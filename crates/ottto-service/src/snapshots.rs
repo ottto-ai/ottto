@@ -48,12 +48,10 @@ struct DurableState {
     owed: Option<Box<sampled_scan::durable_tail::ReceiptOwed>>,
     #[cfg(unix)]
     retail: Option<sampled_scan::durable_tail::RetailAttempt>,
-    #[cfg(unix)]
-    upgrade: Option<sampled_scan::durable_tail::UpgradeRead>,
 }
 crate::heap_layout_bound::fields!(DurableCustody; state);
 crate::heap_layout_bound::fields!(DurableState; #[cfg(unix)] active, #[cfg(unix)] chain,
-    #[cfg(unix)] owed, #[cfg(unix)] retail, #[cfg(unix)] upgrade);
+    #[cfg(unix)] owed, #[cfg(unix)] retail);
 impl DurableCustody {
     #[cfg(unix)]
     fn state_mut(&mut self) -> &mut DurableState {
@@ -78,7 +76,6 @@ impl DurableCustody {
                     && state.chain.is_none()
                     && state.owed.is_none()
                     && state.retail.is_none()
-                    && state.upgrade.is_none()
             })
         }
         #[cfg(not(unix))]
@@ -240,6 +237,7 @@ mod line_delivery_tests;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
 mod restart_restore;
+
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn bounded_restore_tail_items_for_test(source: SnapshotSource) -> Vec<SnapshotItem> {
     m3_d3_tests::bounded_restore_tail_items(source)
@@ -251,7 +249,6 @@ mod sampled_audit;
 mod sampled_jsonl;
 #[cfg(all(test, unix))]
 pub(crate) use sampled_jsonl::durable::pl_text::PlText;
-mod upgrade_replay;
 /// Structural verification plus the nested source binding `decode` enforces.
 #[cfg(unix)]
 pub(crate) fn verify_durable_body(
@@ -4109,14 +4106,9 @@ pub struct ScanIndex {
         deserialize_with = "deserialize_lenient_map"
     )]
     codex_counting_tombstones: BTreeMap<String, codex_counting_version::CountingTombstone>,
-    /// Compatibility slot: only O3's negative release/key spend is live.
-    /// Generic reread budgets and selection holds remain retired.
-    #[serde(
-        rename = "reread_guard",
-        default,
-        skip_serializing_if = "upgrade_replay::State::is_empty"
-    )]
-    o3_replay: upgrade_replay::State,
+    /// Retired replay slot: drain old values without retaining authority.
+    #[serde(rename = "reread_guard", default, skip_serializing)]
+    retired_reread_guard: serde::de::IgnoredAny,
     /// Diagnostic-only bounded FIFO of evicted Legacy tombstones. Appended
     /// serialized slot; old indexes default empty, damaged values are dropped.
     #[serde(
@@ -4339,7 +4331,7 @@ impl Default for ScanIndex {
             upload_ack_retirement_handoff: None,
             upload_context_fingerprint: None,
             files: BTreeMap::new(),
-            o3_replay: upgrade_replay::State::default(),
+            retired_reread_guard: serde::de::IgnoredAny,
             session_account_bindings: BTreeMap::new(),
             terminal_jsonl_dispositions: BTreeMap::new(),
             known_configured_scan_roots: BTreeSet::new(),
@@ -27966,19 +27958,6 @@ impl OwnedSourceScan {
                     break 'scan_step
                 };
             }
-            macro_rules! migration_failure {
-                ($candidate:expr) => {
-                    #[cfg(unix)]
-                    if restart_restore::enabled()
-                        && source == SnapshotSource::ClaudeCode
-                        && sampling
-                            .as_ref()
-                            .is_some_and(|c| c.cache.migration_failure(index, $candidate))
-                    {
-                        pending!();
-                    }
-                };
-            }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
                     if !inventory.step_cached(
@@ -29438,7 +29417,7 @@ impl OwnedSourceScan {
                                 false,
                             );
                         }
-                        migration_failure!(&active.candidate);
+
                         // U1a-2a G14a: a side read error is its charged
                         // attempt; no census line, no dequeue.
                         if let Some(side) = active.side_origin.take() {
@@ -30313,7 +30292,6 @@ impl OwnedSourceScan {
                                     == candidate.opened_object_identity)
                             },
                         ) {
-                            migration_failure!(&candidate);
                             if source == SnapshotSource::ClaudeCode {
                                 claude_request_census::invalidate_claude_request_census(
                                     index,
@@ -30395,7 +30373,6 @@ impl OwnedSourceScan {
                         ) {
                             Ok(completed) => completed,
                             Err(_) => {
-                                migration_failure!(&candidate);
                                 if source == SnapshotSource::ClaudeCode {
                                     claude_request_census::invalidate_claude_request_census(
                                         index,
@@ -30731,7 +30708,7 @@ impl OwnedSourceScan {
                                 false,
                             );
                         }
-                        migration_failure!(&candidate);
+
                         #[cfg(test)]
                         sampled_scan::test_hooks::record_finish_error(&_error);
                         if source == SnapshotSource::ClaudeCode {
@@ -34102,7 +34079,6 @@ impl OwnedSourceScan {
             let mut returned_refusal = None;
             #[cfg(unix)]
             let mut paced_full_granted = false;
-            let mut migration_floor = None;
             let mut active_bound_degraded = false;
             let mut resource_full_pending = None;
             #[cfg(unix)]
@@ -34589,37 +34565,17 @@ impl OwnedSourceScan {
                                         (None, taken_admission, debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Stale(reason) => {
-                                        use sampled_scan::durable_tail::MigrationStart;
-                                        let grant = (source == SnapshotSource::ClaudeCode
-                                            && reason == "old_binding_no_match")
-                                            .then(|| {
-                                                context.cache.migration_start(
-                                                    &key,
-                                                    parser.reader.reader.get_ref(),
-                                                    index,
-                                                    durable_accepted,
-                                                )
-                                            });
-                                        match grant {
-                                            Some(Ok(MigrationStart::Full(end))) => {
-                                                migration_floor = Some(end);
-                                                (None, taken_admission, debt)
-                                            }
-                                            Some(Ok(MigrationStart::Fallback)) => {
-                                                migration_floor = durable_accepted.map(|a| a.end);
-                                                (None, taken_admission, debt)
-                                            }
-                                            Some(Ok(MigrationStart::AwaitSave)) => {
-                                                identified_candidates.push_front(candidate);
-                                                pending!();
-                                            }
-                                            _ => {
-                                                context
-                                                    .cache
-                                                    .durable_stale_hold(source, index, &candidate);
-                                                pending!();
-                                            }
+                                        let granted = source == SnapshotSource::ClaudeCode
+                                            && reason == "old_binding_no_match"
+                                            && context.cache.no_match_full(
+                                                &key, parser.reader.reader.get_ref(), durable_accepted,
+                                            ).is_some();
+                                        if !granted {
+                                            context.cache.durable_stale_hold(source, index, &candidate);
+                                            pending!();
                                         }
+                                        paced_full_granted = true;
+                                        (None, taken_admission, debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
                                         if source == SnapshotSource::Codex {
@@ -34778,10 +34734,6 @@ impl OwnedSourceScan {
                                 }
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
-                                #[cfg(unix)]
-                                if source == SnapshotSource::ClaudeCode {
-                                    context.cache.migration_failure(index, &candidate);
-                                }
                                 let refusal = match rejected.refusal {
                                     sampled_jsonl::PreparationRefusal::Transient => None,
                                     sampled_jsonl::PreparationRefusal::NonTransient(reason) => {
@@ -34825,43 +34777,27 @@ impl OwnedSourceScan {
                         };
                         #[cfg(unix)]
                         if source == SnapshotSource::ClaudeCode
-                            && (migration_floor.is_some()
-                                || !matches!(
-                                    mode,
-                                    crate::transcript_acquisition::ReadMode::Full(_)
-                                ))
+                            && !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                             && durable_accepted.is_some_and(|a| {
-                                parser.reader.acquisition.as_ref().map_or(true, |p| {
-                                    p.frozen_length() < a.end.max(migration_floor.unwrap_or(0))
-                                })
+                                parser
+                                    .reader
+                                    .acquisition
+                                    .as_ref()
+                                    .map_or(true, |p| p.frozen_length() < a.end)
                             })
                         {
-                            let fallback = migration_floor.is_some()
-                                && parser.reader.acquisition.as_ref().is_some_and(|p| {
-                                    durable_accepted.is_some_and(|a| p.frozen_length() > a.end)
-                                })
-                                && context
-                                    .cache
-                                    .no_match_full(
-                                        &key,
-                                        parser.reader.reader.get_ref(),
-                                        durable_accepted,
-                                    )
-                                    .is_some();
-                            if !fallback {
-                                context.cache.durable_hold_exit(
-                                    source,
-                                    crate::durable_tail_store::Refusal::BehindAccepted,
-                                    index,
-                                    &candidate,
-                                    &mut census,
-                                );
-                                drop(parser);
-                                if let Some(lease) = preparation_lease.take() {
-                                    lease.release();
-                                }
-                                pending!();
+                            context.cache.durable_hold_exit(
+                                source,
+                                crate::durable_tail_store::Refusal::BehindAccepted,
+                                index,
+                                &candidate,
+                                &mut census,
+                            );
+                            drop(parser);
+                            if let Some(lease) = preparation_lease.take() {
+                                lease.release();
                             }
+                            pending!();
                         }
                         #[cfg(unix)]
                         if let Some(attempt) = retail_attempt {
@@ -35272,7 +35208,6 @@ impl OwnedSourceScan {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                     if !paced_full_granted
                         && !active_bound_degraded
-                        && migration_floor.is_none()
                         && !cache.upgrade_full_allowed(
                             source,
                             &local_index_key(&active.candidate.path),
@@ -35362,34 +35297,6 @@ impl OwnedSourceScan {
                 );
             }
             if let Some(context) = sampling.as_mut() {
-                #[cfg(unix)]
-                if restart_restore::enabled() && source == SnapshotSource::ClaudeCode
-                    // No plan is the existing unsampled native Full path.
-                    && planned_mode.map_or(true, |(mode, _)| {
-                        matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
-                    })
-                    && (migration_floor.is_some()
-                        || index.o3_replay.upgrade_claimed(&local_index_key(&active.candidate.path))
-                        || index.files.get(&local_index_key(&active.candidate.path))
-                            .is_some_and(|e| !e.source_file_fingerprint.is_empty()
-                                && active.candidate.size_bytes > e.size_bytes))
-                {
-                    match context.cache.migration_read(
-                        &local_index_key(&active.candidate.path),
-                        active.parser.reader.reader.get_ref(),
-                        index,
-                    ) {
-                        Ok(Some(read)) => active.parser.reader.reader.put_upgrade(read),
-                        Ok(None) => {}
-                        // Retained migrations require their exact native observer.
-                        // Absent-record metadata failures retain the baseline Full.
-                        Err(_) => {
-                            if context.cache.migration_failure(index, &active.candidate) {
-                                pending!();
-                            }
-                        }
-                    }
-                }
                 #[cfg(unix)]
                 if stale_selection_pending
                     && planned_mode.map_or(true, |(mode, _)| {
@@ -53329,8 +53236,6 @@ impl ScanIndex {
                         .filter(|key| !self.files.contains_key(*key)),
                 ),
         );
-        let mut o3_replay = self.o3_replay.clone();
-        o3_replay.preserve_spends_from(&previous.o3_replay);
         let mut result = ScanIndex {
             claude_money_birth_store,
             codex_counting_moved_evidence: self.codex_counting_moved_evidence.clone(),
@@ -53357,7 +53262,7 @@ impl ScanIndex {
             generation: previous.generation,
             upload_ack_retirement_handoff: previous.upload_ack_retirement_handoff.clone(),
             upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
-            o3_replay,
+            retired_reread_guard: serde::de::IgnoredAny,
             files,
             session_account_bindings: self.session_account_bindings.clone(),
             terminal_jsonl_dispositions: previous.terminal_jsonl_dispositions.clone(),
@@ -87303,7 +87208,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U subscription_product: Option<String>,
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; withheld_memo, persistence_legacy_recovery, persistence_root, persistence_unavailable, persistence_controls, decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, file_upload_context_enabled, mixed_context_view, context_read_counts, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, o3_replay, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory, claude_copy_removals, copy_unproven_enabled, copy_prefix_base_upload_context);
+crate::heap_layout_bound::fields!(ScanIndex; withheld_memo, persistence_legacy_recovery, persistence_root, persistence_unavailable, persistence_controls, decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, file_upload_context_enabled, mixed_context_view, context_read_counts, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory, claude_copy_removals, copy_unproven_enabled, copy_prefix_base_upload_context);
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);

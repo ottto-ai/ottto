@@ -235,10 +235,6 @@ pub(super) struct NativeFile {
 impl Read for NativeFile {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         #[cfg(unix)]
-        if let Some(read) = self.custody.upgrade_mut() {
-            return read.read(&mut self.file, bytes);
-        }
-        #[cfg(unix)]
         if let Some(attempt) = self.custody.retail_mut() {
             return attempt.read(&mut self.file, bytes);
         }
@@ -255,12 +251,6 @@ impl io::Seek for NativeFile {
 }
 
 impl OpenedInput {
-    #[cfg(unix)]
-    pub(super) fn put_upgrade(&mut self, read: super::sampled_scan::durable_tail::UpgradeRead) {
-        if let Self::Durable(reader) = self {
-            reader.get_mut().custody.put_upgrade(read);
-        }
-    }
     pub(super) fn plain(file: File) -> Self {
         if super::restart_restore::enabled() {
             Self::Durable(Box::new(BufReader::new(NativeFile {

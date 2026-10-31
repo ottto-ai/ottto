@@ -582,7 +582,7 @@ impl SharedCache {
             }
             return Ok(());
         }
-        let certificate = checkpoint
+        let _certificate = checkpoint
             .durable_certificate(birth_unix_nanos(held))
             .ok_or(HeldCause::Incompatible)?;
         lease
@@ -600,7 +600,7 @@ impl SharedCache {
         ) else {
             return Err(HeldCause::Fence);
         };
-        let refused = authorize_strict(slot, source, key, index, custody, binding, &certificate);
+        let refused = authorize_strict(slot, source, key, index, custody);
         stores.release_idle_custody(&digest);
         if refused == Some(store::Refusal::Corrupt) {
             // Known-corrupt disk state may coexist with valid RAM. It cannot
