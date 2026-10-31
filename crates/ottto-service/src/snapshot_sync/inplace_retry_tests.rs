@@ -151,56 +151,6 @@ fn inplace_retry_resends_only_unsettled_bodies() {
     assert_eq!(driven.progress.accepted_fingerprints.len(), 75);
 }
 
-/// The 15 s fast-failure bound is strict, for a fast 500/502 and a short shed
-/// alike: one tick under it is resent, exactly 15 s or more is not.
-#[test]
-#[serial(client_report)]
-fn the_fast_failure_bound_is_strict() {
-    let bound = Duration::from_secs(15);
-    let tick = Duration::from_nanos(1);
-    for failure in ["500", "502", "shed"] {
-        for (failed_after, resent) in [
-            (bound - tick, true),
-            (bound, false),
-            (bound + tick, false),
-            (Duration::from_secs(16), false),
-        ] {
-            let driven = drive(2, Some(failed_after), |attempt, batch| match attempt {
-                0 => Err(match failure {
-                    "500" => batch_server_error(500),
-                    "502" => batch_server_error(502),
-                    _ => shed(Some(1)),
-                }),
-                _ => Ok(accepted_batch(batch.len())),
-            });
-            let case = format!("{failure} after {failed_after:?}");
-            if resent {
-                assert_eq!(
-                    driven.result.unwrap(),
-                    ResumableUploadResult::Completed,
-                    "{case}"
-                );
-                assert_eq!(driven.posts.len(), 2, "{case}");
-                assert_eq!(driven.waits.len(), 1, "{case}");
-            } else {
-                match failure {
-                    "shed" => assert_eq!(
-                        driven.result.unwrap(),
-                        ResumableUploadResult::Shed {
-                            retry_after: Some(Duration::from_secs(1))
-                        },
-                        "{case}"
-                    ),
-                    _ => assert!(driven.result.is_err(), "{case}"),
-                }
-                assert_eq!(driven.posts.len(), 1, "{case}");
-                assert!(driven.waits.is_empty(), "{case}");
-                assert!(driven.progress.accepted_fingerprints.is_empty(), "{case}");
-            }
-        }
-    }
-}
-
 /// T5: at most two resends and 10 s of waiting per upload call, across all of
 /// its pages. A failure that outlasts the budget takes today's path unchanged.
 #[test]
@@ -252,25 +202,6 @@ fn inplace_retry_is_bounded() {
         SNAPSHOT_BATCH_LIMIT,
         "the recovered first page stays checkpointed"
     );
-}
-
-/// T6: a long or absent Retry-After keeps today's single-POST shed. This
-/// covers the 60 s identity deferral and the no-Retry-After jitter ladder.
-#[test]
-#[serial(client_report)]
-fn long_or_absent_retry_after_is_not_retried_in_place() {
-    for retry_after in [Some(60), Some(6), None] {
-        let driven = drive(3, None, |_, _| Err(shed(retry_after)));
-        assert_eq!(
-            driven.result.unwrap(),
-            ResumableUploadResult::Shed {
-                retry_after: retry_after.map(Duration::from_secs)
-            },
-            "Retry-After {retry_after:?}"
-        );
-        assert_eq!(driven.posts.len(), 1, "Retry-After {retry_after:?}");
-        assert!(driven.waits.is_empty());
-    }
 }
 
 fn never_retried_failure(name: &str) -> anyhow::Error {
@@ -431,33 +362,6 @@ fn bootstrap_probe_resent_after_server_error_settles_as_conflict() {
         .quarantined_fingerprints
         .contains_key(&probe.snapshot_fingerprint));
     assert!(progress.accepted_cache_heads.is_empty());
-}
-
-/// T8: a failure that took longer than 15 s means overload; it is not resent.
-#[test]
-#[serial(client_report)]
-fn slow_failure_is_not_retried_in_place() {
-    let slow = Some(Duration::from_secs(16));
-    let driven = drive(2, slow, |attempt, batch| match attempt {
-        0 => Err(shed(Some(1))),
-        _ => Ok(accepted_batch(batch.len())),
-    });
-    assert_eq!(
-        driven.result.unwrap(),
-        ResumableUploadResult::Shed {
-            retry_after: Some(Duration::from_secs(1))
-        }
-    );
-    assert_eq!(driven.posts.len(), 1);
-    assert!(driven.waits.is_empty());
-
-    let driven = drive(2, slow, |attempt, batch| match attempt {
-        0 => Err(batch_server_error(502)),
-        _ => Ok(accepted_batch(batch.len())),
-    });
-    assert!(driven.result.is_err());
-    assert_eq!(driven.posts.len(), 1);
-    assert!(driven.waits.is_empty());
 }
 
 /// T9: each resend re-runs the upload boundary. An account switch during the

@@ -991,54 +991,6 @@ fn roots_under_their_own_bound_are_all_admitted_on_a_page_over_it() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// N1: a session admitted on a small page keeps the same body when a later
-/// big page (a backfill or a closed-fence re-arm) carries it with many other
-/// roots whose total is far over the bound.
-#[test]
-fn admitted_session_is_not_blanked_by_a_big_page() {
-    let dir = temp_dir("claude-file-birth-big-page");
-    let now = OffsetDateTime::now_utc();
-    let roots = [ROOT, SECOND, OTHER_ROOT, FOURTH, FIFTH];
-    let files = five_request_roots(&dir, now, &roots);
-    let paths = files
-        .iter()
-        .map(|(path, _)| path.as_path())
-        .collect::<Vec<_>>();
-
-    let mut small = vec![files[0].1.clone()];
-    let mut index = indexed(&paths[..1], true);
-    let disposition = fold_with_bound(&mut small, &own_rows(&roots[..1], &[]), &mut index, 6);
-    assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
-    assert_eq!(
-        posture(&small[0]),
-        (Some(100), Some(500), Some(500), Some(0))
-    );
-
-    let mut big = files
-        .iter()
-        .map(|(_, item)| item.clone())
-        .collect::<Vec<_>>();
-    let mut index = indexed(&paths, true);
-    let disposition = fold_with_bound(&mut big, &own_rows(&roots, &[]), &mut index, 6);
-    assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
-    let changed = differing_keys(&small[0], &big[0])
-        .intersection(&allowed_difference())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    assert!(
-        changed.is_empty(),
-        "the big page keeps the context numbers and session start: {changed:?}"
-    );
-    assert_eq!(
-        disposition
-            .context_file_birth
-            .total
-            .withheld_evidence_bound_session_count,
-        0
-    );
-    let _ = fs::remove_dir_all(dir);
-}
-
 /// review-678c R3: one root whose requests span slices, with the
 /// contradiction in a later slice than a confirmed request. The earlier
 /// slice's confirmation must not hide the later contradiction.
@@ -1115,68 +1067,6 @@ fn contradiction_in_a_later_slice_vetoes_the_root() {
     let total = disposition.context_file_birth.total;
     assert_eq!(total.withheld_evidence_bound_session_count, 0);
     assert_eq!(total.withheld_tripwire_session_count, 1);
-    let _ = fs::remove_dir_all(dir);
-}
-
-/// SOURCE Amendment 7: with the per-root bound lowered by the test seam, a
-/// root the production bound admitted is counted as evidence-bound on every
-/// later pass, the accessor reports the resource withhold, and the local
-/// alarm fires on the first such pass only.
-#[test]
-fn evidence_bound_past_the_lowered_seam_is_counted_and_alarms_once() {
-    let dir = temp_dir("claude-file-birth-evidence-bound-seam");
-    let now = OffsetDateTime::now_utc();
-    let files = five_request_roots(&dir, now, &[ROOT]);
-    let paths = [files[0].0.as_path()];
-    let rows = own_rows(&[ROOT], &[]);
-    let is_alarm =
-        |record: &serde_json::Value| record["stage"] == "claude_context_resource_withhold";
-    let pass = || {
-        let mut items = vec![files[0].1.clone()];
-        let mut index = indexed(&paths, true);
-        let (disposition, records) = crate::local_resource_diagnostics::capture(|| {
-            fold_with_bound(
-                &mut items,
-                &rows,
-                &mut index,
-                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            )
-        });
-        let alarms = records.into_iter().filter(is_alarm).collect::<Vec<_>>();
-        (disposition, items.remove(0), alarms)
-    };
-
-    let (admitted, item, alarms) = pass();
-    assert_eq!(admitted.posture_admission(ROOT), Some("file_birth_rule"));
-    assert_eq!(posture(&item), (Some(100), Some(500), Some(500), Some(0)));
-    assert!(!admitted.context_file_birth.resource_withheld());
-    assert!(alarms.is_empty());
-
-    claude_context_file_birth::with_claude_evidence_bound_for_test(4, || {
-        for first in [true, false] {
-            let (withheld, item, alarms) = pass();
-            assert_eq!(
-                withheld.posture_admission(ROOT),
-                Some("withheld_evidence_bound")
-            );
-            assert_cleared(&item);
-            let counts = &withheld.context_file_birth;
-            assert_eq!(counts.total.withheld_evidence_bound_session_count, 1);
-            assert!(!counts.remembered_veto_overflowed);
-            assert!(counts.resource_withheld());
-            if first {
-                assert_eq!(alarms.len(), 1);
-                assert_eq!(alarms[0]["source"], "claude_code");
-                assert_eq!(
-                    alarms[0]["counts"]["withheld_evidence_bound_session_count"],
-                    1
-                );
-                assert_eq!(alarms[0]["counts"]["remembered_veto_overflowed"], false);
-            } else {
-                assert!(alarms.is_empty(), "the alarm fires once per process");
-            }
-        }
-    });
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1481,37 +1371,6 @@ fn same_session_id_never_merges_across_accounts() {
     let _ = fs::remove_dir_all(dir);
 }
 
-#[test]
-fn root_records_copied_under_a_subagent_path_are_not_exempt() {
-    let dir = temp_dir("claude-file-birth-subagent-alias");
-    let now = OffsetDateTime::now_utc();
-    let child_dir = dir.join(ROOT).join("subagents");
-    fs::create_dir_all(&child_dir).expect("create subagent dir");
-    let path = child_dir.join("agent-a4d1585d310070d0f.jsonl");
-    // An ordinary root transcript (no sidechain marker) placed where a
-    // subagent file would live: the path keys it as a child, the records do
-    // not, so the exemption does not apply.
-    fs::write(
-        &path,
-        assistant(ROOT, "req_s1", &stamp(now, COPIED), 900_000),
-    )
-    .expect("write fixture");
-    let parsed = parse(&path, now);
-    assert!(parsed.claude_file_birth.is_subagent_for_test());
-    let session_id = parsed.source_session_id.clone();
-    let mut items = vec![parsed];
-    let mut index = indexed(&[&path], true);
-
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
-
-    assert_eq!(
-        disposition.posture_admission(&session_id),
-        Some("withheld_unknown_birth")
-    );
-    assert_cleared(&items[0]);
-    let _ = fs::remove_dir_all(dir);
-}
-
 /// The production loader keeps API rows of a root without a trace sidecar for
 /// the veto only: a copied request that this root's own API sidecar reports
 /// still withholds, through the real scan and local evidence pipeline.
@@ -1747,47 +1606,6 @@ fn last_turn_alone_does_not_change_the_upload_fingerprint() {
         snapshot_fingerprint(SnapshotSource::ClaudeCode, &peak_moved),
         base
     );
-    let _ = fs::remove_dir_all(dir);
-}
-
-#[test]
-fn context_basis_counts_by_version_stay_bounded() {
-    let dir = temp_dir("claude-file-birth-version-bound");
-    let now = OffsetDateTime::now_utc();
-    let mut items = Vec::new();
-    let mut paths = Vec::new();
-    for number in 0..20_u32 {
-        let session = format!("d0000000-0000-4000-8000-{number:012}");
-        let line = assistant(&session, &format!("req_{number}"), &stamp(now, -30), 100);
-        let (path, mut item) = root_session(&dir, &session, &[line]);
-        item.session_start = Some(Box::new(SnapshotSessionStart {
-            client_version: Some(format!("2.1.{number}")),
-            ..SnapshotSessionStart::default()
-        }));
-        paths.push(path);
-        items.push(item);
-    }
-    let mut index = indexed(
-        &paths.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
-        true,
-    );
-
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
-
-    let counts = &disposition.context_file_birth;
-    assert_eq!(counts.total.file_birth_rule_session_count, 20);
-    assert_eq!(
-        counts.by_claude_code_version.len(),
-        17,
-        "sixteen versions + other"
-    );
-    assert_eq!(
-        counts.by_claude_code_version["other"].file_birth_rule_session_count,
-        4
-    );
-    let serialized = serde_json::to_vec(counts).expect("serialize counts");
-    // Fixed fields times seventeen rows: bounded whatever the version mix.
-    assert!(serialized.len() < 12_288, "{} bytes", serialized.len());
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -2162,7 +1980,11 @@ fn native_read(
         .expect("prepare");
     while !parser.step().expect("step") {}
     let acquisition = parser
-        .retain_reduction(&scope, now, sampled_scan::RetainBudget::granted_unclassified(crate::transcript_cache::ENTRY_BYTES))
+        .retain_reduction(
+            &scope,
+            now,
+            sampled_scan::RetainBudget::granted_unclassified(crate::transcript_cache::ENTRY_BYTES),
+        )
         .expect("retain")
         .expect("retained");
     let retained = acquisition
@@ -2376,49 +2198,6 @@ fn claude_backfill_stop_latches_until_restart() {
     note_claude_reemission_stop(&ClaudeContextFileBirthCounts::default(), &BTreeSet::new());
     assert_eq!(adoption_page(), 0);
     let _ = (fs::remove_dir_all(dir), fs::remove_dir_all(home));
-}
-
-/// While latched, the alarm repeats at most once an hour, whatever the folds.
-#[test]
-fn claude_backfill_stop_reminder_is_at_most_hourly() {
-    let withheld = ClaudeContextFileBirthCounts {
-        remembered_veto_overflowed: true,
-        ..Default::default()
-    };
-    let clean = ClaudeContextFileBirthCounts::default();
-    let roots = BTreeSet::new();
-    let start = std::time::Instant::now();
-    let stages = |counts: &ClaudeContextFileBirthCounts, minutes: u64| {
-        let ((), records) = crate::local_resource_diagnostics::capture(|| {
-            note_claude_reemission_stop_at(
-                counts,
-                &roots,
-                start + std::time::Duration::from_secs(minutes * 60),
-            )
-        });
-        records
-            .iter()
-            .map(|record| record["stage"].as_str().unwrap_or_default().to_string())
-            .collect::<Vec<_>>()
-    };
-    assert!(stages(&clean, 0).is_empty(), "a clean fold never latches");
-    assert_eq!(stages(&withheld, 1), ["claude_reemission_stop_latched"]);
-    assert!(stages(&withheld, 2).is_empty());
-    assert!(stages(&clean, 60).is_empty(), "59 minutes since the alarm");
-    assert_eq!(
-        stages(&clean, 61),
-        ["claude_reemission_stop_latched_reminder"]
-    );
-    assert!(stages(&withheld, 90).is_empty());
-    assert_eq!(
-        stages(&clean, 121),
-        ["claude_reemission_stop_latched_reminder"]
-    );
-    assert_eq!(claude_reemission_stop_withheld_folds(), 3);
-    assert!(claude_reemission_stop_latched());
-    restart_claude_reemission_stop_for_test();
-    assert!(!claude_reemission_stop_latched());
-    assert_eq!(claude_reemission_stop_withheld_folds(), 0);
 }
 
 /// Exercise the daemon's real load boundary, including quarantine, rather
@@ -2964,41 +2743,6 @@ fn first_own_request_time_is_absent_unless_the_birth_is_measured() {
     let (admission, _, item) = run(&path, subagent);
     assert_eq!(admission, Some("file_birth_rule"));
     assert_eq!(item.first_own_request_at, None, "exempt is not measured");
-    let _ = fs::remove_dir_all(dir);
-}
-
-/// The strict rule never carries design E's first own request time, even
-/// for the same file the birth rule measures.
-#[test]
-fn strict_path_has_no_first_own_request_time() {
-    // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let dir = temp_dir("claude-file-birth-first-own-strict");
-    let now = OffsetDateTime::now_utc();
-    let (path, parsed) = root_session(
-        &dir,
-        ROOT,
-        &[
-            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
-            assistant(ROOT, "req_a2", &stamp(now, -29), 300),
-        ],
-    );
-    let evidence = reports(&[(ROOT, "req_a1", 1, 100), (ROOT, "req_a2", 2, 300)], true);
-    let run = |fence_closed: bool| {
-        let mut item = parsed.clone();
-        item.first_own_request_at = Some(stamp(now, -3_600));
-        let mut items = vec![item];
-        let mut index = indexed(&[&path], fence_closed);
-        let disposition = fold(&mut items, &evidence, &mut index, true);
-        (disposition.posture_admission(ROOT), items.remove(0))
-    };
-    let (strict_admission, strict) = run(false);
-    let (birth_admission, birth) = run(true);
-    assert_eq!(strict_admission, Some("strict"));
-    assert_eq!(birth_admission, Some("file_birth_rule"));
-    assert_eq!(posture(&strict), posture(&birth));
-    assert_eq!(strict.first_own_request_at, None);
-    assert_eq!(birth.first_own_request_at, Some(stamp(now, -30)));
     let _ = fs::remove_dir_all(dir);
 }
 

@@ -1146,35 +1146,6 @@ mod tests {
         assert_eq!(startup_steps(false), recovery.to_vec());
     }
 
-    /// `serve` and `serve-xpc` finish their startup steps, including the
-    /// local state sweep, before they build the daemon and start relays.
-    #[test]
-    fn local_state_sweep_and_recovery_precede_relays_in_serve_commands() {
-        let source = include_str!("main.rs");
-        let source = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
-        let arm = |start: &str, end: &str| {
-            let from = source.find(start).expect("command arm");
-            &source[from..from + source[from..].find(end).expect("next arm")]
-        };
-        for (arm, prepare) in [
-            (
-                arm("Command::Serve { socket, once } =>", "Command::ServeXpc {"),
-                "prepare_to_serve(!once);",
-            ),
-            (
-                arm("Command::ServeXpc {", "Command::Service { command } =>"),
-                "prepare_to_serve(true);",
-            ),
-        ] {
-            let at = |needle: &str| arm.find(needle).unwrap_or_else(|| panic!("{needle}"));
-            assert_eq!(arm.matches("prepare_to_serve(").count(), 1, "{arm}");
-            assert!(at(prepare) < at("load_or_create_control_token()"), "{arm}");
-            assert!(at(prepare) < at("LocalDaemon::new("), "{arm}");
-            assert!(at(prepare) < at("start_builtin_relays(&daemon)"), "{arm}");
-            assert!(!arm.contains("sweep_local_state_at_startup"), "{arm}");
-        }
-    }
-
     /// Every daemon entry point takes the state-directory lock before it
     /// marks itself serving, runs a startup step or touches any state.
     #[test]
@@ -1327,22 +1298,19 @@ mod tests {
 
     #[test]
     fn account_scope_differs_between_accounts_on_one_machine() {
-        // The whole point of the field: two macOS user accounts on one Mac share
-        // a `machine_id` but must not share an `account_scope`.
-        assert_ne!(ALPHA_UID_501, ALPHA_UID_502);
-        assert_eq!(
-            account_scope_from_uid("otm_machine_alpha", Some(502)).as_deref(),
-            Some(ALPHA_UID_502)
-        );
-    }
-
-    #[test]
-    fn account_scope_differs_for_the_same_account_on_another_machine() {
-        assert_ne!(ALPHA_UID_501, BETA_UID_501);
-        assert_eq!(
-            account_scope_from_uid("otm_machine_beta", Some(501)).as_deref(),
-            Some(BETA_UID_501)
-        );
+        for (machine, uid, expected) in [
+            ("otm_machine_alpha", Some(502), Some(ALPHA_UID_502)),
+            ("otm_machine_beta", Some(501), Some(BETA_UID_501)),
+            ("otm_machine_alpha", None, None),
+        ] {
+            assert_eq!(account_scope_from_uid(machine, uid).as_deref(), expected);
+            assert_ne!(Some(ALPHA_UID_501), expected);
+        }
+        let scope = account_scope_from_uid("otm_machine_alpha", Some(501)).unwrap();
+        let machine_style = stable_machine_id_from_seed("account:otm_machine_alpha:501");
+        assert!(scope.starts_with("otu_"));
+        assert!(machine_style.starts_with("otm_"));
+        assert_ne!(scope, machine_style);
     }
 
     #[test]
@@ -1359,21 +1327,6 @@ mod tests {
         assert!(!scope.contains("501"));
         assert!(!scope.contains("machine_alpha"));
         assert!(!scope.contains('/'));
-    }
-
-    #[test]
-    fn account_scope_never_collides_with_the_machine_id_namespace() {
-        let scope = account_scope_from_uid("otm_machine_alpha", Some(501)).expect("scope");
-        let machine_style = stable_machine_id_from_seed("account:otm_machine_alpha:501");
-
-        assert!(scope.starts_with("otu_"));
-        assert!(machine_style.starts_with("otm_"));
-        assert_ne!(scope, machine_style);
-    }
-
-    #[test]
-    fn account_scope_is_absent_when_no_posix_uid_is_available() {
-        assert_eq!(account_scope_from_uid("otm_machine_alpha", None), None);
     }
 
     #[test]

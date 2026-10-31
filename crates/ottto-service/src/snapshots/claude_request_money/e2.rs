@@ -252,51 +252,6 @@ fn diag_max(key: &'static str, value: u64) {
     let _ = (key, value);
 }
 
-/// Benchmark seam (snapshot_sync money_e2_bench_tests). Test builds only.
-#[cfg(test)]
-pub(crate) mod bench_seam {
-    /// Run `run` with the E2 upload gate forced on (`true`) or off
-    /// (`false`, dark) for every page `run` drives on this thread (the
-    /// benchmark is single-threaded).
-    pub(crate) fn with_gate<T>(on: bool, run: impl FnOnce() -> T) -> T {
-        if on {
-            super::with_enabled(run)
-        } else {
-            super::with_disabled(run)
-        }
-    }
-    /// E2 counter deltas not yet written to a native_collection_page line,
-    /// then zeroed: the same nonzero-only keys as that line.
-    pub(crate) fn drain_counts() -> serde_json::Value {
-        serde_json::to_value(super::take_counts()).expect("E2 counts serialize")
-    }
-    /// Per-stage wall clock (µs) since the last take, then zeroed.
-    pub(crate) fn take_stages() -> serde_json::Value {
-        super::take_stages()
-            .into_iter()
-            .map(|(stage, spent)| {
-                (
-                    stage.to_owned(),
-                    serde_json::json!(spent.as_micros() as u64),
-                )
-            })
-            .collect::<serde_json::Map<_, _>>()
-            .into()
-    }
-    /// Disclosures and holds by reason since the last take, then zeroed.
-    pub(crate) fn take_diag() -> serde_json::Value {
-        serde_json::to_value(super::take_diag()).expect("E2 diag serializes")
-    }
-    /// Run `run` with synthetic root births (local index key -> unix
-    /// nanos) standing in for creation time, which Linux cannot set.
-    pub(crate) fn with_staged_births<T>(
-        births: std::collections::BTreeMap<String, u64>,
-        run: impl FnOnce() -> T,
-    ) -> T {
-        crate::snapshots::claude_history_upgrade::with_staged_births_for_test(births, run)
-    }
-}
-
 /// The parse-time view of the durable birth table (T1's `BirthStore`).
 pub(in crate::snapshots) struct ReadContext<'a> {
     pub(in crate::snapshots) index: &'a ScanIndex,

@@ -547,7 +547,7 @@ pub(super) fn unchanged_requested(index: &ScanIndex, candidate: &CandidateFile, 
         // Re-evaluate every independent reason without revision or mode
         // debt. Sidecar changes, retries and source changes must still parse
         // locally under history holds, as before this scoped mechanism.
-        && index.candidate_decision_with_reason_gated(candidate, now, false, false).0 == CandidateDecision::Skip
+        && index.candidate_decision_with_reason_gated(candidate, now, false, false, false).0 == CandidateDecision::Skip
 }
 
 #[cfg(test)]

@@ -181,19 +181,20 @@ pub(crate) fn describe_descriptor(fd: RawFd) -> String {
     format!("fd {fd} is a socket that is not listening")
 }
 
-/// A one-line count of this process's open descriptors by kind. A steadily
-/// growing count alongside a listener failure points at a descriptor leak.
-pub(crate) fn descriptor_census() -> String {
+/// Process soft descriptor limit; failure supplies no admission authority.
+pub(crate) fn descriptor_limit() -> Option<usize> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
     // SAFETY: getrlimit writes one rlimit into the live struct.
-    let scan_to = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
-        limit.rlim_cur.min(65_536) as RawFd
-    } else {
-        4_096
-    };
+    (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0)
+        .then(|| usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX))
+}
+
+/// A one-line count of this process's open descriptors by kind.
+pub(crate) fn descriptor_census() -> String {
+    let scan_to = descriptor_limit().unwrap_or(4_096).min(65_536) as RawFd;
     let mut counts = std::collections::BTreeMap::<&'static str, usize>::new();
     let mut total = 0_usize;
     for fd in 0..scan_to {

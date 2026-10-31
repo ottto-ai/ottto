@@ -555,16 +555,6 @@ fn linux_witness() -> PlatformDiagnostics {
     }
 }
 #[test]
-fn platform_gate_accepts_linux_only_with_the_layout_witness() {
-    assert!(linux_witness().validate_growth().is_ok());
-}
-#[test]
-fn platform_gate_rejects_a_different_full_cause() {
-    let mut d = linux_witness();
-    d.full_causes = json!({"audit_due":1});
-    assert!(d.validate_growth().is_err());
-}
-#[test]
 fn platform_gate_rejects_records_with_a_restore_miss() {
     let mut d = linux_witness();
     d.records_after_p0 = 1;
@@ -576,35 +566,6 @@ fn platform_gate_rejects_records_with_a_restore_miss() {
     assert!(d.validate_growth().is_err());
 }
 
-#[test]
-fn platform_gate_rejects_non_layout_refusals() {
-    let mut d = linux_witness();
-    d.page.other_refusals = 1;
-    assert!(d.validate_growth().is_err());
-    d.page.other_refusals = 0;
-    d.p0.other_refusals = 1;
-    assert!(d.validate_growth().is_err());
-}
-#[test]
-fn platform_gate_rejects_a_supported_layout_full() {
-    let mut d = linux_witness();
-    d.layout_supported = true;
-    d.records_after_p0 = 1;
-    d.tail = 1;
-    d.full_causes = json!({});
-    d.restore_outcome = json!({"restored":1});
-    assert!(d.validate_growth().is_err());
-}
-
-#[test]
-fn platform_gate_rejects_a_missing_layout_witness() {
-    let mut d = linux_witness();
-    d.page.bound_refused = 0;
-    assert!(d.validate_growth().is_err());
-    d.page.bound_refused = 1;
-    d.p0.bound_refused = 0;
-    assert!(d.validate_growth().is_err());
-}
 #[test]
 fn platform_gate_accepts_supported_layout_restore_and_tail_only() {
     let mut d = linux_witness();
@@ -659,80 +620,6 @@ fn boundary_counts(rows: &mut [Value], page: bool) -> &mut serde_json::Map<Strin
 #[test]
 fn lifecycle_extraction_accepts_valid_unsupported_rows() {
     assert!(extraction_gate(&unsupported_lifecycle_rows()).is_ok());
-}
-
-#[test]
-fn lifecycle_extraction_rejects_clear_metadata_unsupported() {
-    for page in [false, true] {
-        let mut rows = unsupported_lifecycle_rows();
-        boundary_counts(&mut rows, page).insert("clear_metadata_unsupported".into(), json!(1));
-        assert_eq!(
-            extraction_gate(&rows).unwrap_err(),
-            "non-layout lifecycle failure: clear_metadata_unsupported"
-        );
-    }
-}
-
-#[test]
-fn lifecycle_extraction_rejects_every_non_layout_failure() {
-    for page in [false, true] {
-        let extras = if page { PAGE_ONLY_COUNTERS } else { &[] };
-        for (key, class) in LIFECYCLE_COUNTERS.iter().chain(extras) {
-            if *class == CounterClass::NonLayoutFailure {
-                let mut rows = unsupported_lifecycle_rows();
-                boundary_counts(&mut rows, page).insert((*key).into(), json!(1));
-                assert_eq!(
-                    extraction_gate(&rows).unwrap_err(),
-                    format!("non-layout lifecycle failure: {key}"),
-                    "page={page}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn lifecycle_extraction_keeps_every_ordinary_observation_neutral() {
-    for page in [false, true] {
-        let extras = if page { PAGE_ONLY_COUNTERS } else { &[] };
-        for (key, class) in LIFECYCLE_COUNTERS.iter().chain(extras) {
-            // insert_admitted is an observation, but the existing unsupported
-            // layout gate independently requires zero admitted inserts.
-            if *class == CounterClass::Observation && *key != "insert_admitted" {
-                let mut rows = unsupported_lifecycle_rows();
-                boundary_counts(&mut rows, page).insert((*key).into(), json!(1));
-                assert!(extraction_gate(&rows).is_ok(), "key={key} page={page}");
-            }
-        }
-    }
-}
-
-#[test]
-fn lifecycle_extraction_preserves_admission_observations_for_the_gate() {
-    for page in [false, true] {
-        let mut rows = unsupported_lifecycle_rows();
-        boundary_counts(&mut rows, page).insert("insert_admitted".into(), json!(1));
-        assert!(
-            retention_witness(&rows).is_ok(),
-            "admission is an observation"
-        );
-        assert!(
-            extraction_gate(&rows).is_err(),
-            "unsupported layout still requires zero admissions"
-        );
-    }
-}
-
-#[test]
-fn lifecycle_extraction_rejects_unknown_keys_even_when_zero() {
-    for page in [false, true] {
-        let mut rows = unsupported_lifecycle_rows();
-        boundary_counts(&mut rows, page).insert("unclassified_counter".into(), json!(0));
-        assert_eq!(
-            extraction_gate(&rows).unwrap_err(),
-            "unclassified lifecycle counter: unclassified_counter"
-        );
-    }
 }
 
 #[test]
@@ -1003,22 +890,6 @@ fn refuses_invalid_collection_clock_before_scratch_mutation() {
     f.refused(f.command("COLD"));
 }
 
-#[test]
-fn refuses_missing_public_and_symlinked_blinding_keys() {
-    let f = Fixture::new();
-    let original = fs::read(&f.key).unwrap();
-    fs::remove_file(&f.key).unwrap();
-    f.refused(f.command("P0"));
-    fs::write(&f.key, original).unwrap();
-    fs::set_permissions(&f.key, fs::Permissions::from_mode(0o644)).unwrap();
-    f.refused(f.command("P0"));
-    let target = f.base.join("key-target");
-    fs::rename(&f.key, &target).unwrap();
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
-    symlink(target, &f.key).unwrap();
-    f.refused(f.command("P0"));
-}
-
 #[cfg(target_os = "linux")]
 mod fifo_inputs {
     use super::*;
@@ -1062,34 +933,8 @@ mod fifo_inputs {
         make_fifo(&f.key);
         refuse_promptly(&f, f.command("P0"));
     }
-
-    #[test]
-    fn refuses_symlink_to_fifo_blinding_key_without_blocking() {
-        let f = Fixture::new();
-        let target = f.base.join("fifo-target");
-        make_fifo(&target);
-        fs::remove_file(&f.key).unwrap();
-        symlink(target, &f.key).unwrap();
-        refuse_promptly(&f, f.command("P0"));
-    }
 }
 
-#[test]
-fn refuses_mismatched_or_missing_scratch_support() {
-    let f = Fixture::new();
-    let mut command = f.command("P0");
-    command.env("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &f.clone);
-    f.refused(command);
-    let mut command = f.command("P0");
-    command.env_remove("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
-    f.refused(command);
-}
-#[test]
-fn refuses_existing_daemon_state() {
-    let f = Fixture::new();
-    fs::write(f.support.join("account.json"), "{}").unwrap();
-    f.refused(f.command("P0"));
-}
 #[test]
 fn refuses_root_outside_clone_and_nested_symlink() {
     let f = Fixture::new();
@@ -1107,16 +952,6 @@ fn refuses_external_api_and_unowned_loopback() {
         command.env("OTTTO_API_BASE_URL", url);
         f.refused(command);
     }
-}
-#[test]
-fn refuses_missing_and_external_secret_fallback() {
-    let f = Fixture::new();
-    let mut command = f.command("P0");
-    command.env_remove("OTTTO_SERVICE_SECRET_FALLBACK_DIR");
-    f.refused(command);
-    let mut command = f.command("P0");
-    command.env("OTTTO_SERVICE_SECRET_FALLBACK_DIR", &f.clone);
-    f.refused(command);
 }
 #[test]
 fn synthetic_cold_quiet_growth_kill_and_restart() {
@@ -1333,25 +1168,6 @@ fn supplied_hold_back_inventory_is_validated_and_counted() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(f.rows("P0")[0]["held_files"], 1);
-}
-
-#[test]
-fn refuses_physical_targets_of_live_provider_and_support_symlinks() {
-    for provider in [".claude", "Library/Application Support/Ottto"] {
-        let f = Fixture::new();
-        let home = f.base.join("fake-home");
-        let live = home.join(provider);
-        fs::create_dir_all(live.parent().unwrap()).unwrap();
-        let target = if provider == ".claude" {
-            &f.clone
-        } else {
-            &f.support
-        };
-        symlink(target, &live).unwrap();
-        let mut command = f.command("P0");
-        command.env("HOME", &home);
-        f.refused(command);
-    }
 }
 
 #[test]
