@@ -918,6 +918,7 @@ fn restart_between_pages() {
         }
         assert_ne!(bodies[0].raw, bodies[1].raw, "the second page adds money");
         disk_verified(name, &bodies, 2);
+        off_disk_no_record_body(name);
     });
 }
 
@@ -967,6 +968,7 @@ fn upgrade_without_semantic_revision() {
             (0, 1, 0),
         );
         disk_verified(name, &[compare_claude_pages(&c, pages)], 1);
+        off_disk_no_record_body(name);
     });
 }
 
@@ -1027,6 +1029,7 @@ fn downgrade_then_reupgrade() {
         );
         let restored = compare_claude_pages(&c, pages);
         disk_verified(name, &[refused, restored], 1);
+        off_disk_no_record_body(name);
     });
 }
 
@@ -1191,4 +1194,105 @@ fn codex_admission_branches_preserve_emitted_totals() {
         let wire = other_wire(SnapshotSource::Codex, &scan);
         assert!(!wire.is_empty(), "{name}: emitted body must validate");
     }
+}
+
+// Reuse the three disk lifecycles' physical corpus and real uploader. This
+// additional cold owner has the store OFF; its complete envelopes must equal
+// the same prior's ordinary no-record Full, with no restore attempt.
+fn off_disk_no_record_body(name: &str) {
+    let (c, disk, path, _warm, prior) = disk_corpus(&format!("{name}-off"));
+    grow(&path, "off-growth", 20);
+    let before = disk.record_bytes();
+    let _off = crate::snapshots::RestartRestoreForTest::disabled();
+    let owner = E2ScanFixture::default();
+    disk.begin(&owner, SnapshotSource::ClaudeCode);
+    let full = c.raw(&E2ScanFixture::default(), prior.clone(), 100, true, &[]);
+    let disk_page = c.raw(&owner, prior.clone(), 100, true, &[]);
+    assert_eq!(disk_page.modes, (1, 0, 0));
+    assert_eq!(durable_restores(&owner.cache, SnapshotSource::ClaudeCode).0, 0);
+    let tail = c.raw(&E2ScanFixture::default(), prior, 100, true, &[]);
+    let mut pages = [tail, full, disk_page];
+    finish_claude_pages(&c, &mut pages);
+    compare_claude_uploads(&pages);
+    disk.commit(&pages[2].cache, SnapshotSource::ClaudeCode, &mut pages[2].index.clone());
+    assert_eq!(disk.record_bytes(), before, "OFF never refreshes restore records");
+}
+
+/// [money] Rename-before-ACK restart reconstructs exactly the cold complete body.
+#[test]
+fn native_successor_rename_before_ack_cold_reopen_preserves_money() {
+    successor_cold_reopen(None);
+}
+
+/// [money] Refused/not-stored successor remains unacknowledged across cold reopen.
+#[test]
+fn refused_or_not_stored_successor_cold_reopen_preserves_money() {
+    for disposition in ["refused", "not_stored"] {
+        successor_cold_reopen(Some(disposition));
+    }
+}
+
+fn successor_cold_reopen(disposition: Option<&str>) {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("successor-cold-reopen") { return; }
+    with_e2(|| {
+        let (c, mut disk, path, warm, prior) = disk_corpus(
+            &format!("successor-cold-reopen-{}", disposition.unwrap_or("before-ack")));
+        let progress_path = disk.dir.join("upload-progress.json");
+        let mut progress = e2_progress();
+        let mut accepted = c.raw(&E2ScanFixture::default(), ScanIndex::default(), 100, true, &[]);
+        accepted.enrich(&c);
+        accepted.finish();
+        assert_eq!(upload(&accepted.scan.snapshots, &mut progress, ack).0.unwrap(), ResumableUploadResult::Completed);
+        progress.save(&progress_path).unwrap(); // Existing receipts precede successor rename.
+        let accepted_fingerprints = progress.accepted_fingerprints.clone();
+        grow(&path, "next", 20);
+        let mut successor = c.raw(&warm, prior.clone(), 100, true, &[]);
+        successor.enrich(&c);
+        successor.finish();
+        let fulls = successor.modes.0;
+        if let Some(disposition) = disposition {
+            let _result = upload(&successor.scan.snapshots, &mut progress, |batch| {
+                let mut response = ack(batch)?;
+                if disposition == "not_stored" {
+                    response.unchanged_entities = std::mem::take(&mut response.accepted_entities);
+                    for entity in &mut response.unchanged_entities {
+                        entity.unchanged_basis = Some("usage_identical".into());
+                    }
+                } else {
+                    response.rejected_entities = std::mem::take(&mut response.accepted_entities).into_iter()
+                        .map(|entity| crate::snapshot_client::SnapshotEntityRejection {
+                            source_session_id: entity.source_session_id,
+                            snapshot_fingerprint: entity.snapshot_fingerprint,
+                            occurrence_count: entity.occurrence_count,
+                            reason: "usage_accounting_authority_downgrade".into(),
+                            detail: "synthetic refusal".into(), permanent: true,
+                        }).collect();
+                    response.accepted = 0;
+                    response.sessions_reconciled = 0;
+                }
+                Ok(response)
+            });
+            progress.save(&progress_path).unwrap();
+        }
+        // Lose acquisition memory without saving its new index or ACK. Keep
+        // the real renamed record, original index and durable upload progress.
+        drop(successor);
+        drop(warm);
+        let reloaded = SnapshotUploadProgress::load(&progress_path, &format!("{:064x}",99),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode)).unwrap();
+        assert_eq!(reloaded.accepted_fingerprints, accepted_fingerprints);
+        let reopened = disk.owner(SnapshotSource::ClaudeCode);
+        let mut actual = c.raw(&reopened, prior.clone(), 100, true, &[]);
+        let mut cold = c.raw(&E2ScanFixture::default(), prior, 100, true, &[]);
+        actual.enrich(&c); actual.finish();
+        cold.enrich(&c); cold.finish();
+        assert!(fulls + actual.modes.0 <= 1);
+        assert!(!actual.scan.snapshots.is_empty());
+        let (a, actual_wire, _) = upload(&actual.scan.snapshots, &mut e2_progress(), ack);
+        let (b, cold_wire, _) = upload(&cold.scan.snapshots, &mut e2_progress(), ack);
+        assert_eq!(a.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(b.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(actual_wire, cold_wire, "complete money and identity bodies survive cold reopen");
+    });
 }
