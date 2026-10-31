@@ -45,6 +45,10 @@ impl LiveKeys {
     )
 )]
 pub(crate) fn live_key_digests(index_path: &Path) -> Result<LiveKeys> {
+    // Like every public v2 entry point: no path-bearing error context escapes.
+    held(live_keys(index_path))
+}
+fn live_keys(index_path: &Path) -> Result<LiveKeys> {
     let Some(binding) =
         super::super::super::scan_index_integration::scan_index_storage_binding(index_path)
     else {
