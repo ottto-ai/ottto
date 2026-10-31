@@ -184,7 +184,7 @@ impl ScanIndex {
                 && entry
                     .modified_unix_nanos
                     .map_or(true, |n| n == candidate.modified_unix_nanos)
-                && !entry.source_file_fingerprint.is_empty()
+                && !entry.rearmed()
         }) && self
             .file_snapshot_fingerprints
             .get(&key)

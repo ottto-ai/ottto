@@ -564,7 +564,7 @@ impl ScanIndex {
                 let correction = record.proof_correction.as_ref()?;
                 let entry = self.files.get(key)?;
                 (correction.owed_member_ids.contains(&member)
-                    && !entry.source_file_fingerprint.is_empty()
+                    && !entry.rearmed()
                     && record.member_source_file_fingerprints.get(&member)
                         == Some(&entry.source_file_fingerprint)
                     && entry.last_snapshot_fingerprint.is_none()
@@ -626,7 +626,7 @@ impl ScanIndex {
             let known_current = record.member_source_file_fingerprints.get(&member)
                 == Some(&entry.source_file_fingerprint);
             if !known_current
-                || entry.source_file_fingerprint.is_empty()
+                || entry.rearmed()
                 || self
                     .file_snapshot_fingerprints
                     .get(key)

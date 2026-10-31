@@ -294,7 +294,7 @@ pub(super) fn select_recovery_before_audits(
             && requested.contains(&candidate.path)
             && files
                 .get(&local_index_key(&candidate.path))
-                .is_some_and(|entry| entry.source_file_fingerprint.is_empty());
+                .is_some_and(ScanIndexEntry::rearmed);
         if eligible {
             selected.push(candidate.clone());
         }
@@ -1188,7 +1188,7 @@ impl NativePhase {
             || index.terminal_jsonl_dispositions.contains_key(&key)
             || entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
             || entry.last_snapshot_fingerprint.is_none()
-            || entry.source_file_fingerprint.is_empty()
+            || entry.rearmed()
             || entry.source_file_fingerprint != candidate.source_file_fingerprint
             || index.active_upload_context_fingerprint.is_none()
             || index.upload_context_fingerprint != index.active_upload_context_fingerprint

@@ -646,6 +646,19 @@ impl ClaudeRequestCensusRecord {
                 .is_some_and(|fp| fp == self.source_file_fingerprint)
     }
 
+    /// Owed-evidence keep (`evidence_owed` ON only): this exact revision was
+    /// parsed in `window` under the current derivation, whatever its shape,
+    /// so a re-read reproduces it. Never proof, coverage or an ACK.
+    pub(super) fn reproduces(&self, entry_fingerprint: &str, window: u64) -> bool {
+        self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
+            && self.window == window
+            && !self.unverified
+            && !self.twin
+            && self.retired.is_none()
+            && decode_fingerprint(entry_fingerprint)
+                .is_some_and(|fingerprint| fingerprint == self.source_file_fingerprint)
+    }
+
     /// Freshness of a ledger holder: `current_for`, or a loss-free
     /// identity-incomplete record (it has message-only, id-less or displaced
     /// responses) whose message-only ids are known (`message_known`, the
@@ -3016,7 +3029,7 @@ pub(super) fn retain_held(index: &mut ScanIndex, candidate: &super::CandidateFil
             record.birth.is_some_and(|birth| {
                 candidate.physical_identity == Some([birth.device, birth.inode])
             }) && record.modified == Some(entry.modified_unix_seconds)
-                && (entry.source_file_fingerprint.is_empty()
+                && (entry.rearmed()
                     || decode_fingerprint(&entry.source_file_fingerprint)
                         == Some(record.source_file_fingerprint))
         }
@@ -3635,8 +3648,9 @@ impl ClaudeRequestCensusJoin {
         if let Some(record) =
             record.filter(|record| record.shape != ClaudeRequestCensusShape::OverBudget)
         {
-            if decode_fingerprint(&entry.source_file_fingerprint)
-                .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
+            if !entry.evidence_owed
+                && decode_fingerprint(&entry.source_file_fingerprint)
+                    .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
             {
                 return ClaudeRequestCensusCoverage::Fingerprint;
             }
@@ -3654,7 +3668,7 @@ impl ClaudeRequestCensusJoin {
             && !index.file_snapshot_fingerprints.contains_key(key)
         {
             ClaudeRequestCensusCoverage::Placeholder
-        } else if entry.source_file_fingerprint.is_empty() {
+        } else if entry.rearmed() {
             ClaudeRequestCensusCoverage::EmptyFingerprint
         } else if record.is_some() {
             ClaudeRequestCensusCoverage::FingerprintMismatch

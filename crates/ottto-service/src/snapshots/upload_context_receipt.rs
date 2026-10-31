@@ -95,7 +95,7 @@ crate::heap_layout_bound::fields!(MixedContextView; claude, bindings, held_files
 impl ScanIndex {
     fn mixed_context_binding(&self, key: &str) -> Option<String> {
         let entry = self.files.get(key)?;
-        if entry.source_file_fingerprint.is_empty() {
+        if entry.rearmed() {
             return None;
         }
         let mut h = Sha256::new();

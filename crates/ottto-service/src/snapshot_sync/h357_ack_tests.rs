@@ -795,6 +795,7 @@ fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntr
         opened_changed_nanos: 0,
         opened_birth_nanos: 0,
         upload_context_receipt: None,
+        evidence_owed: false,
     }
 }
 

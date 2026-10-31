@@ -173,6 +173,7 @@ fn claude_head_has_unacked_body(index: &ScanIndex, head: &BTreeSet<String>) -> b
 /// Reached only for members `claude_unacked_head_members` returned, which is
 /// empty outside containment.
 fn claude_reoffer_unacked_head(entry: &mut ScanIndexEntry) {
+    evidence_owed::reoffer_clears(entry);
     entry.last_upload_body_witness = None;
 }
 
@@ -483,7 +484,7 @@ fn terminal_off_empty_context_key(index: &ScanIndex, key: &str) -> Option<[u8; 3
         return None;
     }
     let entry = index.files.get(key)?;
-    if entry.source_file_fingerprint.is_empty() {
+    if entry.rearmed() {
         return None; // Genuine cleared/unknown debt can never reuse the memo.
     }
     let mut digest = Sha256::new();

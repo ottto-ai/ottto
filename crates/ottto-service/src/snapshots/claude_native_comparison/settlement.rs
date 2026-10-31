@@ -560,7 +560,7 @@ impl Completion {
                     && previous
                         .files
                         .get(&pending.index_key)
-                        .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+                        .is_some_and(ScanIndexEntry::rearmed)
             }) else {
                 continue;
             };
