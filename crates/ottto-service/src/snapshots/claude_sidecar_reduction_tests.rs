@@ -1309,11 +1309,11 @@ mod durable_restart {
                 let cold = enriched_e2(&f, raw_scan(&f, prior, None, |_| {}));
                 assert_layout_mode(
                     warm.modes,
-                    if append_native { (0, 1, 0) } else { (0, 0, 1) },
+                    if append_native { (0, 1, 0) } else { (1, 0, 0) },
                 );
                 assert_eq!(
                     restored(&restarted),
-                    u64::from(crate::heap_layout_bound::layout_supported())
+                    u64::from(append_native && crate::heap_layout_bound::layout_supported())
                 );
                 assert_eq!(exact_bodies(&warm), exact_bodies(&cold));
                 // These persist into the next replay and copy-proof pass.
@@ -1348,8 +1348,9 @@ mod durable_restart {
                     assert_eq!(fs::read(&f.path).unwrap(), native_before);
                     if crate::heap_layout_bound::layout_supported() {
                         assert_eq!(
-                            warm.native_bytes, 0,
-                            "quiet sidecar does not reacquire native records"
+                            warm.native_bytes,
+                            fs::metadata(&f.path).unwrap().len(),
+                            "explicit quiet sidecar selection uses one ordinary Full"
                         );
                     }
                 }
@@ -1373,11 +1374,8 @@ mod durable_restart {
             &f,
             raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
         );
-        assert_layout_mode(cached.modes, (0, 0, 1));
-        assert_eq!(
-            restored(&second),
-            u64::from(crate::heap_layout_bound::layout_supported())
-        );
+        assert_layout_mode(cached.modes, (1, 0, 0));
+        assert_eq!(restored(&second), 0);
         assert_oracle(&f, &cached, prior);
     }
 

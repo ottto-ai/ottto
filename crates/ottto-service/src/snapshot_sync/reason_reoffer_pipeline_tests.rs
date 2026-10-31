@@ -1500,6 +1500,15 @@ fn durable_store_is_written_only_under_the_state_dir_lock() {
             refused_then_conflicted_holding(name, locked);
         let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
         let records = pipeline.durable_records();
+        // Scoped cold restore waits while quiet; inert growth exercises Tail
+        // without changing the offered body or the cooldown deadline.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(pipeline.transcript())
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
         let due = deadline.as_u64().unwrap() + 60;
         let (day2, _, bytes) = pipeline.measured_cycle(due, true);
         assert!(day2.result.is_ok(), "{name}: {:?}", day2.result);
@@ -1712,6 +1721,15 @@ fn cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore() {
         if !warm {
             pipeline.drop_durable_stores();
         }
+        // Scoped cold restore waits while quiet; inert growth exercises Tail
+        // without changing the offered body or the cooldown deadline.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(pipeline.transcript())
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
         let due = deadline.as_u64().unwrap() + 60;
         let (day2, _, bytes) = pipeline.measured_cycle(due, true);
         if warm {

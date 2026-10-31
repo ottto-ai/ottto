@@ -41,7 +41,7 @@ impl ColdReplay {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         lines[0]["payload"]["source"] = serde_json::json!({
-            "subagent":{"thread_spawn":{"agent_path":"/agents/PRIVATE-LABEL-M3"}}
+            "subagent":{"thread_spawn":{"agent_path":"/root/private_label_m3"}}
         });
         let mut text: String = lines.iter().map(|line| line.to_string() + "\n").collect();
         if raw_value {
@@ -292,7 +292,7 @@ fn cold_store_each_fence_class_and_certificate_reason_retires_before_one_full() 
                 FullReason::HeadChanged | FullReason::BoundaryChanged => {
                     // Distinct sample windows are needed to reach boundary_changed.
                     let needle = if reason == FullReason::HeadChanged {
-                        b"PRIVATE-LABEL-M3".as_slice()
+                        b"private_label_m3".as_slice()
                     } else {
                         b"PRIVATE-TITLE-M3".as_slice()
                     };
@@ -546,8 +546,8 @@ fn native_replacement_finishes_retirement_before_eviction_and_growth() {
         let rig = ColdReplay::new(None, false, false);
         let original = std::fs::read(&rig.path).unwrap();
         let offset = original
-            .windows(b"PRIVATE-LABEL-M3".len())
-            .position(|s| s == b"PRIVATE-LABEL-M3")
+            .windows(b"private_label_m3".len())
+            .position(|s| s == b"private_label_m3")
             .unwrap();
         let mut file = File::options().write(true).open(&rig.path).unwrap();
         file.seek(SeekFrom::Start(offset as u64)).unwrap();

@@ -333,7 +333,7 @@ fn compare_claude(
             &restart,
             [prior.clone(), prior.clone(), prior],
             mode,
-            mode,
+            if mode.2 > 0 { (mode.2, 0, 0) } else { mode },
         ),
     )
 }
@@ -361,8 +361,19 @@ fn claude_pages(
     let disk = c.raw(restart, disk_prior, 100, true, &[]);
     assert_eq!(
         disk.modes, disk_mode,
-        "disk arm must exercise the named restored acquisition"
+        "disk arm must exercise the authorized cold acquisition"
     );
+    if disk_mode.0 > 0 && mode.2 > 0 {
+        let counts = disk
+            .cache
+            .durable_counters(SnapshotSource::ClaudeCode)
+            .unwrap()
+            .0;
+        assert_eq!(
+            counts.resource_full.get("rederive_quiet"),
+            Some(&(disk_mode.0 as u64))
+        );
+    }
     assert_eq!(
         durable_restores(&disk.cache, SnapshotSource::ClaudeCode).1,
         (disk_mode.1 + disk_mode.2) as u64,
@@ -609,7 +620,7 @@ fn claude_case(name: &str) {
                     &disk.owner(SnapshotSource::ClaudeCode),
                     [prior.clone(), prior.clone(), prior],
                     (0, 0, 1),
-                    (0, 0, 1),
+                    (1, 0, 0),
                 );
                 finish_phase(&mut failed, false);
                 let failed_wire = compare_claude_uploads(&failed);
@@ -631,7 +642,7 @@ fn claude_case(name: &str) {
                     &disk.owner(SnapshotSource::ClaudeCode),
                     [tail_failed.index, full_failed.index, disk_prior],
                     (0, 0, 1),
-                    (0, 0, 1),
+                    (1, 0, 0),
                 );
                 finish_phase(&mut healthy, true);
                 let healthy_wire = compare_claude_uploads(&healthy);

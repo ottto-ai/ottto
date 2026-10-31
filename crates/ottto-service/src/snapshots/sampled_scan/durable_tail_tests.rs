@@ -1935,6 +1935,15 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
                 .count()
         };
         assert_eq!(records(), 1, "a real usable record exists");
+        // Scoped restore requires real growth; quiet is a zero-input hold.
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            b"{}\n",
+        )
+        .unwrap();
         let positive = SharedCache::default();
         positive.durable_begin_pass(source, &index_path, &namespace, false);
         let restored = positive
@@ -2344,11 +2353,11 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         assert_eq!(disk.disk_records, 3, "{arm}: c's prior, a, b");
         assert_eq!(
             counts.not_persisted,
-            if t14 {
-                BTreeMap::from([("skill_label_purge_failed", 1)])
-            } else {
-                BTreeMap::new()
-            },
+            BTreeMap::from([
+                ("skill_label_scanned", 1),
+                ("skill_label_purged", 0),
+                ("skill_label_purge_failed", u64::from(t14)),
+            ]),
             "{arm}"
         );
         assert_eq!(disk.records_invalidated, 0, "{arm}");
@@ -4113,6 +4122,15 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 store::tests::pinned_v1_bytes(&disagreement, index.generation),
             )
             .unwrap();
+            // Decode the disagreeing counting contract on growth, not a quiet hold.
+            std::io::Write::write_all(
+                &mut std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+                b"{}\n",
+            )
+            .unwrap();
             let refused = SharedCache::default();
             refused.durable_begin_pass(source, &index_path, &namespace, false);
             assert!(refused
@@ -5068,6 +5086,15 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
             }],
         )
         .unwrap();
+    // Scoped restore requires real growth; quiet is a zero-input hold.
+    std::io::Write::write_all(
+        &mut std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap(),
+        b"{}\n",
+    )
+    .unwrap();
     let cache = SharedCache::default();
     cache.durable_begin_pass(source, &index_path, &namespace, capture);
     let restored = cache
@@ -13114,34 +13141,36 @@ fn retired_missing_native_rebuild_then_successor_tails_without_double_count() {
 /// [off=main] No-record growth follows the ordinary Full path with zero store I/O.
 #[test]
 fn off_no_record_growth_uses_ordinary_full_without_store_io() {
-    let _on = crate::snapshots::RestartRestoreForTest::enabled();
-    let f = O3Fixture::new();
-    std::fs::remove_dir_all(store::store_dir_for_index(&f.index_path)).unwrap();
-    let marker = store::store_dir_for_index(&f.index_path).with_extension("private-labels");
-    if marker.exists() {
-        std::fs::remove_file(marker).unwrap();
-    }
-    let _off = crate::snapshots::RestartRestoreForTest::disabled();
-    let owner = f.owner();
-    let mut prior = f.prior.clone();
-    store::test_hooks::set_before_access(Some(Box::new(|_, _| panic!("OFF store I/O"))));
-    let (_, quiet, modes) = f.scan(&owner, &mut prior);
-    assert!(quiet.snapshots.is_empty());
-    assert_eq!(modes.0 + modes.1, 0);
-    f.append("growth", 200);
-    let (_, grown, modes) = f.scan(&owner, &mut prior);
-    store::test_hooks::set_before_access(None);
-    assert_eq!(modes.0, 1);
-    assert_eq!(modes.1, 0);
-    assert_eq!(grown.snapshots[0].input_tokens, 300);
-    let (counts, store) = owner
-        .cache
-        .durable_counters(SnapshotSource::ClaudeCode)
-        .unwrap();
-    assert_eq!(counts.restore_attempts, 0);
-    assert_eq!(
-        store.guard_header_bytes + store.guard_verify_bytes + store.bytes_read,
-        0
-    );
-    assert_eq!(store.records_written, 0);
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        let _on = crate::snapshots::RestartRestoreForTest::enabled();
+        let f = O3Fixture::new();
+        std::fs::remove_dir_all(store::store_dir_for_index(&f.index_path)).unwrap();
+        let marker = store::store_dir_for_index(&f.index_path).with_extension("private-labels");
+        if marker.exists() {
+            std::fs::remove_file(marker).unwrap();
+        }
+        let _off = crate::snapshots::RestartRestoreForTest::disabled();
+        let owner = f.owner();
+        let mut prior = f.prior.clone();
+        store::test_hooks::set_before_access(Some(Box::new(|_, _| panic!("OFF store I/O"))));
+        let (_, quiet, modes) = f.scan(&owner, &mut prior);
+        assert!(quiet.snapshots.is_empty());
+        assert_eq!(modes.0 + modes.1, 0);
+        f.append("growth", 200);
+        let (_, grown, modes) = f.scan(&owner, &mut prior);
+        store::test_hooks::set_before_access(None);
+        assert_eq!(modes.0, 1);
+        assert_eq!(modes.1, 0);
+        assert_eq!(grown.snapshots[0].input_tokens, 300);
+        let (counts, store) = owner
+            .cache
+            .durable_counters(SnapshotSource::ClaudeCode)
+            .unwrap();
+        assert_eq!(counts.restore_attempts, 0);
+        assert_eq!(
+            store.guard_header_bytes + store.guard_verify_bytes + store.bytes_read,
+            0
+        );
+        assert_eq!(store.records_written, 0);
+    });
 }

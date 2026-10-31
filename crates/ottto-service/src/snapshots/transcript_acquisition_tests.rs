@@ -1899,8 +1899,8 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 // admission refuses it: exercise DT's budget-refused Miss.
                 *second.retained().unwrap() = TranscriptCache::with_byte_limit(0);
             }
-            let private_quiet = quiet && source == SnapshotSource::Codex;
-            if private_quiet {
+            let cold_quiet = quiet;
+            if cold_quiet {
                 loaded = fixture.resume_quiet_on_growth(source, loaded, &second, &namespace.0, NOW);
                 before = fs::metadata(&fixture.file.0).unwrap().len();
             }
@@ -1965,7 +1965,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             let counts = second.durable_counters(source).unwrap().0;
             assert_eq!(
                 counts.restore_attempts,
-                if private_quiet { 2 } else { 1 },
+                if cold_quiet { 2 } else { 1 },
                 "{source:?}/{arm}"
             );
             assert_eq!(counts.restored, u64::from(!full), "{source:?}/{arm}");
@@ -1987,7 +1987,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             // two windows before prepare. Neither totals nor ranges come
             // from the completed context metrics below.
             let window = before.min(crate::transcript_acquisition::SAMPLE_BYTES as u64) as usize;
-            let pairs = if private_quiet {
+            let pairs = if cold_quiet {
                 1 // replay was admitted on growth; this visit only validates quiet audit
             } else if !full {
                 2 // restore + prepare (Tail), or restore + quiet validation
@@ -2314,15 +2314,8 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             let third = Arc::new(sampled_scan::SharedCache::default());
             third.durable_begin_pass(source, &index_path, &namespace, true);
             let mut restart_index = ScanIndex::load(&index_path).unwrap();
-            if source == SnapshotSource::Codex {
-                restart_index = fixture.resume_quiet_on_growth(
-                    source,
-                    restart_index,
-                    &third,
-                    &namespace.0,
-                    NOW,
-                );
-            }
+            restart_index =
+                fixture.resume_quiet_on_growth(source, restart_index, &third, &namespace.0, NOW);
             let mut correction_index = restart_index.clone();
             let ((mut next, raw, result, modes, bytes), retirement_diagnostics) =
                 crate::local_resource_diagnostics::capture(|| {
