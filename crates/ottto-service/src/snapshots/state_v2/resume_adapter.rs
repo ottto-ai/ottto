@@ -92,11 +92,14 @@ impl Adapter {
         store: &mut tail::DurableTailStore,
         checkpoint: &ResumeCheckpoint,
     ) -> Result<Box<tail::DurableRecord>> {
-        let (record, _) = store
-            .read_immutable(&checkpoint.record_name, &checkpoint.key_digest)
-            .map_err(|_| anyhow::anyhow!("state_v2_resume_reference_unresolved"))?;
-        Self::verify(checkpoint, &record)?;
-        Ok(record)
+        let result = (|| {
+            let (record, _) = store
+                .read_immutable(&checkpoint.record_name, &checkpoint.key_digest)
+                .map_err(|_| anyhow::anyhow!("state_v2_resume_reference_unresolved"))?;
+            Self::verify(checkpoint, &record)?;
+            Ok(record)
+        })();
+        result.inspect_err(|_| super::telemetry::event("v2_resume_reference_unresolved", &1))
     }
 }
 impl ResumeHooks for Adapter {
