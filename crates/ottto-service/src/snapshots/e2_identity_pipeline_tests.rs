@@ -477,6 +477,9 @@ fn e2_carry_pages(
     acknowledge: bool,
     marker: bool,
 ) -> Vec<(SnapshotItem, serde_json::Value)> {
+    // These are ordinary session requests, not a newly copied August
+    // prefix. Keep the production copy-prefix seed refusal enabled.
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
     let (dir, root, _) = claude_account_family_fixture();
     let support = dir.join("support");
     if marker {
@@ -543,6 +546,7 @@ fn e2_carry_pages(
         .collect();
     fs::remove_dir_all(dir).unwrap();
     pages
+    })
 }
 
 /// Requests per (login, account_source) over the hourly rows and parts.

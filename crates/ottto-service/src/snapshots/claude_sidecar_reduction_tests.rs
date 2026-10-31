@@ -1361,8 +1361,12 @@ mod durable_restart {
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             let mut accepted = claude_request_identity::AcceptedBuckets::default();
             accepted.set_account_source_enabled(true);
-            let f = Fixture::new(1);
-            f.evidence(1);
+            // A leading native gap, then own A. After restart append a
+            // trailing gap: the two native gaps share a row but have
+            // backward/forward provenance, so multipart assertions are real.
+            let f = Fixture::new(2);
+            f.write_rows(false, &f.api[1..2]);
+            f.write_rows(true, &f.trace[1..2]);
             let state = State::new(&f);
             let first = Arc::new(SharedCache::default());
             state.begin(&first);
@@ -1375,9 +1379,9 @@ mod durable_restart {
             prior.save(&state.index_path).unwrap();
             first.durable_write_after_save(state.lock, SOURCE, &prior);
             drop(first);
-            // No telemetry row for the new request: a gap after req_1's own.
+            // No telemetry row for req_3: a gap after req_2's own A.
             let prefix_bytes = fs::metadata(&f.path).unwrap().len();
-            f.append_transcript(1);
+            f.append_transcript(2);
             let tail_bytes = fs::metadata(&f.path).unwrap().len() - prefix_bytes;
             let prior = ScanIndex::load(&state.index_path).unwrap();
             let restarted = Arc::new(SharedCache::default());
@@ -1420,7 +1424,10 @@ mod durable_restart {
                     .iter()
                     .filter_map(|entry| entry.account_source)
                     .collect::<Vec<_>>(),
-                [AccountSource::CarriedForward]
+                [
+                    AccountSource::CarriedForward,
+                    AccountSource::CarriedBackward
+                ]
             );
         });
     }
