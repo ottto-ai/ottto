@@ -11529,6 +11529,10 @@ fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
                 std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_275_201),
             ))
             .unwrap();
+        // Exercise the certificate path even when the optional current census
+        // is absent. Main's independent native shrink proof otherwise bypasses
+        // the durable record (and its certificate-refusal diagnostic).
+        index.claude_request_census.remove(&key);
         let (mut changed, body, modes) = run(cache.clone(), index, "2026-10-29T12:00:00Z");
         assert_eq!(body.snapshots.len(), 1, "{edit}: changed body acquired");
         assert_eq!(
