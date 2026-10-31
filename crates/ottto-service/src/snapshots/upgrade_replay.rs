@@ -76,7 +76,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for State {
 }
 impl State {
     pub(super) fn refused() -> Self {
-        if !restart_restore::enabled() { return Self::default(); }
+        if !restart_restore::enabled() {
+            return Self::default();
+        }
         Self(Some(Box::new(Ledger {
             closed: true,
             ..Ledger::default()

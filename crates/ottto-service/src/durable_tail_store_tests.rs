@@ -4731,7 +4731,11 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
         }
     }
     test_hooks::set_before_access(None);
-    assert_eq!(store.disabled(), None, "one unreadable record cannot disable erasure");
+    assert_eq!(
+        store.disabled(),
+        None,
+        "one unreadable record cannot disable erasure"
+    );
     assert_eq!(visited, 1028);
     assert_eq!(erased, 1);
     assert!(refused >= 1);
@@ -4753,7 +4757,9 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
     fs::remove_file(&denied_file).unwrap();
     let keep = BTreeSet::from([old.key]);
     for _ in 0..3 {
-        let report = store.purge_private_labels_kept(&lock, &keep, |_| true).unwrap();
+        let report = store
+            .purge_private_labels_kept(&lock, &keep, |_| true)
+            .unwrap();
         assert!(report.visited <= 512);
         assert_eq!(report.refused, 0);
         assert_eq!(report.erased, 0);

@@ -994,7 +994,10 @@ impl DurableTailStore {
         if read_only {
             // Privacy dispatch is not startup/restore: never repair metadata
             // or run the startup barrier merely to identify unrelated bytes.
-            if !self.read_only_directory().map_err(|_| Refusal::Undecodable)? {
+            if !self
+                .read_only_directory()
+                .map_err(|_| Refusal::Undecodable)?
+            {
                 return Ok(None);
             }
         } else if !self.usable(writer) {
@@ -1195,11 +1198,15 @@ impl DurableTailStore {
     fn inspect_file(&mut self, file: &File, read_only: bool) -> Result<fs::Metadata, Refusal> {
         #[cfg(test)]
         if test_hooks::before_access(&self.dir, "fstat").is_err() {
-            if !read_only { self.disable("record_metadata"); }
+            if !read_only {
+                self.disable("record_metadata");
+            }
             return Err(Refusal::Undecodable);
         }
         file.metadata().map_err(|_| {
-            if !read_only { self.disable("record_metadata"); }
+            if !read_only {
+                self.disable("record_metadata");
+            }
             Refusal::Undecodable
         })
     }
@@ -2532,7 +2539,9 @@ impl DurableTailStore {
             // Keep a bounded conservative positive inventory across pages.
             // A live key is not an erase failure and need not be body-read.
             for key in &remaining {
-                if self.private_purge_kept.len() < MAX_RECORDS || self.private_purge_kept.contains(key) {
+                if self.private_purge_kept.len() < MAX_RECORDS
+                    || self.private_purge_kept.contains(key)
+                {
                     self.private_purge_kept.insert(*key);
                 } else {
                     self.private_purge_dirty = true;
@@ -2626,7 +2635,11 @@ impl DurableTailStore {
                 self.sync_store()?;
             } else {
                 // A removed whole store is settled by its parent's barrier.
-                sync_dir(self.dir.parent().ok_or_else(|| io::Error::other("store parent"))?)?;
+                sync_dir(
+                    self.dir
+                        .parent()
+                        .ok_or_else(|| io::Error::other("store parent"))?,
+                )?;
             }
             self.off_v1_sync_due = false;
             self.startup_synced = true;

@@ -2559,7 +2559,8 @@ impl SharedCache {
             return;
         };
         let outcome = if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
-            slot.store.invalidate_outgrown_v1(writer, &digest, published_end)
+            slot.store
+                .invalidate_outgrown_v1(writer, &digest, published_end)
         } else if !slot.dir.try_exists().unwrap_or(true) && slot.store.record_missing(&digest) {
             Ok(true) // No record or outstanding unlink barrier remains.
         } else {
