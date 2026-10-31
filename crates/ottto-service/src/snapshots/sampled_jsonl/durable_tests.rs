@@ -4,6 +4,7 @@
 //! every platform.
 use super::*;
 use crate::durable_tail_codec::take_l_spans;
+use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::transcript_acquisition::{birth_unix_nanos, FullReason, ReadMode, Scope};
 use serde_json::json;
 use std::io::{Seek, SeekFrom, Write};
@@ -332,18 +333,7 @@ fn apply_for(source: SnapshotSource) -> fn(&Value, &mut SnapshotAccumulator) {
 }
 
 fn parser(path: &Path, source: SnapshotSource) -> OwnedJsonlParser {
-    OwnedJsonlParser::new(
-        File::open(path).unwrap(),
-        path,
-        source,
-        apply_for(source),
-        None,
-        None,
-        None,
-        false,
-        true,
-    )
-    .unwrap()
+    fixture::parser(source, path, File::open(path).unwrap(), apply_for(source))
 }
 
 /// A cold positioned Full read: the retained copy and its checkpoint.
@@ -353,13 +343,7 @@ fn full_read(path: &Path, source: SnapshotSource) -> (CachedJsonlReduction, Chec
         .prepare_acquisition(None, &scope(), None, NOW)
         .unwrap();
     assert!(matches!(mode, ReadMode::Full(_)));
-    while !parser.step().unwrap() {}
-    let reduction = parser.reduction_copy();
-    let checkpoint = match parser.certify_without_retention(&scope(), NOW).unwrap() {
-        SideCertificate::Certified { completed, .. } => completed.checkpoint,
-        _ => panic!("a clean fixture read is certified"),
-    };
-    (reduction, checkpoint)
+    fixture::finish_record(&mut parser, &scope(), NOW)
 }
 
 /// The finished upload items of a parser that read to completion. Claude

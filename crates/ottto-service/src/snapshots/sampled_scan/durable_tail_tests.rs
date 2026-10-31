@@ -1657,31 +1657,11 @@ pub(super) fn native_record_of(
         SnapshotSource::Codex => apply_codex_line,
         _ => apply_claude_code_line,
     };
-    let mut parser = OwnedJsonlParser::new(
-        File::open(path).unwrap(),
-        path,
-        source,
-        apply,
-        None,
-        None,
-        None,
-        false,
-        true,
-    )
-    .unwrap();
+    let mut parser = fixture::parser(source, path, File::open(path).unwrap(), apply);
     parser
         .prepare_acquisition(None, scope, None, 1_800_000_000)
         .unwrap();
-    while !parser.step().unwrap() {}
-    let reduction = parser.durable_test_reduction_copy();
-    let checkpoint = match parser
-        .certify_without_retention(scope, 1_800_000_000)
-        .unwrap()
-    {
-        sampled_jsonl::SideCertificate::Certified { completed, .. } => completed.checkpoint,
-        _ => panic!("a clean native fixture is certified"),
-    };
-    (reduction, checkpoint)
+    fixture::finish_record(&mut parser, scope, 1_800_000_000)
 }
 
 pub(super) fn native_fixture(path: &Path) {

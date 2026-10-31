@@ -1260,7 +1260,7 @@ pub(crate) mod native_cold {
         source: DurableSource,
         binding: store::Binding,
         certificate: crate::transcript_acquisition::DurableCertificate,
-        revision: u32,
+        revision: u64,
         generation: u64,
         body_len: usize,
     ) -> store::PreparedHeader {
@@ -1276,6 +1276,33 @@ pub(crate) mod native_cold {
             generation,
             body_len,
         }
+    }
+
+    pub(crate) fn parser(
+        source: SnapshotSource,
+        path: &Path,
+        file: std::fs::File,
+        apply: fn(&serde_json::Value, &mut SnapshotAccumulator),
+    ) -> OwnedJsonlParser {
+        OwnedJsonlParser::new(file, path, source, apply, None, None, None, false, true).unwrap()
+    }
+    pub(crate) fn finish_record(
+        parser: &mut OwnedJsonlParser,
+        scope: &Scope,
+        now: u64,
+    ) -> (
+        crate::snapshots::sampled_jsonl::CachedJsonlReduction,
+        crate::transcript_acquisition::Checkpoint,
+    ) {
+        while !parser.step().unwrap() {}
+        let reduction = parser.durable_test_reduction_copy();
+        let checkpoint = match parser.certify_without_retention(scope, now).unwrap() {
+            crate::snapshots::sampled_jsonl::SideCertificate::Certified { completed, .. } => {
+                completed.checkpoint
+            }
+            _ => panic!("a clean native fixture is certified"),
+        };
+        (reduction, checkpoint)
     }
 
     /// Real v3 streaming; no receipt is synthesized and flush stays explicit.
