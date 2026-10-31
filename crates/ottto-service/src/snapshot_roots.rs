@@ -102,36 +102,41 @@ pub(crate) fn watcher_roots(
     watcher_roots_with(home, read, prior)
 }
 
-/// An unreadable slot registry keeps the homes of the `prior` watcher's Codex
-/// roots (none at start); every source's roots are composed fresh.
+/// An unreadable slot registry keeps the `prior` watcher's Codex roots (the
+/// defaults at start); the other sources' roots are composed fresh.
 fn watcher_roots_with(
     home: &Path,
     read: Result<Vec<PathBuf>>,
     prior: &[(SnapshotSource, PathBuf)],
 ) -> Result<Vec<(SnapshotSource, PathBuf)>> {
-    let mut codex_homes = read.unwrap_or_else(|_| {
-        prior
-            .iter()
-            .filter(|(source, _)| *source == SnapshotSource::Codex)
-            .filter_map(|(_, root)| root.parent().map(Path::to_path_buf))
-            .collect()
-    });
-    codex_homes.sort();
-    codex_homes.dedup();
-    [
-        SnapshotSource::Codex,
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Pi,
-    ]
-    .into_iter()
-    .map(|source| {
-        Ok(scan_roots(source, home, &codex_homes)?
-            .into_iter()
-            .map(|root| (source, root))
-            .collect::<Vec<_>>())
-    })
-    .collect::<Result<Vec<_>>>()
-    .map(|roots| roots.into_iter().flatten().collect())
+    let codex = SnapshotSource::Codex;
+    let codex_roots = match read {
+        Ok(mut homes) => {
+            homes.sort();
+            scan_roots(codex, home, &homes)?
+        }
+        Err(_) => {
+            let kept = prior
+                .iter()
+                .filter(|(source, _)| *source == codex)
+                .map(|(_, root)| root.clone())
+                .collect::<Vec<_>>();
+            if kept.is_empty() {
+                scan_roots(codex, home, &[])?
+            } else {
+                kept
+            }
+        }
+    };
+    let mut roots = codex_roots
+        .into_iter()
+        .map(|root| (codex, root))
+        .collect::<Vec<_>>();
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+        let fresh = scan_roots(source, home, &[])?;
+        roots.extend(fresh.into_iter().map(|root| (source, root)));
+    }
+    Ok(roots)
 }
 
 pub(crate) fn validate_claude_roots(home: &Path, expected: &[PathBuf]) -> Result<()> {
