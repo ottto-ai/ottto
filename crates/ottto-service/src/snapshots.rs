@@ -26114,6 +26114,7 @@ struct OwnedActiveFile {
     recovered_audit_due: Option<u64>,
     candidate: CandidateFile,
     decision: CandidateDecision,
+    parse_reason: Option<CandidateParseReason>,
     previous_snapshot_fingerprint: Option<String>,
     previous_upload_body_witness: Option<String>,
     projection_adoption_required: bool,
@@ -29123,6 +29124,12 @@ impl OwnedSourceScan {
                             plan.mode(),
                             plan.metrics().native_bytes,
                         );
+                        resource_probe.full_parse_reason(
+                            plan.mode(),
+                            active.parse_reason,
+                            0,
+                            plan.metrics().native_bytes,
+                        );
                         #[cfg(unix)]
                         context.cache.durable_acquisition_completed(
                             &local_index_key(&active.candidate.path),
@@ -29562,6 +29569,7 @@ impl OwnedSourceScan {
                     recovered_audit_due,
                     candidate,
                     decision,
+                    parse_reason: _,
                     previous_snapshot_fingerprint,
                     previous_upload_body_witness,
                     projection_adoption_required,
@@ -32330,6 +32338,7 @@ impl OwnedSourceScan {
                         acquisition_admission: context.admission,
                         page_events: crate::local_resource_diagnostics::PageEvents {
                             full_cause: resource_probe.rearm_fulls(),
+                            full_by_parse_reason: resource_probe.full_by_parse_reason(),
                             full_reasons: crate::local_resource_diagnostics::FullReasons(
                                 context.full_reasons,
                             ),
@@ -33756,6 +33765,7 @@ impl OwnedSourceScan {
                 recovered_audit_due,
                 candidate,
                 decision,
+                parse_reason: parse_reason.filter(|_| source == SnapshotSource::ClaudeCode),
                 previous_snapshot_fingerprint,
                 previous_upload_body_witness,
                 projection_adoption_required,
@@ -33943,6 +33953,7 @@ impl OwnedSourceScan {
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
                 resource_probe.rearm_full_selected(&local_index_key(&active.candidate.path), mode);
+                resource_probe.full_parse_reason(mode, active.parse_reason, 1, 0);
             }
             if let Some(delivery) = line_delivery.as_mut() {
                 delivery.arm();
@@ -45640,7 +45651,7 @@ enum CandidateDecision {
 
 /// Count-only diagnostic: the first gate that selected a candidate for parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CandidateParseReason {
+pub(crate) enum CandidateParseReason {
     TerminalDisposition,
     NewFile,
     AuthorityQuarantine,
@@ -45658,8 +45669,8 @@ enum CandidateParseReason {
     ForcedFamily,
 }
 
-const CANDIDATE_PARSE_REASON_COUNT: usize = 15;
-const CANDIDATE_PARSE_REASON_NAMES: [&str; CANDIDATE_PARSE_REASON_COUNT] = [
+pub(crate) const CANDIDATE_PARSE_REASON_COUNT: usize = 15;
+pub(crate) const CANDIDATE_PARSE_REASON_NAMES: [&str; CANDIDATE_PARSE_REASON_COUNT] = [
     "terminal_disposition",
     "new_file",
     "authority_quarantine",
@@ -85185,7 +85196,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
-crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
+crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, parse_reason, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
@@ -85552,6 +85563,10 @@ impl crate::heap_layout_bound::HeapLayoutBound for fn(&Value, &mut SnapshotAccum
 }
 crate::heap_layout_bound::unit_enum!(true;
     CandidateDecision: Skip | Migrate | Parse | ReconcileLegacy;
+    CandidateParseReason: TerminalDisposition | NewFile | AuthorityQuarantine | Audit
+        | BodyWitnessAdoption | UploadContext | ActivityOrQuarantineRetry | TranscriptChanged
+        | CodexCapture | UnknownOutcome | LegacyActivity | LegacyIdentity | Rearmed
+        | SourceChanged | ForcedFamily;
     ClaudeCompactionKind: LegacySummary | CurrentBoundary;
     SnapshotQuarantineDisposition: RetryPending | UnprovenTerminal | SupersededTerminal;
     ClaudeUsageAuthorityQuarantineDisposition: RetryPending | UnprovenTerminal;
