@@ -41,6 +41,30 @@ pub(crate) fn retire_census(index: &mut ScanIndex, file_name: &str) {
     index.claude_request_census.insert(key, record);
 }
 
+/// Preserve the scan binding but simulate parse loss with only these observed ids.
+pub(crate) fn lossy_census(index: &mut ScanIndex, file_name: &str, ids: &[&str]) {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    let key = census_key(index, file_name);
+    let old = index.claude_request_census.take(&key).unwrap();
+    let mut hashes = ids
+        .iter()
+        .map(|id| claude_request_hash(id))
+        .collect::<Vec<_>>();
+    hashes.sort_unstable();
+    hashes.dedup();
+    let record = ClaudeRequestCensusRecord::synthetic_for_test(
+        &old.fingerprint_hex_for_test(),
+        old.window(),
+        ClaudeRequestCensusShape::Lossy,
+        hashes,
+    )
+    .with_modified_for_test(old.modified())
+    .with_birth_for_test(old.birth());
+    index.claude_request_census.insert(key, record);
+}
+
 /// An indexed file left without a census record.
 pub(crate) fn forget_census(index: &mut ScanIndex, file_name: &str) {
     let key = census_key(index, file_name);
@@ -64,6 +88,7 @@ pub(crate) fn legacy_excluded(index: &ScanIndex, member: &str) -> usize {
 pub(crate) struct Released {
     pub(crate) root_fallbacks: u64,
     pub(crate) disclosed: u64,
+    pub(crate) removed_requests: u64,
 }
 thread_local! {
     static RELEASED: std::cell::Cell<Option<Released>> = const { std::cell::Cell::new(None) };
@@ -125,6 +150,17 @@ pub(crate) fn capture_identity_counts<T>(run: impl FnOnce() -> T) -> (T, serde_j
     (result, counts)
 }
 pub(crate) fn before_release(items: &[SnapshotItem]) {
+    RELEASED.with(|counts| {
+        if let Some(mut page) = counts.get() {
+            // Observe final native bodies before the caller's history veto,
+            // including disclosing folds that keep inline marks at release.
+            page.removed_requests = items
+                .iter()
+                .map(|item| item.removed_request_count.unwrap_or(0))
+                .sum();
+            counts.set(Some(page));
+        }
+    });
     IDENTITY.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {

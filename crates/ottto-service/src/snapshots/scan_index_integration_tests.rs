@@ -850,3 +850,66 @@ fn integrated_no_store_true_first_install_still_initializes_without_transcript_r
     let observations = crate::local_resource_diagnostics::take_scan_index_storage_observations();
     assert_eq!(observations.iter().map(|(_, _, n)| n).sum::<u64>(), 0);
 }
+
+// Snapshot every file in this bounded synthetic index, including storage
+// controls and in-flight publication files, to detect accidental recovery.
+fn inspection_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            files.extend(inspection_files(&entry.path()));
+        } else {
+            files.insert(entry.path(), fs::read(entry.path()).unwrap());
+        }
+    }
+    files
+}
+
+#[test]
+fn estimate_index_reader_never_creates_or_repairs_prior_marker() {
+    let fixture = Fixture::new();
+    let prior = fixture
+        .root
+        .with_file_name("claude_code-scan-index-v3.json.storage-prior");
+    for marker in [None, Some(b"scan_index_".as_slice())] {
+        if let Some(marker) = marker {
+            fs::write(&prior, marker).unwrap();
+            fs::set_permissions(&prior, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let before = inspection_files(&fixture.scratch);
+        let index = scan_index_integration::read_scan_index_representation_read_only(
+            &fixture.root,
+            "estimate",
+            "claude_code",
+        )
+        .unwrap();
+        assert!(index.persistence_available());
+        assert_eq!(inspection_files(&fixture.scratch), before);
+        assert!(!fixture.root.with_extension("json.lock").exists());
+    }
+}
+
+#[test]
+fn estimate_index_reader_refuses_unpublished_init_without_removing_files() {
+    let fixture = Fixture::new();
+    fs::remove_file(&fixture.root).unwrap();
+    let temporary = fixture.root.with_file_name(format!(
+        "claude_code-scan-index-v3.json.storage-tmp-{}",
+        "b".repeat(32),
+    ));
+    fs::write(&temporary, b"in-flight publication").unwrap();
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = inspection_files(&fixture.scratch);
+    assert!(
+        scan_index_integration::read_scan_index_representation_read_only(
+            &fixture.root,
+            "estimate",
+            "claude_code",
+        )
+        .is_err()
+    );
+    assert_eq!(inspection_files(&fixture.scratch), before);
+    assert!(fixture.shards.is_dir());
+    assert!(!fixture.root.exists());
+}

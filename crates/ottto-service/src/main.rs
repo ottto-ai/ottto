@@ -44,6 +44,30 @@ enum Command {
         #[arg(long)]
         ready_fd: i32,
     },
+    /// Plan or queue a scoped Claude copy-prefix history re-read. Never enables collection.
+    ClaudeCopyPrefixReread {
+        /// Private JSON array of absolute affected main-file paths.
+        #[arg(long)]
+        scope: PathBuf,
+        /// Exact destination-scoped native Claude scan index (read-only).
+        #[arg(long)]
+        index: PathBuf,
+        #[arg(long)]
+        support_dir: PathBuf,
+        /// Current negotiated scan window, in days (from the ordinary daemon).
+        #[arg(long)]
+        window_days: u64,
+        #[arg(
+            long,
+            alias = "dry-run",
+            conflicts_with = "apply",
+            required_unless_present = "apply"
+        )]
+        estimate: bool,
+        /// Publish local intent for the ordinary daemon; operator authorization required.
+        #[arg(long)]
+        apply: bool,
+    },
     Status {
         #[arg(long)]
         json: bool,
@@ -189,6 +213,32 @@ fn main() -> Result<()> {
         std::process::exit(ottto_service::snapshot_sync::replay_harness::run(args));
     }
 
+    // Administrative planning exits before Keychain or daemon initialization.
+    if let Some(Command::ClaudeCopyPrefixReread {
+        ref scope,
+        ref index,
+        ref support_dir,
+        apply,
+        window_days,
+        ..
+    }) = cli.command
+    {
+        match ottto_service::snapshots::claude_copy_prefix_reread::run(
+            scope,
+            support_dir,
+            index,
+            apply,
+            window_days,
+        ) {
+            Ok(counts) => println!("{}", serde_json::to_string(&counts)?),
+            Err(_) => {
+                eprintln!("copy-prefix re-read request refused");
+                std::process::exit(2);
+            }
+        }
+        return Ok(());
+    }
+
     // This is a background service: it must never block on an interactive
     // keychain modal (e.g. "Keychain Not Found"). Disable Security UI for the
     // whole process up front so a transient keychain failure logs and retries
@@ -198,6 +248,9 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Status { json: true }) {
         #[cfg(feature = "replay-harness")]
         Command::ReplayHarness(_) => unreachable!("replay handled before service startup"),
+        Command::ClaudeCopyPrefixReread { .. } => {
+            unreachable!("administrative command handled before startup")
+        }
         Command::ContextCompositionWorker => {
             ottto_service::context_composition::run_context_composition_worker()?;
         }

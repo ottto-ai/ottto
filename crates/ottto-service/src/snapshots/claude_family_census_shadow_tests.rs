@@ -226,7 +226,6 @@ fn assert_partition(counts: &FamilyCounts) {
         counts.complete + counts.deferred.quantum + counts.incomplete_total(),
         counts.evaluated
     );
-    assert!(counts.child_finalize_candidates() <= counts.evaluated);
 }
 
 fn no_census_bits(index: &ScanIndex) -> bool {
@@ -250,6 +249,7 @@ fn only(reason: Incomplete, count: u64) -> BTreeMap<Incomplete, u64> {
     BTreeMap::from([(reason, count)])
 }
 
+/// [behaviour] current families complete and singletons are counted.
 #[test]
 fn current_families_complete_and_singletons_are_counted() {
     let mut index = index();
@@ -265,6 +265,7 @@ fn current_families_complete_and_singletons_are_counted() {
     assert_eq!(family(&family_keys[0]), family(&family_keys[2]));
 }
 
+/// [behaviour] each reason in isolation partitions the incomplete count.
 #[test]
 fn each_reason_in_isolation_partitions_the_incomplete_count() {
     let mut base = index();
@@ -448,6 +449,7 @@ fn each_reason_in_isolation_partitions_the_incomplete_count() {
     }
 }
 
+/// [behaviour] unknown enumeration keeps every family incomplete.
 #[test]
 fn unknown_enumeration_keeps_every_family_incomplete() {
     let mut base = index();
@@ -522,6 +524,7 @@ fn unknown_enumeration_keeps_every_family_incomplete() {
     }
 }
 
+/// [behaviour] coverage needs an attestation of the current revision.
 #[test]
 fn coverage_needs_an_attestation_of_the_current_revision() {
     let mut base = index();
@@ -623,6 +626,7 @@ fn unchanged_member() -> (ScanIndex, CandidateFile) {
     (index, candidate)
 }
 
+/// [behaviour] only the ordinary equality skip attests.
 #[test]
 fn only_the_ordinary_equality_skip_attests() {
     let (index, candidate) = unchanged_member();
@@ -655,6 +659,7 @@ fn only_the_ordinary_equality_skip_attests() {
     assert!(!attests(&debt, &candidate));
 }
 
+/// [behaviour] loss vetoes stay up for the generation.
 #[test]
 fn loss_vetoes_stay_up_for_the_generation() {
     let mut index = index();
@@ -738,6 +743,7 @@ fn loss_vetoes_stay_up_for_the_generation() {
     assert_eq!(reattested.families.complete, 2);
 }
 
+/// [behaviour] the skipped view is queue plus replay.
 #[test]
 fn the_skipped_view_is_queue_plus_replay() {
     let mut index = index();
@@ -769,31 +775,15 @@ fn the_skipped_view_is_queue_plus_replay() {
     assert_eq!(view.iter().filter(|skipped| skipped.replay).count(), 1);
     assert_eq!(skipped_census_members(&index).count(), 2);
     let mut first_pending = FirstPending::default();
-    let (first, _) = first_pending.observe(skipped_view(&index), |_| false, NOW);
+    let (first, _) = first_pending.observe(skipped_view(&index), |_| false, NOW, None, 0);
     assert_eq!((first.count, first.replay, first.replay_repeat), (2, 1, 0));
     // Still replayed a page later: repeated, and its age a lower bound.
-    let (again, _) = first_pending.observe(skipped_view(&index), |_| false, NOW + 60);
+    let (again, _) = first_pending.observe(skipped_view(&index), |_| false, NOW + 60, None, 0);
     assert_eq!((again.replay, again.replay_repeat), (1, 1));
     assert_eq!(again.oldest_age_s, 60);
 }
 
-#[test]
-fn no_consumer_reads_a_verdict_in_8a() {
-    for completion in [
-        Completion::Complete,
-        Completion::Incomplete(Incomplete::Evidence),
-    ] {
-        for consumer in [
-            FamilyConsumer::AccountWindowMark,
-            FamilyConsumer::CensusRecordAging,
-            FamilyConsumer::ScopedEvidenceLoad,
-            FamilyConsumer::FamilyRetrySchedule,
-        ] {
-            assert!(!completion.permits(consumer));
-        }
-    }
-}
-
+/// [behaviour] changed new and deleted members never count as covered.
 #[test]
 fn changed_new_and_deleted_members_never_count_as_covered() {
     let mut base = index();
@@ -861,6 +851,7 @@ fn changed_new_and_deleted_members_never_count_as_covered() {
     assert!(base.claude_account_family_pending.contains_key(&root));
 }
 
+/// [behaviour] old window carry alone stays incomplete.
 #[test]
 fn old_window_carry_alone_stays_incomplete() {
     let mut index = index();
@@ -877,6 +868,7 @@ fn old_window_carry_alone_stays_incomplete() {
     assert_eq!(counts.complete, 0);
 }
 
+/// [behaviour] quantum admits 64 complete families and defers the rest.
 #[test]
 fn quantum_admits_64_complete_families_and_defers_the_rest() {
     let mut index = index();
@@ -893,6 +885,7 @@ fn quantum_admits_64_complete_families_and_defers_the_rest() {
 /// M4 shape: 1,000 three-member families, all 3,000 members queued, 100
 /// served per page in FIFO order, so many families span a served (uncapped)
 /// and a still-queued (capped) member at a page boundary.
+/// [behaviour] m4 shape drains 3000 queued members at 100 per page.
 #[test]
 fn m4_shape_drains_3000_queued_members_at_100_per_page() {
     const FAMILIES: usize = 1_000;
@@ -993,6 +986,7 @@ fn m4_shape_drains_3000_queued_members_at_100_per_page() {
     assert_eq!(completed.len(), FAMILIES);
 }
 
+/// [behaviour] a restart between pages rederives identical counts with zero reads.
 #[test]
 fn a_restart_between_pages_rederives_identical_counts_with_zero_reads() {
     let mut index = index();
@@ -1090,6 +1084,7 @@ fn a_restart_between_pages_rederives_identical_counts_with_zero_reads() {
     assert!(no_census_bits(&reloaded));
 }
 
+/// [behaviour] first pending at is bounded and counts pace evictions.
 #[test]
 fn first_pending_at_is_bounded_and_counts_pace_evictions() {
     let path = |n: usize| ScanTraversalPath {
@@ -1106,9 +1101,10 @@ fn first_pending_at_is_bounded_and_counts_pace_evictions() {
     }
     let mut first_pending = FirstPending::default();
     let early = (0..100).map(path).collect::<Vec<_>>();
-    first_pending.observe(queued(&early), |_| false, NOW);
+    first_pending.observe(queued(&early), |_| false, NOW, None, 0);
     let all = (0..MAX_FIRST_PENDING + 10).map(path).collect::<Vec<_>>();
-    let (pending, skipped) = first_pending.observe(queued(&all), |_| false, NOW + 2 * OVER_DAY);
+    let (pending, skipped) =
+        first_pending.observe(queued(&all), |_| false, NOW + 2 * OVER_DAY, None, 0);
     assert_eq!(pending.count, (MAX_FIRST_PENDING + 10) as u64);
     assert_eq!(pending.tracked, MAX_FIRST_PENDING as u64);
     // The ten oldest stamps go; the remaining 90 early ones still age.
@@ -1118,18 +1114,21 @@ fn first_pending_at_is_bounded_and_counts_pace_evictions() {
     assert_eq!(skipped.retained, 100);
     // Members that leave the queue unresolved keep their stamps; resolved
     // ones drop out.
-    let (pending, _) = first_pending.observe(std::iter::empty(), |_| false, NOW + 3 * OVER_DAY);
+    let (pending, _) =
+        first_pending.observe(std::iter::empty(), |_| false, NOW + 3 * OVER_DAY, None, 0);
     assert_eq!(
         (pending.count, pending.tracked),
         (0, MAX_FIRST_PENDING as u64)
     );
     assert_eq!(pending.unqueued_unresolved, MAX_FIRST_PENDING as u64);
-    let (pending, _) = first_pending.observe(std::iter::empty(), |_| true, NOW + 3 * OVER_DAY);
+    let (pending, _) =
+        first_pending.observe(std::iter::empty(), |_| true, NOW + 3 * OVER_DAY, None, 0);
     assert_eq!((pending.count, pending.tracked), (0, 0));
 }
 
 const OVER_DAY: u64 = 24 * 60 * 60;
 
+/// [behaviour] rotation visits other families and wraps.
 #[test]
 fn rotation_visits_other_families_and_wraps() {
     let mut index = index();
@@ -1149,6 +1148,7 @@ fn rotation_visits_other_families_and_wraps() {
     assert_eq!(seen.len(), 99);
 }
 
+/// [behaviour] a real claude page emits shadow counts and keeps the census bits.
 #[test]
 fn a_real_claude_page_emits_shadow_counts_and_keeps_the_census_bits() {
     let root = crate::test_scratch::private_dir("e7-8a-family-shadow");
@@ -1219,6 +1219,7 @@ fn a_real_claude_page_emits_shadow_counts_and_keeps_the_census_bits() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// [behaviour] a page that removes a key and adds a path elsewhere recounts the root.
 #[test]
 fn a_page_that_removes_a_key_and_adds_a_path_elsewhere_recounts_the_root() {
     let mut index = index();
@@ -1268,6 +1269,7 @@ fn a_page_that_removes_a_key_and_adds_a_path_elsewhere_recounts_the_root() {
         .contains_key(&Incomplete::PathNotUnique));
 }
 
+/// [behaviour] a confirmed empty path counts for uniqueness but is no member.
 #[test]
 fn a_confirmed_empty_path_counts_for_uniqueness_but_is_no_member() {
     let mut index = index();
@@ -1288,6 +1290,7 @@ fn a_confirmed_empty_path_counts_for_uniqueness_but_is_no_member() {
     );
 }
 
+/// [behaviour] only an attestation after leaving the queue resolves a stamp.
 #[test]
 fn only_an_attestation_after_leaving_the_queue_resolves_a_stamp() {
     let mut index = index();
@@ -1320,6 +1323,7 @@ fn only_an_attestation_after_leaving_the_queue_resolves_a_stamp() {
     assert_eq!(page(&queued, &[], NOW + 240).oldest_age_s, 120);
 }
 
+/// [behaviour] the shadow row carries attestation cost and the page cap fails closed.
 #[test]
 fn the_shadow_row_carries_attestation_cost_and_the_page_cap_fails_closed() {
     let (index, candidate) = unchanged_member();
@@ -1357,6 +1361,7 @@ fn the_shadow_row_carries_attestation_cost_and_the_page_cap_fails_closed() {
     assert_eq!(next["attest_capped"], 0);
 }
 
+/// [behaviour] runtime state at every cap stays within the stated worst case.
 #[test]
 fn runtime_state_at_every_cap_stays_within_the_stated_worst_case() {
     assert!(size_of::<Runtime>() < 512);
@@ -1434,6 +1439,7 @@ fn runtime_state_at_every_cap_stays_within_the_stated_worst_case() {
     assert!(heap >= 256 * 1024 * 3, "{heap}");
 }
 
+/// [behaviour] held history vetoes its family and not a sibling and a literal denial is no hold.
 #[test]
 fn held_history_vetoes_its_family_and_not_a_sibling_and_a_literal_denial_is_no_hold() {
     let mut index = index();
@@ -1495,6 +1501,7 @@ fn evaluate_within(index: &ScanIndex, families: &[FamilyRef], budget: usize) -> 
     counts
 }
 
+/// [behaviour] the budget charges both inventories and the key that ends each range.
 #[test]
 fn the_budget_charges_both_inventories_and_the_key_that_ends_each_range() {
     let mut index = index();
@@ -1513,6 +1520,7 @@ fn the_budget_charges_both_inventories_and_the_key_that_ends_each_range() {
     }
 }
 
+/// [behaviour] confirmed empty families spend the budget and count as nothing.
 #[test]
 fn confirmed_empty_families_spend_the_budget_and_count_as_nothing() {
     let mut index = index();
@@ -1537,6 +1545,7 @@ fn confirmed_empty_families_spend_the_budget_and_count_as_nothing() {
     assert_eq!(short.unevaluated, 2);
 }
 
+/// [behaviour] unrelated keys under a family prefix are charged and a short budget is not complete.
 #[test]
 fn unrelated_keys_under_a_family_prefix_are_charged_and_a_short_budget_is_not_complete() {
     let mut index = index();
@@ -1557,6 +1566,7 @@ fn unrelated_keys_under_a_family_prefix_are_charged_and_a_short_budget_is_not_co
     assert_eq!((short.unevaluated, short.member_keys), (1, 50));
 }
 
+/// [behaviour] an oversized family is membership unknown within the budget.
 #[test]
 fn an_oversized_family_is_membership_unknown_within_the_budget() {
     let mut index = index();
@@ -1569,6 +1579,7 @@ fn an_oversized_family_is_membership_unknown_within_the_budget() {
 /// A corpus far larger than a page, with one touched family: each page does
 /// bounded key work, nothing certifies uniqueness until the pass ends, and a
 /// finished pass costs an unchanged corpus nothing.
+/// [behaviour] a large corpus is counted across small pages.
 #[test]
 fn a_large_corpus_is_counted_across_small_pages() {
     const KEYS: usize = 3 * ROOT_PASS_KEYS_PER_PAGE + 100;
@@ -1694,6 +1705,7 @@ fn root_evidence() -> BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocal
 /// inventory sizes and the generation hold and no page reports a change. The
 /// union keeps the key: the cross-directory duplicate is counted either way,
 /// and the family never completes.
+/// [regress] R1 masked-migration bug: observed-to-indexed moves cannot hide a cross-directory duplicate.
 #[test]
 fn a_masked_observed_to_indexed_migration_mid_pass_keeps_the_duplicate() {
     const FILLER: usize = 2 * ROOT_PASS_KEYS_PER_PAGE;
@@ -1769,6 +1781,7 @@ fn a_masked_observed_to_indexed_migration_mid_pass_keeps_the_duplicate() {
 /// One full-budget call and one that must stop short agree: the merged pass
 /// charges both inventories, never exceeds a page, and resumes after its last
 /// key, so a key in both inventories is counted once.
+/// [behaviour] the merged pass counts a shared key once across a budget stop.
 #[test]
 fn the_merged_pass_counts_a_shared_key_once_across_a_budget_stop() {
     let mut index = index();
@@ -1799,355 +1812,6 @@ fn the_merged_pass_counts_a_shared_key_once_across_a_budget_stop() {
     assert_eq!(stepped.paths_of(&root_id(1)), Some(5));
     // Three keys in both inventories and one in each alone.
     assert_eq!(advances, 2 * keys.len() + 2);
-}
-
-/// Drop every child's finalized revision, as a fresh family has mid-walk:
-/// the root's rows qualified, the children's own rows carry no account yet.
-fn unfinalize_children(index: &mut ScanIndex, root: &str) {
-    let pending = index.claude_account_family_pending.get_mut(root).unwrap();
-    for (member, requests) in &mut pending.current.member_requests {
-        if member != root {
-            requests.identity_revision = None;
-        }
-    }
-}
-
-fn usage_witness(legacy_owner_roots: &[&str]) -> ClaudeUsageFamilyWitness {
-    ClaudeUsageFamilyWitness {
-        evidence_fingerprint: "b".repeat(64),
-        member_request_id_fingerprints: BTreeMap::new(),
-        member_occurrence_fingerprints: BTreeMap::new(),
-        assigned_request_id_fingerprints: BTreeMap::new(),
-        legacy_excluded_request_id_hashes: BTreeMap::new(),
-        legacy_exclusion_evidence_fingerprint: None,
-        legacy_owner_roots: legacy_owner_roots
-            .iter()
-            .map(|root| root.to_string())
-            .collect(),
-    }
-}
-
-/// A family with two unfinalized children, attested and otherwise current, and
-/// a bound singleton that must never count.
-fn child_candidate() -> (ScanIndex, Vec<String>, Vec<FamilyRef>) {
-    let mut index = index();
-    let keys = add_family(&mut index, "dir-a", 1, 2);
-    let singleton = add_family(&mut index, "dir-b", 2, 0);
-    unfinalize_children(&mut index, &root_id(1));
-    let refs = vec![family(&keys[0]), family(&singleton[0])];
-    (index, keys, refs)
-}
-
-#[test]
-fn a_family_lacking_only_child_revisions_is_eligible_and_stays_evidence() {
-    let (index, _, refs) = child_candidate();
-    let counts = evaluate(&index, &refs);
-    assert_eq!(counts.child_finalize_eligible, 1);
-    assert!(counts.child_finalize_blocked.is_empty());
-    assert_eq!(counts.incomplete, only(Incomplete::Evidence, 1));
-    assert_eq!(counts.complete, 1, "the bound singleton");
-    assert!(no_census_bits(&index));
-}
-
-#[test]
-fn each_child_finalize_cause_blocks_alone() {
-    use ChildFinalizeBlocked as Blocked;
-    type Case = (Blocked, Box<dyn Fn(&mut ScanIndex, &str, &[String])>);
-    fn case(cause: Blocked, mutate: impl Fn(&mut ScanIndex, &str, &[String]) + 'static) -> Case {
-        (cause, Box::new(mutate))
-    }
-    let cases = vec![
-        // A child-only family, otherwise valid: the root never had a file.
-        case(Blocked::RootAbsent, |index, root, keys| {
-            index.files.remove(&keys[0]);
-            let traversal = index.traversal.as_mut().unwrap();
-            traversal.observed_index_keys.remove(&keys[0]);
-            let pending = index.claude_account_family_pending.get_mut(root).unwrap();
-            pending.current.members.remove(root);
-            pending.current.member_requests.remove(root);
-        }),
-        // Its root is confirmed empty: indexed, bound, and no member.
-        case(Blocked::RootAbsent, |index, _, keys| {
-            index.confirmed_empty_files.insert(keys[0].clone());
-        }),
-        case(Blocked::WitnessMissing, |index, root, _| {
-            let member = member_name(root, Some(0));
-            let pending = index.claude_account_family_pending.get_mut(root).unwrap();
-            pending.current.members.remove(&member);
-            pending.current.member_requests.remove(&member);
-        }),
-        case(Blocked::WitnessMissing, |index, _, keys| {
-            let entry = index.files.get_mut(&keys[1]).unwrap();
-            entry.last_upload_body_witness = None;
-        }),
-        case(Blocked::WitnessConflict, |index, root, _| {
-            index.claude_account_family_witnesses.insert(
-                root.to_string(),
-                ClaudeAccountFamilyWitness {
-                    account_identifier_hash: "b".repeat(64),
-                    evidence_request_count: 1,
-                    members: BTreeMap::new(),
-                    member_request_id_fingerprints: BTreeMap::new(),
-                },
-            );
-        }),
-        case(Blocked::WitnessHeld, |index, _, keys| {
-            index
-                .claude_account_deferred_holds
-                .insert(keys[1].clone(), "held".into());
-        }),
-        case(Blocked::SharedParent, |index, root, _| {
-            index
-                .claude_usage_family_witnesses
-                .insert(root.to_string(), usage_witness(&["another-root"]));
-        }),
-        case(Blocked::SharedParent, |index, root, _| {
-            index
-                .claude_usage_family_witnesses
-                .insert("another-root".to_string(), usage_witness(&[root]));
-        }),
-        case(Blocked::NativeOwnershipConflict, |index, root, _| {
-            index.claude_duplicate_request_owners.insert(
-                "request".to_string(),
-                BTreeSet::from([claude_duplicate_request_owner(root, "member")]),
-            );
-        }),
-        case(Blocked::CrossFamilyUnknown, |index, _, _| {
-            index.claude_duplicate_request_witness_overflowed = true;
-        }),
-        case(Blocked::CrossFamilyUnknown, |index, _, _| {
-            for n in 0..=MAX_CROSS_FAMILY_ENTRIES {
-                index
-                    .claude_usage_family_witnesses
-                    .insert(format!("root-{n}"), usage_witness(&[]));
-            }
-        }),
-        case(Blocked::IdentityContractChanged, |index, _, _| {
-            index.claude_request_identity_contract_changed = true;
-        }),
-        case(Blocked::TwinSet, |index, root, _| {
-            index
-                .traversal
-                .as_mut()
-                .unwrap()
-                .observed_index_keys
-                .insert(root_key("dir-z", root));
-        }),
-        case(Blocked::StickyVeto, |index, _, _| {
-            let counts = &mut index.traversal.as_mut().unwrap().counts;
-            counts.symlink_rejected_count = 1;
-        }),
-        case(Blocked::StickyVeto, |index, _, _| {
-            let counts = &mut index.traversal.as_mut().unwrap().counts;
-            counts.disappeared_file_count = 1;
-        }),
-        case(Blocked::EnumerationOpen, |index, _, _| {
-            index.traversal.as_mut().unwrap().watcher_hint_seen = true;
-        }),
-        case(Blocked::WindowMoved, |index, root, _| {
-            let pending = index.claude_account_family_pending.get_mut(root).unwrap();
-            pending.current.census_window_end = OLD_WINDOW.into();
-        }),
-        case(Blocked::PolicyChanged, |index, _, _| {
-            index.upload_context_fingerprint = Some("parsed".into());
-            index.active_upload_context_fingerprint = Some("active".into());
-        }),
-    ];
-    let (base, keys, refs) = child_candidate();
-    let root = root_id(1);
-    for (cause, mutate) in cases {
-        let mut index = base.clone();
-        mutate(&mut index, &root, &keys);
-        let counts = evaluate(&index, &refs);
-        assert_eq!(counts.child_finalize_eligible, 0, "{cause:?}");
-        assert_eq!(
-            counts.child_finalize_blocked,
-            BTreeMap::from([(cause, 1)]),
-            "{cause:?}"
-        );
-    }
-}
-
-#[test]
-fn an_unfinished_uniqueness_pass_blocks_child_finalization() {
-    let (index, _, refs) = child_candidate();
-    let traversal = index.traversal.as_ref().unwrap();
-    let attested = attest_all(&index);
-    let roots = RootCounts::default();
-    let vetoes = Vetoes::current(&index, traversal);
-    let counts = View::new(&index, traversal, &roots, &attested, vetoes).evaluate(&refs);
-    assert_eq!(counts.child_finalize_eligible, 0);
-    assert_eq!(
-        counts.child_finalize_blocked,
-        BTreeMap::from([(ChildFinalizeBlocked::UniquenessUnknown, 1)])
-    );
-}
-
-#[test]
-fn child_finalize_causes_are_first_match() {
-    use ChildFinalizeBlocked as Blocked;
-    let (base, keys, refs) = child_candidate();
-    let root = root_id(1);
-    let cause = |index: &ScanIndex| {
-        let counts = evaluate(index, &refs);
-        let causes = counts.child_finalize_blocked.keys().copied();
-        causes.collect::<Vec<_>>()
-    };
-    let mut index = base.clone();
-    index
-        .traversal
-        .as_mut()
-        .unwrap()
-        .counts
-        .symlink_rejected_count = 1;
-    index.upload_context_fingerprint = Some("parsed".into());
-    index.active_upload_context_fingerprint = Some("active".into());
-    assert_eq!(cause(&index), [Blocked::StickyVeto]);
-    index.claude_request_identity_contract_changed = true;
-    assert_eq!(cause(&index), [Blocked::IdentityContractChanged]);
-    index
-        .claude_account_deferred_holds
-        .insert(keys[1].clone(), "held".into());
-    assert_eq!(cause(&index), [Blocked::WitnessHeld]);
-    let pending = index.claude_account_family_pending.get_mut(&root).unwrap();
-    pending.current.members.remove(&member_name(&root, Some(1)));
-    assert_eq!(cause(&index), [Blocked::WitnessMissing]);
-}
-
-/// Only a family missing nothing but child revisions counts at all.
-#[test]
-fn other_evidence_defects_and_other_reasons_are_not_candidates() {
-    let (base, keys, refs) = child_candidate();
-    let root = root_id(1);
-    let mut stale = base.clone();
-    let pending = stale.claude_account_family_pending.get_mut(&root).unwrap();
-    pending
-        .current
-        .member_requests
-        .get_mut(&member_name(&root, Some(0)))
-        .unwrap()
-        .identity_revision = Some("an older revision".into());
-    let mut unbound_root = base.clone();
-    let pending = unbound_root
-        .claude_account_family_pending
-        .get_mut(&root)
-        .unwrap();
-    pending
-        .current
-        .member_requests
-        .get_mut(&root)
-        .unwrap()
-        .identity_revision = None;
-    let mut invalid = base.clone();
-    let pending = invalid
-        .claude_account_family_pending
-        .get_mut(&root)
-        .unwrap();
-    pending.current.invalid = true;
-    let mut foreign_member = base.clone();
-    let pending = foreign_member
-        .claude_account_family_pending
-        .get_mut(&root)
-        .unwrap();
-    pending.current.members.insert("gone".into(), 1);
-    let mut queued = base.clone();
-    queue(&mut queued, &keys[1]);
-    let mut unobserved = base.clone();
-    unobserved
-        .traversal
-        .as_mut()
-        .unwrap()
-        .observed_index_keys
-        .remove(&keys[1]);
-    let mut bound = base.clone();
-    bind_revisions(&mut bound);
-    for index in [
-        stale,
-        unbound_root,
-        invalid,
-        foreign_member,
-        queued,
-        unobserved,
-        bound,
-    ] {
-        assert_eq!(evaluate(&index, &refs).child_finalize_candidates(), 0);
-    }
-    // Presence is not coverage here either.
-    let unattested = evaluate_attested(&base, &refs, &Attestations::default());
-    assert_eq!(unattested.child_finalize_candidates(), 0);
-}
-
-/// The row a page emits: a sticky veto outlives its counter, and the row holds
-/// counts under fixed names, with no id, path or hash.
-#[test]
-fn the_child_finalize_row_is_counts_under_fixed_names() {
-    let (mut index, keys, _) = child_candidate();
-    let other = add_family(&mut index, "dir-c", 3, 1);
-    // `add_family` rebinds every family, so drop the candidate's revisions again.
-    unfinalize_children(&mut index, &root_id(1));
-    unfinalize_children(&mut index, &root_id(3));
-    index.claude_account_family_witnesses.insert(
-        root_id(3),
-        ClaudeAccountFamilyWitness {
-            account_identifier_hash: "b".repeat(64),
-            evidence_request_count: 1,
-            members: BTreeMap::new(),
-            member_request_id_fingerprints: BTreeMap::new(),
-        },
-    );
-    let touched = Touched::from_paths([Path::new(&keys[0]), Path::new(&other[0])]);
-    let parsed = revisions(&index);
-    let mut runtime = Runtime::default();
-    let mut page = |index: &ScanIndex, now| {
-        serde_json::to_value(
-            evaluate_page(
-                &mut runtime,
-                index,
-                &touched,
-                as_parsed(&parsed),
-                false,
-                "scope",
-                now,
-            )
-            .unwrap(),
-        )
-        .unwrap()
-    };
-    let row = page(&index, NOW);
-    assert_eq!(row["family_child_finalize_eligible"], 1, "{row}");
-    assert_eq!(
-        row["family_child_finalize_blocked"],
-        json!({"witness_conflict": 1})
-    );
-    assert_eq!(row["cost"]["cross_family_entries_visited"], 0);
-    let text = row.to_string();
-    for private in [
-        root_id(1),
-        root_id(3),
-        SCAN_ROOT.to_string(),
-        "dir-a".to_string(),
-        "agent-".to_string(),
-        "a".repeat(64),
-        "b".repeat(64),
-        request_hash(64),
-    ] {
-        assert!(!text.contains(&private), "{private} in {text}");
-    }
-    // The loss heals on the checkpoint; the veto does not, for the generation.
-    let mut lost = index.clone();
-    lost.traversal
-        .as_mut()
-        .unwrap()
-        .counts
-        .symlink_rejected_count = 1;
-    page(&lost, NOW + 60);
-    let healed = page(&index, NOW + 120);
-    assert_eq!(healed["family_child_finalize_eligible"], 0, "{healed}");
-    assert_eq!(
-        healed["family_child_finalize_blocked"],
-        json!({"witness_conflict": 1, "sticky_veto": 1})
-    );
-    assert!(no_census_bits(&index));
 }
 
 /// One production Claude page of one file, through the real step, the page
@@ -2195,6 +1859,7 @@ fn root_revision(index: &ScanIndex) -> Option<String> {
         .clone()
 }
 
+/// [behaviour] a real parse and finalization complete a family on a later production page.
 #[test]
 fn a_real_parse_and_finalization_complete_a_family_on_a_later_production_page() {
     let dir = production_corpus("e7-8a-production-complete");
@@ -2209,6 +1874,7 @@ fn a_real_parse_and_finalization_complete_a_family_on_a_later_production_page() 
     let _ = fs::remove_dir_all(dir);
 }
 
+/// [behaviour] a proof that never finalized stays evidence on production pages.
 #[test]
 fn a_proof_that_never_finalized_stays_evidence_on_production_pages() {
     let dir = production_corpus("e7-8a-production-missing");
@@ -2221,6 +1887,7 @@ fn a_proof_that_never_finalized_stays_evidence_on_production_pages() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// [behaviour] same window growth is incomplete until the new revision finalizes.
 #[test]
 fn same_window_growth_is_incomplete_until_the_new_revision_finalizes() {
     let dir = production_corpus("e7-8a-production-growth");

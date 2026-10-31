@@ -18,8 +18,18 @@ pub(crate) struct E2ScanFixture {
     pub(crate) cache: Arc<sampled_scan::SharedCache>,
     observed: Mutex<Vec<PathBuf>>,
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
+    capture_claude_identity: bool,
 }
 impl E2ScanFixture {
+    /// Opt in when the fixture asserts marker/identity behavior. Money-only
+    /// fixtures retain their historical capture-off scope and bytes.
+    pub(crate) fn capturing_identity() -> Self {
+        Self {
+            capture_claude_identity: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
         self.observed.lock().unwrap().clone()
     }
@@ -34,6 +44,11 @@ impl E2ScanFixture {
         index_path: &Path,
     ) {
         let (scope, capture) = durable_binding(source);
+        let capture = if source == SnapshotSource::ClaudeCode {
+            self.capture_claude_identity
+        } else {
+            capture
+        };
         begin_durable_pass(
             &self.cache,
             state_dir,
@@ -67,6 +82,9 @@ impl E2ScanFixture {
         births: &BTreeMap<PathBuf, i128>,
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return self.terminal_off_on_scan(roots, support, index, limit, sampled, births, hints);
+        }
         self.observed.lock().unwrap().clear();
         let mut scan = OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::ClaudeCode,
@@ -79,6 +97,54 @@ impl E2ScanFixture {
             Some(support),
             hints,
             false,
+            true,
+            self.capture_claude_identity,
+        );
+        if sampled {
+            let (scope, _) = durable_binding(SnapshotSource::ClaudeCode);
+            scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
+        }
+        // The same synthetic root births reach the page's staged twin probes,
+        // which read metadata before the file is opened for parse.
+        let staged = births
+            .iter()
+            .filter(|(path, _)| {
+                claude_index_path_member_ref(path)
+                    .is_some_and(|member| member.subagent_stem.is_none())
+            })
+            .filter_map(|(path, birth)| Some((local_index_key(path), u64::try_from(*birth).ok()?)))
+            .collect();
+        claude_history_upgrade::with_staged_births_for_test(staged, || self.drive(scan, births))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn terminal_off_on_scan(
+        &self,
+        roots: &[PathBuf],
+        support: &Path,
+        index: ScanIndex,
+        limit: usize,
+        sampled: bool,
+        births: &BTreeMap<PathBuf, i128>,
+        hints: &[PathBuf],
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        self.observed.lock().unwrap().clear();
+        let relist = hints.is_empty() && index.scan_traversal_exhausted_for_test();
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            roots,
+            index,
+            "2026-08-02T08:00:00Z",
+            183,
+            limit,
+            false,
+            Some(support),
+            hints,
+            // These fixtures explicitly request re-lists at a frozen clock.
+            // Model the production metadata-rediscovery event; a retained
+            // traversal cannot infer a new walk from an identical timestamp.
+            // This changes discovery only, never terminal/proof authority.
+            relist,
             true,
             CLAUDE_IDENTITY_CAPTURE,
         );
@@ -201,4 +267,21 @@ pub(crate) fn indexed_size(index: &ScanIndex, path: &Path) -> Option<u64> {
         .files
         .get(&local_index_key(path))
         .map(|entry| entry.size_bytes)
+}
+
+/// Establish the completed legacy census precondition after the synthetic
+/// uploader has ACKed every current entity. Partial subsets intentionally
+/// retain the previous context; this creates no per-file receipt or ACK.
+pub(crate) fn adopt_acked_census_for_test(index: &mut ScanIndex, context: &str) {
+    let delivered = index.current_snapshot_fingerprints();
+    assert!(!delivered.is_empty());
+    assert!(delivered
+        .iter()
+        .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
+    index.upload_context_fingerprint = Some(context.into());
+}
+
+/// Read the actual runtime context for the exact-ACK fixture bridge.
+pub(crate) fn active_upload_context(index: &ScanIndex) -> Option<&str> {
+    index.active_upload_context_fingerprint.as_deref()
 }

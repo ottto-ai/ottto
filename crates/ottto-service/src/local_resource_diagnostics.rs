@@ -238,7 +238,7 @@ pub(crate) enum UnselectedReason {
     WithheldOversized,
 }
 /// Three reasons, seven withheld events, growth, deleted tokens and audit retirement.
-const UNSELECTED_REASONS: usize = 16;
+const UNSELECTED_REASONS: usize = 18;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -248,7 +248,7 @@ thread_local! {
     static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
         const { [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS] };
 }
-fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
+fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
     let sources = ["claude_code", "codex", "pi"];
     let Some(slot) = sources.iter().position(|s| *s == source) else {
         return 0;
@@ -264,7 +264,14 @@ fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u6
 }
 /// One skip decision, recorded after the gate decided; never a gate input.
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
-    line_unselected(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+    source_count(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+}
+/// One failed parking decision; no logging, resource probes or scan ownership.
+pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bool) {
+    source_count(source, 16 + usize::from(layout_supported), |slot| {
+        slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+            .unwrap_or_else(|n| n)
+    });
 }
 
 /// E3: Claude withheld-account hold events, in the slots after the reasons.
@@ -640,6 +647,8 @@ impl Probe {
             withheld_memo: Option<crate::snapshots::withheld_account::Census>,
             #[serde(flatten)]
             withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            source_rotation_serial_fallback: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -666,6 +675,10 @@ impl Probe {
             withheld_held: claude
                 .then(crate::snapshots::withheld_account::held_gauge)
                 .flatten(),
+            source_rotation_serial_fallback: drain(
+                source,
+                &[("unsupported_layout", 16), ("bound_refused", 17)],
+            ),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {

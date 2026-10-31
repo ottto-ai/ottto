@@ -2707,3 +2707,155 @@ fn empty_map_restore_never_removes_owed_member() {
     );
     apc_save_reload(&mut index, &scratch.join("index.json"));
 }
+
+/// R2 page, CONTROLLED: the committed grant owes the root (with the agent too,
+/// unless `last_owed`), and the root's body is accepted. This page sees the
+/// root at `revision` with the same entity and body set, as a family sidecar
+/// touch leaves it, and its captured current-proof body no-op-drains on the
+/// working index before save selection, as `finish_sync_source` orders it.
+fn apc_r2_page(last_owed: bool, revision: &str) -> (ScanIndex, ScanIndex, ClaudeProofBodyDrains) {
+    let [root, agent] = apc_members();
+    let [root_key, _] = apc_keys();
+    let fingerprint = apc_hex('c');
+    let body = apc_hex('7');
+    let mut committed = apc_granted();
+    committed
+        .files
+        .get_mut(&root_key)
+        .unwrap()
+        .last_upload_body_witness = Some(snapshot_file_upload_body_set_hex([body.as_str()]));
+    if last_owed {
+        apc_settled(&mut committed, &agent);
+    }
+    let mut working = committed.clone();
+    working
+        .files
+        .get_mut(&root_key)
+        .unwrap()
+        .source_file_fingerprint = revision.to_string();
+    let candidate = ClaudeProofCorrectionCandidate {
+        index_key: root_key.clone(),
+        root: APC_ROOT.to_string(),
+        member: root.clone(),
+        proof: apc_record(&committed).proven_witness_fingerprint.clone(),
+        revision: revision.to_string(),
+        fingerprint,
+        body_witness: body,
+    };
+    let drains = working.settle_claude_proof_corrections(
+        &committed,
+        std::slice::from_ref(&candidate),
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+    );
+    assert!(
+        !apc_owed(&working).is_some_and(|owed| owed.contains(&root)),
+        "the no-op drains in memory, with no upload"
+    );
+    if last_owed {
+        assert!(
+            !working
+                .claude_usage_authority_quarantine
+                .contains_key(APC_ROOT),
+            "the last owed member's drain clears the record"
+        );
+        assert!(!working.claude_usage_family_pending.contains_key(APC_ROOT));
+    } else {
+        assert_eq!(apc_map(&working)[&root], revision);
+    }
+    (committed, working, drains)
+}
+
+/// R2 (main, production default): a no-op drain at a revision the partial
+/// save does not select is reverted. The shed page restores the committed
+/// entry, so the member stays owed with its pre-drain pair: the saved record
+/// names the saved file's revision. Proof, counter, deadline, pending proof
+/// and every accepted body are unchanged, and the restarted index parses the
+/// member again for its correction.
+#[test]
+fn r2_a_no_op_drain_whose_revision_the_partial_save_does_not_select_stays_owed() {
+    let [root, _] = apc_members();
+    let [root_key, _] = apc_keys();
+    let moved = apc_hex('5');
+    let scratch = crate::test_scratch::ScratchDir::new("proof-correction-r2-revert");
+    for last_owed in [false, true] {
+        let label = format!("last owed {last_owed}");
+        let (committed, working, drains) = apc_r2_page(last_owed, &moved);
+        let committed_revision = committed.files[&root_key].source_file_fingerprint.clone();
+        assert_ne!(committed_revision, moved, "{label}: the revision moved");
+        let mut subset = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+        assert_eq!(
+            subset.files[&root_key].source_file_fingerprint, committed_revision,
+            "{label}: nothing settled, so the save keeps the committed entry"
+        );
+        assert!(
+            subset.restore_unselected_claude_proof_body_drains(drains),
+            "{label}: the member owes again"
+        );
+        assert!(apc_owed(&subset).unwrap().contains(&root), "{label}");
+        assert_eq!(
+            apc_record(&subset),
+            apc_record(&committed),
+            "{label}: the pre-drain record: pair, owed set, proof, counter, deadline"
+        );
+        assert_eq!(
+            apc_map(&subset)[&root],
+            subset.files[&root_key].source_file_fingerprint,
+            "{label}: the saved record names the saved file's revision"
+        );
+        assert_eq!(
+            subset.claude_usage_family_pending.get(APC_ROOT),
+            committed.claude_usage_family_pending.get(APC_ROOT),
+            "{label}: the pending proof stays with its record"
+        );
+        assert_eq!(apc_debts(&subset), apc_debts(&committed), "{label}");
+        let drops = claude_authority_drops_for_test();
+        let loaded = apc_save_reload(&mut subset, &scratch.join(format!("shed-{last_owed}.json")));
+        assert_eq!(
+            claude_authority_drops_for_test(),
+            drops,
+            "{label}: the re-bound record is valid and bound; nothing is dropped"
+        );
+        assert_eq!(
+            apc_decision(&loaded, &apc_candidate(&loaded, 0)),
+            PARSE_FOR_AUTHORITY,
+            "{label}: the owed member is parsed again after restart"
+        );
+    }
+}
+
+/// R2 controls. A drain whose revision the save does select is kept exactly
+/// as before: with an unmoved revision the committed entry is that revision,
+/// and with a moved one a save that carries the working entry (a page with
+/// no holds) carries it. The restore changes nothing in either case.
+#[test]
+fn r2_a_drain_at_the_selected_revision_settles_exactly_as_before() {
+    let [root, _] = apc_members();
+    let [root_key, _] = apc_keys();
+    let unmoved = apc_revisions()[0].clone();
+    for last_owed in [false, true] {
+        let label = format!("last owed {last_owed}");
+        let (committed, working, drains) = apc_r2_page(last_owed, &unmoved);
+        let mut subset = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+        let selected = serde_json::to_vec(&subset).unwrap();
+        assert!(
+            !subset.restore_unselected_claude_proof_body_drains(drains),
+            "{label}: an unmoved revision is selected"
+        );
+        assert_eq!(serde_json::to_vec(&subset).unwrap(), selected, "{label}");
+
+        let (_, mut working, drains) = apc_r2_page(last_owed, &apc_hex('5'));
+        let carried = serde_json::to_vec(&working).unwrap();
+        assert!(
+            !working.restore_unselected_claude_proof_body_drains(drains),
+            "{label}: the carried working entry is the drained revision"
+        );
+        assert_eq!(serde_json::to_vec(&working).unwrap(), carried, "{label}");
+        if !last_owed {
+            assert_eq!(
+                apc_map(&working)[&root],
+                working.files[&root_key].source_file_fingerprint
+            );
+        }
+    }
+}

@@ -17,8 +17,10 @@ fn session(slot: usize) -> String {
 
 /// `roots` families of a root and one subagent, all sent and stamped at
 /// revision 1 under upload context `ctx-1`.
-fn families(name: &str, roots: usize) -> (PathBuf, PathBuf, ScanIndex) {
+pub(super) fn families(name: &str, roots: usize) -> (PathBuf, PathBuf, ScanIndex) {
     let home = crate::test_scratch::unique_path(&format!("ottto-{name}"));
+    fs::create_dir_all(&home).unwrap();
+    let home = fs::canonicalize(home).unwrap();
     let root = home.join("project");
     for slot in 0..roots {
         let session = session(slot);
