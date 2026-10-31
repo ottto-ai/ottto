@@ -502,6 +502,16 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         published(&f.path).unwrap()
     )
     .unwrap());
+    // The committed graph is the next page's baseline; idle releases it.
+    with_state(&f.path, |state| {
+        assert_eq!(
+            state.save_baseline.as_ref().map(|b| b.generation),
+            Some(G + 1)
+        );
+        Ok(())
+    })
+    .unwrap();
+    let _ = idle(&f.path, &index, true);
     with_state(&f.path, |state| {
         assert!(state.save_baseline.is_none());
         Ok(())

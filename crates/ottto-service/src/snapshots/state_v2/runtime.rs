@@ -659,6 +659,12 @@ fn save_with_custody(
             });
         // All outcomes release the load baseline, including ambiguous COMMIT.
         drop(previous);
+        // A pass saves page by page: keep the unambiguously committed full
+        // graph as the next page's baseline instead of re-hydrating. Idle and
+        // the next load still clear it, so nothing stays resident across passes.
+        if save_result.is_ok() && !claim_only && !session.reload {
+            state.save_baseline = Some(index.clone());
+        }
         if save_result.is_err() {
             if let Some(hold) = session.db.save_failure() {
                 return Err(hold.into());
