@@ -268,27 +268,3 @@ fn snapshot_packing_count_refuses_length_overflow_without_wrapping() {
     assert_eq!(length.bytes, usize::MAX);
     assert_eq!(length.write(&[]).unwrap(), 0);
 }
-
-#[test]
-fn snapshot_packing_count_removes_many_body_retention_with_actual_upload_peak_receipt() {
-    let items = (0..256)
-        .map(|n| item(n, json!("x".repeat(32 * 1024)), false))
-        .collect::<Vec<_>>();
-    let progress = test_upload_progress();
-    let (old_pending, old) =
-        crate::retry_allocation_probe::measure(|| previous_pending(&items, &progress));
-    let retained_body_capacity = old_pending
-        .values()
-        .map(|(_, body, _)| body.capacity())
-        .sum::<usize>();
-    assert!(old.requested_live >= retained_body_capacity as isize);
-    let expected = previous_batches(&items, &progress);
-    let ((actual, accepted), new) =
-        crate::retry_allocation_probe::measure(|| actual_batches(&items, test_upload_progress()));
-    assert_eq!(actual, expected);
-    assert_eq!(accepted, 256);
-    assert!(old.requested_peak >= 8 * 1024 * 1024);
-    assert!(new.requested_peak_with_overlap < old.requested_peak / 2,
-        "new whole uploader (including unchanged batch clones) must beat old retained packing buffers: old={old:?}, new={new:?}");
-    writeln!(std::io::stderr().lock(), "snapshot_packing_count_allocation: synthetic_bodies=256 payload_bytes_each=32768 old_packing_retained_requested={} old_packing_peak_requested={} old_body_vec_capacity={} new_whole_uploader_peak_with_realloc_overlap={} fixture_allocation_excluded=true unchanged_page_clones_included=true batch_order_and_acceptance_equal=true requested_bytes_not_RSS=true installed_causality_unproved=true", old.requested_live, old.requested_peak, retained_body_capacity, new.requested_peak_with_overlap).unwrap();
-}

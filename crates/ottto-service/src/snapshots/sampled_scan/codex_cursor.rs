@@ -815,26 +815,6 @@ impl JobMeta {
         self.fence.is_some() && self.fence == census_token(index)
     }
 
-    /// The live job's copy-budget charge without a walk (E3): the last
-    /// `completed_bound` plus every byte the reader consumed since plus the
-    /// reader buffer's capacity growth since (`buffer` is its capacity now).
-    /// Not a strict upper bound: an accumulator collection that regrows can
-    /// add more than the bytes that caused it. That slack lasts at most
-    /// `CHARGE_REFRESH_BYTES` of input and is corrected by the next walk;
-    /// the pause and completion walks are exact. None when no charge is
-    /// recorded, the reader restarted, or `CHARGE_REFRESH_BYTES` were
-    /// consumed since (the caller walks again: at most one walk per that
-    /// many bytes, never one per line). The scanner reads it through
-    /// `job_charge_estimate`, which also covers group jobs.
-    #[cfg(test)]
-    pub(in crate::snapshots) fn charge_estimate(
-        &self,
-        consumed: u64,
-        buffer: usize,
-    ) -> Option<usize> {
-        estimate_charge(self.charge, consumed, buffer, 1)
-    }
-
     /// Record a walked charge (`usize::MAX` when the walk refused) taken at
     /// reader position `consumed` with reader buffer capacity `buffer`.
     pub(in crate::snapshots) fn record_charge(

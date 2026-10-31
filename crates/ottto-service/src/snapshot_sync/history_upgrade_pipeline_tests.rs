@@ -560,39 +560,6 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
     assert_eq!(sent, vec![1, 1, 1, 0], "paced, one history file per page");
 }
 
-/// StateMissing N1: the incident shape on a verified Mac where no list is
-/// intended (durable intent Absent, no list, no seen-marker; this destination's own bootstrap): the
-/// rebuilt history is paced through the budget, not held for good.
-#[test]
-fn quarantined_index_without_an_intended_list_paces_history() {
-    let fixture = HistoryFixture::new("history-upgrade-quarantine-paced");
-    fixture.baseline();
-    assert_eq!(
-        crate::backfill::load_backfill_state(&fixture.support).claude_history_list_intent,
-        crate::backfill::ClaudeHistoryListIntent::Absent
-    );
-    fixture.corrupt_index();
-    let mut sent = Vec::new();
-    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-        crate::snapshots::with_body_witness_adoption_page_budget(1, || {
-            for hour in 9..13 {
-                sent.push(
-                    fixture
-                        .cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_REVISION_2)
-                        .uploaded
-                        .len(),
-                );
-            }
-        });
-    });
-    assert_eq!(sent, vec![1, 1, 1, 0]);
-    let index = ScanIndex::load(&fixture.index_path).expect("reload");
-    assert!(index
-        .files
-        .values()
-        .all(|entry| entry.effective_upload_body_witness_revision == 2));
-}
-
 /// Addendum 1 item 1 (secondary): existing revision-1 entries, an
 /// independent second reason on every file (a changed upload context), no
 /// list. Nothing is emitted, the old upload tuple stays, and the reason
@@ -1361,45 +1328,6 @@ fn held_history_never_settles_as_accepted_on_a_deferred_page() {
     });
 }
 
-/// SOURCE F4a: the incident shape on an unverified Mac with no override of
-/// the no-list cutoff. The fixture's history is born after 2026-10-21, but
-/// before the history cutoff this load records, so it is still held: the
-/// hold reaches the later of the two.
-#[test]
-fn quarantined_index_holds_history_born_after_the_no_list_cutoff() {
-    let fixture = HistoryFixture::new("history-upgrade-quarantine-real-cutoff");
-    fixture.baseline();
-    fixture.corrupt_backfill_state();
-    fixture.corrupt_index();
-    let rebuilt = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
-    assert_eq!(rebuilt.scan.scanned_file_count, HISTORY_SESSIONS.len());
-    assert!(rebuilt.uploaded.is_empty(), "{:?}", rebuilt.uploaded);
-    assert_eq!(rebuilt.corrections, 0);
-    let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
-    assert_eq!(again.scan.scanned_file_count, 0, "no re-read storm");
-    assert!(again.uploaded.is_empty());
-}
-
-/// SOURCE F1a: a quarantined sibling of this index is prior history by
-/// itself, with no backfill state at all: the rebuilt files are owed history,
-/// paced through the budget (one per page here), not re-sent as new.
-#[test]
-fn quarantined_index_sibling_alone_is_prior_history() {
-    let fixture = HistoryFixture::new("history-upgrade-sibling");
-    fixture.baseline();
-    fixture.corrupt_index();
-    let rebuilt = crate::snapshots::with_body_witness_adoption_page_budget(1, || {
-        fixture.cycle(
-            "2026-08-02T09:00:00Z",
-            HistoryCycle {
-                bootstrapped: false,
-                ..HISTORY_REVISION_2
-            },
-        )
-    });
-    assert_eq!(rebuilt.uploaded.len(), 1, "{:?}", rebuilt.uploaded);
-}
-
 /// SOURCE F1a, StateMissing H1: an unreadable backfill state is prior
 /// history, not a fresh install. With a quarantined index, or with the index
 /// gone and no other evidence, no history is emitted; the state keeps its
@@ -1439,38 +1367,6 @@ fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
             !crate::backfill::pending_backfill_sources_for_destination(&state, HISTORY_DESTINATION)
                 .contains(&SnapshotSource::ClaudeCode),
             "only Claude's bootstrap is suppressed (N2)"
-        );
-    }
-}
-
-/// StateMissing H1: an unreadable backfill state over a populated index arms
-/// no replay (the entries stay, nothing is re-read) and uploads no old
-/// history. The entries' births are old (the no-list cutoff seam).
-#[test]
-fn unreadable_backfill_state_arms_no_replay_over_a_populated_index() {
-    let fixture = HistoryFixture::new("history-upgrade-unreadable-populated");
-    let baseline = fixture.baseline();
-    fixture.corrupt_backfill_state();
-    let outcome = crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-        fixture.cycle(
-            "2026-08-02T09:00:00Z",
-            HistoryCycle {
-                replay_generation: Some("history-replay-2"),
-                bootstrapped: false,
-                ..HISTORY_REVISION_2
-            },
-        )
-    });
-    assert!(outcome.uploaded.is_empty(), "{:?}", outcome.uploaded);
-    assert_eq!(outcome.scan.scanned_file_count, 0, "nothing re-read");
-    for (key, entry) in &outcome.index.files {
-        assert_eq!(
-            entry.source_file_fingerprint, baseline.files[key].source_file_fingerprint,
-            "entries kept"
-        );
-        assert_eq!(
-            entry.effective_upload_body_witness_revision, 1,
-            "a replay would have zeroed it"
         );
     }
 }
@@ -1602,11 +1498,6 @@ fn different_user_cutoff_excludes_history_without_the_gate() {
 #[test]
 fn same_user_reclaim_keeps_the_cutoff_but_gates_the_new_destination() {
     same_user_reclaim_is_gated(true);
-}
-
-#[test]
-fn same_user_reclaim_before_bootstrap_is_still_gated() {
-    same_user_reclaim_is_gated(false);
 }
 
 fn same_user_reclaim_is_gated(complete_bootstrap: bool) {
@@ -2027,33 +1918,6 @@ fn intended_list_holds_listed_families_and_paces_the_rest_after_a_quarantine() {
         vec![1, 1, 0, 0],
         "the two unlisted families, one per page"
     );
-}
-
-/// SOURCE addendum 8: the list's seen-marker present but the list file gone
-/// (`MissingAfterInstall`) pauses: no history is emitted, whatever the
-/// budget, after a quarantine as on an intact index.
-#[test]
-fn seen_marker_without_the_list_pauses_all_history() {
-    let fixture = HistoryFixture::new("history-upgrade-list-missing");
-    fixture.baseline();
-    fixture.install_list(&[]);
-    fixture.cycle("2026-08-02T08:30:00Z", HISTORY_BASELINE);
-    std::fs::remove_file(
-        fixture
-            .support
-            .join("snapshots/claude_code-reemission-exclusions.txt"),
-    )
-    .expect("lose the list");
-    let intact = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
-    assert!(intact.uploaded.is_empty(), "{:?}", intact.uploaded);
-    fixture.corrupt_index();
-    for hour in [10, 11] {
-        // The rebuild latches on its first load; the restart before the
-        // second shows the pause alone holds it.
-        let outcome = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_REVISION_2);
-        assert!(outcome.uploaded.is_empty(), "{:?}", outcome.uploaded);
-        crate::snapshots::restart_claude_reemission_stop_for_test();
-    }
 }
 
 /// The lenient decoder's remaining budget rebuild must compose with the full

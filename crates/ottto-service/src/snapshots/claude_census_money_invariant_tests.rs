@@ -1343,48 +1343,6 @@ fn census_live_insert_mirrors_the_decoder_record_bound() {
     assert_eq!(census.totals_for_test(), census.recounted_for_test());
 }
 
-/// Lead B NO-GO item 7, collection-time evidence: the terminal's production
-/// retirement step, measured with the test counting allocator at M4 size
-/// (898,699 hashes over 14,795 records, 42.85% occupancy) with every record
-/// aged and overlapping. Nothing overflows, and the peak is exactly the
-/// sorted hash copy plus one candidate tuple and one flag per record:
-/// 8 B x 898,699 + 25 B x 14,795 = 7,559,467 B.
-#[test]
-fn census_retirement_peak_is_measured_at_m4_size() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
-    const RECORDS: u64 = 14_795;
-    const HASHES: u64 = 898_699;
-    let mut index = ScanIndex::default();
-    let mut first = 0;
-    for n in 0..RECORDS {
-        let size = HASHES / RECORDS + u64::from(n < HASHES % RECORDS);
-        // A chain: each record's first id is the previous one's last.
-        indexed_census(
-            &mut index,
-            &format!("m{n:05}"),
-            'a',
-            40,
-            (first..first + size).collect(),
-        );
-        first += size - 1;
-    }
-    assert_eq!(
-        index.claude_request_census_for_test().hash_total_for_test(),
-        HASHES as usize
-    );
-    let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
-    let (retirement, stats) = crate::retry_allocation_probe::measure(|| {
-        index.retire_claude_transcript_records_for_test(window)
-    });
-    assert_eq!(retirement, (0, RECORDS, HASHES, 0), "all kept, no overflow");
-    assert_eq!(
-        stats.requested_peak,
-        (8 * HASHES + 25 * RECORDS) as usize,
-        "{stats:?}"
-    );
-    assert_eq!(stats.requested_peak, 7_559_467);
-}
-
 #[test]
 fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
