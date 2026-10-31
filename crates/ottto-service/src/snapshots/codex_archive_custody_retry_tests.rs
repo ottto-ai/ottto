@@ -46,7 +46,14 @@ fn archive_replacement_requires_equal_session_and_accepted_identity_superset() {
         "compressed-fixture",
         &metadata,
     );
-    assert_eq!(baseline.snapshots[0].title, ack.title);
+    assert_eq!(
+        ack.session_display_name.as_deref(),
+        Some("Synthetic accepted title")
+    );
+    assert_eq!(
+        baseline.snapshots[0].session_display_name,
+        ack.session_display_name
+    );
     assert_eq!(
         baseline.snapshots[0].snapshot_fingerprint,
         ack.snapshot_fingerprint
