@@ -1021,8 +1021,25 @@ fn owed_unchanged_file_stays_schedulable_and_settled_file_is_not_read() {
     }
 }
 
-/// [money] F3: a known default-home rollout append with no directory move or
-/// watcher hint is Tail-read once and emits the same whole money body as Full.
+/// Starts a due re-listing pass on a kept generation and walks it.
+fn relist(source: SnapshotSource, index: &mut ScanIndex) {
+    let now = OffsetDateTime::now_utc();
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.listing_started_unix_seconds =
+        Some(now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60);
+    start_due_listing_pass(traversal, &now.format(&Rfc3339).unwrap());
+    advance_bounded_directory_traversal(source, index, 7, None);
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty());
+}
+
+/// [money] A known Codex rollout append with no directory move or watcher
+/// hint is queued once by the re-listing pass, Tail-read once, and emits the
+/// same whole money body as a cold Full.
 #[test]
 fn retained_codex_stat_growth_tails_once_with_full_money() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1040,32 +1057,14 @@ fn retained_codex_stat_growth_tails_once_with_full_money() {
         .unwrap()
         .moved_directories()
         .is_empty());
-    refresh_retained_codex_roster(
-        SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
-        7,
-        discovery_retention!(index),
-    );
-    let traversal = index.traversal.as_ref().unwrap();
-    assert_eq!(traversal.counts.codex_roster_growth_enqueued, 1);
-    assert_eq!(traversal.pending_candidates.len(), 1);
-    assert!(!traversal.pending_candidates[0].census_member);
-    // A second refresh before selection cannot duplicate queued work.
-    refresh_retained_codex_roster(
-        SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
-        7,
-        discovery_retention!(index),
-    );
-    assert_eq!(
-        index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .counts
-            .codex_roster_growth_enqueued,
-        1
-    );
+    // A second pass before selection cannot duplicate queued work.
+    for _ in 0..2 {
+        relist(SnapshotSource::Codex, &mut index);
+        let traversal = index.traversal.as_ref().unwrap();
+        assert_eq!(traversal.counts.listing_changes_without_hint, 1);
+        assert_eq!(traversal.pending_candidates.len(), 1);
+        assert!(!traversal.pending_candidates[0].census_member);
+    }
     let (caught, scan, reads, _) = f.page(SnapshotSource::Codex, index);
     assert_eq!(reads.0.lock().unwrap().0, vec![DeliveryMode::Tail]);
     assert_eq!(scan.snapshots.len(), 1);
@@ -1089,8 +1088,9 @@ fn retained_codex_stat_growth_tails_once_with_full_money() {
     assert!(reads.0.lock().unwrap().0.is_empty());
 }
 
-/// [behaviour] Unchanged bytes and inventory-held growth cannot enqueue or
-/// acquire again while their stat/refusal evidence stays unchanged.
+/// [behaviour] The re-listing pass queues and acquires nothing for unchanged
+/// bytes (a ctime-only change included) or for inventory-held growth while
+/// its refusal evidence stays unchanged.
 #[test]
 fn retained_codex_unchanged_or_inventory_held_member_is_not_enqueued() {
     for held_growth in [false, true] {
@@ -1110,21 +1110,53 @@ fn retained_codex_unchanged_or_inventory_held_member_is_not_enqueued() {
                 ..CodexInventoryHold::default()
             });
         } else {
-            f.age(1); // mtime alone cannot grant another acquisition
+            let original = fs::metadata(&f.path).unwrap().permissions();
+            let mut read_only = original.clone();
+            read_only.set_readonly(true);
+            fs::set_permissions(&f.path, read_only).unwrap();
+            fs::set_permissions(&f.path, original).unwrap();
         }
         for _ in 0..2 {
-            refresh_retained_codex_roster(
-                SnapshotSource::Codex,
-                index.traversal.as_mut().unwrap(),
-                7,
-                discovery_retention!(index),
-            );
+            relist(SnapshotSource::Codex, &mut index);
             let traversal = index.traversal.as_ref().unwrap();
             assert!(traversal.pending_candidates.is_empty());
-            assert_eq!(traversal.counts.codex_roster_growth_enqueued, 0);
+            assert_eq!(traversal.counts.listing_changes_without_hint, 0);
         }
         let (_, scan, reads, _) = f.page(SnapshotSource::Codex, index);
         assert!(scan.snapshots.is_empty());
         assert!(reads.0.lock().unwrap().0.is_empty());
+    }
+}
+
+/// [behaviour] A watcher hint for a settled file is dropped unless this
+/// cycle leased one of its snapshots for a reason re-offer; the leased hint
+/// is kept for the ordinary candidate gate.
+#[test]
+fn leased_reoffer_hint_survives_the_settled_hint_filter() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let mut index = kept_generation(&f, source, false);
+        let unchanged = f.root.join(format!("{UNCHANGED}.jsonl"));
+        let hints = [unchanged.clone()];
+        assert!(
+            changed_watcher_hints(&index, &hints).is_empty(),
+            "{source:?}: a settled hint is dropped"
+        );
+        let fingerprint = index.file_snapshot_fingerprints[&local_index_key(&unchanged)]
+            .first()
+            .expect("the read recorded its snapshot")
+            .clone();
+        let leased =
+            index.activate_reason_reoffer_retries(BTreeMap::from([(fingerprint, "body".into())]));
+        assert_eq!(leased, vec![unchanged.clone()], "{source:?}");
+        assert_eq!(
+            changed_watcher_hints(&index, &hints),
+            vec![unchanged],
+            "{source:?}: the leased hint is kept"
+        );
     }
 }

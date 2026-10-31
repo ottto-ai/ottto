@@ -19,7 +19,9 @@ only delay a generation's discovery, never complete it. Codex selects nothing
 while any directory is pending, re-listing included.
 
 A file the generation already saw that has no index entry (a hold, an
-oversized file) has no stamp, so the pass leaves it to its owner's floor. An
+oversized file) has no stamp, so the pass leaves it to its owner's floor. A
+Codex file held by an incomplete header inventory is left to that hold's own
+evidence-gated release. An
 oversized file found by a re-pass records no debt and stays unobserved: debt
 and loss count are recorded together by the first walk, and a later pass lists
 the file again once it is readable.
@@ -36,6 +38,13 @@ A watcher hint is dropped only when its file is unchanged, not owed, not
 account-held, and the ordinary candidate gate skips it at that stamp, so a
 metadata-only event never queues a settled file and every other hint is queued
 as on main. Owner re-enqueues (the sampled-audit retry) bypass it.
+
+The pass supersedes the retained Codex roster's stat rotation, which is
+deleted with its two counters (`codex_roster_refresh_visited`,
+`codex_roster_growth_enqueued`; their persisted slots stay as decode-only
+placeholders). Known Codex growth is now queued by the pass for all sources
+alike; an mtime change is a stamp change, a ctime change never is. The
+moved-directory roster refresh is unchanged.
 
 Counters: `listing_generations` and `listing_changes_without_hint` in the
 traversal counts. The 6-hour full sweep timer is removed: every successful

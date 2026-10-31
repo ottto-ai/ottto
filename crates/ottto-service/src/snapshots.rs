@@ -2581,6 +2581,12 @@ struct ScanTraversalCounts {
     retired_reread_budget_refused: serde::de::IgnoredAny,
     #[serde(skip_serializing_if = "ownership::Counts::is_empty")]
     causes: ownership::Counts,
+    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    #[serde(rename = "codex_roster_refresh_visited", default, skip_serializing)]
+    retired_codex_roster_refresh_visited: serde::de::IgnoredAny,
+    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    #[serde(rename = "codex_roster_growth_enqueued", default, skip_serializing)]
+    retired_codex_roster_growth_enqueued: serde::de::IgnoredAny,
     /// Re-listing passes this generation started; zero while its first walk
     /// runs.
     #[serde(skip_serializing_if = "is_zero_u64")]
@@ -2589,12 +2595,6 @@ struct ScanTraversalCounts {
     /// had already queued: what the watcher missed.
     #[serde(skip_serializing_if = "is_zero_u64")]
     listing_changes_without_hint: u64,
-    /// Bounded roster visits, also the rotation offset for the next refresh.
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    codex_roster_refresh_visited: u64,
-    /// Known stat-grown members newly queued outside the frozen census.
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    codex_roster_growth_enqueued: u64,
 }
 
 /// Residue a generation disclosed as terminal after settling. Counts exclude
@@ -26821,7 +26821,6 @@ impl OwnedSourceScan {
         let next_generation_hints;
         {
             let traversal = index.traversal.as_mut().expect("traversal initialized");
-            let grown_before = traversal.counts.codex_roster_growth_enqueued;
             refresh_retained_codex_roster(
                 source,
                 traversal,
@@ -26835,13 +26834,7 @@ impl OwnedSourceScan {
                 start_due_listing_pass(traversal, collected_at);
             }
             next_generation_hints =
-                enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed)
-                    .saturating_add(
-                        traversal
-                            .counts
-                            .codex_roster_growth_enqueued
-                            .saturating_sub(grown_before),
-                    );
+                enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
         }
         advance_bounded_directory_traversal(
             source,
@@ -43738,10 +43731,8 @@ fn enqueue_watcher_hints(
 /// deep: rollouts that appeared join the roster and the census candidates
 /// exactly as the walk adds them, rollouts that left drop out of the roster,
 /// and new subdirectories go through the ordinary bounded walk. Files already
-/// in the roster are stat-checked within the remaining entry budget, rotating
-/// across pages independently of directory moves. Only proven growth queues a
-/// non-census Tail candidate; acquisition keeps its normal revalidation.
-/// A listing the walk would turn red (a
+/// in the roster are not re-selected here: the re-listing pass queues their
+/// growth. A listing the walk would turn red (a
 /// symlink, an unreadable entry, a change during the listing, a vanished
 /// entry) refreshes nothing: that directory keeps its old witness and the
 /// existing holds apply until a later tick or the next walk.
@@ -43787,7 +43778,6 @@ fn refresh_retained_codex_roster(
         };
         let entries = entries.take(remaining + 1).collect::<Vec<_>>();
         if entries.len() > remaining {
-            remaining = 0;
             break;
         }
         remaining -= entries.len();
@@ -43900,75 +43890,6 @@ fn refresh_retained_codex_roster(
                 census_member: true,
                 watcher_hint: true,
             }));
-    }
-
-    // A file append need not change its directory witness. Spend only the
-    // directory refresh's unused budget on known roster members, including
-    // unchanged ones. The visit counter rotates large rosters without a new
-    // per-file ledger; pending census work keeps its original selection flags.
-    let population = traversal.codex_rollout_paths.len();
-    if population == 0 {
-        return;
-    }
-    let mut pending = traversal
-        .pending_candidates
-        .iter()
-        .map(|candidate| local_index_key(&candidate.path))
-        .collect::<BTreeSet<_>>();
-    let start = (traversal.counts.codex_roster_refresh_visited % population as u64) as usize;
-    for key in traversal
-        .codex_rollout_paths
-        .iter()
-        .cycle()
-        .skip(start)
-        .take(remaining.min(population))
-    {
-        traversal.counts.codex_roster_refresh_visited = traversal
-            .counts
-            .codex_roster_refresh_visited
-            .wrapping_add(1);
-        let Some(entry) = retention.files.get(key) else {
-            continue;
-        };
-        // Only the existing evidence-gated hold release may retry these keys.
-        if pending.contains(key)
-            || traversal
-                .residue
-                .codex_inventory_hold
-                .as_ref()
-                .is_some_and(|hold| hold.owed.contains(key))
-        {
-            continue;
-        }
-        let path = Path::new(key);
-        let Ok(metadata) = fs::symlink_metadata(path) else {
-            continue;
-        };
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.len() > max_jsonl_file_bytes(source)
-            || !codex_fragment::grown(
-                entry,
-                metadata.len(),
-                codex_fragment::Stamp::metadata(&metadata),
-            )
-        {
-            continue;
-        }
-        let Some(scan_root) = traversal.owning_scan_root(path).cloned() else {
-            continue;
-        };
-        pending.insert(key.clone());
-        traversal.pending_candidates.push_back(ScanTraversalPath {
-            scan_root,
-            path: path.to_path_buf(),
-            census_member: false,
-            watcher_hint: true,
-        });
-        traversal.counts.codex_roster_growth_enqueued = traversal
-            .counts
-            .codex_roster_growth_enqueued
-            .saturating_add(1);
     }
 }
 
@@ -44431,8 +44352,16 @@ fn advance_bounded_directory_traversal_with_budget(
                 let key = local_index_key(&path);
                 // Unchanged and not owed: seen, never queued. A file this
                 // generation already saw with no entry (held, oversized) has
-                // no stamp; its owner's floor re-offers it.
-                let seen = if index.files.contains_key(&key) {
+                // no stamp; its owner's floor re-offers it. A Codex inventory
+                // hold is released only by its own evidence.
+                let seen = if traversal
+                    .residue
+                    .codex_inventory_hold
+                    .as_ref()
+                    .is_some_and(|hold| hold.owed.contains(&key))
+                {
+                    true
+                } else if index.files.contains_key(&key) {
                     index.listing_unchanged(&path, &metadata)
                 } else {
                     traversal.observed_index_keys.contains(&key)
@@ -84418,7 +84347,7 @@ crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; codex_roster_refresh_visited, codex_roster_growth_enqueued, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
