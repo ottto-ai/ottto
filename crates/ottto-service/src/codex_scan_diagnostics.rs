@@ -1408,7 +1408,7 @@ mod fenced_census_tests {
 
     #[test]
     fn fenced_census_unreadable_saturation_inconsistency_and_fixed_resource_bound() {
-        assert_eq!(std::mem::size_of::<UnreadableCauses>(), 576);
+        assert_eq!(std::mem::size_of::<UnreadableCauses>(), 832);
         let mut causes = UnreadableCauses::default();
         causes.record(UnreadableCause::Metadata, u64::MAX);
         causes.record(UnreadableCause::Metadata, 1);
@@ -1448,7 +1448,7 @@ mod fenced_census_tests {
         assert_eq!(json["schema"], "local_fenced_codex_census:v3");
         assert_eq!(json["losses"]["terminal_over_line_cap"], u64::MAX);
         assert_eq!(json["losses"]["terminal_ownership_incomplete"], u64::MAX);
-        println!("CENSUS_CAUSES inline_bytes=576 histogram_heap_bytes=0 worst_test_record_bytes={len} encoding_allocations=0");
+        println!("CENSUS_CAUSES inline_bytes=832 histogram_heap_bytes=0 worst_test_record_bytes={len} encoding_allocations=0");
     }
 
     fn sidecar(fixture: &Fixture) -> serde_json::Value {
