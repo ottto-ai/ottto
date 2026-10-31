@@ -1212,7 +1212,10 @@ impl SharedCache {
             return true;
         };
         let index_len = std::fs::metadata(&slot.index_path).map_or(0, |metadata| metadata.len());
-        !slot.store.check_resources(writer, index_len)
+        !slot
+            .store
+            .check_resources(writer, index_len)
+            .unwrap_or(false)
     }
 
     /// Native discovery/publication query for a held Claude key; counts growth
