@@ -333,7 +333,7 @@ fn cold_store_each_fence_class_and_certificate_reason_retires_before_one_full() 
         );
         cache
             .durable_write_after_save(
-                test_locks::hold(&rig.root),
+                crate::locked_state_dir::held_for(&rig.index_path).unwrap(),
                 SnapshotSource::Codex,
                 &rig.index,
             )
@@ -373,7 +373,7 @@ fn cold_store_each_fence_class_and_certificate_reason_retires_before_one_full() 
         assert!(idle.snapshots.is_empty());
         cache
             .durable_write_after_save(
-                test_locks::hold(&rig.root),
+                crate::locked_state_dir::held_for(&rig.index_path).unwrap(),
                 SnapshotSource::Codex,
                 &rig.index,
             )
