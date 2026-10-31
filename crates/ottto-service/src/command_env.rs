@@ -601,17 +601,15 @@ mod tests {
             "Desktop's bundled CLI does not require default login"
         );
         assert!(claude_desktop_vendored_bin_dirs(&home).contains(&desktop_bin));
-        for prefix in [".nvm/versions/node/v22.19.0/bin"] {
-            let bin = home.join(prefix);
-            fs::create_dir_all(&bin).expect("cli prefix");
-            let cli = bin.join("claude");
-            symlink(&desktop_cli, &cli).expect("executable shim");
-            assert_eq!(resolve(), Some(cli.clone()), "off-PATH {prefix}");
-            fs::remove_file(&cli).expect("remove shim");
-            fs::write(&cli, "non executable").expect("write inert file");
-            assert_eq!(resolve(), None, "inert {prefix} file is not a CLI");
-            fs::remove_file(cli).expect("remove inert file");
-        }
+        let bin = home.join(".nvm/versions/node/v22.19.0/bin");
+        fs::create_dir_all(&bin).expect("cli prefix");
+        let cli = bin.join("claude");
+        symlink(&desktop_cli, &cli).expect("executable shim");
+        assert_eq!(resolve(), Some(cli.clone()), "off-PATH nvm CLI");
+        fs::remove_file(&cli).expect("remove shim");
+        fs::write(&cli, "non executable").expect("write inert file");
+        assert_eq!(resolve(), None, "inert nvm file is not a CLI");
+        fs::remove_file(cli).expect("remove inert file");
         // An explicit search override is authoritative and may point at a bundle.
         assert_eq!(
             claude_default_login_executable_from(Some(desktop_bin.into_os_string()), None, false),
