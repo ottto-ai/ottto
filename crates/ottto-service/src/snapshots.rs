@@ -2592,6 +2592,11 @@ struct ScanTraversalCounts {
     retired_reread_budget_refused: serde::de::IgnoredAny,
     #[serde(skip_serializing_if = "ownership::Counts::is_empty")]
     causes: ownership::Counts,
+    /// These size sightings came from a walk that admitted oversized files.
+    /// Old checkpoints default false, retaining their skipped-file debt until
+    /// that walk ends. OFF omits the field and preserves its legacy bytes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    oversized_pressure_only: bool,
 }
 
 /// Residue a generation disclosed as terminal after settling. Counts exclude
@@ -2620,7 +2625,8 @@ impl ScanTraversalCounts {
         self.symlink_rejected_count > 0
             || self.directory_entry_cap_exceeded_count > 0
             || self.unreadable_path_count > 0
-            || (self.oversized_file_count > 0 && !oversized_discovery::pressure_only(source))
+            || (self.oversized_file_count > 0
+                && (!self.oversized_pressure_only || !oversized_discovery::pressure_only(source)))
             || self.disappeared_file_count > 0
             || self.malformed_json_line_count > 0
             || self.invalid_utf8_line_count > 0
@@ -42458,12 +42464,6 @@ fn scan_traversal_context_fingerprint(
 ) -> String {
     let mut digest = Sha256::new();
     update_length_prefixed(&mut digest, b"ottto:snapshot-bounded-traversal:v1");
-    if oversized_discovery::pressure_only(source) {
-        // A retained OFF traversal may have omitted entire files. Revisit its
-        // discovery under the existing context-change path before declaring
-        // the former loss counter to be pressure; never certify that old walk.
-        update_length_prefixed(&mut digest, b"claude_pi_oversized_admission_enabled:v1");
-    }
     if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
         // Existing context fingerprint, no new persisted field: ON checkpoints
         // cannot resume under OFF (including after a daemon restart).
@@ -42547,6 +42547,16 @@ fn ensure_bounded_traversal(
 ) -> TraversalProgress {
     if source == SnapshotSource::ClaudeCode {
         rearm_cause::retain(index);
+    }
+    if let Some(traversal) = index.traversal.as_mut() {
+        // Do not relabel OFF-era skipped files as warnings. A walk with no
+        // such loss can continue under ON without changing its context or
+        // re-arming any family. OFF restores the legacy count interpretation.
+        if !oversized_discovery::pressure_only(source) {
+            traversal.counts.oversized_pressure_only = false;
+        } else if traversal.counts.oversized_file_count == 0 {
+            traversal.counts.oversized_pressure_only = true;
+        }
     }
     let context_fingerprint =
         scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
@@ -43327,6 +43337,7 @@ fn ensure_bounded_traversal(
         );
     }
     let counts = ScanTraversalCounts {
+        oversized_pressure_only: oversized_discovery::pressure_only(source),
         directory_entry_cap_exceeded_count: census.directory_entry_cap_exceeded_count,
         symlink_rejected_count: census.symlink_rejected_count,
         unreadable_path_count: census.unreadable_path_count,
@@ -85123,7 +85134,7 @@ crate::heap_layout_bound::fields!(ScanIndex; withheld_memo, persistence_legacy_r
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; oversized_pressure_only, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);

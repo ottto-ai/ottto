@@ -11,11 +11,11 @@ sightings alone do not veto traversal health, native comparison or terminal
 receipt classification. Actual read/parser failures keep their usual behavior.
 The line limit, reducer state limits and scheduling budgets are unchanged.
 
-The ON traversal context differs from OFF: a walk that previously skipped
-files must pass through the existing context-change discovery path before it
-can complete under the warning policy. That recovery may also re-arm existing
-pending Claude families according to the existing context-change rules.
-No parser/scan-identity version, persisted field or upload format changes.
+A retained walk with OFF-era oversized loss keeps that loss until the next
+ordinary walk. A shared, defaulted count-provenance flag distinguishes those
+skipped files from ON pressure observations and is omitted from OFF state.
+Enabling admission never changes the traversal context or re-arms families.
+No parser/scan-identity version or upload format changes.
 
 Regression coverage scales the existing JSONL-limit fixture seam instead of
 allocating a transcript above 512 MiB. It checks OFF admission/refusal and ON

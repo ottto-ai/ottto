@@ -14,6 +14,40 @@ mod policy {
     pub(crate) fn set(enabled: bool) -> super::super::terminal_off_policy::ThreadSwitchForTest {
         super::super::terminal_off_policy::ThreadSwitchForTest::set(&ENABLED, enabled)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// [off=main] Absent local opt-in preserves admission and retryable loss.
+        #[test]
+        fn oversized_admission_defaults_off_and_requires_a_regular_marker() {
+            use super::super::super::{ScanTraversalCounts, SnapshotSource};
+            let scratch = crate::test_scratch::ScratchDir::new("oversized-admission-policy");
+            assert!(!enabled_at(&scratch));
+            std::fs::create_dir(scratch.join("claude_pi_oversized_admission_enabled")).unwrap();
+            assert!(!enabled_at(&scratch));
+            std::fs::remove_dir(scratch.join("claude_pi_oversized_admission_enabled")).unwrap();
+            std::fs::write(scratch.join("claude_pi_oversized_admission_enabled"), b"").unwrap();
+            assert!(enabled_at(&scratch));
+            assert!(!enabled(), "test default never reads the host marker");
+            let counts = ScanTraversalCounts {
+                oversized_file_count: 1,
+                ..Default::default()
+            };
+            assert!(serde_json::to_value(&counts)
+                .unwrap()
+                .get("oversized_pressure_only")
+                .is_none());
+            for source in [
+                SnapshotSource::ClaudeCode,
+                SnapshotSource::Pi,
+                SnapshotSource::Codex,
+            ] {
+                assert!(counts.has_errors(source));
+            }
+        }
+    }
 }
 
 /// The admission ceiling remains visible as pressure; only Codex retains its veto.

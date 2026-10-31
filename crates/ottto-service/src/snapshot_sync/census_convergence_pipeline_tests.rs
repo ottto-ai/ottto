@@ -1153,7 +1153,10 @@ fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
     assert!(
         counts.ownership_incomplete_file_count > counts.terminal_ownership_incomplete_file_count
     );
-    assert_eq!(counts.disclosed_loss(SnapshotSource::ClaudeCode), DisclosedLoss::Unsettled);
+    assert_eq!(
+        counts.disclosed_loss(SnapshotSource::ClaudeCode),
+        DisclosedLoss::Unsettled
+    );
     assert!(!last.fully_settled);
     assert!(!last.backfill_succeeded);
     assert!(settled.context_curve_replay_needed(PIPELINE_HOLD_CYCLE.replay_generation));
@@ -2427,7 +2430,10 @@ fn assert_real_rejected_hold(
             counts.ownership_incomplete_file_count
                 > counts.terminal_ownership_incomplete_file_count
         );
-        assert_eq!(counts.disclosed_loss(SnapshotSource::ClaudeCode), DisclosedLoss::Unsettled);
+        assert_eq!(
+            counts.disclosed_loss(SnapshotSource::ClaudeCode),
+            DisclosedLoss::Unsettled
+        );
     } else {
         assert_listed_fold_absent([&first, &last], PIPELINE_HELD_SESSION);
         assert!(last
@@ -2454,7 +2460,10 @@ fn assert_real_rejected_hold(
         );
         assert!(counts.census_complete);
         assert!(counts.terminal_ownership_incomplete_file_count >= 1);
-        assert_ne!(counts.disclosed_loss(SnapshotSource::ClaudeCode), DisclosedLoss::None);
+        assert_ne!(
+            counts.disclosed_loss(SnapshotSource::ClaudeCode),
+            DisclosedLoss::None
+        );
     }
 
     // Independent accepted-fold oracle: A retains its accepted revision;
@@ -4145,7 +4154,10 @@ fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause(
     );
     let counts =
         SyncCounts::from_scan_result(&last.scan, 0, 183).with_snapshot_terminal_counts(&last.index);
-    assert_eq!(counts.disclosed_loss(SnapshotSource::ClaudeCode), DisclosedLoss::Unsettled);
+    assert_eq!(
+        counts.disclosed_loss(SnapshotSource::ClaudeCode),
+        DisclosedLoss::Unsettled
+    );
     assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
 
     // E2-028 Accept arm (restored): a held revision of a RetryPending family
@@ -4253,7 +4265,10 @@ fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause(
         );
         let counts = SyncCounts::from_scan_result(&last.scan, 0, 183)
             .with_snapshot_terminal_counts(&last.index);
-        assert_eq!(counts.disclosed_loss(SnapshotSource::ClaudeCode), DisclosedLoss::Unsettled);
+        assert_eq!(
+            counts.disclosed_loss(SnapshotSource::ClaudeCode),
+            DisclosedLoss::Unsettled
+        );
         assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
     }
 }

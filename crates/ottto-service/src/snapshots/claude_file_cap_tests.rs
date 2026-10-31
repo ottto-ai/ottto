@@ -157,7 +157,6 @@ fn oversized_claude_shrink_then_grow_keeps_unread_content_unproven() {
     assert_native(&fixture.scan(SnapshotSource::ClaudeCode, &mut index, 15), 1);
 }
 
-/// [off=main] Default policy preserves admission, opened-object refusal and health.
 #[test]
 fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
     for (source, limit) in [
@@ -165,12 +164,6 @@ fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
         (SnapshotSource::Pi, 256 * MIB),
         (SnapshotSource::Codex, 2048 * MIB),
     ] {
-        assert!(!oversized_discovery::pressure_only(source));
-        assert!(ScanTraversalCounts {
-            oversized_file_count: 1,
-            ..Default::default()
-        }
-        .has_errors(source));
         let fixture = Fixture::new();
         let file = File::create(fixture.path()).unwrap();
         for (bytes, admitted) in [(limit, true), (limit + 1, false)] {
@@ -235,7 +228,24 @@ fn oversized_claude_and_pi_reach_native_body_without_a_health_veto() {
             assert!(skipped.snapshots.is_empty());
             assert!(!skipped.census_complete);
             assert!(skipped.oversized_file_count > 0);
+            let context = index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .context_fingerprint
+                .clone();
             let _switch = oversized_discovery::set(true);
+            let retained = fixture.scan(source, &mut index, 8);
+            assert!(
+                !retained.census_complete,
+                "OFF-era skipped files remain loss for this walk"
+            );
+            assert!(retained.snapshots.is_empty());
+            assert_eq!(
+                index.traversal.as_ref().unwrap().context_fingerprint,
+                context,
+                "enabling admission never changes the traversal context"
+            );
             let mut scan = OwnedSourceScan::new(
                 source,
                 std::slice::from_ref(&fixture.0),
