@@ -34,14 +34,19 @@ pub(crate) fn scan_roots(
 pub(crate) fn registered_scan_roots(source: SnapshotSource, home: &Path) -> Result<Vec<PathBuf>> {
     let codex_homes = if source == SnapshotSource::Codex {
         registered_codex_homes(&FileCodexAccountSlotSettingsStore::default())?
+            .collect::<Result<Vec<_>>>()?
     } else {
         Vec::new()
     };
     scan_roots(source, home, &codex_homes)
 }
 
-fn registered_codex_homes(store: &FileCodexAccountSlotSettingsStore) -> Result<Vec<PathBuf>> {
-    store
+/// Each accepted registration's slot home, resolved one by one so a caller
+/// can refuse on the first failure or skip it.
+fn registered_codex_homes(
+    store: &FileCodexAccountSlotSettingsStore,
+) -> Result<impl Iterator<Item = Result<PathBuf>> + '_> {
+    Ok(store
         .registered_bindings()
         .context("read registered Codex transcript homes")?
         .into_iter()
@@ -50,8 +55,7 @@ fn registered_codex_homes(store: &FileCodexAccountSlotSettingsStore) -> Result<V
             store
                 .slot_home(&binding.slot_id)
                 .context("resolve registered Codex transcript home")
-        })
-        .collect()
+        }))
 }
 
 fn compose_roots(
@@ -85,7 +89,23 @@ fn compose_roots(
     roots
 }
 
+/// The watcher covers the Codex slot homes discovery scans; without them
+/// growth in a slot home waits for the next census walk. Best effort, as the
+/// watcher is: a slot home that cannot be resolved is skipped, as the status
+/// collection skips it, and an unreadable registry leaves the default roots.
 pub(crate) fn watcher_roots(home: &Path) -> Result<Vec<(SnapshotSource, PathBuf)>> {
+    let codex_homes = registered_codex_homes(&FileCodexAccountSlotSettingsStore::default())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect::<Vec<_>>();
+    watcher_roots_with(home, &codex_homes)
+}
+
+fn watcher_roots_with(
+    home: &Path,
+    codex_homes: &[PathBuf],
+) -> Result<Vec<(SnapshotSource, PathBuf)>> {
     [
         SnapshotSource::Codex,
         SnapshotSource::ClaudeCode,
@@ -93,7 +113,7 @@ pub(crate) fn watcher_roots(home: &Path) -> Result<Vec<(SnapshotSource, PathBuf)
     ]
     .into_iter()
     .map(|source| {
-        Ok(scan_roots(source, home, &[])?
+        Ok(scan_roots(source, home, codex_homes)?
             .into_iter()
             .map(|root| (source, root))
             .collect::<Vec<_>>())
@@ -380,6 +400,49 @@ mod tests {
         assert!(scanned.unreadable_path_count > 0);
         assert_eq!(scanned.snapshots.len(), 1);
         assert_eq!(scanned.snapshots[0].source_session_id, "healthy");
+    }
+
+    /// [behaviour] A write under a registered Codex slot home's `sessions/`
+    /// reaches the watcher queue; a transcript-shaped file elsewhere in that
+    /// home does not.
+    #[test]
+    fn watcher_queues_codex_slot_home_session_writes_only() {
+        let scratch = ScratchDir::new("codex-slot-watch");
+        // FSEvents reports canonical paths (/private for the temp alias).
+        let base = fs::canonicalize(&scratch).unwrap();
+        let slot_home = base.join("codex-accounts/slot/home");
+        let day = slot_home.join("sessions/2026/10/31");
+        fs::create_dir_all(&day).unwrap();
+        let roots =
+            watcher_roots_with(&base.join("user"), std::slice::from_ref(&slot_home)).unwrap();
+        assert!(roots.contains(&(SnapshotSource::Codex, slot_home.join("sessions"))));
+        let watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).unwrap();
+        let session = day.join("rollout-2026-10-31T10-00-00-slot.jsonl");
+        let unrelated = slot_home.join("history.jsonl");
+        // Native watcher startup is asynchronous, so keep writing until the
+        // session write is seen; every queued batch must exclude `unrelated`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no slot session event"
+            );
+            fs::write(&unrelated, "{}\n").unwrap();
+            fs::write(&session, "{}\n").unwrap();
+            match watcher
+                .events
+                .recv_timeout(std::time::Duration::from_millis(250))
+            {
+                Ok(event) if event.source == SnapshotSource::Codex => {
+                    assert!(!event.paths.contains(&unrelated));
+                    if event.paths.contains(&session) {
+                        break;
+                    }
+                }
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("watch event channel: {error}"),
+            }
+        }
     }
 
     #[test]
