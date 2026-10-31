@@ -76,6 +76,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for State {
 }
 impl State {
     pub(super) fn refused() -> Self {
+        if !restart_restore::enabled() { return Self::default(); }
         Self(Some(Box::new(Ledger {
             closed: true,
             ..Ledger::default()
@@ -320,6 +321,7 @@ mod tests {
     /// [format] reservation save moves the working baseline on a bound path.
     #[test]
     fn reservation_save_moves_the_working_baseline_on_a_bound_path() {
+        let _on = RestartRestoreForTest::enabled();
         use std::os::unix::fs::PermissionsExt;
         let root = crate::test_scratch::private_dir("o3-bound-baseline");
         let namespace = root.join("a".repeat(64));
@@ -361,6 +363,7 @@ mod tests {
     /// [format] partial checkpoint unions negative spends without live permissions.
     #[test]
     fn partial_checkpoint_unions_negative_spends_without_live_permissions() {
+        let _on = RestartRestoreForTest::enabled();
         let mut committed = ScanIndex::default();
         assert!(!committed.o3_replay.upgrade_missing("old", true));
         committed.o3_replay.saved();

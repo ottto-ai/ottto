@@ -13063,6 +13063,7 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
         return;
     }
     let side = crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
+    let shared_root = crate::snapshots::sampled_scan::OFF_MAIN_SHARED_BYTES.max(size_of::<SharedCache>());
     let cache = Arc::new(SharedCache::default());
     let walked = |cache: &SharedCache| {
         cache
@@ -13099,7 +13100,7 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
     cache.cursor.heap_bound(&mut parts).unwrap();
     assert_eq!(
         whole.bytes,
-        size_of::<SharedCache>()
+        shared_root
             + align_of::<SharedCache>()
             + 2 * size_of::<usize>()
             + parts.bytes
@@ -13126,7 +13127,7 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
     let overhead = crate::snapshots::sampled_scan::context_overhead(context).unwrap();
     assert_eq!(
         overhead,
-        size_of::<crate::snapshots::sampled_scan::Context>() + size_of::<SharedCache>()
+        size_of::<crate::snapshots::sampled_scan::Context>() + shared_root
             - size_of::<PaceTable>()
             + align_of::<SharedCache>()
             + 2 * size_of::<usize>()
