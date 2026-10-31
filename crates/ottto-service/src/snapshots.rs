@@ -1,13 +1,13 @@
 use crate::codex_scan_diagnostics::{
-    self, CapCounts, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy,
-    IncompleteShape, ParentUnresolvableCauses, RecoveryLineage, StateRowFieldDiffs,
-    UnreadableCause, UnreadableCauses, LINEAGE_SAMPLES,
+    self, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy, IncompleteShape,
+    ParentUnresolvableCauses, RecoveryLineage, StateRowFieldDiffs, UnreadableCause,
+    UnreadableCauses, LINEAGE_SAMPLES,
 };
 use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
 use crate::local_resource_diagnostics::claude_reread::IgnoredVeto;
 use crate::local_resource_diagnostics::rearm_cause;
-use crate::local_resource_diagnostics::{line_delivery_unselected, UnselectedReason};
+use crate::local_resource_diagnostics::{line_delivery_unselected, CapCounts, UnselectedReason};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::ser::SerializeStruct;
@@ -25,7 +25,6 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -7742,6 +7741,7 @@ pub struct SourceScanResult {
     pending_finalization: Vec<PendingIndexFinalization>,
     /// RAM-only observations of this bounded page; never serialized or uploaded.
     discovery_growth: discovery_growth::Page,
+    pub(crate) cap_counts: CapCounts,
     pub(crate) local_codex_diagnostics: Option<CodexScanDiagnostics>,
     /// Local-only V2 counting receipts of this scan, moved out of its census.
     /// `None` when no configured counting parse finished (never a zero block).
@@ -17620,10 +17620,8 @@ fn is_claude_desktop_session_id(value: &str) -> bool {
 /// turn lack a durable response-level selector join. Absence is not positive
 /// proof of standard pricing. File-owned receipts preserve previously applied
 /// decisions after traces expire without extending them to new contributions.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct CodexTurnTraceMap {
-    // Transient slots: boundary, bootstrap, signature clear, trace-row limit.
-    cap_events: [AtomicU64; 4],
     since_epoch: i64,
     priority_turns: BTreeSet<String>,
     /// A present trace DB failed to load, or its row cap was reached: absent
@@ -19071,16 +19069,13 @@ impl SnapshotAccumulator {
         })
     }
 
-    fn note_codex_cap(&self, event: usize) {
-        if let Some(traces) = &self.codex_turn_traces {
-            CapCounts::record(&traces.cap_events[event]);
-        }
-    }
-
     fn buffer_codex_boundary_record(&mut self, value: &Value) {
         const MAX_BOUNDARY_BUFFER_RECORDS: usize = 64;
         if self.codex_boundary_buffer_len() == MAX_BOUNDARY_BUFFER_RECORDS {
-            self.note_codex_cap(0);
+            // Proof-only child parsing stays outside these ordinary-ingestion events.
+            if !self.codex_proof_decision_only {
+                CapCounts::record(self.source.api_slug(), 0, 1);
+            }
             self.clear_codex_boundary_buffer();
             self.codex_legacy_bootstrap_valid = false;
             self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
@@ -19140,7 +19135,7 @@ impl SnapshotAccumulator {
                 return;
             }
             if self.codex_legacy_bootstrap_buffer.len() == MAX_BOOTSTRAP_RECORDS {
-                self.note_codex_cap(1);
+                CapCounts::record(self.source.api_slug(), 1, 1);
                 self.codex_legacy_bootstrap_buffer.clear();
                 self.codex_legacy_bootstrap_valid = false;
                 return;
@@ -19238,7 +19233,7 @@ impl SnapshotAccumulator {
             return;
         };
         if self.codex_physical_signatures.len() == MAX_CODEX_PARENT_LEDGER_SIGNATURES {
-            self.note_codex_cap(2);
+            CapCounts::record(self.source.api_slug(), 2, 1);
             self.codex_physical_signatures.clear();
             self.codex_physical_signatures_complete = false;
             return;
@@ -31427,12 +31422,12 @@ impl OwnedSourceScan {
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
                 context_read_budget.flush(index, &codex_selected_flags);
-                if let Some(traces) = &codex_turn_traces {
-                    if let Some(traversal) = index.traversal.as_mut() {
-                        traversal.counts.caps.drain(&traces.cap_events);
-                    }
-                }
                 if codex_page.continuation() {
+                    let cap_counts = index
+                        .traversal
+                        .as_mut()
+                        .map(|t| t.counts.caps.drain(source.api_slug()))
+                        .unwrap_or_default();
                     let continuation_evidence = codex_join_inventory.map(|inventory| {
                         Arc::new(Mutex::new(Some(CodexContinuationEvidence {
                             inventory,
@@ -31445,6 +31440,7 @@ impl OwnedSourceScan {
                         index: index_storage,
                         terminal_native_traversal: None,
                         scan: SourceScanResult {
+                            cap_counts,
                             discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                             continuation_ticket,
                             continuation_evidence,
@@ -31801,6 +31797,9 @@ impl OwnedSourceScan {
                                     .is_some_and(|boot| boot.group.owner == owner)
                         });
                     }
+                }
+                if let Some(traversal) = index.traversal.as_mut() {
+                    traversal.counts.caps.drain(source.api_slug());
                 }
                 let traversal_snapshot = index
                     .traversal
@@ -32215,6 +32214,7 @@ impl OwnedSourceScan {
                     );
                 }
                 let scan = SourceScanResult {
+                    cap_counts: counts.caps,
                     discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                     strict_cohort_deferred_root_count: 0,
                     source,
@@ -32285,7 +32285,6 @@ impl OwnedSourceScan {
                             // PR-P: traversal-cumulative per-page counts, as
                             // `unreadable_causes`.
                             parent_unresolvable: counts.parent_unresolvable,
-                            caps: counts.caps,
                             // PR-P: omitted unless established on this page.
                             parent_restarts_in_scope: codex_parent_identities.parent_restarts,
                             gates: CensusGates {
@@ -40876,7 +40875,6 @@ impl CodexTurnTraceMap {
                     &db_path,
                     since_epoch,
                     &mut map.priority_turns,
-                    &map.cap_events[3],
                 );
             }
         }
@@ -40899,7 +40897,6 @@ fn load_codex_logs2_priority_turns(
     path: &Path,
     since_epoch: i64,
     priority_turns: &mut BTreeSet<String>,
-    row_limit_hits: &AtomicU64,
 ) -> bool {
     if !path.exists() {
         return true;
@@ -40945,7 +40942,7 @@ fn load_codex_logs2_priority_turns(
     }
     // Saturation is potential omission, not an exact excluded-trace count.
     if read == CODEX_LOGS2_MAX_ROWS as u64 {
-        CapCounts::record(row_limit_hits);
+        CapCounts::record("codex", 3, 1);
     }
     complete && read < CODEX_LOGS2_MAX_ROWS as u64
 }
@@ -43581,11 +43578,7 @@ fn record_codex_inventory_hold(
                 .keys()
                 .filter(|key| !hold.owed.contains(*key) && !hold.refused_headers.contains_key(*key))
                 .count();
-        traversal.counts.caps.inventory_hold_keys_discarded = traversal
-            .counts
-            .caps
-            .inventory_hold_keys_discarded
-            .saturating_add(keys as u64);
+        CapCounts::record("codex", 5, keys as u64);
         // Past the bound only the next walk re-selects them, as before.
         traversal.residue.codex_inventory_hold = None;
     }
@@ -51519,9 +51512,8 @@ impl ScanIndex {
         if fits {
             self.codex_parent_ownership_refs
                 .insert(resolve_codex_identity(parent));
-        } else if let Some(traversal) = self.traversal.as_mut() {
-            traversal.counts.caps.parent_ref_refusals =
-                traversal.counts.caps.parent_ref_refusals.saturating_add(1);
+        } else {
+            CapCounts::record("codex", 4, 1);
         }
         fits
     }
@@ -84815,7 +84807,7 @@ crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ord
 crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
-crate::heap_layout_bound::fields!(CodexTurnTraceMap; cap_events, since_epoch, priority_turns, incomplete);
+crate::heap_layout_bound::fields!(CodexTurnTraceMap; since_epoch, priority_turns, incomplete);
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
     ownership_incomplete_file_count, cause, zero_snapshot_usage_evidence, dropped_usage_record_count,
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,

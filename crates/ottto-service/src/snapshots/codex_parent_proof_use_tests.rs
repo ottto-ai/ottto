@@ -197,7 +197,7 @@ fn parse(
     ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
     proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
 ) -> ParsedJsonlFile {
-    parse_forged(path, ledgers, proof, |_| {}, None)
+    parse_forged(path, ledgers, proof, |_| {})
 }
 
 /// `parse`, with `forge` applied to the accumulator after the last step
@@ -207,7 +207,6 @@ fn parse_forged(
     ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
     proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
     forge: impl FnOnce(&mut SnapshotAccumulator),
-    traces: Option<Arc<CodexTurnTraceMap>>,
 ) -> ParsedJsonlFile {
     let metadata = CodexTitleMetadata::default();
     let mut file = File::open(path).unwrap();
@@ -218,7 +217,7 @@ fn parse_forged(
         SnapshotSource::Codex,
         apply_codex_line,
         Some(&metadata),
-        traces,
+        None,
         Some(Arc::new(Mutex::new(ledgers))),
         true,
         true,
@@ -414,19 +413,13 @@ fn a_mismatched_or_undecided_proof_is_base_exactly() {
     // cannot occur), fails closed in every build: held under main's cause
     // (`NoLedger` with none), never pending, ownership-incomplete.
     for evidence in [witness(CodexParentUnresolvable::Oversize), BTreeMap::new()] {
-        let forged = parse_forged(
-            &child,
-            evidence,
-            Some(installed(&good)),
-            |accumulator| {
-                let (matched, digest, owned) = accumulator
-                    .codex_parent_prefix_decided
-                    .expect("the arm decided as proven");
-                assert_eq!((matched, owned), (good.matched, good.owned));
-                accumulator.codex_parent_prefix_decided = Some((matched - 1, digest, owned));
-            },
-            None,
-        );
+        let forged = parse_forged(&child, evidence, Some(installed(&good)), |accumulator| {
+            let (matched, digest, owned) = accumulator
+                .codex_parent_prefix_decided
+                .expect("the arm decided as proven");
+            assert_eq!((matched, owned), (good.matched, good.owned));
+            accumulator.codex_parent_prefix_decided = Some((matched - 1, digest, owned));
+        });
         assert_eq!(
             forged.codex_parent_proof_refusal,
             Some(ProofRefusal::Decision)
@@ -1072,17 +1065,17 @@ fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
         assert_eq!(used.codex_parent_proof_refusal, None);
     }
     // Undecided under the ledger too: main holds these children.
-    let traces = Arc::new(CodexTurnTraceMap::default());
+    CapCounts::default().drain("codex");
     for path in [&parent_exhausted.0, &child_exhausted.0, &overflow.0] {
         assert!(
-            !parse_forged(path, complete_ledger(), None, |_| {}, Some(traces.clone())).complete(),
+            !parse(path, complete_ledger(), None).complete(),
             "{}",
             path.display()
         );
     }
-    // [behaviour] The ordinary overflow is visible; proof-only parsing is excluded.
+    // [behaviour] The ordinary overflow is visible through the shared source carrier.
     let mut caps = CapCounts::default();
-    caps.drain(&traces.cap_events);
+    caps.drain("codex");
     assert_eq!(caps.boundary_overflow_events, 1);
     let _ = fs::remove_dir_all(root);
 }
@@ -2129,15 +2122,9 @@ fn a_hold_built_before_its_proof_is_not_memoized() {
         matches!(refusal, Some(ProofRefusal::Identity(_))),
         "{refusal:?}"
     );
-    let refused = parse_forged(
-        &scene.child.path,
-        witness(Oversize),
-        None,
-        |acc| {
-            acc.codex_parent_proof_refusal = refusal.clone();
-        },
-        None,
-    );
+    let refused = parse_forged(&scene.child.path, witness(Oversize), None, |acc| {
+        acc.codex_parent_proof_refusal = refusal.clone();
+    });
     assert!(!refused.complete());
     assert!(!awaits(&scene, &refused));
 

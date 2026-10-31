@@ -1,6 +1,6 @@
 //! Content-free observations in the existing local service log, never wire data.
 //! CPU includes concurrent process work; maximum RSS is a lifetime high-water mark.
-use serde::{ser::SerializeMap, Serialize};
+use serde::{ser::SerializeMap, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -312,6 +312,59 @@ pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64) {
     )
 }
 
+/// Sparse local traversal totals; additive named fields, never wire or decision inputs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct CapCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub boundary_overflow_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub bootstrap_overflow_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub parent_signature_clear_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub price_trace_row_limit_hits: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub parent_ref_refusals: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub inventory_hold_keys_discarded: u64,
+}
+impl CapCounts {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    /// Existing process/source event slots, folded into this traversal's local totals.
+    pub(crate) fn drain(&mut self, source: &str) -> Self {
+        for (event, total) in [
+            &mut self.boundary_overflow_events,
+            &mut self.bootstrap_overflow_events,
+            &mut self.parent_signature_clear_events,
+            &mut self.price_trace_row_limit_hits,
+            &mut self.parent_ref_refusals,
+            &mut self.inventory_hold_keys_discarded,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            *total = total.saturating_add(source_count(source, CAP_EVENT_START + event, |n| {
+                n.swap(0, Relaxed)
+            }));
+        }
+        if !self.is_empty() {
+            traversal_point("scan_cap_events", source, self);
+        }
+        *self
+    }
+    pub(crate) fn record(source: &str, event: usize, amount: u64) {
+        source_count(source, CAP_EVENT_START + event, |slot| {
+            slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+                .unwrap_or_else(|n| n)
+        });
+    }
+}
+
+crate::heap_layout_bound::fields!(CapCounts; boundary_overflow_events, bootstrap_overflow_events, parent_signature_clear_events, price_trace_row_limit_hits, parent_ref_refusals, inventory_hold_keys_discarded);
+
 /// K10 (LD): one line observer's counts for a page; nonzero keys only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct LineDeliveryCounts {
@@ -332,8 +385,9 @@ pub(crate) enum UnselectedReason {
     /// F4 kept custody because another same-member path prevents absence proof.
     WithheldAbsenceAmbiguous = 18,
 }
-/// Three reasons, seven withheld events, growth, deleted tokens and audit retirement.
-const UNSELECTED_REASONS: usize = 19;
+// Existing discovery/withheld slots 0..19, then six fixed cap-event slots.
+const CAP_EVENT_START: usize = 19;
+const UNSELECTED_REASONS: usize = CAP_EVENT_START + 6;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
