@@ -40,6 +40,7 @@ pub(super) struct ContextCurveCandidateBoundary {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub struct SnapshotContextCurvePoint {
     pub owned_request_ordinal: u64,
     pub observed_at: String,
@@ -52,6 +53,7 @@ pub struct SnapshotContextCurvePoint {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub struct SnapshotContextCurveBoundary {
     pub boundary_index: u64,
     pub observed_at: String,
@@ -62,6 +64,7 @@ pub struct SnapshotContextCurveBoundary {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub struct SnapshotContextCurveModelWindow {
     pub model_window_index: u16,
     pub model: String,
@@ -71,6 +74,7 @@ pub struct SnapshotContextCurveModelWindow {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub struct SnapshotContextCurve {
     pub contract_version: String,
     pub parser_revision: String,

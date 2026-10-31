@@ -52945,33 +52945,72 @@ mod tests {
         path
     }
 
+    /// Reads a curve from the cross-language golden fixtures. The daemon no
+    /// longer builds curves; retained bodies may still carry one.
+    fn context_curve_golden_fixture(file: &str, key: Option<&str>) -> SnapshotContextCurve {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/snapshot-audit")
+            .join(file);
+        let value: Value =
+            serde_json::from_slice(&fs::read(path).expect("read curve fixture")).expect("json");
+        let value = match key {
+            Some(key) => value[key].clone(),
+            None => value,
+        };
+        serde_json::from_value(value).expect("curve fixture decodes")
+    }
+
     fn max_fractional_context_curve_fixture() -> SnapshotContextCurve {
-        let candidates = (0..1_300_u64)
-            .map(|index| ContextCurveCandidatePoint {
-                observed_at: Some(format!(
-                    "2037-01-15T10:{:02}:{:02}.003000000+02:00",
-                    (index / 60) % 60,
-                    index % 60
-                )),
-                effective_input_tokens: u64::MAX - index,
-                model: Some(format!("model-{:02}-{}", index % 16, "x".repeat(119))),
-                context_window_tokens: Some(u64::MAX - index % 16),
-            })
-            .collect::<Vec<_>>();
-        let boundaries = (1..=70_u64)
-            .map(|index| ContextCurveCandidateBoundary {
-                observed_at: candidates[index as usize * 10].observed_at.clone(),
-                point_count_before: index * 10,
-            })
-            .collect::<Vec<_>>();
-        build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &candidates,
-            &boundaries,
-            "parser_unsupported",
-        )
+        context_curve_golden_fixture("context-curve-v1-max-fractional.json", None)
+    }
+
+    /// One owned request as the retired builder emitted it: ordinal 1 carries
+    /// the anchor, peak and tail flags.
+    fn single_request_context_curve(
+        parser_revision: &str,
+        ownership_revision: &str,
+        model_evidence_revision: &str,
+        observed_at: &str,
+        effective_input_tokens: u64,
+        model: &str,
+        context_window_tokens: Option<u64>,
+    ) -> SnapshotContextCurve {
+        SnapshotContextCurve {
+            contract_version: CONTEXT_CURVE_CONTRACT_VERSION.to_string(),
+            parser_revision: parser_revision.to_string(),
+            ownership_revision: ownership_revision.to_string(),
+            sampling_revision: CONTEXT_CURVE_SAMPLING_REVISION.to_string(),
+            coverage: "complete".to_string(),
+            total_owned_request_count: 1,
+            retained_point_count: 1,
+            total_compaction_boundary_count: 0,
+            retained_boundary_count: 0,
+            points: vec![SnapshotContextCurvePoint {
+                owned_request_ordinal: 1,
+                observed_at: observed_at.to_string(),
+                effective_input_tokens,
+                model_window_index: 0,
+                segment_ordinal: 0,
+                retention_flags: CONTEXT_CURVE_RETENTION_ANCHOR
+                    | CONTEXT_CURVE_RETENTION_PEAK
+                    | CONTEXT_CURVE_RETENTION_TAIL,
+                compaction_before_request_boundary_index: None,
+                compaction_after_request_boundary_index: None,
+            }],
+            boundaries: Vec::new(),
+            model_windows: vec![SnapshotContextCurveModelWindow {
+                model_window_index: 0,
+                model: model.to_string(),
+                context_window_tokens,
+                evidence_kind: if context_window_tokens.is_some() {
+                    "provider_reported_window"
+                } else {
+                    "provider_reported_model"
+                }
+                .to_string(),
+                evidence_revision: model_evidence_revision.to_string(),
+            }],
+        }
     }
 
     fn terminal_unhealthy_traversal(context_fingerprint: String) -> ScanTraversalCheckpoint {
@@ -70456,184 +70495,12 @@ mod tests {
     }
 
     #[test]
-    fn context_curve_collection_is_inert_without_server_capability() {
-        let root = temp_dir("context-curve-capability-gate");
-        let path = root.join("rollout-capability-gate.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-08-24T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"capability-gate\"}}\n",
-                "{\"timestamp\":\"2026-08-24T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":42,\"output_tokens\":2,\"request_count\":1},\"last_token_usage\":{\"input_tokens\":42,\"output_tokens\":2},\"model_context_window\":258400,\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write rollout");
-        let scan = |context_curve_enabled| {
-            scan_source_roots_with_limit_and_attribution_and_curve(
-                SnapshotSource::Codex,
-                std::slice::from_ref(&root),
-                &mut ScanIndex::default(),
-                "2026-08-24T10:02:00Z",
-                730,
-                10,
-                true,
-                None,
-                None,
-                &[],
-                false,
-                context_curve_enabled,
-            )
-            .expect("scan")
-        };
-        assert_eq!(scan(false).snapshots[0].context_curve, None);
-        assert!(scan(true).snapshots[0].context_curve.is_some());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn context_curve_fails_closed_on_unsafe_or_unbounded_model_evidence() {
-        let hostile_path = "/Users/operator/private/repository/session.jsonl";
-        let hostile = build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &[ContextCurveCandidatePoint {
-                observed_at: Some("2026-08-20T12:00:01Z".to_string()),
-                effective_input_tokens: 10,
-                model: Some(hostile_path.to_string()),
-                context_window_tokens: None,
-            }],
-            &[],
-            "parser_unsupported",
-        );
-        assert_eq!(hostile.coverage, "complete");
-        assert_eq!(hostile.model_windows[0].model, "unknown");
-        assert_eq!(hostile.model_windows[0].evidence_kind, "unavailable");
-        assert!(!serde_json::to_string(&hostile)
-            .expect("serialize hostile evidence")
-            .contains(hostile_path));
-
-        let window_without_safe_model = build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &[ContextCurveCandidatePoint {
-                observed_at: Some("2026-08-20T12:00:01Z".to_string()),
-                effective_input_tokens: 10,
-                model: Some(hostile_path.to_string()),
-                context_window_tokens: Some(258_400),
-            }],
-            &[],
-            "parser_unsupported",
-        );
-        assert_eq!(window_without_safe_model.coverage, "complete");
-        assert_eq!(window_without_safe_model.model_windows[0].model, "unknown");
-        assert_eq!(
-            window_without_safe_model.model_windows[0].evidence_kind,
-            "provider_reported_window"
-        );
-
-        let too_many_models = (0..17_u64)
-            .map(|index| ContextCurveCandidatePoint {
-                observed_at: Some(format!("2026-08-20T12:00:{:02}Z", index + 1)),
-                effective_input_tokens: index + 1,
-                model: Some(format!("model-{index}")),
-                context_window_tokens: None,
-            })
-            .collect::<Vec<_>>();
-        let unavailable = build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &too_many_models,
-            &[],
-            "parser_unsupported",
-        );
-        assert_eq!(unavailable.coverage, "parser_unsupported");
-        assert_eq!(unavailable.total_owned_request_count, 0);
-        assert!(unavailable.points.is_empty());
-    }
-
-    #[test]
-    fn context_curve_fails_closed_without_exact_boundary_adjacency() {
-        let candidates = [1_u64, 2]
-            .into_iter()
-            .map(|ordinal| ContextCurveCandidatePoint {
-                observed_at: Some(format!("2026-08-20T12:00:0{ordinal}Z")),
-                effective_input_tokens: ordinal * 10,
-                model: Some("gpt-5.5".to_string()),
-                context_window_tokens: Some(258_400),
-            })
-            .collect::<Vec<_>>();
-        for point_count_before in [0_u64, 2] {
-            let curve = build_context_curve(
-                CODEX_SNAPSHOT_PARSER_VERSION,
-                "codex_owned_rollout_occurrences:v1",
-                "codex_token_count_model_context_window:v1",
-                &candidates,
-                &[ContextCurveCandidateBoundary {
-                    observed_at: Some("2026-08-20T12:00:01Z".to_string()),
-                    point_count_before,
-                }],
-                "ownership_unresolved",
-            );
-            assert_eq!(curve.coverage, "ownership_unresolved");
-            assert!(curve.boundaries.is_empty());
-        }
-        let out_of_interval = build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &candidates,
-            &[ContextCurveCandidateBoundary {
-                observed_at: Some("2026-08-20T12:00:03Z".to_string()),
-                point_count_before: 1,
-            }],
-            "ownership_unresolved",
-        );
-        assert_eq!(out_of_interval.coverage, "ownership_unresolved");
-        assert!(out_of_interval.boundaries.is_empty());
-    }
-
-    #[test]
     fn context_curve_cross_language_golden_is_canonical_and_current() {
-        let point = |timestamp: &str, tokens: u64, model: &str, window: Option<u64>| {
-            ContextCurveCandidatePoint {
-                observed_at: Some(timestamp.to_string()),
-                effective_input_tokens: tokens,
-                model: Some(model.to_string()),
-                context_window_tokens: window,
-            }
-        };
-        let codex = build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &[
-                point("2026-08-20T12:00:01Z", 18_000, "gpt-5.5", Some(258_400)),
-                point("2026-08-20T12:00:02Z", 42_000, "gpt-5.5", Some(258_400)),
-                point("2026-08-20T12:00:04Z", 21_000, "gpt-5.5", Some(258_400)),
-            ],
-            &[ContextCurveCandidateBoundary {
-                observed_at: Some("2026-08-20T12:00:03Z".to_string()),
-                point_count_before: 2,
-            }],
-            "parser_unsupported",
-        );
-        let claude = build_context_curve(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            "claude_owned_request_start_proof:v1",
-            "claude_transcript_model:v1",
-            &[
-                point("2026-08-20T13:00:01Z", 115, "claude-opus-4-8", None),
-                point("2026-08-20T13:00:03Z", 220, "claude-opus-4-8", None),
-                point("2026-08-20T13:00:04Z", 337, "claude-opus-4-8", None),
-            ],
-            &[ContextCurveCandidateBoundary {
-                observed_at: Some("2026-08-20T13:00:02Z".to_string()),
-                point_count_before: 1,
-            }],
-            "parser_unsupported",
-        );
+        // The builder is retired; the committed fixture is the source of
+        // truth and must still round-trip byte-for-byte.
+        let codex = context_curve_golden_fixture("context-curve-v1-golden.json", Some("codex"));
+        let claude =
+            context_curve_golden_fixture("context-curve-v1-golden.json", Some("claude_code"));
         let witness = |curve: SnapshotContextCurve,
                        tool_usage: Option<Vec<SnapshotToolUsage>>,
                        tool_usage_truncated: bool| {
@@ -70699,11 +70566,11 @@ mod tests {
             "revisions": {
                 "sampling": CONTEXT_CURVE_SAMPLING_REVISION,
                 "codex_parser": CODEX_SNAPSHOT_PARSER_VERSION,
-                "codex_ownership": CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION,
-                "codex_model_window_evidence": CODEX_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
+                "codex_ownership": "codex_owned_rollout_occurrences:v1",
+                "codex_model_window_evidence": "codex_token_count_model_context_window:v1",
                 "claude_parser": CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-                "claude_ownership": CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
-                "claude_model_window_evidence": CLAUDE_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
+                "claude_ownership": "claude_owned_request_start_proof:v2",
+                "claude_model_window_evidence": "claude_transcript_model:v1",
             },
             "body_witnesses": body_witnesses,
         });
@@ -70752,18 +70619,14 @@ mod tests {
 
     #[test]
     fn context_curve_requires_exact_durable_entity_ack_proof() {
-        let curve = build_context_curve(
+        let curve = single_request_context_curve(
             CODEX_SNAPSHOT_PARSER_VERSION,
             "codex_owned_rollout_occurrences:v1",
             "codex_token_count_model_context_window:v1",
-            &[ContextCurveCandidatePoint {
-                observed_at: Some("2026-08-20T12:00:00.003Z".to_string()),
-                effective_input_tokens: 42,
-                model: Some("gpt-5.5".to_string()),
-                context_window_tokens: Some(258_400),
-            }],
-            &[],
-            "parser_unsupported",
+            "2026-08-20T12:00:00.003Z",
+            42,
+            "gpt-5.5",
+            Some(258_400),
         );
         let mut item = sample_session_artifact_item();
         item.context_curve = Some(curve);
@@ -70882,18 +70745,14 @@ mod tests {
 
     #[test]
     fn body_witness_ack_normalization_fixture_is_canonical_and_current() {
-        let curve = build_context_curve(
+        let curve = single_request_context_curve(
             CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
             "claude_owned_request_start_proof:v1",
             "claude_transcript_model:v1",
-            &[ContextCurveCandidatePoint {
-                observed_at: Some("2026-08-30T12:00:00Z".to_string()),
-                effective_input_tokens: 42,
-                model: Some("claude-opus-4-8".to_string()),
-                context_window_tokens: None,
-            }],
-            &[],
-            "ownership_unresolved",
+            "2026-08-30T12:00:00Z",
+            42,
+            "claude-opus-4-8",
+            None,
         );
         let mut nonexclusive = sample_session_artifact_item();
         nonexclusive.context_curve = Some(curve.clone());
@@ -71205,7 +71064,10 @@ mod tests {
         prepare_cache_observations(&mut parsed, None);
         assert!(parsed.session_account_evidence.is_some());
         assert!(parsed.cache_observations.is_some());
-        assert!(parsed.context_curve.is_some());
+        assert!(parsed.context_curve.is_none());
+        // The parser no longer builds curves; curve cases carry a retained one.
+        let retained_curve =
+            context_curve_golden_fixture("context-curve-v1-golden.json", Some("codex"));
         assert_eq!((parsed.input_tokens, parsed.output_tokens), (300_000, 3));
         let mut cases = Vec::new();
         for capability in ["creator", "cache", "combined", "legacy"] {
@@ -71228,9 +71090,7 @@ mod tests {
                         if !exclusive {
                             item.usage_accounting_contract = None;
                         }
-                        if !curve {
-                            item.context_curve = None;
-                        }
+                        item.context_curve = curve.then(|| retained_curve.clone());
                         item.tool_usage = match tools {
                             "empty_default_only" => Some(vec![]),
                             "nonempty" => Some(vec![SnapshotToolUsage {
@@ -72117,28 +71977,19 @@ mod tests {
         let root = temp_dir("context-curve-body-witness");
         let path = root.join("curve-session.jsonl");
         let base = "{\"timestamp\":\"2026-08-20T12:00:01Z\",\"sessionId\":\"curve-session\",\"requestId\":\"req_curve_1\",\"message\":{\"id\":\"msg_curve_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":5}}}\n";
-        let point = |tokens| ContextCurveCandidatePoint {
-            observed_at: Some("2026-08-20T12:00:01Z".to_string()),
-            effective_input_tokens: tokens,
-            model: Some("claude-opus-4-8".to_string()),
-            context_window_tokens: None,
+        let curve = |tokens| {
+            single_request_context_curve(
+                CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+                "claude_owned_request_start_proof:v1",
+                "claude_transcript_model:v1",
+                "2026-08-20T12:00:01Z",
+                tokens,
+                "claude-opus-4-8",
+                None,
+            )
         };
-        let curve_a = build_context_curve(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            "claude_owned_request_start_proof:v1",
-            "claude_transcript_model:v1",
-            &[point(100)],
-            &[],
-            "ownership_unresolved",
-        );
-        let curve_b = build_context_curve(
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-            "claude_owned_request_start_proof:v1",
-            "claude_transcript_model:v1",
-            &[point(125)],
-            &[],
-            "ownership_unresolved",
-        );
+        let curve_a = curve(100);
+        let curve_b = curve(125);
         let mut index = ScanIndex::default();
         let mut revision = 0_usize;
         let mut run = |curve: Option<SnapshotContextCurve>| {
@@ -79925,18 +79776,14 @@ mod tests {
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
             compaction_total_duration_ms: None,
-            context_curve: Some(build_context_curve(
+            context_curve: Some(single_request_context_curve(
                 CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
                 "claude_owned_request_start_proof:v1",
                 "claude_transcript_model:v1",
-                &[ContextCurveCandidatePoint {
-                    observed_at: Some("2026-05-28T17:05:00Z".to_string()),
-                    effective_input_tokens: 115,
-                    model: Some("claude-opus-4-7".to_string()),
-                    context_window_tokens: None,
-                }],
-                &[],
-                "parser_unsupported",
+                "2026-05-28T17:05:00Z",
+                115,
+                "claude-opus-4-7",
+                None,
             )),
             claude_context_curve_boundaries: Vec::new(),
             claude_context_curve_identity_complete: false,
@@ -80164,18 +80011,14 @@ mod tests {
                     request.source = SnapshotSource::Codex.api_slug().to_string();
                     let item = &mut request.snapshots[0];
                     item.provenance.collector = "codex_state_sqlite".to_string();
-                    item.context_curve = Some(build_context_curve(
+                    item.context_curve = Some(single_request_context_curve(
                         CODEX_SNAPSHOT_PARSER_VERSION,
                         "codex_owned_rollout_occurrences:v1",
                         "codex_token_count_model_context_window:v1",
-                        &[ContextCurveCandidatePoint {
-                            observed_at: Some("2026-08-20T12:00:01Z".to_string()),
-                            effective_input_tokens: 10,
-                            model: Some("gpt-5.5".to_string()),
-                            context_window_tokens: Some(258_400),
-                        }],
-                        &[],
-                        "pre_capture",
+                        "2026-08-20T12:00:01Z",
+                        10,
+                        "gpt-5.5",
+                        Some(258_400),
                     ));
                     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, item);
                 },
