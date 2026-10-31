@@ -8672,10 +8672,35 @@ pub fn apply_claude_effort_evidence_with_index(
     census_complete: bool,
     census_window_end: &str,
 ) {
+    apply_claude_effort_evidence_with_shared_cache(
+        snapshots,
+        evidence_by_session,
+        index,
+        census_complete,
+        census_window_end,
+        None,
+    );
+}
+
+pub(crate) fn apply_claude_effort_evidence_with_shared_cache(
+    snapshots: &mut [SnapshotItem],
+    evidence_by_session: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
+    index: &mut ScanIndex,
+    census_complete: bool,
+    census_window_end: &str,
+    child_cache: Option<&sampled_scan::SharedCache>,
+) {
     if !index.persistence_available() {
         return;
     }
 
+    let child_witness_roots = terminal_off_policy::child_evidence_digest().then(|| {
+        index
+            .claude_account_family_witnesses
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    });
     let census_complete = claude_terminal_authority(index, census_complete, census_window_end);
     // A fingerprint version mismatch is missing proof, never an observed
     // account change. Preserve owners/ACKs and select the affected files even
@@ -8840,6 +8865,33 @@ pub fn apply_claude_effort_evidence_with_index(
         &mut index.claude_account_family_witnesses,
         &proven_families,
     );
+    if let Some(before) = child_witness_roots {
+        let mut roots = before
+            .into_iter()
+            .filter(|root| !index.claude_account_family_witnesses.contains_key(root))
+            .collect::<BTreeSet<_>>();
+        if census_complete {
+            roots.extend(
+                complete_family_members
+                    .iter()
+                    .filter_map(|(root, members)| {
+                        let missed =
+                            index
+                                .claude_account_family_pending
+                                .get(root)
+                                .map_or(true, |pending| {
+                                    pending.census_window_end != census_window_end
+                                        || &pending.members.keys().cloned().collect::<BTreeSet<_>>()
+                                            != members
+                                });
+                        missed.then(|| root.clone())
+                    }),
+            );
+        }
+        if let Some(cache) = child_cache {
+            child_evidence_digest::reproof_missing_families(index, census_window_end, roots, cache);
+        }
+    }
     if census_complete {
         for pending in index.claude_account_family_pending.values_mut() {
             if pending.census_window_end == census_window_end {
@@ -25962,12 +26014,7 @@ fn prepare_owned_scan_candidate(
     support: Option<&Path>,
 ) {
     prepare_owned_scan_candidate_with_child_evidence(
-        source,
-        candidate,
-        codex,
-        claude,
-        support,
-        &mut child_evidence_digest::Page::default(),
+        source, candidate, codex, claude, support, None,
     );
 }
 
@@ -25977,7 +26024,7 @@ fn prepare_owned_scan_candidate_with_child_evidence(
     codex_title_metadata: &CodexTitleMetadata,
     claude_title_metadata: &ClaudeTitleMetadata,
     claude_effort_support_dir: Option<&Path>,
-    child_evidence: &mut child_evidence_digest::Page,
+    child_evidence: Option<&mut child_evidence_digest::Page>,
 ) {
     // Sidecar contribution is path-derived and can be computed before the
     // transcript opens. Transcript identity itself is filled from the
@@ -26014,7 +26061,7 @@ fn prepare_owned_scan_candidate_with_child_evidence(
                     &identity,
                     claude_effort_support_dir,
                     child_evidence
-                        .digest(claude_effort_support_dir, &identity)
+                        .and_then(|page| page.digest(claude_effort_support_dir, &identity))
                         .as_deref(),
                 )
             } else {
@@ -26080,7 +26127,7 @@ pub(crate) struct OwnedSourceScan {
     claude_effort_support_dir: Option<PathBuf>,
     codex_title_metadata: CodexTitleMetadata,
     claude_title_metadata: ClaudeTitleMetadata,
-    child_evidence: child_evidence_digest::Page,
+    child_evidence: Option<Box<child_evidence_digest::Page>>,
     state_census_complete: bool,
     sidecar_census_complete: bool,
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
@@ -26552,6 +26599,7 @@ impl OwnedSourceScan {
             context_curve_enabled,
             claude_request_identity_capture,
             &[],
+            None,
         )
     }
 
@@ -26574,6 +26622,7 @@ impl OwnedSourceScan {
         context_curve_enabled: bool,
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
+        child_cache: Option<&Arc<sampled_scan::SharedCache>>,
     ) -> Self {
         Self::new_selecting(
             source,
@@ -26589,6 +26638,7 @@ impl OwnedSourceScan {
             context_curve_enabled,
             claude_request_identity_capture,
             recovery_priority,
+            child_cache,
         )
     }
 
@@ -26706,6 +26756,7 @@ impl OwnedSourceScan {
         context_curve_enabled: bool,
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
+        child_cache: Option<&Arc<sampled_scan::SharedCache>>,
     ) -> Self {
         if !owned_index.persistence_available() {
             // No inventory, selection or provider I/O for an unavailable index.
@@ -27156,9 +27207,15 @@ impl OwnedSourceScan {
             })
             .collect::<Vec<_>>();
 
-        let mut child_evidence = child_evidence_digest::Page::new(
-            source == SnapshotSource::ClaudeCode && terminal_off_policy::child_evidence_digest(),
-        );
+        let mut child_evidence = child_cache
+            .filter(|_| {
+                source == SnapshotSource::ClaudeCode && terminal_off_policy::child_evidence_digest()
+            })
+            .map(|cache| {
+                let page = child_evidence_digest::Page::new(Arc::clone(cache));
+                page.prune(index);
+                Box::new(page)
+            });
         let mut prepare_candidate_context = |candidate: &mut CandidateFile| {
             prepare_owned_scan_candidate_with_child_evidence(
                 source,
@@ -27166,7 +27223,7 @@ impl OwnedSourceScan {
                 &codex_title_metadata,
                 &claude_title_metadata,
                 claude_effort_support_dir,
-                &mut child_evidence,
+                child_evidence.as_deref_mut(),
             );
         };
         for candidate in &mut files {
@@ -32481,7 +32538,7 @@ impl OwnedSourceScan {
                 &codex_title_metadata,
                 &claude_title_metadata,
                 claude_effort_support_dir_ref,
-                &mut child_evidence,
+                child_evidence.as_deref_mut(),
             );
             let rescue_key = local_index_key(&candidate.path);
             let open_parked = source == SnapshotSource::ClaudeCode
