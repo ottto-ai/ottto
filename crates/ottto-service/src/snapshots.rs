@@ -5926,20 +5926,14 @@ fn claude_stream_accepted_retry_carry_observed(
     result
 }
 
-fn claude_stream_accepted_retry_carry_inner(
+/// The whole streaming carry's structural price: its member paths, their
+/// doubled key bytes and the scratch bytes charged against `limit`.
+fn claude_stream_carry_price(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
-    diagnostics: &mut StaleCarryRejectionCounts,
-    debt_scope: Option<&BTreeSet<String>>,
-) -> Result<ClaudeStaleFamilyCarry, ClaudeRetryAdmissionRefusal> {
-    if !index.persistence_available() {
-        return Err(ClaudeRetryAdmissionRefusal::Structure);
-    }
-
+    limit: usize,
+) -> Result<(usize, usize, usize), ClaudeRetryAdmissionRefusal> {
     use crate::heap_layout_bound::{tree_nodes, Counter};
-    if !crate::heap_layout_bound::layout_supported() {
-        return Err(ClaudeRetryAdmissionRefusal::Structure);
-    }
     let mut paths = 0usize;
     let mut path_bytes = 0usize;
     for key in index.files.keys() {
@@ -5960,7 +5954,7 @@ fn claude_stream_accepted_retry_carry_inner(
         .iter()
         .try_fold(0usize, |sum, root| sum.checked_add(root.len()))
         .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
-    let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+    let mut cost = Counter::new(limit);
     tree_nodes::<String, ()>(stale.len(), &mut cost)
         .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
     cost.add(root_bytes)
@@ -5979,6 +5973,24 @@ fn claude_stream_accepted_retry_carry_inner(
     .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
     cost.add(path_bytes)
         .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
+    Ok((paths, path_bytes, cost.bytes))
+}
+
+fn claude_stream_accepted_retry_carry_inner(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+    diagnostics: &mut StaleCarryRejectionCounts,
+    debt_scope: Option<&BTreeSet<String>>,
+) -> Result<ClaudeStaleFamilyCarry, ClaudeRetryAdmissionRefusal> {
+    if !index.persistence_available() {
+        return Err(ClaudeRetryAdmissionRefusal::Structure);
+    }
+
+    if !crate::heap_layout_bound::layout_supported() {
+        return Err(ClaudeRetryAdmissionRefusal::Structure);
+    }
+    let (paths, path_bytes, _) =
+        claude_stream_carry_price(index, stale, crate::source_rotation::PARKED_BUDGET)?;
     // Tests may refuse an otherwise priced multi-root start; the actual
     // structural math above still runs unchanged before this scheduling seam.
     #[cfg(test)]

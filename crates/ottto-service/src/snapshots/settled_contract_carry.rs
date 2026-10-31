@@ -20,12 +20,6 @@ use super::*;
 
 pub(super) const NAME: &str = "claude_settled_contract_carry_enabled";
 
-fn enabled_at(support: &Path) -> bool {
-    // Same rule as the terminal-off marker: a regular local file, no symlink.
-    std::fs::symlink_metadata(support.join(NAME))
-        .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
-}
-
 pub(super) fn enabled() -> bool {
     #[cfg(test)]
     {
@@ -36,7 +30,9 @@ pub(super) fn enabled() -> bool {
     {
         // Pinned per process; the owner changes the marker and restarts.
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
+        *ENABLED.get_or_init(|| {
+            terminal_off_policy::marker_at(&ottto_core::default_support_dir(), NAME)
+        })
     }
 }
 
@@ -154,12 +150,9 @@ mod tests {
     #[test]
     fn settled_contract_carry_defaults_off_and_only_local_regular_marker_enables() {
         let scratch = crate::test_scratch::ScratchDir::new("settled-contract-carry-policy");
-        assert!(!enabled_at(&scratch));
+        assert!(!terminal_off_policy::marker_at(&scratch, NAME));
         std::fs::write(scratch.join(NAME), b"").unwrap();
-        assert!(enabled_at(&scratch));
-        std::fs::remove_file(scratch.join(NAME)).unwrap();
-        std::fs::create_dir(scratch.join(NAME)).unwrap();
-        assert!(!enabled_at(&scratch));
+        assert!(terminal_off_policy::marker_at(&scratch, NAME));
         assert!(!enabled(), "fixture process never consults host marker");
         let guard = SettledContractCarryForTest::enabled();
         assert!(enabled());
