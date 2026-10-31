@@ -92,11 +92,6 @@ impl Hold {
         };
         let codes = error.chain().filter_map(code).collect::<Vec<_>>();
         let cause = serde_json::json!({ "at": codes.first(), "cause": codes.last() });
-        #[cfg(test)]
-        eprintln!(
-            "state_v2 storage hold [{}]: {cause}",
-            std::thread::current().name().unwrap_or("?")
-        );
         telemetry::event("db_unavailable_cause", &cause);
         let hold = if sqlite::disk_full(&error) {
             telemetry::event("sqlite_full", &1);
