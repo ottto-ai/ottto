@@ -31,7 +31,7 @@ fn fake_thread_cpu_and_clock_enforce_archive_boundary_pacing() {
     use crate::snapshots::sampled_scan::ArchivePass as Pass;
     let mut pass = Pass::default();
     assert!(!pass.ready(1));
-    pass.power = true;
+    archive_power(&mut pass, true);
     assert!(pass.ready(1));
     assert!(!pass.ready(0));
     pass.observe(Some(0), 19_999_999);
