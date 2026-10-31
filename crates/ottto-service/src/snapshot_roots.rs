@@ -89,37 +89,56 @@ fn compose_roots(
     roots
 }
 
-/// The watcher covers the Codex slot homes discovery scans; without them
-/// growth in a slot home waits for the next census walk. A slot home that
-/// cannot be resolved is skipped, as the status collection skips it; an
-/// unreadable registry is an error, so the caller keeps its current watcher.
-/// Sorted so a reordered registry does not replace the watcher.
-pub(crate) fn watcher_roots(home: &Path) -> Result<Vec<(SnapshotSource, PathBuf)>> {
-    let mut codex_homes = registered_codex_homes(&FileCodexAccountSlotSettingsStore::default())?
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
-    codex_homes.sort();
-    watcher_roots_with(home, &codex_homes)
+pub(crate) struct WatcherRoots {
+    pub(crate) roots: Vec<(SnapshotSource, PathBuf)>,
+    /// False when the Codex slot registry could not be read: `roots` then
+    /// hold no slot homes, so a running watcher is kept rather than replaced.
+    pub(crate) codex_slots_read: bool,
 }
 
-fn watcher_roots_with(
-    home: &Path,
-    codex_homes: &[PathBuf],
-) -> Result<Vec<(SnapshotSource, PathBuf)>> {
-    [
+/// The watcher covers the Codex slot homes discovery scans; without them
+/// growth in a slot home waits for the next census walk. A slot home that
+/// cannot be resolved is skipped, as the status collection skips it. Sorted
+/// so a reordered registry does not replace the watcher.
+pub(crate) fn watcher_roots(home: &Path) -> Result<WatcherRoots> {
+    let codex_homes = registered_codex_homes(&FileCodexAccountSlotSettingsStore::default())
+        .map(|homes| homes.filter_map(Result::ok).collect());
+    watcher_roots_with(home, codex_homes)
+}
+
+/// An unreadable slot registry never costs the other roots: it is counted in
+/// the local diagnostics and the slot homes join on a later successful read.
+fn watcher_roots_with(home: &Path, codex_homes: Result<Vec<PathBuf>>) -> Result<WatcherRoots> {
+    let codex_slots_read = codex_homes.is_ok();
+    let mut codex_homes = codex_homes.unwrap_or_else(|_| {
+        crate::local_resource_diagnostics::traversal_point(
+            "watcher_roots",
+            "codex",
+            &serde_json::json!({"codex_slot_registry_unreadable": 1}),
+        );
+        Vec::new()
+    });
+    codex_homes.sort();
+    let roots = [
         SnapshotSource::Codex,
         SnapshotSource::ClaudeCode,
         SnapshotSource::Pi,
     ]
     .into_iter()
     .map(|source| {
-        Ok(scan_roots(source, home, codex_homes)?
+        Ok(scan_roots(source, home, &codex_homes)?
             .into_iter()
             .map(|root| (source, root))
             .collect::<Vec<_>>())
     })
-    .collect::<Result<Vec<_>>>()
-    .map(|roots| roots.into_iter().flatten().collect())
+    .collect::<Result<Vec<_>>>()?
+    .into_iter()
+    .flatten()
+    .collect();
+    Ok(WatcherRoots {
+        roots,
+        codex_slots_read,
+    })
 }
 
 pub(crate) fn validate_claude_roots(home: &Path, expected: &[PathBuf]) -> Result<()> {
@@ -402,6 +421,41 @@ mod tests {
         assert_eq!(scanned.snapshots[0].source_session_id, "healthy");
     }
 
+    /// Watches `roots` until a Codex batch names `session`; no Codex batch may
+    /// name `unrelated`. Native watcher startup is asynchronous, so it keeps
+    /// writing. Drains the process-wide Codex hint queue it wrote to.
+    fn assert_codex_write_queued(
+        roots: Vec<(SnapshotSource, PathBuf)>,
+        session: &Path,
+        unrelated: &Path,
+    ) {
+        let watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no Codex session event"
+            );
+            fs::write(unrelated, "{}\n").unwrap();
+            fs::write(session, "{}\n").unwrap();
+            match watcher
+                .events
+                .recv_timeout(std::time::Duration::from_millis(250))
+            {
+                Ok(event) if event.source == SnapshotSource::Codex => {
+                    assert!(!event.paths.iter().any(|path| path == unrelated));
+                    if event.paths.iter().any(|path| path == session) {
+                        break;
+                    }
+                }
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("watch event channel: {error}"),
+            }
+        }
+        drop(watcher);
+        let _ = crate::snapshot_watcher::take_pending_snapshot_paths(SnapshotSource::Codex);
+    }
+
     /// [behaviour] A write under a registered Codex slot home's `sessions/`
     /// reaches the watcher queue; a transcript-shaped file elsewhere in that
     /// home does not.
@@ -413,39 +467,38 @@ mod tests {
         let slot_home = base.join("codex-accounts/slot/home");
         let day = slot_home.join("sessions/2026/10/31");
         fs::create_dir_all(&day).unwrap();
-        let roots =
-            watcher_roots_with(&base.join("user"), std::slice::from_ref(&slot_home)).unwrap();
-        assert!(roots.contains(&(SnapshotSource::Codex, slot_home.join("sessions"))));
-        let watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).unwrap();
-        let session = day.join("rollout-2026-10-31T10-00-00-slot.jsonl");
-        let unrelated = slot_home.join("history.jsonl");
-        // Native watcher startup is asynchronous, so keep writing until the
-        // session write is seen; every queued batch must exclude `unrelated`.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-        loop {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "no slot session event"
-            );
-            fs::write(&unrelated, "{}\n").unwrap();
-            fs::write(&session, "{}\n").unwrap();
-            match watcher
-                .events
-                .recv_timeout(std::time::Duration::from_millis(250))
-            {
-                Ok(event) if event.source == SnapshotSource::Codex => {
-                    assert!(!event.paths.contains(&unrelated));
-                    if event.paths.contains(&session) {
-                        break;
-                    }
-                }
-                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(error) => panic!("watch event channel: {error}"),
-            }
-        }
-        // The queue is process-wide; leave no scratch hints for other tests.
-        drop(watcher);
-        let _ = crate::snapshot_watcher::take_pending_snapshot_paths(SnapshotSource::Codex);
+        let next = watcher_roots_with(&base.join("user"), Ok(vec![slot_home.clone()])).unwrap();
+        assert!(next.codex_slots_read);
+        assert!(next
+            .roots
+            .contains(&(SnapshotSource::Codex, slot_home.join("sessions"))));
+        assert_codex_write_queued(
+            next.roots,
+            &day.join("rollout-2026-10-31T10-00-00-slot.jsonl"),
+            &slot_home.join("history.jsonl"),
+        );
+    }
+
+    /// [behaviour] An unreadable Codex slot registry at start still watches
+    /// the other roots, and is counted in the local diagnostics.
+    #[test]
+    fn unreadable_codex_slot_registry_still_watches_other_roots() {
+        let scratch = ScratchDir::new("codex-slot-registry-unreadable");
+        let home = fs::canonicalize(&scratch).unwrap().join("user");
+        let day = home.join(".codex/sessions/2026/10/31");
+        fs::create_dir_all(&day).unwrap();
+        let (next, lines) = crate::local_resource_diagnostics::capture(|| {
+            watcher_roots_with(&home, Err(anyhow::anyhow!("synthetic unreadable registry")))
+                .unwrap()
+        });
+        assert!(!next.codex_slots_read);
+        assert!(lines.iter().any(|line| line["stage"] == "watcher_roots"
+            && line["counts"]["codex_slot_registry_unreadable"] == 1));
+        assert_codex_write_queued(
+            next.roots,
+            &day.join("rollout-2026-10-31T10-00-00-default.jsonl"),
+            &home.join(".codex/history.jsonl"),
+        );
     }
 
     #[test]
