@@ -642,6 +642,8 @@ pub(crate) struct StoreCounters {
     pub(crate) uninventoried_records: u64,
     /// GC deletions: records and stale temp files.
     pub(crate) gc_records_deleted: u64,
+    /// Verified PL records absent from the committed index, unlinked and dir-synced.
+    pub(crate) rec_orphans_erased: u64,
     pub(crate) native_class_retired: u64,
     pub(crate) native_class_parked: u64,
     pub(crate) restore_unavailable_layout_gc: u64,
@@ -757,6 +759,12 @@ pub(crate) struct PrivateLabelPurge {
     pub(crate) verified: u64,
     pub(crate) erased: u64,
     pub(crate) refused: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrivateLabelEraseReason {
+    ConsentOrSource,
+    CommittedKeyAbsent,
 }
 
 #[derive(Default)]
@@ -2409,6 +2417,7 @@ impl DurableTailStore {
         &mut self,
         writer: &W,
         keep: &BTreeSet<Digest32>,
+        reason: PrivateLabelEraseReason,
         mut contains: impl FnMut(&[u8]) -> bool,
     ) -> io::Result<PrivateLabelPurge> {
         self.check_writer(writer)?;
@@ -2476,6 +2485,9 @@ impl DurableTailStore {
             return Ok(report); // Previous inventory still says PL may exist.
         }
         report.erased = erased;
+        if reason == PrivateLabelEraseReason::CommittedKeyAbsent {
+            self.counters.rec_orphans_erased += erased;
+        }
         if known.is_none() {
             self.private_purge_dirty |= report.refused > 0;
             // Keep a bounded conservative positive inventory across pages.
@@ -2521,7 +2533,12 @@ impl DurableTailStore {
         writer: &W,
         contains: impl FnMut(&[u8]) -> bool,
     ) -> io::Result<PrivateLabelPurge> {
-        self.purge_private_labels_kept(writer, &BTreeSet::new(), contains)
+        self.purge_private_labels_kept(
+            writer,
+            &BTreeSet::new(),
+            PrivateLabelEraseReason::ConsentOrSource,
+            contains,
+        )
     }
 
     /// OFF may remove only the retired v1 record for this published key.

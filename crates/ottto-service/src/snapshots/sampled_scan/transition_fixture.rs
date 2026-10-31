@@ -1098,21 +1098,28 @@ fn native_m3_plain_flush_matrix_has_no_file_fsync_boundary() {
 /// Native cold-store setup shared by transition tests. Scans stop before
 /// policy finalization, ACK and save; each driver chooses its settlement.
 pub(crate) mod native_cold {
-    use super::super::{durable_tail, SharedCache};
+    #[cfg(target_os = "macos")]
+    use super::super::durable_tail;
+    use super::super::SharedCache;
     use crate::durable_tail_store::{self as store, DurableSource};
     use crate::locked_state_dir::test_locks;
     use crate::snapshots::*;
     use crate::transcript_acquisition::Scope;
+    #[cfg(target_os = "macos")]
     use std::sync::Arc;
 
     pub(crate) struct NativeColdStore {
         pub(crate) writer: &'static crate::locked_state_dir::LockedStateDir,
+        #[cfg(target_os = "macos")]
         pub(crate) source: SnapshotSource,
         pub(crate) root: PathBuf,
         pub(crate) sessions: PathBuf,
+        #[cfg(target_os = "macos")]
         pub(crate) index_path: PathBuf,
         pub(crate) namespace: Scope,
+        #[cfg(target_os = "macos")]
         pub(crate) cache: Arc<SharedCache>,
+        #[cfg(target_os = "macos")]
         pub(crate) index: ScanIndex,
         scratch: Option<crate::test_scratch::ScratchDir>,
     }
@@ -1128,10 +1135,14 @@ pub(crate) mod native_cold {
             root: PathBuf,
             namespace: Scope,
         ) -> Self {
+            #[cfg(not(target_os = "macos"))]
+            let _ = source;
             let sessions = root.join("sessions");
             fs::create_dir_all(&sessions).unwrap();
             let writer = test_locks::hold(&root);
+            #[cfg(target_os = "macos")]
             let index_path = root.join("index.json");
+            #[cfg(target_os = "macos")]
             let index = if index_path.exists() {
                 ScanIndex::load(&index_path).unwrap()
             } else {
@@ -1139,16 +1150,21 @@ pub(crate) mod native_cold {
             };
             Self {
                 writer,
+                #[cfg(target_os = "macos")]
                 source,
                 root,
                 sessions,
+                #[cfg(target_os = "macos")]
                 index_path,
                 namespace,
+                #[cfg(target_os = "macos")]
                 cache: Arc::new(SharedCache::default()),
+                #[cfg(target_os = "macos")]
                 index,
                 scratch: None,
             }
         }
+        #[cfg(target_os = "macos")]
         pub(crate) fn restart(&mut self) {
             self.cache = Arc::new(SharedCache::default());
             self.index = ScanIndex::load(&self.index_path).unwrap();
@@ -1156,15 +1172,18 @@ pub(crate) mod native_cold {
         pub(crate) fn path(&self, session: &str) -> PathBuf {
             self.sessions.join(format!("{session}.jsonl"))
         }
+        #[cfg(target_os = "macos")]
         pub(crate) fn key(&self, session: &str) -> String {
             local_index_key(&self.path(session))
         }
+        #[cfg(target_os = "macos")]
         pub(crate) fn digest(&self, session: &str) -> store::Digest32 {
             store::key_digest(
                 durable_tail::durable_source(self.source).unwrap(),
                 &self.key(session),
             )
         }
+        #[cfg(target_os = "macos")]
         pub(crate) fn store_dir(&self) -> PathBuf {
             store::store_dir_for_index(&self.index_path)
         }

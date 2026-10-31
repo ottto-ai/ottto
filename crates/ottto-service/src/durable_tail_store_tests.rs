@@ -4462,7 +4462,12 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
     let keep = BTreeSet::from([old.key]);
     for _ in 0..3 {
         let report = store
-            .purge_private_labels_kept(&lock, &keep, |_| true)
+            .purge_private_labels_kept(
+                &lock,
+                &keep,
+                PrivateLabelEraseReason::ConsentOrSource,
+                |_| true,
+            )
             .unwrap();
         assert!(report.visited <= 512);
         assert_eq!(report.refused, 0);

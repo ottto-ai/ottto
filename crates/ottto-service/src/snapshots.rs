@@ -34860,7 +34860,10 @@ impl OwnedSourceScan {
                                     ) {
                                         Ok(mode) => mode,
                                         Err(_) => {
-                                            census.record_unreadable(UnreadableCause::Reduction, 1);
+                                            census.record_unreadable_file(
+                                                UnreadableCause::Reduction,
+                                                &candidate.path,
+                                            );
                                             pending!();
                                         }
                                     }
@@ -34875,7 +34878,10 @@ impl OwnedSourceScan {
                                             &candidate.path,
                                         );
                                     }
-                                    census.record_unreadable(UnreadableCause::Reduction, 1);
+                                    census.record_unreadable_file(
+                                        UnreadableCause::Reduction,
+                                        &candidate.path,
+                                    );
                                     pending!();
                                 }
                             }

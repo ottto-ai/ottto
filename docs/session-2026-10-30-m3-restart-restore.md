@@ -16,6 +16,15 @@ bounded, counted and fail-closed. Owned sibling recognition and counted deletion
 of outgrown v1 records also remain active while OFF. A failed deletion retries at
 the next publication; a downgrade during that window may re-count that file.
 
+The adopted erasure contract is: "Nothing deleted is readable in S1's db, WAL or SHM. For .rec files, unlink plus dir-sync under the existing writer custody (my 10-30 retire_exact ruling item 4)."
+S1 owns database, WAL and SHM erasure; M3 owns record unlink and directory sync.
+This does not promise physical block overwrite. `rec_orphans_erased` counts only
+verified private-label records erased after a save because their digest is absent
+from the committed JSON index. Consent erasure and ordinary GC do not contribute.
+This incremental counter does not establish the complete C′ owner sweep: an
+authoritative sweep independent of label inventory and body decoding, all erasure
+triggers and whole-source fallback still need integration before adapter-free ON.
+
 Claude native completions use write-ahead preparation on the existing source
 owner and active lease. Commit fences check the held object, scope, generation
 and accepted evidence before the existing writer can publish a replacement.
