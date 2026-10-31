@@ -506,7 +506,16 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
     let latched = rearm.terminal(&mut older, &rearm.items);
     assert!(latched.rearmed_files >= 2, "main's identity contract re-arm: {latched:?}");
 
-    quarantined.insert_unproven_terminal_claude_authority_for_test(OTHER_ROOT, "rev-other");
+    // A quarantine binds the member's real (sha256-shaped) revision.
+    let revision = "1".repeat(64);
+    let other_key = rearm.other_key();
+    rearm.sources.insert(other_key.clone(), revision.clone());
+    quarantined
+        .files
+        .get_mut(&other_key)
+        .unwrap()
+        .source_file_fingerprint = revision.clone();
+    quarantined.insert_unproven_terminal_claude_authority_for_test(OTHER_ROOT, &revision);
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     rearm.terminal(&mut quarantined, &rearm.items);
     let latch = scope.finish().contract.identity_contract_latch;
