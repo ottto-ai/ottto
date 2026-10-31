@@ -1283,7 +1283,9 @@ fn copy_invalidated_rows(
         };
         for row in &bucket.model_usage {
             let key = row_key_from_model_usage(row);
-            if copy_derived.iter().any(|(at, derived)| *at == start && *derived == key)
+            if copy_derived
+                .iter()
+                .any(|(at, derived)| *at == start && *derived == key)
                 || accepted.copy_invalidated(start, &key)
             {
                 flagged
