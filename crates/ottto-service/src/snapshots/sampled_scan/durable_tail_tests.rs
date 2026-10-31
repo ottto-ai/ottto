@@ -2189,7 +2189,7 @@ fn open_call(call_id_bytes: usize) -> serde_json::Value {
             "call_id":format!("call_{}", "x".repeat(call_id_bytes))}})
 }
 
-/// P2-1 (review r10): a resident deferred by the per-save byte budget
+/// [regress] P2-1 (review r10): a resident deferred by the per-save byte budget
 /// (`WRITE_PASS_BYTES`) keeps its acquired selection provenance. Its next
 /// save, with no rescan or admission of the key in between, writes its
 /// record: no selection refusal, no invalidation of the key's existing
@@ -2397,7 +2397,9 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         assert_eq!(
             counts.not_persisted,
             BTreeMap::from([
-                ("skill_label_scanned", 1),
+                // A corrupt prior leaves the inventory unknown: the retry
+                // scans all three records after the first one-record pass.
+                ("skill_label_scanned", 1 + 3 * u64::from(t14)),
                 ("skill_label_purged", 0),
                 ("skill_label_purge_failed", 2 * u64::from(t14)),
             ]),

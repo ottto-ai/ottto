@@ -1483,7 +1483,7 @@ fn refused_then_conflicted_holding(
     (pipeline, fingerprint, t1, deadline)
 }
 
-/// M1 through the real sync caller, both ways. Without the daemon's
+/// [regress] M1 through the real sync caller, both ways. Without the daemon's
 /// single-writer lock (#801) on the support directory the post-save write
 /// writes nothing, and the due-day restart reads the file cold. Holding it,
 /// the earlier cycles write the retained copy after their saves, and the
@@ -1673,7 +1673,7 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
         .accepted_snapshot_fingerprint_recorded(&fingerprint));
 }
 
-/// SOURCE B1: the cooldown test's twin with the durable store present.
+/// [regress] SOURCE B1: the cooldown test's twin with the durable store present.
 /// Both arms hold the state-directory lock, so their earlier cycles write
 /// the retained copy; the cold arm then drops the store, the warm arm keeps
 /// it. Across restarts that could restore the file, the quiet cycles still
