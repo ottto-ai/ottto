@@ -5070,6 +5070,9 @@ impl SharedCache {
     /// strict predecessor check. Sized by the committed index; an overflow is
     /// counted and only keeps that key's record (GC) or reads it (no write).
     pub(crate) fn durable_note_scope(&self, source: SnapshotSource, key: &str, scope: &Scope) {
+        if !restart_restore::enabled() {
+            return;
+        }
         let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) else {
             return;
         };
@@ -5095,6 +5098,9 @@ impl SharedCache {
     /// the scanned source-file fingerprint the scan wrote into its entry.
     /// An overflow is counted; that reduction is not written (it reads later).
     pub(crate) fn durable_note_selection(&self, key: &str, source_file_fingerprint: &str) {
+        if !restart_restore::enabled() {
+            return;
+        }
         if let Some(mut stores) = self.durable() {
             if stores.selected.len() < stores.pass_key_cap() || stores.selected.contains_key(key) {
                 stores
@@ -5109,6 +5115,9 @@ impl SharedCache {
     /// Marks `key` admitted this pass: a write candidate after the next save.
     /// An overflow is counted; that entry is not written (it reads later).
     pub(super) fn durable_touch(&self, key: &str) {
+        if !restart_restore::enabled() {
+            return;
+        }
         if let Some(mut stores) = self.durable() {
             if stores.touched.len() < stores.pass_key_cap() || stores.touched.contains(key) {
                 stores.touched.insert(key.to_string());
