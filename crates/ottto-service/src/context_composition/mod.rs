@@ -41,13 +41,9 @@ use crate::composition_kinds::Kind as Category;
 #[cfg(test)]
 use {
     self::{claude::*, codex::*, measure::*, report::*},
-    crate::composition_kinds::{
-        classify_by_read_path, codex_mcp_category, codex_tool_category, is_memory_path,
-    },
     serde_json::Value,
     std::fs,
-    std::path::{Path, PathBuf},
-    std::time::SystemTime,
+    std::path::PathBuf,
     time::Date,
 };
 

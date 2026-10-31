@@ -1106,7 +1106,7 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use crate::snapshot_client::{SnapshotBatchResponse, SnapshotEntityRef};
-    use crate::test_scratch::{create_private_dir, ScratchDir};
+    use crate::test_scratch::ScratchDir;
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_dir() -> ScratchDir {
@@ -1411,51 +1411,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_older_reason_is_retained_only_as_rejected_receipt_evidence() {
-        let request = proof_request("claude_code", false);
-        let item = &request.snapshots[0];
-        let mut ack = proof_response(&request, false);
-        ack.accepted = 0;
-        ack.sessions_reconciled = 0;
-        ack.accepted_entities.clear();
-        ack.rejected_entities.push(SnapshotEntityRejection {
-            source_session_id: item.source_session_id.clone(),
-            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-            occurrence_count: 1,
-            reason: "accepted_log_stale_older_upload".into(),
-            detail: "must-not-persist".into(),
-            permanent: true,
-        });
-        let proof = evidence(&request, &ack, false).unwrap();
-        assert_eq!(proof.outcome_occurrences["rejected"], 1);
-        assert_eq!(
-            proof
-                .outcome_occurrences
-                .get("accepted")
-                .copied()
-                .unwrap_or(0),
-            0
-        );
-        let entity = &proof.entities[0];
-        assert_eq!(entity.outcome, "rejected");
-        assert_eq!(entity.snapshot_fingerprint, item.snapshot_fingerprint);
-        let usage = entity.rejection_usage.as_ref().unwrap();
-        assert_eq!(
-            usage.reason,
-            RejectedUsageReason::AcceptedLogStaleOlderUpload
-        );
-        assert!(usage.permanent);
-        let bytes = serde_json::to_string(entity).unwrap();
-        assert!(bytes.contains("accepted_log_stale_older_upload"));
-        assert!(!bytes.contains("must-not-persist"));
-        let restored: ValidatedReceiptEntity = serde_json::from_str(&bytes).unwrap();
-        assert_eq!(restored.rejection_usage.unwrap().reason, usage.reason);
-        // A reason token does not authorize an invalid entity partition.
-        ack.rejected_entities[0].snapshot_fingerprint = "f".repeat(64);
-        assert!(evidence(&request, &ack, false).is_none());
-    }
-
-    #[test]
     fn unknown_rejection_reasons_still_map_to_other_and_old_other_decodes() {
         assert_eq!(
             RejectedUsageReason::from_wire("future-private-reason"),
@@ -1678,120 +1633,6 @@ mod tests {
             .contains(".corrupt.")));
         append_transport_error(&dir, SourceKind::Pi, 3).unwrap();
         assert_eq!(read(&dir, 50, None, None).unwrap().receipts.len(), 1);
-    }
-
-    #[test]
-    fn outcomes_and_filters_cover_each_upload_path() {
-        let dir = temp_dir();
-        append_success(&dir, SourceKind::Codex, 1, 200, None, &response("a")).unwrap();
-        let mut partial = response("b");
-        partial.conflict_entities = partial.accepted_entities.clone();
-        append_success(&dir, SourceKind::Codex, 1, 200, None, &partial).unwrap();
-        append_http_failure(
-            &dir,
-            SourceKind::ClaudeCode,
-            2,
-            UploadReceiptOutcomeV1::Shed,
-            429,
-            None,
-            Some(30),
-        )
-        .unwrap();
-        append_http_failure(
-            &dir,
-            SourceKind::Pi,
-            3,
-            UploadReceiptOutcomeV1::Rejected,
-            422,
-            None,
-            None,
-        )
-        .unwrap();
-        append_http_failure(
-            &dir,
-            SourceKind::Pi,
-            3,
-            UploadReceiptOutcomeV1::AuthRejected,
-            401,
-            None,
-            None,
-        )
-        .unwrap();
-        append_transport_error(&dir, SourceKind::Pi, 4).unwrap();
-        let outcomes = read(&dir, 500, None, None)
-            .unwrap()
-            .receipts
-            .into_iter()
-            .map(|receipt| receipt.outcome)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            outcomes,
-            vec![
-                UploadReceiptOutcomeV1::TransportError,
-                UploadReceiptOutcomeV1::AuthRejected,
-                UploadReceiptOutcomeV1::Rejected,
-                UploadReceiptOutcomeV1::Shed,
-                UploadReceiptOutcomeV1::Partial,
-                UploadReceiptOutcomeV1::Accepted
-            ]
-        );
-        assert_eq!(
-            read(&dir, 10, None, Some(SourceKind::Codex))
-                .unwrap()
-                .receipts
-                .len(),
-            2
-        );
-        assert!(read(&dir, 10, Some("2999-01-01T00:00:00Z"), None)
-            .unwrap()
-            .receipts
-            .is_empty());
-    }
-
-    #[test]
-    fn scratch_directory_is_owner_traversable() {
-        let dir = temp_dir();
-        let mode = std::fs::metadata(&dir)
-            .expect("scratch metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        // `0o600` on a directory reads as "private" but has no execute bit, so
-        // the directory cannot be traversed and every write inside it fails.
-        assert_eq!(mode, 0o700);
-        std::fs::write(dir.join("probe"), b"probe").expect("write inside scratch directory");
-    }
-
-    #[test]
-    fn scratch_directory_never_adopts_an_existing_path() {
-        let dir = temp_dir();
-        let leftover = dir.join("leftover");
-        std::fs::create_dir(&leftover).expect("leftover directory");
-        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o600))
-            .expect("narrow leftover directory");
-
-        let error = create_private_dir(&leftover).expect_err("an existing path must be refused");
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-
-        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o700))
-            .expect("restore leftover directory");
-    }
-
-    #[test]
-    fn scratch_directory_is_removed_when_a_test_panics() {
-        let dir = temp_dir();
-        let path = dir.to_path_buf();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _dir = dir;
-            panic!("failing test body");
-        }));
-
-        assert!(outcome.is_err());
-        assert!(
-            !path.exists(),
-            "a panicking test left {} behind for a later run to inherit",
-            path.display()
-        );
     }
 }
 

@@ -263,10 +263,10 @@ pub(super) struct CountingTombstone {
 
 /// The first valid owner a complete parse proved for this entry. An invalid
 /// (corrupt or future-format) binding never masks a valid one.
-pub(super) fn proven_owner(entry: &ScanIndexEntry) -> Option<&String> {
+pub(super) fn proven_owner(entry: &ScanIndexEntry) -> Option<&str> {
     [
-        entry.codex_counting_owner.as_ref(),
-        entry.codex_protected_owner.as_ref(),
+        entry.codex_counting_owner.as_deref(),
+        entry.codex_protected_owner.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -287,7 +287,7 @@ pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool 
         return true;
     }
     let retired = match proven_owner(entry) {
-        Some(owner) => vec![(owner.clone(), evidence)],
+        Some(owner) => vec![(owner.to_owned(), evidence)],
         None => codex_session_id_candidates_from_path(Path::new(key))
             .iter()
             .map(|id| (codex_protected_owner(id), AckEvidence::LegacyAcked))
@@ -536,7 +536,7 @@ pub(super) fn prepare_moved_evidence(
             .codex_counting_evicted_legacy
             .owners
             .iter()
-            .map(|record| (&record.owner, record.selected_v2))
+            .map(|record| (record.owner.as_str(), record.selected_v2))
             .collect::<BTreeMap<_, _>>();
         // A restored tombstone is also a committed carrier. Absorb before
         // absence GC below: losing that restored carrier to GC later must not
@@ -560,7 +560,7 @@ pub(super) fn prepare_moved_evidence(
             .codex_counting_evicted_legacy
             .owners
             .iter()
-            .map(|record| !pending.contains_key(&record.owner))
+            .map(|record| !pending.contains_key(record.owner.as_str()))
             .collect::<Vec<_>>();
         drop(pending);
         let mut absorbed = absorbed.into_iter();
@@ -583,7 +583,7 @@ pub(super) fn prepare_moved_evidence(
             continue;
         }
         let binding = proven_owner(entry)
-            .or_else(|| owners.get(path))
+            .or_else(|| owners.get(path).map(String::as_str))
             .filter(|owner| valid_codex_protected_owner(owner));
         if let Some(owner) = binding {
             if let Some(previous) = by_owner.get_mut(owner) {

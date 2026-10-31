@@ -9,13 +9,7 @@ fn discovered_scan(f: &ArchiveFixture, mut index: ScanIndex, limit: usize) -> Ow
         &now,
         BACKFILL_WINDOW_DAYS,
     );
-    let traversal = index.traversal.as_mut().unwrap();
-    advance_bounded_directory_traversal(
-        SnapshotSource::Codex,
-        traversal,
-        BACKFILL_WINDOW_DAYS,
-        DiscoveryRetention::unverified(&index.files),
-    );
+    advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, BACKFILL_WINDOW_DAYS, None);
     OwnedSourceScan::new(
         SnapshotSource::Codex,
         &[root],
@@ -307,12 +301,8 @@ fn watcher_retained_refresh_and_bounded_walk_admit_exact_codex_archives() {
             .pending_candidates
             .iter()
             .all(|p| p.path == plain || (source == SnapshotSource::Codex && p.path == f.0)));
-        advance_bounded_directory_traversal(
-            source,
-            traversal,
-            BACKFILL_WINDOW_DAYS,
-            DiscoveryRetention::unverified(&index.files),
-        );
+        advance_bounded_directory_traversal(source, &mut index, BACKFILL_WINDOW_DAYS, None);
+        let traversal = index.traversal.as_mut().unwrap();
         assert!(traversal.pending_directories.is_empty());
         // The retained refresh runs only on a walked generation; it keeps the
         // walk's exact archive roster.

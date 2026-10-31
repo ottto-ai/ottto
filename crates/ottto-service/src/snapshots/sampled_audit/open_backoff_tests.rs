@@ -342,7 +342,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
         &mut ScanCensus::default(),
         None,
         183,
-        discovery_retention!(index),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
     )
     .unwrap();
     index.held_audit_progress = Some(HeldAuditProgress {

@@ -149,7 +149,9 @@ impl FamilyRef {
 /// The families one page's selection touched, deduplicated and bounded.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Touched {
-    families: Vec<FamilyRef>,
+    // Immutable after selection: summarize the owned heaps once rather than
+    // visiting two strings per family on every parked-frame bound.
+    families: crate::owned_heap::OwnedVec<FamilyRef>,
     over_cap: u64,
 }
 
@@ -175,14 +177,14 @@ impl Touched {
             }
         }
         Self {
-            families: families.into_iter().collect(),
+            families: families.into_iter().collect::<Vec<_>>().into(),
             over_cap,
         }
     }
 }
 
 crate::heap_layout_bound::fields!(FamilyRef; prefix, root);
-crate::heap_layout_bound::fields!(Touched; families, over_cap);
+crate::heap_layout_bound::split_fields!(Touched; inline: [over_cap]; heap: [families]);
 
 /// One entry of the per-pass skipped set.
 #[derive(Debug, Clone, Copy)]
@@ -1563,7 +1565,9 @@ pub(super) fn evaluate_page<'p>(
         traversal.pending_candidates.len() + index.claude_stale_family_carry.replay.len();
     let history_gates = index.claude_history_emission.files.len();
     let parsed_count = parsed_keys.len();
-    runtime.followup = Touched::from_keys(parsed_keys, MAX_FOLLOWUP_FAMILIES).families;
+    runtime.followup = Touched::from_keys(parsed_keys, MAX_FOLLOWUP_FAMILIES)
+        .families
+        .into_vec();
     let cost = Cost {
         predicate_cpu_us: crate::context_composition::thread_cpu_micros()
             .unwrap_or(0)

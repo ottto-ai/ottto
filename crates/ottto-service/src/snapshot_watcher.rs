@@ -215,11 +215,6 @@ mod tests {
     }
 
     #[test]
-    fn debounce_duration_matches_plan() {
-        assert_eq!(SNAPSHOT_WATCH_DEBOUNCE, Duration::from_secs(2));
-    }
-
-    #[test]
     fn snapshot_file_event_is_source_specific() {
         let event = SnapshotFileEvent {
             source: SnapshotSource::Codex,

@@ -839,12 +839,12 @@ impl super::ScanIndex {
         };
         self.files
             .get(key)
-            .and_then(|e| e.codex_counting_owner.as_ref())
+            .and_then(|e| e.codex_counting_owner.as_deref())
             .is_some_and(|o| {
                 t.residue
                     .blocked_session_ids
                     .iter()
-                    .any(|id| super::codex_protected_owner(id) == *o)
+                    .any(|id| super::codex_protected_owner(id) == o)
             })
             || self
                 .files

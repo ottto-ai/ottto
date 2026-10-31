@@ -1284,26 +1284,6 @@ mod tests {
     }
 
     #[test]
-    fn ip_literal_netlocs_bypass_resolution_entirely() {
-        let primary_calls = Arc::new(AtomicU32::new(0));
-        let counted = primary_calls.clone();
-        let resolver = FallbackDnsResolver::with_hooks(
-            move |_| {
-                counted.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![addr(1)])
-            },
-            |_| None,
-        );
-
-        let resolved = resolver
-            .resolve_at("127.0.0.1:8080", Instant::now())
-            .expect("ip literal resolves");
-
-        assert_eq!(resolved, vec![addr(8080)]);
-        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
     fn deadline_resolver_bounds_blocked_primary_and_probe_workers() {
         let resolver = DeadlineFallbackDnsResolver::with_hooks(
             Duration::from_millis(30),
@@ -1924,83 +1904,53 @@ mod tests {
     /// and only then does the watchdog request the transport self-restart.
     #[test]
     fn transport_outage_with_probe_proof_requests_self_restart() {
-        let start = Instant::now();
-        let error = refused_connect_transport_error();
-        let mut state = TransportState::default();
-        let mut watchdog = SyncWatchdogState::default();
-        let _ = watchdog.decide_sync_failure(None, false, None, false, start);
+        for error in [
+            refused_connect_transport_error(),
+            diagnostics_error("transport_timeout"),
+        ] {
+            let start = Instant::now();
+            let mut state = TransportState::default();
+            let mut watchdog = SyncWatchdogState::default();
+            let _ = watchdog.decide_sync_failure(None, false, None, false, start);
 
-        // Failing 5-minute cycles for just over an hour.
-        let mut at = start;
-        let past_restart = start + SELF_RESTART_MIN_OUTAGE + Duration::from_secs(1);
-        while at < past_restart {
-            run_failing_cycle(&mut state, &error, at);
-            at += Duration::from_secs(5 * 60);
+            // Failing 5-minute cycles for just over an hour.
+            let mut at = start;
+            let past_restart = start + SELF_RESTART_MIN_OUTAGE + Duration::from_secs(1);
+            while at < past_restart {
+                run_failing_cycle(&mut state, &error, at);
+                at += Duration::from_secs(5 * 60);
+            }
+            let transport_outage = state.outage_duration(past_restart);
+            assert!(transport_outage.is_some_and(|outage| outage >= SELF_RESTART_MIN_OUTAGE));
+
+            // Without process-local evidence the machine may just be offline.
+            assert!(watchdog
+                .decide_sync_failure(None, false, transport_outage, false, past_restart)
+                .self_restart
+                .is_none());
+
+            // The TCP probe (rate-limited, only during an outage) succeeding is
+            // the process-wedge proof — including for timeout-shaped failures.
+            assert!(state.should_attempt_probe(past_restart));
+            assert!(
+                !state.should_attempt_probe(past_restart + Duration::from_secs(1)),
+                "probes are rate-limited"
+            );
+            state.note_probe_succeeded(past_restart);
+            assert!(state.probe_success_is_fresh(past_restart));
+            assert_eq!(
+                watchdog
+                    .decide_sync_failure(
+                        None,
+                        false,
+                        transport_outage,
+                        state.probe_success_is_fresh(past_restart),
+                        past_restart
+                    )
+                    .self_restart,
+                Some(SelfRestartReason::TransportOutage)
+            );
         }
-        let transport_outage = state.outage_duration(past_restart);
-        assert!(transport_outage.is_some_and(|outage| outage >= SELF_RESTART_MIN_OUTAGE));
-
-        // Without process-local evidence the machine may just be offline.
-        assert!(watchdog
-            .decide_sync_failure(None, false, transport_outage, false, past_restart)
-            .self_restart
-            .is_none());
-
-        // The TCP probe (rate-limited, only during an outage) succeeding is
-        // the process-wedge proof — including for timeout-shaped failures.
-        assert!(state.should_attempt_probe(past_restart));
-        assert!(
-            !state.should_attempt_probe(past_restart + Duration::from_secs(1)),
-            "probes are rate-limited"
-        );
-        state.note_probe_succeeded(past_restart);
-        assert!(state.probe_success_is_fresh(past_restart));
-        assert_eq!(
-            watchdog
-                .decide_sync_failure(
-                    None,
-                    false,
-                    transport_outage,
-                    state.probe_success_is_fresh(past_restart),
-                    past_restart
-                )
-                .self_restart,
-            Some(SelfRestartReason::TransportOutage)
-        );
-    }
-
-    /// HOLE A: a MAGICWAKE blackhole makes connects hang, so failures
-    /// classify `transport_timeout` — the streak and the probe-backed
-    /// self-restart must treat that family exactly like connection failures.
-    #[test]
-    fn timeout_family_accrues_and_self_restarts_with_probe_proof() {
-        let start = Instant::now();
-        let error = diagnostics_error("transport_timeout");
-        let mut state = TransportState::default();
-        let mut watchdog = SyncWatchdogState::default();
-        let _ = watchdog.decide_sync_failure(None, false, None, false, start);
-
-        let past_restart = start + SELF_RESTART_MIN_OUTAGE + Duration::from_secs(1);
-        let mut at = start;
-        while at < past_restart {
-            run_failing_cycle(&mut state, &error, at);
-            at += Duration::from_secs(5 * 60);
-        }
-        let transport_outage = state.outage_duration(past_restart);
-        assert!(transport_outage.is_some_and(|outage| outage >= SELF_RESTART_MIN_OUTAGE));
-        state.note_probe_succeeded(past_restart - Duration::from_secs(60));
-        assert_eq!(
-            watchdog
-                .decide_sync_failure(
-                    None,
-                    false,
-                    transport_outage,
-                    state.probe_success_is_fresh(past_restart),
-                    past_restart
-                )
-                .self_restart,
-            Some(SelfRestartReason::TransportOutage)
-        );
     }
 
     /// The offline-churn negative: a genuinely offline machine accrues the

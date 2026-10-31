@@ -495,19 +495,6 @@ fn write_native_bootstrap_sidecars(fixture: &IdentityPipelineHome, support: &Pat
 // finish_sync_source leases and commits the shared client_report counters.
 #[serial(client_report)]
 fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save() {
-    // Production prepares and scans on the sync worker's stack; the merged
-    // archive scan frames overflow libtest's 2 MiB debug thread here.
-    let run = std::thread::Builder::new()
-        .stack_size(crate::snapshot_sync::SNAPSHOT_SYNC_WORKER_STACK_BYTES)
-        .spawn(native_comparison_real_source_finish_on_worker_stack)
-        .unwrap()
-        .join();
-    if let Err(panic) = run {
-        std::panic::resume_unwind(panic);
-    }
-}
-
-fn native_comparison_real_source_finish_on_worker_stack() {
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
