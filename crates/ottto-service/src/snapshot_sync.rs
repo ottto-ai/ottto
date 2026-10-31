@@ -24784,7 +24784,7 @@ mod tests {
             baseline.prepare_historical_replay("boundary-pending-replay".into());
             baseline.save(&index_path).unwrap();
             let mut working = baseline.clone();
-            let mut items = Self::prepare(&root, &mut working).snapshots;
+            let mut items = Self::prepare(&root, &mut working, false).snapshots;
             items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
             assert_eq!(items.len(), 3);
             let keys = items
@@ -24820,7 +24820,8 @@ mod tests {
             assert!(f.baseline.files.contains_key(&f.keys[2]));
             f
         }
-        fn prepare(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
+        /// `keep_cache` keeps the scanned cache evidence (the default strips it).
+        fn prepare(root: &Path, index: &mut ScanIndex, keep_cache: bool) -> SourceScanResult {
             index.activate_upload_context("boundary-current-policy".into());
             index.activate_effective_upload_body_witness_revision(1);
             let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
@@ -24834,8 +24835,10 @@ mod tests {
             )
             .unwrap();
             for item in &mut scan.snapshots {
-                item.cache_observations = None;
-                item.cache_observations_state = None;
+                if !keep_cache {
+                    item.cache_observations = None;
+                    item.cache_observations_state = None;
+                }
                 item.session_account_evidence = None;
             }
             finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, index);
@@ -24906,9 +24909,12 @@ mod tests {
         }
         /// Reload as a restarted pass; returns the ordinary scan's counts.
         fn restart_preparation(&mut self) -> SourceScanResult {
+            self.restart(false)
+        }
+        fn restart(&mut self, keep_cache: bool) -> SourceScanResult {
             self.baseline = ScanIndex::load(&self.index_path).unwrap();
             self.working = self.baseline.clone();
-            let mut scan = Self::prepare(&self.root, &mut self.working);
+            let mut scan = Self::prepare(&self.root, &mut self.working, keep_cache);
             self.items = std::mem::take(&mut scan.snapshots);
             self.items
                 .sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
@@ -24944,8 +24950,10 @@ mod tests {
     /// Phase 1: settled history saturates the bound; pruning it (never a page
     /// session) is durable before the POST, both batches settle into an exact
     /// receipt/index checkpoint. C, accepted before this page and pruned as
-    /// settled history, then grows: the ordinary scan re-reads it once and its
-    /// definite body settles into the receipt and index without a head. A
+    /// settled history, then grows: the ordinary scan re-reads it once with its
+    /// real cache evidence; with its head pruned it is deferred under head CAS
+    /// and probed for a fresh head, then its definite body settles into the
+    /// receipt and index. A
     /// failed POST still leaves a committable partial checkpoint. Phase 2: live (pending-head) evidence alone exceeds the
     /// bound; the route takes an alarmed paced hold, nothing is posted and
     /// custody bytes are unchanged.
@@ -25023,19 +25031,26 @@ mod tests {
                     .insert(cache_session_key(session), "f".repeat(64));
             }
             // Pending head obligations mark sessions live: one in phase 1, all in 2.
+            // Identifiers are fingerprint-shaped, as the progress loader requires
+            // (snapshot_sync.rs:1572); otherwise a restart quarantines the ledger.
             let live = if phase == 1 {
                 &sessions[..1]
             } else {
                 &sessions[..]
             };
             f.progress.pending_cache_heads.insert(
-                "pending-file".into(),
+                cache_session_key("pending-file"),
                 PendingCacheHeadFile {
-                    source_file_fingerprint: "pending-source".into(),
-                    group_fingerprint: "pending-group".into(),
+                    source_file_fingerprint: cache_session_key("pending-source"),
+                    group_fingerprint: cache_session_key("pending-group"),
                     entities: live
                         .iter()
-                        .map(|session| (format!("entity-{session}"), cache_session_key(session)))
+                        .map(|session| {
+                            (
+                                cache_session_key(&format!("entity-{session}")),
+                                cache_session_key(session),
+                            )
+                        })
                         .collect(),
                     reselected_heads: BTreeMap::new(),
                     settled_entities: BTreeSet::new(),
@@ -25171,6 +25186,8 @@ mod tests {
                 // and saves that index. Run that quiet pass from the saved
                 // checkpoint first: all accepted bodies stay suppressed.
                 let recovery = f.progress.ack_recovery.take();
+                // Every restart below reloads this exact saved ledger.
+                let saved = std::fs::read(&f.progress_path).unwrap();
                 let adopted = |index: &ScanIndex| {
                     serde_json::to_value(index).unwrap()["upload_context_fingerprint"]
                         == "boundary-current-policy"
@@ -25186,7 +25203,8 @@ mod tests {
                 assert!(adopted(&f.working));
                 // Pruned C reopens: its rollout grows and the ordinary scan (the
                 // counted read owner) re-reads only that file into one definite
-                // body. With no head it uploads ordinarily and settles exactly.
+                // body with its real cache evidence. Its head was pruned, so it
+                // takes the missing-head path and settles exactly.
                 let path = std::fs::read_dir(&f.root)
                     .unwrap()
                     .map(|entry| entry.unwrap().path())
@@ -25206,9 +25224,9 @@ mod tests {
                     std::io::Write::write_all(&mut grown, format!("{row}\n").as_bytes()).unwrap();
                 }
                 drop(grown);
-                let scan = f.restart_preparation();
+                let scan = f.restart(true);
+                assert_eq!(std::fs::read(&f.progress_path).unwrap(), saved);
                 f.progress.ack_recovery = recovery;
-                f.progress.freeze_custody_page(&f.items);
                 assert_eq!(scan.scanned_file_count, 1, "only the grown source is read");
                 assert_eq!(scan.semantic_noop_count, 0);
                 assert_eq!(scan.unreadable_path_count, 0);
@@ -25218,16 +25236,89 @@ mod tests {
                     1,
                     "one definite body for the reopened source"
                 );
-                let reopened = f.items[0].clone();
-                assert_eq!(reopened.source_session_id, c_item.source_session_id);
-                assert_ne!(reopened.snapshot_fingerprint, c_item.snapshot_fingerprint);
+                let scanned = f.items[0].clone();
+                assert_eq!(scanned.source_session_id, c_item.source_session_id);
+                assert_ne!(scanned.snapshot_fingerprint, c_item.snapshot_fingerprint);
                 assert!(!f.progress.accepted_cache_heads.contains_key(&c));
+                assert!(!f.progress.accepted_cache_states.contains_key(&c));
+                assert!(scanned.cache_observations.is_some(), "real cache evidence");
+                // Under head CAS the headless session is deferred to a pending head.
+                let deferred = capture_deferred_cache_head_identities(
+                    SnapshotSource::Codex,
+                    &f.items,
+                    &f.progress,
+                    true,
+                    true,
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+                );
+                assert_eq!(deferred.len(), 1);
+                assert_eq!(deferred[0].session_key, c);
+                assert_eq!(
+                    deferred[0].snapshot_fingerprint,
+                    scanned.snapshot_fingerprint
+                );
+                // The ordinary pass, in finish_sync_source order: no new pending
+                // head, the cache patch is kept with no base head, the page is
+                // frozen, and the headless item is probed.
+                let groups = cache_head_file_groups(&f.working);
+                assert!(!f
+                    .progress
+                    .record_pending_cache_head(&f.items[0], &groups, false)
+                    .unwrap());
+                prepare_snapshot_cache_for_upload(
+                    &mut f.items[0],
+                    &f.progress,
+                    true,
+                    false,
+                    &BTreeSet::new(),
+                );
+                f.progress.freeze_custody_page(&f.items);
+                let probes = f
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        item.cache_observations.is_some() && item.cache_base_head_etag.is_none()
+                    })
+                    .map(cache_head_probe)
+                    .collect::<Vec<_>>();
+                assert_eq!(probes.len(), 1, "the reopened headless session is probed");
+                let stages = std::cell::RefCell::new(Vec::new());
+                assert_eq!(
+                    bootstrap_cache_heads_with_budget(
+                        &probes,
+                        &unique_poison_scope(),
+                        &mut f.progress,
+                        true,
+                        &mut InplaceRetryBudget::default(),
+                        |items, enforce_head_cas| {
+                            posts.set(posts.get() + 1);
+                            stages.borrow_mut().push(enforce_head_cas);
+                            headed(items)
+                        },
+                        |progress| progress.save(&f.progress_path),
+                    )
+                    .unwrap(),
+                    0
+                );
+                // Ordinary authority, then the exact CAS repeat.
+                assert_eq!(stages.into_inner(), [false, true]);
+                assert_eq!(f.progress.accepted_cache_heads[&c], "e".repeat(64));
+                assert_eq!(
+                    apply_bootstrapped_cache_heads(&mut f.items, &f.progress).unwrap(),
+                    0
+                );
+                assert_eq!(f.items[0].cache_base_head_etag, Some("e".repeat(64)));
+                assert!(f.items[0].cache_observations.is_some());
+                let reopened = f.items[0].clone();
                 f.send(0, |items| {
                     posts.set(posts.get() + 1);
-                    same_source_fixture_ack(items)
+                    headed(items)
                 })
                 .unwrap();
-                assert_eq!(posts.get(), 3);
+                assert_eq!(posts.get(), 5);
+                assert_eq!(f.progress.accepted_cache_heads[&c], "e".repeat(64));
                 assert!(f.progress.contains_body(
                     &reopened.snapshot_fingerprint,
                     &snapshot_upload_body_witness(&reopened)
