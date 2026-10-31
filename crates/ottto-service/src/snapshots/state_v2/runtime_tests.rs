@@ -581,10 +581,10 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         published(&f.path).unwrap()
     )
     .unwrap());
-    // The committed graph is the next page's baseline; idle releases it.
+    // Committed row digests seed the next page; idle releases them.
     with_state(&f.path, |state| {
         assert_eq!(
-            state.save_baseline.as_ref().map(|b| b.generation),
+            state.save_digests.as_ref().map(|b| b.generation),
             Some(G + 1)
         );
         Ok(())
@@ -593,18 +593,23 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
     // A cycle that errors skips idle; its drop guard still releases it.
     drop(BaselineRelease::new(&f.path, &index));
     with_state(&f.path, |state| {
-        assert!(state.save_baseline.is_none());
-        state.save_baseline = Some(index.clone());
+        assert!(state.save_digests.is_none());
+        Ok(())
+    })
+    .unwrap();
+    assert!(save_locked(&f.path, &mut index, false, None, true).unwrap());
+    with_state(&f.path, |state| {
+        assert!(state.save_digests.is_some());
         Ok(())
     })
     .unwrap();
     let _ = idle(&f.path, &index, true);
     with_state(&f.path, |state| {
-        assert!(state.save_baseline.is_none());
+        assert!(state.save_digests.is_none());
         Ok(())
     })
     .unwrap();
-    assert_eq!(index.generation, G + 1);
+    assert_eq!(index.generation, G + 2);
     assert_eq!(
         index.active_upload_context_fingerprint.as_deref(),
         Some("active-synthetic-policy")

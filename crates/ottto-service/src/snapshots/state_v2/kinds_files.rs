@@ -3,34 +3,22 @@ use super::catalogue::scan_index_fields;
 use super::*;
 use anyhow::ensure;
 use std::collections::BTreeMap;
-pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction) -> Result<()> {
-    delta(&ScanIndex::default(), index, tx)
-}
-pub(super) fn delta(prev: &ScanIndex, next: &ScanIndex, tx: &mut dyn Transaction) -> Result<()> {
+pub(super) fn rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
     macro_rules! save {
         ($f:ident, Files, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            mapper::map_delta(tx, $kind, &prev.$f, &next.$f)?;
+            rows.map($kind, &next.$f)?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each save);
-    mapper::map_delta(
-        tx,
-        "file.growth_retention",
-        &prev.v2().growth_retention,
-        &next.v2().growth_retention,
+    rows.map("file.growth_retention", &next.v2().growth_retention)?;
+    rows.put(
+        mapper::key("file.confirmed_empty", "", 0)?,
+        &next.confirmed_empty_files.len(),
     )?;
-    let before = prev
-        .confirmed_empty_files
-        .iter()
-        .map(|s| (s.clone(), true))
-        .collect();
-    let after = next
-        .confirmed_empty_files
-        .iter()
-        .map(|s| (s.clone(), true))
-        .collect();
-    mapper::map_delta(tx, "file.confirmed_empty", &before, &after)?;
+    for name in &next.confirmed_empty_files {
+        rows.put(mapper::key("file.confirmed_empty", name, 1)?, &true)?;
+    }
     Ok(())
 }
 pub(super) fn hydrate_txn(tx: &mut dyn Transaction, index: &mut ScanIndex) -> Result<()> {

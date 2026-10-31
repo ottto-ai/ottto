@@ -1,5 +1,18 @@
 //! Integration fixtures; compiled locally, executed only in later CI.
 use super::*;
+use std::collections::BTreeSet;
+
+fn save_graph(
+    db: &mut sqlite::Sqlite,
+    identity: &Identity,
+    previous: &ScanIndex,
+    next: &mut ScanIndex,
+    cx: &mut KindCx,
+) -> Result<()> {
+    let (_, mut hydrated) = hydrate(db, identity.binding.clone())?;
+    let previous = baseline(previous, &mut hydrated)?;
+    super::save_graph(db, identity, previous, next, cx).map(|_| ())
+}
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +71,22 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+fn assert_persisted(db: &mut sqlite::Sqlite, expected: &ScanIndex) {
+    let (restored, _) = hydrate(db, Scratch::binding()).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&restored).unwrap(),
+        serde_json::to_vec(expected).unwrap()
+    );
+    assert!(restored.decode_holds.same_as(&expected.decode_holds));
+    assert_eq!(
+        restored.decode_holds.v2_provenance(),
+        expected.decode_holds.v2_provenance()
+    );
+    assert_eq!(
+        restored.v2().growth_retention,
+        expected.v2().growth_retention
+    );
 }
 fn fixture() -> ScanIndex {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -246,13 +275,17 @@ fn generic_erasure_extraction_visits_nested_text_keys_and_shared_evidence() {
     }
 }
 
-/// [format] complete misc dirty plan covers scalar map ack and raw hold changes.
+/// [format] row commitments cover scalar, member and exact opaque custody changes.
 #[test]
 fn complete_misc_dirty_plan_covers_scalar_map_ack_and_raw_hold_changes() {
-    let prev = fixture();
+    let (_scratch, mut db) = Scratch::store();
+    commit_populate(&mut db, &fixture());
+    let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let before = baseline(&prev, &mut cx).unwrap();
+    let (_, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
     let mut next = prev.clone();
     next.generation += 1;
-    assert!(kinds_misc::dirty_fields(&prev, &next).unwrap().is_empty());
+    assert_eq!(before.rows, baseline(&next, &mut cx).unwrap().rows);
     next.upload_context_fingerprint = Some("different-context".into());
     next.accepted_snapshot_fingerprints.insert("e".repeat(64));
     next.decode_holds
@@ -264,12 +297,27 @@ fn complete_misc_dirty_plan_covers_scalar_map_ack_and_raw_hold_changes() {
             128,
         )
         .unwrap();
+    let (_, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let after = baseline(&next, &mut cx).unwrap();
+    let changed: BTreeSet<_> = after
+        .rows
+        .iter()
+        .filter(|(k, v)| before.rows.get(*k) != Some(*v))
+        .map(|(k, _)| k.clone())
+        .collect();
     assert_eq!(
-        kinds_misc::dirty_fields(&prev, &next).unwrap(),
+        changed,
         BTreeSet::from([
-            "upload_context_fingerprint".into(),
-            "accepted_snapshot_fingerprints".into(),
-            "decode_holds".into()
+            mapper::key("setting.upload_context_fingerprint", "", 0).unwrap(),
+            mapper::key("accepted.entity", "", 0).unwrap(),
+            mapper::key(
+                "v1_field.accepted_snapshot_fingerprints",
+                &"e".repeat(64),
+                1
+            )
+            .unwrap(),
+            mapper::key("v1_field.repair_provenance", "", 0).unwrap(),
+            mapper::key("raw_hold.files", "/synthetic/held", 0).unwrap(),
         ])
     );
 }
@@ -322,6 +370,11 @@ fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quar
         20
     );
     assert!(kinds_misc::merge_cas_at(&mut tx, &mut working, generation + 1).is_err());
+    drop(tx);
+    let (previous, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    save_graph(&mut db, &identity, &previous, &mut working, &mut cx).unwrap();
+    assert_persisted(&mut db, &working);
 }
 /// [money] growth raw hold survives composed hydration and cas cannot release it.
 #[test]
@@ -371,7 +424,16 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     let mut next = prev.clone();
     next.upload_context_fingerprint = Some("new-context".into());
-    save_graph(&mut db, &identity, &prev, &mut next, &mut cx).unwrap();
+    let digests = baseline(&prev, &mut cx).unwrap();
+    let digests = super::save_graph(&mut db, &identity, digests, &mut next, &mut cx).unwrap();
+    assert_persisted(&mut db, &next);
+    let mut unchanged = next.clone();
+    let attempts = db.save_row_attempts();
+    let digests = super::save_graph(&mut db, &identity, digests, &mut unchanged, &mut cx).unwrap();
+    // Only backend-owned controls advance on an unchanged selected graph.
+    assert_eq!(db.save_row_attempts().1, attempts.1);
+    assert_persisted(&mut db, &unchanged);
+    next = unchanged;
     assert_eq!(
         db.read_control::<u64>("generation").unwrap(),
         Some(next.generation)
@@ -390,8 +452,9 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
             .insert(format!("{n:064x}"));
     }
     sqlite::cap_pages(&db);
-    assert!(save_graph(&mut db, &identity, &current, &mut retry, &mut cx).is_err());
+    assert!(super::save_graph(&mut db, &identity, digests, &mut retry, &mut cx).is_err());
     assert!(!cx.valid && cx.ambiguous);
+    assert_persisted(&mut db, &current);
     assert_eq!(
         hydrate(&mut db, Scratch::binding())
             .unwrap()
@@ -401,32 +464,52 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
     );
 }
 
-/// [regress] A refused COMMIT is a definite rollback: save_graph refuses with
-/// ReloadRequired (no save hold), keeps the prior
-/// generation and graph, and a fresh save then commits.
+/// [regress] Failure before COMMIT rolls back; failure before digest promotion
+/// reloads the complete committed graph. Either path can retry from hydration.
 #[test]
 fn refused_commit_refuses_reload_required_without_post_commit() {
-    let (_scratch, mut db) = Scratch::live_store();
-    commit_populate(&mut db, &fixture());
-    let (current, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
-    let mut next = current.clone();
-    next.upload_context_fingerprint = Some("never-committed".into());
-    sqlite::fence_commit_writing(&db, "generation");
-    let error = save_graph(&mut db, &identity, &current, &mut next, &mut cx).unwrap_err();
-    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
-    assert!(!cx.valid && cx.ambiguous);
-    assert_eq!(next.generation, current.generation);
-    assert!(!db.reload_required());
-    let (hydrated, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    assert_eq!(hydrated.generation, current.generation);
-    assert_eq!(
-        hydrated.upload_context_fingerprint,
-        current.upload_context_fingerprint
-    );
-    let mut next = hydrated.clone();
-    next.upload_context_fingerprint = Some("committed".into());
-    save_graph(&mut db, &identity, &hydrated, &mut next, &mut cx).unwrap();
+    for after_commit in [false, true] {
+        let (_scratch, mut db) = Scratch::live_store();
+        commit_populate(&mut db, &fixture());
+        let (current, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+        let mut next = current.clone();
+        next.upload_context_fingerprint = Some("never-committed".into());
+        next.files.clear();
+        next.claude_account_family_pending.clear();
+        next.accepted_snapshot_fingerprints.insert("f".repeat(64));
+        if after_commit {
+            FAIL_DIGEST_PROMOTION.with(|fail| fail.set(true));
+        } else {
+            sqlite::fence_commit_writing(&db, "generation");
+        }
+        let error = save_graph(&mut db, &identity, &current, &mut next, &mut cx).unwrap_err();
+        assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
+        assert!(!cx.valid && cx.ambiguous);
+        assert_eq!(
+            next.generation,
+            current.generation + u64::from(after_commit)
+        );
+        assert_persisted(&mut db, if after_commit { &next } else { &current });
+        assert!(!db.reload_required());
+        let (hydrated, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        assert_eq!(
+            hydrated.generation,
+            current.generation + u64::from(after_commit)
+        );
+        assert_eq!(
+            hydrated.upload_context_fingerprint,
+            if after_commit {
+                next.upload_context_fingerprint.clone()
+            } else {
+                current.upload_context_fingerprint
+            }
+        );
+        let mut next = hydrated.clone();
+        next.upload_context_fingerprint = Some("committed".into());
+        save_graph(&mut db, &identity, &hydrated, &mut next, &mut cx).unwrap();
+        assert_persisted(&mut db, &next);
+    }
 }
 
 /// [format] stale generation or future writer refuses before saving.
@@ -437,6 +520,7 @@ fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
         commit_populate(&mut db, &fixture());
         let (mut prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
         let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+        let original = prev.clone();
         let mut next = prev.clone();
         if future_writer {
             sqlite::future_writer_for_test(&mut db);
@@ -445,6 +529,9 @@ fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
         }
         assert!(save_graph(&mut db, &identity, &prev, &mut next, &mut cx).is_err());
         assert!(!cx.valid && cx.ambiguous);
+        if !future_writer {
+            assert_persisted(&mut db, &original);
+        }
     }
 }
 
@@ -476,8 +563,9 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
                 p.current.census_window_end = boundary.into();
             }
         }
+        let baseline = baseline(&prev, &mut cx).unwrap();
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        delta(&prev, &next, &mut tx, &mut cx, std::iter::empty::<String>()).unwrap();
+        delta(baseline, &next, &mut tx, &mut cx).unwrap();
         let key = mapper::key("account.current", "synthetic-family", 1).unwrap();
         let h = tx.get(&key).unwrap().unwrap();
         let (id, high, _): (Option<u64>, u64, Vec<u64>) = mapper::read(&mut tx, &h).unwrap();
@@ -549,6 +637,7 @@ fn refused_commit_preserves_owed_custody_through_independent_saves() {
         selected.files["synthetic-file"].clone(),
     );
     save_graph(&mut db, &identity, &restored, &mut selected, &mut cx).unwrap();
+    assert_persisted(&mut db, &selected);
     let (reopened, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert!(reopened.files.contains_key("independent-file"));
     assert_eq!(
@@ -567,6 +656,7 @@ fn refused_commit_preserves_owed_custody_through_independent_saves() {
     let mut advanced = reopened.clone();
     advanced.files.get_mut("synthetic-file").unwrap().size_bytes += 1;
     save_graph(&mut db, &identity, &reopened, &mut advanced, &mut cx).unwrap();
+    assert_persisted(&mut db, &advanced);
     let (final_graph, _) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert_eq!(
         final_graph.files["synthetic-file"].size_bytes,

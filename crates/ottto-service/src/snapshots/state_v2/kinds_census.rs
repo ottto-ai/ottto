@@ -3,51 +3,37 @@ use super::catalogue::scan_index_fields;
 use super::*;
 use anyhow::{ensure, Context};
 use std::collections::{BTreeMap, BTreeSet};
-pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
-    delta(&ScanIndex::default(), index, tx, cx)
-}
-pub(super) fn delta(
-    prev: &ScanIndex,
-    next: &ScanIndex,
-    tx: &mut dyn Transaction,
-    _: &mut KindCx,
-) -> Result<()> {
-    mapper::map_delta(
-        tx,
-        "file.census",
-        prev.claude_request_census.storage_records(),
-        next.claude_request_census.storage_records(),
-    )?;
-    mapper::map_delta(
-        tx,
+pub(super) fn rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
+    rows.map("file.census", next.claude_request_census.storage_records())?;
+    rows.map(
         "tombstone.claude_retired_family_tombstones",
-        &prev.claude_retired_family_tombstones.entries,
         &next.claude_retired_family_tombstones.entries,
     )?;
     macro_rules! save_map {
         ($f:ident, Census, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            mapper::map_delta(tx, $kind, &prev.$f, &next.$f)?;
+            rows.map($kind, &next.$f)?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each save_map);
     macro_rules! save {
         ($f:ident, Census, (scalar $($c:ident)*), [$kind:literal], $h:ident) => {
-            mapper::put(tx, &mapper::key($kind, "", 0)?, &next.$f)?;
+            rows.put(mapper::key($kind, "", 0)?, &next.$f)?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each save);
-    // The separate ownership manifest proves census-owned membership accompanies
-    // the account pending row. Its values remain deduplicated by the shared hook.
-    let members = |index: &ScanIndex| {
-        index
-            .claude_usage_family_pending
-            .iter()
-            .map(|(k, v)| (k.clone(), v.member_request_id_hashes.len()))
-            .collect::<BTreeMap<_, _>>()
-    };
-    mapper::map_delta(tx, "family.requests", &members(prev), &members(next))?;
+    // Census owns the membership cardinality, derived once from selected usage.
+    rows.put(
+        mapper::key("family.requests", "", 0)?,
+        &next.claude_usage_family_pending.len(),
+    )?;
+    for (root, pending) in &next.claude_usage_family_pending {
+        rows.put(
+            mapper::key("family.requests", root, 1)?,
+            &pending.member_request_id_hashes.len(),
+        )?;
+    }
     Ok(())
 }
 pub(super) fn hydrate_txn(

@@ -15,43 +15,14 @@ fn field_mode(kind: &str) -> mapper::Members {
     scan_index_fields!(each lookup);
     mapper::Members::Field
 }
-fn field_kind(field: &str) -> Option<&'static str> {
-    macro_rules! lookup {
-        ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
-            if field == stringify!($f) {
-                return Some($kind);
-            }
-        };
-        ($($t:tt)*) => {};
-    }
-    scan_index_fields!(each lookup);
-    None
-}
-pub(super) const CONTROLS: &[&str] = &["schema_version", "generation"];
-
-fn put_raw(tx: &mut dyn Transaction, cx: &mut KindCx, key: RowKey, raw: &[u8]) -> Result<()> {
-    let old = tx.get(&key)?;
-    let h = if let Some(h) = old.filter(|h| h.digest == codec::digest(raw)) {
-        h
-    } else {
-        tx.put(RowInput {
-            key: &key,
-            fixed: &Fixed::None,
-            value_version: 1,
-            value: raw,
-        })?
-    };
-    cx.misc_rows.insert(key, (h, true));
-    Ok(())
-}
 fn write_field<T: Serialize + ?Sized>(
     value: &T,
     slot: &str,
     kind: &str,
-    tx: &mut dyn Transaction,
+    rows: &mut mapper::Rows<'_>,
     cx: &mut KindCx,
 ) -> Result<()> {
-    mapper::field_write(tx, cx, kind, value, field_mode(kind))?;
+    mapper::field_write(rows, kind, value, field_mode(kind))?;
     cx.presence.entry(slot.into()).or_insert(true);
     Ok(())
 }
@@ -73,7 +44,7 @@ struct HoldSlot {
     owner: Option<(usize, usize)>,
     charge: u64,
 }
-fn write_holds(index: &ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
+fn write_holds(index: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
     let mut metadata = HoldMetadata {
         provenance: index.decode_holds.v2_provenance(),
         ..Default::default()
@@ -85,7 +56,7 @@ fn write_holds(index: &ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCx) ->
             "state_v2_misc_unmapped_hold"
         );
         let row_key = RowKey::record(&kind, key.as_bytes(), 0)?;
-        put_raw(txn, cx, row_key, raw)?;
+        rows.raw(row_key, raw)?;
         metadata.entries.entry(field.into()).or_default().insert(
             key.into(),
             HoldSlot {
@@ -96,8 +67,7 @@ fn write_holds(index: &ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCx) ->
     }
     // Internal repair custody is not a field in the original v1 document.
     mapper::field_write(
-        txn,
-        cx,
+        rows,
         "v1_field.repair_provenance",
         &metadata,
         mapper::Members::Field,
@@ -158,20 +128,6 @@ fn read_holds(index: &mut ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCx)
     ensure!(actual == expected, "state_v2_misc_orphan_hold");
     holds.v2_finish(metadata.provenance);
     index.decode_holds = holds;
-    Ok(())
-}
-fn control<T: Serialize>(
-    name: &str,
-    value: &T,
-    txn: &mut dyn Transaction,
-    cx: &mut KindCx,
-) -> Result<()> {
-    put_raw(
-        txn,
-        cx,
-        RowKey::Meta(name.into()),
-        &serde_json::to_vec(value)?,
-    )?;
     Ok(())
 }
 fn read_control<T: serde::de::DeserializeOwned + Serialize>(
@@ -366,81 +322,24 @@ pub(super) fn merge_cas_at(
     Ok(())
 }
 
-impl KindCx {
-    pub(super) fn plan_delta(
-        &mut self,
-        fields: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<()> {
-        let fields: BTreeSet<String> = fields.into_iter().map(Into::into).collect();
-        for field in &fields {
-            ensure!(
-                CONTROLS.contains(&field.as_str())
-                    || field == "decode_holds"
-                    || field_kind(field).is_some(),
-                "state_v2_misc_unknown_dirty_field"
-            );
-        }
-        self.dirty_fields = Some(fields);
-        Ok(())
-    }
-}
-/// Complete field plan derived from the two owner graphs. Hashing is streamed
-/// with fixed scratch; no JSON history copy or payload read is used to decide
-/// which of the MISC fields the selected graph actually changed.
-pub(super) fn dirty_fields(prev: &ScanIndex, next: &ScanIndex) -> Result<BTreeSet<String>> {
-    fn commitment(value: &impl Serialize) -> Result<[u8; 32]> {
-        use sha2::Digest;
-        Ok(
-            super::super::serialized_json_digest(value, b"ottto.state-v2.misc-dirty.v1\0")
-                .context("state_v2_misc_serialize")?
-                .finalize()
-                .into(),
-        )
-    }
-    let mut dirty = BTreeSet::new();
-    macro_rules! compare {
+pub(super) fn rows(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut KindCx) -> Result<()> {
+    rows.raw(
+        RowKey::Meta("schema_version".into()),
+        &serde_json::to_vec(&index.schema_version)?,
+    )?;
+    macro_rules! save {
         (claude_desktop_store_inventory, $($t:tt)*) => {};
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
-            if commitment(&prev.$f)? != commitment(&next.$f)? {
-                dirty.insert(stringify!($f).to_owned());
-            }
-        };
-        ($($t:tt)*) => {};
-    }
-    scan_index_fields!(each compare);
-    if prev.schema_version != next.schema_version {
-        dirty.insert("schema_version".into());
-    }
-    if !prev.decode_holds.same_as(&next.decode_holds)
-        || prev.decode_holds.v2_provenance() != next.decode_holds.v2_provenance()
-    {
-        dirty.insert("decode_holds".into());
-    }
-    // COMMIT, rather than semantic delta, owns the single generation advance.
-    Ok(dirty)
-}
-
-pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
-    control("schema_version", &index.schema_version, tx, cx)?;
-    control("generation", &index.generation, tx, cx)?;
-    macro_rules! save {
-        (claude_desktop_store_inventory, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
-            write_field(
-                &None::<String>,
-                "claude_desktop_store_inventory",
-                $kind,
-                tx,
-                cx,
-            )?;
-        };
-        ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
-            write_field(&index.$f, stringify!($f), $kind, tx, cx)?;
+            write_field(&index.$f, stringify!($f), $kind, rows, cx)?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each save);
-    write_holds(index, tx, cx)?;
-    control("field_presence", &cx.presence.clone(), tx, cx)
+    write_holds(index, rows)?;
+    rows.raw(
+        RowKey::Meta("field_presence".into()),
+        &serde_json::to_vec(&cx.presence)?,
+    )
 }
 pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,
@@ -467,51 +366,6 @@ pub(super) fn hydrate_txn(
     }
     scan_index_fields!(each load);
     read_holds(index, tx, cx)
-}
-pub(super) fn delta(
-    _prev: &ScanIndex,
-    next: &ScanIndex,
-    tx: &mut dyn Transaction,
-    cx: &mut KindCx,
-) -> Result<()> {
-    let dirty = cx
-        .dirty_fields
-        .take()
-        .context("state_v2_misc_dirty_plan_required")?;
-    macro_rules! save {
-        (claude_desktop_store_inventory, $($t:tt)*) => {};
-        ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
-            if dirty.contains(stringify!($f)) {
-                write_field(&next.$f, stringify!($f), $kind, tx, cx)?;
-            }
-        };
-        ($($t:tt)*) => {};
-    }
-    scan_index_fields!(each save);
-    if dirty.contains("schema_version") {
-        control("schema_version", &next.schema_version, tx, cx)?;
-    }
-    if dirty.contains("generation") {
-        control("generation", &next.generation, tx, cx)?;
-    }
-    if dirty.contains("decode_holds") {
-        let old: BTreeSet<_> = cx
-            .misc_rows
-            .keys()
-            .filter(|k| matches!(k,RowKey::Record{kind,..} if kind.name().starts_with("raw_hold.")))
-            .cloned()
-            .collect();
-        for k in &old {
-            cx.misc_rows.remove(k);
-        }
-        write_holds(next, tx, cx)?;
-        for k in old {
-            if !cx.misc_rows.contains_key(&k) {
-                tx.delete(&k)?;
-            }
-        }
-    }
-    control("field_presence", &cx.presence.clone(), tx, cx)
 }
 pub(super) fn references(
     _: &Header,

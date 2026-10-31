@@ -134,8 +134,8 @@ struct RouteState {
     original: Option<import::Original>,
     runtimes: Vec<std::sync::Weak<Runtime>>,
     current: Option<Arc<Runtime>>,
-    // One load baseline, consumed by the next save or discarded at idle.
-    save_baseline: Option<ScanIndex>,
+    // Logical row commitments, consumed by the next save or discarded at idle.
+    save_digests: Option<kinds::Baseline>,
     page_limit: usize,
     requested_page: usize,
     save_hold: Option<Hold>,
@@ -196,7 +196,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     original: None,
                     runtimes: Vec::new(),
                     current: None,
-                    save_baseline: None,
+                    save_digests: None,
                     page_limit: 250,
                     requested_page: 250,
                     save_hold: None,
@@ -309,7 +309,7 @@ fn load_with_custody<M: Mapper>(
     let result = held(with_state(path, |state| {
         state.inventory_ready = false;
         state.original = None;
-        state.save_baseline = None;
+        state.save_digests = None;
         let pair = fence::reconcile(path, &binding, state.latched)?;
         state.pass_written_start = (switched || pair.is_some())
             .then(telemetry::process_written_bytes)
@@ -336,21 +336,21 @@ fn load_with_custody<M: Mapper>(
                         super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
                         // Reuse the connection, but hydrate the durable graph each pass.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-                        let (mut index, cx) = mapper.hydrate_context(&mut session.db)?;
+                        let (mut index, mut cx) = mapper.hydrate_context(&mut session.db)?;
                         ensure!(index.generation == stamp.0, Hold::DbUnavailable);
                         normalize_hydrated(&mut index)?;
                         session.stamp = session.db.stamp()?;
                         ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
+                        state.save_digests = Some(kinds::baseline(&index, &mut cx)?);
                         session.cx = cx;
                         index.v2_mut().persistence_v2 = Some(runtime.clone());
-                        state.save_baseline = Some(index.clone());
                         telemetry::event("route", &"v2");
                         return Ok(Some(index));
                     }
                 }
                 // Invalidate every old clone before replacing the connection.
                 guard.take();
-                state.save_baseline = None;
+                state.save_digests = None;
                 state.current = None;
             }
             let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
@@ -363,13 +363,14 @@ fn load_with_custody<M: Mapper>(
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)
                 .context("state_v2_open_recover")?;
-            let (mut index, cx) = mapper
+            let (mut index, mut cx) = mapper
                 .hydrate_context(&mut db)
                 .context("state_v2_open_hydrate")?;
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             normalize_hydrated(&mut index).context("state_v2_open_normalize")?;
             db.audit_headers().context("state_v2_open_audit_headers")?;
+            state.save_digests = Some(kinds::baseline(&index, &mut cx)?);
             index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
                 active: true,
                 session: Mutex::new(Some(Session {
@@ -382,7 +383,6 @@ fn load_with_custody<M: Mapper>(
                 })),
             }));
             register(state, &index)?;
-            state.save_baseline = Some(index.clone());
             telemetry::event("route", &"v2");
             return Ok(Some(index));
         }
@@ -430,7 +430,7 @@ fn load_with_custody<M: Mapper>(
             if state.latched || state.current.as_ref().is_some_and(|runtime| runtime.active) {
                 telemetry::abort_pass();
             }
-            state.save_baseline = None;
+            state.save_digests = None;
             if let Some(runtime) = state.current.take() {
                 runtime
                     .session
@@ -522,7 +522,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             original.publish_import(path, &identity, db, &mut state.latched)?;
             Ok(cx)
         })();
-        let cx = match result {
+        let mut cx = match result {
             Ok(cx) => {
                 telemetry::event("import_done", &1);
                 cx
@@ -549,6 +549,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             Hold::DbUnavailable
         );
         index.generation = stamp.0;
+        state.save_digests = Some(kinds::baseline(index, &mut cx)?);
         index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
             active: true,
             session: Mutex::new(Some(Session {
@@ -562,7 +563,6 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
         }));
         telemetry::pass_start();
         register(state, index)?;
-        state.save_baseline = Some(index.clone());
         Ok(())
     })
 }
@@ -619,7 +619,7 @@ fn save_with_custody(
             stale_graph = true;
             bail!(Hold::ReloadRequired);
         }
-        let previous = match state.save_baseline.take() {
+        let previous = match state.save_digests.take() {
             Some(previous) => previous,
             None => {
                 // A pass may save more than once (including claim-only saves).
@@ -628,8 +628,10 @@ fn save_with_custody(
                 let (mut previous, cx) = ClaudeMapper.hydrate_context(&mut session.db)?;
                 normalize_hydrated(&mut previous)?;
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
+                let mut cx = cx;
+                let digests = kinds::baseline(&previous, &mut cx)?;
                 session.cx = cx;
-                previous
+                digests
             }
         };
         ensure!(previous.generation == session.stamp.0, Hold::ReloadRequired);
@@ -644,26 +646,21 @@ fn save_with_custody(
                     path,
                     owner,
                 )?;
-                ClaudeMapper.save(
+                let digests = ClaudeMapper.save(
                     &mut session.db,
                     &identity,
-                    &previous,
+                    previous,
                     index,
                     &mut session.cx,
                     claim_only,
                 )?;
                 session.stamp = session.db.stamp()?;
                 state.saved_page(session.db.save_over_target(), claim_only);
+                if !claim_only && !session.reload {
+                    state.save_digests = Some(digests);
+                }
                 Ok(true)
             });
-        // All outcomes release the load baseline, including ambiguous COMMIT.
-        drop(previous);
-        // A pass saves page by page: keep the unambiguously committed full
-        // graph as the next page's baseline instead of re-hydrating. Idle and
-        // the next load still clear it, so nothing stays resident across passes.
-        if save_result.is_ok() && !claim_only && !session.reload {
-            state.save_baseline = Some(index.clone());
-        }
         if save_result.is_err() {
             if let Some(hold) = session.db.save_failure() {
                 return Err(hold.into());
@@ -676,7 +673,7 @@ fn save_with_custody(
             return result;
         }
         with_state(path, |state| {
-            state.save_baseline = None;
+            state.save_digests = None;
             state.save_retry_completed = false;
             if (!claim_only || state.save_hold != Some(Hold::SaveOversize))
                 && matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveCeiling))
@@ -931,7 +928,7 @@ impl Drop for BaselineRelease {
     fn drop(&mut self) {
         if let Some(path) = &self.0 {
             let _ = with_state(path, |state| {
-                state.save_baseline = None;
+                state.save_digests = None;
                 Ok(())
             });
         }
@@ -944,7 +941,7 @@ pub(in super::super) fn idle(path: &Path, index: &ScanIndex, quiet: bool) -> Res
     // The cycle can finish without saving. Release its baseline even if
     // advisory maintenance cannot acquire the checkpoint lock or fails.
     with_state(path, |state| {
-        state.save_baseline = None;
+        state.save_digests = None;
         Ok(())
     })?;
     let _lock = super::super::CheckpointLock::acquire(path)?;
@@ -1033,7 +1030,7 @@ fn invalidate_locked(path: &Path) -> Result<()> {
     with_state(path, |state| {
         state.latched = true;
         state.inventory_ready = false;
-        state.save_baseline = None;
+        state.save_digests = None;
         state.current = None;
         for runtime in state.runtimes.drain(..).filter_map(|r| r.upgrade()) {
             runtime

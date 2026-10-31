@@ -146,7 +146,7 @@ impl Fixture {
         }
         drop(guard);
         with_state(&self.path, |state| {
-            state.save_baseline = None;
+            state.save_digests = None;
             Ok(())
         })
         .unwrap();
@@ -328,6 +328,27 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
         .growth_retention
         .insert(f.key.clone(), debt(Some(NOW)));
     claim.save_growth_claim(&f.path).unwrap();
+    with_state(&f.path, |state| {
+        assert!(state.save_digests.is_none());
+        Ok(())
+    })
+    .unwrap();
+    let durable_claim = {
+        let runtime = claim.v2().persistence_v2.as_ref().unwrap();
+        let mut guard = runtime.session.lock().unwrap();
+        import::ClaudeMapper
+            .hydrate_context(&mut guard.as_mut().unwrap().db)
+            .unwrap()
+            .0
+    };
+    assert_eq!(
+        serde_json::to_vec(&durable_claim).unwrap(),
+        serde_json::to_vec(&claim).unwrap()
+    );
+    assert_eq!(
+        durable_claim.v2().growth_retention,
+        claim.v2().growth_retention
+    );
     assert!(Arc::ptr_eq(
         claim.v2().growth_claim_context.as_ref().unwrap(),
         &context
@@ -359,6 +380,11 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
         None
     );
     let reopened = f.load();
+    assert_eq!(
+        serde_json::to_vec(&reopened).unwrap(),
+        serde_json::to_vec(&old).unwrap()
+    );
+    assert_eq!(reopened.v2().growth_retention, old.v2().growth_retention);
     assert_eq!(
         reopened.upload_context_fingerprint,
         old.upload_context_fingerprint
