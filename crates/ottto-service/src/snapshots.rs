@@ -4589,7 +4589,7 @@ pub struct ScanIndexEntry {
     /// Local-only exact current-context acceptance. Appended for old readers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) upload_context_receipt: Option<upload_context_receipt::Receipt>,
-    /// AR1 R1 (switch `evidence_owed`): a re-arm kept `source_file_fingerprint`
+    /// Evidence owed ON: a re-arm kept `source_file_fingerprint`
     /// and owes this file's request evidence to the current census window.
     /// Older binaries drop it and see the kept fingerprint: their own re-arm
     /// clears it again. Never set while the switch is OFF.
@@ -5046,10 +5046,10 @@ struct ClaudeUsageFamilyPending {
         deserialize_with = "idless_retry_marker::deserialize"
     )]
     idless_revision: Option<[u8; 32]>,
-    /// #1025 Q5b (Lead B S1-S6): the request-identity contract (and body
-    /// witness revision) this WHOLE pending was built under; `None` = mixed,
-    /// legacy or unknown, never provable. Written on accumulation whatever the
-    /// switch; read only by the evidence owed re-stamp. An old decoder drops it.
+    /// The request-identity contract (and body-witness revision) this WHOLE
+    /// pending was built under; `None` = mixed, legacy or unknown, never
+    /// provable. Written on accumulation; read only by the evidence-owed
+    /// re-stamp. An old decoder drops it.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -9474,8 +9474,8 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             &index.claude_usage_family_pending,
             legacy_request_owners.as_ref(),
         );
-        // S3 (#1025 ON): owed evidence, including a latch-time Q5b re-stamp,
-        // proves nothing until it resolves.
+        // Evidence owed ON: owed evidence, including a re-stamp under the
+        // identity-contract latch, proves nothing until it resolves.
         let owed_roots = evidence_owed::owed_roots(index);
         for (root_session_id, members) in &complete_families {
             if uncertified_roots.contains(root_session_id) || owed_roots.contains(root_session_id) {
@@ -10406,7 +10406,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         let contract = claude_request_identity::cycle_contract(identity.is_some());
         let cutover_terminal = cutover == CLAUDE_CONTRACT_CUTOVER_OWED
             && index.claude_request_identity_contract.as_deref() == Some(contract);
-        // RF1 #992 Q5 (evidence owed ON): a mid-walk contract change records
+        // Evidence owed ON: a mid-walk contract change records
         // a placeholder, so a recorded current contract means this window's
         // evidence was parsed under it. With no older evidence left there is
         // nothing to mix; the latch clears before its full re-arm. Counted.
@@ -10759,9 +10759,9 @@ fn apply_claude_reported_usage_with_negative_dependencies(
                 // once; stable duplicates remain fail-closed without an
                 // unbounded corrective replay loop.
                 rearm.clear_calls = rearm.clear_calls.saturating_add(1);
-                // Round 3 (C5 P6, the #893 fold): ON owes instead of clearing.
-                // A census-only re-arm is resolved by a bound re-stamp; a
-                // changed witness or duplicate owner must be read.
+                // Evidence owed ON: owe instead of clearing. A census-only
+                // re-arm is resolved by a bound re-stamp; a changed witness or
+                // duplicate owner must be read.
                 evidence_owed::clear(
                     entry,
                     if invalidated_witness_roots.contains(&root_session_id)
@@ -10802,7 +10802,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             diagnostic.update(|d| d.terminal_rearm = Some(rearm));
         }
 
-        // RF1 #992 GUARD (evidence_owed ON): completion retires only families
+        // Evidence owed ON: completion retires only families
         // with a completed family proof; every other indexed family stays owed.
         let guard = evidence_owed::enabled();
         index

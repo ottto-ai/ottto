@@ -1,22 +1,24 @@
-//! AR1 R1 (Lead B ruling 1, 2026-10-31): a Claude census re-arm keeps the
-//! file's fingerprint and marks its request evidence owed
-//! (`ScanIndexEntry::evidence_owed`) instead of clearing the fingerprint.
-//! Machine-local opt-in marker `claude_evidence_owed_enabled` (#977
-//! `local_switch!`); absent marker = main (the re-arm clears).
+//! Evidence owed: a Claude census re-arm keeps the file's fingerprint and
+//! marks its request evidence owed (`ScanIndexEntry::evidence_owed`) instead
+//! of clearing the fingerprint. Machine-local opt-in marker
+//! `claude_evidence_owed_enabled` (`local_switch!`); absent marker = main (the
+//! re-arm clears).
 //!
 //! The traversal resolves an owed, unchanged member at selection:
 //! - (a) its stored occurrences are bound to this revision: re-stamp them into
-//!   the current census window, no read (Lead B ruling 1 conditions a-d);
+//!   the current census window, no read;
 //! - (c) cap-invalid family, unchanged, its occurrences still do not fit:
-//!   stays owed, no read, no credit (Lead B Q3, RF1 #992 KeepOwedNoCredit);
-//! - otherwise one counted `Rearmed` parse; with the fingerprint kept the
-//!   existing RAM/durable restore may serve it (b), else it reads Full (d).
+//!   stays owed, no read, no credit;
+//! - otherwise one counted `Rearmed` parse, paced per page; with the
+//!   fingerprint kept the existing RAM/durable restore may serve it (b), else
+//!   it reads Full (d).
 //!
-//! GUARD (RF1 #992, folded here): census completion retires only families
-//! with a completed family proof; every other indexed family stays owed.
+//! Census completion retires only families with a completed family proof;
+//! every other indexed family stays owed.
 //!
-//! Real invalidations keep main's clear: a traversal context change, an audit
-//! cap delay, an unACKed head re-offer and every non-re-arm clear site.
+//! Real invalidations keep main's clear: an audit cap delay, an unACKed head
+//! re-offer, a held upload revert that must reparse, and a context change
+//! that is not only added roots, a backfill or an upload-context change.
 use super::*;
 
 super::terminal_off_policy::local_switch!(
@@ -59,7 +61,7 @@ pub(crate) enum Kind {
     Read,
 }
 
-/// Round 3: every census fingerprint clear goes through here. OFF (or an
+/// Every census fingerprint clear goes through here. OFF (or an
 /// already cleared entry): main's clear. ON: keep the revision, owe it.
 pub(crate) fn clear(entry: &mut ScanIndexEntry, kind: Kind) {
     if enabled() && !entry.source_file_fingerprint.is_empty() {
@@ -169,7 +171,7 @@ pub(super) fn context_change_owes(
         ) == inputs.rootless
 }
 
-/// B-P2 under ON: an unACKed head is a real invalidation; it keeps main's
+/// Under ON an unACKed head is a real invalidation; it keeps main's
 /// cleared fingerprint, never an owed one.
 pub(super) fn reoffer_clears(entry: &mut ScanIndexEntry) {
     if entry.evidence_owed {
@@ -203,7 +205,7 @@ pub(super) struct Page {
     pub(super) retained: Option<usize>,
     /// The pending occurrence cap a kept family's re-read must fit.
     pub(super) cap: usize,
-    /// Round 3 (C5 P4): owed Fulls this page already admitted, and the one
+    /// Owed Fulls this page already admitted, and the one
     /// per-page cap. It reuses the existing paced re-read page allowance
     /// (`BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE`); the rest wait in the
     /// walk's own queue for later pages.
@@ -222,8 +224,9 @@ impl Default for Page {
     }
 }
 
-/// #1025 Q5b (Lead B S1-S6): the identity contract a pending was built
-/// under, as a bounded code plus the body-witness revision E2 adoption reads.
+/// The identity contract a pending was built under, as a bounded code plus
+/// the body-witness revision the request-money adoption reads. No identity
+/// bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct EvidenceContract {
     /// 0 = `""` (no permit), 1 = COLLECTOR, 2 = E2_GROUPING.
@@ -234,7 +237,7 @@ pub(crate) struct EvidenceContract {
 crate::heap_layout_bound::no_heap!(true; EvidenceContract);
 
 impl EvidenceContract {
-    /// S2: the contract this cycle builds under, only while the index records
+    /// The contract this cycle builds under, only while the index records
     /// that same real contract (never a placeholder, never unknown).
     pub(crate) fn current(index: &ScanIndex) -> Option<Self> {
         let cycle = claude_request_identity::cycle_contract(true);
@@ -254,10 +257,11 @@ impl EvidenceContract {
     }
 }
 
-/// S1: accumulate `snapshots` into the index's pending and stamp each touched
+/// Accumulate `snapshots` into the index's pending and stamp each touched
 /// family: the current contract only if its pending was empty before or
-/// already carried that same stamp; otherwise `None` (mixed). Written with the
-/// switch OFF too (13a), so the ON flip finds stamped evidence. A durable-tail
+/// already carried that same stamp; otherwise `None` (mixed), so a stamp is
+/// never laundered. Written with the switch OFF too, so the ON flip finds
+/// stamped evidence. A durable-tail
 /// restore folds here as well: its record is keyed by the recorded contract
 /// (`Interpretation::identity_contract`), so it was built under `current`.
 pub(super) fn stamped<T>(
@@ -321,7 +325,7 @@ fn evidence_free(pending: &ClaudeUsageFamilyPending) -> bool {
             .all(BTreeSet::is_empty)
 }
 
-/// RF1 #992 KeepOwedNoCredit, per member: cap-invalid family, no stored
+/// Kept owed with no credit, per member: cap-invalid family, no stored
 /// evidence, no authority quarantine or decode hold, and this exact revision
 /// is the one its census record reproduced in the family's window, with an
 /// ACKed head.
@@ -379,7 +383,7 @@ fn family<'a>(
         })
 }
 
-/// Lead B Q1 cap room: the family's recorded requests fit the pending
+/// Cap room: the family's recorded requests fit the pending
 /// occurrence cap after what is already retained; admitted in selection order.
 fn cap_room(index: &ScanIndex, page: &mut Page, key: &str, root: &str) -> bool {
     let retained = *page.retained.get_or_insert_with(|| {
@@ -458,7 +462,7 @@ pub(super) fn resolve(
                 return;
             }
             Ok(Restamp::UnderLatch) => {
-                // S3: window membership only. The entry stays owed, so fence
+                // Window membership only. The entry stays owed, so fence
                 // coverage, family proof and retirement still see it
                 // unobserved until a re-stamp without the latch.
                 claude_contract::note(|c| c.evidence_owed.restamped_under_latch += 1);
@@ -538,7 +542,7 @@ pub(super) fn resolve(
     }
 }
 
-/// D34 age: this owed member's family evidence window against this census.
+/// Age of this owed member's family evidence window against this census.
 fn note_age(index: &ScanIndex, root: Option<&str>, census_window_end: &str) {
     let age = root
         .and_then(|root| index.claude_usage_family_pending.get(root))
@@ -557,7 +561,7 @@ fn note_age(index: &ScanIndex, root: Option<&str>, census_window_end: &str) {
     });
 }
 
-/// A bound re-stamp: an observation, or (latch set, Q5b stamp current)
+/// A bound re-stamp: an observation, or (latch set, contract stamp current)
 /// window membership only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Restamp {
@@ -578,7 +582,7 @@ enum Refusal {
     NoPending,
 }
 
-/// (a) Lead B ruling 1 (2026-10-31): an unchanged member's stored occurrences
+/// (a) An unchanged member's stored occurrences
 /// count as an observation in this census window, no read, only when
 /// (a) the fingerprint is unchanged (the caller), (b) the scan identity and
 /// request-identity contracts are unchanged since storage, (c) the stored
@@ -656,8 +660,8 @@ fn restamp(
     })
 }
 
-/// S3: under ON a family with an owed member is not proven at completion:
-/// owed evidence (including a latch-time Q5b re-stamp) earns no credit,
+/// Under ON a family with an owed member is not proven at completion: owed
+/// evidence (including a re-stamp under the latch) earns no credit,
 /// retirement or fence decision until it resolves.
 pub(super) fn owed_roots(index: &ScanIndex) -> BTreeSet<String> {
     if !enabled() {
@@ -723,7 +727,7 @@ pub(super) fn latch_clearable(
     Some(exempt)
 }
 
-/// The admission drop (RF1 #992 rev F2): an unfinished admission still owes
+/// The admission drop: an unfinished admission still owes
 /// due paths its existing selector has not offered.
 pub(super) fn due_unoffered(
     index: &ScanIndex,
@@ -752,7 +756,7 @@ pub(super) fn due_only(state: &ClaudeRetryAdmission) -> ClaudeRetryAdmission {
     }
 }
 
-/// GUARD: an indexed family this census did not prove stays owed; only a
+/// An indexed family this census did not prove stays owed; only a
 /// completed family proof retires pending.
 pub(super) fn owed_at_completion(
     root_session_id: &str,
@@ -823,7 +827,7 @@ mod tests {
     }
 
     /// [money] Equality readers that stand for "observed" or feed a proof
-    /// (E2 copy proof, native credit, proof corrections, owned start, record
+    /// (`e2` copy proof, native credit, proof corrections, owned start, record
     /// retirement, audits) see an owed revision exactly as main's cleared
     /// one, until a re-stamp or read resolves it.
     #[test]
@@ -844,7 +848,7 @@ mod tests {
         assert_eq!(owed.observed_fingerprint(), "revision");
     }
 
-    /// [off=main] Round 3: every census clear site goes through `clear`. OFF
+    /// [behaviour] Every census clear site goes through `clear`. OFF
     /// it is main's clear; ON it keeps the revision owed, and a `Read` site
     /// also marks it must-read (never re-stamped).
     #[test]
@@ -881,14 +885,14 @@ mod tests {
         }
     }
 
-    /// [money] Q5b S1/S2 (Lead B): the stamp is the contract the WHOLE pending
+    /// [money] The contract stamp is the contract the WHOLE pending
     /// was built under. Empty pending takes the current contract; a pending
     /// stamped with the current contract keeps it; anything accumulated across
     /// a contract (or body-witness revision) change is `None` and never
     /// laundered back; a placeholder or unknown record stamps `None` (so a
     /// stampless restore gives `None`); invalid evidence is `None`.
     #[test]
-    fn q5b_stamp_is_written_on_accumulation_and_never_laundered() {
+    fn contract_stamp_is_written_on_accumulation_and_never_laundered() {
         let mut index = ScanIndex {
             claude_request_identity_contract: Some(
                 claude_request_identity::cycle_contract(true).into(),

@@ -4558,7 +4558,7 @@ fn terminal_off_suppressed_start_still_rearms_an_unacked_head() {
     assert_eq!(again["rearmed_index_files"], 1);
 }
 
-/// AR1 R1 fixture: the scoped-retry families, each member's census record bound
+/// Evidence-owed fixture: the scoped-retry families, each member's census record bound
 /// to the request ids its stored pending holds, after one whole-set re-arm
 /// (BASE start: nothing carried) under `on`.
 fn owed_rearmed(healthy: usize, on: bool) -> (ScopedRetryFixture, String) {
@@ -4609,8 +4609,8 @@ fn owed_selected_parses(
         .count()
 }
 
-/// [regress] AR1 R1 (RC4: 31,738 of 36,992 Claude Fulls in 14.6 h were
-/// `selection_cleared`): a whole-set re-arm of unchanged ACKed families reads
+/// [regress] Most Claude Full reads were `selection_cleared`: a whole-set
+/// re-arm of unchanged ACKed families reads
 /// every member on main; with evidence owed it reads none of them, and a
 /// changed member is read once.
 #[test]
@@ -4631,7 +4631,7 @@ fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
             &window,
         );
         assert_eq!(parsed, if on { 1 } else { 4 }, "on={on}");
-        // AR2 D34: every owed visit is counted by outcome and evidence age.
+        // Every owed visit is counted by outcome and evidence age.
         let counts = scope.finish().contract.evidence_owed;
         if on {
             assert_eq!((counts.restamped, counts.changed, counts.read), (3, 1, 0));
@@ -4649,11 +4649,11 @@ fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
     }
 }
 
-/// [money] Lead B ruling 1 (2026-10-31): a re-stamp's proof equals a fresh
+/// [money] A re-stamp's proof equals a fresh
 /// Full's (the family pending a Full folds in this window: same ids, same
 /// occurrences, observed for fence coverage); an owed cap-invalid family gets
 /// no read and no credit unless its recorded requests fit the cap; and census
-/// completion retires only proven families (GUARD).
+/// completion retires only proven families.
 #[test]
 fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -4713,7 +4713,7 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         );
     }
 
-    // GUARD: an indexed family this census did not prove stays owed.
+    // An indexed family this census did not prove stays owed.
     let indexed = BTreeSet::from([root.clone()]);
     assert!(evidence_owed::owed_at_completion(
         &root, &invalid, false, &indexed
@@ -4729,14 +4729,15 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
     ));
 }
 
-/// [money] Q5b (Lead B S1-S6, 2026-10-31) with the latch SET: a family whose
-/// pending is stamped with the recorded, real contract re-stamps with no read
-/// and its pending equals a Full's fold, but every member stays owed so fence
-/// coverage, family proof and retirement stay vetoed (S3). A legacy (None),
-/// mixed (other contract or body-witness revision) or placeholder-recorded
-/// family reads as round 2.
+/// [money] With the identity-contract latch SET, a family whose pending is
+/// stamped with the recorded, real contract re-stamps with no read and its
+/// pending equals a Full's fold, but every member stays owed so fence
+/// coverage, family proof and retirement stay vetoed. A legacy (None), mixed
+/// (other contract or body-witness revision) or placeholder-recorded family
+/// reads. A contract-unproven family proves its contract only through its own
+/// stamp.
 #[test]
-fn owed_evidence_q5b_stamp_restamps_under_the_latch_and_keeps_the_vetoes() {
+fn owed_evidence_contract_stamp_restamps_under_the_latch_and_keeps_the_vetoes() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4784,12 +4785,12 @@ fn owed_evidence_q5b_stamp_restamps_under_the_latch_and_keeps_the_vetoes() {
     assert_eq!(
         claude_duplicate_fence_coverage_missing_member_count(&index, &window),
         2,
-        "S3: no fence coverage under the latch"
+        "no fence coverage under the latch"
     );
     assert_eq!(
         evidence_owed::owed_roots(&index),
         fixture.roots.iter().cloned().collect(),
-        "S3: family proof skips owed roots"
+        "family proof skips owed roots"
     );
 
     let mut placeholder = fixture.index.clone();
@@ -4833,7 +4834,8 @@ fn owed_evidence_q5b_stamp_restamps_under_the_latch_and_keeps_the_vetoes() {
     }
 }
 
-/// [regress] RF1 round 3 (C5 P4): owed Fulls share ONE per-page allowance
+/// [regress] Owed Fulls were limited only by the page budget; they now share
+/// ONE per-page allowance
 /// (the paced history-upgrade re-read budget). Past it an owed read is
 /// deferred, counted, and requeued as a non-member re-read, still owed. A
 /// must-read revision (a fold correction) never re-stamps.
@@ -4873,8 +4875,8 @@ fn owed_evidence_reads_are_capped_per_page_and_must_reads_never_restamp() {
     assert!(fixture.index.files.values().all(|entry| entry.evidence_owed));
 }
 
-/// [regress] RF1 round 2 admission drop (B1 deadlock: off terminal-off any
-/// persisted admission vetoes traversal health). Main keeps the admission;
+/// [regress] A persisted unfinished admission vetoed traversal health for
+/// good (a deadlock). Main keeps the admission;
 /// evidence owed ON drops the unfinished one at the next start, creates no
 /// batch admission, counts the drop, and its stale members keep their
 /// fingerprints (owed, never credited by the dropped carry).

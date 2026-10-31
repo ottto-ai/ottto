@@ -525,9 +525,9 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
     assert_eq!(pending.census_window_end, "2026-08-01T07:10:00Z");
 }
 
-/// [regress] RF1 round 3 (C5 P6, the #893 fold: the first complete census
-/// clears every family file, ~15.6k on the M4, again on a 1-24 h backoff).
-/// OFF the fold clears exactly as main; ON it owes the same files, keeping
+/// [regress] The first complete census's full re-arm clears every family
+/// file, again on a 1-24 h backoff while the fence stays closed. OFF the fold
+/// clears exactly as main; ON it owes the same files, keeping
 /// their fingerprints, so the owed resolver (re-stamp, restore, paced Full)
 /// decides each one at the next walk.
 #[test]

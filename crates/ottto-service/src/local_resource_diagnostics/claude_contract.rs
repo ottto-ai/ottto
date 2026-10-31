@@ -40,7 +40,7 @@ counters!(ContextChange {
     replay_changed,
     roots_changed
 });
-// AR2 D34 (evidence owed ON): each owed member the traversal's selection
+// Evidence owed ON: each owed member the traversal's selection
 // visits, by outcome, by why a re-stamp was refused, and by the age of its
 // family's stored evidence window against this census window.
 counters!(EvidenceOwed {
