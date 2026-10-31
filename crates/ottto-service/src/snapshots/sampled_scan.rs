@@ -440,16 +440,17 @@ impl SharedCache {
             .is_ok()
     }
     /// A completion whose durable record the M3 native route already
-    /// settled. Keep its post-save offer: the saved audit carrier can change
-    /// after native settlement (in particular, quiet audit retirement).
+    /// settled. A receipted record keeps its post-save audit-carrier offer;
+    /// a no-record disposition must not retry the failed write after effects.
     #[cfg(unix)]
     pub(super) fn insert_settled(
         &self,
         key: String,
         completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
+        write_candidate: bool,
     ) -> bool {
-        self.insert_with_custody(key, completed, live_bytes, false, true, false)
+        self.insert_with_custody(key, completed, live_bytes, false, write_candidate, false)
             .is_ok()
     }
     pub(super) fn return_prepared_taken(
