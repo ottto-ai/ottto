@@ -7,6 +7,7 @@
 //! CLI JSON, task titles, URLs, provider ids, and cursors are used only in
 //! memory to derive content-free observations.
 
+use crate::locked_state_dir::FileLock;
 use anyhow::{anyhow, Context, Result};
 use getrandom::fill as random_fill;
 use hmac::{Hmac, Mac};
@@ -298,38 +299,8 @@ impl CloudSessionControlTokenUseStore {
         atomic_json_write(&self.path, &ledger)
     }
 
-    fn lock(&self) -> Result<CloudSessionGrantLock> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| anyhow!("cloud-session control token ledger path has no parent"))?;
-        fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-        }
-        let path = self.path.with_extension("lock");
-        let mut options = OpenOptions::new();
-        options.create(true).read(true).write(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(&path)
-            .context("open cloud-session control token ledger lock")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        }
-        #[cfg(unix)]
-        if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) } != 0 {
-            return Err(anyhow!("lock cloud-session control token ledger"));
-        }
-        Ok(CloudSessionGrantLock { file })
+    fn lock(&self) -> Result<FileLock> {
+        lock_state_file(&self.path, "control token ledger")
     }
 }
 
@@ -994,43 +965,11 @@ impl CloudSessionGrantStore {
         self.write(&state)
     }
 
-    fn lock(&self) -> Result<CloudSessionGrantLock> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| anyhow!("cloud-session grant path has no parent"))?;
-        fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-        }
-        let path = self.path.with_extension("lock");
-        let mut options = OpenOptions::new();
-        options.create(true).read(true).write(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(&path)
-            .context("open cloud-session grant lock")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        }
-        #[cfg(unix)]
-        {
-            // The state can be changed by the local UI/control process while
-            // the collector thread records health. Hold a process-wide lock so
-            // stale read-modify-write health updates cannot restore consent.
-            if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) } != 0 {
-                return Err(anyhow!("lock cloud-session grant"));
-            }
-        }
-        Ok(CloudSessionGrantLock { file })
+    /// The state can be changed by the local UI/control process while the
+    /// collector thread records health. Hold a process-wide lock so stale
+    /// read-modify-write health updates cannot restore consent.
+    fn lock(&self) -> Result<FileLock> {
+        lock_state_file(&self.path, "grant")
     }
 }
 
@@ -1044,17 +983,26 @@ impl Default for CloudSessionGrantStore {
     }
 }
 
-struct CloudSessionGrantLock {
-    file: File,
-}
-
-impl Drop for CloudSessionGrantLock {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        unsafe {
-            libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN);
-        }
-    }
+/// Waits for an exclusive flock on `<state_path>.lock` (0600) in an owner-only
+/// (0700) directory.
+fn lock_state_file(state_path: &Path, label: &str) -> Result<FileLock> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let parent = state_path
+        .parent()
+        .ok_or_else(|| anyhow!("cloud-session {label} path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    let path = state_path.with_extension("lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("open cloud-session {label} lock"))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    FileLock::exclusive(file).map_err(|_| anyhow!("lock cloud-session {label}"))
 }
 
 /// Build the visible collector state without creating a runner or invoking

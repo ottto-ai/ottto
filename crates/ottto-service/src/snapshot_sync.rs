@@ -1091,7 +1091,10 @@ fn settle_index_after_upload(
 
 /// Correction completion depends on the final selected file/empty facts. In
 /// particular, the last M2 no-body drain must precede the completion decision.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the selected index, page facts, correction candidates and drain ledger"
+)]
 fn settle_upload_corrections_after_selection(
     index: &mut ScanIndex,
     scan: &SourceScanResult,
@@ -1141,6 +1144,71 @@ fn settle_upload_corrections_after_selection(
         crate::local_resource_diagnostics::claude_history_proof_correction_deferred(deferred);
     }
     transport_fully_settled && !blocking
+}
+
+struct SelectedSettlementInputs<'a> {
+    scan: &'a SourceScanResult,
+    committed_index: &'a ScanIndex,
+    progress: &'a SnapshotUploadProgress,
+    candidates: &'a [crate::snapshots::ClaudeProofCorrectionCandidate],
+    cutoff_candidates: &'a [crate::snapshots::ClaudeCutoffCorrectionCandidate],
+    transport_fully_settled: bool,
+    body_drains: crate::snapshots::ClaudeProofBodyDrains,
+    comparison: Option<&'a mut crate::snapshots::claude_native_comparison::Completion>,
+    audit_release: Option<AccountAuditRelease<'a>>,
+}
+
+/// The finish order after save selection, shared with the proof-correction
+/// pipeline harness so its regressions guard this order: correction settle,
+/// native paid restore, account-audit release (which can clear a drained
+/// entry's revision), then the body-drain restore. Returns whether the page
+/// is fully settled.
+fn finish_selected_settlement(
+    index: &mut ScanIndex,
+    inputs: SelectedSettlementInputs<'_>,
+) -> Result<bool, crate::source_rotation::LocalRefusal> {
+    let SelectedSettlementInputs {
+        scan,
+        committed_index,
+        progress,
+        candidates,
+        cutoff_candidates,
+        transport_fully_settled,
+        mut body_drains,
+        comparison,
+        audit_release,
+    } = inputs;
+    let mut fully_settled = settle_upload_corrections_after_selection(
+        index,
+        scan,
+        committed_index,
+        progress,
+        candidates,
+        cutoff_candidates,
+        transport_fully_settled,
+        &mut body_drains,
+    );
+    if let Some(comparison) = comparison {
+        if comparison.restore_selected_paid(index, committed_index)? {
+            fully_settled = false;
+        }
+    }
+    if let Some(release) = audit_release {
+        scan.preserve_released_account_audits(
+            index,
+            release.previous,
+            release.cache,
+            release.roots,
+            release.backfill_window_days,
+        );
+    }
+    // After every selected-entry restore and the account-audit release, which
+    // can clear a drained entry's revision: a drain (pre-selection or D1)
+    // whose entry this save does not keep stays owed.
+    if index.restore_unselected_claude_proof_body_drains(body_drains) {
+        fully_settled = false;
+    }
+    Ok(fully_settled)
 }
 
 fn apply_backfill_cutoff_with_claude_corrections(
@@ -8443,36 +8511,25 @@ fn finish_sync_source(
     settle_index_after_upload(&mut index, &committed_index, &upload_progress);
     // Completed/checkpointed outcomes have now selected their retained file
     // facts. No-body completion must share that exact durable checkpoint.
-    upload_fully_settled = settle_upload_corrections_after_selection(
+    upload_fully_settled = finish_selected_settlement(
         &mut index,
-        &scan_result,
-        &committed_index,
-        &upload_progress,
-        &claude_proof_correction_candidates,
-        &claude_cutoff_corrections,
-        upload_fully_settled,
-        &mut claude_proof_body_drains,
-    );
-    if let Some(comparison) = comparison_completion.as_mut() {
-        if comparison.restore_selected_paid(&mut index, &committed_index)? {
-            upload_fully_settled = false;
-        }
-    }
-    if source == SnapshotSource::ClaudeCode {
-        scan_result.preserve_released_account_audits(
-            &mut index,
-            &committed_index,
-            &daemon.transcript_cache,
-            claude_scan_roots.as_deref().unwrap_or_default(),
-            receipt_window_days,
-        );
-    }
-    // After every selected-entry restore and the account-audit release, which
-    // can clear a drained entry's revision: a drain (pre-selection or D1)
-    // whose entry this save does not keep stays owed.
-    if index.restore_unselected_claude_proof_body_drains(claude_proof_body_drains) {
-        upload_fully_settled = false;
-    }
+        SelectedSettlementInputs {
+            scan: &scan_result,
+            committed_index: &committed_index,
+            progress: &upload_progress,
+            candidates: &claude_proof_correction_candidates,
+            cutoff_candidates: &claude_cutoff_corrections,
+            transport_fully_settled: upload_fully_settled,
+            body_drains: claude_proof_body_drains,
+            comparison: comparison_completion.as_mut(),
+            audit_release: (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
+                previous: &committed_index,
+                cache: &daemon.transcript_cache,
+                roots: claude_scan_roots.as_deref().unwrap_or_default(),
+                backfill_window_days: receipt_window_days,
+            }),
+        },
+    )?;
     let mut retired_upload_acks = upload_progress.stage_selected_ack_retirement(
         &committed_index,
         &mut index,
@@ -9004,7 +9061,8 @@ pub struct ClaudeLocalEvidenceStats {
     /// Strict trace reads dropped as grown or replaced; absent while empty.
     #[serde(skip_serializing_if = "crate::claude_local_otel::ClaudeTraceRowsDiscarded::is_empty")]
     pub trace_rows_discarded: crate::claude_local_otel::ClaudeTraceRowsDiscarded,
-    /// Requests placed Unknown because this page discarded their strict trace.
+    /// Requests placed Unknown because this page discarded their strict trace:
+    /// `unhealthy_root_no_fallback_requests.discarded`, kept for #932 readers.
     #[serde(skip_serializing_if = "trace_discard_count_is_zero")]
     pub trace_discard_no_fallback_requests: u64,
     /// Items whose upload this page deferred because it discarded their
@@ -9024,6 +9082,12 @@ pub struct ClaudeLocalEvidenceStats {
     pub effort_evidence_load_failed: bool,
     pub own_request_complete_root_count: usize,
     pub own_request_unknown_root_count: usize,
+    /// E2 requests left Unknown because their family's strict read failed;
+    /// absent from the line while empty.
+    #[serde(
+        skip_serializing_if = "crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts::is_empty"
+    )]
+    pub unhealthy_root_no_fallback_requests: crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
     /// Containment's withheld full re-arm; absent from the line while zero,
     /// which it always is under the default OFF.
@@ -9594,6 +9658,15 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     let request_owned =
         |root: &str| crate::snapshots::claude_request_money::e2::family_applies(index, root, None);
     let mut identity_unhealthy_roots = BTreeSet::new();
+    // The strongest cause per unhealthy root, for its no-fallback counter.
+    let mut unhealthy_reasons = BTreeMap::new();
+    let mut note_unhealthy =
+        |root: &str, reason: crate::snapshots::claude_request_identity::UnhealthyRootReason| {
+            unhealthy_reasons
+                .entry(root.to_owned())
+                .and_modify(|known| *known = reason.min(*known))
+                .or_insert(reason);
+        };
     let usage_roots = usage_roots
         .into_iter()
         .filter(|session_id| {
@@ -9618,6 +9691,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             {
                 full_rearm_evidence_complete = false;
                 identity_unhealthy_roots.insert(session_id.clone());
+                note_unhealthy(
+                    session_id,
+                    crate::snapshots::claude_request_identity::UnhealthyRootReason::Incomplete,
+                );
             }
             // Contract 5 must tell absent evidence from failed evidence.
             if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
@@ -9625,6 +9702,17 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 full_rearm_evidence_complete = false;
                 if builds_evidence || request_owned(session_id) {
                     identity_unhealthy_roots.insert(session_id.clone());
+                    let (oversized, unreadable) =
+                        crate::claude_local_otel::claude_sidecar_pair_faults(
+                            support_dir,
+                            session_id,
+                        );
+                    note_unhealthy(
+                        session_id,
+                        crate::snapshots::claude_request_identity::UnhealthyRootReason::of(
+                            oversized, unreadable, 0,
+                        ),
+                    );
                 }
             }
             paired
@@ -9770,6 +9858,28 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 veto_api_rows.insert(root_session_id.clone(), rows);
             }
             if builds_evidence || request_owned(&root_session_id) {
+                use crate::snapshots::claude_request_identity::UnhealthyRootReason;
+                let api_reason = (!api.health.is_complete()).then(|| {
+                    UnhealthyRootReason::of(
+                        api.health.oversized_files,
+                        api.health.unreadable_lines,
+                        api.health.malformed_lines,
+                    )
+                });
+                let trace_reason = (!trace.is_complete()).then(|| {
+                    if trace.rows_discarded.is_empty() {
+                        UnhealthyRootReason::of(
+                            trace.oversized_files,
+                            trace.unreadable_lines,
+                            trace.malformed_lines,
+                        )
+                    } else {
+                        UnhealthyRootReason::Discarded
+                    }
+                });
+                if let Some(reason) = api_reason.into_iter().chain(trace_reason).min() {
+                    note_unhealthy(&root_session_id, reason);
+                }
                 identity_unhealthy_roots.insert(root_session_id);
             }
             continue;
@@ -9834,6 +9944,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         &trace_report,
         index,
     );
+    let mut trace_discard_unfolded = BTreeSet::new();
     if request_owned_enabled {
         // Reuse the per-root read verdict before identity consumes it. Missing
         // sidecars are ordinary absence; partial pairs and failed strict reads
@@ -9844,8 +9955,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         index.hold_claude_history_for_unhealthy_telemetry_roots(&side_calls_unresolved);
         // A discarded strict trace read defers the family's bodies through the
         // E2 withhold: the accepted revision stays, delayed one pass, never
-        // replaced by an untagged one.
-        stats.trace_discard_deferred_items =
+        // replaced by an untagged one. Listed families included.
+        (stats.trace_discard_deferred_items, trace_discard_unfolded) =
             crate::snapshots::claude_request_money::e2::hold_trace_discarded(
                 &mut scan_result.snapshots,
                 &trace_discarded_roots,
@@ -9860,7 +9971,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             identity_unhealthy_roots,
             crate::snapshots::claude_request_identity::desktop_census(index),
         )
-        .with_trace_discarded_roots(trace_discarded_roots)
+        .with_unhealthy_reasons(unhealthy_reasons)
         .with_status_coverage(crate::claude_status_coverage::snapshot())
         .with_native_originals(&originals)
         .with_accepted_buckets(accepted_identity_buckets)
@@ -9897,11 +10008,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     if crate::snapshots::claude_request_money::e2::enabled() {
         if let Some(evidence) = &identity_evidence {
-            stats.trace_discard_no_fallback_requests =
-                crate::snapshots::claude_request_identity::reconcile_request_accounts(
-                    &mut scan_result.snapshots,
-                    evidence,
-                );
+            let no_fallback = crate::snapshots::claude_request_identity::reconcile_request_accounts(
+                &mut scan_result.snapshots,
+                evidence,
+            );
+            // #932's scalar stays, equal to its reason in the map.
+            stats.trace_discard_no_fallback_requests = no_fallback.discarded;
+            stats.unhealthy_root_no_fallback_requests = no_fallback;
         }
     }
     let request_owned_activity = identity_evidence.as_ref().map(|evidence| {
@@ -9921,7 +10034,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // the account hash then tag the rows that upload.
     // Gate off this only counts, so the page is unchanged.
     // Withheld entities stay on the page and owed: delayed, never settled.
-    let withheld = crate::snapshots::claude_request_money::e2::finish_page(
+    let mut withheld = crate::snapshots::claude_request_money::e2::finish_page(
         &mut scan_result.snapshots,
         index,
         if telemetry_read_failed {
@@ -9930,6 +10043,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
         },
     );
+    withheld.extend(trace_discard_unfolded);
     if let Some((cache, committed)) = retained {
         cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
     }
@@ -10008,8 +10122,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     disposition.mixed_uploads = qualification.mixed;
     // Request identity is not the session owner: admit only this scan's
     // exact contract-5 bodies, never rewriting a retained owner.
+    // Nor is an unhealthy read's cleared account: admit this scan's exact
+    // Unknown bodies so a bound session uploads them (Lead B Addendum 4).
     for item in &scan_result.snapshots {
         disposition.mixed_uploads.admit_request_identity(item);
+        disposition.mixed_uploads.admit_unhealthy_unknown(item);
     }
     stats.identity_complete_session_count = scan_result
         .snapshots

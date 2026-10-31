@@ -822,7 +822,7 @@ impl ApcFixture {
         // Production order: exact upload progress is durable before this seam,
         // and the following save commits both body state and correction
         // progress, or neither.
-        let mut body_drains = index.settle_claude_proof_corrections(
+        let body_drains = index.settle_claude_proof_corrections(
             &committed_index,
             &candidates,
             &progress.accepted_fingerprints,
@@ -885,32 +885,30 @@ impl ApcFixture {
         };
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
-        let mut fully_settled = settle_upload_corrections_after_selection(
+        // The production finish order. The opt-in account-audit release has
+        // an empty cache, so no retained custody: a released hold's entry is
+        // cleared and queued for retry.
+        let no_custody = crate::snapshots::sampled_scan::SharedCache::default();
+        let fully_settled = finish_selected_settlement(
             &mut index,
-            &scan,
-            &committed_index,
-            &progress,
-            &candidates,
-            &cutoff_candidates,
-            settlement.fully_settled,
-            &mut body_drains,
-        );
-        if self.audit_release.get() {
-            // Production order: the account-audit release runs after native
-            // restore and before the body-drain restore. The empty cache has
-            // no retained custody, so a released hold's entry is cleared and
-            // queued for retry.
-            scan.preserve_released_account_audits(
-                &mut index,
-                &committed_index,
-                &crate::snapshots::sampled_scan::SharedCache::default(),
-                std::slice::from_ref(&self.root),
-                183,
-            );
-        }
-        if index.restore_unselected_claude_proof_body_drains(body_drains) {
-            fully_settled = false;
-        }
+            SelectedSettlementInputs {
+                scan: &scan,
+                committed_index: &committed_index,
+                progress: &progress,
+                candidates: &candidates,
+                cutoff_candidates: &cutoff_candidates,
+                transport_fully_settled: settlement.fully_settled,
+                body_drains,
+                comparison: None,
+                audit_release: self.audit_release.get().then_some(AccountAuditRelease {
+                    previous: &committed_index,
+                    cache: &no_custody,
+                    roots: std::slice::from_ref(&self.root),
+                    backfill_window_days: 183,
+                }),
+            },
+        )
+        .expect("no paid restore");
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
             &mut index,
@@ -1245,7 +1243,7 @@ impl ApcFixture {
         // Production order: exact upload progress is durable before this seam,
         // and the following save commits both body state and correction
         // progress, or neither.
-        let mut body_drains = index.settle_claude_proof_corrections(
+        let body_drains = index.settle_claude_proof_corrections(
             &committed_index,
             &candidates,
             &progress.accepted_fingerprints,
@@ -1308,32 +1306,30 @@ impl ApcFixture {
         };
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
-        let mut fully_settled = settle_upload_corrections_after_selection(
+        // The production finish order. The opt-in account-audit release has
+        // an empty cache, so no retained custody: a released hold's entry is
+        // cleared and queued for retry.
+        let no_custody = crate::snapshots::sampled_scan::SharedCache::default();
+        let fully_settled = finish_selected_settlement(
             &mut index,
-            &scan,
-            &committed_index,
-            &progress,
-            &candidates,
-            &cutoff_candidates,
-            settlement.fully_settled,
-            &mut body_drains,
-        );
-        if self.audit_release.get() {
-            // Production order: the account-audit release runs after native
-            // restore and before the body-drain restore. The empty cache has
-            // no retained custody, so a released hold's entry is cleared and
-            // queued for retry.
-            scan.preserve_released_account_audits(
-                &mut index,
-                &committed_index,
-                &crate::snapshots::sampled_scan::SharedCache::default(),
-                std::slice::from_ref(&self.root),
-                183,
-            );
-        }
-        if index.restore_unselected_claude_proof_body_drains(body_drains) {
-            fully_settled = false;
-        }
+            SelectedSettlementInputs {
+                scan: &scan,
+                committed_index: &committed_index,
+                progress: &progress,
+                candidates: &candidates,
+                cutoff_candidates: &cutoff_candidates,
+                transport_fully_settled: settlement.fully_settled,
+                body_drains,
+                comparison: None,
+                audit_release: self.audit_release.get().then_some(AccountAuditRelease {
+                    previous: &committed_index,
+                    cache: &no_custody,
+                    roots: std::slice::from_ref(&self.root),
+                    backfill_window_days: 183,
+                }),
+            },
+        )
+        .expect("no paid restore");
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
             &mut index,
@@ -4276,9 +4272,10 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
 /// revision. It stays owed with its pre-drain pair beside the held root, and
 /// drains again once the retry re-reads it.
 /// At the production E2 gate (ON), on an owed pre-flip correction
-/// (`ApcFixture::pre_flip_grant`). Fails without 2015e841f: the restore runs
-/// before the release and carries agent b's drain, so
-/// `apc_f1_released_members_stay_owed` panics "stays owed".
+/// (`ApcFixture::pre_flip_grant`). Not a discriminator of 2015e841f on its
+/// own: if selection kept agent b's committed re-arm marker, either order
+/// re-owes it, and the page exposes no pre-release entry to tell. The last
+/// owed and permanent refusal F1 tests are the discriminators.
 #[test]
 #[serial(source_manifests)]
 fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_one() {
