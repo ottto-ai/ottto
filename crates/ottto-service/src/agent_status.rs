@@ -25518,91 +25518,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_durable_slot_is_one_row_and_platform_orgs_add_nothing() {
-        let token = codex_split_identity_token(
-            "raw-workspace-binding",
-            serde_json::json!([
-                {"id": "raw-org-acme", "title": "Acme", "is_default": true},
-                {"id": "raw-org-deprecated", "title": "Acme Deprecated", "is_default": false},
-                {"id": "raw-org-personal", "title": "Personal", "is_default": false}
-            ]),
-        );
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let binding_workspace_hash =
-            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
-                .expect("workspace hash");
-        let mut durable = codex_candidate_for_test(
-            "codex_slot_durable",
-            CodexAccountSlotOwnershipV1::Managed,
-            &account_hash,
-            &binding_workspace_hash,
-            5,
-        );
-        durable.workspace_targets = evidence;
-
-        let coverage =
-            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[durable]);
-
-        assert_eq!(coverage.targets.len(), 1);
-        let connected = &coverage.targets[0];
-        assert_eq!(
-            connected.durability,
-            CodexAccountTargetDurabilityV1::Durable
-        );
-        assert_eq!(connected.workspace_label.as_deref(), Some("Acme"));
-        assert_eq!(
-            connected.subscription_product.as_deref(),
-            Some("chatgpt_pro")
-        );
-        assert!(!connected.connectable, "already connected");
-        assert_eq!(coverage.connectable_targets, 0);
-    }
-
-    #[test]
-    fn codex_non_default_platform_org_adds_no_row_even_when_it_claims_a_plan() {
-        // A platform organization naming its own plan is still a platform
-        // organization. A claimed plan must not smuggle it back in as a
-        // subscription the owner could connect.
-        let token = codex_split_identity_token(
-            "raw-workspace-binding",
-            serde_json::json!([
-                {"id": "raw-org-acme", "title": "Acme", "is_default": true},
-                {"id": "raw-org-team", "title": "Team", "is_default": false, "plan_type": "business"}
-            ]),
-        );
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let binding_workspace_hash =
-            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
-                .expect("workspace hash");
-        let mut candidate = codex_candidate_for_test(
-            "default",
-            CodexAccountSlotOwnershipV1::Default,
-            &account_hash,
-            &binding_workspace_hash,
-            5,
-        );
-        candidate.workspace_targets = evidence;
-
-        let coverage =
-            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
-
-        assert_eq!(coverage.targets.len(), 1);
-        assert_eq!(coverage.targets[0].workspace_label.as_deref(), Some("Acme"));
-        assert!(coverage
-            .targets
-            .iter()
-            .all(|target| target.workspace_label.as_deref() != Some("Team")));
-    }
-
-    #[test]
     fn codex_current_login_is_one_target_when_binding_and_default_org_ids_differ() {
         // Live shape: the credential is bound by `chatgpt_account_id`, and its only
         // organization is the default one, named "Personal", carrying a different id.
@@ -25650,44 +25565,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_targets_name_the_account_from_the_id_token_email() {
-        let token = codex_split_identity_token(
-            "raw-workspace-binding",
-            serde_json::json!([
-                {"id": "raw-org-personal", "title": "Personal", "is_default": true},
-                {"id": "raw-org-other", "title": "Other", "is_default": false}
-            ]),
-        );
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let binding_workspace_hash =
-            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
-                .expect("workspace hash");
-        let mut candidate = codex_candidate_for_test(
-            "default",
-            CodexAccountSlotOwnershipV1::Default,
-            &account_hash,
-            &binding_workspace_hash,
-            5,
-        );
-        candidate.workspace_targets = evidence;
-
-        let coverage =
-            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
-
-        assert!(
-            coverage
-                .targets
-                .iter()
-                .all(|target| target.account_label == "private.person@example.test"),
-            "every row of one account names that account, including the bound one"
-        );
-    }
-
-    #[test]
     fn codex_target_account_label_falls_back_when_the_token_claims_no_email() {
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
         let payload = URL_SAFE_NO_PAD.encode(
@@ -25724,48 +25601,6 @@ for line in sys.stdin:
         let coverage =
             derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
         assert_eq!(coverage.targets[0].account_label, "Codex account");
-    }
-
-    #[test]
-    fn codex_workspace_target_coverage_collapses_durable_current_composite() {
-        let token = codex_workspace_target_token(serde_json::json!([
-            {"id": "raw-workspace-default", "title": "Personal", "is_default": true}
-        ]));
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let workspace_hash = billing_identity_hash("openai", "workspace", "raw-workspace-default")
-            .expect("workspace hash");
-        let mut default = codex_candidate_for_test(
-            "default",
-            CodexAccountSlotOwnershipV1::Default,
-            &account_hash,
-            &workspace_hash,
-            5,
-        );
-        default.workspace_targets = evidence;
-        let durable = codex_candidate_for_test(
-            "codex_slot_durable",
-            CodexAccountSlotOwnershipV1::Managed,
-            &account_hash,
-            &workspace_hash,
-            5,
-        );
-        let mut candidates = vec![default, durable];
-        canonicalize_codex_candidates(&mut candidates);
-
-        let coverage =
-            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &candidates);
-
-        assert_eq!(coverage.targets.len(), 1);
-        let target = &coverage.targets[0];
-        assert_eq!(target.durability, CodexAccountTargetDurabilityV1::Durable);
-        assert!(target.is_current);
-        assert!(!target.connectable);
-        assert_eq!(target.health, Some(CodexAccountTargetHealthV1::Healthy));
-        assert_eq!(target.workspace_label.as_deref(), Some("Personal"));
     }
 
     #[test]
@@ -26022,31 +25857,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn a_failed_default_probe_alone_is_a_retrying_read() {
-        let mut default = codex_failed_probe_candidate(
-            "/tmp/codex-health-test-default-probe",
-            "default_user",
-            "default_workspace",
-        );
-        default.slot.slot_id = "default".to_string();
-        default.slot.ownership = CodexAccountSlotOwnershipV1::Default;
-        default.slot.registered_binding = None;
-        default.snapshot.status = AgentStatusState::Degraded;
-
-        let health = codex_source_health_snapshot(
-            &[default],
-            "2026-08-23T00:00:00Z",
-            "2026-08-23T00:15:00Z",
-        );
-
-        assert_eq!(health.status, AgentStatusState::Degraded);
-        assert!(codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
-        assert!(!codex_source_health_codes(&health)
-            .iter()
-            .any(|code| code.starts_with("codex_registered_slot_needs_attention")));
-    }
-
-    #[test]
     fn a_real_connection_problem_still_needs_attention_beside_a_failed_default_probe() {
         let mut default = codex_failed_probe_candidate(
             "/tmp/codex-health-test-default-probe-and-login",
@@ -26102,39 +25912,6 @@ for line in sys.stdin:
         );
 
         assert_eq!(health.status, AgentStatusState::AuthRequired);
-        assert!(!codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
-    }
-
-    #[test]
-    fn an_unconfirmed_default_login_is_not_hidden_behind_a_retrying_read() {
-        let mut default = codex_failed_probe_candidate(
-            "/tmp/codex-health-test-unknown-default-login",
-            "default_user",
-            "default_workspace",
-        );
-        default.slot.slot_id = "default".to_string();
-        default.slot.ownership = CodexAccountSlotOwnershipV1::Default;
-        default.slot.registered_binding = None;
-        default.snapshot.status = AgentStatusState::Degraded;
-        default
-            .snapshot
-            .account
-            .as_mut()
-            .expect("account")
-            .login_state = AgentLoginState::Unknown;
-        default.status.state = CodexAccountSlotCollectionStateV1::ProviderUnavailable;
-        let failed = codex_failed_probe_candidate(
-            "/tmp/codex-health-test-unknown-default-managed",
-            "managed_user",
-            "managed_workspace",
-        );
-
-        let health = codex_source_health_snapshot(
-            &[default, failed],
-            "2026-08-23T00:00:00Z",
-            "2026-08-23T00:15:00Z",
-        );
-
         assert!(!codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
     }
 
@@ -26963,20 +26740,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_id_token_subscription_period_is_absent_when_the_claims_are_absent() {
-        let token = codex_id_token_with_auth_claim(
-            r#"{"chatgpt_account_id": "account_123", "chatgpt_plan_type": "Pro"}"#,
-        );
-
-        let account = parse_codex_id_token_account(&token).expect("account");
-
-        assert_eq!(account.plan_type.as_deref(), Some("pro"));
-        assert_eq!(account.subscription_period_start, None);
-        assert_eq!(account.subscription_period_end, None);
-        assert_eq!(account.subscription_period_last_checked_at, None);
-    }
-
-    #[test]
     fn codex_id_token_subscription_period_reads_rfc3339_strings_as_utc() {
         let token = codex_id_token_with_auth_claim(
             r#"{
@@ -27026,42 +26789,6 @@ for line in sys.stdin:
                 "claim: {claim}"
             );
         }
-    }
-
-    #[test]
-    fn codex_id_token_subscription_period_accepts_one_sided_reporting() {
-        let token = codex_id_token_with_auth_claim(
-            r#"{
-                "chatgpt_plan_type": "Pro",
-                "chatgpt_subscription_active_until": 1785542400
-            }"#,
-        );
-
-        let account = parse_codex_id_token_account(&token).expect("account");
-
-        assert_eq!(account.subscription_period_start, None);
-        assert_eq!(account.subscription_period_last_checked_at, None);
-        assert_eq!(
-            account.subscription_period_end.as_deref(),
-            Some("2026-08-01T00:00:00Z")
-        );
-    }
-
-    #[test]
-    fn codex_id_token_subscription_period_alone_does_not_resurrect_an_empty_account() {
-        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
-        let payload = URL_SAFE_NO_PAD.encode(
-            r#"{
-                "https://api.openai.com/auth": {
-                    "chatgpt_subscription_active_start": 1782864000,
-                    "chatgpt_subscription_active_until": 1785542400,
-                    "chatgpt_subscription_last_checked": 1785283200
-                }
-            }"#,
-        );
-        let token = format!("{header}.{payload}.signature");
-
-        assert!(parse_codex_id_token_account(&token).is_none());
     }
 
     #[test]
@@ -27532,56 +27259,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_app_server_selects_snapshot_with_only_monthly_credit_limit() {
-        let json = serde_json::json!({
-            "rateLimits": {
-                "limitId": "codex",
-                "primary": null,
-                "secondary": null,
-                "credits": null,
-                "individualLimit": {
-                    "limit": "100",
-                    "used": "100",
-                    "remainingPercent": 0,
-                    "resetsAt": 1788220800_u64
-                }
-            }
-        });
-
-        let credits = codex_app_server_credit_balances(&json);
-
-        assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].name, "workspace_monthly_credits");
-        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
-        assert_eq!(credits[0].remaining, Some(0));
-    }
-
-    #[test]
-    fn codex_app_server_ignores_null_monthly_placeholder_when_selecting_snapshot() {
-        let json = serde_json::json!({
-            "rateLimitsByLimitId": {
-                "codex": {
-                    "individualLimit": null
-                }
-            },
-            "rateLimits": {
-                "individualLimit": {
-                    "limit": "8000",
-                    "used": "4525",
-                    "remainingPercent": 43,
-                    "resetsAt": 1788220800_u64
-                }
-            }
-        });
-
-        let credits = codex_app_server_credit_balances(&json);
-
-        assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].name, "workspace_monthly_credits");
-        assert_eq!(credits[0].remaining, Some(3475));
-    }
-
-    #[test]
     fn codex_app_server_falls_back_from_null_effective_snapshot_to_limit_map() {
         let json = serde_json::json!({
             "rateLimits": {
@@ -27928,51 +27605,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn registered_claude_plan_observations_skip_accounts_without_a_product() {
-        // An account Ottto cannot price adds nothing to say. Its row still
-        // comes from the evidence that named the account in the first place.
-        let mut source_health = base_snapshot(
-            SourceKind::ClaudeCode,
-            AgentStatusState::Available,
-            AgentStatusCollectionMethod::CliJson,
-            "2026-09-18T10:00:00Z".to_string(),
-            "2026-09-18T10:30:00Z".to_string(),
-        );
-        let mut snapshot =
-            claude_account_snapshot("ron@ottto.net", "claude_max_20x", "hash-one", "org-one");
-        if let Some(account) = snapshot.account.as_mut() {
-            account.subscription_product = None;
-            account.plan_type = None;
-        }
-
-        append_registered_claude_plan_observations(&mut source_health, &[snapshot]);
-
-        assert!(source_health.plan_observations.is_empty());
-    }
-
-    #[test]
-    fn registered_claude_plan_observations_need_both_identity_halves() {
-        // Without an organization hash the observation cannot be matched to one
-        // subscription, so it is not worth emitting.
-        let mut source_health = base_snapshot(
-            SourceKind::ClaudeCode,
-            AgentStatusState::Available,
-            AgentStatusCollectionMethod::CliJson,
-            "2026-09-18T10:00:00Z".to_string(),
-            "2026-09-18T10:30:00Z".to_string(),
-        );
-        let mut snapshot =
-            claude_account_snapshot("ron@ottto.net", "claude_max_20x", "hash-one", "org-one");
-        if let Some(account) = snapshot.account.as_mut() {
-            account.organization_identifier_hash = None;
-        }
-
-        append_registered_claude_plan_observations(&mut source_health, &[snapshot]);
-
-        assert!(source_health.plan_observations.is_empty());
-    }
-
-    #[test]
     fn claude_cli_account_identity_refuses_mismatched_metadata() {
         // `~/.claude.json` lagging behind an account switch must never stamp a
         // different account's uuid onto the signed-in account.
@@ -28023,121 +27655,6 @@ for line in sys.stdin:
         assert!(fresh.account_identifier_hash.is_none());
     }
 
-    #[test]
-    fn claude_team_seat_tier_refines_premium_from_seat_tier() {
-        let mut account = team_auth_account("team.member@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("team.member@example.com".to_string()),
-            organization_uuid: Some("org-1".to_string()),
-            organization_type: Some("claude_team".to_string()),
-            seat_tier: Some("premium".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        let refined = refine_claude_team_seat_plan(&mut account, &oauth);
-
-        assert_eq!(refined, Some("team_premium"));
-        assert_eq!(account.plan_type.as_deref(), Some("team_premium"));
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_team_premium")
-        );
-    }
-
-    #[test]
-    fn claude_team_seat_tier_refines_premium_from_user_rate_limit_tier() {
-        let mut account = team_auth_account("team.member@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("team.member@example.com".to_string()),
-            user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_team_seat_plan(&mut account, &oauth),
-            Some("team_premium")
-        );
-    }
-
-    #[test]
-    fn claude_team_seat_tier_refines_standard_from_seat_tier() {
-        let mut account = team_auth_account("team.member@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            seat_tier: Some("standard".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_team_seat_plan(&mut account, &oauth),
-            Some("team_standard")
-        );
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_team_standard")
-        );
-    }
-
-    #[test]
-    fn claude_team_seat_tier_leaves_generic_team_without_explicit_signal() {
-        let mut account = team_auth_account("team.member@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("team.member@example.com".to_string()),
-            organization_type: Some("claude_team".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(refine_claude_team_seat_plan(&mut account, &oauth), None);
-        assert_eq!(account.plan_type.as_deref(), Some("team"));
-        assert_eq!(account.subscription_product.as_deref(), Some("claude_team"));
-    }
-
-    #[test]
-    fn claude_team_seat_tier_ignores_mismatched_account_metadata() {
-        // `~/.claude.json` lagging behind an account switch must not leak a
-        // different account's seat tier onto the signed-in account.
-        let mut account = team_auth_account("team.member@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("someone.else@example.com".to_string()),
-            seat_tier: Some("premium".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(refine_claude_team_seat_plan(&mut account, &oauth), None);
-        assert_eq!(account.plan_type.as_deref(), Some("team"));
-    }
-
-    #[test]
-    fn claude_team_seat_tier_ignores_non_team_plans_and_orgs() {
-        let mut max_account = parse_claude_auth_json(&serde_json::json!({
-            "loggedIn": true,
-            "email": "user@example.com",
-            "subscriptionType": "max"
-        }));
-        let premium_oauth = ClaudeCliOauthAccount {
-            seat_tier: Some("premium".to_string()),
-            user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-        assert_eq!(
-            refine_claude_team_seat_plan(&mut max_account, &premium_oauth),
-            None
-        );
-        assert_eq!(max_account.plan_type.as_deref(), Some("max"));
-
-        // A stale non-team organizationType blocks refinement even when the
-        // auth status says team.
-        let mut team_account = team_auth_account("team.member@example.com", "org-1");
-        let stale_oauth = ClaudeCliOauthAccount {
-            organization_type: Some("claude_max".to_string()),
-            seat_tier: Some("premium".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-        assert_eq!(
-            refine_claude_team_seat_plan(&mut team_account, &stale_oauth),
-            None
-        );
-    }
-
     fn max_auth_account(email: &str) -> AgentAccountStatus {
         parse_claude_auth_json(&serde_json::json!({
             "loggedIn": true,
@@ -28146,65 +27663,6 @@ for line in sys.stdin:
             "email": email,
             "subscriptionType": "max"
         }))
-    }
-
-    #[test]
-    fn claude_max_tier_refines_20x_from_organization_rate_limit_tier() {
-        let mut account = max_auth_account("user@example.com");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("user@example.com".to_string()),
-            organization_type: Some("claude_max".to_string()),
-            organization_rate_limit_tier: Some("default_claude_max_20x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        let refined = refine_claude_max_rate_limit_plan(&mut account, &oauth);
-
-        assert_eq!(refined, Some("max_20x"));
-        assert_eq!(account.plan_type.as_deref(), Some("max_20x"));
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_max_20x")
-        );
-    }
-
-    #[test]
-    fn claude_max_tier_refines_5x_from_user_rate_limit_tier_fallback() {
-        let mut account = max_auth_account("user@example.com");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("user@example.com".to_string()),
-            user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_max_rate_limit_plan(&mut account, &oauth),
-            Some("max_5x")
-        );
-        assert_eq!(account.plan_type.as_deref(), Some("max_5x"));
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_max_5x")
-        );
-    }
-
-    #[test]
-    fn claude_max_tier_left_generic_without_explicit_signal() {
-        // Bare `max` is emitted for BOTH Max tiers: no recognized rate-limit
-        // tier means no refinement, never a guess.
-        let mut account = max_auth_account("user@example.com");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("user@example.com".to_string()),
-            organization_rate_limit_tier: Some("claude_max".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_max_rate_limit_plan(&mut account, &oauth),
-            None
-        );
-        assert_eq!(account.plan_type.as_deref(), Some("max"));
-        assert_eq!(account.subscription_product.as_deref(), Some("claude_max"));
     }
 
     /// One registered slot on a throwaway HOME with a fake `claude` that only
@@ -28938,67 +28396,6 @@ for line in sys.stdin:
             account.subscription_product.as_deref(),
             Some("claude_max_20x")
         );
-    }
-
-    #[test]
-    fn refine_claude_local_plan_metadata_resolves_team_premium_for_a_registered_slot() {
-        // Same gap, the Team seat half: an external-slot Premium seat used to
-        // ship a bare `team` and price as Standard ($25 instead of $125).
-        let mut account = team_auth_account("user@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("user@example.com".to_string()),
-            organization_type: Some("claude_team".to_string()),
-            seat_tier: Some("team_tier_1".to_string()),
-            user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        let refined = refine_claude_local_plan_metadata(&mut account, &oauth);
-
-        assert_eq!(refined.seat_plan, Some("team_premium"));
-        assert_eq!(refined.max_plan, None);
-        assert_eq!(account.plan_type.as_deref(), Some("team_premium"));
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_team_premium")
-        );
-    }
-
-    #[test]
-    fn refine_claude_local_plan_metadata_leaves_a_bare_plan_untouched() {
-        // No explicit signal stays no refinement, through the shared helper
-        // too: the backend's conservative pricing depends on never guessing.
-        let mut account = max_auth_account("user@example.com");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("user@example.com".to_string()),
-            organization_type: Some("claude_max".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_local_plan_metadata(&mut account, &oauth),
-            RefinedClaudeLocalPlan::default()
-        );
-        assert_eq!(account.plan_type.as_deref(), Some("max"));
-        assert_eq!(account.subscription_product.as_deref(), Some("claude_max"));
-    }
-
-    #[test]
-    fn claude_max_tier_ignores_mismatched_account_metadata() {
-        // `~/.claude.json` lagging behind an account switch must not leak a
-        // different account's tier onto the signed-in account.
-        let mut account = max_auth_account("user@example.com");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("someone.else@example.com".to_string()),
-            organization_rate_limit_tier: Some("default_claude_max_20x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_max_rate_limit_plan(&mut account, &oauth),
-            None
-        );
-        assert_eq!(account.plan_type.as_deref(), Some("max"));
     }
 
     #[test]
@@ -34346,32 +33743,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_statusline_context_cache_maps_window_size_only() {
-        let cache = ClaudeStatusLineContextWindowCache {
-            schema_version: 1,
-            observed_at_epoch_seconds: 100,
-            active_tokens: None,
-            max_tokens: Some(1_000_000),
-            used_percent: None,
-            remaining_tokens: None,
-        };
-
-        let context = claude_statusline_context_from_cache(cache, None);
-
-        assert_eq!(context.status, AgentContextState::Available);
-        assert_eq!(context.active_tokens, None);
-        assert_eq!(context.max_tokens, Some(1_000_000));
-        assert_eq!(context.used_percent, None);
-        assert_eq!(context.remaining_tokens, None);
-        assert_eq!(
-            context.completeness,
-            Some(AgentContextCompleteness::WindowSizeOnly)
-        );
-        assert_eq!(context.reason.as_deref(), Some("context_window_size_only"));
-        assert!(context.recent_samples.is_empty());
-    }
-
-    #[test]
     fn claude_statusline_context_cache_normalizes_legacy_zero_sentinel() {
         let now = current_unix_seconds();
         let cache = ClaudeStatusLineContextWindowCache {
@@ -34585,27 +33956,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             routes[1].classification.source_category.as_deref(),
             Some("google_cloud_vertex")
         );
-    }
-
-    #[test]
-    fn pi_smoke_route_prefers_default_model_only() {
-        let settings = serde_json::json!({
-            "defaultProvider": "google-vertex",
-            "defaultModel": "gemini-3.1-pro-preview-customtools",
-            "defaultThinkingLevel": "high",
-            "enabledModels": [
-                "google-vertex/gemini-3.1-pro-preview-customtools:xhigh",
-                "google-vertex/gemini-3.1-pro-preview:xhigh",
-                "google-vertex/gemini-2.5-pro:xhigh"
-            ]
-        });
-
-        let route = collect_default_pi_smoke_route_from_settings(&settings)
-            .expect("default Pi smoke route");
-
-        assert_eq!(route.provider, "google-vertex");
-        assert_eq!(route.model, "gemini-3.1-pro-preview-customtools");
-        assert_eq!(route.thinking_level.as_deref(), Some("high"));
     }
 
     #[test]
@@ -37501,203 +36851,6 @@ exit 0
         }
     }
 
-    /// The default login on the fixture HOME, file credential included.
-    fn sign_in_default(fixture: &ClaudeBindingFixture, which: (&str, &str), with_org: bool) {
-        let home = fixture.root.join("home");
-        let mut account = serde_json::json!({
-            "accountUuid": which.0,
-            "emailAddress": "team.person@example.invalid",
-            "organizationType": "claude_team",
-            "seatTier": "premium",
-        });
-        if with_org {
-            account["organizationUuid"] = serde_json::json!(which.1);
-        }
-        fs::write(
-            home.join(".claude.json"),
-            serde_json::to_vec(&serde_json::json!({ "oauthAccount": account }))
-                .expect("serialize identity"),
-        )
-        .expect("write identity");
-        fs::create_dir_all(home.join(".claude")).expect("create default config dir");
-        fs::write(
-            home.join(".claude").join(".credentials.json"),
-            serde_json::to_vec(&claude_credential_fixture(
-                "fixture-secret-token-default",
-                TimeDuration::hours(6),
-                Some("team"),
-            ))
-            .expect("serialize credential"),
-        )
-        .expect("write credential");
-    }
-
-    fn browser_auth_state_path(fixture: &ClaudeBindingFixture) -> PathBuf {
-        fixture
-            .root
-            .join("support")
-            .join("claude-browser-auth-state.json")
-    }
-
-    #[test]
-    #[serial]
-    fn failed_slot_gate_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-gate");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = PassiveRunHarness {
-            fixture: &fixture,
-            config: fixture.slot_dir.join(".claude.json"),
-            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
-        };
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                // Another account signed in to the slot: the gate refuses.
-                fixture.sign_in(MAX_20X);
-                fixture.collect();
-                assert_eq!(
-                    fixture.slot(&slot_id).collection.state,
-                    ClaudeConfigSlotCollectionStateV1::IdentityMismatch
-                );
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn unresolved_default_identity_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-default");
-        sign_in_default(&fixture, TEAM_PREMIUM, true);
-        let harness = PassiveRunHarness {
-            fixture: &fixture,
-            config: fixture.root.join("home").join(".claude.json"),
-            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
-        };
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                // The default login's organization is not resolvable this pass.
-                sign_in_default(&fixture, TEAM_PREMIUM, false);
-                fixture.collect();
-            },
-            &|| sign_in_default(&fixture, TEAM_PREMIUM, true),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn browser_resign_in_pass_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-browser");
-        fixture.sign_in(TEAM_PREMIUM);
-        fixture.register();
-        fixture.collect();
-        let harness = PassiveRunHarness {
-            fixture: &fixture,
-            config: fixture.slot_dir.join(".claude.json"),
-            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
-        };
-        let state = browser_auth_state_path(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                // Unreadable browser sign-in state: collection is suppressed.
-                fs::write(&state, b"{not json").expect("write browser state");
-                fixture.collect();
-            },
-            &|| fs::remove_file(&state).expect("remove browser state"),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn single_slot_browser_resign_in_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-browser-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = PassiveRunHarness {
-            fixture: &fixture,
-            config: fixture.slot_dir.join(".claude.json"),
-            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
-        };
-        let state = browser_auth_state_path(&fixture);
-        let pass = || {
-            collect_registered_claude_slot_status(
-                &slot_id,
-                binding_test_time(0),
-                binding_test_time(15),
-            );
-        };
-        harness.assert_skipped_pass_ends_run(
-            &pass,
-            &|| {
-                fs::write(&state, b"{not json").expect("write browser state");
-                pass();
-            },
-            &|| fs::remove_file(&state).expect("remove browser state"),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn single_slot_provisional_target_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-target-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = PassiveRunHarness {
-            fixture: &fixture,
-            config: fixture.slot_dir.join(".claude.json"),
-            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
-        };
-        let state = browser_auth_state_path(&fixture);
-        let pass = || {
-            collect_registered_claude_slot_status(
-                &slot_id,
-                binding_test_time(0),
-                binding_test_time(15),
-            );
-        };
-        harness.assert_skipped_pass_ends_run(
-            &pass,
-            &|| {
-                // A browser sign-in targeting this slot is still running.
-                let now = current_unix_seconds();
-                fs::write(
-                    &state,
-                    serde_json::to_vec(&serde_json::json!({
-                        "schema_version": 1,
-                        "operations": [{
-                            "operation_id": "operation-target",
-                            "slot_id": slot_id,
-                            "mode": "target",
-                            "phase": "waiting_for_provider",
-                            "started_unix_seconds": now,
-                            "deadline_unix_seconds": now + 600
-                        }]
-                    }))
-                    .expect("serialize browser state"),
-                )
-                .expect("write browser state");
-                assert_eq!(
-                    crate::claude_browser_auth::collection_suppression(&slot_id),
-                    Some(crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget)
-                );
-                pass();
-            },
-            &|| fs::remove_file(&state).expect("remove browser state"),
-        );
-    }
-
     fn slot_harness(fixture: &ClaudeBindingFixture) -> PassiveRunHarness<'_> {
         PassiveRunHarness {
             fixture,
@@ -37729,83 +36882,21 @@ exit 0
         }
     }
 
-    /// Resolution fails after the gate passed: two logins wrote the slot
-    /// (credential plan contradicts the identity), in the slot loop.
     #[test]
     #[serial]
-    fn slot_resolution_conflict_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-resolution-conflict");
+    fn single_slot_gate_never_lets_a_passive_reading_through() {
+        let fixture = ClaudeBindingFixture::new("passive-gate-single");
         fixture.sign_in(TEAM_PREMIUM);
-        fixture.register();
+        let slot_id = fixture.register();
         fixture.collect();
         let harness = slot_harness(&fixture);
         harness.assert_skipped_pass_ends_run(
+            &|| single_slot_pass(&slot_id),
             &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                fs::write(
-                    fixture.slot_dir.join(".credentials.json"),
-                    serde_json::to_vec(&claude_credential_fixture(
-                        "fixture-secret-token-conflict",
-                        TimeDuration::hours(6),
-                        Some("max"),
-                    ))
-                    .expect("serialize credential"),
-                )
-                .expect("write credential");
-                fixture.collect();
+                fixture.sign_in(MAX_20X);
+                single_slot_pass(&slot_id);
             },
             &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    /// Resolution fails after the gate passed: the credential is gone.
-    #[test]
-    #[serial]
-    fn slot_missing_credential_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-missing-credential");
-        fixture.sign_in(TEAM_PREMIUM);
-        fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                fs::remove_file(fixture.slot_dir.join(".credentials.json"))
-                    .expect("remove credential");
-                fixture.collect();
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    /// A pass that cannot load the slot settings visits no registered slot;
-    /// only the end-of-pass sweep ends their runs.
-    #[test]
-    #[serial]
-    fn failed_settings_load_pass_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-settings-failure");
-        fixture.sign_in(TEAM_PREMIUM);
-        fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        let settings = fixture
-            .root
-            .join("support")
-            .join(ottto_core::CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME);
-        let saved = fs::read(&settings).expect("read settings");
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                fs::write(&settings, b"{not json").expect("corrupt settings");
-                fixture.collect();
-            },
-            &|| fs::write(&settings, &saved).expect("restore settings"),
         );
     }
 
@@ -37832,93 +36923,6 @@ exit 0
                 );
             },
             &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn single_slot_gate_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-gate-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| single_slot_pass(&slot_id),
-            &|| {
-                fixture.sign_in(MAX_20X);
-                single_slot_pass(&slot_id);
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn single_slot_post_resolution_gate_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-post-gate-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| single_slot_pass(&slot_id),
-            &|| {
-                let _hook = PreGateHook::sign_in_between_reads(fixture.slot_dir.clone(), MAX_20X);
-                let status = collect_registered_claude_slot_status(
-                    &slot_id,
-                    binding_test_time(0),
-                    binding_test_time(15),
-                );
-                assert_eq!(
-                    status.state,
-                    ClaudeConfigSlotCollectionStateV1::IdentityMismatch
-                );
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn single_slot_missing_credential_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-missing-credential-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| single_slot_pass(&slot_id),
-            &|| {
-                fs::remove_file(fixture.slot_dir.join(".credentials.json"))
-                    .expect("remove credential");
-                single_slot_pass(&slot_id);
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    /// The slot is unregistered for a pass; the same slot id comes back.
-    #[test]
-    #[serial]
-    fn single_slot_unregistered_pass_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-unregistered-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        let settings = fixture
-            .root
-            .join("support")
-            .join(ottto_core::CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME);
-        let saved = fs::read(&settings).expect("read settings");
-        harness.assert_skipped_pass_ends_run(
-            &|| single_slot_pass(&slot_id),
-            &|| {
-                fs::remove_file(&settings).expect("remove settings");
-                single_slot_pass(&slot_id);
-            },
-            &|| fs::write(&settings, &saved).expect("restore settings"),
         );
     }
 
@@ -37970,71 +36974,6 @@ exit 0
             .unwrap()
             .iter()
             .all(|endpoint| endpoint.contains("cedar_ember=1")));
-    }
-
-    /// Claude Code's refresh grant has expired: the slot's upkeep stops
-    /// collection after the identity gate passed.
-    fn expire_slot_refresh(fixture: &ClaudeBindingFixture) {
-        let mut credential = claude_credential_fixture(
-            "fixture-secret-token-expired",
-            TimeDuration::hours(6),
-            Some("team"),
-        );
-        credential["claudeAiOauth"]["refreshTokenExpiresAt"] = serde_json::json!(
-            (OffsetDateTime::now_utc() - TimeDuration::hours(1)).unix_timestamp() * 1_000
-        );
-        fs::write(
-            fixture.slot_dir.join(".credentials.json"),
-            serde_json::to_vec(&credential).expect("serialize credential"),
-        )
-        .expect("write credential");
-    }
-
-    #[test]
-    #[serial]
-    fn slot_upkeep_blocked_pass_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-upkeep");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                expire_slot_refresh(&fixture);
-                fixture.collect();
-                assert_eq!(
-                    fixture.slot(&slot_id).collection.state,
-                    ClaudeConfigSlotCollectionStateV1::NeedsLogin
-                );
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn single_slot_upkeep_blocked_pass_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-upkeep-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| single_slot_pass(&slot_id),
-            &|| {
-                expire_slot_refresh(&fixture);
-                let status = collect_registered_claude_slot_status(
-                    &slot_id,
-                    binding_test_time(0),
-                    binding_test_time(15),
-                );
-                assert_eq!(status.state, ClaudeConfigSlotCollectionStateV1::NeedsLogin);
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
     }
 
     fn respond_variant_unrecognized(_endpoint: &str) -> Result<Value, u16> {

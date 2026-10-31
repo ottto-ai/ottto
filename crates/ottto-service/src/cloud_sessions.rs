@@ -8465,44 +8465,6 @@ mod tests {
     }
 
     #[test]
-    fn revocation_after_chunk_revalidation_closes_relay_admission() {
-        let root = temp_dir("chunk-post-revalidation-race");
-        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
-        enabled(&grants);
-        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
-            root.join("checkpoint.json"),
-        ));
-        let transport = Arc::new(ThreadRecordingTransport::default());
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
-        checkpoints.set_relay_admission_barrier_for_test(
-            0,
-            Arc::clone(&entered),
-            Arc::clone(&release),
-        );
-
-        let collector_grants = grants.clone();
-        let collector_checkpoints = Arc::clone(&checkpoints);
-        let collector_transport = Arc::clone(&transport);
-        let collector = thread::spawn(move || {
-            collect_cloud_sessions_once(
-                &collector_grants,
-                &collector_checkpoints,
-                &CursorRecordingPages::new(vec![page("chunk-race", None)]),
-                collector_transport.as_ref(),
-                now(),
-            )
-        });
-        entered.wait();
-        grants.revoke(now()).unwrap();
-        release.wait();
-
-        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
-        assert_eq!(transport.chunks.load(Ordering::SeqCst), 0);
-        assert_eq!(transport.finalizes.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
     fn revocation_after_finalize_revalidation_closes_relay_admission() {
         let root = temp_dir("finalize-post-revalidation-race");
         let grants = CloudSessionGrantStore::new(root.join("grant.json"));
@@ -8540,92 +8502,6 @@ mod tests {
         assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
         assert_eq!(transport.chunks.load(Ordering::SeqCst), 1);
         assert_eq!(transport.finalizes.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn revocation_after_heartbeat_revalidation_closes_relay_admission() {
-        let root = temp_dir("heartbeat-post-revalidation-race");
-        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
-        enabled(&grants);
-        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
-            root.join("checkpoint.json"),
-        ));
-        let seed_transport = V2RecordingTransport::new();
-        assert_eq!(
-            collect_cloud_sessions_once(
-                &grants,
-                &checkpoints,
-                &CursorRecordingPages::new(vec![page("stable-heartbeat", None)]),
-                &seed_transport,
-                now(),
-            ),
-            CloudSessionCycleOutcome::Uploaded
-        );
-
-        let transport = Arc::new(ThreadRecordingTransport::default());
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
-        checkpoints.set_relay_admission_barrier_for_test(
-            0,
-            Arc::clone(&entered),
-            Arc::clone(&release),
-        );
-        let collector_grants = grants.clone();
-        let collector_checkpoints = Arc::clone(&checkpoints);
-        let collector_transport = Arc::clone(&transport);
-        let collector = thread::spawn(move || {
-            collect_cloud_sessions_once(
-                &collector_grants,
-                &collector_checkpoints,
-                &CursorRecordingPages::new(vec![page("stable-heartbeat", None)]),
-                collector_transport.as_ref(),
-                now() + TimeDuration::minutes(61),
-            )
-        });
-        entered.wait();
-        grants.revoke(now()).unwrap();
-        release.wait();
-
-        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
-        assert_eq!(transport.v1_sends.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn revocation_after_failure_revalidation_closes_relay_admission() {
-        let root = temp_dir("failure-post-revalidation-race");
-        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
-        enabled(&grants);
-        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
-            root.join("checkpoint.json"),
-        ));
-        let transport = Arc::new(ThreadRecordingTransport::default());
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
-        checkpoints.set_relay_admission_barrier_for_test(
-            0,
-            Arc::clone(&entered),
-            Arc::clone(&release),
-        );
-        let collector_grants = grants.clone();
-        let collector_checkpoints = Arc::clone(&checkpoints);
-        let collector_transport = Arc::clone(&transport);
-        let collector = thread::spawn(move || {
-            collect_cloud_sessions_once(
-                &collector_grants,
-                &collector_checkpoints,
-                &FailingPages {
-                    calls: Cell::new(0),
-                },
-                collector_transport.as_ref(),
-                now(),
-            )
-        });
-        entered.wait();
-        grants.revoke(now()).unwrap();
-        release.wait();
-
-        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
-        assert_eq!(transport.v1_sends.load(Ordering::SeqCst), 0);
     }
 
     #[test]

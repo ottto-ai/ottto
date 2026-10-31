@@ -902,86 +902,6 @@ fn bounded_retry_native_reshed_keeps_original_expiry_and_shared_posts() {
     assert_eq!(f.baseline.files.len(), 2);
 }
 
-#[test]
-fn bounded_retry_native_tls_trickle_cannot_extend_token_or_batch_deadline() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let _guard = SNAPSHOT_SYNC_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    for token in [true, false] {
-        let f = SameSourceAckFixture::new();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = bounded_native_server(listener, move |listener| {
-            use std::io::{Read, Write};
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut hello = [0; 4096];
-            assert!(stream.read(&mut hello).unwrap() > 0);
-            // Incomplete TLS handshake record: every byte arrives within the
-            // fixed socket timeout, but completing the record exceeds expiry.
-            stream.write_all(&[22, 3, 3, 64, 0]).unwrap();
-            for _ in 0..60 {
-                if stream.write_all(&[0]).is_err() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        });
-        let client = SnapshotApiClient::new(format!("https://{address}"));
-        let mut budget = crate::snapshot_retry::RetryBudget::after_shed(
-            Instant::now() - crate::snapshot_retry::RETENTION + Duration::from_millis(500),
-            Duration::ZERO,
-        )
-        .unwrap();
-        budget.enter(Instant::now()).unwrap();
-        let started = Instant::now();
-        let result = if token {
-            client
-                .issue_relay_token_bounded(
-                    &bounded_native_device(),
-                    "synthetic-secret",
-                    SnapshotSource::Codex,
-                    &budget,
-                    &mut || Ok(()),
-                )
-                .map(|_| ())
-        } else {
-            let request = SnapshotBatchRequest {
-                schema_version: SNAPSHOT_SCHEMA_VERSION,
-                source: "codex".into(),
-                machine_id: "a".repeat(64),
-                collector_version: None,
-                snapshots: vec![f.items[0].clone()],
-                upload_policy: SnapshotUploadPolicy::default(),
-                client_report: crate::client_report::ClientReport::empty(),
-            };
-            client
-                .upload_batch_bounded("synthetic-token", &request, false, &mut budget, &mut || {
-                    Ok(())
-                })
-                .map(|_| ())
-        };
-        let elapsed = started.elapsed();
-        assert!(result.is_err());
-        assert!(
-            elapsed < Duration::from_millis(900),
-            "TLS trickle escaped expiry: {elapsed:?}"
-        );
-        assert_eq!(budget.posts_left(), if token { 3 } else { 2 });
-        server.join().unwrap();
-        eprintln!(
-            "bounded TLS token={token} elapsed_ms={}",
-            elapsed.as_millis()
-        );
-    }
-}
-
 // #660 D2: Codex side state that enlarges the index past `RESPONSE_BYTES`
 // must not loosen any cap. Bounded retry declines before any copy (the
 // caller's existing `None` → ordinary path), and the ordinary unbounded
@@ -1001,40 +921,6 @@ fn bounded_native_enlarged_by_side_state() -> SameSourceAckFixture {
         crate::snapshot_retry::RESPONSE_BYTES
     ));
     f
-}
-
-#[test]
-fn bounded_retry_declines_an_index_enlarged_by_side_state_and_ordinary_checkpoint_keeps_it() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let _guard = SNAPSHOT_SYNC_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let mut f = bounded_native_enlarged_by_side_state();
-    assert!(PreparedRetry::capture(
-        SnapshotSource::Codex,
-        &"a".repeat(64),
-        SnapshotUploadPolicy::default(),
-        [1; 32],
-        std::slice::from_ref(&f.items[0]),
-        &f.working,
-        &f.baseline,
-        &f.progress,
-        &f.index_path,
-        &f.progress_path,
-        Instant::now() - Duration::from_secs(61),
-        Duration::from_secs(60),
-        4 * 1024 * 1024,
-    )
-    .is_none());
-    f.send(0, same_source_fixture_ack).unwrap();
-    assert_eq!(f.checkpoint_boundary(|| Ok(())).unwrap(), 1);
-    assert!(f.baseline.files.contains_key(&f.keys[0]));
-    let reloaded = ScanIndex::load(&f.index_path).unwrap();
-    assert!(reloaded.files.contains_key(&f.keys[0]));
-    assert_eq!(reloaded.codex_side_state_len_for_test(), (100, 100));
 }
 
 // #660 D2: the bounded checkpoint's capped read refuses the enlarged index

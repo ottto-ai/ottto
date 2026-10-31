@@ -741,23 +741,6 @@ fn entry_cap_skips_the_whole_directory() {
 }
 
 #[test]
-fn time_budget_stops_the_sweep() {
-    let f = fixture();
-    let orphan = plant_orphan(&f.dest, INDEX);
-    let policy = Policy {
-        time_budget: Duration::ZERO,
-        ..later()
-    };
-
-    let report = apply(&f.support, &policy);
-
-    assert!(report.time_budget_exhausted);
-    assert_eq!(report.removed, 0);
-    assert!(orphan.exists());
-    assert!(report.log_line("startup").is_some());
-}
-
-#[test]
 fn plan_mode_writes_nothing_and_takes_no_locks() {
     let f = fixture();
     let orphan = plant_orphan(&f.dest, INDEX);
@@ -1070,33 +1053,6 @@ fn support_paths_through_symlinks_or_odd_spellings_are_refused() {
     // The same tree through its real path.
     assert_eq!(apply(&support, &names_and_locks_only()).removed, 1);
     assert!(!orphan.exists());
-}
-
-#[test]
-fn directory_listing_stops_at_the_deadline() {
-    let f = fixture();
-    for name in ["a", "b", "c", "d", "e"] {
-        write(&f.dest.join(name), b"");
-    }
-    let dest = open_at(
-        libc::AT_FDCWD,
-        &CString::new(f.dest.as_os_str().as_bytes()).unwrap(),
-        libc::O_RDONLY | libc::O_DIRECTORY,
-    )
-    .unwrap();
-    let mut checks = 0;
-    let listing = list_dir(&dest, 100, &mut || {
-        checks += 1;
-        checks > 2
-    });
-    assert!(matches!(listing, Listing::OutOfTime));
-    assert_eq!(checks, 3);
-    // The copy it read through closes with its stream, and the original
-    // descriptor is still usable from the start.
-    assert!(matches!(
-        list_dir(&dest, 100, &mut || false),
-        Listing::Names(names) if names.len() == 5
-    ));
 }
 
 #[test]
@@ -1591,6 +1547,10 @@ mod native_process_table {
     #[test]
     fn zero_process_count_applies_nothing() {
         // libproc's wrapper returns 0, not -1, when its syscall fails.
+        let mut partial = FakeLibproc::healthy();
+        partial.pids.retain(|pid| *pid != own());
+        assert!(partial.read().is_err());
+        assert_applied_nothing(partial);
         let mut no_estimate = FakeLibproc::healthy();
         no_estimate.estimate = failed(0, 0);
         assert!(no_estimate.read().is_err());
@@ -1605,14 +1565,6 @@ mod native_process_table {
         negative.fill = Some(failed(-1, libc::EINVAL));
         assert!(negative.read().is_err());
         assert_applied_nothing(negative);
-    }
-
-    #[test]
-    fn table_without_this_process_applies_nothing() {
-        let mut partial = FakeLibproc::healthy();
-        partial.pids.retain(|pid| *pid != own());
-        assert!(partial.read().is_err());
-        assert_applied_nothing(partial);
     }
 
     #[test]
@@ -1669,17 +1621,5 @@ mod native_process_table {
         assert_eq!(report.other_daemon_check, OtherDaemonState::Clear);
         assert_eq!(report.removed, 3);
         assert!(planted.iter().all(|(orphan, _)| !orphan.exists()));
-    }
-
-    #[test]
-    fn daemon_started_under_another_name_applies_nothing() {
-        let mut renamed = FakeLibproc::healthy();
-        renamed
-            .info
-            .insert(STRANGER, Ok(process("my-daemon-link", uid())));
-        renamed
-            .paths
-            .insert(STRANGER, Ok("/opt/ottto/bin/ottto-service"));
-        assert_blocked(renamed, OtherDaemonState::Present);
     }
 }

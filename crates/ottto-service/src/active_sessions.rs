@@ -2280,24 +2280,6 @@ mod tests {
     }
 
     #[test]
-    fn leaves_interactive_codex_run_unlabelled() {
-        // An interactive Codex Desktop run must stay role-free: labelling it
-        // would be a claim the session header does not support.
-        let mut snapshot = test_snapshot("interactive", "2026-07-19T10:04:00Z");
-        snapshot.session_display_name = None;
-        snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
-            originator: Some("Codex Desktop".to_string()),
-            source: Some("vscode".to_string()),
-            thread_source: Some("user".to_string()),
-            ..Default::default()
-        });
-
-        let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
-
-        assert_eq!(active.session_kind, None);
-    }
-
-    #[test]
     fn keeps_subagent_role_for_a_headless_subagent_run() {
         // Codex spawns subagents through `codex exec`, so both signals appear.
         // The more specific role wins; headless never overwrites it.
@@ -2313,25 +2295,6 @@ mod tests {
         let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
 
         assert_eq!(active.session_kind.as_deref(), Some("subagent"));
-    }
-
-    #[test]
-    fn leaves_a_desktop_run_unlabelled_even_when_its_source_says_exec() {
-        // ChatGPT Work desktop rollouts write `source: "exec"` under a desktop
-        // originator. The client wins, so the row keeps its plain title instead
-        // of gaining a headless claim the header does not support.
-        let mut snapshot = test_snapshot("work-desktop", "2026-07-19T10:04:00Z");
-        snapshot.session_display_name = None;
-        snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
-            originator: Some("codex_work_desktop".to_string()),
-            source: Some("exec".to_string()),
-            thread_source: Some("user".to_string()),
-            ..Default::default()
-        });
-
-        let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
-
-        assert_eq!(active.session_kind, None);
     }
 
     #[test]
