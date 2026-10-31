@@ -868,7 +868,8 @@ pub(crate) mod money_oracle {
                     "model_usage": [total],
                     "usage_buckets": requests.into_iter().enumerate().map(|(i, mut request)| {
                         request["model"] = json!("claude-synthetic");
-                        json!({"bucket_start": format!("2026-10-31T0{i}:00:00Z"), "model_usage":[request]})
+                        let hour = if entity == "side-call" { 2 } else if i == 2 { 3 } else { i };
+                        json!({"bucket_start": format!("2026-10-31T0{hour}:00:00Z"), "model_usage":[request]})
                     }).collect::<Vec<_>>()
                 }));
             }
@@ -916,7 +917,9 @@ pub(crate) mod money_oracle {
                         .unwrap()
                         .reverse();
                     for row in snapshot["model_usage"].as_array_mut().unwrap() {
-                        if let Some(parts) = row["identity_parts"].as_array_mut() {
+                        if let Some(parts) =
+                            row.get_mut("identity_parts").and_then(Value::as_array_mut)
+                        {
                             for part in parts.iter_mut() {
                                 if let Some(n) = part["evidence_ref"].as_u64() {
                                     part["evidence_ref"] = json!(1 - n);
