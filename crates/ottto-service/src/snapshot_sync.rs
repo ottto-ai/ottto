@@ -3375,6 +3375,9 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         &quarantined,
         locally_held,
     );
+    if correction_scan.is_some_and(|scan| scan.source == SnapshotSource::Codex) {
+        committable.keep_unacknowledged_codex_files_owed(index, locally_held);
+    }
     if let Some(scan) = correction_scan {
         // A2: settle no-body grants only against the file/empty/map facts
         // actually selected for this save, after any old-entry restoration.
