@@ -264,7 +264,7 @@ impl codex_file_join::HeaderInventory {
             }
             self.custody_peak = cost.bytes;
             if !self.custody_refused {
-                for owner in &self.held_owners {
+                for owner in self.held_owners.iter() {
                     let protected = codex_protected_owner(owner);
                     if index.codex_counting_tombstones.contains_key(&protected) {
                         self.absence_held.insert(protected);
