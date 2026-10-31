@@ -122,7 +122,40 @@ impl Mapper for ClaudeMapper {
         index: &ScanIndex,
         original: Option<&Original>,
     ) -> Result<KindCx> {
-        self.import_graph_with_hooks(store, index, original, None)
+        let original = original.ok_or(Pause::Mismatch)?;
+        original.unchanged()?;
+        let identity = {
+            let mut tx = store.begin(TxnMode::Read)?;
+            identity(&mut tx)?
+        };
+        let generation = self.import_generation(index)?;
+        anyhow::ensure!(identity.fence_generation == generation, Pause::Mismatch);
+        let mut cx = KindCx::default();
+        cx.binding = Some(identity.binding.clone());
+        cx.presence = original.presence.clone();
+        let mut imported = index.clone();
+        imported.generation = generation;
+        // Legacy import has no native acquisition. Publish no resume refs;
+        // the existing native pass/pacing owner stages each file afterwards.
+        let mut tx = store.begin(TxnMode::Write)?;
+        kinds::populate_import(index, &imported, &mut tx, &mut cx)?;
+        anyhow::ensure!(
+            tx.commit(index.generation, generation) == DurableCommitOutcome::Committed(generation),
+            Pause::Mismatch
+        );
+        // A COMMIT advanced control.generation; the proof must compare the
+        // normalized G graph against that one deliberate G+1 control change.
+        let mut tx = store.begin(TxnMode::Read)?;
+        let mut verified = verify_normalized_with_checkpoints(
+            &mut tx,
+            index,
+            original,
+            identity.binding,
+            generation,
+            cx.committed.clone(),
+        )?;
+        verified.committed = cx.committed;
+        Ok(verified)
     }
     fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
         let mut tx = store.begin(TxnMode::Read)?;
@@ -141,59 +174,6 @@ impl Mapper for ClaudeMapper {
     }
 }
 impl ClaudeMapper {
-    fn import_graph_with_hooks<S: Store>(
-        &self,
-        store: &mut S,
-        index: &ScanIndex,
-        original: Option<&Original>,
-        mut hooks: Option<&mut dyn ResumeHooks>,
-    ) -> Result<KindCx> {
-        let original = original.ok_or(Pause::Mismatch)?;
-        original.unchanged()?;
-        let identity = {
-            let mut tx = store.begin(TxnMode::Read)?;
-            identity(&mut tx)?
-        };
-        let generation = self.import_generation(index)?;
-        anyhow::ensure!(identity.fence_generation == generation, Pause::Mismatch);
-        let mut cx = KindCx::default();
-        cx.binding = Some(identity.binding.clone());
-        cx.presence = original.presence.clone();
-        let mut imported = index.clone();
-        imported.generation = generation;
-        if let Some(hooks) = hooks.as_deref_mut() {
-            let empty = ScanIndex::default();
-            let reserved = cx.prepare_plan(&empty, &imported, hooks)?;
-            let planned = cx.prepared_checkpoints().cloned();
-            cx.prepared = None;
-            let selected = hooks.preflight_selected(&empty, &imported, &cx.committed)?;
-            anyhow::ensure!(selected <= reserved, "state_v2_resume_staging_admission");
-            cx.preflight_reserved(&empty, &imported, hooks, selected)?;
-            cx.check_planned_checkpoints(planned.as_ref())?;
-        }
-        let mut tx = store.begin(TxnMode::Write)?;
-        kinds::populate_import(index, &imported, &mut tx, &mut cx)?;
-        anyhow::ensure!(
-            tx.commit(index.generation, generation) == DurableCommitOutcome::Committed(generation),
-            Pause::Mismatch
-        );
-        if let Some(hooks) = hooks {
-            cx.post_commit(&DurableCommitOutcome::Committed(generation), hooks)?;
-        }
-        // A COMMIT advanced control.generation; the proof must compare the
-        // normalized G graph against that one deliberate G+1 control change.
-        let mut tx = store.begin(TxnMode::Read)?;
-        let mut verified = verify_normalized_with_checkpoints(
-            &mut tx,
-            index,
-            original,
-            identity.binding,
-            generation,
-            cx.committed.clone(),
-        )?;
-        verified.committed = cx.committed;
-        Ok(verified)
-    }
     /// The one production save: merge current CAS custody, then run the
     /// semantic delta under the resident committed context. Emit the complete
     /// dirty delta against the resident header map. Saves above 5k rows /
@@ -1765,15 +1745,7 @@ impl Mapper for ResumeMapper {
         index: &ScanIndex,
         original: Option<&Original>,
     ) -> Result<KindCx> {
-        match &self.adapter {
-            Some(adapter) => ClaudeMapper.import_graph_with_hooks(
-                store,
-                index,
-                original,
-                Some(&mut *adapter.borrow_mut()),
-            ),
-            None => ClaudeMapper.import_graph(store, index, original),
-        }
+        ClaudeMapper.import_graph(store, index, original)
     }
     fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
         let Some(adapter) = &self.adapter else {

@@ -167,6 +167,73 @@ pub(crate) struct FinishProof {
     pub source_proof: [u8; 32],
     pub settled_dependencies: [u8; 32],
 }
+impl FinishProof {
+    /// Called only at the admitted, revalidated vanished-file removal site.
+    /// Ordinary absence/age and unverified-audit retirement have no producer.
+    pub(in crate::snapshots) fn authoritative_removal(
+        index: &ScanIndex,
+        key: &str,
+    ) -> Option<Self> {
+        use sha2::Digest;
+        if !super::super::restart_restore::enabled()
+            || !super::state_v2_growth_retention_active(index)
+        {
+            return None;
+        }
+        let entry = index.files.get(key)?;
+        let prior = index.v2().resume_checkpoints.as_ref()?.get(key)?;
+        if super::super::claude_index_path_family_member(std::path::Path::new(key)).is_some_and(
+            |(root, _)| {
+                index.claude_usage_authority_quarantine.contains_key(&root)
+                    || index.claude_account_family_pending.contains_key(&root)
+            },
+        ) {
+            return None;
+        }
+        if prior.binding.source == super::super::scan_index_persistence::Source::Claude
+            && !entry.has_unverified_source()
+            && !index.effective_upload_body_witness_revision_requires_adoption(key)
+            && !index
+                .claude_copy_removals
+                .pending(super::super::claude_money_birth_store::location_key(key))
+            && !index.decode_holds_file(key)
+            && !index.claude_account_deferred_holds.contains_key(key)
+            && (super::super::claude_index_file_body_accepted(index, key, entry)
+                && super::super::claude_accepted_ledger_is_current(index)
+                || index.confirmed_empty_files.contains(key)
+                    && index
+                        .file_snapshot_fingerprints
+                        .get(key)
+                        .map_or(true, BTreeSet::is_empty))
+            && publication(entry).ok()? == prior.publication
+        {
+            let source_proof = super::super::serialized_json_digest(
+                &(key, prior, index.generation),
+                b"ottto.resume.vanished.v1\0",
+            )?
+            .finalize()
+            .into();
+            let settled_dependencies = super::super::serialized_json_digest(
+                &(
+                    prior,
+                    index.file_snapshot_fingerprints.get(key),
+                    index.confirmed_empty_files.contains(key),
+                ),
+                b"ottto.resume.settled.v1\0",
+            )?
+            .finalize()
+            .into();
+            Some(Self {
+                prior: prior.clone(),
+                reason: FinishReason::AuthoritativeRemoval,
+                source_proof,
+                settled_dependencies,
+            })
+        } else {
+            None
+        }
+    }
+}
 #[derive(Clone, Default)]
 pub(crate) struct StagedCheckpoints {
     /// Actual immutable record bytes fsynced by R1, including replaced records.
@@ -452,3 +519,12 @@ impl KindCx {
 
 crate::heap_layout_bound::fields!(ResumeCheckpoint; record_generation, record_name, trailer_digest, file_generation, committed_bytes, reduction_version, reduction_allowlist, reduction_pin, binding, key_digest, context, scope, entry, publication, certificate);
 crate::heap_layout_bound::fields!(Certificate; device, inode, length, modified, birth_nanos, sealed_offset, sample_len, head_sha256, boundary_sha256, verified_unix_seconds, audit_debt_unix_seconds);
+
+crate::heap_layout_bound::fields!(FinishProof; prior, reason, source_proof, settled_dependencies);
+impl crate::heap_layout_bound::HeapLayoutBound for FinishReason {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::IrreversibleTerminal | Self::AuthoritativeRemoval => c.add(0),
+        }
+    }
+}

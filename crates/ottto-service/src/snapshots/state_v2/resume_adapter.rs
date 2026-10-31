@@ -135,7 +135,7 @@ impl ResumeHooks for Adapter {
         ensure!(self.planned.is_none(), "state_v2_resume_plan_reused");
         let (planned, records) =
             self.cache
-                .plan_resume(prev, next, &self.binding, &self.attempt)?;
+                .plan_resume(prev, next, current, &self.binding, &self.attempt)?;
         self.signature = Some(super::resume::files_signature(next)?);
         self.prior = current.clone();
         self.records = records;

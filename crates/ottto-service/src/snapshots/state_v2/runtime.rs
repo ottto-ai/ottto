@@ -704,6 +704,7 @@ fn save_with_custody(
                     import::SaveOwner { claim_only, hooks },
                 )?;
                 index.v2_mut().resume_checkpoints = Some(Arc::new(session.cx.committed.clone()));
+                index.v2_mut().resume_finishes = None;
                 session.stamp = session.db.stamp()?;
                 // Only a freshly committed replacement/finish resolves the
                 // failed key. Unrelated saves and elapsed backoff never do.

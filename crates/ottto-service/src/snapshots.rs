@@ -32347,6 +32347,22 @@ impl OwnedSourceScan {
                         // retire its request-census record (SOURCE N1).
                         let vanished = census.claude_vanished_index_keys.contains(index_key)
                             && sampled_audit::proven_absent(Path::new(index_key), &roots);
+                        // M4 observed this ordinary indexed vanished-file site.
+                        // Capture the exact ref before removal, only after absence
+                        // and dependency admission. Every other site stays closed.
+                        let resume_finish = (source == SnapshotSource::ClaudeCode
+                            && state_v2::state_v2_growth_retention_active(index)
+                            && restart_restore::enabled()
+                            && vanished
+                            && !owed_discovery(
+                                sampling.as_ref().map(|c| &*c.cache),
+                                source,
+                                index_key,
+                            ))
+                        .then(|| {
+                            state_v2::resume::FinishProof::authoritative_removal(index, index_key)
+                        })
+                        .flatten();
                         let census_record =
                             vanished && index.claude_request_census.get(index_key).is_some();
                         if vanished && index.retire_vanished_claude_audit_debt_entry(index_key) {
@@ -32361,6 +32377,17 @@ impl OwnedSourceScan {
                             || codex_counting_version::tombstone_before_retire(index, index_key)
                         {
                             index.remove_file_entry_unless_held(index_key, vanished);
+                        }
+                        if !index.files.contains_key(index_key) {
+                            if let Some(proof) = resume_finish {
+                                Arc::make_mut(
+                                    index
+                                        .v2_mut()
+                                        .resume_finishes
+                                        .get_or_insert_with(|| Arc::new(BTreeMap::new())),
+                                )
+                                .insert(index_key.clone(), proof);
+                            }
                         }
                         if census_record && index.claude_request_census.get(index_key).is_none() {
                             disappearance_diagnostics::vanished(
@@ -34599,10 +34626,12 @@ impl OwnedSourceScan {
                                         }
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
-                                        if source == SnapshotSource::Codex {
-                                            if let sampled_scan::durable_tail::MissClass::Resource(phase) = class {
+                                        if let sampled_scan::durable_tail::MissClass::Resource(phase) = class {
+                                            if source == SnapshotSource::Codex || phase == "import_cold_first_stage" {
                                                 resource_full_pending = Some(phase);
                                             }
+                                        }
+                                        if source == SnapshotSource::Codex {
                                             stale_selection_pending = matches!(class,
                                                 sampled_scan::durable_tail::MissClass::StaleSelection);
                                         }
@@ -53000,6 +53029,7 @@ impl ScanIndex {
                 Box::new(state_v2::IndexState {
                     persistence_v2: state.persistence_v2.clone(),
                     resume_checkpoints: state.resume_checkpoints.clone(),
+                    resume_finishes: self.v2().resume_finishes.clone(),
                     growth_claim_context: state.growth_claim_context.clone(),
                     growth_retention: sampled_audit::growth_subset(self, previous, &safe_keys),
                     growth_checked: Default::default(),
@@ -53911,6 +53941,12 @@ impl ScanIndex {
                     Some(CandidateParseReason::LegacyIdentity),
                 )
             };
+        }
+        if state_v2::needs_resume_stage(self, &key) {
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::UnknownOutcome),
+            );
         }
         if entry.source_file_fingerprint != candidate.source_file_fingerprint {
             let reason = if entry.source_file_fingerprint.is_empty() {

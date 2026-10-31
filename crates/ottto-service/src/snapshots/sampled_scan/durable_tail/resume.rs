@@ -42,6 +42,7 @@ impl SharedCache {
         &self,
         prev: &ScanIndex,
         next: &ScanIndex,
+        current: &BTreeMap<String, ResumeCheckpoint>,
         binding: &scan_index_persistence::Binding,
         attempt: &str,
     ) -> anyhow::Result<(StagedCheckpoints, Vec<store::ImmutableRecord>)> {
@@ -71,12 +72,24 @@ impl SharedCache {
             )
         };
         let mut staged = StagedCheckpoints::default();
+        if let Some(finishes) = &next.v2().resume_finishes {
+            staged.finished.extend(
+                finishes
+                    .iter()
+                    .filter(|(key, proof)| {
+                        !next.files.contains_key(*key) && current.get(*key) == Some(&proof.prior)
+                    })
+                    .map(|(key, proof)| (key.clone(), proof.clone())),
+            );
+        }
         let mut records = Vec::new();
         let cache = self
             .retained()
             .map_err(|_| anyhow::anyhow!("state_v2_resume_cache"))?;
         for (key, entry) in &next.files {
-            if prev.files.get(key).map(publication).transpose()? == Some(publication(entry)?) {
+            if prev.files.get(key).map(publication).transpose()? == Some(publication(entry)?)
+                && (current.contains_key(key) || !selected.contains_key(key))
+            {
                 continue;
             }
             anyhow::ensure!(

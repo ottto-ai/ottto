@@ -3517,6 +3517,14 @@ impl SharedCache {
         held: &File,
         index: &ScanIndex,
     ) -> RestoreOutcome {
+        if phase == "import_cold_first_stage" {
+            // Eligibility only; spend and count at the actual native Full start.
+            return if self.paced_admission(source, key, SystemTime::now(), false, false, false) {
+                RestoreOutcome::Miss(MissClass::Resource(phase))
+            } else {
+                RestoreOutcome::Pending
+            };
+        }
         let rederive = phase.starts_with("rederive_") || phase == "decode";
         let full = !matches!(phase, "active_wait" | "rederive_quiet" | "rederive_budget")
             && if rederive {
@@ -3585,7 +3593,7 @@ impl SharedCache {
         accepted_end: u64,
         phase: &'static str,
     ) -> bool {
-        let granted = if phase == "rederive_quiet" {
+        let granted = if matches!(phase, "rederive_quiet" | "import_cold_first_stage") {
             // Restore itself read no input. The scanner already selected this
             // key for an ordinary reparse and checked its history-upgrade gate.
             // Spend the existing cross-cause pace only at native Full start.
@@ -4062,7 +4070,11 @@ impl SharedCache {
                         .as_ref()
                         .and_then(|refs| refs.get(key))
                     else {
-                        return Err(MissClass::NoEntry.into());
+                        return if state_v2::needs_resume_stage(index, key) {
+                            Ok(Err("import_cold_first_stage"))
+                        } else {
+                            Err(MissClass::NoEntry.into())
+                        };
                     };
                     if lease.charge(store::RESTORE_INPUT_BYTES).is_err() {
                         return Ok(Err("input"));
@@ -6425,7 +6437,8 @@ impl MissClass {
                 "cache_key",
                 "certificate_scope",
                 "rederive_unfunded",
-                "rederive_budget"
+                "rederive_budget",
+                "import_cold_first_stage"
             ),
             Self::Unregistered(owed) => match owed.kind {
                 ObligationKind::BodyWitness => "unregistered_replay.body_witness",

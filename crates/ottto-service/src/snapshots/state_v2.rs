@@ -44,6 +44,8 @@ use kinds::KindCx;
 pub(super) struct IndexState {
     pub(super) persistence_v2: Option<Arc<Runtime>>,
     pub(super) resume_checkpoints: Option<Arc<BTreeMap<String, resume::ResumeCheckpoint>>>,
+    /// Exact source-authorized removals, carried only until a durable save.
+    pub(super) resume_finishes: Option<Arc<BTreeMap<String, resume::FinishProof>>>,
     pub(super) growth_claim_context: Option<Arc<super::sampled_audit::GrowthClaimContext>>,
     pub(super) growth_retention: BTreeMap<String, super::sampled_audit::GrowthRetention>,
     /// Runtime-only: keys whose growth was revalidated in this graph
@@ -53,6 +55,7 @@ pub(super) struct IndexState {
 pub(super) static EMPTY_INDEX: IndexState = IndexState {
     persistence_v2: None,
     resume_checkpoints: None,
+    resume_finishes: None,
     growth_claim_context: None,
     growth_retention: BTreeMap::new(),
     growth_checked: (0, std::collections::BTreeSet::new()),
@@ -65,7 +68,7 @@ impl ScanIndex {
         self.v2.get_or_insert_with(Box::default)
     }
 }
-crate::heap_layout_bound::fields!(IndexState; persistence_v2, resume_checkpoints, growth_claim_context, growth_retention, growth_checked);
+crate::heap_layout_bound::fields!(IndexState; persistence_v2, resume_checkpoints, resume_finishes, growth_claim_context, growth_retention, growth_checked);
 
 /// Runtime-only custody carrier. Only the verified v2 load route may install it.
 /// Environment/sentinel state alone must never activate growth retention.
@@ -93,6 +96,19 @@ pub(crate) fn state_v2_growth_retention_active(index: &ScanIndex) -> bool {
         .persistence_v2
         .as_ref()
         .is_some_and(|runtime| runtime.active)
+}
+
+/// A verified v2 legacy baseline has progress but no native resume record yet.
+/// No second migration cursor: publication of the first exact ref clears this.
+pub(super) fn needs_resume_stage(index: &ScanIndex, key: &str) -> bool {
+    state_v2_growth_retention_active(index)
+        && super::restart_restore::enabled()
+        && index.files.contains_key(key)
+        && !index
+            .v2()
+            .resume_checkpoints
+            .as_ref()
+            .is_some_and(|refs| refs.contains_key(key))
 }
 
 const FORMAT: u32 = 1;

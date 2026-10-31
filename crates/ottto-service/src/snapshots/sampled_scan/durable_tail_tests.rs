@@ -13229,13 +13229,15 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
     use crate::snapshots::state_v2::resume::ResumeHooks;
     use crate::snapshots::state_v2::resume_adapter::Adapter;
     let _restart = crate::snapshots::RestartRestoreForTest::enabled();
-    let root = crate::test_scratch::ScratchDir::new("v2-native-resume");
+    let root = crate::test_scratch::ScratchDir::canonical("v2-native-resume");
     let writer = test_locks::hold(&root);
     let projects = root.join("projects");
     std::fs::create_dir(&projects).unwrap();
     let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
     std::fs::write(&path, a1a_row("accepted", 100)).unwrap();
-    let index_path = root.join("index.json");
+    let parent = root.join("snapshots/destinations").join("a".repeat(64));
+    std::fs::create_dir_all(&parent).unwrap();
+    let index_path = parent.join("claude_code-test-scan-index.json");
     let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
     owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
     let mut prev = ScanIndex::default();
@@ -13255,7 +13257,48 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
             )
         });
     a1a_wire(&root, &mut next, &mut scan);
-    next.generation = prev.generation + 1;
+    // Import the nonempty legacy graph through the production route, with
+    // an empty native cache. Import must not ask that cache to stage history.
+    let mut imported = next.clone();
+    imported.generation = prev.generation;
+    ottto_core::write_owner_only_file_atomic(&index_path, &serde_json::to_vec(&imported).unwrap())
+        .unwrap();
+    std::fs::write(root.join("snapshots/claude_state_v2"), b"").unwrap();
+    state_v2::register_resume_owner(&index_path, &root, &owner.cache).unwrap();
+    owner.evict();
+    assert!(state_v2::load_locked(&index_path, Some(&root), false)
+        .unwrap()
+        .0
+        .is_none());
+    state_v2::after_v1_locked(&index_path, &mut imported).unwrap();
+    assert!(state_v2::state_v2_growth_retention_active(&imported));
+    assert!(imported
+        .v2()
+        .resume_checkpoints
+        .as_ref()
+        .unwrap()
+        .is_empty());
+    owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
+    let (mut cold, mut scan, modes) =
+        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+            owner.scan(
+                std::slice::from_ref(&projects),
+                &root,
+                imported.clone(),
+                100,
+                true,
+                &BTreeMap::new(),
+                &[],
+            )
+        });
+    assert_eq!(
+        modes,
+        (1, 0, 0),
+        "first native pass after cold import is one Full"
+    );
+    a1a_wire(&root, &mut cold, &mut scan);
+    next = cold;
+    next.generation = imported.generation + 1;
     let binding = scan_index_persistence::Binding {
         source: scan_index_persistence::Source::Claude,
         namespace_hash: "a".repeat(64),
@@ -13266,7 +13309,11 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
     store::test_hooks::set_before_access(Some(Box::new(|_, _| {
         panic!("plan performed filesystem IO")
     })));
-    let planned = adapter.plan(&prev, &next, &current).unwrap();
+    // Cold import preserves this same file.progress without a resume ref.
+    // Its first native acquisition must stage even when publication is unchanged.
+    let mut unchanged = next.clone();
+    unchanged.generation = imported.generation;
+    let planned = adapter.plan(&unchanged, &next, &current).unwrap();
     store::test_hooks::set_before_access(None);
     assert!(planned.excluded.is_empty());
     let checkpoint = planned
@@ -13284,9 +13331,21 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
     );
     let staged = adapter.stage(&prev, &next, &current).unwrap();
     assert_eq!(staged.replacements, planned.replacements);
-    let committed = staged.replacements;
-    adapter.post_commit(next.generation, &committed).unwrap();
+    adapter
+        .post_commit(next.generation, &staged.replacements)
+        .unwrap();
     drop(adapter);
+    // The real save owns SQL publication and exact-reference attachment.
+    next.generation = imported.generation;
+    assert!(state_v2::save_locked(&index_path, &mut next, false, None, true).unwrap());
+    let committed = next
+        .v2()
+        .resume_checkpoints
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .clone();
+    let checkpoint = committed[&key].clone();
     // A later, durable, uncommitted candidate must never become the restore target.
     owner
         .cache
@@ -13306,7 +13365,7 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
         .cache
         .with_resume_store(&index_path, |store| {
             let restored = Adapter::restore(store, &checkpoint)?;
-            assert_eq!(restored.index_generation, 1);
+            assert_eq!(restored.index_generation, next.generation);
             assert_eq!(restored.trailer_digest(), Some(checkpoint.trailer_digest));
             Ok(())
         })
@@ -13325,12 +13384,40 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
     changed.files.get_mut(&key).unwrap().size_bytes += 7;
     let mut refused = Adapter::new(owner.cache.clone(), &index_path, binding.clone()).unwrap();
     let plan = refused.plan(&next, &changed, &committed).unwrap();
-    assert_eq!(plan.excluded, BTreeSet::from([key]));
+    assert_eq!(plan.excluded, BTreeSet::from([key.clone()]));
     assert!(std::fs::metadata(
-        store::store_dir_for_index(&index_path).join(checkpoint.record_name)
+        store::store_dir_for_index(&index_path).join(&checkpoint.record_name)
     )
     .is_ok());
     drop(refused);
+    next.record_accepted_snapshot_fingerprints(&next.current_snapshot_fingerprints());
+    assert!(state_v2::save_locked(&index_path, &mut next, false, None, true).unwrap());
+    std::fs::remove_file(&path).unwrap();
+    owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
+    let (mut removed, _, _) = owner.scan(
+        std::slice::from_ref(&projects),
+        &root,
+        next.clone(),
+        100,
+        true,
+        &BTreeMap::new(),
+        std::slice::from_ref(&path),
+    );
+    assert!(
+        !removed.files.contains_key(&key),
+        "admitted vanished removal premise"
+    );
+    assert!(state_v2::save_locked(&index_path, &mut removed, false, None, true).unwrap());
+    assert!(!removed
+        .v2()
+        .resume_checkpoints
+        .as_ref()
+        .unwrap()
+        .contains_key(&key));
+    assert!(!store::store_dir_for_index(&index_path)
+        .join(&checkpoint.record_name)
+        .exists());
+    std::fs::write(&path, a1a_row("accepted", 100)).unwrap();
     // A real native page beyond the staging batch must request the existing
     // runtime page-reduction outcome, rather than an unrecoverable DB hold.
     // runtime::tests::ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back
@@ -13369,4 +13456,6 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
         error.downcast_ref::<state_v2::Hold>(),
         Some(&state_v2::Hold::SaveCeiling)
     );
+    drop(oversized);
+    state_v2::money_test_support::erase_published(&index_path);
 }
