@@ -21632,11 +21632,6 @@ const SELECTOR_CONTEXT_ALLOWED: &[&str] = &[
     "auth_mode",
     "gateway_provider",
     "subscription_product",
-    "attribution_subagent",
-    "attribution_skill",
-    "attribution_plugin",
-    "attribution_mcp_server",
-    "attribution_mcp_tool",
 ];
 
 pub fn scan_source_roots(
