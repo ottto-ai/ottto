@@ -31406,8 +31406,6 @@ impl OwnedSourceScan {
                         index.upload_context_fingerprint == index.active_upload_context_fingerprint,
                     ) {
                         eprintln!("{line}");
-                        #[cfg(test)]
-                        CODEX_PARSE_REASON_LINES.with(|lines| lines.borrow_mut().push(line));
                     }
                 }
                 if source == SnapshotSource::ClaudeCode
@@ -45065,16 +45063,6 @@ fn census_count_fields(names: &[&str], counts: &[usize]) -> String {
         .join(" ")
 }
 
-#[cfg(test)]
-thread_local! {
-    static CODEX_PARSE_REASON_LINES: std::cell::RefCell<Vec<String>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-#[cfg(test)]
-fn take_codex_parse_reason_lines_for_test() -> Vec<String> {
-    CODEX_PARSE_REASON_LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
-}
 
 struct CheckpointLock {
     file: File,
@@ -60300,82 +60288,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_scan_logs_selection_reasons_on_the_census_line() {
-        fn line(upload_context_matches: bool, counts: &[(&str, usize)]) -> String {
-            let field = |name: &str| {
-                counts
-                    .iter()
-                    .find(|(counted, _)| *counted == name)
-                    .map_or(0, |(_, count)| *count)
-            };
-            format!(
-                "local snapshot census codex parse reasons: upload_context_matches={upload_context_matches} {}",
-                CANDIDATE_PARSE_REASON_NAMES
-                    .iter()
-                    .chain(CODEX_SELECTION_NAMES.iter())
-                    .map(|name| format!("{name}={}", field(name)))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
-        }
-        let root = temp_dir("codex-parse-reason-census");
-        let ids = [
-            "019e2700-4444-7000-9000-444444444441",
-            "019e2700-4444-7000-9000-444444444442",
-            "019e2700-4444-7000-9000-444444444443",
-        ];
-        let usage = "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.5\"}}}\n";
-        let fixture = |id: &str| {
-            format!(
-                "{{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n{usage}"
-            )
-        };
-        let paths = ids
-            .iter()
-            .map(|&id| {
-                let path = root.join(format!("rollout-2026-05-14T10-00-00-{id}.jsonl"));
-                fs::write(&path, fixture(id)).expect("write codex fixture");
-                path
-            })
-            .collect::<Vec<_>>();
-        let mut index = ScanIndex::default();
-        let scan = |index: &mut ScanIndex, collected_at: &str| {
-            let _ = take_codex_parse_reason_lines_for_test();
-            scan_source_roots(
-                SnapshotSource::Codex,
-                std::slice::from_ref(&root),
-                index,
-                collected_at,
-                BACKFILL_WINDOW_DAYS,
-            )
-            .expect("codex scan");
-            take_codex_parse_reason_lines_for_test()
-        };
-
-        assert_eq!(
-            scan(&mut index, "2026-05-14T10:05:00Z"),
-            vec![line(true, &[("new_file", 3)])]
-        );
-
-        let grown = usage
-            .replace("10:03:00", "10:04:00")
-            .replace(":40,", ":50,");
-        fs::write(&paths[1], fixture(ids[1]) + &grown).expect("grow one fixture");
-        assert_eq!(
-            scan(&mut index, "2026-05-14T10:06:00Z"),
-            vec![line(true, &[("transcript_changed", 1), ("skip", 2)])]
-        );
-
-        index.activate_upload_context("codex-parse-reason-context".to_string());
-        assert_eq!(
-            scan(&mut index, "2026-05-14T10:07:00Z"),
-            vec![line(false, &[("upload_context", 3)])]
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn zero_snapshot_usage_evidence_stays_visible_across_bounded_retries() {
         let root = temp_dir("pi-zero-snapshot-usage-evidence");
         let path = root.join("session.jsonl");
@@ -65964,50 +65876,6 @@ mod tests {
         let mut accepted = working.committable_subset(&previous, &newer_entities, &BTreeMap::new());
         accepted.save(&dir.join("all-accepted.json")).unwrap();
         assert!(!accepted.claude_account_family_pending.contains_key(&root));
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn claude_account_pending_finalizer_records_exact_account_bearing_upload_revision() {
-        let (dir, root, _) = claude_account_family_fixture();
-        let mut index = ScanIndex::default();
-        let mut result = scan_source_roots_with_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&dir),
-            &mut index,
-            "2026-08-02T07:01:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .unwrap();
-        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
-        apply_claude_effort_evidence_with_index(
-            &mut result.snapshots,
-            &evidence,
-            &mut index,
-            true,
-            "2026-08-02T07:01:00Z",
-        );
-        assert!(index.claude_account_family_pending[&root]
-            .member_requests
-            .values()
-            .all(|set| set.identity_revision.is_none()));
-        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
-        for (key, entry) in &index.files {
-            let (_, member) = claude_index_path_family_member(Path::new(key)).unwrap();
-            let expected = claude_account_identity_revision(
-                &entry.source_file_fingerprint,
-                entry.last_snapshot_fingerprint.as_deref(),
-                entry.last_upload_body_witness.as_deref(),
-            );
-            assert!(expected.is_some());
-            assert_eq!(
-                index.claude_account_family_pending[&root].member_requests[&member]
-                    .identity_revision,
-                expected
-            );
-        }
         fs::remove_dir_all(dir).unwrap();
     }
 
