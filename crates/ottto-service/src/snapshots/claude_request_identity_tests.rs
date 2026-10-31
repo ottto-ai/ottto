@@ -2929,12 +2929,9 @@ fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
 }
 
 // Released builds capture contract 5 for Claude Code always (no cohort
-// token) and keep `transcript_email` and its feed compiled out, and
-// `transcript_sole_login` suppressed independently of the email gate.
+// token) and keep `transcript_sole_login` suppressed.
 const _: () = assert!(
-    identity::captures(SnapshotSource::ClaudeCode)
-        && !identity::TRANSCRIPT_EMAIL_ENABLED
-        && !identity::TRANSCRIPT_SOLE_LOGIN_ENABLED
+    identity::captures(SnapshotSource::ClaudeCode) && !identity::TRANSCRIPT_SOLE_LOGIN_ENABLED
 );
 
 fn parse_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
