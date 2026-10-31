@@ -501,7 +501,14 @@ const TERMINAL_OFF_EMPTY_CONTEXT_KEYS: usize = 4096;
 struct TerminalOffEmptyContexts {
     keys: BTreeSet<[u8; 32]>,
     order: VecDeque<[u8; 32]>,
+    // Held entries share the resident-key set, FIFO and lock with empty ones.
+    held: BTreeMap<[u8; 32], [u8; 32]>,
     evictions: u64,
+}
+#[derive(Clone, Copy)]
+enum TerminalOffContextReason {
+    Empty,
+    Held,
 }
 impl TerminalOffEmptyContexts {
     fn remember(&mut self, key: [u8; 32]) {
@@ -511,11 +518,31 @@ impl TerminalOffEmptyContexts {
         if self.keys.len() == TERMINAL_OFF_EMPTY_CONTEXT_KEYS {
             let oldest = self.order.pop_front().expect("bounded memo has an owner");
             self.keys.remove(&oldest);
+            self.held.remove(&oldest);
             self.evictions = self.evictions.saturating_add(1);
             eprintln!("upload_context_empty_memo_evicted evictions={} capacity={TERMINAL_OFF_EMPTY_CONTEXT_KEYS}", self.evictions);
         }
         self.keys.insert(key);
         self.order.push_back(key);
+    }
+    fn forget_held(&mut self, path: &[u8; 32]) {
+        if self.held.remove(path).is_some() {
+            self.keys.remove(path);
+            self.order.retain(|key| key != path);
+        }
+    }
+    fn seen_held(&mut self, path: [u8; 32], context: Option<[u8; 32]>) -> bool {
+        if context.is_some() && self.held.get(&path).copied() == context {
+            return true;
+        }
+        self.forget_held(&path);
+        false
+    }
+    fn remember_held(&mut self, path: [u8; 32], context: [u8; 32]) {
+        if !self.seen_held(path, Some(context)) {
+            self.remember(path);
+            self.held.insert(path, context);
+        }
     }
 }
 #[cfg(test)]
@@ -538,7 +565,19 @@ fn with_terminal_off_empty_contexts<T>(f: impl FnOnce(&mut TerminalOffEmptyConte
     TERMINAL_OFF_EMPTY_CONTEXTS.with(|memo| f(&mut memo.borrow_mut()))
 }
 fn terminal_off_empty_context_key(index: &ScanIndex, key: &str) -> Option<[u8; 32]> {
-    if !claude_terminal_off() || !index.confirmed_empty_files.contains(key) {
+    terminal_off_context_key(index, key, TerminalOffContextReason::Empty)
+}
+fn terminal_off_context_key(
+    index: &ScanIndex,
+    key: &str,
+    reason: TerminalOffContextReason,
+) -> Option<[u8; 32]> {
+    if !claude_terminal_off() {
+        return None;
+    }
+    if matches!(reason, TerminalOffContextReason::Empty)
+        && !index.confirmed_empty_files.contains(key)
+    {
         return None;
     }
     let entry = index.files.get(key)?;
@@ -547,7 +586,10 @@ fn terminal_off_empty_context_key(index: &ScanIndex, key: &str) -> Option<[u8; 3
     }
     let mut digest = Sha256::new();
     for value in [
-        "terminal-off-empty-context:v1",
+        match reason {
+            TerminalOffContextReason::Empty => "terminal-off-empty-context:v1",
+            TerminalOffContextReason::Held => "terminal-off-held-context:v1",
+        },
         key,
         index.active_upload_context_fingerprint.as_deref()?,
         &entry.source_file_fingerprint,
@@ -558,7 +600,36 @@ fn terminal_off_empty_context_key(index: &ScanIndex, key: &str) -> Option<[u8; 3
     ] {
         update_length_prefixed(&mut digest, value.as_bytes());
     }
+    if matches!(reason, TerminalOffContextReason::Held) {
+        update_length_prefixed(
+            &mut digest,
+            index.claude_reemission_exclusions.status().as_bytes(),
+        );
+    }
     digest.update(index.context_curve_replay_epoch.to_be_bytes());
+    if matches!(reason, TerminalOffContextReason::Held) {
+        digest.update(
+            index
+                .active_effective_upload_body_witness_revision
+                .to_be_bytes(),
+        );
+        digest.update([match index.claude_no_list_policy {
+            NoListPolicy::Pace => 0,
+            NoListPolicy::HoldUnverified => 1,
+            NoListPolicy::HoldMoveNotFull => 2,
+        }]);
+        digest.update(index.claude_reemission_exclusions.held_context_digest());
+        digest.update(
+            index
+                .claude_history_cutoff_unix_seconds
+                .unwrap_or_default()
+                .to_be_bytes(),
+        );
+        digest.update([
+            u8::from(index.claude_history_move_not_full),
+            u8::from(index.claude_history_move_released),
+        ]);
+    }
     Some(digest.finalize().into())
 }
 fn terminal_off_empty_context_seen(index: &ScanIndex, key: &str) -> bool {
@@ -578,123 +649,17 @@ fn note_terminal_off_empty_context(index: &ScanIndex, key: &str, parsed_fingerpr
     }
 }
 
-// R5: the last complete parse was history-held in exactly this context. RAM
-// only: it suppresses UploadContext selection and wakes, never ACKs, receipts
-// or other read causes. Eviction or restart permits one more held re-read.
-const TERMINAL_OFF_HELD_CONTEXT_KEYS: usize = MAX_BACKFILL_FILES_PER_SOURCE;
-#[derive(Default)]
-struct TerminalOffHeldContexts {
-    // One context per path: changing a context/fingerprint forgets its old hit.
-    keys: BTreeMap<[u8; 32], [u8; 32]>,
-    order: VecDeque<[u8; 32]>,
-    evictions: u64,
-}
-impl TerminalOffHeldContexts {
-    fn forget(&mut self, path: &[u8; 32]) {
-        if self.keys.remove(path).is_some() {
-            self.order.retain(|key| key != path);
-        }
-    }
-    fn seen(&mut self, path: [u8; 32], context: Option<[u8; 32]>) -> bool {
-        if context.is_some() && self.keys.get(&path).copied() == context {
-            return true;
-        }
-        self.forget(&path);
-        false
-    }
-    fn remember(&mut self, path: [u8; 32], context: [u8; 32]) {
-        if self.seen(path, Some(context)) {
-            return;
-        }
-        if self.keys.len() == TERMINAL_OFF_HELD_CONTEXT_KEYS {
-            let oldest = self
-                .order
-                .pop_front()
-                .expect("bounded held memo has an owner");
-            self.keys.remove(&oldest);
-            self.evictions = self.evictions.saturating_add(1);
-            crate::local_resource_diagnostics::traversal_point(
-                "upload_context_held_memo_evicted",
-                SnapshotSource::ClaudeCode.api_slug(),
-                &BTreeMap::from([
-                    ("evictions", self.evictions),
-                    ("capacity", TERMINAL_OFF_HELD_CONTEXT_KEYS as u64),
-                ]),
-            );
-        }
-        self.keys.insert(path, context);
-        self.order.push_back(path);
-    }
-}
-#[cfg(test)]
-thread_local! {
-    static TERMINAL_OFF_HELD_CONTEXTS: std::cell::RefCell<TerminalOffHeldContexts> =
-        std::cell::RefCell::new(TerminalOffHeldContexts::default());
-}
-fn with_terminal_off_held_contexts<T>(f: impl FnOnce(&mut TerminalOffHeldContexts) -> T) -> T {
-    #[cfg(not(test))]
-    {
-        static MEMO: std::sync::OnceLock<std::sync::Mutex<TerminalOffHeldContexts>> =
-            std::sync::OnceLock::new();
-        f(&mut MEMO
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
-    }
-    #[cfg(test)]
-    TERMINAL_OFF_HELD_CONTEXTS.with(|memo| f(&mut memo.borrow_mut()))
-}
-fn terminal_off_held_path(key: &str) -> [u8; 32] {
-    Sha256::digest(key.as_bytes()).into()
-}
-fn terminal_off_held_context_key(index: &ScanIndex, key: &str) -> Option<[u8; 32]> {
-    if !claude_terminal_off() {
-        return None;
-    }
-    let entry = index.files.get(key)?;
-    if entry.source_file_fingerprint.is_empty() {
-        return None;
-    }
-    let mut digest = Sha256::new();
-    for value in [
-        "terminal-off-held-context:v1",
-        key,
-        index.active_upload_context_fingerprint.as_deref()?,
-        &entry.source_file_fingerprint,
-        index
-            .historical_replay_generation
-            .as_deref()
-            .unwrap_or("none"),
-        index.claude_reemission_exclusions.status(),
-    ] {
-        update_length_prefixed(&mut digest, value.as_bytes());
-    }
-    digest.update(index.context_curve_replay_epoch.to_be_bytes());
-    digest.update(index.active_effective_upload_body_witness_revision.to_be_bytes());
-    digest.update([match index.claude_no_list_policy {
-        NoListPolicy::Pace => 0,
-        NoListPolicy::HoldUnverified => 1,
-        NoListPolicy::HoldMoveNotFull => 2,
-    }]);
-    digest.update(index.claude_reemission_exclusions.held_context_digest());
-    digest.update(
-        index
-            .claude_history_cutoff_unix_seconds
-            .unwrap_or_default()
-            .to_be_bytes(),
-    );
-    digest.update([
-        u8::from(index.claude_history_move_not_full),
-        u8::from(index.claude_history_move_released),
-    ]);
-    Some(digest.finalize().into())
-}
+// R5: held-history observations use the empty-context memo's bounded owner.
+// Only UploadContext selection is suppressed; every privacy/interpretation
+// change invalidates a held observation, and eviction grants no delivery credit.
 fn terminal_off_held_context_seen(index: &ScanIndex, key: &str) -> bool {
     if !claude_terminal_off() {
         return false;
     }
-    let context = terminal_off_held_context_key(index, key);
-    with_terminal_off_held_contexts(|memo| memo.seen(terminal_off_held_path(key), context))
+    let context = terminal_off_context_key(index, key, TerminalOffContextReason::Held);
+    with_terminal_off_empty_contexts(|memo| {
+        memo.seen_held(Sha256::digest(key.as_bytes()).into(), context)
+    })
 }
 fn note_terminal_off_held_context(index: &ScanIndex, key: &str, parsed_fingerprint: &str) {
     if !claude_terminal_off()
@@ -705,13 +670,17 @@ fn note_terminal_off_held_context(index: &ScanIndex, key: &str, parsed_fingerpri
     {
         return;
     }
-    if let Some(context) = terminal_off_held_context_key(index, key) {
-        with_terminal_off_held_contexts(|memo| memo.remember(terminal_off_held_path(key), context));
+    if let Some(context) = terminal_off_context_key(index, key, TerminalOffContextReason::Held) {
+        with_terminal_off_empty_contexts(|memo| {
+            memo.remember_held(Sha256::digest(key.as_bytes()).into(), context)
+        });
     }
 }
 fn forget_terminal_off_held_context(key: &str) {
     if claude_terminal_off() {
-        with_terminal_off_held_contexts(|memo| memo.forget(&terminal_off_held_path(key)));
+        with_terminal_off_empty_contexts(|memo| {
+            memo.forget_held(&Sha256::digest(key.as_bytes()).into())
+        });
     }
 }
 

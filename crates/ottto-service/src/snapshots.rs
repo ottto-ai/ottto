@@ -31593,9 +31593,6 @@ impl OwnedSourceScan {
                         .terminal_dropped_usage_record_count
                         .saturating_add(census.terminal_dropped_usage_record_count);
                 }
-                if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
-                    history_upgrade.emit_page_diagnostics();
-                }
                 if source == SnapshotSource::Codex {
                     // Count-only attribution of why Codex files were selected
                     // on this page. No path, session, or identifier is named.
@@ -32618,7 +32615,6 @@ impl OwnedSourceScan {
             if comparison_target {
                 decision = CandidateDecision::Parse;
             }
-            let mut history_read = false;
             // History-upgrade gate (SOURCE P1), whatever selected the file:
             // unchanged Claude history that would carry a new body-witness
             // revision passes the list, the no-list birth hold, the family
@@ -32716,10 +32712,6 @@ impl OwnedSourceScan {
                     }
                     HistoryDecision::NotOwed => {}
                 }
-                history_read = source == SnapshotSource::ClaudeCode
-                    && claude_terminal_off()
-                    && decision == CandidateDecision::Parse
-                    && matches!(history, HistoryDecision::Owed | HistoryDecision::Held(_));
             }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
@@ -33238,9 +33230,6 @@ impl OwnedSourceScan {
             if side_plan.is_none() {
                 scanned_file_count += 1;
                 if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
-                    if history_read {
-                        history_upgrade.note_history_read();
-                    }
                     terminal_off_discovery::served(index, &candidate, audit_now);
                 }
             }

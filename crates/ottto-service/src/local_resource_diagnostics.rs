@@ -342,16 +342,14 @@ pub(crate) enum UnselectedReason {
 /// a gate input, never carried in a scan/frame graph.
 #[derive(Clone, Copy)]
 pub(crate) enum TerminalOffCount {
-    /// History files admitted to a parser on this page (R4); page drained.
-    HistoryRead = 21,
     /// NBF: never-committed held keys given their one immediate retry.
-    NbfInitialRetryRead,
+    NbfInitialRetryRead = 21,
     /// NBF: held keys read because their six-hour floor expired.
     NbfFloorExpiryForcedRead,
     /// R11: semantic-clear members carried on exact ACK without a receipt.
     CarriedExactAckWithoutReceipt,
 }
-const SOURCE_SLOTS: usize = 25;
+const SOURCE_SLOTS: usize = 24;
 /// Claude, Codex, Pi x (age, size, serial fallback causes, ON counts),
 /// drained by that source's page line or the ON line that owns the slot.
 /// Diagnostics only; never carried in a scan/frame graph.

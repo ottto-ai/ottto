@@ -2440,65 +2440,116 @@ fn terminal_off_start_and_resumed_admission_never_rearm_a_witness_bound_family()
     }
 }
 
-/// [regress] R5: a complete held parse suppresses only this exact context's
-/// UploadContext re-read. A context or fingerprint change, a non-held parse
-/// and OFF all fail toward another read; the memo persists no proof, receipt
-/// or ACK.
+/// [regress] R5: finalized history holds suppress repeated context reads after
+/// reload, without receipts or ACKs. Context/privacy changes permit a new read;
+/// a successful non-held parse forgets the old hold even if settlement reloads
+/// the prior checkpoint. All observations go through scan and finalization.
 #[test]
 fn terminal_off_held_context_memo_forgets_changes_and_nonheld_parse_without_credit() {
-    let _on = ClaudeTerminalOffForTest::enabled();
-    let scratch = crate::test_scratch::ScratchDir::new("held-context-key");
-    let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
-    fs::write(&path, freshness_line(OFF_ROOT, "held-context-key")).unwrap();
-    let mut index = off_index();
-    off_scan(&mut index, &scratch, W1, 10);
-    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "memo-context".into());
-    let key = local_index_key(&path);
-    let fp = index.files[&key].source_file_fingerprint.clone();
-    let before = serde_json::to_value(&index).unwrap();
-    note_terminal_off_held_context(&index, &key, &fp);
-    assert!(terminal_off_held_context_seen(&index, &key));
-    assert_eq!(
-        serde_json::to_value(&index).unwrap(),
-        before,
-        "no persisted proof, receipt or ACK"
-    );
-    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "other-context".into());
-    assert!(!terminal_off_held_context_seen(&index, &key));
-    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "memo-context".into());
-    assert!(
-        !terminal_off_held_context_seen(&index, &key),
-        "old context forgotten"
-    );
-    note_terminal_off_held_context(&index, &key, &fp);
-    index
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .source_file_fingerprint
-        .clear();
-    assert!(!terminal_off_held_context_seen(&index, &key));
-    index.files.get_mut(&key).unwrap().source_file_fingerprint = fp.clone();
-    assert!(
-        !terminal_off_held_context_seen(&index, &key),
-        "old fingerprint forgotten"
-    );
-    note_terminal_off_held_context(&index, &key, &fp);
-    forget_terminal_off_held_context(&key);
-    assert!(
-        !terminal_off_held_context_seen(&index, &key),
-        "non-held parse forgets"
-    );
-    {
-        let _off = ClaudeCompletionPathsForTest::enable();
-        assert!(!claude_terminal_off());
-        note_terminal_off_held_context(&index, &key, &fp);
-        assert!(!terminal_off_held_context_seen(&index, &key));
+    use super::super::claude_history_upgrade_tests::families;
+    use super::super::claude_reemission_exclusions::ReemissionExclusions;
+    type Change = fn(&mut ScanIndex);
+    for (case, change) in [
+        (
+            "context",
+            (|i| i.activate_file_upload_context(SnapshotSource::ClaudeCode, "changed".into()))
+                as Change,
+        ),
+        ("replay", |i| {
+            i.historical_replay_generation = Some("changed".into())
+        }),
+        ("epoch", |i| i.context_curve_replay_epoch += 1),
+        ("revision", |i| {
+            i.activate_effective_upload_body_witness_revision(3)
+        }),
+        ("list", |i| {
+            i.claude_reemission_exclusions = ReemissionExclusions::parse(
+                format!(
+                    "{:x}\n{}\n",
+                    Sha256::digest(b"bbbbbbbb-cccc-4ddd-8eee-000000000000"),
+                    "0".repeat(64)
+                )
+                .as_bytes(),
+            )
+        }),
+        ("policy", |i| {
+            i.claude_no_list_policy = NoListPolicy::HoldMoveNotFull
+        }),
+        ("cutoff", |i| i.claude_history_cutoff_unix_seconds = Some(1)),
+        ("nonheld", |_| {}),
+    ] {
+        let (home, root, mut index) = families(&format!("held-context-{case}"), 1);
+        let _on = ClaudeTerminalOffForTest::enabled();
+        let configure = |i: &mut ScanIndex| {
+            i.activate_file_upload_context(SnapshotSource::ClaudeCode, "held-context".into());
+            i.activate_effective_upload_body_witness_revision(2);
+            // An installed list holds both members; it also has a concrete
+            // digest scope to invalidate independently of the list state.
+            i.claude_reemission_exclusions = ReemissionExclusions::parse(
+                format!(
+                    "{:x}\n",
+                    Sha256::digest(b"bbbbbbbb-cccc-4ddd-8eee-000000000000")
+                )
+                .as_bytes(),
+            );
+        };
+        configure(&mut index);
+        let accepted = index.accepted_snapshot_fingerprints.clone();
+        let run = |i: &mut ScanIndex| {
+            let (result, reads) = terminal_contract_retry::source_acquisitions(|| {
+                off_scan(i, &root, "2026-08-23T18:40:00Z", 10)
+            });
+            (result, reads.values().sum::<usize>())
+        };
+        let (first, reads) = run(&mut index);
+        assert_eq!(reads, 2, "{case}: the held bodies are actually read");
+        assert!(first.snapshots.is_empty(), "{case}: history emits nothing");
+        let checkpoint = home.join("held-index.json");
+        index.save(&checkpoint).unwrap();
+        index = ScanIndex::load(&checkpoint).unwrap();
+        configure(&mut index);
+        // Force a fresh metadata traversal: a retained cursor cannot explain
+        // the no-read result, and no private memo operation seeds it.
+        index.traversal = None;
+        let (same, reads) = run(&mut index);
+        assert_eq!(reads, 0, "{case}: finalization suppresses the second read");
+        assert!(same.snapshots.is_empty());
+        assert!(index.files.iter().all(|(key, entry)| index
+            .file_upload_context_requires_adoption(key)
+            && entry.upload_context_receipt.is_none()));
+        assert_eq!(
+            index.accepted_snapshot_fingerprints, accepted,
+            "{case}: no ACK credit"
+        );
+        if case == "nonheld" {
+            // Independent semantic re-arm returns before the context-memo
+            // lookup. Revision 1 makes this a non-history parse, so only the
+            // production finalization forget can remove the prior hold.
+            index.activate_effective_upload_body_witness_revision(1);
+            for entry in index.files.values_mut() {
+                entry.source_file_fingerprint.clear();
+            }
+            index.traversal = None;
+            assert_eq!(run(&mut index).1, 2, "nonheld: real successful parse");
+            // No upload was ACKed: settlement may still retain this checkpoint.
+            index = ScanIndex::load(&checkpoint).unwrap();
+            configure(&mut index);
+        } else {
+            change(&mut index);
+        }
+        index.traversal = None;
+        let (changed, reads) = run(&mut index);
+        assert_eq!(reads, 2, "{case}: invalidation permits the held read");
+        assert!(changed.snapshots.is_empty(), "{case}: no history upload");
+        assert!(index.files.iter().all(|(key, entry)| index
+            .file_upload_context_requires_adoption(key)
+            && entry.upload_context_receipt.is_none()));
+        assert_eq!(
+            index.accepted_snapshot_fingerprints, accepted,
+            "{case}: no ACK credit"
+        );
+        let _ = fs::remove_dir_all(home);
     }
-    assert!(
-        !terminal_off_held_context_seen(&index, &key),
-        "OFF writes no memo"
-    );
 }
 
 /// [regress] NBF: a non-blocking hold (the real `into_locally_held_keys_reverted`

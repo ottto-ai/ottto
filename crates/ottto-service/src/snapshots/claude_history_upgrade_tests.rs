@@ -2003,122 +2003,149 @@ fn copies_read_under_a_closed_duplicate_fence_settle_after_one_walk() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// [regress] R11 (Lead B Ask 1): the ON semantic stale clear carries a member
-/// main independently accepted (every snapshot fingerprint ACKed) whose
-/// request census is current, with no upload-context receipt; its context
-/// stays owed. Every other case keeps the clear: the BASE control, an ACK-less
-/// or changed member, a stale census, held or listed history and the no-list
-/// hold.
+/// [regress] R11 (Lead B Ask 1): traversal start carries exact-ACK unchanged
+/// members without receipts; paced context delivery remains owed. Controls
+/// that lack acceptance or current identity keep the semantic clear and read.
 #[test]
 fn terminal_off_semantic_stale_clear_carries_only_an_unchanged_exact_ack() {
-    // Main's OFF builder accepts both members; ON then owes a new per-file
-    // context (the source stays adopted at `ctx-1`) and mints no receipt.
-    let (home, _root, mut index) = families("r11-skip-clear", 1);
-    let _on = ClaudeTerminalOffForTest::enabled();
-    index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
-    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-on".into());
-    let skips = |index: &ScanIndex| {
-        with_no_list_cutoff(u64::MAX, || {
-            index
-                .files
-                .iter()
-                .map(|(key, entry)| terminal_off_stale_member_can_skip_clear(index, key, entry))
-                .collect::<Vec<_>>()
-        })
-    };
-    assert!(
-        index.files.keys().all(|key| index
-            .claude_request_census
-            .retry_carry_record(key)
-            .is_some()),
-        "fixture parses record a census"
-    );
-    assert_eq!(
-        skips(&index),
-        [true, true],
-        "exact ACKs carry without a receipt"
-    );
-    assert!(
-        index
+    type Change = fn(&mut ScanIndex);
+    for (case, change, cleared) in [
+        ("exact ACK", (|_| {}) as Change, false),
+        ("BASE", |_| {}, true),
+        (
+            "ACK-less",
+            |i| i.accepted_snapshot_fingerprints.clear(),
+            true,
+        ),
+        (
+            "member changed",
+            |i| {
+                let added = "0".repeat(64);
+                for head in i.file_snapshot_fingerprints.values_mut() {
+                    head.insert(added.clone());
+                }
+                i.accepted_snapshot_fingerprints.insert(added);
+            },
+            true,
+        ),
+        (
+            "census stale",
+            |i| {
+                let old = i
+                    .files
+                    .values()
+                    .map(|e| e.source_file_fingerprint.clone())
+                    .collect::<Vec<_>>();
+                for (entry, fp) in i.files.values_mut().zip(old.into_iter().rev()) {
+                    entry.source_file_fingerprint = fp;
+                }
+            },
+            true,
+        ),
+        (
+            "held",
+            |i| {
+                i.claude_reemission_exclusions =
+                    ReemissionExclusions::with_state(ListState::Unreadable)
+            },
+            true,
+        ),
+        (
+            "listed",
+            |i| {
+                i.claude_reemission_exclusions =
+                    ReemissionExclusions::parse(format!("{}\n", digest(&session(0))).as_bytes())
+            },
+            true,
+        ),
+        (
+            "no-list held",
+            |i| {
+                i.claude_reemission_exclusions =
+                    ReemissionExclusions::with_state(ListState::NotInstalled)
+            },
+            true,
+        ),
+    ] {
+        let (home, root, mut index) = families(&format!("r11-skip-clear-{case}"), 1);
+        let _on = ClaudeTerminalOffForTest::enabled();
+        let _base = (case == "BASE").then(KeepStaleClaudeFamilyRearmForTest::new);
+        index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+        index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-on".into());
+        index.activate_effective_upload_body_witness_revision(1);
+        index.traversal = None;
+        // This is durable stale work, not a private skip-predicate probe.
+        index.claude_usage_family_pending.insert(
+            session(0),
+            ClaudeUsageFamilyPending {
+                census_window_end: "2026-08-23T18:30:00Z".into(),
+                member_request_id_hashes: BTreeMap::new(),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+                idless_revision: None,
+            },
+        );
+        change(&mut index);
+        let accepted = index.accepted_snapshot_fingerprints.clone();
+        let exclusions = index.claude_reemission_exclusions.clone();
+        let before = index
             .files
             .iter()
-            .all(|(key, entry)| !index.receipt_matches(key, entry)
-                && index.file_upload_context_requires_adoption(key)),
-        "the upload context stays owed"
-    );
-    {
-        let _base = KeepStaleClaudeFamilyRearmForTest::new();
-        assert_eq!(skips(&index), [false, false], "BASE keeps main's re-arm");
-    }
-    type Change = fn(&mut ScanIndex);
-    let cases: [(&str, Change); 6] = [
-        ("ACK-less", |index| {
-            index.accepted_snapshot_fingerprints.clear()
-        }),
-        ("member changed", |index| {
-            // A new, even ACKed, entity: the committed head no longer matches.
-            let added = "0".repeat(64);
-            for fingerprints in index.file_snapshot_fingerprints.values_mut() {
-                fingerprints.insert(added.clone());
+            .map(|(key, e)| (key.clone(), e.source_file_fingerprint.clone()))
+            .collect::<BTreeMap<_, _>>();
+        with_no_list_cutoff(u64::MAX, || {
+            ensure_bounded_traversal(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut index,
+                COLLECTED_AT,
+                BACKFILL_WINDOW_DAYS,
+            );
+        });
+        for (key, entry) in &index.files {
+            assert_eq!(
+                entry.source_file_fingerprint.is_empty(),
+                cleared,
+                "{case}: production traversal clear"
+            );
+            if !cleared {
+                assert_eq!(entry.source_file_fingerprint, before[key]);
             }
-            index.accepted_snapshot_fingerprints.insert(added);
-        }),
-        ("census stale", |index| {
-            // Each member's fingerprint moves off its census record.
-            let fingerprints = index
-                .files
-                .values()
-                .map(|entry| entry.source_file_fingerprint.clone())
-                .collect::<Vec<_>>();
-            for (entry, fingerprint) in index.files.values_mut().zip(fingerprints.into_iter().rev())
-            {
-                entry.source_file_fingerprint = fingerprint;
-            }
-        }),
-        ("held", |index| {
-            index.claude_reemission_exclusions =
-                ReemissionExclusions::with_state(ListState::Unreadable)
-        }),
-        ("listed", |index| {
-            index.claude_reemission_exclusions =
-                ReemissionExclusions::parse(format!("{}\n", digest(&session(0))).as_bytes())
-        }),
-        ("no-list held", |index| {
-            index.claude_reemission_exclusions =
-                ReemissionExclusions::with_state(ListState::NotInstalled)
-        }),
-    ];
-    for (case, change) in cases {
-        let mut changed = index.clone();
-        change(&mut changed);
-        assert_eq!(skips(&changed), [false, false], "{case} keeps the clear");
-    }
-    let _ = fs::remove_dir_all(home);
-}
-
-/// [behaviour] R4 disclosure: ON counts the history files actually admitted
-/// to a parser and discloses those beyond the page budget; OFF emits nothing.
-#[test]
-fn terminal_off_history_page_discloses_reads_beyond_its_budget() {
-    let budget = body_witness_adoption_page_budget();
-    for on in [false, true] {
-        let _on = on.then(ClaudeTerminalOffForTest::enabled);
-        let page = HistoryPage::default();
-        for _ in 0..budget + 2 {
-            page.note_history_read();
         }
-        let ((), records) =
-            crate::local_resource_diagnostics::capture(|| page.emit_page_diagnostics());
-        let counts = records
-            .iter()
-            .filter(|record| record["stage"] == "history_upgrade_page")
-            .map(|record| record["counts"]["history_upgrade_page"].clone())
-            .collect::<Vec<_>>();
-        let expected = if on {
-            vec![json!({"admitted_files": budget + 2, "budget": budget, "extra_files": 2})]
-        } else {
-            Vec::new()
-        };
-        assert_eq!(counts, expected, "on={on}");
+        let checkpoint = home.join("r11-index.json");
+        index.save(&checkpoint).unwrap();
+        index = ScanIndex::load(&checkpoint).unwrap();
+        index.claude_reemission_exclusions = exclusions;
+        index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-on".into());
+        // No context-only read can fit. Cleared controls must still read for
+        // their independent source debt; carried exact ACKs wait for pacing.
+        let ((mut result, _), reads) = terminal_contract_retry::source_acquisitions(|| {
+            upload_context_read::with_read_limit(0, || scan(&root, &mut index, "ctx-on", 1))
+        });
+        assert_eq!(
+            reads.values().sum::<usize>(),
+            if cleared { 2 } else { 0 },
+            "{case}: actual reads"
+        );
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+        assert!(
+            index.files.iter().all(
+                |(key, entry)| index.file_upload_context_requires_adoption(key)
+                    && entry.upload_context_receipt.is_none()
+            ),
+            "{case}: context remains owed"
+        );
+        assert_eq!(
+            index.accepted_snapshot_fingerprints, accepted,
+            "{case}: no ACK credit"
+        );
+        // Persist without acknowledging any of the returned bodies.
+        index.save(&checkpoint).unwrap();
+        let settled = ScanIndex::load(&checkpoint).unwrap();
+        assert!(
+            settled.accepted_snapshot_fingerprints.is_subset(&accepted),
+            "{case}: reload mints no ACK"
+        );
+        let _ = fs::remove_dir_all(home);
     }
 }
