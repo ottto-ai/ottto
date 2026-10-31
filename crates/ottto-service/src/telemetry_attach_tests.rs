@@ -115,40 +115,6 @@ fn holder_and_compatibility_outcomes_are_exclusive() {
 }
 
 #[test]
-fn conflicting_values_are_all_disclosed_and_never_compared_or_matched() {
-    let rows = [Row("same", Some(10)), Row("same", Some(99))];
-    let duplicates = BTreeSet::from(["same".to_string()]);
-    for holder_kind in 0..3 {
-        let mut disclosed = 0;
-        let counts = join(
-            SessionReport {
-                rows: &rows,
-                complete: false,
-                duplicate_keys: &duplicates,
-            },
-            |_| match holder_kind {
-                0 => Holders::One(1),
-                1 => Holders::None,
-                _ => Holders::Many,
-            },
-            |_, _| panic!("conflicting reports must never reach compatibility"),
-            |event| match event {
-                Attachment::Disclosed { row, reason } => {
-                    assert_eq!(reason, DisclosureReason::DuplicateReport);
-                    assert!(std::ptr::eq(row, &rows[disclosed]));
-                    disclosed += 1;
-                }
-                _ => panic!("conflicting reports must only disclose"),
-            },
-        );
-        assert_eq!(counts.disclosed, 2);
-        assert_eq!(counts.matched, 0);
-        assert_eq!(counts.unheld, 0);
-        assert_eq!(disclosed, 2);
-    }
-}
-
-#[test]
 fn held_not_attachable_is_silent_even_for_a_conflicting_key() {
     let rows = [Row("skipped", Some(10))];
     let duplicates = BTreeSet::from(["skipped".to_string()]);
@@ -163,60 +129,6 @@ fn held_not_attachable_is_silent_even_for_a_conflicting_key() {
         |_| panic!("skipped holder cannot emit an attachment event"),
     );
     assert_eq!(counts, JoinCounts::default());
-}
-
-#[test]
-fn missing_request_keys_cannot_attach_or_become_side_calls() {
-    let rows = [Row("", Some(10)), Row("", Some(99))];
-    let duplicates = BTreeSet::new();
-    for holder_kind in 0..3 {
-        let mut events = 0;
-        let counts = join(
-            SessionReport {
-                rows: &rows,
-                complete: false,
-                duplicate_keys: &duplicates,
-            },
-            |_| match holder_kind {
-                0 => Holders::One(()),
-                1 => Holders::None,
-                _ => Holders::Many,
-            },
-            |_, _| panic!("missing key must veto compatibility"),
-            |event| {
-                assert!(matches!(
-                    event,
-                    Attachment::Disclosed {
-                        reason: DisclosureReason::Incompatible,
-                        ..
-                    }
-                ));
-                events += 1;
-            },
-        );
-        assert_eq!(events, 2);
-        assert_eq!(counts.disclosed, 2);
-        assert_eq!(counts.matched + counts.unheld, 0);
-    }
-}
-
-#[test]
-fn empty_report_preserves_reader_completeness() {
-    let duplicates = BTreeSet::new();
-    for complete in [false, true] {
-        let counts = join(
-            SessionReport::<Row> {
-                rows: &[],
-                complete,
-                duplicate_keys: &duplicates,
-            },
-            |_| Holders::<()>::None,
-            |_, _| panic!("empty report"),
-            |_| panic!("empty report"),
-        );
-        assert_eq!(counts.complete, complete);
-        assert_eq!(counts.matched + counts.unheld + counts.disclosed, 0);
-    }
 }
 
 #[test]

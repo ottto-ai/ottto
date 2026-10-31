@@ -2711,6 +2711,7 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
         let mut scan = SourceScanResult::empty(source);
         scan.snapshots = parsed.snapshots;
         scan.pending_finalization.push(PendingIndexFinalization {
+            withheld_content: None,
             restored_behind_accepted: sampled_scan::durable_tail::restored_tail_below_accepted(
                 source,
                 true,

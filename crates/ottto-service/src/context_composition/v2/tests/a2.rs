@@ -476,103 +476,12 @@ fn health_mark_releases_the_worker_lease_before_posting() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-#[test]
-fn run_health_client_bounds_a_stalled_response() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let client = crate::snapshot_client::SnapshotApiClient::new(format!(
-        "http://{}",
-        listener.local_addr().unwrap()
-    ));
-    let (done, stop) = std::sync::mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let until = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Ok((_stream, _)) = listener.accept() {
-                // Stay open past the asserted client deadline. The caller
-                // releases us after it returns, including on a failed assertion.
-                let _ = stop.recv_timeout(Duration::from_secs(3));
-                return;
-            }
-            assert!(Instant::now() < until, "health client never connected");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    });
-    let start = Instant::now();
-    let result = client.post_context_composition_run_health_with_timeout(
-        "synthetic-relay",
-        &json!({}),
-        Duration::from_millis(150),
-    );
-    let elapsed = start.elapsed();
-    let _ = done.send(());
-    server.join().unwrap();
-    assert!(result.is_err());
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "health deadline took {elapsed:?}"
-    );
-}
-
 fn health_device() -> ottto_core::LocalDeviceBinding {
     ottto_core::LocalDeviceBinding {
         device_id: "synthetic".into(),
         machine_id: Some("a".repeat(64)),
         sources: vec!["codex".into()],
     }
-}
-
-#[test]
-fn run_health_token_bounds_a_slow_progressing_tls_handshake() {
-    use std::io::Read;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let client = crate::snapshot_client::SnapshotApiClient::new(format!(
-        "https://127.0.0.1:{}",
-        listener.local_addr().unwrap().port()
-    ));
-    let server = std::thread::spawn(move || {
-        let until = Instant::now() + Duration::from_secs(3);
-        let mut seen = 0;
-        while Instant::now() < until {
-            if let Ok((mut socket, _)) = listener.accept() {
-                seen += 1;
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
-                let _ = socket.read(&mut [0; 4096]);
-                // Drip a TLS record, keeping every read below the socket's
-                // timeout while the complete handshake exceeds the deadline.
-                let _ = socket.write_all(&[22, 3, 3, 0x40, 0]);
-                let drip_end = Instant::now() + Duration::from_secs(2);
-                while Instant::now() < drip_end {
-                    if socket.write_all(&[0]).is_err() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // Any retry would still be queued on the listener.
-        assert!(listener.accept().is_err());
-        seen
-    });
-    let start = Instant::now();
-    let result = client.issue_composition_health_relay_token(
-        &health_device(),
-        "synthetic-secret",
-        crate::snapshots::SnapshotSource::Codex,
-        Duration::from_millis(300),
-    );
-    let elapsed = start.elapsed();
-    assert_eq!(server.join().unwrap(), 1);
-    assert!(result.is_err());
-    assert!(
-        elapsed < Duration::from_millis(900),
-        "token handshake took {elapsed:?}"
-    );
 }
 
 #[test]

@@ -1088,7 +1088,7 @@ fn receipt_pending_guard_keeps_accepted_witness_and_census_without_unreadable() 
         &mut census,
         None,
         365,
-        &BTreeMap::new(),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
     )
     .unwrap();
     candidate.source_file_fingerprint = "b".repeat(64); // Synthetic committed version.
@@ -2724,7 +2724,11 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         &mut ScanCensus::default(),
                         None,
                         365,
-                        &BTreeMap::new(),
+                        &mut crate::snapshots::CandidateDiscovery::new(
+                            &mut ScanIndex::default(),
+                            None,
+                            None,
+                        ),
                     )
                     .unwrap();
                     assert!(sampled_scan::reduction_dependencies(
@@ -3639,7 +3643,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         &mut census,
         None,
         365,
-        &BTreeMap::new(),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
     )
     .unwrap();
     cache.durable_hold_exit(
@@ -8294,6 +8298,7 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
                 opened_object_identity: String::new(),
                 fingerprint_changed_nanos: 0,
                 fingerprint_birth_nanos: 0,
+                withheld_content_stamp: None,
             };
             assert_eq!(
                 held.candidate_decision_with_reason_at(&candidate, 0),
@@ -9002,6 +9007,7 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
             opened_object_identity: String::new(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         };
         assert_eq!(
             held.candidate_decision_with_reason_at(&candidate, 0),
@@ -13253,7 +13259,11 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
                     &mut ScanCensus::default(),
                     None,
                     365,
-                    &BTreeMap::new(),
+                    &mut crate::snapshots::CandidateDiscovery::new(
+                        &mut ScanIndex::default(),
+                        None,
+                        None,
+                    ),
                 )
                 .unwrap()
             })

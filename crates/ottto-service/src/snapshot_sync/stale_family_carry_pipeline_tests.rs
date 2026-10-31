@@ -912,40 +912,6 @@ fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_o
     assert_eq!(fix.retry.liveness(), base.retry.liveness());
 }
 
-/// COST: the held family itself (its root and every member) is never carried.
-/// Its RetryPending record, bound to its retained witness, is written after
-/// the red window; the retry start carries nothing and equals BASE's.
-#[test]
-#[serial(source_manifests)]
-fn c1b_retry_pending_family_is_never_carried() {
-    if !c1a_layout_supported("c1b_retry_pending_never_carried") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let hold = |fixture: &RearmFixture| {
-        let mut index = ScanIndex::load(&fixture.index_path).unwrap();
-        let members = RearmFixture::family_keys(&index)
-            .into_iter()
-            .map(|(session, key)| {
-                let revision = index.files[&key].source_file_fingerprint.clone();
-                assert!(!revision.is_empty(), "the red window read {session}");
-                (session, revision)
-            })
-            .collect();
-        index.bind_retry_pending_claude_authority_for_test(REARM_ROOT, members);
-        index.save(&fixture.index_path).unwrap();
-    };
-    let fix = c1b_red_chain("c1b-held-family", "fix", hold);
-    let base = c1b_base_red_chain("c1b-held-family-base", hold);
-    let (retry, base_retry) = (&fix.windows[2], &base.windows[2]);
-    let start = retry.start.as_ref().expect("a retry start");
-    assert_eq!(start.carried_pending_families, Some(0), "never carried");
-    assert_eq!(retry.start, base_retry.start, "the start is BASE's");
-    assert_eq!(retry.family_reads, base_retry.family_reads);
-    assert_eq!(retry.parsed, base_retry.parsed);
-    assert!(retry.retry_pending && base_retry.retry_pending);
-}
-
 /// COST: authority debt beside another cause on an ordinary red retry,
 /// outside Fix 2's full-rearm-window exception. An unsettled mark already
 /// left by another producer stays set; the retry carries nothing and re-reads

@@ -341,7 +341,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
         &mut ScanCensus::default(),
         None,
         183,
-        &index.files,
+        &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
     )
     .unwrap();
     index.held_audit_progress = Some(HeldAuditProgress {
@@ -367,7 +367,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
             &mut ScanCensus::default(),
             None,
             183,
-            &index.files,
+            discovery_retention!(index),
             now
         )
         .is_none());
@@ -377,7 +377,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
             &mut ScanCensus::default(),
             None,
             183,
-            &index.files,
+            discovery_retention!(index),
             true,
             now,
             None
@@ -402,7 +402,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
         &mut ScanCensus::default(),
         None,
         183,
-        &index.files,
+        discovery_retention!(index),
         true,
         now,
         None

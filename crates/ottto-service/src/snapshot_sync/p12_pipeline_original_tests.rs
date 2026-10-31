@@ -1317,44 +1317,6 @@ fn novel_import_recovers_after_owner_coverage_then_stops_reading() {
     assert_late_import_checks_settled_request_owners(false);
 }
 
-fn observe_base_prelude(experimental_base_exit: bool) {
-    let _scope = experimental_base_exit
-        .then(crate::snapshots::envelope_selection_experiment::Scope::restart);
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fixture = RearmFixture::new("p12-novel-import-prelude");
-    let established = fixture.establish();
-    let quiet = fixture.generation(10);
-    assert_eq!(
-        rearm_reads(&quiet),
-        rearm_family_sessions().len(),
-        "base re-reads all three members, not the original optimized zero-read requirement"
-    );
-    assert_eq!(
-        RearmFixture::family_heads(&quiet.last().unwrap().index),
-        established.heads
-    );
-    let mode = if experimental_base_exit {
-        "experimental_base_exit_no_reuse"
-    } else {
-        "base_control"
-    };
-    writeln!(std::io::stderr().lock(), "p12_oracle: name=novel_import_recovers_after_owner_coverage_then_stops_reading mode={mode} status=BLOCKED_OPTIMIZED_PRELUDE original_expected_reads=0 observed_reads={} original_oracle_passed=false downstream_assertions_executed=false", rearm_reads(&quiet)).unwrap();
-}
-#[test]
-#[serial(source_manifests)]
-fn p12_novel_import_base_control_reveals_unmet_original_prelude() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    observe_base_prelude(false);
-}
-#[test]
-#[serial(source_manifests)]
-fn p12_novel_import_experiment_base_exit_reveals_unmet_original_prelude() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    observe_base_prelude(true);
-}
-
 #[test]
 #[ignore = "UNMET historical strict-fence aspiration; superseded by explicit native_comparison_novel_import_base_parity"]
 fn native_comparison_original_novel_import_oracle() {

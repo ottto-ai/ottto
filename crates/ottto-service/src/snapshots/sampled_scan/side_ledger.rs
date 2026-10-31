@@ -872,7 +872,7 @@ mod tests {
         assert!(c.bytes <= SIDE_LEDGER_BYTES);
     }
 
-    /// U-T64(f): the charge is constant, lock-free and inside the state bound.
+    /// [behaviour] U-T64(f): the charge is constant, lock-free and inside the state bound.
     #[test]
     fn shared_cache_charges_the_constant_without_locking_the_ledger() {
         let empty = SharedCache::default();
@@ -901,6 +901,13 @@ mod tests {
                 .unwrap();
             crate::heap_layout_bound::HeapLayoutBound::heap_bound(&empty.cursor, &mut without)
                 .unwrap();
+            // The separately allocated memo header is another cache-owned
+            // component; include it once to isolate the ledger's fixed term.
+            crate::heap_layout_bound::HeapLayoutBound::heap_bound(
+                &empty.withheld_memo,
+                &mut without,
+            )
+            .unwrap();
             assert_eq!(
                 with.bytes + size_of::<SharedCache>(),
                 without.bytes + SIDE_LEDGER_BYTES + super::super::OFF_MAIN_SHARED_BYTES
@@ -1113,6 +1120,7 @@ mod tests {
 
     fn file_entry() -> crate::snapshots::ScanIndexEntry {
         crate::snapshots::ScanIndexEntry {
+            codex_fragment: None,
             size_bytes: 42,
             modified_unix_seconds: 1_700_000_000,
             modified_unix_nanos: None,
@@ -1776,10 +1784,10 @@ mod tests {
         assert_eq!(loaded.codex_parent_side_requests.get(P), Some(&charged));
     }
 
-    /// D5′ sizes: the entry and slot keep their cleared sizes, so the heap
-    /// formula is unchanged; the ledger's inline growth is inside
-    /// `size_of::<SharedCache>()`, which the whole-cache bound charges once
-    /// beside the constant (never twice).
+    /// [behaviour] D5′ sizes: the entry and slot keep their cleared sizes. The
+    /// ledger's inline growth is inside `size_of::<SharedCache>()`; its fixed
+    /// heap reservation and the memo's separate allocation header are each
+    /// charged once beside that payload.
     #[test]
     fn d5_inline_ledger_is_in_the_cache_size_and_the_heap_formula_holds() {
         use crate::heap_layout_bound::HeapLayoutBound;
@@ -1798,6 +1806,7 @@ mod tests {
         let mut parts = Counter::new(usize::MAX);
         cache.inner.heap_bound(&mut parts).unwrap();
         cache.cursor.heap_bound(&mut parts).unwrap();
+        cache.withheld_memo.heap_bound(&mut parts).unwrap();
         assert_eq!(
             whole.bytes,
             super::super::OFF_MAIN_SHARED_BYTES

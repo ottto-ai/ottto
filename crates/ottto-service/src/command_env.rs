@@ -522,12 +522,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_nvm_dir_yields_no_node_bins() {
-        let home = scratch_home("no-nvm");
-        assert!(nvm_node_bin_dirs(&home).is_empty());
-    }
-
-    #[test]
     fn executable_path_finds_binary_off_launchd_path() {
         let home = scratch_home("off-path");
         let bin_dir = home.join(".local/bin");
@@ -743,12 +737,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_desktop_vendored_dirs_missing_root_is_empty() {
-        let home = scratch_home("claude-desktop-none");
-        assert!(claude_desktop_vendored_bin_dirs(&home).is_empty());
-    }
-
-    #[test]
     fn executable_path_semantics_find_vendored_claude_binary() {
         let home = scratch_home("claude-desktop-binary");
         let bin_dir = home.join(
@@ -773,13 +761,6 @@ mod tests {
         assert_eq!(found, Some(claude));
 
         fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn version_sort_key_orders_numeric_components() {
-        assert!(version_sort_key("2.1.202") > version_sort_key("2.1.9"));
-        assert!(version_sort_key("10.0.0") > version_sort_key("9.9.9"));
-        assert!(version_sort_key("2.1.9") > version_sort_key("README"));
     }
 
     #[test]

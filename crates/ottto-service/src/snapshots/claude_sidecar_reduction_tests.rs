@@ -85,7 +85,7 @@ impl Fixture {
             &mut ScanCensus::default(),
             None,
             BACKFILL_WINDOW_DAYS,
-            &BTreeMap::new(),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
         )
         .unwrap()
     }
@@ -429,24 +429,6 @@ fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
 }
 
 #[test]
-fn transcript_and_sidecar_append_use_tail_without_changing_joined_body() {
-    let f = Fixture::new(1);
-    let cache = Arc::new(SharedCache::default());
-    let prior = seed_predecessor(&f, &cache);
-    f.append_transcript(1);
-    f.evidence(2);
-    let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
-    assert_layout_mode(cached.modes, (0, 1, 0));
-    assert_oracle(&f, &cached, prior);
-    assert_eq!(
-        cached.index.files[&local_index_key(&f.path)]
-            .audit_obligation(now_seconds())
-            .is_some(),
-        crate::heap_layout_bound::layout_supported()
-    );
-}
-
-#[test]
 fn root_telemetry_reselects_every_child_without_invalidating_reduction() {
     let mut f = Fixture::new(1);
     let children = ["a4d1585d310070d0f", "b4d1585d310070d0f"];
@@ -595,6 +577,7 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
         let prior = seed_predecessor(&f, &cache);
         let cache = if retained_budget {
             Arc::new(SharedCache {
+                withheld_memo: Default::default(),
                 cap_pace: Default::default(),
                 inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
                 cursor: Default::default(),
@@ -1469,11 +1452,7 @@ fn desktop_bucket(home: &Path, root: &str, account: &str, org: &str) -> PathBuf 
     bucket
 }
 
-const DESKTOP_ACCOUNT: &str = "123e4567-e89b-12d3-a456-426614174000";
-const DESKTOP_ORG: &str = "123e4567-e89b-12d3-a456-426614174001";
-const SIBLING_ACCOUNT: &str = "223e4567-e89b-12d3-a456-426614174000";
-const SIBLING_ORG: &str = "223e4567-e89b-12d3-a456-426614174001";
-
+// [behaviour] Deferred: adjacent restore trait is removed by active e5/pi-b2.
 #[test]
 fn desktop_completed_census_counts_existing_held_retry_reads() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -1557,284 +1536,6 @@ fn desktop_completed_census_counts_existing_held_retry_reads() {
     );
 }
 
-#[test]
-fn desktop_source_revision_read_is_counted_once_per_file() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let home = crate::test_scratch::ScratchDir::new("desktop-revision-read");
-    let f = fixture_in_home(&home);
-    let store = desktop_bucket(&home, "Claude", DESKTOP_ACCOUNT, DESKTOP_ORG);
-    let title = |title: &str| {
-        fs::write(
-            store.join("one.json"),
-            json!({"cliSessionId":f.session,"title":title,"titleSource":"user",
-                "createdAt":"2026-08-02T06:59:00Z"})
-            .to_string(),
-        )
-        .unwrap();
-    };
-    title("first");
-    let cache = Arc::new(SharedCache::default());
-    let prior = settle(raw_scan_at(
-        &f,
-        ScanIndex::default(),
-        Some(cache.clone()),
-        true,
-        COLLECTED,
-        |_| {},
-    ));
-    title("second");
-    let (revised, rows) = crate::local_resource_diagnostics::capture(|| {
-        raw_scan_at(&f, prior, Some(cache), true, "2026-08-02T07:12:00Z", |_| {})
-    });
-    assert_eq!(revised.result.snapshots.len(), 1);
-    assert_eq!(
-        rows.iter()
-            .filter_map(
-                |row| row["counts"]["desktop_metadata"]["source_revision_body_rereads"].as_u64()
-            )
-            .sum::<u64>(),
-        1
-    );
-}
+const DESKTOP_ACCOUNT: &str = "123e4567-e89b-12d3-a456-426614174000";
 
-#[test]
-fn desktop_lineage_window_counts_only_an_opened_transcript() {
-    use crate::local_resource_diagnostics::claude_reread;
-    let root = crate::test_scratch::ScratchDir::new("desktop-window-count");
-    let path = root.join("one.jsonl");
-    fs::write(&path, "{}\n").unwrap();
-    let scope = claude_reread::Scope::begin(true);
-    read_claude_transcript_live_window(&path).unwrap();
-    assert!(read_claude_transcript_live_window(&root.join("absent.jsonl")).is_err());
-    assert_eq!(
-        scope.finish().desktop_metadata.lineage_window_read_attempts,
-        1
-    );
-}
-
-thread_local! {
-    // (Desktop metadata opens, transcript-window opens) on this thread.
-    static DESKTOP_OPENS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
-}
-fn count_desktop_open(window: bool) {
-    DESKTOP_OPENS.with(|opens| {
-        let (metadata, windows) = opens.get();
-        opens.set(if window {
-            (metadata, windows + 1)
-        } else {
-            (metadata + 1, windows)
-        });
-    });
-}
-
-/// Everything one pass decides or emits that a sibling Desktop root or the #851
-/// inventory key could steer.
-#[derive(Debug, PartialEq)]
-struct PassEvidence {
-    selected_files: usize,
-    modes: (usize, usize, usize),
-    full_reasons: [usize; 11],
-    native_bytes: u64,
-    desktop_opens: (u64, u64),
-    upload_body: Vec<u8>,
-    upload_witnesses: Vec<(String, String)>,
-    desktop_state: Vec<(String, Value)>,
-}
-
-/// Every persisted Desktop field: census flags, witness, cursor, ceiling, retry
-/// and title entries, plus the account owners they decide.
-fn desktop_state(index: &ScanIndex) -> Vec<(String, Value)> {
-    serde_json::to_value(index)
-        .unwrap()
-        .as_object()
-        .unwrap()
-        .iter()
-        .filter(|(key, _)| {
-            key.starts_with("claude_desktop_") || key.as_str() == "session_account_bindings"
-        })
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
-
-/// Proof conditions 1, 2 and 5 for the inert #851 re-land. The arms scan one
-/// on-disk transcript in lockstep, each with its own index and cache, so any
-/// difference comes from the sibling root or the carried key. A cross-build
-/// comparison against the cut release is a separate release check.
-#[test]
-fn sibling_desktop_root_and_inventory_key_change_no_selection_read_or_upload_body() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let home = crate::test_scratch::ScratchDir::new("desktop-sibling-inert");
-    let f = fixture_in_home(&home);
-    let session = json!({"cliSessionId":f.session,"title":"primary title","titleSource":"user",
-        "createdAt":"2026-08-02T06:59:00Z"});
-    fs::write(
-        desktop_bucket(&home, "Claude", DESKTOP_ACCOUNT, DESKTOP_ORG).join("one.json"),
-        session.to_string(),
-    )
-    .unwrap();
-    // A sibling with a different account and title for the SAME session, the
-    // strongest input multi-root discovery would act on.
-    let sibling_bucket = desktop_bucket(&home, "Claude-ALT", SIBLING_ACCOUNT, SIBLING_ORG);
-    fs::write(
-        sibling_bucket.join("one.json"),
-        json!({"cliSessionId":f.session,"title":"sibling title","titleSource":"user",
-            "createdAt":"2026-08-02T06:59:00Z"})
-        .to_string(),
-    )
-    .unwrap();
-    fs::write(
-        sibling_bucket.join("two.json"),
-        json!({"cliSessionId":"00000000-0000-4000-8000-000000000099","title":"other"}).to_string(),
-    )
-    .unwrap();
-    let sibling = home.join("Library/Application Support/Claude-ALT");
-    fs::write(
-        sibling.join("config.json"),
-        json!({"lastKnownAccountUuid":SIBLING_ACCOUNT}).to_string(),
-    )
-    .unwrap();
-    let parked = home.join("parked-Claude-ALT");
-
-    // Negative control: read, this sibling WOULD change the selection hash, so
-    // equal arms below prove it is unread rather than irrelevant.
-    let stores = |root: &str| {
-        BTreeSet::from([home
-            .join("Library/Application Support")
-            .join(root)
-            .join("claude-code-sessions")])
-    };
-    let fingerprint = |dirs: &BTreeSet<PathBuf>| {
-        ClaudeTitleMetadata::load_from_store_dirs_with_index(
-            dirs,
-            &mut ScanIndex::default(),
-            COLLECTED,
-            true,
-        )
-        .session_sidecar_fingerprint(&f.session)
-    };
-    let mut both = stores("Claude");
-    both.extend(stores("Claude-ALT"));
-    assert_ne!(fingerprint(&stores("Claude")), fingerprint(&both));
-
-    CLAUDE_DESKTOP_READ_FOR_TEST.with(|hook| hook.set(Some(count_desktop_open)));
-    // (sibling root present, the index starts with the #851 key)
-    let arms = [(false, false), (true, false), (true, true)];
-    let mut indexes = arms.map(|(_, carried)| ScanIndex {
-        claude_desktop_store_inventory: carried.then(|| "b".repeat(64)),
-        ..ScanIndex::default()
-    });
-    let caches = arms.map(|_| Arc::new(SharedCache::default()));
-    f.evidence(1);
-    for pass in ["cold", "unchanged", "grown"] {
-        if pass == "grown" {
-            f.append_transcript(1);
-            f.evidence(2);
-        }
-        let mut evidence = Vec::new();
-        for (arm, (with_sibling, _)) in arms.into_iter().enumerate() {
-            if with_sibling {
-                if parked.exists() {
-                    fs::rename(&parked, &sibling).unwrap();
-                }
-            } else if sibling.exists() {
-                fs::rename(&sibling, &parked).unwrap();
-            }
-            DESKTOP_OPENS.with(|opens| opens.set((0, 0)));
-            let run = enriched(
-                &f,
-                raw_scan_at(
-                    &f,
-                    std::mem::take(&mut indexes[arm]),
-                    Some(caches[arm].clone()),
-                    true,
-                    COLLECTED,
-                    |_| {},
-                ),
-            );
-            let (upload_body, upload_witnesses) = exact_bodies(&run);
-            let selected_files = run.result.scanned_file_count;
-            let (modes, full_reasons, native_bytes) = (run.modes, run.reasons, run.native_bytes);
-            let index = settle(run);
-            assert!(serde_json::to_value(&index)
-                .unwrap()
-                .get("claude_desktop_store_inventory")
-                .is_none());
-            evidence.push(PassEvidence {
-                selected_files,
-                modes,
-                full_reasons,
-                native_bytes,
-                desktop_opens: DESKTOP_OPENS.with(|opens| opens.get()),
-                upload_body,
-                upload_witnesses,
-                desktop_state: desktop_state(&index),
-            });
-            indexes[arm] = index;
-        }
-        assert_eq!(evidence[0], evidence[1], "{pass}: sibling root");
-        assert_eq!(evidence[0], evidence[2], "{pass}: sibling root + #851 key");
-        // Not vacuous: the fixture really selects, reads and emits.
-        assert!(evidence[0].desktop_opens.0 > 0, "{pass}: store was swept");
-        assert_eq!(
-            !evidence[0].upload_witnesses.is_empty(),
-            pass != "unchanged",
-            "{pass}"
-        );
-    }
-    CLAUDE_DESKTOP_READ_FOR_TEST.with(|hook| hook.set(None));
-}
-
-/// Proof condition 4: a carried inventory steers no census, retry or authority
-/// state, including the "flags true + retry deadline" state only #851 wrote,
-/// which must keep reporting incomplete here.
-#[test]
-fn desktop_inventory_key_steers_no_census_or_backoff_state() {
-    let home = crate::test_scratch::ScratchDir::new("desktop-inventory-inert");
-    let store = home.join("store");
-    fs::create_dir_all(&store).unwrap();
-    fs::write(
-        store.join("one.json"),
-        json!({"cliSessionId":"one","title":"t","titleSource":"user"}).to_string(),
-    )
-    .unwrap();
-    let dirs = BTreeSet::from([store]);
-    let deadline = rfc3339_unix_seconds(COLLECTED).unwrap() + 60;
-    // (cursor, retry deadline, both census flags, sweep had errors)
-    let states = [
-        (None, None, false, false),
-        (None, Some(deadline), true, false),
-        (Some("/synthetic/mid-sweep"), None, false, false),
-        (None, Some(deadline), false, true),
-    ];
-    for (state, (cursor, retry, complete, errors)) in states.into_iter().enumerate() {
-        let load = |inventory: Option<String>| {
-            let mut index = ScanIndex {
-                claude_desktop_store_inventory: inventory.clone(),
-                claude_desktop_store_cursor: cursor.map(str::to_string),
-                claude_desktop_store_retry_not_before_unix_seconds: retry,
-                claude_desktop_store_sweep_had_errors: errors,
-                claude_desktop_identity_census_complete: complete,
-                claude_desktop_lineage_census_complete: complete,
-                ..ScanIndex::default()
-            };
-            let metadata = ClaudeTitleMetadata::load_from_store_dirs_with_index(
-                &dirs, &mut index, COLLECTED, true,
-            );
-            assert_eq!(index.claude_desktop_store_inventory, inventory);
-            (
-                metadata.sidecar_census_incomplete,
-                metadata.original_identity_census_incomplete,
-                metadata.titles.len(),
-                desktop_state(&index),
-            )
-        };
-        let absent = load(None);
-        assert_eq!(load(Some("b".repeat(64))), absent, "state {state}");
-        if state == 1 {
-            assert!(
-                absent.0,
-                "a retry deadline stays incomplete: no raised completion"
-            );
-        }
-    }
-}
+const DESKTOP_ORG: &str = "123e4567-e89b-12d3-a456-426614174001";

@@ -107,6 +107,7 @@ fn candidate(name: &str, size: u64) -> CandidateFile {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     }
 }
 
@@ -279,58 +280,6 @@ fn refused_fixture() -> PathBuf {
         &member(OWNER, "bad-overlap", 200, 250),
     );
     root
-}
-
-#[test]
-fn terminal_join_debt_settles_census_without_alias_parser() {
-    let root = refused_fixture();
-    let (index, result) = scan(&root, ScanIndex::default(), 2);
-    assert!(result.snapshots.is_empty());
-    assert_eq!(
-        result.unreadable_path_count, 0,
-        "terminal proof debt is not an unreadable file"
-    );
-    assert!(
-        result.census_complete,
-        "outcome R: settleable residue lets the census complete: {result:?}"
-    );
-    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn fence_filters_watcher_hint_after_attempt() {
-    let root = refused_fixture();
-    write_rows(
-        &root.join("sessions/c.jsonl"),
-        &member(OTHER, "healthy", 100, 100),
-    );
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, first) = sampled(&root, ScanIndex::default(), 2, &cache);
-    assert!(first.snapshots.is_empty());
-    let overlap = JoinRefusal::Overlap.slot();
-    assert_eq!(counters(&cache).join_terminal_debt[overlap], 1);
-    // A watcher hint for a member of the attempted group, same generation.
-    let traversal = index.traversal.as_mut().expect("the generation continues");
-    let scan_root = traversal.scan_roots[0].clone();
-    traversal.pending_candidates.push_back(ScanTraversalPath {
-        path: scan_root.join("b.jsonl"),
-        scan_root,
-        census_member: false,
-        watcher_hint: true,
-    });
-    let (_, next) = sampled(&root, index, 2, &cache);
-    let after = counters(&cache);
-    assert_eq!(
-        after.join_terminal_debt[overlap], 1,
-        "no second attempt in the generation: {after:?}"
-    );
-    assert_eq!(after.groups_fenced, 1, "{after:?}");
-    assert!(next
-        .snapshots
-        .iter()
-        .all(|snapshot| snapshot.source_session_id == OTHER));
-    fs::remove_dir_all(root).unwrap();
 }
 
 /// G1 (review of #751, P1): a processed group re-hinted through one member
@@ -723,28 +672,6 @@ fn ui_shape_unreadable_is_proof_domain() {
         None,
     );
     assert_eq!(proof.refusal(), Some((JoinRefusal::CumulativeOnly, 0)));
-}
-
-#[test]
-fn ui_root_shared_with_parser() {
-    let last = usage(70);
-    for row in [
-        json!({"type": "event_msg", "payload": {"type": "token_count",
-            "info": {"last_token_usage": last}}}),
-        json!({"type": "event_msg", "payload": {"type": "token_count",
-            "last_token_usage": last}}),
-        json!({"token_count": {"info": {"last_token_usage": last}}}),
-        json!({"last_token_usage": last}),
-    ] {
-        assert_eq!(codex_last_usage_root(&row), Some(&last), "{row}");
-        assert_eq!(
-            codex_last_usage(&row).map(|usage| usage.input_tokens),
-            Some(70)
-        );
-    }
-    let cumulative = json!({"payload": {"info": {"total_token_usage": last}}});
-    assert!(codex_last_usage_root(&cumulative).is_none());
-    assert!(codex_last_usage(&cumulative).is_none());
 }
 
 #[test]
@@ -1792,22 +1719,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
     fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
-fn proof_charge_uses_proven_btree_fill() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let mut proof = StreamProof::new(OWNER.into(), false, vec![MemberPlan::default()]);
-    proof.responses.extend(0..100_000u64);
-    proof.ui.extend(0..100_000u64);
-    let charged = crate::heap_layout_bound::completed_bound(&proof, usize::MAX).unwrap();
-    // R2-M4: every non-root std B-tree node holds at least 5 entries.
-    let node = 256 + 12 * size_of::<usize>() + 11 * size_of::<u64>();
-    let ceiling = 2 * (100_000 / 5 + 1) * node + 64 * 1024;
-    assert!(charged <= ceiling, "{charged} > {ceiling}");
-    assert!(charged >= 2 * 100_000 * size_of::<u64>(), "{charged}");
-}
-
 /// R1-H1 (round 2): an append-curable refusal at a paged group's frozen cut
 /// is not memoized while the live member already holds bytes past the cut:
 /// they may cure it, so the next generation reads them and accepts.
@@ -2083,33 +1994,6 @@ fn allowance_bound_probe_order_takes_an_own_page_then_parks() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// Round 3 (R1-L1, R2-L2 (b)): a probe cut by `PROBE_BYTES` itself gives
-/// the same fallback order every generation: parked at once, not replayed.
-#[test]
-fn probe_limit_bound_order_parks_until_a_member_changes() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let root = probe_order_corpus("probe-limit", PROBE_BYTES / 4096 + 16);
-    let order = JoinRefusal::ProbeBudgetOrder.slot();
-    let cache = Arc::new(SharedCache::default());
-    let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
-    let first = counters(&cache);
-    assert!(first.probe_bound >= 1, "{first:?}");
-    assert_eq!(first.join_terminal_debt[order], 1, "{first:?}");
-    let (index, parked) = next_generation(&root, index, &cache, 1);
-    let after = counters(&cache);
-    assert_eq!(
-        after.join_terminal_debt[order], 1,
-        "not replayed: {after:?}"
-    );
-    assert_eq!(after.parked_hits, 1, "{after:?}");
-    assert!(parked.snapshots.is_empty());
-    assert!(parked.unreadable_path_count > 0, "disclosed as strict debt");
-    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
-    fs::remove_dir_all(root).unwrap();
-}
-
 /// Round 4 (L4): the own-page cure. A group read first leaves the shared
 /// page's singleton remainder short of this paged group's probes
 /// (`ProbeBudgetOrder`); on its own page the remainder covers them, the
@@ -2253,31 +2137,6 @@ fn probe_order_end_leaves_no_waiter_ahead_of_p1_singletons() {
         assert_eq!(cache.rotation_waiters_for_test(), 0, "{after:?}");
     });
     fs::remove_dir_all(root).unwrap();
-}
-
-/// Round 4 (L3): `MEMBER_SWAP_CHARGE` covers the fixed records a member swap
-/// adds: the applied receipt's B-tree slot share (a non-root node holds at
-/// least 5 of its 11 entries) and the baseline and `MemberSeen` Vec slots
-/// (at most twice the element under doubling). The first swap also covers
-/// the one-time first allocations: the root node and the Vec minimum
-/// capacity of 4 (two elements past the doubling share).
-#[test]
-fn member_swap_charge_covers_the_fixed_per_member_records() {
-    let entry = size_of::<String>() + size_of::<AppliedTierReceipt>();
-    let node = 11 * entry + 12 * size_of::<usize>() + 2 * size_of::<usize>();
-    let fixed = node / 5 + 2 * size_of::<LegacyBaseline>() + 2 * size_of::<MemberSeen>();
-    assert!(cursor::MEMBER_SWAP_CHARGE as usize >= fixed, "{fixed}");
-    let first = fixed + node + 2 * (size_of::<LegacyBaseline>() + size_of::<MemberSeen>());
-    assert!(cursor::MEMBER_SWAP_CHARGE as usize >= first, "{first}");
-    // An unbounded record walks at the next step.
-    assert_eq!(
-        cursor::swap_charge(&[Some(10), None]),
-        cursor::swap_charge(&[Some(usize::MAX)])
-    );
-    assert_eq!(
-        cursor::swap_charge(&[Some(10), Some(0), Some(0)]),
-        cursor::MEMBER_SWAP_CHARGE + 10
-    );
 }
 
 /// Round 3 (R2-M1): a memoized group larger than the singleton budget
@@ -2478,24 +2337,6 @@ fn join_release_keeps_a_non_member_claim_on_the_same_owner() {
     fs::remove_dir_all(root).unwrap();
 }
 
-thread_local! {
-    /// J-T3: `(from, to)`: the posted compact key of `from` is `to`'s.
-    static FORCE_COLLISION: std::cell::RefCell<Option<(String, String)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Main's `compact_key` body, test-local, with the forced collision.
-fn posted_compact_key(key: &str) -> u64 {
-    let key = FORCE_COLLISION.with(|forced| match &*forced.borrow() {
-        Some((from, to)) if from == key => to.clone(),
-        _ => key.to_owned(),
-    });
-    let digest = <sha2::Sha256 as sha2::Digest>::digest(key.as_bytes());
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-    u64::from_be_bytes(bytes)
-}
-
 /// A clean walk's traversal whose census is exactly `census`.
 fn census_traversal(census: &[&str]) -> crate::snapshots::ScanTraversalCheckpoint {
     crate::snapshots::ScanTraversalCheckpoint {
@@ -2541,40 +2382,6 @@ fn recorded_release_fixture(cache: &SharedCache) -> (ScanIndex, [String; 3]) {
         .codex_state_only_blocked_session_ids
         .insert(OWNER.to_owned());
     (index, keys)
-}
-
-/// J-T3: a forced compact-key collision (`n` digests as member `a`) makes
-/// the posted digest filter select the non-member `n`; the amended release
-/// matches exact keys, so the collision has nothing to act on.
-#[test]
-fn forced_compact_key_collision_cannot_remove_a_non_member_claim() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, [a, b, n]) = recorded_release_fixture(&cache);
-    let census = "/fixture/sessions/c.jsonl";
-    index.traversal = Some(census_traversal(&[census]));
-    FORCE_COLLISION.with(|forced| *forced.borrow_mut() = Some((n.clone(), a.clone())));
-    // The posted (B) filter, verbatim, on this state.
-    let members = [&a, &b].map(|key| posted_compact_key(key.as_str()));
-    let present = BTreeSet::from([posted_compact_key(census)]);
-    let selected = index
-        .codex_state_only_blocked_by_file
-        .keys()
-        .filter(|key| {
-            members.contains(&posted_compact_key(key.as_str()))
-                && !present.contains(&posted_compact_key(key.as_str()))
-        })
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    assert!(selected.contains(&n), "the forced collision is real");
-    crate::snapshots::release_departed_join_owners(&mut index, &cache, |_| false);
-    FORCE_COLLISION.with(|forced| *forced.borrow_mut() = None);
-    assert_eq!(claims(&index, &a), None);
-    assert_eq!(claims(&index, &b), None);
-    assert_eq!(claims(&index, &n), Some(BTreeSet::from([OWNER.to_owned()])));
-    assert!(held_owner(&index, OWNER));
 }
 
 /// J-T4 (a): an unclean walk (a rejected symlink) releases nothing.

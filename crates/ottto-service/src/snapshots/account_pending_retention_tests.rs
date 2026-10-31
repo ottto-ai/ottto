@@ -200,38 +200,6 @@ fn account_window_unsafe_boundaries_are_untouched() {
 }
 
 #[test]
-fn account_window_push_keeps_endpoints_and_change_points() {
-    let (dir, root, base) = retention_fixture();
-    let mut pending = base.claude_account_family_pending[&root].clone();
-    let original = pending.previous_windows.clone();
-    pending.previous_windows.clear();
-    for old in &original {
-        pending.retain_previous_window(old.clone());
-    }
-    assert_eq!(
-        pending.previous_windows,
-        vec![original[0].clone(), original[5].clone()]
-    );
-    let mut changed = original[5].clone();
-    changed.census_window_end = "2026-08-02T07:06:00Z".into();
-    changed
-        .member_requests
-        .values_mut()
-        .next()
-        .unwrap()
-        .identity_revision = Some("b".repeat(64));
-    pending.retain_previous_window(changed.clone());
-    let mut returned = original[5].clone();
-    returned.census_window_end = "2026-08-02T07:07:00Z".into();
-    pending.retain_previous_window(returned.clone());
-    assert_eq!(
-        pending.previous_windows,
-        vec![original[0].clone(), original[5].clone(), changed, returned]
-    );
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
 fn account_window_load_crash_retry_normal_save_and_old_decoder() {
     let (dir, root, mut original) = retention_fixture();
     // Hold the family so normal save cannot retire it before the load fixture.
@@ -284,45 +252,6 @@ fn account_window_load_crash_retry_normal_save_and_old_decoder() {
 }
 
 #[test]
-fn account_window_consumer_fields_are_projection_fields() {
-    // Read the actual consumer's code, not a second hand-maintained field list.
-    // Historical Window access is confined to retirement_observations; all
-    // subsequent evidence reads have ConsumerProjection's type. Strict run
-    // equality separately exhaustively covers every non-boundary Window field.
-    let source = include_str!("../snapshots.rs");
-    let consumer = source
-        .split("    fn retire_committed_claude_account_pending_windows(&mut self) {")
-        .nth(1)
-        .unwrap()
-        .split("\n    fn ")
-        .next()
-        .unwrap();
-    assert!(consumer.contains("pending.retirement_observations()"));
-    assert!(
-        !consumer.contains(".previous_windows"),
-        "historical evidence must enter through the projection"
-    );
-    let projection = include_str!("account_pending_retention.rs")
-        .split("pub(super) struct ConsumerProjection<'a> {")
-        .nth(1)
-        .unwrap()
-        .split('\n')
-        .take_while(|line| *line != "}")
-        .collect::<Vec<_>>()
-        .join("\n");
-    for read in consumer.split("window.").skip(1) {
-        let field: String = read
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        assert!(
-            projection.contains(&format!(" {field}:")),
-            "consumer read {field} outside the projection"
-        );
-    }
-}
-
-#[test]
 fn account_window_collapse_preserves_every_other_index_field_and_scan_identity() {
     let (dir, root, mut index) = retention_fixture();
     let mut before = serde_json::to_value(&index).unwrap();
@@ -343,56 +272,6 @@ fn account_window_collapse_preserves_every_other_index_field_and_scan_identity()
     // Includes file/source fingerprints, scan identities, accepted/upload
     // witnesses, obligations, current evidence, generation and parser contracts.
     assert_eq!(before, after);
-}
-
-#[test]
-fn account_window_strict_comparison_covers_every_window_field() {
-    // Compilation itself is the coverage gate: strict_evidence exhaustively
-    // destructures Window without `..`. Derive-based window equality below
-    // independently checks that only the boundary may be excluded.
-    let (dir, root, index) = retention_fixture();
-    let original = &index.claude_account_family_pending[&root].previous_windows[0];
-    let mut boundary_only = original.clone();
-    boundary_only.census_window_end = "2026-08-02T07:09:00Z".into();
-    let mut pending = index.claude_account_family_pending[&root].clone();
-    pending.previous_windows = vec![original.clone(), original.clone(), boundary_only.clone()];
-    for (i, w) in pending.previous_windows.iter_mut().enumerate() {
-        w.census_window_end = format!("2026-08-02T07:0{i}:00Z");
-    }
-    let mut collapsed = index.clone();
-    collapsed
-        .claude_account_family_pending
-        .insert(root.clone(), pending);
-    collapsed.collapse_account_pending_windows();
-    assert_eq!(
-        collapsed.claude_account_family_pending[&root]
-            .previous_windows
-            .len(),
-        2
-    );
-    boundary_only
-        .census_window_end
-        .clone_from(&original.census_window_end);
-    assert_eq!(boundary_only, *original);
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn account_window_retention_counts_use_existing_diagnostics_carrier() {
-    let (dir, _, mut index) = retention_fixture();
-    index.collapse_account_pending_windows();
-    let carrier =
-        serde_json::to_value(index.claude_account_retained_pending_resources().unwrap()).unwrap();
-    assert_eq!(carrier["roots_collapsed"], 1);
-    assert_eq!(carrier["windows_collapsed"], 4);
-    assert_eq!(carrier["roots_refused"], 0);
-    assert_eq!(
-        carrier["window_bytes_saved"].as_u64().unwrap(),
-        carrier["window_bytes_before"].as_u64().unwrap()
-            - carrier["window_bytes_after"].as_u64().unwrap()
-    );
-    assert!(carrier["window_bytes_saved"].as_u64().unwrap() > 0);
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

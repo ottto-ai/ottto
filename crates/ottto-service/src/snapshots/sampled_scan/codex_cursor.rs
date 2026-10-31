@@ -458,12 +458,30 @@ pub(in crate::snapshots) struct OpenStamp {
 }
 crate::heap_layout_bound::fields!(OpenStamp; dev, ino, extent, modified, changed);
 
+/// The cursor/acquisition content key, without metadata-only ctime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct ContentStamp {
+    dev: u64,
+    ino: u64,
+    extent: u64,
+    modified: (i64, i64),
+}
+crate::heap_layout_bound::fields!(ContentStamp; dev, ino, extent, modified);
+impl ContentStamp {
+    pub(in crate::snapshots) fn extent(&self) -> u64 {
+        self.extent
+    }
+    pub(in crate::snapshots) fn same_content(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 impl OpenStamp {
     pub(in crate::snapshots) fn capture(file: &File) -> std::io::Result<Self> {
         Ok(Self::of(&file.metadata()?))
     }
 
-    fn of(metadata: &fs::Metadata) -> Self {
+    pub(in crate::snapshots) fn of(metadata: &fs::Metadata) -> Self {
         Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
@@ -471,6 +489,23 @@ impl OpenStamp {
             modified: (metadata.mtime(), metadata.mtime_nsec()),
             changed: (metadata.ctime(), metadata.ctime_nsec()),
         }
+    }
+
+    pub(in crate::snapshots) fn candidate(candidate: &super::super::CandidateFile) -> Option<Self> {
+        let [dev, ino] = candidate.physical_identity?;
+        Some(Self {
+            dev,
+            ino,
+            extent: candidate.size_bytes,
+            modified: (
+                (candidate.modified_unix_nanos / 1_000_000_000) as i64,
+                (candidate.modified_unix_nanos % 1_000_000_000) as i64,
+            ),
+            changed: (
+                (candidate.fingerprint_changed_nanos / 1_000_000_000) as i64,
+                (candidate.fingerprint_changed_nanos % 1_000_000_000) as i64,
+            ),
+        })
     }
 
     /// The object `path` names now, without following a final symlink.
@@ -494,7 +529,16 @@ impl OpenStamp {
     /// `transcript_acquisition::FileStamp::same_content`'s rule: the same
     /// object, extent and nanosecond mtime; never ctime.
     pub(in crate::snapshots) fn same_content(&self, other: &Self) -> bool {
-        self.same_object(other) && self.extent == other.extent && self.modified == other.modified
+        self.content_stamp().same_content(&other.content_stamp())
+    }
+
+    pub(in crate::snapshots) fn content_stamp(&self) -> ContentStamp {
+        ContentStamp {
+            dev: self.dev,
+            ino: self.ino,
+            extent: self.extent,
+            modified: self.modified,
+        }
     }
 
     /// The memo and parked wake rule, on stamps `SharedCache::retained_stamp`
@@ -813,26 +857,6 @@ impl JobMeta {
     /// froze its extent after that generation's `census_window_end`.
     pub(in crate::snapshots) fn in_generation(&self, index: &ScanIndex) -> bool {
         self.fence.is_some() && self.fence == census_token(index)
-    }
-
-    /// The live job's copy-budget charge without a walk (E3): the last
-    /// `completed_bound` plus every byte the reader consumed since plus the
-    /// reader buffer's capacity growth since (`buffer` is its capacity now).
-    /// Not a strict upper bound: an accumulator collection that regrows can
-    /// add more than the bytes that caused it. That slack lasts at most
-    /// `CHARGE_REFRESH_BYTES` of input and is corrected by the next walk;
-    /// the pause and completion walks are exact. None when no charge is
-    /// recorded, the reader restarted, or `CHARGE_REFRESH_BYTES` were
-    /// consumed since (the caller walks again: at most one walk per that
-    /// many bytes, never one per line). The scanner reads it through
-    /// `job_charge_estimate`, which also covers group jobs.
-    #[cfg(test)]
-    pub(in crate::snapshots) fn charge_estimate(
-        &self,
-        consumed: u64,
-        buffer: usize,
-    ) -> Option<usize> {
-        estimate_charge(self.charge, consumed, buffer, 1)
     }
 
     /// Record a walked charge (`usize::MAX` when the walk refused) taken at
@@ -6950,6 +6974,7 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
     }
     targets.pending_finalization.push(PendingIndexFinalization {
         restored_behind_accepted: false,
+        withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: index
             .files
