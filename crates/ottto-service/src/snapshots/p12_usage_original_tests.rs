@@ -168,6 +168,7 @@ impl Family {
                     lineage_edge_reoffer_bytes: None,
                     desktop_identity_reoffer: None,
                     desktop_identity_evidence: None,
+                    desktop_identity_withheld: false,
                     codex_pending_recovery: false,
                     index_key: key.clone(),
                     source_file_fingerprint: item

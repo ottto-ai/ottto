@@ -857,6 +857,7 @@ fn apc_pending(
         lineage_edge_reoffer_bytes: None,
         desktop_identity_reoffer: None,
         desktop_identity_evidence: None,
+        desktop_identity_withheld: false,
         codex_pending_recovery: false,
         index_key: apc_keys()[slot].clone(),
         source_file_fingerprint: revision.to_string(),

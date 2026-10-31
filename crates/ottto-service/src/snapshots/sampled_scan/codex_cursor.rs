@@ -6924,6 +6924,7 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
         lineage_edge_reoffer_bytes: None,
         desktop_identity_reoffer: None,
         desktop_identity_evidence: None,
+        desktop_identity_withheld: false,
         codex_pending_recovery: index
             .files
             .get(&index_key)

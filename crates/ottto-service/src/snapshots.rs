@@ -8037,8 +8037,11 @@ struct PendingIndexFinalization {
     /// Selected only by the Desktop identity latch, with its native bytes.
     desktop_identity_reoffer: Option<(desktop_identity::IdentityReoffer, u64)>,
     /// Digest of the child's own live evidence when it resolved complete at
-    /// read time: a non-complete emission is then a downgrade, memoized in RAM.
-    desktop_identity_evidence: Option<[u8; 32]>,
+    /// read time: a non-complete emission is then a downgrade, Refused at it.
+    desktop_identity_evidence: Option<desktop_identity::EvidenceDigest>,
+    /// N1: one of this child's own bodies was withheld from this pass's upload
+    /// (carried or no-op), so this pass's ACKs cannot settle the child.
+    desktop_identity_withheld: bool,
     codex_pending_recovery: bool,
     index_key: String,
     source_file_fingerprint: String,
@@ -8354,6 +8357,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
 
     let mut noop_source_files = BTreeSet::new();
     let mut carried_noop_entities = BTreeSet::new();
+    let mut identity_withheld = BTreeSet::new();
     for pending in &result.pending_finalization {
         if let Some(diagnostic) = result.local_codex_diagnostics.as_mut() {
             let key_digest = codex_scan_diagnostics::digest(&pending.index_key);
@@ -8561,12 +8565,14 @@ pub fn finalize_scan_after_policy_with_body_witness(
         if source == SnapshotSource::ClaudeCode {
             // The emitted body, after every downgrade and veto; its latch
             // commits with this file's ACK-settled entry only.
-            index.note_desktop_identity_emission(
+            if index.note_desktop_identity_emission(
                 pending,
                 &result.snapshots,
                 noop_source_files.contains(&pending.source_file_fingerprint),
                 &carried_noop_entities,
-            );
+            ) {
+                identity_withheld.insert(pending.index_key.clone());
+            }
         }
     }
     if source == SnapshotSource::ClaudeCode {
@@ -8583,6 +8589,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
 
     if source == SnapshotSource::ClaudeCode {
         for pending in &mut result.pending_finalization {
+            pending.desktop_identity_withheld = identity_withheld.contains(&pending.index_key);
             if let Some(bytes) = pending
                 .lineage_edge_reoffer_bytes
                 .take()
@@ -31441,15 +31448,13 @@ impl OwnedSourceScan {
                             sampled_audit_verified: false,
                             lineage_edge_reoffer_bytes: None,
                             desktop_identity_reoffer: None,
-                            desktop_identity_evidence: (source == SnapshotSource::ClaudeCode)
-                                .then(|| {
-                                    desktop_identity::identity_evidence(
-                                        &claude_title_metadata,
-                                        &alias.path,
-                                        &alias_fingerprint,
-                                    )
-                                })
-                                .flatten(),
+                            desktop_identity_evidence: desktop_identity::identity_evidence(
+                                source,
+                                &claude_title_metadata,
+                                &alias.path,
+                                &alias_fingerprint,
+                            ),
+                            desktop_identity_withheld: false,
                             codex_pending_recovery: index
                                 .files
                                 .get(&local_index_key(&alias.path))
@@ -31559,15 +31564,13 @@ impl OwnedSourceScan {
                     sampled_audit_verified,
                     lineage_edge_reoffer_bytes,
                     desktop_identity_reoffer,
-                    desktop_identity_evidence: (source == SnapshotSource::ClaudeCode)
-                        .then(|| {
-                            desktop_identity::identity_evidence(
-                                &claude_title_metadata,
-                                &candidate.path,
-                                &source_file_fingerprint,
-                            )
-                        })
-                        .flatten(),
+                    desktop_identity_evidence: desktop_identity::identity_evidence(
+                        source,
+                        &claude_title_metadata,
+                        &candidate.path,
+                        &source_file_fingerprint,
+                    ),
+                    desktop_identity_withheld: false,
                     codex_pending_recovery: index
                         .files
                         .get(&index_key)
@@ -33125,58 +33128,26 @@ impl OwnedSourceScan {
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Skip {
                 // Selection only, through the ordinary source-revision path.
                 let key = local_index_key(&candidate.path);
-                let now = sampled_scan::now_seconds();
-                let reoffer =
-                    index
-                        .desktop_identity_reoffer(&candidate, &claude_title_metadata)
-                        .filter(|kind| {
-                            *kind == desktop_identity::IdentityReoffer::Recovered || {
-                                // SOURCE: adoption never reads. Only a retained
-                                // reduction that acquisition below reuses as
-                                // Unchanged (0 native bytes) qualifies, and never an
-                                // E2 path twin whose absent sibling would withhold
-                                // it. Otherwise it waits for a natural read.
-                                let twin = claude_request_money::e2::enabled()
-                                    && history_upgrade.twin_groups().get().map_or(true, |groups| {
-                                        !claude_request_money::e2::selected_twin_roots(
-                                            std::iter::once(candidate.path.as_path()),
-                                            groups,
-                                        )
-                                        .is_empty()
-                                    });
-                                !twin
-                                    && state_census_complete
-                                    && sampling.as_ref().is_some_and(|context| {
-                                        let debt = sampled_audit::debt_for_key(index, &key, now);
-                                        context.audit_metadata_supported
-                                            && (debt.is_some() || context.audit_slots > 0)
-                                            && sampled_scan::reduction_dependencies(
-                                                source,
-                                                &candidate,
-                                                &codex_title_metadata,
-                                                &claude_title_metadata,
-                                                claude_effort_support_dir_ref,
-                                            )
-                                            .is_some_and(|sidecar| {
-                                                let scope = context.file_scope(
-                                                    source,
-                                                    &candidate,
-                                                    &sidecar,
-                                                    artifacts_enabled,
-                                                    context_curve_enabled,
-                                                    index,
-                                                );
-                                                context.cache.reuses_unchanged(
-                                                    &key,
-                                                    &opened_file,
-                                                    &scope,
-                                                    debt,
-                                                    now,
-                                                )
-                                            })
-                                    })
-                            }
-                        });
+                let reoffer = index
+                    .desktop_identity_reoffer(&candidate, &claude_title_metadata)
+                    .filter(|kind| {
+                        *kind == desktop_identity::IdentityReoffer::Recovered
+                            || desktop_identity::adoption_reads_nothing(
+                                index,
+                                &candidate,
+                                &opened_file,
+                                sampling.as_ref(),
+                                &history_upgrade,
+                                state_census_complete,
+                                desktop_identity::ReductionInputs {
+                                    codex: &codex_title_metadata,
+                                    claude: &claude_title_metadata,
+                                    support: claude_effort_support_dir_ref,
+                                    artifacts: artifacts_enabled,
+                                    context_curve: context_curve_enabled,
+                                },
+                            )
+                    });
                 if let Some(kind) = reoffer {
                     decision = CandidateDecision::Parse;
                     parse_reason = Some(CandidateParseReason::SourceChanged);
@@ -86058,7 +86029,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery, desktop_identity_reoffers; shared codex_versions);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision, lineage_edge_reoffer_bytes, desktop_identity_reoffer, desktop_identity_evidence);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision, lineage_edge_reoffer_bytes, desktop_identity_reoffer, desktop_identity_evidence, desktop_identity_withheld);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {

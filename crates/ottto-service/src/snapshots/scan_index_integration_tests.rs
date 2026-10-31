@@ -566,6 +566,7 @@ fn recovery_emission_boundaries(
         lineage_edge_reoffer_bytes: None,
         desktop_identity_reoffer: None,
         desktop_identity_evidence: None,
+        desktop_identity_withheld: false,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: "synthetic-file".into(),

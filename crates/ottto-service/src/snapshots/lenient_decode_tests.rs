@@ -797,6 +797,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
         lineage_edge_reoffer_bytes: None,
         desktop_identity_reoffer: None,
         desktop_identity_evidence: None,
+        desktop_identity_withheld: false,
         codex_pending_recovery: false,
         index_key: key.clone(),
         source_file_fingerprint: "source".into(),

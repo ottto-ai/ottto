@@ -1,6 +1,6 @@
 //! Reader, serializer, custody and joint-budget fixtures for the identity latch.
 use super::*;
-use desktop_identity::IdentityLatch::{Pending, Settled};
+use desktop_identity::IdentityLatch::{Pending, Refused, Settled};
 include!("desktop_lineage_legacy_fields.rs");
 
 const CHILD: &str = "/synthetic/child.jsonl";
@@ -43,16 +43,20 @@ fn selector_drops(rows: &[Value]) -> u64 {
 #[test]
 fn desktop_identity_latch_roundtrips_closed_states_through_every_reader() {
     let mut index = seed();
-    for latch in [Pending, Settled] {
+    for latch in [Pending, Settled, Refused(0x0123_4567_89ab_cdef)] {
         index
             .claude_desktop_identity_latches
             .insert(CHILD.into(), latch);
         let bytes = serde_json::to_vec(&index).unwrap();
         let text = String::from_utf8_lossy(&bytes);
-        assert!(text.contains(match latch {
-            Pending => r#""claude_desktop_identity_latches":{"/synthetic/child.jsonl":"identity_pending"}"#,
-            Settled => r#""claude_desktop_identity_latches":{"/synthetic/child.jsonl":"settled"}"#,
-        }));
+        let value = match latch {
+            Pending => "identity_pending",
+            Settled => "settled",
+            Refused(_) => "refused:0123456789abcdef",
+        };
+        assert!(text.contains(&format!(
+            r#""claude_desktop_identity_latches":{{"/synthetic/child.jsonl":"{value}"}}"#
+        )));
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
         let streaming = read(std::io::Cursor::new(&bytes), "load", "claude_code").unwrap();
         let bounded = read_bounded(&bytes).unwrap();
