@@ -24,14 +24,7 @@ const UUID_STEM: &str = "22222222-aaaa-4bbb-8ccc-000000000004";
 struct Home(PathBuf);
 impl Home {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ottto-launch-demand-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_scratch::unique_path("ottto-launch-demand");
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }

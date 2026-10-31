@@ -130,6 +130,33 @@ impl ScanIndexEntry {
     }
 }
 impl ScanIndex {
+    /// Existing obligations are never evicted. Imported over-cap populations
+    /// must drain before any new marker can be admitted.
+    pub(super) fn can_stage_sampled_audit(&self, key: &str) -> bool {
+        self.files
+            .get(key)
+            .is_some_and(ScanIndexEntry::has_unverified_source)
+            || self
+                .files
+                .values()
+                .filter(|entry| entry.has_unverified_source())
+                .take(CACHE_ENTRIES)
+                .count()
+                < CACHE_ENTRIES
+    }
+
+    pub(super) fn retire_quiet_audit(&mut self, key: &str, fingerprint: &str) -> bool {
+        let Some(entry) = self.files.get_mut(key).filter(|entry| {
+            entry.source_file_fingerprint == fingerprint
+                && entry.has_unverified_source()
+                && !entry.has_prefix_provenance()
+        }) else {
+            return false;
+        };
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        true
+    }
+
     /// Called only by a current validated native source completion. Entry/source
     /// equality fences an older completion; the existing writer owns lock/CAS.
     /// A delivery ACK never calls this method as source-verification authority.
@@ -139,6 +166,9 @@ impl ScanIndex {
         source_fingerprint: &str,
         debt: AuditDebt,
     ) -> bool {
+        if !self.can_stage_sampled_audit(key) {
+            return false;
+        }
         let Some(entry) = self
             .files
             .get_mut(key)
@@ -182,6 +212,9 @@ impl ScanIndex {
         true
     }
     pub(super) fn mark_sealed_prefix(&mut self, key: &str, source_fingerprint: &str) -> bool {
+        if !self.can_stage_sampled_audit(key) {
+            return false;
+        }
         let Some(entry) = self
             .files
             .get_mut(key)
@@ -214,9 +247,9 @@ pub(super) fn path_requires_verification(
     files: &BTreeMap<String, ScanIndexEntry>,
     path: &Path,
 ) -> bool {
-    files
-        .get(&local_index_key(path))
-        .is_some_and(ScanIndexEntry::has_unverified_source)
+    files.get(&local_index_key(path)).is_some_and(|entry| {
+        entry.has_unverified_source() || entry.source_file_fingerprint.is_empty()
+    })
 }
 
 pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
@@ -716,6 +749,107 @@ impl OwnedSourceScan {
     }
 }
 
+impl SourceScanResult {
+    /// Transfer a released account hold's acquisition debt before upload/save.
+    /// Working retirements never refund their committed marker reservation.
+    pub(crate) fn preserve_released_account_audits(
+        &self,
+        index: &mut ScanIndex,
+        previous: &ScanIndex,
+        cache: &sampled_scan::SharedCache,
+        roots: &[PathBuf],
+        backfill_window_days: u64,
+    ) {
+        let mut reserved = previous
+            .files
+            .values()
+            .filter(|entry| entry.has_unverified_source())
+            .count()
+            .saturating_add(
+                index
+                    .files
+                    .iter()
+                    .filter(|(key, entry)| {
+                        entry.has_unverified_source()
+                            && !previous
+                                .files
+                                .get(*key)
+                                .is_some_and(ScanIndexEntry::has_unverified_source)
+                    })
+                    .count(),
+            );
+        let mut staged = 0_u64;
+        let mut queued = 0_u64;
+        for (key, fingerprint) in self.completed_parses() {
+            if !previous.claude_account_deferred_holds.contains_key(key)
+                || index.claude_account_deferred_holds.contains_key(key)
+                || !index
+                    .files
+                    .get(key)
+                    .is_some_and(|entry| !entry.has_unverified_source())
+            {
+                continue;
+            }
+            // None is unknown/missing retained custody; keep a discoverable
+            // retry rather than assuming that a missing copy discharged debt.
+            let debt = cache.retained().ok().and_then(|retained| {
+                retained
+                    .peek(key)
+                    .map(|entry| entry.checkpoint.audit_debt())
+            });
+            if debt == Some(None) {
+                continue;
+            }
+            if let Some(Some(debt)) = debt {
+                if reserved < CACHE_ENTRIES
+                    && index
+                        .files
+                        .get(key)
+                        .is_some_and(|entry| entry.source_file_fingerprint == fingerprint)
+                    && index.stage_sampled_audit(key, fingerprint, debt)
+                {
+                    reserved += 1;
+                    staged += 1;
+                    continue;
+                }
+            }
+            // This existing explicit-reparse witness survives traversal resets
+            // and ages. It never labels an audit/clock Full or grants credit.
+            index
+                .files
+                .get_mut(key)
+                .expect("current parsed entry")
+                .source_file_fingerprint
+                .clear();
+            if index.traversal.is_none() {
+                ensure_bounded_traversal(
+                    SnapshotSource::ClaudeCode,
+                    roots,
+                    index,
+                    &self.census_window_end,
+                    backfill_window_days,
+                );
+            }
+            if let Some(traversal) = index.traversal.as_mut() {
+                enqueue_watcher_hints(
+                    SnapshotSource::ClaudeCode,
+                    traversal,
+                    &[PathBuf::from(key)],
+                    false,
+                );
+            }
+            queued += 1;
+        }
+        if staged + queued > 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "sampled_audit_account_release",
+                "claude_code",
+                &serde_json::json!({"marker_staged": staged, "retry_queued": queued}),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +887,93 @@ mod tests {
         index.confirmed_empty_files.insert(key);
         index
     }
+    #[test]
+    fn cap_retry_keeps_durable_custody_without_a_traversal_or_marker() {
+        let mut index = index();
+        let candidate = candidate();
+        let key = local_index_key(&candidate.path);
+        assert!(index.traversal.is_none());
+        assert!(!path_requires_verification(&index.files, &candidate.path));
+        queue_cap_retry(&mut index, &candidate);
+        let mut loaded: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        assert!(loaded.traversal.is_none());
+        assert!(path_requires_verification(&loaded.files, &candidate.path));
+        assert!(!loaded.files[&key].has_unverified_source());
+        assert_eq!(loaded.files[&key].size_bytes, 1);
+        // Same-process provenance survives the index round-trip until an
+        // actual Full completes; merely queuing the retry emits no Full.
+        let probe = crate::local_resource_diagnostics::Probe::start();
+        assert!(probe.rearm_fulls().is_empty());
+        let full = crate::transcript_acquisition::ReadMode::Full(
+            crate::transcript_acquisition::FullReason::StateMissing,
+        );
+        probe.rearm_full_selected(&key, full);
+        probe.rearm_full_completed(&key, full, 3);
+        assert_eq!(
+            serde_json::to_value(probe.rearm_fulls()).unwrap(),
+            json!({"rearm_cleared{audit_cap_delay}": {"count": 1, "completed_native_bytes": 3}})
+        );
+        loaded.files.remove(&key);
+        queue_cap_retry(&mut loaded, &candidate);
+        assert!(!loaded.files.contains_key(&key), "no invented membership");
+    }
+
+    #[test]
+    fn marked_population_admission_and_quiet_retirement_share_the_cap() {
+        let mut index = index();
+        for n in 0..CACHE_ENTRIES {
+            let key = format!("missing-{n}");
+            index.files.insert(key.clone(), entry());
+            assert!(index.stage_sampled_audit(
+                &key,
+                "source",
+                AuditDebt {
+                    due_unix_seconds: 200
+                }
+            ));
+        }
+        let key = local_index_key(&candidate().path);
+        assert!(!index.stage_sampled_audit(
+            &key,
+            "source",
+            AuditDebt {
+                due_unix_seconds: 200
+            }
+        ));
+        assert!(!index.mark_sealed_prefix(&key, "source"));
+        assert!(index.stage_sampled_audit(
+            "missing-0",
+            "source",
+            AuditDebt {
+                due_unix_seconds: 100
+            }
+        ));
+        assert!(index.mark_sealed_prefix("missing-0", "source"));
+        assert!(
+            !index.retire_quiet_audit("missing-0", "source"),
+            "prefix cannot retire"
+        );
+        assert!(!index.retire_quiet_audit("missing-1", "stale"));
+        assert!(index.retire_quiet_audit("missing-1", "source"));
+        assert!(index.stage_sampled_audit(
+            &key,
+            "source",
+            AuditDebt {
+                due_unix_seconds: 200
+            }
+        ));
+        assert_eq!(
+            index
+                .files
+                .values()
+                .filter(|entry| entry.has_unverified_source())
+                .count(),
+            CACHE_ENTRIES
+        );
+        assert!(index.files["missing-0"].has_unverified_source());
+    }
+
     #[test]
     fn sampled_audit_oldest_deadline_not_ack_or_tail_controls_idle_selection() {
         let mut index = index();
@@ -1183,5 +1404,348 @@ mod provenance_tests {
             assert!(marked.files[&key].has_unverified_source(), "{reset:?}");
             assert!(marked.files[&key].has_prefix_provenance(), "{reset:?}");
         }
+    }
+}
+
+/// Keep a provisionally retired path selectable if partial-save reconciliation
+/// restores its marker. Preserve the actual read's root: guessing from nested
+/// roots could change the acquisition scope. A committed retirement skips it.
+pub(super) fn queue_quiet_retirement(index: &mut ScanIndex, key: &str, scan_root: PathBuf) {
+    if let Some(traversal) = index.traversal.as_mut() {
+        let path = Path::new(key);
+        if !traversal
+            .pending_candidates
+            .iter()
+            .any(|queued| queued.path == path)
+        {
+            traversal.pending_candidates.push_back(ScanTraversalPath {
+                scan_root,
+                path: path.to_owned(),
+                census_member: false,
+                watcher_hint: false,
+            });
+        }
+    }
+}
+
+/// A cap delay is still owed: persist an age-bypassing retry without advancing
+/// the committed file size or claiming source/census completion.
+pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) {
+    // The queue can disappear on a context-changing traversal replacement.
+    // Reuse the existing durable reparse witness at every age/open gate and
+    // in partial saves; keep the committed size and marker population intact.
+    let key = local_index_key(&candidate.path);
+    if let Some(entry) = index.files.get_mut(&key) {
+        crate::local_resource_diagnostics::rearm_cause::clear(
+            &key,
+            entry,
+            crate::local_resource_diagnostics::rearm_cause::Cause::AuditCapDelay,
+        );
+    }
+    if let Some(traversal) = index.traversal.as_mut() {
+        if !traversal
+            .pending_candidates
+            .iter()
+            .any(|path| path.path == candidate.path)
+        {
+            traversal.pending_candidates.push_back(ScanTraversalPath {
+                scan_root: candidate.scan_root.clone(),
+                path: candidate.path.clone(),
+                census_member: true,
+                watcher_hint: true,
+            });
+        }
+    }
+}
+
+// To be replaced by #876's implementation at merge. Exact round-18 copy
+// from e3/withheld-age-exempt at 5df3fc370c10b3ce0e0d9f98ec46f044c2388c54.
+/// Positive removal only: a file or intermediate directory is NotFound beneath
+/// a readable ancestor securely reached from a configured, readable root.
+/// Missing roots, symlinks and permission errors keep the audit and account debt.
+/// This is absence authority, never source verification or census credit.
+pub(super) fn proven_absent(path: &Path, roots: &[PathBuf]) -> bool {
+    #[cfg(unix)]
+    {
+        roots
+            .iter()
+            .any(|root| proven_absent_beneath_root(path, root).unwrap_or(false))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, roots);
+        false
+    }
+}
+
+#[cfg(unix)]
+fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool> {
+    fn open_directory(parent: &File, name: &std::ffi::CStr) -> std::io::Result<File> {
+        // Match open_candidate_beneath_root: every directory is readable and
+        // no component below the configured root may redirect through a link.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+    fn name_absent(parent: &File, name: &std::ffi::CStr) -> std::io::Result<bool> {
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // A dangling symlink is present, not positive absence. Stat relative
+        // to the pinned parent without opening any transcript bytes.
+        let result = unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == 0 {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(true)
+        } else {
+            Err(error)
+        }
+    }
+    fn same_directory(left: &File, right: &File) -> std::io::Result<bool> {
+        let left = left.metadata()?;
+        let right = right.metadata()?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+
+    if !root.is_absolute()
+        || root
+            .components()
+            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Ok(false);
+    }
+    // Preserve the nofollow check on the root's final component even when its
+    // configured spelling has a trailing separator or `/.`.
+    let root: PathBuf = root.components().collect();
+    let Ok(relative) = path.strip_prefix(&root) else {
+        return Ok(false);
+    };
+    let mut names = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Ok(false);
+        };
+        let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
+            return Ok(false);
+        };
+        names.push(name);
+    }
+    let Some((final_name, parents)) = names.split_last() else {
+        return Ok(false);
+    };
+    let mut root_options = fs::OpenOptions::new();
+    root_options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut directories = vec![root_options.open(&root)?];
+    let mut missing_name = final_name;
+    for name in parents {
+        match open_directory(directories.last().expect("opened ancestor"), name) {
+            Ok(next) => directories.push(next),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                // The last pinned directory is the nearest existing ancestor.
+                // Do not traverse the missing suffix or accept any other error.
+                missing_name = name;
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if !name_absent(directories.last().expect("opened ancestor"), missing_name)? {
+        return Ok(false);
+    }
+
+    // A removed/replaced ancestor can leave a readable but detached descriptor.
+    // Rewalk from the configured root and compare every pinned directory before
+    // accepting ENOENT at the same missing component. Any observed substitution
+    // or recreation (even an empty directory) keeps the debt.
+    let mut directory = root_options.open(&root)?;
+    if !same_directory(&directory, &directories[0])? {
+        return Ok(false);
+    }
+    for (name, original) in parents.iter().zip(&directories[1..]) {
+        directory = open_directory(&directory, name)?;
+        if !same_directory(&directory, original)? {
+            return Ok(false);
+        }
+    }
+    name_absent(&directory, missing_name)
+}
+
+#[cfg(all(test, unix))]
+mod absence_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let root = crate::test_scratch::unique_path("ottto-audit-absence");
+            fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+        fn transcript(&self) -> PathBuf {
+            let path = self.0.join("root/project/session/subagents/file.jsonl");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"owed transcript").unwrap();
+            path
+        }
+        fn roots(&self) -> Vec<PathBuf> {
+            vec![self.0.join("root")]
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn intermediate_symlink_cannot_prove_absence_in_another_tree() {
+        let fixture = Fixture::new();
+        let path = fixture.transcript();
+        let saved = fixture.0.join("original-project");
+        fs::rename(fixture.0.join("root/project"), &saved).unwrap();
+        let replacement = fixture.0.join("replacement-project");
+        fs::create_dir_all(replacement.join("session/subagents")).unwrap();
+        symlink(&replacement, fixture.0.join("root/project")).unwrap();
+        // Reproduce the old predicate's false proof: the final parent is a
+        // readable directory, and only the transcript name is NotFound.
+        assert_eq!(
+            fs::symlink_metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(fs::read_dir(path.parent().unwrap()).is_ok());
+        assert!(!proven_absent(&path, &fixture.roots()));
+        assert!(saved.join("session/subagents/file.jsonl").is_file());
+    }
+
+    #[test]
+    fn real_deletion_beneath_readable_parent_proves_absence() {
+        let fixture = Fixture::new();
+        let path = fixture.transcript();
+        assert!(!proven_absent(&path, &fixture.roots()));
+        fs::remove_file(&path).unwrap();
+        assert!(proven_absent(&path, &fixture.roots()));
+    }
+
+    #[test]
+    fn missing_intermediate_directory_beneath_readable_root_proves_absence() {
+        let fixture = Fixture::new();
+        let path = fixture.transcript();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        assert!(proven_absent(&path, &fixture.roots()));
+        fs::remove_dir_all(fixture.0.join("root/project")).unwrap();
+        assert!(proven_absent(&path, &fixture.roots()));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"recreated transcript").unwrap();
+        assert!(!proven_absent(&path, &fixture.roots()));
+    }
+
+    #[test]
+    fn missing_configured_root_cannot_prove_absence() {
+        let fixture = Fixture::new();
+        let path = fixture.transcript();
+        fs::remove_dir_all(fixture.0.join("root")).unwrap();
+        assert!(!proven_absent(&path, &fixture.roots()));
+    }
+
+    #[test]
+    fn dangling_symlink_or_non_directory_ancestor_cannot_prove_absence() {
+        let fixture = Fixture::new();
+        let path = fixture.transcript();
+        let project = fixture.0.join("root/project");
+        fs::remove_dir_all(&project).unwrap();
+        symlink("missing-project", &project).unwrap();
+        assert!(!proven_absent(&path, &fixture.roots()));
+        fs::remove_file(&project).unwrap();
+        fs::write(&project, b"not a directory").unwrap();
+        assert!(!proven_absent(&path, &fixture.roots()));
+    }
+
+    #[test]
+    fn unreadable_existing_ancestor_or_root_cannot_prove_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root can bypass directory permissions; this control needs an
+        // unprivileged process to exercise the permission-error boundary.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let fixture = Fixture::new();
+        let path = fixture.transcript();
+        let root = fixture.0.join("root");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        for directory in [path.parent().unwrap().parent().unwrap(), root.as_path()] {
+            let permissions = fs::metadata(directory).unwrap().permissions();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o0)).unwrap();
+            let absent = proven_absent(&path, &fixture.roots());
+            fs::set_permissions(directory, permissions).unwrap();
+            assert!(!absent);
+        }
+    }
+
+    #[test]
+    fn recreated_transcript_is_present_even_after_positive_absence() {
+        let fixture = Fixture::new();
+        let path = fixture.transcript();
+        fs::remove_file(&path).unwrap();
+        assert!(proven_absent(&path, &fixture.roots()));
+        fs::write(&path, b"new transcript").unwrap();
+        assert!(!proven_absent(&path, &fixture.roots()));
+        fs::remove_file(&path).unwrap();
+        symlink("missing-target", &path).unwrap();
+        assert!(!proven_absent(&path, &fixture.roots()));
+    }
+
+    #[test]
+    fn uncertain_roots_and_non_normal_paths_cannot_prove_absence() {
+        let fixture = Fixture::new();
+        let path = fixture.transcript();
+        fs::remove_file(&path).unwrap();
+        assert!(!proven_absent(&path, &[]));
+        assert!(!proven_absent(&path, &[fixture.0.join("elsewhere")]));
+        assert!(!proven_absent(&fixture.0.join("root"), &fixture.roots()));
+        assert!(!proven_absent(
+            &path.parent().unwrap().join("../subagents/file.jsonl"),
+            &fixture.roots()
+        ));
+        let root_link = fixture.0.join("root-link");
+        symlink(fixture.0.join("root"), &root_link).unwrap();
+        for root in [root_link.clone(), root_link.join(""), root_link.join(".")] {
+            assert!(!proven_absent(
+                &root.join("project/session/subagents/file.jsonl"),
+                &[root]
+            ));
+        }
+        fs::remove_dir_all(fixture.0.join("root")).unwrap();
+        assert!(!proven_absent(&path, &fixture.roots()));
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod absence_non_unix_tests {
+    #[test]
+    fn absence_never_grants_authority_without_secure_directory_descriptors() {
+        assert!(!super::proven_absent(
+            std::path::Path::new("missing/file.jsonl"),
+            &[std::path::PathBuf::from("missing")]
+        ));
     }
 }
