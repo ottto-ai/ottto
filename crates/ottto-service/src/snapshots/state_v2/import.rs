@@ -27,53 +27,21 @@ impl std::fmt::Display for Pause {
     }
 }
 impl std::error::Error for Pause {}
-impl Pause {
-    fn deterministic(self) -> bool {
-        !matches!(self, Self::Io | Self::UnsafeParent)
-    }
-}
+/// Every attempt, whatever its pause class, is retried after one fixed day.
 #[derive(Default)]
 pub(super) struct Pace {
     attempts: u64,
-    transient_failures: u8,
     next: Option<Instant>,
-    disabled: bool,
 }
 impl Pace {
     pub(super) fn start(&mut self, now: Instant) -> Option<bool> {
-        if self.disabled || self.next.is_some_and(|next| now < next) {
+        if self.next.is_some_and(|next| now < next) {
             return None;
         }
         let first = self.attempts == 0;
         self.attempts = self.attempts.saturating_add(1);
-        self.next = now.checked_add(Duration::from_secs(24 * 3600));
-        if self.next.is_none() {
-            self.disabled = true;
-        }
+        self.next = Some(now + Duration::from_secs(24 * 3600));
         Some(first)
-    }
-    pub(super) fn failed(&mut self, now: Instant, class: Pause) {
-        let hours = if class.deterministic() {
-            24
-        } else {
-            self.transient_failures = self.transient_failures.saturating_add(1);
-            match self.transient_failures {
-                1 => 1,
-                2 => 6,
-                _ => {
-                    self.disabled = true;
-                    return;
-                }
-            }
-        };
-        self.next = now.checked_add(Duration::from_secs(hours * 3600));
-        // Overflow cannot grant a fresh attempt.
-        if self.next.is_none() {
-            self.disabled = true;
-        }
-    }
-    pub(super) fn disabled(&self) -> bool {
-        self.disabled
     }
 }
 

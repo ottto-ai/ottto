@@ -422,7 +422,7 @@ fn load_with_custody<M: Mapper>(
                     state.original = original;
                 }
                 Err(class) => {
-                    pause(state, now, class);
+                    pause(state, class);
                 }
             }
         }
@@ -459,15 +459,11 @@ fn normalize_hydrated(index: &mut ScanIndex) -> Result<()> {
     )
 }
 
-fn pause(state: &mut RouteState, now: Instant, class: Pause) {
+fn pause(state: &mut RouteState, class: Pause) {
     state.inventory_ready = false;
     state.original = None;
-    state.pace.failed(now, class);
     telemetry::event("import_paused", &class);
     telemetry::event("import_paused_alarm", &1);
-    if state.pace.disabled() {
-        telemetry::event("import_disabled", &1);
-    }
 }
 
 /// Import is attempted only on the normalized available graph and only if the
@@ -491,14 +487,13 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             return Ok(());
         }
         state.inventory_ready = false;
-        let now = Instant::now();
         if !index.persistence_available() {
-            pause(state, now, Pause::Partial);
+            pause(state, Pause::Partial);
             return Ok(());
         }
         let _gauge = telemetry::Stage::import(path);
         if let Err(class) = mapper.preflight(index) {
-            pause(state, now, class);
+            pause(state, class);
             return Ok(());
         }
         let result = (|| -> Result<KindCx> {
@@ -543,7 +538,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             Err(error) if state.latched => return Err(Hold::storage(error)),
             Err(error) => {
                 let class = error.downcast_ref::<Pause>().copied().unwrap_or(Pause::Io);
-                pause(state, now, class);
+                pause(state, class);
                 return Ok(());
             }
         };
