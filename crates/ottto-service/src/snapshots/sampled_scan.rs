@@ -2137,28 +2137,29 @@ pub(super) fn new_source_parser(
     {
         crate::context_composition::set_utility_qos();
         let key = local_index_key(&candidate.path);
-        let previous = index.files.get(&key).and_then(|e| e.archive.as_deref());
         anyhow::ensure!(
-            !previous.is_some_and(|a| a.quiet(&file)),
-            "compressed rollout already attempted"
+            index.archives.get(&key).is_some_and(|a| a.ready_full()),
+            "archive reservation unavailable"
         );
         let input = cache
-            .map(|cache| OpenedInput::funded(file, cache))
+            .map(|c| OpenedInput::funded(file, c))
             .transpose()?
             .flatten()
             .ok_or(codex_compressed_input::ArchiveAdmissionYield)?;
-        let evidence = match codex_compressed_input::ArchiveEvidence::begin(
-            input.get_ref(),
-            &candidate.path,
-            previous,
-        ) {
-            Ok(evidence) => evidence,
-            Err(error) => {
-                input.close();
-                return Err(error.into());
-            }
-        };
-        index.files.entry(key).or_default().archive = Some(Box::new(evidence));
+        let attempts = index
+            .archives
+            .get(&key)
+            .and_then(|a| a.work.as_ref())
+            .map_or(0, |w| w.attempts);
+        crate::local_resource_diagnostics::traversal_point(
+            if attempts > 1 {
+                "codex_zst_first_read_retry"
+            } else {
+                "codex_zst_first_read"
+            },
+            "codex",
+            &serde_json::json!({"full_attempts":1}),
+        );
         input
     } else {
         OpenedInput::plain(file)
@@ -2178,7 +2179,6 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
     )?;
-    parser.reader.capture_header = parser.reader.reader.is_compressed();
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
         configure_tier_replay(&mut parser, candidate, index);

@@ -1098,7 +1098,6 @@ mod tests {
             opened_changed_nanos: 0,
             opened_birth_nanos: 0,
             upload_context_receipt: None,
-            archive: None,
         }
     }
 

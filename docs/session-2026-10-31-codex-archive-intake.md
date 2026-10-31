@@ -1,38 +1,46 @@
 # Codex archive intake v1
 
 Codex discovery and watcher hints include exact `.jsonl.zst` suffixes by default.
-The source registry and ordinary native parser remain the owners of scanning,
-usage, identity, policy, upload bodies and accepted receipts. Claude and Pi do
-not gain an archive reader.
+Claude and Pi retain their existing readers. All sources retain the ordinary
+parser, reducer, line delivery, upload policy and destination receipt owners.
 
-A complete native header inventory admits a standalone archive only when its own
-header names a unique session. Another archive claiming that session, an
-unavailable header, an unresolved parent, conflicting creator evidence or an
-unfunded classification keeps the archive held. When a plain file claims the
-same session, only an exact accepted native response subset or equality can
-finish as `archive_dominated`, without an upload. Larger cumulative totals alone
-cannot prove coverage. Every other relation stays held.
+An archive can publish only when its own header names a standalone native
+session. Every configured root and relevant home must have complete absence
+coverage through the existing census owner. Any plain or archive claimant of
+the same session is held before Full decoding. Unknown or damaged headers,
+unresolved parents and conflicting creators are also held. V1 does not use
+response signatures, cumulative totals or accepted plain bodies to establish
+archive domination or replacement.
 
-The decoder prepays its native allocation through the existing shared cache.
-A Full reservation and its retry deadline are saved through the ordinary atomic
-index owner before any Full bytes are consumed. Plain work precedes archive
-bodies. The native parser keeps its RAM checkpoint across decoded pages and
-reads to EOF; decoded size is not a terminal cutoff. A process restart loses
-that checkpoint and a later eligible retry starts from the beginning.
+Archive debt blocks only archive-dependent decisions. It is counted and alarmed
+separately from ordinary unreadable-file errors. Unaccepted reservations remain
+owed after a crash and prevent a clean complete money posture while ordinary
+plain fork/parent processing continues. No unknown usage becomes a zero total.
 
-Held keys retain their existing cause, alarm and discovery obligation. An
-unchanged key can spend at most one funded Full per six hours. Accepted exact
-bodies settle through destination-bound upload progress; admission, empty
-output and held states create no upload ACK. Context changes expose correction
-debt without automatically granting an archive reread. Unknown usage remains
-owed rather than becoming a zero total.
+The bounded header prefix is inventory work, separate from a Full read. Header
+attempt markers are saved as a batch before decoding; incomplete attempts after
+a restart remain held. One batch saves all admitted Full reservations for the
+page before any Full body bytes. Decoder allocation is prepaid through the
+existing shared cache. The same native parser continues in RAM across decoded
+pages to EOF; a process restart loses that checkpoint.
 
-Older writers can discard the additive archive marker. Their native accepted
-ledger remains authoritative, and re-upgrade discovers the archive object
-again. The historical-writer CI probe covers this compatibility boundary.
+Power, CPU, contention and byte-budget refusal before a Full remain eligible on
+the next pass. A spent Full keeps its saved six-hour retry deadline. An unchanged
+structural cause does not trigger another Full. Parent support and same-session
+union bodies are follow-up work. Caps retain owed discovery and disclose refusal.
 
-Follow-up work includes generic correction debt, same-session union bodies,
-retained resend, durable continuation if justified, archive parents, state-store
-convergence, shared listing/owed resolution and further resource measurements.
-The shared placement comparator will replace explicit fixture checks when it
-is available.
+Exact accepted body witnesses in the current destination settle an archive.
+Settled archive markers keep only object stamp and disposition; acquisition
+headers and body scratch are discarded. Settled files use listing stamps rather
+than repeated opens. Archive state uses the existing index save and state-store
+owners, with no slot added to ordinary file entries.
+
+Release note: context or replay changes retain accepted archive money and mark
+`CorrectionUnapplied` once per transition. No automatic archive reread is granted;
+generic correction/evidence debt remains a named follow-up.
+
+Other follow-ups are same-session union bodies, retained resend, durable
+continuation if measurement justifies it, archive parents, shared listing/owed
+resolution, placement-comparator convergence and resource measurements. The
+historical-writer compatibility probe currently runs in Linux CI; running it only
+at release cuts is follow-up work.

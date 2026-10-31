@@ -280,8 +280,12 @@ pub(crate) struct ArchivePass {
     pub(crate) power: bool,
     /// Continuation's platform gates; a pass and its pages share them.
     pub(crate) gates: crate::snapshot_sync::ArchiveGates,
+    pub(crate) dirty: bool,
+    pub(crate) prepared: bool,
+    pub(crate) headers_prepared: bool,
+    pub(crate) deferred: usize,
 }
-crate::heap_layout_bound::fields!(ArchivePass; started, cpu, work, power; shared gates);
+crate::heap_layout_bound::fields!(ArchivePass; started, cpu, work, power, dirty, prepared, headers_prepared, deferred; shared gates);
 
 impl ArchivePass {
     /// A new ordinary pass: fresh counters and the prepare-time power gate;
@@ -293,6 +297,7 @@ impl ArchivePass {
             work,
             power,
             gates,
+            ..
         } = self;
         (*started, *cpu, *work) = (
             false,
@@ -3798,7 +3803,7 @@ impl CursorCredit {
     }
 
     /// Return the claim. Never call it while holding the cursor lock.
-    pub(in crate::snapshots) fn refund(mut self) {
+    fn refund(mut self) {
         self.settled = true;
         let (id, bytes) = (self.cursor, self.bytes);
         self.cache
@@ -4268,11 +4273,7 @@ impl SharedCache {
     fn cursor_reserve(self: &Arc<Self>, charge: usize) -> Option<CursorCredit> {
         self.cursor_claim(charge, false)
     }
-    pub(in crate::snapshots) fn cursor_claim(
-        self: &Arc<Self>,
-        charge: usize,
-        free_only: bool,
-    ) -> Option<CursorCredit> {
+    fn cursor_claim(self: &Arc<Self>, charge: usize, free_only: bool) -> Option<CursorCredit> {
         let mut retained = self.retained().ok()?;
         let mut header_occupancy_refused = false;
         let claimed = self

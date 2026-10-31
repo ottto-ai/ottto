@@ -206,50 +206,43 @@ pub(crate) enum CodexZstCause {
     ParentLedgerUnbound = 7,
     #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
     PhysicalOffsetUnsupported = 8,
-    #[serde(rename = "CompressedCompatibilityUnsupported")]
-    CompatibilityUnsupported = 9,
+    #[serde(alias = "CompressedConstructorUnfunded")]
+    #[serde(alias = "decode_budget")]
+    #[serde(alias = "CompressedCatchupTooLarge")]
     #[serde(rename = "CompressedAdmissionRefused")]
-    AdmissionRefused = 10,
+    AdmissionRefused = 9,
     #[serde(rename = "CompressedDecodeFailed")]
-    DecodeFailed = 11,
+    DecodeFailed = 10,
+    #[serde(alias = "CompressedCompatibilityUnsupported")]
     #[serde(rename = "CompressedOwnerUnproven")]
-    OwnerUnproven = 12,
+    OwnerUnproven = 11,
+    #[serde(alias = "CompressedSettlementStuck")]
     #[serde(rename = "CompressedOutputHeld")]
-    OutputHeld = 13,
-    #[serde(rename = "CompressedSettlementStuck")]
-    SettlementStuck = 14,
-    #[serde(rename = "CompressedConstructorUnfunded")]
-    ConstructorUnfunded = 15,
+    OutputHeld = 12,
     #[serde(rename = "CompressedDecodedOverLimit")]
-    DecodedOverLimit = 16,
-    #[serde(rename = "CompressedParserStateRequired")]
-    ParserStateRequired = 17,
+    DecodedOverLimit = 13,
     #[serde(rename = "CompressedHeaderInvalid")]
-    HeaderInvalid = 18,
-    #[serde(rename = "decode_budget")]
-    DecodeBudget = 19,
+    HeaderInvalid = 14,
     #[serde(rename = "admission_starved")]
-    AdmissionStarved = 20,
+    AdmissionStarved = 15,
     #[serde(rename = "CompressedCorrectionUnapplied")]
-    CorrectionUnapplied = 21,
+    CorrectionUnapplied = 16,
     #[serde(rename = "CompressedHeaderUnfunded")]
-    HeaderUnfunded = 22,
+    HeaderUnfunded = 17,
+    #[serde(alias = "CompressedParserStateRequired")]
     #[serde(rename = "CompressedCompatibilityUnfunded")]
-    CompatibilityUnfunded = 23,
+    CompatibilityUnfunded = 18,
     // Optional plain header occupancy refused an otherwise fundable decoder.
     #[serde(rename = "decoder_refused_header_occupancy")]
-    DecoderRefusedHeaderOccupancy = 24,
+    DecoderRefusedHeaderOccupancy = 19,
     #[serde(rename = "CompressedFamilyUnproven")]
-    FamilyUnproven = 25,
+    FamilyUnproven = 20,
+    #[serde(alias = "archive_dominated")]
     #[serde(rename = "ArchiveEquivalenceUnproven")]
-    ArchiveEquivalenceUnproven = 26,
-    #[serde(rename = "CompressedCatchupTooLarge")]
-    CatchupTooLarge = 27,
-    #[serde(rename = "archive_dominated")]
-    ArchiveDominated = 28,
+    ArchiveEquivalenceUnproven = 21,
     #[doc(hidden)]
     #[serde(skip)]
-    __Count = 29,
+    __Count = 22,
 }
 impl std::fmt::Display for CodexZstCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -314,43 +307,12 @@ pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
     }
 }
 
-thread_local! {
-    static CODEX_ZST_HELD: std::cell::Cell<[Option<(CodexZstCause, u64)>; CODEX_ZST_CAUSES]> = const { std::cell::Cell::new([None; CODEX_ZST_CAUSES]) };
-}
 pub(crate) fn codex_zst_held(cause: CodexZstCause) {
-    CODEX_ZST_HELD.with(|slot| {
-        let mut counts = slot.get();
-        counts[cause as usize] = Some((
-            cause,
-            counts[cause as usize].map_or(1, |(_, n)| n.saturating_add(1)),
-        ));
-        slot.set(counts);
-    });
-}
-pub(crate) fn flush_codex_zst_held() {
-    CODEX_ZST_HELD.with(|slot| {
-        let counts = slot
-            .replace([None; CODEX_ZST_CAUSES])
-            .into_iter()
-            .flatten()
-            .collect::<BTreeMap<_, _>>();
-        if !counts.is_empty() {
-            traversal_point(
-                "codex_zst_held",
-                "codex",
-                &BTreeMap::from([("codex_zst_held", counts)]),
-            );
-        }
-    });
-}
-
-/// Flush on every attempt exit, including refusal/unwind and a one-shot thread.
-/// Nested scopes are safe: draining replaces the batch before emitting it.
-pub(crate) struct CodexHeldScope;
-impl Drop for CodexHeldScope {
-    fn drop(&mut self) {
-        flush_codex_zst_held();
-    }
+    traversal_point(
+        "codex_zst_held",
+        "codex",
+        &BTreeMap::from([("codex_zst_held", BTreeMap::from([(cause, 1_u64)]))]),
+    );
 }
 
 /// Nonzero-only counters on the existing native_collection_page line.
@@ -1944,17 +1906,12 @@ mod tests {
             GroupReadUnsupported,
             ParentLedgerUnbound,
             PhysicalOffsetUnsupported,
-            CompatibilityUnsupported,
             AdmissionRefused,
             DecodeFailed,
             OwnerUnproven,
             OutputHeld,
-            SettlementStuck,
-            ConstructorUnfunded,
             DecodedOverLimit,
-            ParserStateRequired,
             HeaderInvalid,
-            DecodeBudget,
             AdmissionStarved,
             CorrectionUnapplied,
             HeaderUnfunded,
@@ -1962,8 +1919,6 @@ mod tests {
             DecoderRefusedHeaderOccupancy,
             FamilyUnproven,
             ArchiveEquivalenceUnproven,
-            CatchupTooLarge,
-            ArchiveDominated,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         assert_eq!(
@@ -1971,7 +1926,6 @@ mod tests {
             "decoder_refused_header_occupancy"
         );
         let mut labels = std::collections::BTreeSet::new();
-        assert_eq!(ArchiveDominated as usize + 1, super::CODEX_ZST_CAUSES);
 
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);

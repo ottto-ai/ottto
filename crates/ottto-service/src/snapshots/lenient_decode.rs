@@ -117,6 +117,7 @@ impl Holds {
             matches!(
                 field,
                 "files"
+                    | "archives"
                     | "growth_retention"
                     | "claude_account_family_witnesses"
                     | "claude_account_family_pending"
@@ -161,6 +162,13 @@ impl Holds {
     }
     pub(super) fn contains_field(&self, field: &str) -> bool {
         self.0.get(field).is_some_and(|slots| !slots.is_empty())
+    }
+    pub(super) fn archive_keys(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .get("archives")
+            .into_iter()
+            .flat_map(|m| m.keys())
+            .map(String::as_str)
     }
     pub(super) fn file_keys(&self) -> impl Iterator<Item = &str> {
         self.0
@@ -306,6 +314,7 @@ impl Serialize for ScanIndex {
             "files",
             &WireMap(&self.files, self.decode_holds.0.get("files")),
         )?;
+        field!(held archives);
         field!(session_account_bindings, BTreeMap::is_empty);
         field!(terminal_jsonl_dispositions, BTreeMap::is_empty);
         field!(known_configured_scan_roots, BTreeSet::is_empty);
@@ -421,6 +430,7 @@ pub(super) const FIELDS: &[&str] = &[
     "generation",
     "upload_context_fingerprint",
     "files",
+    "archives",
     "session_account_bindings",
     "terminal_jsonl_dispositions",
     "known_configured_scan_roots",
@@ -2093,6 +2103,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.upload_context_fingerprint = self.typed(value)?
                         }
                         "files" => index.files = self.records("files", value, true)?,
+                        "archives" => index.archives = self.records("archives", value, true)?,
                         "session_account_bindings" => {
                             index.session_account_bindings = self.typed(value)?
                         }

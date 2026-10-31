@@ -8333,7 +8333,7 @@ fn finish_sync_source(
     // obligations this full scan references before any selection (#794 F1).
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
-    if index.files.values().any(|entry| entry.archive.is_some()) {
+    if !index.archives.is_empty() {
         index.settle_archive_outcome(|fp| {
             upload_progress
                 .accepted_body_witnesses
@@ -13028,7 +13028,6 @@ mod tests {
                 opened_changed_nanos: 0,
                 opened_birth_nanos: 0,
                 upload_context_receipt: None,
-                archive: None,
             },
         );
         index.file_snapshot_fingerprints.insert(
@@ -23955,10 +23954,12 @@ crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, ap
 /// Continuation's platform gates for archive work: the native signals unless
 /// a caller injects its own. A pass and its continuation pages share them.
 #[derive(Clone)]
-pub(crate) struct ArchiveGates(std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>);
+pub(crate) struct ArchiveGates(
+    Option<std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>>,
+);
 impl Default for ArchiveGates {
     fn default() -> Self {
-        Self::new(continuation::MacPlatformSignals::default())
+        Self::new(None::<continuation::MacPlatformSignals>)
     }
 }
 impl std::fmt::Debug for ArchiveGates {
@@ -23967,13 +23968,21 @@ impl std::fmt::Debug for ArchiveGates {
     }
 }
 impl ArchiveGates {
-    pub(crate) fn new(gates: impl continuation::PlatformGates + Send + 'static) -> Self {
-        Self(std::sync::Arc::new(Mutex::new(gates)))
+    pub(crate) fn new(gates: Option<impl continuation::PlatformGates + Send + 'static>) -> Self {
+        Self(gates.map(|g| {
+            std::sync::Arc::new(Mutex::new(g))
+                as std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>
+        }))
     }
     /// Continuation's power policy: only `Allowed` permits archive work;
     /// `Refused` and `Unknown` deny.
     pub(crate) fn power_ready(&self) -> bool {
-        self.0
+        let Some(gates) = self.0.as_ref() else {
+            return continuation::PlatformGates::power(
+                &mut continuation::MacPlatformSignals::default(),
+            ) == continuation::PlatformState::Allowed;
+        };
+        gates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .power()
