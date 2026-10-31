@@ -611,6 +611,24 @@ fn corrupt_retired_predecessor_rebuilds_once_without_withholding_native_usage() 
     // Preserve the recognized header and damage its checksum, never decode it.
     std::fs::write(&rig.record_path, bytes).unwrap();
     rig.append();
+    {
+        let probe = rig.cache();
+        let source = SnapshotSource::Codex;
+        assert_eq!(
+            probe.durable_full_hold(source, &rig.key(), true).unwrap(),
+            None
+        );
+        assert_eq!(
+            probe.durable_full_hold(source, &rig.key(), false).unwrap(),
+            Some(store::Refusal::Corrupt)
+        );
+        assert_eq!(
+            probe
+                .durable_carrier_reprobe(source, &rig.key(), &ScanIndex::default())
+                .unwrap(),
+            None
+        );
+    }
     let cache = Arc::new(rig.cache());
     let (next, rebuilt, fulls) = rig.scan(cache.clone(), rig.index.clone());
     assert_eq!(fulls, 1);

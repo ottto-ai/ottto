@@ -1049,7 +1049,10 @@ impl DurableTailStore {
                 return Err(Refusal::Corrupt);
             }
             if let Some((content, old, _)) = self.durable.get(key) {
-                if !restoring && *old == stamp && (work != "overwrite" || content.is_some()) {
+                if !restoring && *old == stamp && content.is_some() {
+                    if retired && work == "guard" {
+                        return Err(Refusal::Repin);
+                    }
                     binding.content = *content;
                     return Ok(Some(binding));
                 }
