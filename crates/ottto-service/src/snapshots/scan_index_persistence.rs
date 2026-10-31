@@ -1194,11 +1194,11 @@ impl LockedStore {
                         name,
                         libc::O_RDONLY | libc::O_DIRECTORY,
                     )?)?;
-                } else if text == format!("{stem}.private-labels") {
-                    Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
-                } else if text.strip_prefix(&temp_prefix).is_some_and(|suffix| {
-                    suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
-                }) {
+                } else if text == format!("{stem}.private-labels")
+                    || text.strip_prefix(&temp_prefix).is_some_and(|suffix| {
+                        suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                {
                     Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
                 } else {
                     bail!("scan_index_prior_state_requires_repair");
