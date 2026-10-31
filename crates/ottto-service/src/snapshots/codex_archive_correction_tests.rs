@@ -31,11 +31,7 @@ fn user_context(label: &str) -> String {
 }
 fn synthetic_permission(scan: &mut OwnedSourceScan) {
     archive_power(&mut scan.index.archive_pass, true);
-    scan.codex_join_inventory = Some(codex_file_join::HeaderInventory::new(
-        &[],
-        &BTreeSet::new(),
-        None,
-    ));
+    // Permission changes power only; preserve the native inventory/classification.
 }
 
 /// [money] Read bound: one re-decode per user-setting generation; internal churn grants none.
@@ -155,6 +151,7 @@ fn correction_waits_for_power_and_a4_keeps_historical_witness_without_decode() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn transient_attempt_three_continues_and_six_decodes_exhaust_budget() {
+    let retry_not_before = sampled_scan::now_seconds().saturating_add(6 * 3600);
     let _lock = ARCHIVE_TEST_LOCK
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
@@ -197,14 +194,16 @@ fn transient_attempt_three_continues_and_six_decodes_exhaust_budget() {
             retry_due(&mut index, &key);
         }
     }
-    assert!(matches!(
-        archive_evidence(&index, &f).disposition,
-        ArchiveDisposition::Held {
-            cause: CodexZstCause::DecodeBudget
-        }
+    assert!(matches!(archive_evidence(&index, &f).disposition,
+        ArchiveDisposition::Pending { retry_after, .. } if retry_after >= retry_not_before
     ));
-    let (_, _, rows, _) = archive_pass(&f, checkpoint(&index), true, None);
+    assert_eq!(
+        index.files[&local_index_key(&f.0)].codex_compressed_hold,
+        Some(CodexZstCause::DecodeBudget)
+    );
+    let (_, quiet, rows, _) = archive_pass(&f, checkpoint(&index), true, None);
     assert_eq!(decodes(&rows), 0);
+    assert!(quiet.snapshots.is_empty());
 }
 
 /// [money] Terminal failures count once per attempt; only a late exact ACK revives a stuck archive.
@@ -744,17 +743,18 @@ fn compressed_removal_hint_keeps_scoped_unknown_without_counting_owner() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn crash_lost_terminal_outcomes_stop_at_exactly_six_decodes() {
+    let retry_not_before = sampled_scan::now_seconds().saturating_add(6 * 3600);
     let _lock = ARCHIVE_TEST_LOCK
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let f = correction_archive();
     let key = local_index_key(&f.0);
     let path = f.0.parent().unwrap().join("outcome-crash-index.json");
-    let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut committed = ScanIndex::default();
     committed.save(&path).unwrap();
     let mut total_decodes = 0;
     for attempt in 1..=6 {
+        let cache = Arc::new(sampled_scan::SharedCache::default());
         let mut scan = staged_archive(&f, committed.clone(), Arc::clone(&cache));
         assert_eq!(decoded_in(&scan), 0);
         scan.persist_archive_reservation(&mut committed, &path)
@@ -786,15 +786,17 @@ fn crash_lost_terminal_outcomes_stop_at_exactly_six_decodes() {
         assert_eq!(archive_evidence(&committed, &f).terminal_failures, 0);
         retry_due(&mut committed, &key);
     }
-    let (held, _, rows, _) = archive_pass(&f, committed, true, None);
+    let (held, quiet, rows, _) = archive_pass(&f, committed, true, None);
+    assert!(quiet.snapshots.is_empty());
     assert_eq!(total_decodes, 6);
     assert_eq!(decodes(&rows), 0);
-    assert!(matches!(
-        archive_evidence(&held, &f).disposition,
-        ArchiveDisposition::Held {
-            cause: CodexZstCause::DecodeBudget
-        }
+    assert!(matches!(archive_evidence(&held, &f).disposition,
+        ArchiveDisposition::Pending { retry_after, .. } if retry_after >= retry_not_before
     ));
+    assert_eq!(
+        held.files[&local_index_key(&f.0)].codex_compressed_hold,
+        Some(CodexZstCause::DecodeBudget)
+    );
 }
 
 /// [behaviour] A replaced archive gets a first read under its new stamp without the old correction
@@ -821,6 +823,13 @@ fn replaced_archive_uses_new_stamp_first_read_without_old_correction_permission(
     fs::write(&f.0, changed).unwrap();
     assert!(fs::metadata(&f.0).unwrap().len() > original_len);
     assert!(!archive_evidence(&state, &f).matches(&File::open(&f.0).unwrap()));
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let header_rows = header_inventory(&f, &mut state, &cache);
+    assert_eq!(
+        decodes(&header_rows),
+        1,
+        "new stamp pays its discovery prefix"
+    );
     let (fresh, body, rows, _) = archive_pass(&f, state, true, None); // no correction power permission
     assert_eq!(decodes(&rows), 1);
     assert!(!body.snapshots.is_empty());
@@ -993,6 +1002,13 @@ fn sixth_first_read_success_and_repeated_acked_a3_generations_are_independent() 
     let key = local_index_key(&f.0);
     let mut index = ScanIndex::default();
     index.activate_archive_user_context(user_context("A"));
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let header_rows = header_inventory(&f, &mut index, &cache);
+    assert_eq!(
+        decodes(&header_rows),
+        1,
+        "discovery prefix is separate from Full"
+    );
     for attempt in 1..=6 {
         let (next, body, rows, _) = archive_pass(&f, index, true, None);
         assert_eq!(decodes(&rows), 1);

@@ -211,8 +211,15 @@ fn stamp_matching_header_inventory_never_decodes_archives() {
         state.inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
     });
     assert_header_validated(&read, &rows);
-    let mut scan = discovered_scan(&f, state, 1);
+    let mut scan = selector_scan(
+        &f,
+        state,
+        cache.clone(),
+        VecDeque::from([f.candidate()]),
+        true,
+    );
     let mut inventory = scan.codex_join_inventory.take().unwrap();
+    inventory.retain_cached_archives(&scan.index, &BTreeSet::from([local_index_key(&f.0)]));
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
         while inventory.step_with_archive(
             &CodexTitleMetadata::default(),
@@ -232,7 +239,13 @@ fn stamp_matching_header_inventory_never_decodes_archives() {
         .write_all(b"changed")
         .unwrap();
     assert!(scan.index.archive_header(&f.0).is_none());
-    let mut replaced = discovered_scan(&f, scan.index, 1);
+    let mut replaced = selector_scan(
+        &f,
+        scan.index,
+        cache.clone(),
+        VecDeque::from([f.candidate()]),
+        true,
+    );
     let inventory = replaced.codex_join_inventory.as_mut().unwrap();
     assert_eq!(
         inventory.step_with_archive(

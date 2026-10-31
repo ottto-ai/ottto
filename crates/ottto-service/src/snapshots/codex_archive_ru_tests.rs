@@ -217,36 +217,43 @@ fn quiet_pending_discloses_a_bodyless_current_attempt_despite_historical_output(
     ignore = "funded decoder needs validated heap layout"
 )]
 fn native_finish_output_held_has_no_ru_and_healthy_census_work_proceeds() {
+    let retry_not_before = sampled_scan::now_seconds().saturating_add(6 * 3600);
     let _lock = ARCHIVE_TEST_LOCK
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let mut bytes = synthetic_rollout();
     bytes.extend_from_slice(b"not-json\n"); // complete frame, known owner, incomplete reduction
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
-    let (index, result, rows, ends) = archive_pass_with(
-        &f,
-        ScanIndex::default(),
-        true,
-        None,
-        &[],
-        archive_ru_healthy_sibling,
+    let mut initial = ScanIndex::default();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let prefix = header_inventory(&f, &mut initial, &cache);
+    assert_eq!(
+        decodes(&prefix),
+        1,
+        "discovery prefix is separate from Full"
     );
+    let (index, result, rows, ends) =
+        archive_pass_with(&f, initial, true, None, &[], archive_ru_healthy_sibling);
     let evidence = archive_evidence(&index, &f);
     assert_eq!(decodes(&rows), 1);
     assert_eq!(evidence.owner.as_deref(), Some("compressed-fixture"));
     assert!(evidence.header_validated.is_some());
-    assert!(matches!(
-        evidence.disposition,
-        ArchiveDisposition::Held {
-            cause: CodexZstCause::OutputHeld
-        }
+    assert!(matches!(evidence.disposition,
+        ArchiveDisposition::Pending { retry_after, .. } if retry_after >= retry_not_before
     ));
+    assert_eq!(
+        index.files[&local_index_key(&f.0)].codex_compressed_hold,
+        Some(CodexZstCause::OutputHeld)
+    );
     assert!(!ends
         .0
         .lock()
         .unwrap()
         .contains(&super::super::line_delivery::DeliveryEnd::Complete));
     assert_archive_ru_residue(&result, &rows, CodexZstCause::OutputHeld);
+    let (_, quiet, rows, _) = archive_pass(&f, checkpoint(&index), true, None);
+    assert_eq!(decodes(&rows), 0);
+    assert!(quiet.snapshots.is_empty());
 }
 
 /// [behaviour] Admission starvation of a new archive yields in C's header

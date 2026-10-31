@@ -508,6 +508,21 @@ fn only_pending_sibling_resolves_to_another_owner_then_exactly_one_a1() {
         VecDeque::from([f.candidate(), peer_candidate.clone()]),
         false,
     );
+    // Model an already deferred peer, rather than a new unread family member.
+    let paths = scan
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .codex_rollout_paths
+        .clone();
+    let inventory = scan.codex_join_inventory.as_mut().unwrap();
+    inventory.retain_cached_archives(&scan.index, &paths);
+    inventory.feed_prepared = true;
+    inventory
+        .first_read_archives
+        .remove(&local_index_key(&peer));
+    inventory.deferred_archives.insert(local_index_key(&peer));
     let (index, deferred) = finish_selector_with(scan, |scan| {
         if scan.codex_join_prepared {
             let inventory = scan.codex_join_inventory.as_ref().unwrap();
@@ -794,6 +809,7 @@ fn claude_retained_reuse_is_unchanged_beside_archive_pressure() {
         let mut index = ScanIndex::default();
         let mut bodies = Vec::new();
         for pass in 0..2 {
+            let prior = index.clone();
             let mut scan = OwnedSourceScan::new(
                 SnapshotSource::ClaudeCode,
                 &[],
@@ -808,6 +824,8 @@ fn claude_retained_reuse_is_unchanged_beside_archive_pressure() {
                 true,
             )
             .with_sampled_acquisition(cache.clone(), Scope("mixed-claude".into()));
+            scan.state_census_complete = true;
+            scan.sidecar_census_complete = true;
             scan.identified_candidates = VecDeque::from([member.clone()]);
             scan.census.observed_index_keys.insert(key.clone());
             scan.census_unix_seconds = None;
@@ -837,7 +855,13 @@ fn claude_retained_reuse_is_unchanged_beside_archive_pressure() {
                     }
                     panic!("plain Claude scan did not complete");
                 });
-            index = next_index;
+            // No upload ACK: use the ordinary committable rollback, keeping only RAM.
+            index = next_index.committable_subset_with_local_holds(
+                &prior,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+            );
             assert_eq!(result.snapshots.len(), 1);
             bodies.push(snapshot_upload_body_witness(&result.snapshots[0]));
             if pass == 1 {

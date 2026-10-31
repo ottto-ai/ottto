@@ -159,6 +159,17 @@ impl ScanIndex {
         };
         let changed = entry.codex_compressed_hold != Some(cause);
         entry.codex_compressed_hold = Some(cause);
+        if changed {
+            if let Some(archive) = entry.archive.as_mut().filter(|a| {
+                matches!(
+                    a.disposition,
+                    codex_compressed_input::ArchiveDisposition::HeaderValidated
+                )
+            }) {
+                // A newly held header must wait before its first custody retry.
+                archive.defer_custody(cause);
+            }
+        }
         self.codex_state_only_blocked_session_ids
             .extend(owners.iter().cloned());
         self.extend_codex_blocked_attribution(&key, owners);

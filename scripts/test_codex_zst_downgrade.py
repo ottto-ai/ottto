@@ -37,7 +37,10 @@ mod codex_zst_downgrade_probe {
         }
         assert_eq!(fs::read(&path).unwrap(), original);
         let label = std::env::var("OTTTO_ZST_OLD_DECODER").unwrap();
-        decoded.save(&root.join(format!("{label}.json"))).unwrap();
+        let saved_path = root.join(format!("{label}.json"));
+        // The old writer's CAS requires an existing same-generation checkpoint.
+        fs::write(&saved_path, &original).unwrap();
+        decoded.save(&saved_path).unwrap();
         println!("ZST_OLD_DECODER_VERIFIED {label}");
         let activation = ScanIndex::load(&root.join("activation.json")).unwrap();
         let key = fs::read_to_string(root.join("activation-key.txt")).unwrap();
@@ -55,7 +58,9 @@ mod codex_zst_downgrade_probe {
                     assert!(!index.files.contains_key(&key), "old census retires unprotected archive");
                     assert!(!index.file_snapshot_fingerprints.contains_key(&key));
                     assert!(!index.accepted_snapshot_fingerprints.is_empty());
-                    index.save(&root.join(format!("{label}-census.json"))).unwrap();
+                    let saved_path = root.join(format!("{label}-census.json"));
+                    fs::copy(root.join("activation.json"), &saved_path).unwrap();
+                    index.save(&saved_path).unwrap();
                     saved = true;
                     break;
                 }
@@ -68,7 +73,11 @@ mod codex_zst_downgrade_probe {
 
 
 def run(args, **kwargs):
-    return subprocess.run(args, check=True, text=True, **kwargs)
+    result = subprocess.run(args, check=False, text=True, **kwargs)
+    if result.returncode and result.stdout is not None:
+        print(result.stdout, flush=True)
+    result.check_returncode()
+    return result
 
 
 def fixture_test(tree, name, env, marker=None):

@@ -27922,6 +27922,18 @@ impl OwnedSourceScan {
                             .get(&local_index_key(&candidate.path))
                             .is_some_and(|e| e.custody_retry_due(&candidate.path));
                         if !custody_retry && inventory.plain_twin(&candidate.path) {
+                            index.hold_compressed(
+                                &candidate.path,
+                                codex_session_id_candidates_from_path(&candidate.path)
+                                    .into_iter()
+                                    .collect(),
+                                CodexZstCause::FamilyUnproven,
+                            );
+                            codex_archive_catchup::retain_residue(
+                                &mut residue_index_keys,
+                                &candidate.path,
+                                CodexZstCause::FamilyUnproven,
+                            );
                             continue;
                         }
                         if !custody_retry && inventory.member_held(&candidate.path) {
@@ -27941,7 +27953,7 @@ impl OwnedSourceScan {
                                     codex_session_id_candidates_from_path(&candidate.path)
                                         .into_iter()
                                         .collect(),
-                                    CodexZstCause::OwnerUnproven,
+                                    cause,
                                 );
                             }
                             if !index
@@ -30242,6 +30254,7 @@ impl OwnedSourceScan {
                                 );
                             }
                             census.record_unreadable(cause, 1);
+                            parser.reader.reader.close();
                             pending!();
                         }
                         // #665 second-lander condition: only a retaining,
@@ -33493,6 +33506,19 @@ impl OwnedSourceScan {
                     &identified_candidates,
                 );
             }
+            // Quiet terminal debt remains counted even when equality skips parsing.
+            if source == SnapshotSource::Codex && codex_archive_path(&candidate.path) {
+                if let Some(archive) = index
+                    .files
+                    .get(&local_index_key(&candidate.path))
+                    .and_then(|e| e.archive.as_deref())
+                    .filter(|a| a.quiet(&opened_file))
+                {
+                    if let Some(cause) = archive.terminal_cause() {
+                        census.archive_residue(&candidate.path, Some(archive), cause);
+                    }
+                }
+            }
             match decision {
                 CandidateDecision::Skip => {
                     #[cfg(feature = "replay-harness")]
@@ -33887,7 +33913,9 @@ impl OwnedSourceScan {
             };
             // U1a-2a G5: a side read is not a scanned file.
             if side_plan.is_none() {
-                scanned_file_count += 1;
+                if source != SnapshotSource::Codex || !codex_archive_path(&candidate.path) {
+                    scanned_file_count += 1;
+                }
                 if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
                     terminal_off_discovery::served(index, &candidate, audit_now);
                 }
@@ -34027,6 +34055,9 @@ impl OwnedSourceScan {
                     pending!();
                 }
             };
+            if source == SnapshotSource::Codex && codex_archive_path(&candidate.path) {
+                scanned_file_count += 1;
+            }
             // U1a-2a (D6(a)): this child's proof, P-fenced before its parse.
             // A side read is P's, never a proof consumer.
             if source == SnapshotSource::Codex && side_origin.is_none() {

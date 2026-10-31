@@ -2115,10 +2115,12 @@ pub(in crate::snapshots) mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = synthetic_rollout();
-        let valid = zstd::stream::encode_all(&bytes[..], 1).unwrap();
+        let (header, body) = bytes.split_at(bytes.iter().position(|b| *b == b'\n').unwrap() + 1);
+        let prefix = zstd::stream::encode_all(header, 1).unwrap();
+        let valid = zstd::stream::encode_all(body, 1).unwrap();
         let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
         encoder.include_checksum(true).unwrap();
-        encoder.write_all(&bytes).unwrap();
+        encoder.write_all(body).unwrap();
         let mut checksum = encoder.finish().unwrap();
         *checksum.last_mut().unwrap() ^= 1;
         for (encoded, paid, limit) in [
@@ -2127,8 +2129,13 @@ pub(in crate::snapshots) mod tests {
             (valid[..valid.len() - 1].to_vec(), true, None),
             (valid.clone(), true, Some(1)),
         ] {
+            // A valid separate header frame reaches the failed-Full edge.
+            let encoded = [prefix.as_slice(), encoded.as_slice()].concat();
             let f = ArchiveFixture::new(&encoded);
-            let (index, result, rows, ends) = archive_pass(&f, ScanIndex::default(), paid, limit);
+            let mut initial = ScanIndex::default();
+            let cache = Arc::new(sampled_scan::SharedCache::default());
+            assert_eq!(decodes(&header_inventory(&f, &mut initial, &cache)), 1);
+            let (index, result, rows, ends) = archive_pass(&f, initial, paid, limit);
             assert_eq!(decodes(&rows), usize::from(paid));
             assert!(result.snapshots.is_empty());
             assert!(index.codex_parent_ownership_ledgers.is_empty());
@@ -2409,7 +2416,8 @@ pub(in crate::snapshots) mod tests {
                 curve: true,
                 identity_capture: false,
                 cache,
-                archive_scope: None,
+                // This constructor driver tests funded admission, not scope discovery.
+                archive_scope: Some(&Scope("archive-factory-test".into())),
             },
         )
     }
@@ -3415,7 +3423,24 @@ pub(in crate::snapshots) mod tests {
         // Six hours also passes the traversal's at-most-one-hour retry. The
         // old red generation cannot certify the parent's current census.
         saved.traversal = None;
-        let (after, result, rows, _) = archive_pass_with(&f, saved, true, None, &roots, |_| {});
+        let ledgers = saved.codex_parent_ownership_ledgers.clone();
+        let (after, result, rows, _) = archive_pass_with(&f, saved, true, None, &roots, |scan| {
+            // Restore the arrived parent's real census before validating its ledger.
+            scan.index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .codex_rollout_paths
+                .insert(local_index_key(&path));
+            scan.codex_parent_identities =
+                CodexParentIdentities::new(SnapshotSource::Codex, scan.index.traversal.as_ref());
+            scan.index.codex_parent_ownership_ledgers = ledgers.clone();
+            let (validated, _) = validate_codex_parent_ownership_ledgers(
+                &scan.index,
+                scan.codex_parent_identities.census(&scan.index),
+            );
+            scan.codex_parent_ownership_ledgers = Some(Arc::new(std::sync::Mutex::new(validated)));
+        });
         // Discovery may read a prefix; replay/retain makes no new FULL decode.
         assert_eq!(
             rows.iter()

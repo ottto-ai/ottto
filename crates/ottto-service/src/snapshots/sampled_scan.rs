@@ -2187,7 +2187,15 @@ pub(super) fn new_source_parser(
                     && !a.user_change
                     && matches!(a.disposition, ArchiveDisposition::Pending { .. })
             });
-        if reuse && archive_scope.is_none() && !custody_retry {
+        if reuse
+            && archive_scope.is_none()
+            && !custody_retry
+            && index
+                .files
+                .get(&key)
+                .and_then(|e| e.archive.as_ref())
+                .is_some_and(|a| a.body_witness.is_some())
+        {
             traversal_point(
                 "codex_zst_retained_scope_deferred",
                 "codex",
@@ -2266,6 +2274,19 @@ pub(super) fn new_source_parser(
             // The driver MUST call persist_archive_reservation before stepping;
             // only that committed attempt spends the per-stamp decode budget.
             if !custody_retry && archive.matches(&file) && archive.stop_exhausted() {
+                if let Some(
+                    cause @ (CodexZstCause::DecodeBudget | CodexZstCause::SettlementStuck),
+                ) = archive.terminal_cause()
+                {
+                    archive.defer_custody(cause);
+                    index.hold_compressed(
+                        &candidate.path,
+                        codex_session_id_candidates_from_path(&candidate.path)
+                            .into_iter()
+                            .collect(),
+                        cause,
+                    );
+                }
                 anyhow::bail!("compressed settlement exhausted");
             }
         }
