@@ -5,23 +5,18 @@ use crate::durable_tail_store::{
     self as store, AcquisitionFields, Binding, DurableSource, PendingRecord, ReadOutcome, Refusal,
 };
 use crate::locked_state_dir::test_locks;
+use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::snapshots::{AcquisitionProtocol, ImmutableCounting};
-use crate::transcript_acquisition::{birth_unix_nanos, DurableCertificate, ReadPlan};
+use crate::transcript_acquisition::{birth_unix_nanos, DurableCertificate};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 fn certificate(path: &Path) -> DurableCertificate {
     let scope = Scope("m3-format-fixture".into());
     let mut file = File::open(path).unwrap();
-    let mut plan = ReadPlan::prepare(&mut file, None, &scope, None, 1_800_000_000).unwrap();
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).unwrap();
-    plan.observe_complete_records(&bytes).unwrap();
-    plan.commit_after_native_completion(&file, &scope, 1_800_000_000)
-        .unwrap()
+    fixture::checkpoint(&mut file, &scope, 1_800_000_000)
         .durable_certificate(birth_unix_nanos(&file.metadata().unwrap()))
         .unwrap()
 }
@@ -53,8 +48,7 @@ fn pending(
     }
 }
 fn path(dir: &Path, key: &store::Digest32) -> std::path::PathBuf {
-    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-    dir.join(format!("{hex}.rec"))
+    fixture::record_path(dir, key)
 }
 fn found(outcome: ReadOutcome) -> store::DurableRecord {
     match outcome {

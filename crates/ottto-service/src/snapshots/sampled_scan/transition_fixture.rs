@@ -1234,6 +1234,28 @@ pub(crate) mod native_cold {
         let (index, scan, modes, bytes) = scan(owned, steps);
         (index, scan, (modes.0, modes.1, bytes))
     }
+    /// Seal the exact complete bytes through production ReadPlan, retaining
+    /// the caller's open file and resulting position for later growth reads.
+    pub(crate) fn checkpoint(
+        file: &mut std::fs::File,
+        scope: &Scope,
+        now: u64,
+    ) -> crate::transcript_acquisition::Checkpoint {
+        use std::io::Read;
+        let mut plan =
+            crate::transcript_acquisition::ReadPlan::prepare(file, None, scope, None, now).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        plan.observe_complete_records(&bytes).unwrap();
+        plan.commit_after_native_completion(file, scope, now)
+            .unwrap()
+    }
+
+    pub(crate) fn record_path(dir: &Path, key: &store::Digest32) -> PathBuf {
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        dir.join(format!("{hex}.rec"))
+    }
+
     /// Real v3 streaming; no receipt is synthesized and flush stays explicit.
     pub(crate) fn commit(
         disk: &mut store::DurableTailStore,

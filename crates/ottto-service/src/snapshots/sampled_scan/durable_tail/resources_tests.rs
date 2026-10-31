@@ -3,8 +3,8 @@
 //! the P2 restored head budget and the Codex refused stale record. Every row
 //! drives the real `Stores` owner; nothing here is a production entry point.
 use super::*;
-use crate::transcript_acquisition::ReadPlan;
-use std::io::{Read, Write};
+use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
+use std::io::Write;
 
 const CLAUDE: SnapshotSource = SnapshotSource::ClaudeCode;
 
@@ -19,13 +19,7 @@ fn grown(name: &str) -> (PathBuf, Checkpoint, File) {
     std::fs::write(&path, b"{\"n\":1}\n").unwrap();
     let scope = Scope("r7-scope".into());
     let mut file = File::open(&path).unwrap();
-    let mut plan = ReadPlan::prepare(&mut file, None, &scope, None, 1_800_000_000).unwrap();
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).unwrap();
-    plan.observe_complete_records(&bytes).unwrap();
-    let checkpoint = plan
-        .commit_after_native_completion(&file, &scope, 1_800_000_000)
-        .unwrap();
+    let checkpoint = fixture::checkpoint(&mut file, &scope, 1_800_000_000);
     std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
@@ -47,7 +41,7 @@ fn entry() -> ScanIndexEntry {
 fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use super::owed::{OwedMark, OwedQuery};
-    use crate::snapshots::{OwnedSourceScan, OwnedSourceScanStep};
+    use crate::snapshots::OwnedSourceScan;
     let scratch = crate::test_scratch::ScratchDir::new("m3-native-debt-cap-corpus");
     let _lock = crate::locked_state_dir::test_locks::hold(&scratch);
     let sessions = scratch.join("sessions");
@@ -78,7 +72,7 @@ fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
         }
     }
     let run = |cache: Arc<SharedCache>| {
-        let mut scan = OwnedSourceScan::new(
+        let scan = OwnedSourceScan::new(
             CLAUDE,
             std::slice::from_ref(&sessions),
             ScanIndex::default(),
@@ -92,13 +86,7 @@ fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
             true,
         )
         .with_sampled_acquisition(cache, namespace.clone());
-        for _ in 0..1000 {
-            match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => scan = next,
-                OwnedSourceScanStep::Complete { scan, .. } => return scan.snapshots,
-            }
-        }
-        panic!("bounded native cap corpus did not finish");
+        fixture::scan(scan, 1000).1.snapshots
     };
     let actual = run(cache.clone());
     let cold = run(Arc::new(SharedCache::default()));
