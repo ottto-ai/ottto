@@ -1097,7 +1097,10 @@ fn settle_index_after_upload(
 
 /// Correction completion depends on the final selected file/empty facts. In
 /// particular, the last M2 no-body drain must precede the completion decision.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the selected index, page facts, correction candidates and drain ledger"
+)]
 fn settle_upload_corrections_after_selection(
     index: &mut ScanIndex,
     scan: &SourceScanResult,
@@ -1147,6 +1150,71 @@ fn settle_upload_corrections_after_selection(
         crate::local_resource_diagnostics::claude_history_proof_correction_deferred(deferred);
     }
     transport_fully_settled && !blocking
+}
+
+struct SelectedSettlementInputs<'a> {
+    scan: &'a SourceScanResult,
+    committed_index: &'a ScanIndex,
+    progress: &'a SnapshotUploadProgress,
+    candidates: &'a [crate::snapshots::ClaudeProofCorrectionCandidate],
+    cutoff_candidates: &'a [crate::snapshots::ClaudeCutoffCorrectionCandidate],
+    transport_fully_settled: bool,
+    body_drains: crate::snapshots::ClaudeProofBodyDrains,
+    comparison: Option<&'a mut crate::snapshots::claude_native_comparison::Completion>,
+    audit_release: Option<AccountAuditRelease<'a>>,
+}
+
+/// The finish order after save selection, shared with the proof-correction
+/// pipeline harness so its regressions guard this order: correction settle,
+/// native paid restore, account-audit release (which can clear a drained
+/// entry's revision), then the body-drain restore. Returns whether the page
+/// is fully settled.
+fn finish_selected_settlement(
+    index: &mut ScanIndex,
+    inputs: SelectedSettlementInputs<'_>,
+) -> Result<bool, crate::source_rotation::LocalRefusal> {
+    let SelectedSettlementInputs {
+        scan,
+        committed_index,
+        progress,
+        candidates,
+        cutoff_candidates,
+        transport_fully_settled,
+        mut body_drains,
+        comparison,
+        audit_release,
+    } = inputs;
+    let mut fully_settled = settle_upload_corrections_after_selection(
+        index,
+        scan,
+        committed_index,
+        progress,
+        candidates,
+        cutoff_candidates,
+        transport_fully_settled,
+        &mut body_drains,
+    );
+    if let Some(comparison) = comparison {
+        if comparison.restore_selected_paid(index, committed_index)? {
+            fully_settled = false;
+        }
+    }
+    if let Some(release) = audit_release {
+        scan.preserve_released_account_audits(
+            index,
+            release.previous,
+            release.cache,
+            release.roots,
+            release.backfill_window_days,
+        );
+    }
+    // After every selected-entry restore and the account-audit release, which
+    // can clear a drained entry's revision: a drain (pre-selection or D1)
+    // whose entry this save does not keep stays owed.
+    if index.restore_unselected_claude_proof_body_drains(body_drains) {
+        fully_settled = false;
+    }
+    Ok(fully_settled)
 }
 
 fn apply_backfill_cutoff_with_claude_corrections(
@@ -8455,36 +8523,25 @@ fn finish_sync_source(
     settle_index_after_upload(&mut index, &committed_index, &upload_progress);
     // Completed/checkpointed outcomes have now selected their retained file
     // facts. No-body completion must share that exact durable checkpoint.
-    upload_fully_settled = settle_upload_corrections_after_selection(
+    upload_fully_settled = finish_selected_settlement(
         &mut index,
-        &scan_result,
-        &committed_index,
-        &upload_progress,
-        &claude_proof_correction_candidates,
-        &claude_cutoff_corrections,
-        upload_fully_settled,
-        &mut claude_proof_body_drains,
-    );
-    if let Some(comparison) = comparison_completion.as_mut() {
-        if comparison.restore_selected_paid(&mut index, &committed_index)? {
-            upload_fully_settled = false;
-        }
-    }
-    if source == SnapshotSource::ClaudeCode {
-        scan_result.preserve_released_account_audits(
-            &mut index,
-            &committed_index,
-            &daemon.transcript_cache,
-            claude_scan_roots.as_deref().unwrap_or_default(),
-            receipt_window_days,
-        );
-    }
-    // After every selected-entry restore and the account-audit release, which
-    // can clear a drained entry's revision: a drain (pre-selection or D1)
-    // whose entry this save does not keep stays owed.
-    if index.restore_unselected_claude_proof_body_drains(claude_proof_body_drains) {
-        upload_fully_settled = false;
-    }
+        SelectedSettlementInputs {
+            scan: &scan_result,
+            committed_index: &committed_index,
+            progress: &upload_progress,
+            candidates: &claude_proof_correction_candidates,
+            cutoff_candidates: &claude_cutoff_corrections,
+            transport_fully_settled: upload_fully_settled,
+            body_drains: claude_proof_body_drains,
+            comparison: comparison_completion.as_mut(),
+            audit_release: (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
+                previous: &committed_index,
+                cache: &daemon.transcript_cache,
+                roots: claude_scan_roots.as_deref().unwrap_or_default(),
+                backfill_window_days: receipt_window_days,
+            }),
+        },
+    )?;
     let mut retired_upload_acks = upload_progress.stage_selected_ack_retirement(
         &committed_index,
         &mut index,
