@@ -2184,8 +2184,8 @@ fn incomplete_sidecar_census_pages_cursor_only_and_publishes_unverified() {
 
 /// [regress] E2 (R2-B1): a resume whose evidence is unavailable is tried at
 /// most once per page and ends after `UNAVAILABLE_RESUMES` such pages,
-/// freeing the slot. The trigger is R1-M1's: an untrusted census plus a
-/// changed scope (here a changed upload context, a `file_scope` input).
+/// freeing the slot. The trigger: an untrusted census plus reduction
+/// dependencies that cannot be computed (the existing refusal hook).
 /// Before E2 the deferred job was resumed again on the next step of the
 /// same scan object, forever; every page here must finish within a bound.
 #[test]
@@ -2197,10 +2197,16 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
     let fixture = ScanRoot::new(40);
     let path = fixture.file(SESSION);
     let cache = Arc::new(SharedCache::default());
+    struct ResetDependencies;
+    impl Drop for ResetDependencies {
+        fn drop(&mut self) {
+            super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+        }
+    }
+    let _reset = ResetDependencies;
     let flipped = |scan: &mut OwnedSourceScan| {
         scan.sidecar_census_complete = false;
-        scan.index
-            .activate_upload_context("cursor-fixture-context".into());
+        super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(true));
     };
     with_test_limits(2048, 1024, 64, || {
         let (mut index, _, _) = page_steps(
