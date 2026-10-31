@@ -81,18 +81,16 @@ fn commit_populate(db: &mut sqlite::Sqlite, index: &ScanIndex) {
 /// [regress] v2 hydration's closed catalogue includes its own growth raw holds.
 #[test]
 fn owned_kinds_are_admitted_without_adding_v1_growth_slots() {
-    for kind in [
-        kinds_files::KINDS,
-        kinds_census::KINDS,
-        kinds_accounts::KINDS,
-        kinds_misc::KINDS,
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for (kind, _) in catalogue::OWNED {
         assert_eq!(RecordKind::parse(kind).unwrap().name(), *kind);
     }
-    for kind in ["raw_hold.future", "v1_field.growth_retention"] {
+    // Names no semantic group owns refuse like any other unknown kind.
+    for kind in [
+        "raw_hold.future",
+        "v1_field.growth_retention",
+        "file.receipt",
+        "account.window_retention",
+    ] {
         let error = RecordKind::parse(kind).unwrap_err();
         assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::UnknownRecordKind));
     }
@@ -280,7 +278,7 @@ fn foreign_source_and_registered_but_unmapped_money_kinds_refuse_hydration() {
         key: &RowKey::record("v1_field.census_money_marks", Vec::new(), 0).unwrap(),
         fixed: &Fixed::None,
         value_version: 1,
-        value: &Stored(b"null".to_vec()),
+        value: b"null",
     })
     .unwrap();
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
@@ -315,8 +313,13 @@ fn generic_erasure_extraction_visits_nested_text_keys_and_shared_evidence() {
     }
 }
 
+/// R1's observable side effects: immutable staging, and the generation after
+/// which it may garbage-collect superseded records (None = no GC).
 #[derive(Default)]
-struct SaveHooks(Vec<&'static str>);
+struct SaveHooks {
+    staged: bool,
+    gc_after: Option<u64>,
+}
 impl kinds_files::ResumeHooks for SaveHooks {
     fn plan(
         &mut self,
@@ -324,7 +327,6 @@ impl kinds_files::ResumeHooks for SaveHooks {
         _: &ScanIndex,
         _: &BTreeMap<String, kinds_files::ResumeCheckpoint>,
     ) -> Result<kinds_files::StagedCheckpoints> {
-        self.0.push("plan");
         Ok(Default::default())
     }
     fn preflight_selected(
@@ -333,7 +335,6 @@ impl kinds_files::ResumeHooks for SaveHooks {
         _: &ScanIndex,
         _: &BTreeMap<String, kinds_files::ResumeCheckpoint>,
     ) -> Result<u64> {
-        self.0.push("preflight");
         Ok(0)
     }
     fn stage(
@@ -342,15 +343,15 @@ impl kinds_files::ResumeHooks for SaveHooks {
         _: &ScanIndex,
         _: &BTreeMap<String, kinds_files::ResumeCheckpoint>,
     ) -> Result<kinds_files::StagedCheckpoints> {
-        self.0.push("stage");
+        self.staged = true;
         Ok(Default::default())
     }
     fn post_commit(
         &mut self,
-        _: u64,
+        generation: u64,
         _: &BTreeMap<String, kinds_files::ResumeCheckpoint>,
     ) -> Result<()> {
-        self.0.push("post_commit");
+        self.gc_after = Some(generation);
         Ok(())
     }
 }
@@ -470,9 +471,10 @@ fn growth_raw_hold_survives_composed_hydration_and_cas_cannot_release_it() {
     }
 }
 
-/// [format] whole delta stages before begin and calls gc only after commit.
+/// [format] a committed save GCs only after its durable generation; a save
+/// that fails at the page cap never GCs and leaves the committed graph.
 #[test]
-fn whole_delta_stages_before_begin_and_calls_gc_only_after_commit() {
+fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
     let (_scratch, mut db) = Scratch::live_store();
     commit_populate(&mut db, &fixture());
     let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
@@ -481,13 +483,17 @@ fn whole_delta_stages_before_begin_and_calls_gc_only_after_commit() {
     next.upload_context_fingerprint = Some("new-context".into());
     let mut hooks = SaveHooks::default();
     save_graph(&mut db, &identity, &prev, &mut next, &mut cx, &mut hooks).unwrap();
-    assert_eq!(hooks.0, ["plan", "preflight", "stage", "post_commit"]);
+    assert_eq!(
+        db.read_control::<u64>("generation").unwrap(),
+        Some(next.generation)
+    );
+    assert_eq!(hooks.gc_after, Some(next.generation));
     let (current, _) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert_eq!(
         current.upload_context_fingerprint,
         next.upload_context_fingerprint
     );
-    hooks.0.clear();
+    let mut hooks = SaveHooks::default();
     let mut retry = current.clone();
     retry.upload_context_fingerprint = Some("never-committed".into());
     // Enough new rows that the save must grow the file past SQLite's page cap.
@@ -498,7 +504,7 @@ fn whole_delta_stages_before_begin_and_calls_gc_only_after_commit() {
     }
     sqlite::cap_pages(&db);
     assert!(save_graph(&mut db, &identity, &current, &mut retry, &mut cx, &mut hooks).is_err());
-    assert_eq!(hooks.0, ["plan", "preflight", "stage"]);
+    assert_eq!(hooks.gc_after, None);
     assert!(!cx.valid && cx.ambiguous);
     assert_eq!(
         hydrate(&mut db, Scratch::binding())
@@ -525,7 +531,7 @@ fn refused_commit_refuses_reload_required_without_post_commit() {
     let error =
         save_graph(&mut db, &identity, &current, &mut next, &mut cx, &mut hooks).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
-    assert_eq!(hooks.0, ["plan", "preflight", "stage"]);
+    assert_eq!(hooks.gc_after, None);
     assert!(!cx.valid && cx.ambiguous);
     assert_eq!(next.generation, current.generation);
     assert!(!db.reload_required());
@@ -535,14 +541,13 @@ fn refused_commit_refuses_reload_required_without_post_commit() {
         hydrated.upload_context_fingerprint,
         current.upload_context_fingerprint
     );
-    hooks.0.clear();
     let mut next = hydrated.clone();
     next.upload_context_fingerprint = Some("committed".into());
     save_graph(
         &mut db, &identity, &hydrated, &mut next, &mut cx, &mut hooks,
     )
     .unwrap();
-    assert_eq!(hooks.0, ["plan", "preflight", "stage", "post_commit"]);
+    assert_eq!(hooks.gc_after, Some(next.generation));
 }
 
 /// [format] stale generation or future writer refuses before restart side effects.
@@ -561,7 +566,7 @@ fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
         }
         let mut hooks = SaveHooks::default();
         assert!(save_graph(&mut db, &identity, &prev, &mut next, &mut cx, &mut hooks).is_err());
-        assert!(hooks.0.is_empty());
+        assert!(!hooks.staged && hooks.gc_after.is_none());
         assert!(!cx.valid && cx.ambiguous);
     }
 }

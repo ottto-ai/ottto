@@ -28,7 +28,7 @@ fn allocate(
         value_version: 1,
         key: &key,
         fixed: &Fixed::None,
-        value: &ControlJson(&next),
+        value: &control_json(&next)?,
     })?;
     Ok(id)
 }
@@ -79,7 +79,7 @@ pub(super) fn resolve(
             refs: 1,
         },
         value_version: 1,
-        value: &codec::Bytes(&bytes),
+        value: &bytes,
     })?;
     Ok((id, true))
 }
@@ -136,7 +136,7 @@ pub(super) enum RequestEvidence<'a> {
         hash_count: Option<u64>,
     },
     Census {
-        hashes: &'a dyn Value,
+        hashes: &'a [u8],
         hash_count: Option<u64>,
     },
 }
@@ -159,7 +159,7 @@ pub(super) fn intern_request_set(
             hash_count
         ]),
         RequestEvidence::Census { hashes, hash_count } => {
-            serde_json::json!(["census", codec::capture(*hashes, VALUE_BYTES)?, hash_count])
+            serde_json::json!(["census", hashes, hash_count])
         }
     };
     intern(tx, &value)

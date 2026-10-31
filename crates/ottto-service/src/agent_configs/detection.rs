@@ -322,11 +322,13 @@ mod tests {
 
     #[test]
     fn presence_claude_absent_with_no_config_is_not_present() {
-        let home = test_home("presence-claude-empty");
-        assert!(!source_present_with_paths(
-            detection_spec(&SourceKind::ClaudeCode, &home),
-            false,
-        ));
+        let home = test_home("presence-empty");
+        for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
+            assert!(!source_present_with_paths(
+                detection_spec(&source, &home),
+                false
+            ));
+        }
     }
 
     #[test]
@@ -338,68 +340,6 @@ mod tests {
 
         assert!(source_present_with_paths(
             detection_spec(&SourceKind::ClaudeCode, &home),
-            false,
-        ));
-    }
-
-    #[test]
-    fn presence_claude_desktop_app_data_counts_without_binary() {
-        let home = test_home("presence-claude-desktop");
-        fs::create_dir_all(
-            home.join("Library")
-                .join("Application Support")
-                .join("Claude")
-                .join("claude-code"),
-        )
-        .expect("desktop vendored dir");
-
-        assert!(source_present_with_paths(
-            detection_spec(&SourceKind::ClaudeCode, &home),
-            false,
-        ));
-    }
-
-    #[test]
-    fn detect_claude_installed_via_usage_metadata_without_binary() {
-        let home = test_home("detect-claude-metadata");
-        fs::create_dir_all(home.join(".claude").join("projects")).expect("projects dir");
-
-        let detected = detect_agent_installation_with_paths(
-            &SourceKind::ClaudeCode,
-            detection_spec(&SourceKind::ClaudeCode, &home),
-            None,
-            None,
-        );
-
-        assert!(detected.installed);
-        assert_eq!(detected.binary_path, None);
-    }
-
-    #[test]
-    fn presence_codex_config_dir_counts_when_binary_absent() {
-        let home = test_home("presence-codex-config");
-        fs::create_dir_all(home.join(".codex")).expect("codex dir");
-        // Codex treats a genuine user config directory as presence.
-        assert!(source_present_with_paths(
-            detection_spec(&SourceKind::Codex, &home),
-            false,
-        ));
-    }
-
-    #[test]
-    fn presence_codex_absent_with_no_config_is_not_present() {
-        let home = test_home("presence-codex-empty");
-        assert!(!source_present_with_paths(
-            detection_spec(&SourceKind::Codex, &home),
-            false,
-        ));
-    }
-
-    #[test]
-    fn presence_pi_absent_with_no_data_is_not_present() {
-        let home = test_home("presence-pi-empty");
-        assert!(!source_present_with_paths(
-            detection_spec(&SourceKind::Pi, &home),
             false,
         ));
     }

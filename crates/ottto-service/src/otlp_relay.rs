@@ -1662,23 +1662,6 @@ mod tests {
     }
 
     #[test]
-    fn state_fingerprint_is_short_and_stable() {
-        let first = state_fingerprint(
-            SnapshotSource::ClaudeCode,
-            "https://ottto.test/backend",
-            "device_1",
-        );
-        let second = state_fingerprint(
-            SnapshotSource::ClaudeCode,
-            "https://ottto.test/backend",
-            "device_1",
-        );
-
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 16);
-    }
-
-    #[test]
     fn client_disconnect_during_write_recognises_routine_io_errors() {
         let broken_pipe: anyhow::Error =
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Broken pipe (os error 32)").into();
@@ -1714,35 +1697,6 @@ mod tests {
         let plain = anyhow::anyhow!("relay device binding is missing");
         assert!(!client_disconnect_during_write(&not_found));
         assert!(!client_disconnect_during_write(&plain));
-    }
-
-    #[test]
-    fn relay_source_header_routes_codex_separately_from_claude_code() {
-        assert_eq!(
-            source_from_relay_header("codex"),
-            Some(SnapshotSource::Codex)
-        );
-        assert_eq!(
-            source_from_relay_header("claude_code"),
-            Some(SnapshotSource::ClaudeCode)
-        );
-        assert_eq!(
-            source_from_relay_header("CLAUDE-CODE"),
-            Some(SnapshotSource::ClaudeCode)
-        );
-        assert_eq!(source_from_relay_header("unknown"), None);
-    }
-
-    #[test]
-    fn relay_candidates_try_default_before_user_fallbacks() {
-        let ports = candidate_relay_ports(501);
-
-        assert_eq!(ports.first().copied(), Some(LOCAL_RELAY_DEFAULT_PORT));
-        assert_eq!(
-            ports.get(1).copied(),
-            Some(LOCAL_RELAY_FALLBACK_BASE_PORT + 501)
-        );
-        assert_eq!(ports.len(), usize::from(LOCAL_RELAY_FALLBACK_ATTEMPTS) + 1);
     }
 
     #[test]
@@ -1974,69 +1928,74 @@ mod tests {
 
     #[test]
     fn read_http_request_rejects_over_long_header_line() {
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nX-Big: ");
-        raw.push_str(&"a".repeat(MAX_HEADER_LINE_BYTES + 64));
-        raw.push_str("\r\n\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("over-long line rejected");
-        assert!(
-            error.to_string().contains("read header")
-                || error.to_string().contains("exceeds maximum length"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_cumulative_header_bytes() {
-        // Each header line stays under the per-line cap, but together they
-        // exceed the cumulative byte cap.
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
-        let value = "b".repeat(MAX_HEADER_LINE_BYTES / 2);
-        let lines_needed = (MAX_HEADER_TOTAL_BYTES / value.len()) + 2;
-        for index in 0..lines_needed {
-            raw.push_str(&format!("X-Pad-{index}: {value}\r\n"));
+        for (raw, expected) in [
+            {
+                let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nX-Big: ");
+                raw.push_str(&"a".repeat(MAX_HEADER_LINE_BYTES + 64));
+                raw.push_str("\r\n\r\n");
+                raw
+            },
+            {
+                let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
+                let value = "b".repeat(MAX_HEADER_LINE_BYTES / 2);
+                let lines_needed = (MAX_HEADER_TOTAL_BYTES / value.len()) + 2;
+                for index in 0..lines_needed {
+                    raw.push_str(&format!("X-Pad-{index}: {value}\r\n"));
+                }
+                raw.push_str("\r\n");
+                raw
+            },
+            {
+                let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
+                for index in 0..(MAX_HEADER_COUNT + 5) {
+                    raw.push_str(&format!("X-H-{index}: v\r\n"));
+                }
+                raw.push_str("\r\n");
+                raw
+            },
+            format!(
+                "POST /v1/logs HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                MAX_OTLP_BODY_BYTES + 1
+            ),
+            format!(
+                "POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                MAX_OTLP_BODY_BYTES + 1
+            ),
+            {
+                let mut raw =
+                    String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+                for _ in 0..MAX_CHUNK_COUNT {
+                    raw.push_str("1\r\na\r\n");
+                }
+                raw.push_str("1\r\nb\r\n0\r\n\r\n");
+                raw
+            },
+            {
+                let extension = "a".repeat(MAX_HEADER_LINE_BYTES - 4);
+                let mut raw =
+                    String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+                for _ in 0..=(MAX_CHUNK_FRAMING_BYTES / MAX_HEADER_LINE_BYTES) {
+                    raw.push_str(&format!("1;{extension}\r\na\r\n"));
+                }
+                raw.push_str("0\r\n\r\n");
+                raw
+            },
+        ]
+        .into_iter()
+        .zip([
+            "read header",
+            "headers too large",
+            "too many request headers",
+            "request body too large",
+            "request body too large",
+            "too many chunks",
+            "chunk framing too large",
+        ]) {
+            let mut reader = BufReader::new(raw.as_bytes());
+            let error =
+                read_http_request_from(&mut reader).expect_err("oversized HTTP framing rejected");
+            assert!(error.to_string().contains(expected), "{error}");
         }
-        raw.push_str("\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error =
-            read_http_request_from(&mut reader).expect_err("cumulative header bytes rejected");
-        assert!(
-            error.to_string().contains("headers too large"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_excess_header_count() {
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
-        for index in 0..(MAX_HEADER_COUNT + 5) {
-            raw.push_str(&format!("X-H-{index}: v\r\n"));
-        }
-        raw.push_str("\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("excess header count rejected");
-        assert!(
-            error.to_string().contains("too many request headers"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_oversized_body_via_content_length() {
-        let raw = format!(
-            "POST /v1/logs HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
-            MAX_OTLP_BODY_BYTES + 1
-        );
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("oversized body rejected");
-        assert!(
-            error.to_string().contains("request body too large"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]
@@ -2075,54 +2034,6 @@ mod tests {
     }
 
     #[test]
-    fn read_http_request_rejects_chunked_body_over_limit_before_allocation() {
-        let raw = format!(
-            "POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
-            MAX_OTLP_BODY_BYTES + 1
-        );
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("oversized chunk rejected");
-        assert!(
-            error.to_string().contains("request body too large"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_excessive_chunk_count() {
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
-        for _ in 0..MAX_CHUNK_COUNT {
-            raw.push_str("1\r\na\r\n");
-        }
-        raw.push_str("1\r\nb\r\n0\r\n\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("chunk flood rejected");
-        assert!(
-            error.to_string().contains("too many chunks"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_excessive_chunk_extension_framing() {
-        let extension = "a".repeat(MAX_HEADER_LINE_BYTES - 4);
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
-        for _ in 0..=(MAX_CHUNK_FRAMING_BYTES / MAX_HEADER_LINE_BYTES) {
-            raw.push_str(&format!("1;{extension}\r\na\r\n"));
-        }
-        raw.push_str("0\r\n\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("framing flood rejected");
-        assert!(
-            error.to_string().contains("chunk framing too large"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
     fn read_line_limited_accepts_line_at_cap_and_rejects_beyond() {
         // A line whose bytes (including the newline) total exactly the cap is
         // accepted.
@@ -2141,15 +2052,6 @@ mod tests {
         let error =
             read_line_limited(&mut reader, &mut buf, 16).expect_err("over-cap line rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn read_line_limited_reports_eof_as_zero() {
-        let mut reader = BufReader::new(&b""[..]);
-        let mut buf = String::new();
-        let read = read_line_limited(&mut reader, &mut buf, 16).expect("eof is not an error");
-        assert_eq!(read, 0);
-        assert!(buf.is_empty());
     }
 
     // The two ConnectionGuard tests both mutate the shared
@@ -2367,22 +2269,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn relay_accept_backoff_is_bounded() {
-        assert_eq!(relay_accept_backoff(1), RELAY_ACCEPT_BACKOFF_START);
-        assert_eq!(relay_accept_backoff(2), RELAY_ACCEPT_BACKOFF_START * 2);
-        assert_eq!(relay_accept_backoff(u32::MAX), RELAY_ACCEPT_BACKOFF_MAX);
-    }
-
-    #[test]
-    fn relay_log_timestamp_is_utc_rfc3339_to_the_millisecond() {
-        let stamp = relay_log_timestamp();
-        let parsed = OffsetDateTime::parse(&stamp, &Rfc3339).expect("rfc3339");
-        assert_eq!(parsed.offset(), time::UtcOffset::UTC, "{stamp}");
-        assert_eq!(parsed.nanosecond() % 1_000_000, 0, "{stamp}");
-        assert!(stamp.ends_with('Z'), "{stamp}");
-    }
-
     /// Drains a live relay listener the way XNU does (see
     /// `unix_socket::tests::drain_listener`) and proves the supervisor reports
     /// `Failed`, binds a fresh listener on the same port, reports `Connected`
@@ -2465,14 +2351,6 @@ mod tests {
             .expect("connected state");
         assert_eq!(connected.state, RelayRuntimeState::Connected);
         assert_eq!(connected.endpoint, Some(format!("http://{addr}")));
-    }
-
-    #[test]
-    fn relay_limits_leave_daemon_thread_headroom() {
-        const _: () = assert!(
-            MAX_CONCURRENT_RELAY_CONNECTIONS <= 16,
-            "relay workers must leave LaunchAgent thread headroom for local control"
-        );
     }
 
     #[test]

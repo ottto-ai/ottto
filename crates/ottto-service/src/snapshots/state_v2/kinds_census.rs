@@ -1,41 +1,8 @@
 //! Census records keep the existing v1 JSON; no hand-written census binary.
+use super::catalogue::scan_index_fields;
 use super::*;
 use anyhow::{ensure, Context};
 use std::collections::{BTreeMap, BTreeSet};
-pub(super) const KINDS: &[&str] = &[
-    "file.census",
-    "family.requests",
-    "v1_field.census_shadow",
-    "v1_field.duplicate_owners",
-    "proof.owned_start",
-    "setting.claude_duplicate_request_witness_overflowed",
-    "tombstone.claude_retired_family_tombstones",
-    "setting.claude_retired_family_tombstones_initialized",
-    "setting.claude_retired_family_tombstones_uncertain",
-];
-macro_rules! maps {
-    ($m:ident) => {
-        $m!(claude_duplicate_request_owners, "v1_field.duplicate_owners");
-        $m!(claude_owned_start_census, "proof.owned_start");
-    };
-}
-macro_rules! scalars {
-    ($m:ident) => {
-        $m!(claude_request_census_shadow, "v1_field.census_shadow");
-        $m!(
-            claude_duplicate_request_witness_overflowed,
-            "setting.claude_duplicate_request_witness_overflowed"
-        );
-        $m!(
-            claude_retired_family_tombstones_initialized,
-            "setting.claude_retired_family_tombstones_initialized"
-        );
-        $m!(
-            claude_retired_family_tombstones_uncertain,
-            "setting.claude_retired_family_tombstones_uncertain"
-        );
-    };
-}
 pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
     delta(&ScanIndex::default(), index, tx, cx)
 }
@@ -58,17 +25,19 @@ pub(super) fn delta(
         &next.claude_retired_family_tombstones.entries,
     )?;
     macro_rules! save_map {
-        ($field:ident,$kind:literal) => {
-            mapper::map_delta(tx, $kind, &prev.$field, &next.$field)?;
+        ($f:ident, Census, (map $($c:ident)*), [$kind:literal], $h:ident) => {
+            mapper::map_delta(tx, $kind, &prev.$f, &next.$f)?;
         };
+        ($($t:tt)*) => {};
     }
-    maps!(save_map);
+    scan_index_fields!(each save_map);
     macro_rules! save {
-        ($field:ident,$kind:literal) => {
-            mapper::put(tx, &mapper::key($kind, "", 0)?, &next.$field)?;
+        ($f:ident, Census, (scalar $($c:ident)*), [$kind:literal], $h:ident) => {
+            mapper::put(tx, &mapper::key($kind, "", 0)?, &next.$f)?;
         };
+        ($($t:tt)*) => {};
     }
-    scalars!(save);
+    scan_index_fields!(each save);
     // The separate ownership manifest proves census-owned membership accompanies
     // the account pending row. Its values remain deduplicated by the shared hook.
     let members = |index: &ScanIndex| {
@@ -103,23 +72,25 @@ pub(super) fn hydrate_txn(
         );
     }
     macro_rules! load_map {
-        ($field:ident,$kind:literal) => {
-            index.$field = mapper::read_map(tx, $kind, None)?;
+        ($f:ident, Census, (map $($c:ident)*), [$kind:literal], $h:ident) => {
+            index.$f = mapper::read_map(tx, $kind, None)?;
         };
+        ($($t:tt)*) => {};
     }
-    maps!(load_map);
+    scan_index_fields!(each load_map);
     index.claude_retired_family_tombstones.entries =
         mapper::read_map(tx, "tombstone.claude_retired_family_tombstones", None)?;
     index.claude_retired_family_tombstones.decoded = true;
     macro_rules! load {
-        ($field:ident,$kind:literal) => {
+        ($f:ident, Census, (scalar $($c:ident)*), [$kind:literal], $h:ident) => {
             let h = tx
                 .get(&mapper::key($kind, "", 0)?)?
                 .context("state_v2_census_missing")?;
-            index.$field = mapper::read(tx, &h)?;
+            index.$f = mapper::read(tx, &h)?;
         };
+        ($($t:tt)*) => {};
     }
-    scalars!(load);
+    scan_index_fields!(each load);
     let members: BTreeMap<String, usize> = mapper::read_map(tx, "family.requests", None)?;
     ensure!(
         members.len() == index.claude_usage_family_pending.len(),
@@ -178,31 +149,4 @@ pub(super) fn hydrate_cas_families(
         }
     }
     Ok(())
-}
-pub(super) use mapper::{private_paths, references};
-
-pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
-    field: &str,
-    map: &mut A,
-    model: &ScanIndex,
-) -> std::result::Result<bool, A::Error> {
-    macro_rules! check {
-        ($field:ident,$kind:literal) => {
-            if field == stringify!($field) {
-                codec::check_field(map, &model.$field)?;
-                return Ok(true);
-            }
-        };
-    }
-    maps!(check);
-    scalars!(check);
-    if field == "claude_request_census" {
-        codec::check_field(map, &model.claude_request_census)?;
-        return Ok(true);
-    }
-    if field == "claude_retired_family_tombstones" {
-        codec::check_field(map, &model.claude_retired_family_tombstones)?;
-        return Ok(true);
-    }
-    Ok(false)
 }

@@ -791,7 +791,7 @@ impl Sqlite {
                 value_version: 1,
                 key: &RowKey::Meta(name.into()),
                 fixed: &Fixed::None,
-                value: &ControlJson(value),
+                value: &control_json(value)?,
             })?;
             tx.store.conn()?.execute_batch("COMMIT")?;
             tx.finished = true;
@@ -1165,29 +1165,14 @@ impl Sqlite {
         }
     }
 }
-/// Values stream through std::io::Write. Keep native classification when a
-/// chunk INSERT's SQLite error is nested in an I/O wrapper by the encoder.
 pub(super) fn disk_full(error: &anyhow::Error) -> bool {
-    error.chain().any(|mut cause| loop {
-        if cause
+    error.chain().any(|cause| {
+        cause
             .downcast_ref::<rusqlite::ffi::Error>()
             .is_some_and(|e| e.code == rusqlite::ErrorCode::DiskFull)
-        {
-            return true;
-        }
-        if cause
-            .downcast_ref::<rusqlite::Error>()
-            .is_some_and(|e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))
-        {
-            return true;
-        }
-        let Some(inner) = cause
-            .downcast_ref::<io::Error>()
-            .and_then(io::Error::get_ref)
-        else {
-            return false;
-        };
-        cause = inner;
+            || cause
+                .downcast_ref::<rusqlite::Error>()
+                .is_some_and(|e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))
     })
 }
 const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
@@ -1338,54 +1323,6 @@ fn read_json<T: serde::de::DeserializeOwned>(conn: &Connection, key: &RowKey) ->
     Ok(Some(serde_json::from_slice(&encoded)?))
 }
 
-struct PartWriter<'a> {
-    conn: &'a Connection,
-    owner: ChunkOwner,
-    part: u16,
-    bytes: Vec<u8>,
-    len: u64,
-    hash: sha2::Sha256,
-    cap: u64,
-}
-impl PartWriter<'_> {
-    fn part(&mut self) -> io::Result<()> {
-        if self.bytes.is_empty() {
-            return Ok(());
-        }
-        self.conn
-            .execute(
-                "INSERT INTO value_chunks(owner_table,owner_kind,owner_key,position,chunk_no,chunk) VALUES(?1,?2,?3,?4,?5,?6)",
-                params![self.owner.table,self.owner.kind,self.owner.key,self.owner.position,self.part,self.bytes],
-            )
-            .map_err(io::Error::other)?;
-        self.part += 1;
-        self.bytes.clear();
-        Ok(())
-    }
-}
-impl Write for PartWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.len = self
-            .len
-            .checked_add(bytes.len() as u64)
-            .filter(|n| *n <= self.cap)
-            .ok_or_else(|| io::Error::other("state_v2_value_admission"))?;
-        self.hash.update(bytes);
-        let mut rest = bytes;
-        while !rest.is_empty() {
-            let n = rest.len().min(PART_BYTES - self.bytes.len());
-            self.bytes.extend_from_slice(&rest[..n]);
-            rest = &rest[n..];
-            if self.bytes.len() == PART_BYTES {
-                self.part()?;
-            }
-        }
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 fn pl(key: &RowKey) -> bool {
     match key {
         RowKey::Meta(name) => !control_name(name),
@@ -1413,8 +1350,7 @@ impl Transaction for Txn<'_> {
         let result = (|| {
             let h = preflight(&row)?;
             if *row.key == RowKey::Meta("minimum_writer_capability".into()) {
-                let bytes = codec::capture(row.value, CONTROL_BYTES)?;
-                let next: u64 = serde_json::from_slice(&bytes)?;
+                let next: u64 = serde_json::from_slice(row.value)?;
                 let old = self
                     .store
                     .read_control::<u64>("minimum_writer_capability")?
@@ -1442,50 +1378,21 @@ impl Transaction for Txn<'_> {
             delete_chunks(self.store.conn()?, row.key)?;
             self.removed_keys.remove(row.key);
             let conn = self.store.conn()?;
-            let inline = if matches!(row.key, RowKey::Meta(_)) {
-                // Replay remains bounded before allocating for a changing producer.
-                let bytes = codec::capture(row.value, CONTROL_BYTES)?;
-                let mut hash = value_digest_start(h.value_version);
-                hash.update(&bytes);
-                ensure!(
-                    bytes.len() as u64 == h.len && integrity(hash) == h.digest,
-                    "state_v2_value_changed_after_preflight"
-                );
-                Some(bytes)
+            // Rows are immutable encoded bytes: no replay, so no change check.
+            let inline = if h.parts == 0 {
+                Some(row.value.to_vec())
             } else {
-                let expected = codec::capture(row.value, value_cap(row.key))?;
-                ensure!(
-                    codec::stored_digest(row.key, h.value_version, &expected)? == h.digest,
-                    "state_v2_value_changed_after_preflight"
-                );
-                let mut expected_hash = value_digest_start(h.value_version);
-                expected_hash.update(&expected);
-                let mut writer = PartWriter {
-                    conn,
-                    owner: chunk_owner(row.key)?,
-                    part: 0,
-                    bytes: Vec::with_capacity(if h.parts == 0 {
-                        INLINE_BYTES
-                    } else {
-                        PART_BYTES
-                    }),
-                    len: 0,
-                    hash: value_digest_start(h.value_version),
-                    cap: value_cap(row.key),
-                };
-                row.value.write(&mut writer)?;
-                ensure!(
-                    writer.len == h.len
-                        && integrity(writer.hash.clone()) == integrity(expected_hash),
-                    "state_v2_value_changed_after_preflight"
-                );
-                if h.parts == 0 {
-                    Some(writer.bytes)
-                } else {
-                    writer.part()?;
-                    ensure!(writer.part == h.parts, "state_v2_part_shape");
-                    None
+                let owner = chunk_owner(row.key)?;
+                let mut part = 0_u16;
+                for chunk in row.value.chunks(PART_BYTES) {
+                    conn.prepare_cached(
+                        "INSERT INTO value_chunks(owner_table,owner_kind,owner_key,position,chunk_no,chunk) VALUES(?1,?2,?3,?4,?5,?6)",
+                    )?
+                    .execute(params![owner.table, owner.kind, owner.key, owner.position, part, chunk])?;
+                    part += 1;
                 }
+                ensure!(part == h.parts, "state_v2_part_shape");
+                None
             };
             let mut values = row.key.values()?;
             let table = row.key.table();
@@ -1659,9 +1566,9 @@ impl Txn<'_> {
                         value_version: 1,
                         key: &RowKey::Meta("erasure_since".into()),
                         fixed: &Fixed::None,
-                        value: &ControlJson(
+                        value: &control_json(
                             &SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                        ),
+                        )?,
                     })?;
                 }
                 // Every deleting transaction gets its own epoch. Keep the
@@ -1670,20 +1577,20 @@ impl Txn<'_> {
                     value_version: 1,
                     key: &RowKey::Meta("erasure_pending".into()),
                     fixed: &Fixed::None,
-                    value: &ControlJson(&next),
+                    value: &control_json(&next)?,
                 })?;
             }
             self.put(RowInput {
                 value_version: 1,
                 key: &RowKey::Meta("minimum_writer_capability".into()),
                 fixed: &Fixed::None,
-                value: &ControlJson(&migrations::WRITER_CAPABILITY),
+                value: &control_json(&migrations::WRITER_CAPABILITY)?,
             })?;
             self.put(RowInput {
                 value_version: 1,
                 key: &RowKey::Meta("generation".into()),
                 fixed: &Fixed::None,
-                value: &ControlJson(&next),
+                value: &control_json(&next)?,
             })?;
             Ok(())
         })();

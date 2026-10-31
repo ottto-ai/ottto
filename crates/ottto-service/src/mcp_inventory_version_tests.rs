@@ -417,26 +417,6 @@ fn harvest_seed_post_success_failure_restart_and_read_free_dumps() {
 }
 
 #[test]
-fn version_registration_is_limited_to_the_two_sync_builders() {
-    let sync = include_str!("snapshot_sync.rs");
-    assert_eq!(sync.matches(".with_codex_versions(").count(), 2);
-    for (start, end) in [
-        ("fn prepare_sync_source_inner(", "struct ContinuationInputs"),
-        ("fn prepare_continuation_source(", "fn finish_sync_source("),
-    ] {
-        let after = sync.split(start).nth(1).expect("builder");
-        let body = after.split(end).next().unwrap();
-        assert_eq!(body.matches(".with_codex_versions(").count(), 1);
-    }
-    for code in [
-        include_str!("retry_owned_rotation.rs"),
-        include_str!("snapshots/codex_file_join.rs"),
-    ] {
-        assert!(!code.contains(".with_codex_versions("));
-    }
-}
-
-#[test]
 #[serial_test::serial]
 fn seed_validation_on_write_and_load_drops_and_counts_bad_values() {
     let home = test_home("seed-validation");

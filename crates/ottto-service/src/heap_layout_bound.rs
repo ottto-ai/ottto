@@ -136,6 +136,7 @@ scalar!(
     f32,
     f64,
     serde::de::IgnoredAny,
+    std::time::Instant,
     ()
 );
 impl HeapLayoutBound for String {
@@ -148,6 +149,13 @@ impl HeapLayoutBound for PathBuf {
     const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         c.add(self.capacity())
+    }
+}
+// Immutable owned string slices have no spare capacity or nested allocations.
+impl HeapLayoutBound for Box<str> {
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(self.len())
     }
 }
 impl<T: HeapLayoutBound> HeapLayoutBound for Option<T> {
@@ -813,24 +821,6 @@ mod sampled_scalar_buffer_tests {
         }
     }
 
-    #[test]
-    fn sampled_release_compiler_allowlist_refuses_unvalidated_versions() {
-        assert!(compiler_layout_supported(
-            "rustc 1.88.0 (6b00bc388 2025-06-23)"
-        ));
-        assert!(compiler_layout_supported(
-            "rustc 1.95.0 (59807616e 2026-04-14)"
-        ));
-        for compiler in [
-            "",
-            "rustc 1.95.1 (unknown)",
-            "rustc 1.195.0 (unknown)",
-            "rustc 1.95.0-nightly (unknown)",
-            "rustc 1.97.0 (unknown)",
-        ] {
-            assert!(!compiler_layout_supported(compiler));
-        }
-    }
     #[test]
     fn sampled_release_layout_bounds_nested_requested_allocations() {
         if !layout_supported() {

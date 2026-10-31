@@ -1,30 +1,10 @@
 //! Account families share the generic mapper; only window positions need policy.
 use super::super::{ClaudeAccountFamilyPending, ClaudeAccountFamilyPendingWindow};
+use super::catalogue::scan_index_fields;
 use super::*;
 use anyhow::{ensure, Context};
-use std::collections::BTreeSet;
-pub(super) const KINDS: &[&str] = &[
-    "account.current",
-    "account_window",
-    "account.absent_members",
-    "usage.pending",
-    "proof.account",
-    "proof.usage",
-    "proof.deferred_account",
-    "setting.binding",
-    "refusal.authority",
-];
 pub(super) use mapper::family as dependency_family;
-macro_rules! maps {
-    ($m:ident) => {
-        $m!(claude_usage_family_pending, "usage.pending");
-        $m!(claude_account_family_witnesses, "proof.account");
-        $m!(claude_usage_family_witnesses, "proof.usage");
-        $m!(claude_usage_authority_quarantine, "refusal.authority");
-        $m!(claude_account_deferred_holds, "proof.deferred_account");
-        $m!(session_account_bindings, "setting.binding");
-    };
-}
+use std::collections::BTreeSet;
 // Metadata, not a second account schema: current id, next ordinal, archive ids.
 type Positions = (Option<u64>, u64, Vec<u64>);
 fn windows(
@@ -113,11 +93,12 @@ pub(super) fn delta(
     _cx: &mut KindCx,
 ) -> Result<()> {
     macro_rules! save {
-        ($field:ident,$kind:literal) => {
-            mapper::map_delta(tx, $kind, &prev.$field, &next.$field)?;
+        ($f:ident, Accounts, (map $($c:ident)*), [$kind:literal], $h:ident) => {
+            mapper::map_delta(tx, $kind, &prev.$f, &next.$f)?;
         };
+        ($($t:tt)*) => {};
     }
-    maps!(save);
+    scan_index_fields!(each save);
     // Count inactive high-water controls too: losing one must not permit ID reuse.
     let manifest = mapper::key("account.current", "", 0)?;
     let mut controls = match tx.get(&manifest)? {
@@ -163,11 +144,12 @@ pub(super) fn hydrate_filtered(
 ) -> Result<()> {
     let roots = filter.map(|(roots, _)| roots);
     macro_rules! load {
-        ($field:ident,$kind:literal) => {
-            index.$field = mapper::read_map(tx, $kind, roots)?;
+        ($f:ident, Accounts, (map $($c:ident)*), [$kind:literal], $h:ident) => {
+            index.$f = mapper::read_map(tx, $kind, roots)?;
         };
+        ($($t:tt)*) => {};
     }
-    maps!(load);
+    scan_index_fields!(each load);
     let h = tx
         .get(&mapper::key("account.current", "", 0)?)?
         .context("accounts_missing_manifest")?;
@@ -261,26 +243,4 @@ pub(super) fn hydrate_filtered(
         Ok(())
     })?;
     Ok(())
-}
-pub(super) use mapper::{private_paths, references};
-
-pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
-    field: &str,
-    map: &mut A,
-    model: &ScanIndex,
-) -> std::result::Result<bool, A::Error> {
-    macro_rules! check {
-        ($field:ident,$kind:literal) => {
-            if field == stringify!($field) {
-                codec::check_map(map, &model.$field)?;
-                return Ok(true);
-            }
-        };
-    }
-    maps!(check);
-    if field == "claude_account_family_pending" {
-        codec::check_map(map, &model.claude_account_family_pending)?;
-        return Ok(true);
-    }
-    Ok(false)
 }

@@ -11584,19 +11584,6 @@ struct InstallSessionApiResponse {
     install_session_token: String,
 }
 
-#[cfg(test)]
-#[derive(Deserialize)]
-struct TelemetryDeviceRegisterApiResponse {
-    device: TelemetryDeviceApiResponse,
-    device_secret: String,
-    #[serde(default)]
-    identity_continuity_capability: Option<String>,
-    #[serde(default)]
-    credential_rotation_performed: Option<bool>,
-    #[serde(default)]
-    rotated_prior_device_id: Option<String>,
-}
-
 #[derive(Clone, Deserialize)]
 struct DeviceCredentialPreparationApiResponse {
     preparation_id: String,
@@ -11966,47 +11953,6 @@ fn validate_device_credential_status(
         ));
     }
     Ok(())
-}
-
-#[cfg(test)] // Only the removed legacy register path used it in production.
-fn validate_registration_continuity_response(
-    url: &str,
-    registered: &TelemetryDeviceRegisterApiResponse,
-    prior: Option<&PriorDeviceCredential>,
-) -> Result<(), LocalApiError> {
-    if registered
-        .identity_continuity_capability
-        .as_deref()
-        .is_some_and(|value| value != IDENTITY_CONTINUITY_CAPABILITY)
-    {
-        return Err(backend_response_unexpected(
-            url,
-            "telemetry registration returned an unsupported identity continuity capability"
-                .to_string(),
-        ));
-    }
-    match registered.credential_rotation_performed {
-        Some(true)
-            if registered.identity_continuity_capability.as_deref()
-                != Some(IDENTITY_CONTINUITY_CAPABILITY)
-                || prior.is_none()
-                || registered.rotated_prior_device_id.as_deref()
-                    != prior.map(|value| value.device_id.as_str()) =>
-        {
-            Err(backend_response_unexpected(
-                url,
-                "telemetry registration returned inconsistent credential rotation proof"
-                    .to_string(),
-            ))
-        }
-        Some(false) | None if registered.rotated_prior_device_id.is_some() => {
-            Err(backend_response_unexpected(
-                url,
-                "telemetry registration returned a prior device without rotation".to_string(),
-            ))
-        }
-        _ => Ok(()),
-    }
 }
 
 const IDENTITY_CONTINUITY_CAPABILITY: &str = "prior_device_credential_v1";
@@ -17803,32 +17749,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_managed_config_preview_extracts_otel_section_and_fence() {
-        let sectioned = "[otel]\nenvironment = \"prod\"\n\n[other]\nkey = 1\n";
-        let preview = super::codex_managed_config_preview(Some(sectioned))
-            .expect("otel section yields a preview");
-        let joined = preview["lines"]
-            .as_array()
-            .expect("lines")
-            .iter()
-            .map(|line| line.as_str().expect("str"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(joined.contains("[otel]"));
-        assert!(joined.contains("environment = \"prod\""));
-        assert!(!joined.contains("[other]"));
-
-        // Legacy fenced files still delegate to the fence extractor.
-        let fenced = "# ottto:start\n[otel]\nenvironment = \"prod\"\n# ottto:end\n";
-        let preview = super::codex_managed_config_preview(Some(fenced))
-            .expect("fenced body yields a preview");
-        assert_eq!(preview["lines"][0], "# ottto:start");
-
-        assert!(super::codex_managed_config_preview(None).is_none());
-        assert!(super::codex_managed_config_preview(Some("plain = true\n")).is_none());
-    }
-
-    #[test]
     fn claude_managed_config_preview_renders_managed_env_keys() {
         let fake_secret = format!("otel_{}", "k1v2x3y4z5".repeat(4));
         let body = format!(
@@ -17862,35 +17782,6 @@ mod tests {
         assert!(!joined.contains(&fake_secret));
         assert!(!joined.contains("UNRELATED_KEY"));
         assert!(!joined.contains("kept-private"));
-    }
-
-    #[test]
-    fn claude_managed_config_preview_absent_without_managed_keys() {
-        assert!(super::claude_managed_config_preview(None).is_none());
-        assert!(super::claude_managed_config_preview(Some("not json")).is_none());
-        assert!(
-            super::claude_managed_config_preview(Some("{\"env\": {\"OTHER\": \"1\"}}")).is_none()
-        );
-    }
-
-    #[test]
-    fn managed_config_preview_absent_without_fence_or_body() {
-        assert!(super::managed_config_preview("~/.codex/config.toml", None).is_none());
-        assert!(
-            super::managed_config_preview("~/.codex/config.toml", Some("plain = true\n")).is_none()
-        );
-    }
-
-    #[test]
-    fn redact_managed_config_line_masks_secret_bearing_keys() {
-        assert_eq!(
-            super::redact_managed_config_line("export OTEL_EXPORTER_OTLP_HEADERS='x-ottto short'"),
-            "export OTEL_EXPORTER_OTLP_HEADERS= …redacted…",
-        );
-        assert_eq!(
-            super::redact_managed_config_line("log_user_prompt = false"),
-            "log_user_prompt = false",
-        );
     }
 
     use super::*;
@@ -21375,30 +21266,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn maps_bad_token_to_local_auth_error() {
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_test".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: Some("bad-token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::Status {
-                    refresh_agent_status: false,
-                    retry_relay_authorization: false,
-                },
-            },
-        );
-
-        assert!(!response.ok);
-        assert_eq!(
-            response.error.expect("error").code,
-            CliErrorCode::LocalAuthFailed
-        );
-    }
-
-    #[test]
     #[serial]
     fn claude_accounts_require_auth_and_apply_operation_specific_mutations() {
         let root = control_test_root("claude-config-slots");
@@ -22740,12 +22607,32 @@ for line in sys.stdin:
             LocalControlCommand::AuthCompletePending {
                 claim_code: "claim_test".to_string(),
             },
+            LocalControlCommand::Status {
+                refresh_agent_status: false,
+                retry_relay_authorization: false,
+            },
+            LocalControlCommand::AuthSwitchAccount {
+                claim_code: "claim_test".into(),
+            },
+            LocalControlCommand::ClaudeAccountStartBrowserLogin {
+                schema_version: ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                operation_id: "claude_setup_a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0".into(),
+                target_id: None,
+            },
+            LocalControlCommand::ClaudeAccountStartBrowserReconnect {
+                schema_version: ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                operation_id: "claude_setup_b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".into(),
+                slot_id: "claude_slot_b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".into(),
+                target_id: "claude_target_b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".into(),
+            },
         ] {
             let response = handle_request(
                 &daemon(),
                 LocalControlRequest {
                     request_id: "req_cli_browser_claim".to_string(),
-                    protocol_version: PROTOCOL_VERSION,
+                    protocol_version: ottto_protocol::expected_local_control_protocol_version(
+                        &command,
+                    ),
                     token: Some("bad-token".to_string()),
                     client_kind: Some(LocalClientKind::Cli),
                     client_install_owner: None,
@@ -22753,40 +22640,6 @@ for line in sys.stdin:
                 },
             );
 
-            assert!(!response.ok);
-            assert_eq!(
-                response.error.expect("error").code,
-                CliErrorCode::LocalAuthFailed
-            );
-        }
-    }
-
-    #[test]
-    fn claude_browser_auth_commands_reject_bad_control_token() {
-        for command in [
-            LocalControlCommand::ClaudeAccountStartBrowserLogin {
-                schema_version: ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-                operation_id: "claude_setup_a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0".to_string(),
-                target_id: None,
-            },
-            LocalControlCommand::ClaudeAccountStartBrowserReconnect {
-                schema_version: ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-                operation_id: "claude_setup_b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".to_string(),
-                slot_id: "claude_slot_b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".to_string(),
-                target_id: "claude_target_b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".to_string(),
-            },
-        ] {
-            let response = handle_request(
-                &daemon(),
-                LocalControlRequest {
-                    request_id: "req_claude_browser_bad_token".to_string(),
-                    protocol_version: ottto_protocol::CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION,
-                    token: Some("bad-token".to_string()),
-                    client_kind: Some(LocalClientKind::Cli),
-                    client_install_owner: None,
-                    command,
-                },
-            );
             assert!(!response.ok);
             assert_eq!(
                 response.error.expect("error").code,
@@ -22821,29 +22674,6 @@ for line in sys.stdin:
         assert!(!serde_json::to_string(&response)
             .expect("response")
             .contains(submitted));
-    }
-
-    #[test]
-    fn auth_switch_account_rejects_bad_token() {
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_switch_bad_token".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: Some("bad-token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::AuthSwitchAccount {
-                    claim_code: "claim_test".to_string(),
-                },
-            },
-        );
-
-        assert!(!response.ok);
-        assert_eq!(
-            response.error.expect("error").code,
-            CliErrorCode::LocalAuthFailed
-        );
     }
 
     #[test]
@@ -24105,34 +23935,6 @@ for line in sys.stdin:
             telemetry_device_register_body_with_prior(&install_session, &machine, Some(&prior));
         assert_eq!(repeat["prior_device_id"], "device_prior");
         assert_eq!(repeat["prior_device_secret"], "secret_prior");
-    }
-
-    #[test]
-    fn telemetry_registration_response_keeps_old_backend_tolerance_and_checks_rotation() {
-        let url = "https://api.ottto.net/api/v1/telemetry/devices/register";
-        let prior = PriorDeviceCredential {
-            device_id: "device_prior".to_string(),
-            device_sources: vec!["codex".to_string()],
-            device_secret: "secret_prior".to_string(),
-        };
-        let old: TelemetryDeviceRegisterApiResponse = serde_json::from_str(
-            r#"{"device":{"id":"device","machine_id":"machine","sources":["codex"]},"device_secret":"secret"}"#,
-        )
-        .expect("old backend response");
-        assert_eq!(old.device.id, "device");
-        assert_eq!(old.device_secret, "secret");
-        validate_registration_continuity_response(url, &old, Some(&prior))
-            .expect("additive response fields stay optional");
-
-        let rotated: TelemetryDeviceRegisterApiResponse = serde_json::from_str(
-            r#"{"device":{"id":"device_new","machine_id":"machine","sources":["codex"]},"device_secret":"secret_new","identity_continuity_capability":"prior_device_credential_v1","credential_rotation_performed":true,"rotated_prior_device_id":"device_prior"}"#,
-        )
-        .expect("rotation response");
-        validate_registration_continuity_response(url, &rotated, Some(&prior))
-            .expect("matching rotation proof");
-
-        validate_registration_continuity_response(url, &rotated, None)
-            .expect_err("first registration cannot claim a prior rotation");
     }
 
     #[test]
@@ -26349,32 +26151,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn typed_status_rejects_cloud_sessions_protocol_version() {
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_status_v16".to_string(),
-                protocol_version: ottto_protocol::CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::Status {
-                    refresh_agent_status: false,
-                    retry_relay_authorization: false,
-                },
-            },
-        );
-
-        assert!(!response.ok);
-        let error = response.error.expect("error");
-        assert_eq!(error.code, CliErrorCode::InvalidRequest);
-        assert!(error
-            .message
-            .contains("unsupported local control protocol_version 16"));
-        assert!(error.message.contains("expected 15"));
-    }
-
-    #[test]
     fn validated_api_base_url_rejects_untrusted_https_origin() {
         assert!(validated_api_base_url(Some("https://attacker.example")).is_err());
     }
@@ -26392,38 +26168,6 @@ for line in sys.stdin:
         assert_eq!(
             validated_api_base_url(Some(DIRECT_API_BASE_URL)).expect("valid"),
             DIRECT_API_BASE_URL.to_string()
-        );
-    }
-
-    #[test]
-    fn agent_context_url_encodes_local_client_query() {
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_context".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: DIRECT_API_BASE_URL.to_string(),
-        };
-        let url = agent_context_url(
-            DIRECT_API_BASE_URL,
-            &connection,
-            &AgentContextQuery {
-                days: Some(14),
-                range: Some("last 7 days".to_string()),
-                start_date: Some("2026-06-01".to_string()),
-                end_date: Some("2026-06-05".to_string()),
-                timezone: Some("America/Los_Angeles".to_string()),
-                source: Some("claude_code".to_string()),
-                machine_id: Some("otm_test".to_string()),
-                source_plan_profile_id: Some("profile_123".to_string()),
-                max_tokens: Some(4000),
-                all_machines: false,
-            },
-        );
-
-        assert_eq!(
-            url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_context/local-client/agent-context?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&source=claude_code&machine_id=otm_test&source_plan_profile_id=profile_123&max_tokens=4000"
         );
     }
 
@@ -26499,59 +26243,6 @@ for line in sys.stdin:
         assert_eq!(
             url,
             "https://api.ottto.net/api/v1/setup-runs/setup_sessions/local-client/sessions?limit=25&cursor=next+123&range=today&start_date=2026-06-01&end_date=2026-06-05&source=codex&model=gpt-5.3+codex&billing_provider=openai&billing_channel=subscription&machine_id=otm_test&source_plan_profile_id=profile_123&min_cost=1.25&max_cost=7.5&sort_by=cost&sort_dir=desc&search=roadmap+review"
-        );
-    }
-
-    #[test]
-    fn agent_recommendations_url_targets_local_client_endpoint() {
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_recommendations".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: DIRECT_API_BASE_URL.to_string(),
-        };
-        let url = agent_recommendations_url(
-            DIRECT_API_BASE_URL,
-            &connection,
-            &AgentRecommendationsQuery::default(),
-        );
-
-        assert_eq!(
-            url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_recommendations/local-client/recommendations"
-        );
-    }
-
-    #[test]
-    fn agent_provider_impact_url_encodes_local_client_query() {
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_provider_impact".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: DIRECT_API_BASE_URL.to_string(),
-        };
-        let url = agent_provider_impact_url(
-            DIRECT_API_BASE_URL,
-            &connection,
-            &AgentProviderImpactQuery {
-                date_from: Some("2026-06-01".to_string()),
-                date_to: Some("2026-06-08".to_string()),
-                provider: Some("openai".to_string()),
-                app: Some("codex".to_string()),
-                kind: Some("quota".to_string()),
-                confidence: Some("high".to_string()),
-                impact_priority: Some("critical".to_string()),
-                status: Some("verified".to_string()),
-                q: Some("subscription change".to_string()),
-                limit: Some(25),
-            },
-        );
-
-        assert_eq!(
-            url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_provider_impact/local-client/provider-impact?date_from=2026-06-01&date_to=2026-06-08&provider=openai&app=codex&kind=quota&confidence=high&impact_priority=critical&status=verified&q=subscription+change&limit=25"
         );
     }
 
@@ -26868,43 +26559,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn update_state_keeps_release_notes_for_current_build() {
-        let state = update_state_from_manifest(
-            release_manifest_for_update("0.2.0", Some("0.1.0"), None),
-            "0.2.0".to_string(),
-            ReleaseChannel::Dev,
-            Some("2026-05-20T00:00:00Z".to_string()),
-            Some("deadbeef".to_string()),
-            InstallOwner::AppBundle,
-        );
-
-        assert_eq!(state.status, UpdateStatus::Current);
-        assert_eq!(state.gate, UpdateGate::Current);
-        assert_eq!(
-            state.release_notes.as_deref(),
-            Some("- Fixes sign-in completion.\n- Improves local usage sync reliability.")
-        );
-    }
-
-    #[test]
-    fn update_state_omits_blank_release_notes() {
-        let mut manifest = release_manifest_for_update("0.2.0", Some("0.1.0"), None);
-        manifest.release_notes = Some("  \n\t  ".to_string());
-
-        let state = update_state_from_manifest(
-            manifest,
-            "0.2.0".to_string(),
-            ReleaseChannel::Dev,
-            Some("2026-05-20T00:00:00Z".to_string()),
-            Some("deadbeef".to_string()),
-            InstallOwner::AppBundle,
-        );
-
-        assert_eq!(state.status, UpdateStatus::Current);
-        assert_eq!(state.release_notes, None);
-    }
-
-    #[test]
     fn update_state_hard_blocks_below_min_supported_version() {
         let state = update_state_from_manifest(
             release_manifest_for_update("0.2.0", Some("0.1.0"), None),
@@ -27021,26 +26675,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn default_release_manifest_url_follows_local_channel() {
-        assert_eq!(
-            default_release_manifest_url(&ReleaseChannel::Dev),
-            "https://install.ottto.net/ottto-local-platform/releases/dev/latest/release-manifest.json"
-        );
-        assert_eq!(
-            default_release_manifest_url(&ReleaseChannel::Preview),
-            "https://install.ottto.net/ottto-local-platform/releases/preview/latest/release-manifest.json"
-        );
-        assert_eq!(
-            default_release_manifest_url(&ReleaseChannel::StableCandidate),
-            "https://install.ottto.net/ottto-local-platform/releases/stable-candidate/latest/release-manifest.json"
-        );
-        assert_eq!(
-            default_release_manifest_url(&ReleaseChannel::Stable),
-            "https://install.ottto.net/ottto-local-platform/releases/stable/latest/release-manifest.json"
-        );
-    }
-
-    #[test]
     fn trusted_companion_can_read_status_without_keychain_token() {
         let response = handle_request_with_peer(
             &daemon(),
@@ -27084,27 +26718,6 @@ for line in sys.stdin:
             response.error.expect("error").code,
             CliErrorCode::LocalClientNotTrusted
         );
-    }
-
-    #[test]
-    fn peer_euid_matches_daemon_for_self_uid() {
-        let peer = LocalClientPeer::from_pid_and_euid(Some(1234), Some(daemon_effective_uid()));
-        assert!(peer.euid_matches_daemon());
-    }
-
-    #[test]
-    fn peer_euid_mismatch_is_not_daemon() {
-        // A different uid (daemon uid +1) must not match.
-        let other = daemon_effective_uid().wrapping_add(1);
-        let peer = LocalClientPeer::from_pid_and_euid(Some(1234), Some(other));
-        assert!(!peer.euid_matches_daemon());
-    }
-
-    #[test]
-    fn peer_without_euid_fails_closed() {
-        // When the transport could not supply the peer euid we must fail closed.
-        let peer = LocalClientPeer::from_pid_and_euid(Some(1234), None);
-        assert!(!peer.euid_matches_daemon());
     }
 
     #[test]
@@ -27203,23 +26816,6 @@ for line in sys.stdin:
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn the_daemons_own_signature_is_what_separates_the_two() {
-        // The property that makes this self-correcting: with identical inputs,
-        // only the daemon's own signature decides, so no installer, LaunchAgent
-        // or app re-bootstrap has to carry the decision.
-        let release = resolve_companion_code_requirement(None, None, TEST_TEAM_ID, RELEASE_SIGNED);
-        let internal = resolve_companion_code_requirement(None, None, TEST_TEAM_ID, INTERNAL_BUILD);
-        assert_ne!(release, internal);
-        assert!(
-            matches!(release, CompanionCodeRequirement::Enforced(ref text) if text.contains(TEST_TEAM_ID))
-        );
-        assert!(
-            matches!(internal, CompanionCodeRequirement::Enforced(ref text) if !text.contains(TEST_TEAM_ID))
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
     #[serial]
     fn shipped_build_bakes_in_a_companion_team_id() {
         // Guards the actual shipped constant, not just the resolver: a build
@@ -27245,18 +26841,6 @@ for line in sys.stdin:
             companion_code_requirement(),
             CompanionCodeRequirement::Enforced(expected),
             "an unconfigured process must enforce a requirement matching its own build kind"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_test_binary_is_not_a_release_build() {
-        // Anchors the test above: `cargo test` produces an ad-hoc-signed
-        // binary, so the internal-build branch is the one it exercises. If this
-        // ever flips, the release branch above stops being hypothetical.
-        assert!(
-            !daemon_is_release_signed(),
-            "a cargo-built test binary must not look like a signed release"
         );
     }
 
@@ -27314,62 +26898,37 @@ for line in sys.stdin:
     #[cfg(target_os = "macos")]
     #[test]
     fn requirement_override_wins_on_a_release_daemon() {
-        // The documented QA flow: a release daemon pointed at a locally built,
-        // ad-hoc-signed Companion.
-        assert_eq!(
-            resolve_companion_code_requirement(
+        for (requirement, team, release, expected) in [
+            (
                 Some(DEV_ADHOC_COMPANION_REQUIREMENT),
                 Some("ABCDE12345"),
-                TEST_TEAM_ID,
-                RELEASE_SIGNED
+                RELEASE_SIGNED,
+                DEV_ADHOC_COMPANION_REQUIREMENT.to_string(),
             ),
-            CompanionCodeRequirement::Enforced(DEV_ADHOC_COMPANION_REQUIREMENT.to_string())
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn team_id_override_wins_over_the_baked_default() {
-        assert_eq!(
-            resolve_companion_code_requirement(
+            (
                 None,
                 Some(" ABCDE12345 "),
-                TEST_TEAM_ID,
-                RELEASE_SIGNED
+                RELEASE_SIGNED,
+                companion_team_code_requirement("ABCDE12345"),
             ),
-            CompanionCodeRequirement::Enforced(companion_team_code_requirement("ABCDE12345"))
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_team_id_override_also_applies_to_an_internal_build() {
-        // An explicit team id is an instruction, not a hint: it must not be
-        // quietly downgraded to the identifier-only internal requirement.
-        assert_eq!(
-            resolve_companion_code_requirement(
+            (
                 None,
                 Some("ABCDE12345"),
-                TEST_TEAM_ID,
-                INTERNAL_BUILD
+                INTERNAL_BUILD,
+                companion_team_code_requirement("ABCDE12345"),
             ),
-            CompanionCodeRequirement::Enforced(companion_team_code_requirement("ABCDE12345"))
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn blank_overrides_fall_through_instead_of_changing_the_outcome() {
-        // An empty env var is an operator slip, not an instruction.
-        assert_eq!(
-            resolve_companion_code_requirement(
+            (
                 Some(""),
                 Some("\t\n"),
-                TEST_TEAM_ID,
-                RELEASE_SIGNED
+                RELEASE_SIGNED,
+                companion_team_code_requirement(TEST_TEAM_ID),
             ),
-            CompanionCodeRequirement::Enforced(companion_team_code_requirement(TEST_TEAM_ID))
-        );
+        ] {
+            assert_eq!(
+                resolve_companion_code_requirement(requirement, team, TEST_TEAM_ID, release),
+                CompanionCodeRequirement::Enforced(expected)
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -27551,82 +27110,45 @@ for line in sys.stdin:
 
     #[test]
     fn diagnostics_upload_requires_explicit_approval() {
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_diagnostics_upload_missing_approval".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::DiagnosticsCollect {
-                    upload: true,
-                    upload_approval: None,
-                    api_base_url: None,
+        for (upload_approval, message) in [
+            (None, "--approve-upload"),
+            (
+                Some(DiagnosticsUploadApproval {
+                    approved: true,
+                    retention_disclosure_accepted: false,
+                    support_claim: Some("support_123".into()),
+                }),
+                "--accept-retention-disclosure",
+            ),
+            (
+                Some(DiagnosticsUploadApproval {
+                    approved: true,
+                    retention_disclosure_accepted: true,
+                    support_claim: None,
+                }),
+                "Ottto login or --support-claim",
+            ),
+        ] {
+            let response = handle_request(
+                &daemon(),
+                LocalControlRequest {
+                    request_id: "req_diagnostics_refusal".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    token: Some("token".into()),
+                    client_kind: Some(LocalClientKind::Cli),
+                    client_install_owner: None,
+                    command: LocalControlCommand::DiagnosticsCollect {
+                        upload: true,
+                        upload_approval,
+                        api_base_url: None,
+                    },
                 },
-            },
-        );
-
-        assert!(!response.ok);
-        let error = response.error.expect("error");
-        assert_eq!(error.code, CliErrorCode::InvalidRequest);
-        assert!(error.message.contains("--approve-upload"));
-    }
-
-    #[test]
-    fn diagnostics_upload_requires_retention_disclosure() {
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_diagnostics_upload_missing_retention".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::DiagnosticsCollect {
-                    upload: true,
-                    upload_approval: Some(DiagnosticsUploadApproval {
-                        approved: true,
-                        retention_disclosure_accepted: false,
-                        support_claim: Some("support_123".to_string()),
-                    }),
-                    api_base_url: None,
-                },
-            },
-        );
-
-        assert!(!response.ok);
-        let error = response.error.expect("error");
-        assert_eq!(error.code, CliErrorCode::InvalidRequest);
-        assert!(error.message.contains("--accept-retention-disclosure"));
-    }
-
-    #[test]
-    fn diagnostics_upload_requires_login_or_support_claim() {
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_diagnostics_upload_missing_auth".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::DiagnosticsCollect {
-                    upload: true,
-                    upload_approval: Some(DiagnosticsUploadApproval {
-                        approved: true,
-                        retention_disclosure_accepted: true,
-                        support_claim: None,
-                    }),
-                    api_base_url: None,
-                },
-            },
-        );
-
-        assert!(!response.ok);
-        let error = response.error.expect("error");
-        assert_eq!(error.code, CliErrorCode::InvalidRequest);
-        assert!(error.message.contains("Ottto login or --support-claim"));
+            );
+            assert!(!response.ok);
+            let error = response.error.expect("error");
+            assert_eq!(error.code, CliErrorCode::InvalidRequest);
+            assert!(error.message.contains(message));
+        }
     }
 
     #[test]
@@ -30219,39 +29741,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn pi_smoke_command_runs_non_interactive_prompt_instead_of_help() {
-        let command = smoke_command(&SourceKind::Pi);
-
-        assert_eq!(command.program, "pi");
-        assert!(command.args.iter().any(|arg| arg == "--print"));
-        assert!(command.args.iter().any(|arg| arg == "--no-builtin-tools"));
-        assert!(command.args.iter().any(|arg| arg == "--no-context-files"));
-        assert!(command.args.iter().any(|arg| arg == SMOKE_PROMPT));
-        assert!(!command.args.iter().any(|arg| arg == "--help"));
-    }
-
-    #[test]
-    fn codex_smoke_command_uses_json_event_mode_for_otel_flush() {
-        let command = smoke_command(&SourceKind::Codex);
-
-        assert_eq!(command.program, "codex");
-        assert!(command.args.iter().any(|arg| arg == "exec"));
-        assert!(command.args.iter().any(|arg| arg == "--ignore-user-config"));
-        assert!(command.args.iter().any(|arg| arg == "--ignore-rules"));
-        assert!(command.args.iter().any(|arg| arg == "--ephemeral"));
-        assert!(command.args.iter().any(|arg| arg == "--json"));
-        assert!(command
-            .args
-            .iter()
-            .any(|arg| arg == "--skip-git-repo-check"));
-        assert!(command
-            .args
-            .windows(2)
-            .any(|args| args == ["-c", "model_reasoning_effort=low"]));
-        assert!(command.args.iter().any(|arg| arg == SMOKE_PROMPT));
-    }
-
-    #[test]
     fn pi_smoke_command_includes_route_provider_model_and_thinking() {
         let route = PiModelRoute {
             provider: "google-vertex".to_string(),
@@ -30358,15 +29847,6 @@ for line in sys.stdin:
             "timeout path must not block on a descendant-held stdout pipe"
         );
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn pi_session_import_platform_support_matches_rooted_open_contract() {
-        assert_eq!(pi_session_import_supported_on_target(), cfg!(unix));
-        assert_eq!(
-            require_pi_session_import_platform_support().is_ok(),
-            cfg!(unix)
-        );
     }
 
     #[cfg(unix)]
@@ -31537,23 +31017,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_smoke_command_places_prompt_after_print_flag() {
-        let command = smoke_command(&SourceKind::ClaudeCode);
-
-        assert_eq!(command.program, "claude");
-        let print_index = command
-            .args
-            .iter()
-            .position(|arg| arg == "-p")
-            .expect("print flag");
-        assert_eq!(
-            command.args.get(print_index + 1).map(String::as_str),
-            Some(SMOKE_PROMPT)
-        );
-        assert!(command.args.iter().any(|arg| arg == "--disallowedTools"));
-    }
-
-    #[test]
     fn command_diagnostics_are_redacted_before_display() {
         let diagnostic = redact_command_diagnostic(
             "Token sk-secret123 is expired at /Users/ron/.aws/sso/cache/file.json account_id=org_123 raw_prompt=show private repo",
@@ -31721,6 +31184,18 @@ X-API-Key = "otel_redacted"
     #[test]
     fn codex_source_off_recovers_orphan_end_with_exact_byte_preservation() {
         let generated = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
+        let external = generated.lines().nth(3).unwrap().replace(
+            "http://127.0.0.1:44621/v1/traces",
+            "https://collector.example/v1/traces",
+        );
+        for (body, expected) in [
+            (format!("{} # retain annotation\n{external}\n# ottto:end\n", generated.lines().nth(2).unwrap()), format!(" # retain annotation\n{external}\n")),
+            ("[otel]\nenvironment='custom'\nexporter = { otlp-http = { endpoint='http://localhost:44621/v1/logs', headers={ X-Ottto-Local-Relay='codex' } } }\n# ottto:end\ncustom_setting=true\n".into(), "[otel]\nenvironment='custom'\n\ncustom_setting=true\n".into()),
+        ] {
+            let next = codex_source_off_body(&body).unwrap();
+            assert_eq!(next, expected);
+            assert_eq!(codex_source_off_body(&next).unwrap(), next);
+        }
         for eol in ["\n", "\r\n"] {
             let prefix = format!("# user formatting{eol}model='kept'{eol}");
             let suffix = format!("[profiles.work]{eol}model = 'also kept' # user comment{eol}");
@@ -31732,34 +31207,6 @@ X-API-Key = "otel_redacted"
             assert_eq!(codex_source_off_body(&next).unwrap(), next);
             assert!(!next.contains("/v1/"));
         }
-    }
-
-    #[test]
-    fn codex_source_off_orphan_keeps_external_exporter_and_assignment_comment() {
-        let generated = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
-        let external = generated.lines().nth(3).unwrap().replace(
-            "http://127.0.0.1:44621/v1/traces",
-            "https://collector.example/v1/traces",
-        );
-        let body = format!(
-            "{} # retain annotation\n{external}\n# ottto:end\n",
-            generated.lines().nth(2).unwrap()
-        );
-        let expected = format!(" # retain annotation\n{external}\n");
-        let next = codex_source_off_body(&body).unwrap();
-        assert_eq!(next, expected);
-        assert_eq!(codex_source_off_body(&next).unwrap(), next);
-    }
-
-    #[test]
-    fn codex_source_off_orphan_keeps_otel_section_scope_and_user_fields() {
-        let body = "[otel]\nenvironment='custom'\nexporter = { otlp-http = { endpoint='http://localhost:44621/v1/logs', headers={ X-Ottto-Local-Relay='codex' } } }\n# ottto:end\ncustom_setting=true\n";
-        let expected = "[otel]\nenvironment='custom'\n\ncustom_setting=true\n";
-        assert_eq!(codex_source_off_body(body).unwrap(), expected);
-        assert_eq!(
-            expected.parse::<DocumentMut>().unwrap()["otel"]["custom_setting"].as_bool(),
-            Some(true)
-        );
     }
 
     #[test]
@@ -32079,20 +31526,6 @@ X-API-Key = "otel_redacted"
     #[test]
     #[serial]
     #[cfg(unix)]
-    fn startup_relay_without_settings_binds_default() {
-        let (root, _guards) = managed_claude_relay_fixture();
-        fs::remove_file(root.join(".claude/settings.json")).unwrap();
-        let listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(
-            listener.local_addr().unwrap().port(),
-            crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    #[cfg(unix)]
     fn startup_relay_busy_preferred_port_uses_default_then_fallbacks() {
         let (root, _guards) = managed_claude_relay_fixture();
         let ports = startup_relay_candidates();
@@ -32179,26 +31612,6 @@ X-API-Key = "otel_redacted"
         assert_eq!(attempts, 2);
         assert_eq!(listener.local_addr().unwrap().port(), ports[1]);
         assert_eq!(fs::read(settings).unwrap(), before);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    #[cfg(unix)]
-    fn rebind_uses_free_approved_port_before_old_port() {
-        let (root, _guards) = managed_claude_relay_fixture();
-        let ports = startup_relay_candidates();
-        write_startup_relay_settings(
-            &root,
-            &crate::otlp_relay::local_relay_base_url_for_port(ports[1]),
-        );
-        let mut attempts = 0;
-        let listener = crate::otlp_relay::rebind_relay_listener(ports[0], &mut |old, attempt| {
-            attempts += 1;
-            crate::otlp_relay::bind_replacement_local_relay_listener(old, attempt)
-        });
-        assert_eq!(attempts, 1);
-        assert_eq!(listener.local_addr().unwrap().port(), ports[1]);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -32317,20 +31730,6 @@ X-API-Key = "otel_redacted"
         assert_eq!(default.local_addr().unwrap().port(), ports[0]);
         let fallback = bind();
         assert_eq!(fallback.local_addr().unwrap().port(), ports[2]);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    #[cfg(unix)]
-    fn rebind_ignores_approved_port_outside_candidate_list() {
-        let (root, _guards) = managed_claude_relay_fixture();
-        // The fixture's approved 48123 endpoint is outside every uid's list.
-        let ports = startup_relay_candidates();
-        let _busy_old = std::net::TcpListener::bind(("127.0.0.1", ports[1])).unwrap();
-        let listener =
-            crate::otlp_relay::bind_replacement_local_relay_listener(ports[1], 1).unwrap();
-        assert_eq!(listener.local_addr().unwrap().port(), ports[0]);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -36321,35 +35720,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    fn agent_read_http_timeout_covers_heavy_org_reads() {
-        assert!(AGENT_READ_HTTP_TIMEOUT >= Duration::from_secs(120));
-        assert!(AGENT_READ_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn setup_verification_http_timeout_covers_full_poll_window() {
-        assert!(SETUP_VERIFICATION_HTTP_TIMEOUT > VERIFICATION_WAIT_TIMEOUT);
-        assert!(SETUP_VERIFICATION_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn setup_verification_marker_timeout_stays_interactive() {
-        assert!(SETUP_VERIFICATION_MARKER_HTTP_TIMEOUT < BACKEND_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn pi_verify_budgets_fit_interactive_cli_bounds() {
-        assert!(PI_SMOKE_COMMAND_TIMEOUT < SMOKE_COMMAND_TIMEOUT);
-        assert!(PI_VERIFICATION_WAIT_TIMEOUT < VERIFICATION_WAIT_TIMEOUT);
-        assert!(PI_VERIFICATION_HTTP_TIMEOUT < SETUP_VERIFICATION_HTTP_TIMEOUT);
-        assert!(PI_VERIFICATION_HTTP_TIMEOUT > PI_VERIFICATION_WAIT_TIMEOUT);
-        assert!(
-            PI_SMOKE_COMMAND_TIMEOUT + PI_VERIFICATION_HTTP_TIMEOUT + PIPE_DRAIN_TIMEOUT
-                < Duration::from_secs(90)
-        );
-    }
-
-    #[test]
     fn setup_verification_request_honors_custom_timeout() {
         let api_base_url = delayed_setup_verification_server(
             "setup_slow_verification",
@@ -36376,12 +35746,6 @@ X-API-Key = "otel_redacted"
 
         assert!(matches!(result, Err(LocalApiError::TimedOut(_))));
         assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn setup_scan_result_http_timeout_covers_synchronous_backend_work() {
-        assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT >= Duration::from_secs(120));
-        assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
     }
 
     #[test]

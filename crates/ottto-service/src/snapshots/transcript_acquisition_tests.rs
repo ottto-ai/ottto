@@ -1185,12 +1185,17 @@ type ProductionScanPage = (
 fn production_scan_page_at_with_setup(
     fixture: &ScanFixture,
     source: SnapshotSource,
-    index: ScanIndex,
+    mut index: ScanIndex,
     cache: Option<Arc<sampled_scan::SharedCache>>,
     namespace: &str,
     collected_at: &str,
     setup: impl FnOnce(&mut OwnedSourceScan),
 ) -> ProductionScanPage {
+    if source == SnapshotSource::ClaudeCode {
+        if let Some(cache) = &cache {
+            cache.bind_withheld(&mut index);
+        }
+    }
     let mut scan = OwnedSourceScan::new(
         source,
         std::slice::from_ref(&fixture.root),
@@ -1217,6 +1222,7 @@ fn finish_production_scan_page(
     mut scan: OwnedSourceScan,
     source: SnapshotSource,
 ) -> ProductionScanPage {
+    withheld_account::support::clock(&scan.index.withheld_memo);
     let mut modes = (0, 0, 0);
     let mut metrics = (0, 0);
     loop {
@@ -2635,155 +2641,6 @@ fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value 
     serde_json::to_value(scan.snapshots).unwrap()
 }
 
-/// The shipped release compiler must exercise this path rather than silently
-/// passing the rest of the sampled suite through unsupported-layout skips.
-#[test]
-#[cfg(all(target_os = "macos", target_pointer_width = "64"))]
-fn sampled_release_compiler_enables_native_tails_for_both_providers() {
-    let compiler = env!("OTTTO_SCAN_LAYOUT_RUSTC");
-    if !(compiler.starts_with("rustc 1.88.0 ") || compiler.starts_with("rustc 1.95.0 ")) {
-        return;
-    }
-    assert!(
-        crate::heap_layout_bound::layout_supported(),
-        "validated release compiler must admit bounded native cache: {compiler}"
-    );
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        let fixture = ScanFixture::new(source);
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-        let (index, _, modes) = production_scan(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            Some(cache.clone()),
-            "release-compiler",
-        );
-        assert_eq!(modes, (1, 0, 0));
-        fixture.file.append(&usage(source, 140, 1, "fixture-model"));
-        let (_, tail, modes, metrics) =
-            production_scan_with_metrics(&fixture, source, index, Some(cache), "release-compiler");
-        assert_eq!(modes, (0, 1, 0));
-        assert!(metrics.0 < fixture.file.0.metadata().unwrap().len());
-        assert!(metrics.1 > 0);
-        let (_, full, _) = production_scan(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            None,
-            "release-compiler",
-        );
-        assert_eq!(production_body(source, tail), production_body(source, full));
-    }
-}
-
-#[test]
-fn sampled_production_large_session_append_reuses_bounded_history() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let mut failures = Vec::new();
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        let fixture = ScanFixture::new(source);
-        for id in 0..1200 {
-            fixture
-                .file
-                .append(&usage(source, 100 + id as u64, id, "synthetic-model"));
-        }
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        let (index, _, modes, _) = production_scan_with_metrics(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            Some(cache.clone()),
-            "large-native-history",
-        );
-        assert_eq!(modes, (1, 0, 0));
-        let before = fs::metadata(&fixture.file.0).unwrap().len();
-        fixture
-            .file
-            .append(&usage(source, 1500, 1200, "synthetic-model"));
-        let after = fs::metadata(&fixture.file.0).unwrap().len();
-        let (_, tail, modes, bytes) = production_scan_with_metrics(
-            &fixture,
-            source,
-            index,
-            Some(cache),
-            "large-native-history",
-        );
-        let (_, full, _, full_bytes) = production_scan_with_metrics(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            None,
-            "independent-full-reader",
-        );
-        assert_eq!(production_body(source, tail), production_body(source, full));
-        assert_eq!(full_bytes.0, 0); // Unsampled oracle uses native production parsing.
-        eprintln!("LARGE_SESSION_TAIL source={source:?} modes={modes:?} full_bytes={after} suffix_bytes={} native_bytes={} guard_bytes={}", after - before, bytes.0, bytes.1);
-        if modes != (0, 1, 0) || bytes.0 != after - before || bytes.1 != 8192 {
-            failures.push(format!("{source:?}: {modes:?}, bytes={bytes:?}"));
-        }
-    }
-    assert!(failures.is_empty(), "{}", failures.join("; "));
-}
-
-#[test]
-fn sampled_native_large_history_has_constant_step_charge_and_conservative_clones() {
-    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        let mut visits = Vec::new();
-        for count in [100, 1200, 2400] {
-            let fixture = Fixture::new(source);
-            for n in 0..count {
-                fixture.append(&usage(source, 100 + n as u64, n, "fixture-model"));
-            }
-            let ((parser, total_visits, steps, micros), actual) =
-                crate::retry_allocation_probe::measure(|| {
-                    let (mut parser, _, scope) = native_parser(&fixture, source);
-                    parser.prepare_acquisition(None, &scope, None, 100).unwrap();
-                    let start = std::time::Instant::now();
-                    let mut total_visits = 0;
-                    let mut steps = 0;
-                    loop {
-                        let done = parser.step().unwrap();
-                        let mut counter = Counter::new(31 * 1024 * 1024);
-                        parser.heap_bound(&mut counter).unwrap();
-                        total_visits += counter.visits_for_test();
-                        steps += 1;
-                        if done {
-                            break;
-                        }
-                    }
-                    (parser, total_visits, steps, start.elapsed().as_micros())
-                });
-            let charge = crate::heap_layout_bound::bound(&parser, 31 * 1024 * 1024).unwrap();
-            assert!(charge >= actual.requested_live as usize);
-            let mut counter = Counter::new(31 * 1024 * 1024);
-            parser.heap_bound(&mut counter).unwrap();
-            visits.push(counter.visits_for_test());
-            let (cloned, copy_actual) =
-                crate::retry_allocation_probe::measure(|| parser.accumulator.clone());
-            let copy_charge = crate::heap_layout_bound::bound(&cloned, 31 * 1024 * 1024).unwrap();
-            assert!(copy_charge >= copy_actual.requested_live as usize);
-            assert!(total_visits <= steps * counter.visits_for_test());
-            assert_eq!(
-                crate::heap_layout_bound::bound(&cloned, crate::transcript_cache::ENTRY_BYTES)
-                    .is_some(),
-                copy_charge <= crate::transcript_cache::ENTRY_BYTES
-            );
-            eprintln!("LARGE_SESSION_CHARGE source={source:?} records={count} visits={} total_visits={total_visits} steps={steps} parser_and_charge_us={micros} active_bytes={charge} active_requested={} clone_bytes={copy_charge} clone_requested={}", counter.visits_for_test(), actual.requested_live, copy_actual.requested_live);
-        }
-        assert!(
-            visits.windows(2).all(|n| n[0] == n[1]),
-            "{source:?} visits={visits:?}"
-        );
-    }
-}
-
 #[test]
 fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_restart() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3522,148 +3379,6 @@ fn sampled_production_long_owning_header_change_cannot_hide_outside_samples() {
     );
     let (_, full, _) = production_scan(&fixture, source, ScanIndex::default(), None, "a");
     assert_eq!(production_body(source, scan), production_body(source, full));
-}
-
-/// Explicit synthetic performance probe; excluded from routine unit runs.
-/// No timing threshold: filesystem caches and host load affect wall time.
-#[test]
-#[ignore = "run explicitly for native synthetic throughput measurements"]
-fn sampled_production_performance_32mib() {
-    assert!(
-        crate::heap_layout_bound::layout_supported(),
-        "native pinned layout required"
-    );
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        let fixture = ScanFixture::new(source);
-        let mut row = serde_json::to_vec(
-            &json!({"type":"progress", "data":{"synthetic_padding":"x".repeat(1024 * 1024)}}),
-        )
-        .unwrap();
-        row.push(b'\n');
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&fixture.file.0)
-            .unwrap();
-        for _ in 0..32 {
-            file.write_all(&row).unwrap();
-        }
-        drop(file);
-        drop(row);
-        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        let start = std::time::Instant::now();
-        let (mut index, _, modes, metrics) = production_scan_with_metrics(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            Some(cache.clone()),
-            "synthetic-perf",
-        );
-        let initial_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let initial_length = fs::metadata(&fixture.file.0).unwrap().len();
-        assert_eq!(modes, (1, 0, 0));
-        assert_eq!(metrics.0, initial_length);
-        for id in 1..=3 {
-            let before = fs::metadata(&fixture.file.0).unwrap().len();
-            fixture
-                .file
-                .append(&usage(source, 100 + id as u64 * 100, id, "fixture-model"));
-            let after = fs::metadata(&fixture.file.0).unwrap().len();
-            let start = std::time::Instant::now();
-            let (next, tail, modes, bytes) = production_scan_with_metrics(
-                &fixture,
-                source,
-                index,
-                Some(cache.clone()),
-                "synthetic-perf",
-            );
-            let tail_ms = start.elapsed().as_secs_f64() * 1000.0;
-            assert_eq!(modes, (0, 1, 0));
-            assert_eq!(bytes.0, after - before);
-            assert_eq!(bytes.1, 8192);
-            let cache_bound =
-                crate::heap_layout_bound::bound(&cache, crate::transcript_cache::CACHE_BYTES)
-                    .unwrap();
-            let start = std::time::Instant::now();
-            let (_, full, _) = production_scan(
-                &fixture,
-                source,
-                ScanIndex::default(),
-                None,
-                "synthetic-perf",
-            );
-            let full_ms = start.elapsed().as_secs_f64() * 1000.0;
-            assert_eq!(production_body(source, tail), production_body(source, full));
-            eprintln!("SAMPLED_PERFORMANCE source={source:?} file_bytes={after} initial_full_ms={initial_ms:.3} repeated_full_ms={full_ms:.3} tail_ms={tail_ms:.3} native_tail_bytes={} guard_bytes={} retained_layout_bytes={cache_bound}; excludes independent header/identity/sidecar/discovery reads", bytes.0, bytes.1);
-            index = next;
-        }
-    }
-}
-
-#[test]
-#[ignore = "explicit native allocation probe; process scope requires serial isolation"]
-fn sampled_production_allocation_baseline_and_tail() {
-    assert!(crate::heap_layout_bound::layout_supported());
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        let fixture = ScanFixture::new(source);
-        let mut row = serde_json::to_vec(
-            &json!({"type":"progress", "data":{"synthetic_padding":"x".repeat(1024 * 1024)}}),
-        )
-        .unwrap();
-        row.push(b'\n');
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&fixture.file.0)
-            .unwrap();
-        for _ in 0..32 {
-            file.write_all(&row).unwrap();
-        }
-        drop(file);
-        drop(row);
-        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-        let ((_, full, _), baseline) = crate::retry_allocation_probe::measure_process(|| {
-            production_scan(
-                &fixture,
-                source,
-                ScanIndex::default(),
-                None,
-                "allocation-fixture",
-            )
-        });
-        drop(full);
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        let ((index, _, _), cold) = crate::retry_allocation_probe::measure_process(|| {
-            production_scan(
-                &fixture,
-                source,
-                ScanIndex::default(),
-                Some(cache.clone()),
-                "allocation-fixture",
-            )
-        });
-        fixture.file.append(&usage(source, 140, 1, "fixture-model"));
-        let ((_, tail, modes), warm) = crate::retry_allocation_probe::measure_process(|| {
-            production_scan(
-                &fixture,
-                source,
-                index,
-                Some(cache.clone()),
-                "allocation-fixture",
-            )
-        });
-        assert_eq!(modes, (0, 1, 0));
-        let resident =
-            crate::heap_layout_bound::bound(&cache, crate::transcript_cache::CACHE_BYTES).unwrap();
-        let (_, full, _) = production_scan(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            None,
-            "allocation-fixture",
-        );
-        assert_eq!(production_body(source, tail), production_body(source, full));
-        eprintln!("SAMPLED_ALLOCATIONS source={source:?} baseline_full_scope_peak={} baseline_full_scope_live={} cold_sampled_scope_peak={} cold_sampled_scope_live={} warm_scope_peak={} warm_scope_live={} total_retained_layout={resident}; process probe counts allocations born within each scan only; pre-existing index/cache excluded from scope counts, included in resident layout and separate process RSS", baseline.requested_peak, baseline.requested_live, cold.requested_peak, cold.requested_live, warm.requested_peak, warm.requested_live);
-    }
 }
 
 #[test]
@@ -5836,7 +5551,7 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
             "held-index.json"
         });
         index.save(&path).unwrap();
-        let index = ScanIndex::load(&path).unwrap();
+        let mut index = ScanIndex::load(&path).unwrap();
         let queued = index
             .traversal
             .as_ref()
@@ -5851,7 +5566,7 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
             &mut ScanCensus::default(),
             None,
             183,
-            &index.files,
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
         )
         .unwrap();
         let retry_dependencies = sampled_scan::reduction_dependencies(

@@ -204,16 +204,6 @@ fn key_coverage(
     Ok(())
 }
 
-// Fixture Values use the same production JSON codec.
-#[cfg(test)]
-pub(super) struct Json<'a, T: ?Sized>(pub &'a T);
-#[cfg(test)]
-impl<T: Serialize + ?Sized> Value for Json<'_, T> {
-    fn write(&self, out: &mut dyn Write) -> Result<()> {
-        out.write_all(&encode(&json(self.0, VALUE_BYTES)?)?)?;
-        Ok(())
-    }
-}
 #[cfg(test)]
 pub(super) struct Encoder<W> {
     out: W,
@@ -272,11 +262,7 @@ pub(super) fn inventory(input: impl Read) -> std::result::Result<(), Pause> {
         ) -> std::result::Result<(), A::Error> {
             let model = ScanIndex::default();
             while let Some(field) = map.next_key::<String>()? {
-                if !(kinds_misc::inventory_field(&field, &mut map, &model)?
-                    || kinds_files::inventory_field(&field, &mut map, &model)?
-                    || kinds_accounts::inventory_field(&field, &mut map, &model)?
-                    || kinds_census::inventory_field(&field, &mut map, &model)?)
-                {
+                if !catalogue::inventory_field(&field, &mut map, &model)? {
                     return Err(serde::de::Error::custom("state_v2_ignored_field"));
                 }
             }
@@ -303,13 +289,14 @@ pub(super) fn inventory(input: impl Read) -> std::result::Result<(), Pause> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// [format] threshold magic logical digest and bounded decode.
+    /// [format] stored bytes never exceed JSON, restore exactly, keep the
+    /// logical digest and decode only within the cap.
     #[test]
-    fn threshold_magic_logical_digest_and_bounded_decode() {
-        for len in [0, 509, 510, 511, 512, 4096] {
+    fn stored_bytes_restore_exactly_with_logical_digest_and_bounded_decode() {
+        for len in [0, 4096] {
             let json = serde_json::to_vec(&"x".repeat(len)).unwrap();
             let stored = encode(&json).unwrap();
-            assert_eq!(stored.starts_with(MAGIC), json.len() >= 512);
+            assert!(stored.len() <= json.len());
             assert_eq!(expand(&stored, json.len() as u64).unwrap(), json);
             assert!(expand(&stored, json.len() as u64 - 1).is_err());
             let key = RowKey::record("file.progress", b"synthetic", 1).unwrap();

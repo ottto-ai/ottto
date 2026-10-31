@@ -207,10 +207,6 @@ impl Holds {
             self.1.sum,
         )
     }
-    #[cfg(test)]
-    pub(super) fn clone_provenance_for_test(&self) -> impl Sized {
-        self.1
-    }
     pub(super) fn contains(&self, field: &str, key: &str) -> bool {
         self.0.get(field).is_some_and(|map| map.contains_key(key))
     }
@@ -2702,8 +2698,6 @@ impl ScanIndex {
         self.decode_holds.1.count == 0 || self.decode_holds.1 == working.decode_holds.1
     }
     pub(super) fn decode_holds_family(&self, root: &str) -> bool {
-        #[cfg(test)]
-        SCOPE_VISITS.with(|count| count.set(count.get() + 1));
         !self.persistence_available()
             || self.decode_holds.2.contains(&repair_key(root))
             || [
@@ -2717,8 +2711,6 @@ impl ScanIndex {
             .any(|field| self.decode_holds.contains(field, root))
     }
     pub(crate) fn decode_holds_file(&self, key: &str) -> bool {
-        #[cfg(test)]
-        SCOPE_VISITS.with(|count| count.set(count.get() + 1));
         self.decode_holds.contains("files", key)
             || claude_index_path_member_ref(Path::new(key))
                 .is_some_and(|member| self.decode_holds_family(member.root))
@@ -3109,13 +3101,6 @@ pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
 
 fn repair_key(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
-}
-
-#[cfg(test)]
-thread_local! { static SCOPE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-#[cfg(test)]
-pub(super) fn scope_visits_for_test(reset: bool) -> usize {
-    SCOPE_VISITS.with(|count| if reset { count.replace(0) } else { count.get() })
 }
 
 #[cfg(test)]

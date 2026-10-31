@@ -23,9 +23,8 @@ pub(super) use runtime::{
     idle, load_locked, published, recovery_save_guard, save_locked, save_oversize_active,
     save_read_admitted, save_read_completed,
 };
+mod catalogue;
 mod codec;
-#[cfg(test)]
-mod field_coverage;
 mod ignored;
 mod interning;
 mod kinds;
@@ -127,59 +126,13 @@ const VALUE_BYTES: u64 = 64 * 1024 * 1024;
 const WAL_PASSIVE_BYTES: u64 = 8 * 1024 * 1024;
 const WAL_ALARM_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Readable closed record catalogue. Field-backed kinds inherit the original
-/// slot's privacy and presence contract; accepting a name is not a mapper.
+/// Readable closed record catalogue (catalogue.rs). Field-backed kinds inherit
+/// the original slot's privacy and presence contract.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct RecordKind(String);
 impl RecordKind {
     fn parse(name: &str) -> Result<Self> {
-        let known = matches!(
-            name,
-            "file.progress"
-                | "file.receipt"
-                | "file.terminal"
-                | "file.confirmed_empty"
-                | "file.entities"
-                | "file.census"
-                | "file.growth_retention"
-                // V2-only custody has no corresponding v1 positional slot.
-                | "raw_hold.growth_retention"
-                | "account_window"
-                | "account.window_retention"
-                | "account.current"
-                | "account.absent_members"
-                | "usage.pending"
-                | "family.requests"
-                | "proof.account"
-                | "proof.usage"
-                | "proof.owned_start"
-                | "proof.deferred_account"
-                | "accepted.entity"
-                | "accepted.activity"
-                | "accepted.rebuild_incidence"
-                | "accepted.ack_handoff"
-                | "refusal.snapshot"
-                | "refusal.authority"
-                | "resume.checkpoint"
-                | "setting.binding"
-                | "v1_field.census_shadow"
-                | "v1_field.census_money_marks"
-                | "v1_field.repair_provenance"
-                | "v1_field.duplicate_owners"
-                | "v1_field.birth_store"
-        ) || [
-            "raw_hold.",
-            "scan_state.",
-            "v1_field.",
-            "setting.",
-            "tombstone.",
-        ]
-        .iter()
-        .any(|prefix| {
-            name.strip_prefix(prefix)
-                .is_some_and(|slot| super::lenient_decode::FIELDS.contains(&slot))
-        });
-        anyhow::ensure!(known, Hold::UnknownRecordKind);
+        anyhow::ensure!(catalogue::accepts(name), Hold::UnknownRecordKind);
         Ok(Self(name.to_owned()))
     }
     fn name(&self) -> &str {
@@ -226,15 +179,17 @@ pub(super) struct Header {
     parts: u16,
 }
 
-/// Replayable streaming value: preflight and write must emit identical bytes.
+/// Stored row bytes handed to path/reference extractors; a stored row is read
+/// only if the extractor needs its value.
 pub(super) trait Value {
     fn write(&self, out: &mut dyn Write) -> Result<()>;
 }
+/// One immutable encoded row: `value` is the exact stored (codec) bytes.
 pub(super) struct RowInput<'a> {
     key: &'a RowKey,
     fixed: &'a Fixed,
     value_version: u32,
-    value: &'a dyn Value,
+    value: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -423,9 +378,9 @@ fn preflight(row: &RowInput<'_>) -> Result<Header> {
         value_version_supported(row.key, row.value_version),
         "scan_index_representation_refused"
     );
-    let stored = codec::capture(row.value, value_cap(row.key))?;
-    let len = stored.len() as u64;
-    let logical_digest = codec::stored_digest(row.key, row.value_version, &stored)?;
+    let len = row.value.len() as u64;
+    anyhow::ensure!(len <= value_cap(row.key), "state_v2_value_admission");
+    let logical_digest = codec::stored_digest(row.key, row.value_version, row.value)?;
     let parts = if matches!(row.key, RowKey::Meta(_)) || len <= INLINE_BYTES as u64 {
         0
     } else {
@@ -441,15 +396,7 @@ fn preflight(row: &RowInput<'_>) -> Result<Header> {
         parts,
     };
     header.row_checksum = if let RowKey::Meta(name) = row.key {
-        let bytes = codec::capture(row.value, CONTROL_BYTES)?;
-        let mut hash = value_digest_start(row.value_version);
-        use sha2::Digest;
-        hash.update(&bytes);
-        anyhow::ensure!(
-            bytes.len() as u64 == header.len && integrity(hash) == header.digest,
-            "state_v2_value_changed_after_preflight"
-        );
-        control_checksum(name, row.value_version, &bytes)
+        control_checksum(name, row.value_version, row.value)
     } else {
         row_checksum(&header)?
     };
@@ -517,12 +464,9 @@ fn row_checksum(h: &Header) -> Result<[u8; 16]> {
 #[cfg(test)]
 mod tests;
 
-struct ControlJson<'a, T: Serialize + ?Sized>(&'a T);
-impl<T: Serialize + ?Sized> Value for ControlJson<'_, T> {
-    fn write(&self, out: &mut dyn Write) -> Result<()> {
-        serde_json::to_writer(out, self.0)?;
-        Ok(())
-    }
+/// Controls are stored as plain serde JSON, bounded before allocation grows.
+fn control_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    codec::json(value, CONTROL_BYTES)
 }
 fn control_checksum(name: &str, version: u32, value: &[u8]) -> [u8; 16] {
     use sha2::Digest;

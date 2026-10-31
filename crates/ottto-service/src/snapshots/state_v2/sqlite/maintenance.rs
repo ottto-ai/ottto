@@ -317,7 +317,7 @@ impl Sqlite {
                 value_version: 1,
                 key: &RowKey::Meta(name.into()),
                 fixed: &Fixed::None,
-                value: &ControlJson(&value),
+                value: &control_json(&value)?,
             })?;
         }
         if tx.store.conn()?.execute_batch("COMMIT").is_err() {

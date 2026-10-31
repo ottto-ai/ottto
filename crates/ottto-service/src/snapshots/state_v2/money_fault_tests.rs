@@ -316,7 +316,7 @@ fn money_unknown_registered_marks_refuse_even_with_zero_length_payload() {
         key: &RowKey::record("v1_field.census_money_marks", Vec::new(), 0).unwrap(),
         fixed: &Fixed::None,
         value_version: 1,
-        value: &Bytes(Vec::new()),
+        value: &[],
     })
     .unwrap();
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));

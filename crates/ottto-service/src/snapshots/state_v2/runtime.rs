@@ -75,7 +75,9 @@ impl Hold {
         } else if error.chain().any(|e| {
             matches!(
                 e.to_string().as_str(),
-                "state_v2_save_ceiling" | "state_v2_path_diff_admission"
+                "state_v2_save_ceiling"
+                    | "state_v2_path_diff_admission"
+                    | "state_v2_value_admission"
             )
         }) {
             Self::SaveCeiling
