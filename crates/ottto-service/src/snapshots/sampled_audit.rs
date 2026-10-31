@@ -1408,8 +1408,19 @@ mod provenance_tests {
 /// restores its marker. Preserve the actual read's root: guessing from nested
 /// roots could change the acquisition scope. A committed retirement skips it.
 pub(super) fn queue_quiet_retirement(index: &mut ScanIndex, key: &str, scan_root: PathBuf) {
+    queue_pending(index, Path::new(key), scan_root, false, false);
+}
+
+/// The one deduplicated pending-candidate insert. Callers keep their own side
+/// effects (rearm cause, growth residue); an absent traversal queues nothing.
+fn queue_pending(
+    index: &mut ScanIndex,
+    path: &Path,
+    scan_root: PathBuf,
+    census_member: bool,
+    watcher_hint: bool,
+) {
     if let Some(traversal) = index.traversal.as_mut() {
-        let path = Path::new(key);
         if !traversal
             .pending_candidates
             .iter()
@@ -1418,8 +1429,8 @@ pub(super) fn queue_quiet_retirement(index: &mut ScanIndex, key: &str, scan_root
             traversal.pending_candidates.push_back(ScanTraversalPath {
                 scan_root,
                 path: path.to_owned(),
-                census_member: false,
-                watcher_hint: false,
+                census_member,
+                watcher_hint,
             });
         }
     }
@@ -1439,20 +1450,13 @@ pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) 
             crate::local_resource_diagnostics::rearm_cause::Cause::AuditCapDelay,
         );
     }
-    if let Some(traversal) = index.traversal.as_mut() {
-        if !traversal
-            .pending_candidates
-            .iter()
-            .any(|path| path.path == candidate.path)
-        {
-            traversal.pending_candidates.push_back(ScanTraversalPath {
-                scan_root: candidate.scan_root.clone(),
-                path: candidate.path.clone(),
-                census_member: true,
-                watcher_hint: true,
-            });
-        }
-    }
+    queue_pending(
+        index,
+        &candidate.path,
+        candidate.scan_root.clone(),
+        true,
+        true,
+    );
 }
 
 // To be replaced by #876's implementation at merge. Exact round-18 copy
@@ -1917,19 +1921,8 @@ pub(super) fn revalidate_growth(index: &mut ScanIndex, key: &str, roots: &[PathB
 }
 
 fn queue_growth_path(index: &mut ScanIndex, key: &str, scan_root: PathBuf, census_member: bool) {
+    queue_pending(index, Path::new(key), scan_root, census_member, false);
     if let Some(walk) = index.traversal.as_mut() {
-        if !walk
-            .pending_candidates
-            .iter()
-            .any(|queued| queued.path == Path::new(key))
-        {
-            walk.pending_candidates.push_back(ScanTraversalPath {
-                scan_root,
-                path: PathBuf::from(key),
-                census_member,
-                watcher_hint: false,
-            });
-        }
         walk.residue.index_keys.insert(key.to_owned());
     }
 }
