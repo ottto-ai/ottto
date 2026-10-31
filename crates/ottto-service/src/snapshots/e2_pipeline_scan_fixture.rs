@@ -285,3 +285,16 @@ pub(crate) fn adopt_acked_census_for_test(index: &mut ScanIndex, context: &str) 
 pub(crate) fn active_upload_context(index: &ScanIndex) -> Option<&str> {
     index.active_upload_context_fingerprint.as_deref()
 }
+
+/// Install the real exclusion input used by ordinary-money fixture families.
+/// An empty slice adopts request-owned money on the next normal source pass.
+pub(crate) fn write_exclusions(support: &Path, sessions: &[&str]) {
+    use sha2::Digest;
+    let path = claude_reemission_exclusions::ReemissionExclusions::path(support);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let lines = sessions
+        .iter()
+        .map(|session| format!("{:x}\n", sha2::Sha256::digest(session.as_bytes())))
+        .collect::<String>();
+    fs::write(path, lines).unwrap();
+}

@@ -612,11 +612,12 @@ fn terminal_off_on_ready(
 
 #[test]
 fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
-    e2::with_disabled(e2_pipeline_dark_matches_fold_absent_publication_and_selection_body);
+    e2_pipeline_dark_matches_fold_absent_publication_and_selection_body();
 }
 
 fn e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
     let mut c = Corpus::new("e2-pipeline-dark");
+    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&c.support, &[ROOT, COPY]);
     c.root(
         ROOT,
         &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20)),
