@@ -5436,8 +5436,14 @@ fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
         None
     );
     index = held;
-    // Preserve genuine sampled debt; move its existing deadline past due as in
-    // the native audit fixtures. The source mtime is now more than W old.
+    // Preserve genuine sampled debt for discovery past W. Since #870,
+    // overdue ordinary checkpoints still Tail: age cannot authorize a Full.
+    // Use the existing independent head-edit cause for the counted Full below;
+    // leading JSON whitespace preserves every native money/body field.
+    let mut changed = std::fs::read(&path).unwrap();
+    changed.insert(0, b' ');
+    std::fs::write(&path, changed).unwrap();
+    // The source mtime is now more than W old.
     index
         .files
         .get_mut(&key)
