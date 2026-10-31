@@ -1204,28 +1204,6 @@ pub(crate) mod test_support {
             }
         }
     }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn probe_resources() -> (usize, i32) {
-        let fds = (0..4096)
-            .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
-            .count();
-        let mut task = unsafe { std::mem::zeroed::<libc::proc_taskinfo>() };
-        let size = std::mem::size_of_val(&task) as libc::c_int;
-        assert_eq!(
-            unsafe {
-                libc::proc_pidinfo(
-                    libc::getpid(),
-                    libc::PROC_PIDTASKINFO,
-                    0,
-                    &mut task as *mut _ as *mut libc::c_void,
-                    size,
-                )
-            },
-            size
-        );
-        (fds, task.pti_threadnum)
-    }
 }
 
 #[cfg(test)]

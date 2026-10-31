@@ -15,6 +15,184 @@ const COLLECTED: &str = "2026-10-20T12:00:00Z";
 const CLAUDE_SESSION: &str = "5f0c2a8e-1111-4222-8333-944445555666";
 const CODEX_SESSION: &str = "0199f7a0-0000-7000-8000-0000000d7a11";
 
+/// [format] The current store/body reader accepts genuine v1 records and publishes
+/// no reduction from a body edit. Native certificate portability is not asserted.
+#[test]
+fn v1_goldens_current_reader_matches_facts_and_refuses_body_edit() {
+    use crate::durable_tail_store::{
+        self as store, DurableSource, DurableTailStore, ReadOutcome, Refusal,
+    };
+    use crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens;
+    for golden in load_v1_goldens().unwrap() {
+        let scratch = Scratch::new(golden.case_id);
+        let claude = golden.metadata["source_tag"] == 1;
+        let source = if claude {
+            SnapshotSource::ClaudeCode
+        } else {
+            SnapshotSource::Codex
+        };
+        let ds = if claude {
+            DurableSource::ClaudeCode
+        } else {
+            DurableSource::Codex
+        };
+        let key: [u8; 32] = golden.record[43..75].try_into().unwrap();
+        let record_path = scratch.0.join(format!("{}.rec", hex(key)));
+        fs::write(&record_path, golden.record).unwrap();
+        let mut disk = DurableTailStore::new(scratch.0.clone(), ds);
+        let ReadOutcome::Found(record) = disk.read(&key) else {
+            panic!(
+                "{}: current reader must accept the historical representation",
+                golden.case_id
+            );
+        };
+        assert_eq!(record.format as u64, golden.metadata["envelope_version"]);
+        assert_eq!(record.index_generation, golden.metadata["index_generation"]);
+        assert_eq!(
+            hex(record.record.allowlist),
+            golden.metadata["historical_allowlist"]
+        );
+        for (name, digest) in [
+            ("key", record.record.binding.key),
+            ("context", record.record.binding.context),
+            ("scope", record.record.binding.scope),
+            ("entry", record.record.binding.entry),
+        ] {
+            assert_eq!(hex(digest), golden.expected["binding"][name]);
+        }
+        let decoded = decode(&record.record.body, source).unwrap();
+        let counting_version = match decoded.counting().map(|(_, version, _)| version) {
+            None => "not_applicable",
+            Some(1) => "Legacy",
+            Some(2) => "V2",
+            other => panic!("unexpected counting: {other:?}"),
+        };
+        assert_eq!(
+            counting_version,
+            golden.expected["facts"]["counting_version"]
+        );
+        if let Some((_, _, evidence)) = decoded.counting() {
+            assert_eq!(
+                evidence,
+                if golden.case_id == "codex-legacy-acked" {
+                    2
+                } else {
+                    0
+                }
+            );
+        }
+        let mut receipts = crate::codex_scan_diagnostics::CountingV2Receipts::default();
+        if let Some(counting) = decoded.reduction.accumulator.codex_counting.as_ref() {
+            counting.fold_receipts(&mut receipts);
+        }
+        assert_eq!(
+            serde_json::to_value(receipts).unwrap(),
+            golden.expected["counting_receipts"]
+        );
+        let path = scratch.0.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+        fs::write(&path, golden.input).unwrap();
+        let fresh = rederive_parser(File::open(&path).unwrap(), &path, &decoded).unwrap();
+        let (reduction, _) = decoded
+            .rederive(fresh, &mut File::open(&path).unwrap(), line_cap())
+            .unwrap();
+        let selector = reduction.accumulator.current_selector.clone();
+        let tier_replay_persisted = reduction.accumulator.codex_tier_replay.is_some();
+        let mut acc = reduction.accumulator;
+        if claude {
+            acc.finalize_claude_responses();
+        }
+        let item = acc
+            .into_items(&path, COLLECTED, "synthetic-v1".into(), None)
+            .pop()
+            .unwrap();
+        let start = item.session_start.as_deref();
+        let actual = json!({
+            "source_session_id": item.source_session_id, "input_tokens": item.input_tokens,
+            "output_tokens": item.output_tokens, "request_count": item.request_count,
+            "cache_read_tokens": item.cache_read_tokens, "cache_creation_5m_tokens": item.cache_creation_5m_tokens,
+            "cache_creation_1h_tokens": item.cache_creation_1h_tokens, "counting_version": counting_version,
+            "cli_version": if !claude { start.and_then(|s| s.client_version.as_deref()) } else { None },
+            "opening_request_count": if claude { start.and_then(|s| s.opening_request_count) } else { None },
+            "opening_output_tokens": if claude { start.and_then(|s| s.opening_output_tokens) } else { None },
+            "request_2_context_tokens": if claude { start.and_then(|s| s.request_2_context_tokens) } else { None },
+            "request_3_context_tokens": if claude { start.and_then(|s| s.request_3_context_tokens) } else { None },
+            "selector_context": selector.context, "selector_sources": selector.sources,
+            "tier_replay_persisted": tier_replay_persisted,
+        });
+        // These four generation facts belong to sidecars, not the serialized reduction.
+        let mut expected = golden.expected["facts"].clone();
+        let facts = expected.as_object_mut().unwrap();
+        for name in [
+            "accepted_body_witness",
+            "telemetry_cost_micros",
+            "tier_replay_finished",
+            "protected_tier_receipt_present",
+        ] {
+            facts.remove(name);
+        }
+        assert_eq!(actual, expected, "{}", golden.case_id);
+        assert!(
+            golden.expected["post_save"]["entry"]["last_upload_body_witness"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert_eq!(golden.expected["facts"]["accepted_body_witness"], true);
+
+        let mut corrupted = golden.record.to_vec();
+        corrupted[store::HEADER_BYTES] ^= 1;
+        fs::write(&record_path, &corrupted).unwrap();
+        disk.begin_pass();
+        assert_eq!(
+            disk.read(&key),
+            ReadOutcome::Refused(Refusal::Corrupt),
+            "no restored reduction from {}",
+            golden.case_id
+        );
+    }
+}
+
+/// [format] Unequal historical selector maps catch both reader and writer swaps.
+#[test]
+fn v1_golden_selector_named_fields_and_writer_order() {
+    use crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens;
+    let golden = load_v1_goldens()
+        .unwrap()
+        .into_iter()
+        .find(|g| g.case_id == "claude-selector-unequal")
+        .unwrap();
+    let span = &golden.metadata["selector_span"];
+    let offset = span["offset"].as_u64().unwrap() as usize;
+    let length = span["length"].as_u64().unwrap() as usize;
+    let bytes = &golden.record[offset..offset + length];
+    let mut d = Dec::new(bytes);
+    let capture = SelectorCapture::take(&mut d).unwrap();
+    d.finish().unwrap();
+    let independent = SelectorCapture {
+        context: BTreeMap::from([("service_tier".into(), "priority".into())]),
+        sources: BTreeMap::from([("service_tier".into(), "derived_from_logs_2".into())]),
+    };
+    assert_eq!(capture, independent);
+    let mut e = Enc::bytes(length);
+    independent.put(&mut e).unwrap();
+    assert_eq!(e.into_bytes(), bytes);
+    let map_span = |name: &str| {
+        let offset = span[name]["offset"].as_u64().unwrap() as usize;
+        let length = span[name]["length"].as_u64().unwrap() as usize;
+        &golden.record[offset..offset + length]
+    };
+    assert_eq!([map_span("context"), map_span("sources")].concat(), bytes);
+    let swapped_bytes = [map_span("sources"), map_span("context")].concat();
+    let mut d = Dec::new(&swapped_bytes);
+    let swapped = SelectorCapture::take(&mut d).unwrap();
+    d.finish().unwrap();
+    assert_eq!(swapped.context, independent.sources);
+    assert_eq!(swapped.sources, independent.context);
+    assert_ne!(
+        swapped, independent,
+        "same-type map swap parses but changes semantics"
+    );
+}
+
 struct Scratch(PathBuf);
 impl Scratch {
     fn new(tag: &str) -> Self {

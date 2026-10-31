@@ -777,6 +777,20 @@ fn claude_contract5_bodies_need_no_cohort_token() {
     let collector = |items: &[SnapshotItem]| items.iter().find(|item| item.source_session_id == root.source_session_id).unwrap().provenance.collector.clone();
     let first = run();
     assert_eq!(collector(&first), identity::COLLECTOR);
+    let tagged = first
+        .iter()
+        .find(|item| item.source_session_id == root.source_session_id)
+        .unwrap();
+    assert!(
+        tagged.claude_org_markers.is_none(),
+        "fresh tags need no org marker"
+    );
+    assert!(
+        !tagged.request_evidence.is_empty(),
+        "fresh contract-5 bodies get identity tags"
+    );
+    assert_eq!(tagged.request_count, 4);
+    assert_eq!(tagged.request_identity_refusals, 0);
     assert_eq!(serde_json::to_vec(&run()).unwrap(), serde_json::to_vec(&first).unwrap());
     fs::remove_dir_all(dir).unwrap();
 }

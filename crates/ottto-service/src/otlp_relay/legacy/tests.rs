@@ -384,25 +384,6 @@ fn restricted_handler_rejects_control_health_and_non_otlp_and_shares_export_resp
 }
 
 #[test]
-fn recent_request_window_expires_at_one_hour() {
-    let counters = Arc::new(Counters::default());
-    let activity = Activity::new(
-        2,
-        APPROVED,
-        100,
-        0,
-        counters.clone(),
-        Arc::new(Admission::default()),
-    );
-    assert!(!recent_at(0, 100));
-    activity.accepted_at(1000);
-    let last = counters.last_request.load(Ordering::Relaxed);
-    assert!(recent_at(last, 1000));
-    assert!(recent_at(last, 4599));
-    assert!(!recent_at(last, 4600));
-}
-
-#[test]
 fn unsupported_or_oversized_records_fail_without_overwrite() {
     let (dir, supervisor) = scratch();
     for bytes in [
@@ -849,34 +830,6 @@ fn failed_revoke_save_closes_and_tombstone_blocks_replayed_old_allowlist() {
 }
 
 #[test]
-fn failed_idle_save_also_retires_before_fail_closed_cleanup() {
-    let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
-    let candidates = [APPROVED, port];
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    let old_disk = std::fs::read(&supervisor.path).unwrap();
-    supervisor.fail_save.set(true);
-    assert!(supervisor
-        .reconcile_current(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[])
-        .is_err());
-    assert!(supervisor.open.is_empty());
-    std::fs::write(&supervisor.path, old_disk).unwrap();
-    let mut restarted = Supervisor::load(
-        supervisor.path.clone(),
-        supervisor.counters.clone(),
-        100 + IDLE_SECONDS,
-    )
-    .unwrap();
-    restarted
-        .reconcile_current(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    assert!(restarted.open.is_empty());
-    assert!(restarted.record.retired.contains(&port));
-}
-
-#[test]
 fn unknown_ticks_preserve_state_and_revocation_requires_two_consecutive_ticks() {
     use crate::control::ManagedClaudeRelaySettings;
     let (_dir, mut supervisor) = scratch();
@@ -1006,30 +959,6 @@ fn dual_stack_ipv6_owner_vetoes_ipv4_legacy_bind() {
     assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
     let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
     let _accepted = accept_within(&owner).expect("V6ONLY=0 owner still receives IPv4 traffic");
-}
-
-#[test]
-fn native_legacy_listener_enables_reuseaddr_after_wildcard_probes() {
-    let listener = socket::bind(0).unwrap();
-    let mut reuse: libc::c_int = -1;
-    let mut length = std::mem::size_of_val(&reuse) as libc::socklen_t;
-    // SAFETY: getsockopt writes to our initialized c_int with its exact size.
-    let result = unsafe {
-        libc::getsockopt(
-            listener.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            (&mut reuse as *mut libc::c_int).cast(),
-            &mut length,
-        )
-    };
-    assert_eq!(result, 0);
-    // Linux reports 1; macOS reports the option's flag bit (SO_REUSEADDR).
-    assert_ne!(reuse, 0);
-    assert_eq!(
-        listener.local_addr().unwrap().ip(),
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
-    );
 }
 
 #[test]

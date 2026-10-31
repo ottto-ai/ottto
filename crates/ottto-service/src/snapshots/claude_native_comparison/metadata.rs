@@ -408,6 +408,7 @@ mod tests {
                 opened_object_identity: "descriptor-only".into(),
                 fingerprint_changed_nanos: 0,
                 fingerprint_birth_nanos: 0,
+                withheld_content_stamp: None,
             };
             roots.insert(
                 root.clone(),

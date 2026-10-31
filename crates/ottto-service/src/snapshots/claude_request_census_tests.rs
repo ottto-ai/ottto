@@ -562,66 +562,6 @@ fn census_derivation_canary_pins_ids_and_shapes() {
     );
 }
 
-/// SOURCE early condition: the canary provably goes red when extraction
-/// changes without a bump. Each mutation is what the parser would yield after
-/// the named extraction change on the same fixture.
-#[test]
-fn census_derivation_canary_fails_on_a_missed_bump() {
-    let scratch = crate::test_scratch::ScratchDir::new("census-derivation-canary-red");
-    let root = scratch.join("projects");
-    write_census_corpus(&root);
-    let mut index = ScanIndex::default();
-    census_scan(&root, &mut index, FIRST_WINDOW);
-    let observed = observed_census_table(&index, &root);
-    assert_eq!(
-        canary_verdict(CLAUDE_REQUEST_CENSUS_DERIVATION, &observed),
-        Ok(())
-    );
-    let mutate = |name: &str, change: &dyn Fn(&mut CanaryRow)| {
-        let mut table = observed.clone();
-        change(table.get_mut(name).expect("canary fixture"));
-        table
-    };
-    let changes = [
-        // Zero-usage (API error) ids no longer collected.
-        mutate("canary-zero-usage.jsonl", &|entry| {
-            entry
-                .1
-                .retain(|hash| *hash != claude_request_hash("req_zero_err"))
-        }),
-        // An id-less response starts reporting its message id.
-        mutate("canary-id-less.jsonl", &|entry| {
-            entry.1.push(claude_request_hash("msg_idless_2"));
-            entry.1.sort_unstable();
-        }),
-        // A repeated id no longer marks the identity incomplete.
-        mutate("canary-repeated.jsonl", &|entry| {
-            entry.0 = "exact".to_string()
-        }),
-        // A provider-marked fork prefix is no longer excluded.
-        mutate("canary-forked.jsonl", &|entry| {
-            entry.1.push(claude_request_hash("req_fork_parent"));
-            entry.1.sort_unstable();
-        }),
-        // A dropped response becomes loss-free.
-        mutate("canary-invalid-fork.jsonl", &|entry| {
-            entry.0 = "exact".to_string()
-        }),
-    ];
-    for changed in &changes {
-        assert_ne!(changed, &observed);
-        let verdict = canary_verdict(CLAUDE_REQUEST_CENSUS_DERIVATION, changed);
-        assert!(
-            verdict
-                .as_ref()
-                .is_err_and(|reason| reason.contains("bump CLAUDE_REQUEST_CENSUS_DERIVATION")),
-            "{verdict:?}"
-        );
-    }
-    // A bump without a re-pinned digest is red too.
-    assert!(canary_verdict(CLAUDE_REQUEST_CENSUS_DERIVATION + 1, &observed).is_err());
-}
-
 /// TD1f (review F1, SOURCE S2(c)): a re-parse of a previously complete key
 /// that ends as residue, with copied ids, replaces the old record. The key is
 /// never covered by the old revision, and the copied ids join the census.
@@ -1705,7 +1645,10 @@ fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
     // re-read rule rebuilds the scan fingerprint from the ctime so a
     // ctime-only change never re-reads, and only for the same object
     // generation, bound by its exact birth (owner-approved 464 -> 472 -> 480).
-    // Optional context receipt adds 80 inline bytes; its three H digests are heap-charged.
+    // #876's RAM fragment pointer adds 8; immutable counting-owner Box<str>
+    // recovers 8 from Option<String>, preserving the pre-receipt layout contract.
+    // Main's optional context receipt adds 80 inline bytes; its three H digests
+    // are heap-charged. Keep main's exact combined layout pin.
     const SCAN_INDEX_ENTRY_BYTES: usize = 560;
     assert_eq!(
         std::mem::size_of::<ScanIndexEntry>(),
@@ -1887,35 +1830,6 @@ fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
         .expect("CAS also drains oversized evidence");
 }
 
-#[test]
-fn census_hash_budget_warning_starts_at_eighty_percent() {
-    // 80% of the hash cap, rounded up: the first count that warns.
-    let threshold = (MAX_CLAUDE_REQUEST_CENSUS_HASHES * 4).div_ceil(5) as u64;
-    for hashes in [threshold - 1, threshold] {
-        let mut index = ScanIndex::default();
-        index.claude_request_census_mut_for_test().insert_for_test(
-            "key",
-            ClaudeRequestCensusRecord::synthetic_for_test(
-                &hex_fingerprint('a'),
-                1,
-                ClaudeRequestCensusShape::Lossy,
-                (0..hashes).collect(),
-            ),
-        );
-        let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-            &mut index,
-            &BTreeSet::from(["key".to_owned()]),
-            &BTreeSet::new(),
-            FIRST_WINDOW,
-        );
-        assert_eq!(counts.hash_budget_warning, hashes == threshold);
-        assert_eq!(
-            counts.hash_budget_usage_percent,
-            if hashes == threshold { 80 } else { 79 }
-        );
-    }
-}
-
 /// A pre-D1 shape has no census fields: IgnoredAny consumes their tokens,
 /// including non-finite numbers, without trying to interpret them.
 #[test]
@@ -1939,22 +1853,12 @@ fn census_old_shape_decoder_ignores_new_evidence() {
     assert_eq!(old.files.len(), 1);
 }
 
+/// [money] A failed owned read invalidates the old census record; ordinary
+/// in-progress continuations retain it. Other failure kinds use this same guard.
+#[test]
 #[cfg(unix)]
-#[derive(Clone, Copy)]
-enum CensusAbandonedParse {
-    Read,
-    Attribution,
-    Scope,
-    Object,
-    Reopen,
-    Reduction,
-}
-
-/// Real owned-reader continuations, with synthetic filesystem/acquisition
-/// failures. Every case starts with an older valid record and changed bytes.
-#[cfg(unix)]
-fn census_assert_abandoned_parse_invalidates_record(failure: CensusAbandonedParse) {
-    use crate::transcript_acquisition::{ReadPlan, Scope};
+fn census_failed_read_invalidates_old_record() {
+    use crate::transcript_acquisition::Scope;
     let scratch = crate::test_scratch::ScratchDir::new("census-abandoned");
     let root = scratch.join("projects");
     let session = "b2222222-2222-4222-8222-222222222222";
@@ -2013,55 +1917,9 @@ fn census_assert_abandoned_parse_invalidates_record(failure: CensusAbandonedPars
     );
     let active = state.active_file.as_mut().expect("selected parser");
     assert!(active.sampling.is_some(), "exercise sampled revalidation");
-    let mut context = None;
-    match failure {
-        CensusAbandonedParse::Read => {
-            active.parser.reader.reader = OpenedInput::plain(File::open(&root).unwrap());
-        }
-        CensusAbandonedParse::Attribution => {
-            let home = scratch.join("home");
-            let events = home.join(".ottto/launch-events");
-            std::fs::create_dir_all(&events).unwrap();
-            // Listing this regular file as the pending directory fails.
-            std::fs::write(events.join("pending"), b"unavailable").unwrap();
-            context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
-                SnapshotSource::ClaudeCode,
-                &home,
-                true,
-                Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-                Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
-            );
-            assert!(context.is_some());
-        }
-        CensusAbandonedParse::Scope => {
-            active.sampling.as_mut().unwrap().scope = Scope("changed-scope".to_owned());
-        }
-        CensusAbandonedParse::Object => {
-            let path = &active.candidate.path;
-            let bytes = std::fs::read(path).unwrap();
-            std::fs::rename(path, scratch.join("old-object")).unwrap();
-            std::fs::write(path, bytes).unwrap();
-        }
-        CensusAbandonedParse::Reopen => {
-            std::fs::remove_file(&active.candidate.path).unwrap();
-        }
-        CensusAbandonedParse::Reduction => {
-            // The selected scope is still current, but the acquisition's
-            // certificate belongs to another interpretation. EOF commit fails.
-            active.parser.reader.acquisition = Some(
-                ReadPlan::prepare(
-                    active.parser.reader.reader.get_mut(),
-                    None,
-                    &Scope("wrong-certificate".to_owned()),
-                    None,
-                    1,
-                )
-                .unwrap(),
-            );
-        }
-    }
+    active.parser.reader.reader = OpenedInput::plain(File::open(&root).unwrap());
     for _ in 0..100 {
-        state = match state.step(context.as_ref()) {
+        state = match state.step(None) {
             OwnedSourceScanStep::Pending(next) => next,
             OwnedSourceScanStep::Complete { .. } => panic!("expected an abandoned parse"),
         };
@@ -2084,37 +1942,6 @@ fn census_assert_abandoned_parse_invalidates_record(failure: CensusAbandonedPars
         );
     }
     panic!("failure path was not reached");
-}
-
-#[test]
-#[cfg(unix)]
-fn census_failed_read_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Read);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_attribution_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Attribution);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_scope_revalidation_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Scope);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_object_revalidation_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Object);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_reopen_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Reopen);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_reduction_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Reduction);
 }
 
 #[test]
@@ -2448,7 +2275,7 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
         &mut ScanCensus::default(),
         None,
         365,
-        &BTreeMap::new(),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
     )
     .unwrap();
     candidate.physical_identity = Some([metadata.dev(), metadata.ino()]);

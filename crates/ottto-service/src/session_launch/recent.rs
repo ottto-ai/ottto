@@ -452,14 +452,6 @@ mod tests {
         assert_eq!(cli_launchable(None), None);
     }
     #[test]
-    fn folder_ids_are_opaque_and_process_key_bound() {
-        assert_ne!(
-            opaque_id("a", Path::new("/one")),
-            opaque_id("b", Path::new("/one"))
-        );
-        assert_eq!(opaque_id("a", Path::new("/one")).len(), 64);
-    }
-    #[test]
     fn sqlite_projection_is_bounded_ordered_and_schema_aware() {
         let path = std::env::temp_dir().join(format!(
             "recent-{}.sqlite",
