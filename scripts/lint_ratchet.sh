@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Pull-request lint ratchet, run inside the Linux "Runtime clippy" step.
 #
-# Fails when the diff from <base> to HEAD adds a Rust suppression that hides
-# unused code: allow(dead_code), allow(unused...), a blanket #![allow(...)] or
-# cfg_attr(not(test), allow(...)). A needed suppression is
-# #[expect(<lint>, reason = "...")] on the smallest item. A line that the same
-# diff also removes counts as moved, not added.
+# Fails when HEAD has more Rust suppressions that hide unused code than <base>
+# had, counted per attribute across all changed .rs files: allow(dead_code),
+# allow(unused...), a blanket #![allow(...)] or cfg_attr(not(test), allow(...)).
+# Attributes are read whole from both full file versions (multiline ones too,
+# skipping strings and comments) and compared without whitespace and reason, so
+# moving one or adding a reason passes, while each extra copy fails. A needed
+# suppression is #[expect(<lint>, reason = "...")] on the smallest item.
 #
 # When the diff touches Rust files, the PR body (PR_BODY) must also carry a
 # "Reuse:" line naming what was searched and reused.
@@ -14,49 +16,79 @@
 set -euo pipefail
 
 base=${1:?usage: PR_BODY=... lint_ratchet.sh <base-rev>}
-diff=$(git diff --unified=0 --no-color --no-ext-diff "$base" HEAD -- '*.rs')
-[ -n "$diff" ] || exit 0
+[ -n "$(git diff --name-only "$base" HEAD -- '*.rs')" ] || exit 0
 
 status=0
-offenders=$(printf '%s\n' "$diff" | awk '
-  # Each attribute on the line, without spaces and reason strings, so adding a
-  # reason to an existing allow compares equal to the removed original.
-  function attrs(text, out,   n, i, j, d, a) {
-    n = 0
-    for (i = 1; i <= length(text); i++) {
-      if (substr(text, i, 2) != "#[" && substr(text, i, 3) != "#![") continue
-      d = 0
-      for (j = i; j <= length(text); j++) {
-        if (substr(text, j, 1) == "[") d++
-        else if (substr(text, j, 1) == "]" && --d == 0) break
-      }
-      a = substr(text, i, j - i + 1); i = j
-      gsub(/[ \t]/, "", a); gsub(/,?reason="[^"]*"/, "", a)
-      out[++n] = a
-    }
-    return n
-  }
-  function hides(a) {
-    return a ~ /allow\(([^)]*,)?(dead_code|unused)/ || a ~ /^#!\[allow\(/ ||
-      a ~ /cfg_attr\(not\(test\),allow\(/
-  }
-  /^\+\+\+ / { file = substr($0, 7); next }
-  /^--- / { next }
-  /^@@ / { split($3, h, ","); line = substr(h[1], 2) + 0; next }
-  /^-/ { k = attrs($0, got); for (i = 1; i <= k; i++) removed[got[i]] = 1; next }
-  /^\+/ {
-    k = attrs($0, got)
-    for (i = 1; i <= k; i++) if (hides(got[i])) { hits[++n] = file ":" line ": " got[i]; keys[n] = got[i] }
-    line++
-  }
-  END { for (i = 1; i <= n; i++) if (!(keys[i] in removed)) print hits[i] }
-')
-if [ -n "$offenders" ]; then
-  echo "error: this PR adds suppressions that hide unused code:" >&2
-  printf '%s\n' "$offenders" | sed 's/^/  /' >&2
-  echo "Delete the unused code, or use #[expect(<lint>, reason = \"...\")] on the smallest item." >&2
-  status=1
-fi
+python3 -I - "$base" <<'PY' || status=1
+import collections, re, subprocess, sys
+
+base = sys.argv[1]
+# Comments, string/char literals and attribute brackets; everything else is code.
+TOKEN = re.compile(r"""//[^\n]*|/\*|[bc]?r(\#*)"|[bc]?"(?:\\.|[^"\\])*"|b?'(?:\\.|[^'\\])'|\#!?\[|\[|\]""", re.S)
+HIDES = re.compile(r"allow\(([^)]*,)?(dead_code|unused)|^#!\[allow\(|cfg_attr\(not\(test\),allow\(")
+
+def attributes(text):
+    """Yield (offset, attribute without whitespace, comments and reason)."""
+    pos, depth, start, parts = 0, 0, 0, []
+    while (m := TOKEN.search(text, pos)):
+        tok, end = m.group(), m.end()
+        if depth:
+            parts.append(re.sub(r"\s+", "", text[pos:m.start()]))
+        if tok.startswith("//"):
+            pass
+        elif tok == "/*":
+            nest = 1
+            while nest and end < len(text):
+                if text.startswith("/*", end): nest, end = nest + 1, end + 2
+                elif text.startswith("*/", end): nest, end = nest - 1, end + 2
+                else: end += 1
+        elif m.group(1) is not None:  # raw string r#"..."#
+            close = text.find('"' + m.group(1), end)
+            end = len(text) if close < 0 else close + 1 + len(m.group(1))
+        if not depth:
+            if tok.startswith("#"):
+                depth, start, parts = 1, m.start(), [tok]
+            pos = end
+            continue
+        if tok.startswith(("//", "/*")):
+            pass
+        elif tok[-1] in "\"'":  # a literal: drop it when it is the reason
+            if "".join(parts).endswith("reason="):
+                parts = [re.sub(r",?reason=$", "", "".join(parts))]
+            else:
+                parts.append(text[m.start():end])
+        else:
+            depth += 1 if tok.endswith("[") else -1
+            parts.append(tok)
+            if not depth:
+                yield start, "".join(parts).replace(",)", ")")
+        pos = end
+
+def show(rev, path):
+    out = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True)
+    return out.stdout.decode("utf-8", "replace") if out.returncode == 0 else ""
+
+paths = subprocess.run(["git", "diff", "--name-only", "--no-renames", "-z", base, "HEAD", "--", "*.rs"],
+                       capture_output=True, check=True).stdout.decode().split("\0")
+counts = {rev: collections.Counter() for rev in (base, "HEAD")}
+where = collections.defaultdict(list)
+for path in filter(None, paths):
+    for rev in counts:
+        text = show(rev, path)
+        for start, attr in attributes(text):
+            if HIDES.search(attr):
+                counts[rev][attr] += 1
+                if rev == "HEAD":
+                    line = text.count("\n", 0, start) + 1
+                    where[attr].append(f"{path}:{line}")
+bad = [a for a in counts["HEAD"] if counts["HEAD"][a] > counts[base][a]]
+if bad:
+    print("error: this PR adds suppressions that hide unused code:", file=sys.stderr)
+    for a in bad:
+        print(f"  {a}: {counts[base][a]} before, {counts['HEAD'][a]} now ({', '.join(where[a])})", file=sys.stderr)
+    print('Delete the unused code, or use #[expect(<lint>, reason = "...")] on the smallest item.', file=sys.stderr)
+    sys.exit(1)
+PY
 
 if ! printf '%s\n' "${PR_BODY:-}" | grep -qE '^[[:space:]>*_`-]*Reuse:'; then
   echo "error: the PR body has no 'Reuse:' line (Reuse: <item> | searched: <terms> | reused/extended <path::fn>)." >&2
