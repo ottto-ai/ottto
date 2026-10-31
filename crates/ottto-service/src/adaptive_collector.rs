@@ -8,7 +8,6 @@ pub struct CadenceConfig {
     pub warm_window: Duration,
     pub idle_interval: Duration,
     pub cold_interval: Duration,
-    pub full_sweep_interval: Duration,
     pub failure_backoffs: Vec<Duration>,
 }
 
@@ -20,7 +19,6 @@ impl Default for CadenceConfig {
             warm_window: Duration::from_secs(15 * 60),
             idle_interval: Duration::from_secs(10 * 60),
             cold_interval: Duration::from_secs(30 * 60),
-            full_sweep_interval: Duration::from_secs(6 * 60 * 60),
             failure_backoffs: vec![
                 Duration::from_secs(60),
                 Duration::from_secs(2 * 60),
@@ -87,7 +85,6 @@ pub struct SourceCadence {
     state: LocalCollectorState,
     last_activity_at: Option<Instant>,
     last_scan_at: Option<Instant>,
-    last_full_sweep_at: Option<Instant>,
     consecutive_failures: usize,
     disabled: bool,
     server_min_interval: Option<Duration>,
@@ -101,7 +98,6 @@ impl SourceCadence {
             state: LocalCollectorState::Cold,
             last_activity_at: None,
             last_scan_at: None,
-            last_full_sweep_at: None,
             consecutive_failures: 0,
             disabled: false,
             server_min_interval: None,
@@ -184,10 +180,6 @@ impl SourceCadence {
         self.last_scan_at = Some(now);
         self.consecutive_failures += 1;
         self.state = LocalCollectorState::Failing;
-    }
-
-    pub fn record_full_sweep(&mut self, now: Instant) {
-        self.last_full_sweep_at = Some(now);
     }
 
     /// The Hot tier's floor: the shortest gap the ordinary cadence ever takes.
@@ -282,18 +274,7 @@ impl SourceCadence {
         let since_scan = self
             .last_scan_at
             .map(|last_scan| now.saturating_duration_since(last_scan));
-        let cadence_due = remaining_after(interval, since_scan);
-
-        let sweep_due = self
-            .last_full_sweep_at
-            .map(|last_sweep| {
-                remaining_after(
-                    self.config.full_sweep_interval,
-                    Some(now.saturating_duration_since(last_sweep)),
-                )
-            })
-            .unwrap_or(self.config.full_sweep_interval);
-        cadence_due.min(sweep_due)
+        remaining_after(interval, since_scan)
     }
 
     fn failure_backoff(&self) -> Duration {
@@ -339,11 +320,6 @@ mod tests {
         // the floor or this buys nothing.
         assert!(config.idle_interval > floor);
         assert!(config.cold_interval > config.idle_interval);
-        // The sweep is untouched by the cost posture.
-        assert_eq!(
-            config.full_sweep_interval,
-            CadenceConfig::default().full_sweep_interval
-        );
     }
 
     #[test]
@@ -603,19 +579,5 @@ mod tests {
         assert!(!disabled.request_continuation(start, Duration::from_secs(1)));
         assert_eq!(disabled.continuation_work(), None);
         assert_eq!(disabled.continuation_due(PACING), None);
-    }
-
-    #[test]
-    fn full_sweep_caps_idle_wait() {
-        let start = Instant::now();
-        let mut cadence = SourceCadence::new(CadenceConfig::default());
-        cadence.record_full_sweep(start);
-        cadence.record_scan_success(start, 0);
-
-        assert_eq!(cadence.state(), LocalCollectorState::Idle);
-        assert_eq!(
-            cadence.next_scan_after(start + Duration::from_secs(6 * 60 * 60)),
-            Duration::ZERO
-        );
     }
 }

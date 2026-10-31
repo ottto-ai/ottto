@@ -926,6 +926,9 @@ pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
 // consumes at most this many directory entries and then resumes next tick.
 pub const MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK: usize = 10_000;
 pub const MAX_WATCHER_HINTED_FILES_PER_TICK: usize = 256;
+/// R3: the gap between metadata-only re-listing passes of one kept
+/// generation (the cold cadence tier).
+const LISTING_INTERVAL_SECONDS: u64 = 30 * 60;
 const UNHEALTHY_SCAN_RETRY_BASE_SECONDS: u64 = 60;
 const UNHEALTHY_SCAN_RETRY_MAX_SECONDS: u64 = 60 * 60;
 /// The retry attempt at which the exponential delay reaches its ceiling
@@ -2587,6 +2590,14 @@ struct ScanTraversalCounts {
     retired_reread_budget_refused: serde::de::IgnoredAny,
     #[serde(skip_serializing_if = "ownership::Counts::is_empty")]
     causes: ownership::Counts,
+    /// Re-listing passes this generation started; zero while its first walk
+    /// runs (R3).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    listing_generations: u64,
+    /// Changed files a re-listing pass queued that no watcher hint or earlier
+    /// walk had already queued: what the watcher missed (R4).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    listing_changes_without_hint: u64,
 }
 
 /// Residue a generation disclosed as terminal after settling. Counts exclude
@@ -2733,6 +2744,10 @@ struct ScanTraversalCheckpoint {
     /// counts name their files instead of silently folding them into totals.
     #[serde(default, skip_serializing_if = "ScanTraversalResidue::is_empty")]
     residue: ScanTraversalResidue,
+    /// When this generation's latest walk started. An older checkpoint
+    /// without it starts the re-listing clock at its next page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    listing_started_unix_seconds: Option<u64>,
 }
 
 // A candidate's scan root is not only where its no-follow open starts: it is
@@ -4591,6 +4606,36 @@ pub struct ScanIndexEntry {
 const _: () = assert!(std::mem::size_of::<ScanIndexEntry>() == 560);
 
 impl ScanIndexEntry {
+    /// R3's listing stamp: the same size (or a certified Codex EOF fragment
+    /// of it), the same mtime nanos and, when both are known, the same file
+    /// birth. ctime, mode, xattrs and links never count (Ron's re-read rule).
+    /// It only decides "unchanged"; acquisition still picks the read mode.
+    fn same_listing_stamp(
+        &self,
+        len: u64,
+        modified_nanos: Option<u64>,
+        birth_nanos: Option<u64>,
+        fragment: Option<codex_fragment::Stamp>,
+    ) -> bool {
+        (self.size_bytes == len
+            || self
+                .codex_fragment
+                .as_ref()
+                .is_some_and(|bound| bound.matches(self.size_bytes, len, fragment)))
+            && modified_nanos.is_some()
+            && self.modified_unix_nanos == modified_nanos
+            && (self.opened_birth_nanos == 0 || birth_nanos == Some(self.opened_birth_nanos))
+    }
+
+    fn same_listing_stamp_as(&self, metadata: &fs::Metadata) -> bool {
+        self.same_listing_stamp(
+            metadata.len(),
+            metadata.modified().ok().and_then(unix_nanos),
+            metadata.created().ok().and_then(unix_nanos),
+            codex_fragment::Stamp::metadata(metadata),
+        )
+    }
+
     fn codex_recovery_is_pending(&self) -> bool {
         self.codex_captured_joined_member_set.is_some()
             || self.codex_captured_tier_receipt_required
@@ -26773,8 +26818,13 @@ impl OwnedSourceScan {
                 backfill_window_days,
                 discovery_retention!(index, &resource_probe.discovery_growth),
             );
-            next_generation_hints =
-                enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
+            start_due_listing_pass(traversal, collected_at);
+            next_generation_hints = enqueue_watcher_hints(
+                source,
+                traversal,
+                &changed_watcher_hints(&index.files, hinted_paths),
+                watcher_overflowed,
+            );
         }
         advance_bounded_directory_traversal(
             source,
@@ -26825,12 +26875,14 @@ impl OwnedSourceScan {
                 .pending_candidates
                 .iter()
                 .any(|candidate| candidate.census_member && !candidate.watcher_hint);
-        let selection_limit =
-            if source == SnapshotSource::Codex && !traversal.pending_directories.is_empty() {
-                0
-            } else {
-                file_limit
-            };
+        let selection_limit = if source == SnapshotSource::Codex
+            && !traversal.pending_directories.is_empty()
+            && traversal.counts.listing_generations == 0
+        {
+            0
+        } else {
+            file_limit
+        };
         // Fresh data gets a bounded page of its own, at most every other
         // ordinary page. Mixing it behind 64 MiB of census revalidation
         // starves it; always putting it first can starve the census instead.
@@ -43354,6 +43406,7 @@ fn ensure_bounded_traversal(
         unhealthy_retry_not_before_unix_seconds: None,
         counts,
         residue: ScanTraversalResidue::default(),
+        listing_started_unix_seconds: rfc3339_unix_seconds(collected_at),
     });
     if source == SnapshotSource::ClaudeCode
         && index
@@ -43424,6 +43477,61 @@ fn codex_fresh_data_pending(
             && !metadata.file_type().is_symlink()
             && entry.map_or(true, |entry| entry.size_bytes != metadata.len())
     })
+}
+
+/// R3: once a kept generation's latest walk has finished, re-list its roots
+/// every `LISTING_INTERVAL_SECONDS`, metadata only. The pass queues only
+/// stamp changes and never starts a generation, so it re-arms nothing; it can
+/// only delay this generation's discovery, never complete it.
+fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at: &str) {
+    let Some(now) = rfc3339_unix_seconds(collected_at) else {
+        return;
+    };
+    if !traversal.pending_directories.is_empty() {
+        return;
+    }
+    let Some(started) = traversal.listing_started_unix_seconds else {
+        traversal.listing_started_unix_seconds = Some(now);
+        return;
+    };
+    // A clock moved backwards cannot postpone the pass indefinitely.
+    if now < started.saturating_add(LISTING_INTERVAL_SECONDS)
+        && started <= now.saturating_add(LISTING_INTERVAL_SECONDS)
+    {
+        return;
+    }
+    traversal.listing_started_unix_seconds = Some(now);
+    traversal.counts.listing_generations += 1;
+    let roots = traversal.scan_roots.clone();
+    traversal
+        .pending_directories
+        .extend(roots.into_iter().map(|root| ScanTraversalPath {
+            scan_root: root.clone(),
+            path: root,
+            census_member: true,
+            watcher_hint: false,
+        }));
+}
+
+/// R4: watcher hints go through the listing's stamp compare. An unchanged
+/// file (ctime-only events included) is dropped; a vanished one is kept for
+/// the exact removal path. Owner re-enqueues (audit retry) bypass this.
+fn changed_watcher_hints(
+    files: &BTreeMap<String, ScanIndexEntry>,
+    hinted_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    hinted_paths
+        .iter()
+        .filter(|path| {
+            !fs::symlink_metadata(path).is_ok_and(|metadata| {
+                metadata.is_file()
+                    && files
+                        .get(&local_index_key(path))
+                        .is_some_and(|entry| entry.same_listing_stamp_as(&metadata))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// Returns how many Codex hints re-entered as next-generation evidence.
@@ -43847,6 +43955,11 @@ fn advance_bounded_directory_traversal_with_budget(
         )
     };
     let issues_before = walk_issues(&traversal.counts);
+    // A re-listing pass (R3) only queues stamp changes. Its walk problems
+    // and counts belong to the next generation's first walk, so it can never
+    // turn this generation red or green or move its census counts.
+    let relisting = traversal.counts.listing_generations > 0;
+    let counts_before = relisting.then(|| traversal.counts.clone());
     // Eligibility belongs to the frozen census generation, not to whichever
     // later tick happens to reach a directory. Otherwise a multi-page walk can
     // silently age boundary files out while still publishing the earlier
@@ -43905,7 +44018,11 @@ fn advance_bounded_directory_traversal_with_budget(
         // too wide to scan truthfully and turns the generation red.
         let mut entries = entries.take(remaining + 1).collect::<Vec<_>>();
         if let Some(census) = traversal.codex_join_directory_census.as_mut() {
-            census.observe(&directory.path, &metadata);
+            // The roster refresh re-certifies known directories; a re-listing
+            // pass adds only directories the census has not seen.
+            if !relisting || !census.contains(&directory.path) {
+                census.observe(&directory.path, &metadata);
+            }
         }
         if entries.len() > remaining {
             if remaining == max_entries {
@@ -44018,7 +44135,20 @@ fn advance_bounded_directory_traversal_with_budget(
                 metadata.len(),
                 codex_fragment::Stamp::metadata(&metadata),
             ) {
-                line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
+                if !relisting {
+                    line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
+                }
+                continue;
+            }
+            if relisting
+                && index
+                    .files
+                    .get(&local_index_key(&path))
+                    .is_some_and(|entry| entry.same_listing_stamp_as(&metadata))
+            {
+                // Unchanged since its last read: seen, never queued. Missing
+                // state is the owed resolver's, not discovery's (#1025).
+                traversal.observed_index_keys.insert(local_index_key(&path));
                 continue;
             }
             if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
@@ -44043,7 +44173,7 @@ fn advance_bounded_directory_traversal_with_budget(
             // Presence and enqueue authority are separate. A new-round walk
             // sees pending/floor-blocked files even when it adds no read work.
             traversal.counts.discovered_file_count += 1;
-            traversal.observed_index_keys.insert(local_index_key(&path));
+            let newly_observed = traversal.observed_index_keys.insert(local_index_key(&path));
             if metadata.len() > max_jsonl_file_bytes(source) {
                 traversal.counts.oversized_file_count += 1;
                 oversized_discovery::record(
@@ -44062,24 +44192,32 @@ fn advance_bounded_directory_traversal_with_budget(
                 continue;
             }
             if let Some(&position) = pending.get(&path) {
-                let existing = traversal
-                    .pending_candidates
-                    .get_mut(position)
-                    .expect("walk queue position");
-                existing.census_member = true;
-                existing.watcher_hint |= directory.watcher_hint;
+                if !relisting {
+                    let existing = traversal
+                        .pending_candidates
+                        .get_mut(position)
+                        .expect("walk queue position");
+                    existing.census_member = true;
+                    existing.watcher_hint |= directory.watcher_hint;
+                }
             } else {
+                // A re-listed change is fresh data. Like a hint (K7), it joins
+                // the census only if this generation has not observed it.
+                traversal.counts.listing_changes_without_hint += u64::from(relisting);
                 pending.insert(path.clone(), traversal.pending_candidates.len());
                 traversal.pending_candidates.push_back(ScanTraversalPath {
                     scan_root: directory.scan_root.clone(),
                     path,
-                    census_member: true,
-                    watcher_hint: directory.watcher_hint,
+                    census_member: !relisting || newly_observed,
+                    watcher_hint: relisting || directory.watcher_hint,
                 });
             }
         }
     }
-    if walk_issues(&traversal.counts) != issues_before {
+    if let Some(mut counts) = counts_before {
+        counts.listing_changes_without_hint = traversal.counts.listing_changes_without_hint;
+        traversal.counts = counts;
+    } else if walk_issues(&traversal.counts) != issues_before {
         if let Some(census) = traversal.codex_join_directory_census.as_mut() {
             census.invalidate_walk();
         }
@@ -45325,15 +45463,12 @@ fn adopt_stored_changed_time(
     let stored = entry.opened_changed_nanos;
     if stored == 0
         || stored == candidate.fingerprint_changed_nanos
-        || (entry.size_bytes != candidate.size_bytes
-            && !entry.codex_fragment.as_ref().is_some_and(|fragment| {
-                fragment.matches(
-                    entry.size_bytes,
-                    candidate.size_bytes,
-                    codex_fragment::Stamp::candidate(candidate),
-                )
-            }))
-        || entry.modified_unix_nanos != Some(candidate.modified_unix_nanos)
+        || !entry.same_listing_stamp(
+            candidate.size_bytes,
+            Some(candidate.modified_unix_nanos),
+            live.birth_nanos,
+            codex_fragment::Stamp::candidate(candidate),
+        )
         || !live.same_birth(entry.opened_birth_nanos)
     {
         // No stored ctime, nothing moved (the live identity already
@@ -48632,6 +48767,7 @@ impl ScanIndex {
                 ..ScanTraversalCounts::default()
             },
             residue: ScanTraversalResidue::default(),
+            listing_started_unix_seconds: None,
         });
     }
 
@@ -53593,6 +53729,7 @@ mod tests {
                 ..ScanTraversalCounts::default()
             },
             residue: ScanTraversalResidue::default(),
+            listing_started_unix_seconds: None,
         }
     }
 
@@ -56938,6 +57075,7 @@ mod tests {
             unhealthy_retry_not_before_unix_seconds: None,
             counts: ScanTraversalCounts::default(),
             residue: ScanTraversalResidue::default(),
+            listing_started_unix_seconds: None,
         });
 
         let scan = scan_source_roots(
@@ -57457,6 +57595,7 @@ mod tests {
                 unhealthy_retry_not_before_unix_seconds: None,
                 counts: ScanTraversalCounts::default(),
                 residue: ScanTraversalResidue::default(),
+                listing_started_unix_seconds: None,
             }),
             ..ScanIndex::default()
         };
@@ -58553,6 +58692,7 @@ mod tests {
                     ..ScanTraversalCounts::default()
                 },
                 residue: ScanTraversalResidue::default(),
+                listing_started_unix_seconds: None,
             };
 
         index.traversal = Some(stale_witness(&index, 46, Some(now - 15 * 60 * 60)));
@@ -67167,6 +67307,7 @@ mod tests {
                     unhealthy_retry_not_before_unix_seconds: None,
                     counts: ScanTraversalCounts::default(),
                     residue: ScanTraversalResidue::default(),
+                    listing_started_unix_seconds: None,
                 });
                 assert!(reconcile_missing_index_entries_with_limit(
                     &mut working,
@@ -84497,6 +84638,7 @@ mod tests {
             unhealthy_retry_not_before_unix_seconds: None,
             counts,
             residue: ScanTraversalResidue::default(),
+            listing_started_unix_seconds: None,
         }
     }
 
@@ -85087,8 +85229,8 @@ crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg
 crate::heap_layout_bound::fields!(ScanIndex; withheld_memo, persistence_legacy_recovery, persistence_root, persistence_unavailable, persistence_controls, decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, file_upload_context_enabled, mixed_context_view, context_read_counts, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory, claude_copy_removals, copy_unproven_enabled, copy_prefix_base_upload_context);
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
-crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
+crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);

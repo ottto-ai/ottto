@@ -48,7 +48,15 @@ impl Fixture {
     fn page(
         &self,
         source: SnapshotSource,
+        index: ScanIndex,
+    ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
+        self.page_hinted(source, index, &[])
+    }
+    fn page_hinted(
+        &self,
+        source: SnapshotSource,
         mut index: ScanIndex,
+        hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         self.cache.bind_withheld(&mut index);
         let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
@@ -63,7 +71,7 @@ impl Fixture {
                 10,
                 false,
                 None,
-                &[],
+                hints,
                 false,
                 true,
             )
@@ -627,4 +635,165 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     let (_, idle, reads, _) = f.page(source, caught);
     assert!(idle.snapshots.is_empty(), "emitted once");
     assert!(reads.0.lock().unwrap().0.is_empty());
+}
+
+/// One usage record (with the session header first) in each source's format.
+fn usage_records(source: SnapshotSource, session: &str, n: u64, header: bool) -> String {
+    let at = "2026-10-06T10:00:00Z";
+    let (head, line) = match source {
+        SnapshotSource::ClaudeCode => (
+            None,
+            json!({"type":"assistant", "sessionId":session, "uuid":format!("{session}-{n}"),
+            "cwd":"/synthetic", "timestamp":at, "requestId":format!("req_{session}_{n}"),
+            "message": {"id":format!("msg_{session}_{n}"), "model":"claude-opus-4-8",
+            "role":"assistant", "usage":{"input_tokens":10,"output_tokens":20}}}),
+        ),
+        SnapshotSource::Codex => (
+            Some(json!({"type":"session_meta", "timestamp":at, "payload":{"id":session}})),
+            json!({"timestamp":at, "type":"event_msg", "payload":{"type":"token_count",
+            "info":{"model":"fixture-model",
+            "total_token_usage":{"input_tokens":10 * n,"output_tokens":10 * n},
+            "last_token_usage":{"input_tokens":10,"output_tokens":10}}}}),
+        ),
+        SnapshotSource::Pi => (
+            Some(json!({"type":"session", "session_id":session, "cwd":"/work", "timestamp":at})),
+            json!({"type":"message_end", "message":{"provider":"openai", "model":"gpt-5.4",
+            "api":"responses", "timestamp":1_791_280_800_000_u64 + n,
+            "usage":{"input":12,"output":4,"cacheRead":0,"cacheWrite":0}}}),
+        ),
+    };
+    let head = head.filter(|_| header).map(|head| format!("{head}\n"));
+    format!("{}{line}\n", head.unwrap_or_default())
+}
+
+fn append_records(path: &Path, text: &str) {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    file.write_all(text.as_bytes()).unwrap();
+}
+
+const UNCHANGED: &str = "0a000000-0000-4000-8000-00000000000a";
+const GROWN: &str = "0b000000-0000-4000-8000-00000000000b";
+const CREATED: &str = "0c000000-0000-4000-8000-00000000000c";
+const REARMED: &str = "0d000000-0000-4000-8000-00000000000d";
+
+/// A kept generation whose first walk has finished and whose members were
+/// all served, over three read files; `listing_due` backdates its walk.
+fn kept_generation(f: &Fixture, source: SnapshotSource, listing_due: bool) -> ScanIndex {
+    for session in [UNCHANGED, GROWN, REARMED] {
+        let path = f.root.join(format!("{session}.jsonl"));
+        append_records(&path, &usage_records(source, session, 1, true));
+    }
+    let (mut index, _, reads, _) = f.page(source, ScanIndex::default());
+    assert_eq!(
+        reads.0.lock().unwrap().0.len(),
+        3,
+        "{source:?}: first reads"
+    );
+    let now = OffsetDateTime::now_utc();
+    let collected_at = now.format(&Rfc3339).unwrap();
+    ensure_bounded_traversal(
+        source,
+        std::slice::from_ref(&f.root),
+        &mut index,
+        &collected_at,
+        7,
+    );
+    advance_bounded_directory_traversal(source, &mut index, 7, None);
+    let traversal = index.traversal.as_mut().unwrap();
+    assert!(traversal.pending_directories.is_empty());
+    traversal.pending_candidates.clear();
+    let due = now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60;
+    traversal.listing_started_unix_seconds = Some(if listing_due {
+        due
+    } else {
+        now.unix_timestamp() as u64
+    });
+    index
+}
+
+fn modes(reads: &Reads) -> Vec<String> {
+    let mut modes = reads
+        .0
+        .lock()
+        .unwrap()
+        .0
+        .iter()
+        .map(|mode| format!("{mode:?}"))
+        .collect::<Vec<_>>();
+    modes.sort();
+    modes
+}
+
+/// [behaviour] R3/R4: a kept generation's re-listing pass reads exactly the
+/// stamp changes for every source: grown by Tail, created by Full; unchanged
+/// and re-armed-but-unchanged files are never queued.
+#[test]
+fn listing_repass_reads_only_stamp_changes_for_every_source() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let mut index = kept_generation(&f, source, true);
+        append_records(
+            &f.root.join(format!("{GROWN}.jsonl")),
+            &usage_records(source, GROWN, 2, false),
+        );
+        append_records(
+            &f.root.join(format!("{CREATED}.jsonl")),
+            &usage_records(source, CREATED, 1, true),
+        );
+        let rearmed = local_index_key(&f.root.join(format!("{REARMED}.jsonl")));
+        index
+            .files
+            .get_mut(&rearmed)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        let (_, _, reads, _) = f.page(source, index);
+        let mut expected = vec![
+            format!("{:?}", DeliveryMode::Full),
+            format!("{:?}", growth_mode()),
+        ];
+        expected.sort();
+        assert_eq!(modes(&reads), expected, "{source:?}");
+    }
+}
+
+/// [regress] C1: 677,422 Claude `state_missing` Fulls in 4.56 days were fed
+/// by discovery. An unchanged file whose state is missing (fingerprint
+/// re-armed, no retained checkpoint after a restart) is not Full-read by a
+/// re-listing pass or by a metadata-only watcher hint; main read it in Full.
+#[test]
+fn unchanged_file_with_missing_state_is_not_full_read_by_discovery() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let mut f = Fixture::new();
+        let mut index = kept_generation(&f, source, true);
+        f.cache = Arc::new(sampled_scan::SharedCache::default());
+        let path = f.root.join(format!("{REARMED}.jsonl"));
+        index
+            .files
+            .get_mut(&local_index_key(&path))
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        // A metadata-only change (ctime) and its watcher hint.
+        let original = fs::metadata(&path).unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_readonly(true);
+        fs::set_permissions(&path, read_only).unwrap();
+        fs::set_permissions(&path, original).unwrap();
+        let (_, scan, reads, _) = f.page_hinted(source, index, std::slice::from_ref(&path));
+        assert!(modes(&reads).is_empty(), "{source:?}");
+        assert_eq!(scan.scanned_file_count, 0, "{source:?}");
+    }
 }

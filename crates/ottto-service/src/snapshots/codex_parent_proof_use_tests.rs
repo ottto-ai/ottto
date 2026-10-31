@@ -484,6 +484,7 @@ impl Scene {
                 unhealthy_retry_not_before_unix_seconds: None,
                 counts: ScanTraversalCounts::default(),
                 residue: ScanTraversalResidue::default(),
+                listing_started_unix_seconds: None,
             }),
             ..ScanIndex::default()
         };
