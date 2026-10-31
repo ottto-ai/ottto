@@ -677,6 +677,7 @@ impl GroupBoot {
             source_file_fingerprint: last.source_file_fingerprint.clone(),
             candidate: first,
             decision: CandidateDecision::Parse,
+            parse_reason: None,
             parser,
             aliases: members.clone(),
             applied_receipts: BTreeMap::new(),

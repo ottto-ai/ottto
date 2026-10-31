@@ -88,7 +88,6 @@ fn refresh_terminal_off_discovery_at_test(
         roots,
         rfc3339_unix_seconds(at).unwrap(),
         overflow,
-        at,
         MAX_BACKFILL_FILES_PER_SOURCE,
     );
 }
@@ -1676,7 +1675,7 @@ fn terminal_off_targeted_adoption_is_page_bounded_deduplicated_and_never_census(
         SnapshotSource::ClaudeCode,
     );
     uploader.prepare_for_scan(SnapshotSource::ClaudeCode, "d".repeat(64), &mut index);
-    terminal_off_discovery::prepare(&mut index, now, W1, false);
+    terminal_off_discovery::prepare(&mut index, now, false);
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
         terminal_off_discovery::targeted(&mut index, now, 3)
     });

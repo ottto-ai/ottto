@@ -1609,7 +1609,7 @@ reported through `process_retained_cache_lifecycle_totals`. There is no labelled
 log line or per-line diagnostic emission. Counts are per observed usage line,
 before response deduplication, timestamp drops and token-field validation;
 rereads count again. Shape probes do not count. These are observations rather
-than retention failures. The replay harness classifies both as `Observation`.
+than retention failures.
 
 
 ## Compressed Codex reader refusals

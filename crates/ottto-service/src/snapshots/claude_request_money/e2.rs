@@ -303,21 +303,11 @@ enum Role {
     /// The recorded owner path is gone: this read proves a move from it.
     Moved(LocationKey),
 }
-impl crate::heap_layout_bound::HeapLayoutBound for Role {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; Role);
 /// This root file's own location key (inline digest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Located(LocationKey);
-impl crate::heap_layout_bound::HeapLayoutBound for Located {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; Located);
 
 /// The proof a held copy skip needs; `decide_page_copies` checks it per
 /// request once per page.
@@ -937,29 +927,12 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeEntityBody {
     entity_heap_method!(completed_heap_bound);
 }
 // Existing grain types were inline P1 values; E retains only the aggregate.
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeGrainSide {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        // Exhaustive: every field is an inline token/counter, already paid
-        // by its containing slot. No per-token graph walk is needed.
-        let Self {
-            tokens: _,
-            requests: _,
-            cost_micros: _,
-            unpriced: _,
-            contributions: _,
-            last_own_at: _,
-        } = self;
-        c.add(0)
-    }
-}
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestUsageOrigin {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+// Exhaustive: every field is an inline token/counter, already paid
+// by its containing slot. No per-token graph walk is needed.
+crate::heap_layout_bound::no_heap!(true; ClaudeGrainSide {
+    tokens, requests, cost_micros, unpriced, contributions, last_own_at,
+});
+crate::heap_layout_bound::no_heap!(false; ClaudeRequestUsageOrigin);
 
 /// What this page's telemetry read did for one fold.
 #[derive(Debug, Clone, Default)]
@@ -990,13 +963,7 @@ impl std::fmt::Debug for FoldNanos {
         f.write_str("FoldNanos")
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for FoldNanos {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; FoldNanos);
 
 /// The copied prefix's page outcome (copy-family fix, Lead B Addendum 2),
 /// local diagnostics only until SOURCE/COST consume the flag: requests of
@@ -1018,13 +985,7 @@ pub(crate) struct PrefixTally {
     removed_priced_requests: u64,
     removed_cost_micros: u64,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for PrefixTally {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; PrefixTally);
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileFold {
@@ -2911,19 +2872,28 @@ fn hold_copies(item: &mut SnapshotItem, reason: &'static str) {
 /// This page discarded the family's strict trace read (cap or generation
 /// race), so no account can be decided for it: every member is withheld like
 /// an undecided copy. No new revision replaces the accepted one; the next
-/// clean page decides it. Returns the items withheld.
-pub(crate) fn hold_trace_discarded(items: &mut [SnapshotItem], roots: &BTreeSet<String>) -> u64 {
+/// clean page decides it. Members without a fold (a family kept on ordinary
+/// money by the re-emission list) are returned for the same page withhold.
+/// Returns the items withheld and those unfolded sessions.
+pub(crate) fn hold_trace_discarded(
+    items: &mut [SnapshotItem],
+    roots: &BTreeSet<String>,
+) -> (u64, BTreeSet<String>) {
     let mut held = 0;
+    let mut unfolded = BTreeSet::new();
     for item in items {
         if !roots.contains(claude_snapshot_family_root_ref(item)) {
             continue;
         }
-        if let Some(fold) = item.claude_money.as_deref_mut() {
-            fold.entity.held = true;
-            held += 1;
+        match item.claude_money.as_deref_mut() {
+            Some(fold) => fold.entity.held = true,
+            None => {
+                unfolded.insert(item.source_session_id.clone());
+            }
         }
+        held += 1;
     }
-    held
+    (held, unfolded)
 }
 
 /// Decided: `uncovered` (and every id-less copy) counts, disclosed.
@@ -4276,22 +4246,9 @@ impl Serialize for Counts {
     }
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeMoneyTokens {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        let Self {
-            input: _,
-            output: _,
-            cache_read: _,
-            cache_5m: _,
-            cache_1h: _,
-            unattributed: _,
-            reasoning: _,
-        } = self;
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ClaudeMoneyTokens {
+    input, output, cache_read, cache_5m, cache_1h, unattributed, reasoning,
+});
 
 #[cfg(test)]
 #[path = "e2_tests.rs"]
