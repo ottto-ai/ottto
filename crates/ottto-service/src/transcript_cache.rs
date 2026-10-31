@@ -40,8 +40,6 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Retained<S> {
     }
 }
 struct Entry<S> {
-    // Empty custody must keep main's node layout; M3 ownership is optional.
-    durable: Option<Box<crate::snapshots::DurableCustody>>,
     retained: Retained<S>,
     used: u64,
     // Validated once at admission; private retained state is immutable until
@@ -59,7 +57,6 @@ struct Entry<S> {
 impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         let Self {
-            durable,
             retained: _,
             used: _,
             heap_bytes,
@@ -67,7 +64,6 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
             finalization_charge: _,
             e2_held_new_file: _,
         } = self;
-        durable.heap_bound(c)?;
         c.add(*heap_bytes)
     }
 }
@@ -171,21 +167,26 @@ pub(crate) fn entry_overhead<S>() -> usize {
 /// payloads; it never estimates memory from the source file's size.
 pub(crate) struct TranscriptCache<S> {
     entries: BTreeMap<String, Entry<S>>,
+    custody: Option<Box<BTreeMap<String, Box<crate::snapshots::DurableCustody>>>>,
     clock: u64,
     byte_limit: usize,
-    entry_limit: usize,
-    count_limit: usize,
+    // Fixed cache caps fit u32; packing them preserves main's root layout
+    // while the optional ON-only custody map lives outside entry nodes.
+    entry_limit: u32,
+    count_limit: u32,
 }
 impl<S: HeapLayoutBound> HeapLayoutBound for TranscriptCache<S> {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         let Self {
             entries,
+            custody,
             clock,
             byte_limit,
             entry_limit,
             count_limit,
         } = self;
         entries.heap_bound(c)?;
+        custody.heap_bound(c)?;
         clock.heap_bound(c)?;
         byte_limit.heap_bound(c)?;
         entry_limit.heap_bound(c)?;
@@ -201,23 +202,51 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     fn new(byte_limit: usize, entry_limit: usize, count_limit: usize) -> Self {
         Self {
             entries: BTreeMap::new(),
+            custody: None,
             clock: 0,
             byte_limit,
-            entry_limit,
-            count_limit,
+            entry_limit: u32::try_from(entry_limit).expect("fixed cache entry limit"),
+            count_limit: u32::try_from(count_limit).expect("fixed cache count limit"),
         }
     }
     pub(crate) fn with_byte_limit(byte_limit: usize) -> Self {
         Self::new(byte_limit, ENTRY_BYTES, CACHE_ENTRIES)
     }
+    fn remove_custody(&mut self, key: &str) -> crate::snapshots::DurableCustody {
+        let value = self.custody.as_mut().and_then(|map| map.remove(key));
+        if self.custody.as_ref().is_some_and(|map| map.is_empty()) {
+            self.custody = None;
+        }
+        value.map_or_else(Default::default, |value| *value)
+    }
+    fn custody_entry_bytes(key: &String, bytes: usize) -> Option<usize> {
+        if bytes == 0 {
+            return Some(0);
+        }
+        heap_layout_bound::tree_node_bytes::<String, Box<crate::snapshots::DurableCustody>>()?
+            .checked_add(key.capacity())?
+            .checked_add(bytes)
+    }
+    fn custody_root_bytes() -> Option<usize> {
+        type Map = BTreeMap<String, Box<crate::snapshots::DurableCustody>>;
+        heap_layout_bound::tree_node_bytes::<String, Box<crate::snapshots::DurableCustody>>()?
+            .checked_add(std::mem::size_of::<Map>() + std::mem::align_of::<Map>())
+    }
+    pub(crate) fn custody_extra(&self, key: &String, bytes: usize) -> Option<usize> {
+        let entry = Self::custody_entry_bytes(key, bytes)?;
+        if bytes > 0 && self.custody.is_none() {
+            entry.checked_add(Self::custody_root_bytes()?)
+        } else {
+            Some(entry)
+        }
+    }
+
     /// Moves state into the existing active frame: there is no cached duplicate
     /// while the provider mutates it. The active frame must count this allocation
     /// through its own existing HeapLayoutBound admission.
     pub(crate) fn take(&mut self, key: &str) -> Option<Taken<S>> {
         let taken = self.entries.remove(key).map(|entry| Taken {
-            durable: entry
-                .durable
-                .map_or_else(Default::default, |custody| *custody),
+            durable: self.remove_custody(key),
             retained: entry.retained,
             modified_hint: entry.modified_hint,
             finalization_charge: entry.finalization_charge,
@@ -242,6 +271,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     pub(crate) fn clear(&mut self) {
         add(Event::ClearEntriesReleased, self.entries.len() as u64);
         self.entries.clear();
+        self.custody = None;
     }
     /// Evict in admission victim order (oldest source, then least recently
     /// used) until the resident state fits `limit`. False when even an empty
@@ -336,6 +366,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             let Some(entry) = self.entries.remove(&victim) else {
                 return false;
             };
+            self.remove_custody(&victim);
             match cause {
                 Release::CursorReservation => record(Event::CursorReservationEntriesEvicted),
                 Release::CopyRefusal => {
@@ -366,7 +397,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     #[cfg_attr(not(unix), allow(dead_code))]
     /// The same resident's acquisition provenance, borrowed under this cache guard.
     pub(crate) fn custody(&self, key: &str) -> Option<&crate::snapshots::DurableCustody> {
-        self.entries.get(key)?.durable.as_deref()
+        self.custody.as_ref()?.get(key).map(Box::as_ref)
     }
     pub(crate) fn peek(&self, key: &str) -> Option<&Retained<S>> {
         self.entries.get(key).map(|entry| &entry.retained)
@@ -398,6 +429,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &str) {
         self.entries.remove(key);
+        self.remove_custody(key);
     }
     #[cfg(test)]
     pub(crate) fn resident_bound(&self) -> Option<usize> {
@@ -496,38 +528,50 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         victims: bool,
     ) -> bool {
         (|| {
-            if self.count_limit == 0
+            if (self.count_limit as usize) == 0
                 || self.clock == u64::MAX
                 || !retained.state.supports_frozen_charge()
             {
                 return None;
             }
-            let heap = heap_layout_bound::bound(retained, self.entry_limit)?
+            let heap = heap_layout_bound::bound(retained, (self.entry_limit as usize))?
                 .checked_sub(std::mem::size_of_val(retained))?;
             let entry = std::mem::size_of::<Entry<S>>()
                 .checked_add(heap)?
                 .checked_add(custody_bytes)?;
-            heap_layout_bound::bound(key, self.entry_limit.checked_sub(entry)?)?;
+            heap_layout_bound::bound(key, (self.entry_limit as usize).checked_sub(entry)?)?;
             let limit = self.byte_limit.checked_sub(reserved)?;
             let mut bytes = heap_layout_bound::bound(&Self::new(0, 0, 0), limit)?
                 .checked_add(entry_slot_bytes::<S>(key.capacity())?)?
                 .checked_add(heap)?
                 .checked_add(custody_bytes)?;
+            let mut custody_count = usize::from(custody_bytes > 0);
+            let mut custody_charge = Self::custody_entry_bytes(key, custody_bytes)?;
             let mut count = 1_usize;
             for (other, entry) in &self.entries {
                 if other == key || (victims && entry.modified_hint <= rank) {
                     continue;
                 }
                 count = count.checked_add(1)?;
-                let mut custody = Counter::new(limit);
-                entry.durable.heap_bound(&mut custody)?;
+                let other_custody = self
+                    .custody(other)
+                    .map_or(Some(0), |c| c.retained_bytes(limit))?;
+                custody_count += usize::from(other_custody > 0);
+                custody_charge =
+                    custody_charge.checked_add(Self::custody_entry_bytes(other, other_custody)?)?;
                 bytes = bytes
                     .checked_add(entry_slot_bytes::<S>(other.capacity())?)?
-                    .checked_add(entry.heap_bytes)?
-                    .checked_add(custody.bytes)?;
+                    .checked_add(entry.heap_bytes)?;
+            }
+            // The cache root already includes the optional map pointer.
+            bytes = bytes
+                .checked_sub(custody_bytes)?
+                .checked_add(custody_charge)?;
+            if custody_count > 0 {
+                bytes = bytes.checked_add(Self::custody_root_bytes()?)?;
             }
             // Header eviction can relieve bytes, never retained-entry count.
-            ((!victims || count <= self.count_limit) && bytes <= limit).then_some(())
+            ((!victims || count <= (self.count_limit as usize)) && bytes <= limit).then_some(())
         })()
         .is_some()
     }
@@ -561,6 +605,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         live_bytes: usize,
     ) -> Result<(), I> {
         self.entries.remove(&key);
+        self.remove_custody(&key);
         let taken: &Taken<S> = incoming.borrow();
         let refuse = |event, taken| {
             record(event);
@@ -571,39 +616,41 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         };
         let Some(next) = self.clock.checked_add(1) else {
             self.entries.clear();
+            self.custody = None;
             self.clock = 0;
             return refuse(Event::InsertClockReset, incoming);
         };
-        if self.count_limit == 0 || !heap_layout_bound::layout_supported() {
+        if (self.count_limit as usize) == 0 || !heap_layout_bound::layout_supported() {
             return refuse(Event::InsertDisabledOrLayoutRefused, incoming);
         }
-        let Some(heap_bytes) = heap_layout_bound::bound(&taken.retained, self.entry_limit)
-            .and_then(|bytes| bytes.checked_sub(std::mem::size_of_val(&taken.retained)))
+        let Some(heap_bytes) =
+            heap_layout_bound::bound(&taken.retained, (self.entry_limit as usize))
+                .and_then(|bytes| bytes.checked_sub(std::mem::size_of_val(&taken.retained)))
         else {
             return refuse(Event::InsertEntryBoundRefused, incoming);
         };
         if !taken.retained.state.supports_frozen_charge() {
             return refuse(Event::InsertFrozenChargeRefused, incoming);
         }
-        let custody_bytes = taken.durable.retained_bytes(self.entry_limit);
+        let custody_bytes = taken.durable.retained_bytes((self.entry_limit as usize));
         let state_bytes = custody_bytes.and_then(|bytes| {
             std::mem::size_of::<Entry<S>>()
                 .checked_add(heap_bytes)?
                 .checked_add(bytes)
         });
-        let Some(state_bytes) = state_bytes.filter(|n| *n <= self.entry_limit) else {
+        let Some(state_bytes) = state_bytes.filter(|n| *n <= (self.entry_limit as usize)) else {
             return refuse(Event::InsertEntryBoundRefused, incoming);
         };
-        if heap_layout_bound::bound(&key, self.entry_limit - state_bytes).is_none() {
+        if heap_layout_bound::bound(&key, (self.entry_limit as usize) - state_bytes).is_none() {
             return refuse(Event::InsertKeyBoundRefused, incoming);
         }
         let extra = entry_slot_bytes::<S>(key.len())
             .and_then(|n| n.checked_add(heap_bytes))
-            .and_then(|n| n.checked_add(custody_bytes?));
+            .and_then(|n| n.checked_add(self.custody_extra(&key, custody_bytes?)?));
         self.clock = next;
         let mut admitted = true;
         loop {
-            let fits = self.entries.len() + usize::from(admitted) <= self.count_limit
+            let fits = self.entries.len() + usize::from(admitted) <= (self.count_limit as usize)
                 && heap_layout_bound::bound(self, usize::MAX)
                     .and_then(|n| n.checked_add(if admitted { extra? } else { 0 }))
                     .is_some_and(|n| n <= resident_limit);
@@ -618,12 +665,14 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
                 && victim.map_or(true, |(_, entry)| {
                     (taken.modified_hint, next) < (entry.modified_hint, entry.used)
                 });
-            let count_pressure = self.entries.len() + usize::from(admitted) > self.count_limit;
+            let count_pressure =
+                self.entries.len() + usize::from(admitted) > (self.count_limit as usize);
             if own {
                 admitted = false;
             } else if let Some((victim, _)) = victim {
                 let victim = victim.clone();
                 self.entries.remove(&victim);
+                self.remove_custody(&victim);
             } else {
                 return refuse(Event::InsertNoVictimRefused, incoming);
             }
@@ -646,7 +695,6 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             key.clone(),
             Entry {
                 retained,
-                durable: (!durable.is_empty()).then(|| Box::new(durable)),
                 modified_hint,
                 finalization_charge,
                 e2_held_new_file,
@@ -654,6 +702,11 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
                 heap_bytes,
             },
         );
+        if !durable.is_empty() {
+            self.custody
+                .get_or_insert_with(Default::default)
+                .insert(key, Box::new(durable));
+        }
         record(Event::InsertAdmitted);
         Ok(())
     }
@@ -662,159 +715,6 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn predecessor_admit(
-        cache: &mut TranscriptCache<String>,
-        key: String,
-        retained: Retained<String>,
-        live_bytes: usize,
-        finalization_charge: usize,
-        rank: (i64, i64),
-    ) -> bool {
-        cache.entries.remove(&key);
-        let Some(resident_limit) = cache.byte_limit.checked_sub(live_bytes) else {
-            record(Event::InsertLiveReservationRefused);
-            return false;
-        };
-        let Some(next) = cache.clock.checked_add(1) else {
-            // A safe local reset; no durable debt is owned here. Unreachable
-            // in practice (`u64` admissions), but it does clear the cache.
-            cache.entries.clear();
-            cache.clock = 0;
-            record(Event::InsertClockReset);
-            return false;
-        };
-        // A zero count limit, or a toolchain whose layouts are not validated.
-        // Neither evicts; a P1-RETAIN R0 release needs a supported layout, so
-        // it never precedes this refusal.
-        if cache.count_limit == 0 || !heap_layout_bound::layout_supported() {
-            record(Event::InsertDisabledOrLayoutRefused);
-            return false;
-        }
-        let Some(heap_bytes) = heap_layout_bound::bound(&retained, cache.entry_limit)
-            .and_then(|bytes| bytes.checked_sub(std::mem::size_of_val(&retained)))
-        else {
-            record(Event::InsertEntryBoundRefused);
-            return false;
-        };
-        if !retained.state.supports_frozen_charge() {
-            record(Event::InsertFrozenChargeRefused);
-            return false;
-        }
-        // Only the count/byte caps and the victim order below decide
-        // residency, never idle age: under pressure, older-modified work loses
-        // to newer resident state. Neither decision suppresses a native full
-        // read or audit.
-        let entry = Entry {
-            durable: Default::default(),
-            modified_hint: rank,
-            retained,
-            used: next,
-            heap_bytes,
-            finalization_charge,
-            e2_held_new_file: false,
-        };
-        let Some(state_bytes) = heap_layout_bound::bound(&entry, cache.entry_limit) else {
-            record(Event::InsertEntryBoundRefused);
-            return false;
-        };
-        if heap_layout_bound::bound(&key, cache.entry_limit.saturating_sub(state_bytes)).is_none() {
-            record(Event::InsertKeyBoundRefused);
-            return false;
-        }
-        cache.clock = next;
-        cache.entries.insert(key.clone(), entry);
-        let mut admitted = true;
-        loop {
-            if cache.entries.len() <= cache.count_limit
-                && heap_layout_bound::bound(cache, resident_limit).is_some()
-            {
-                record(if admitted {
-                    Event::InsertAdmitted
-                } else {
-                    Event::InsertSelfEvicted
-                });
-                return admitted;
-            }
-            let victim = cache
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| (entry.modified_hint, entry.used))
-                .map(|(candidate, _)| candidate.clone());
-            let Some(victim) = victim else {
-                cache.entries.remove(&key);
-                record(Event::InsertNoVictimRefused);
-                return false;
-            };
-            let count_pressure = cache.entries.len() > cache.count_limit;
-            cache.entries.remove(&victim);
-            record(Event::InsertEntriesEvicted);
-            crate::local_resource_diagnostics::claude_reread::cache_capacity_eviction(
-                count_pressure,
-            );
-            if victim == key {
-                // Even a rejected new entry must release enough older state
-                // for the caller's live allocation reservation.
-                admitted = false;
-            }
-        }
-    }
-
-    /// [money] ordinary admission matches predecessor limits victims clocks and events.
-    #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]
-    fn ordinary_admission_matches_predecessor_limits_victims_clocks_and_events() {
-        assert!(heap_layout_bound::layout_supported());
-        for count in [1, 3, 256] {
-            for bytes in [16 * 1024, 128 * 1024] {
-                let mut current = TranscriptCache::<String>::new(bytes, 64 * 1024, count);
-                let mut predecessor = TranscriptCache::<String>::new(bytes, 64 * 1024, count);
-                for n in 0..24 {
-                    let mut key = format!("key-{}", n % 7);
-                    if n % 4 == 0 {
-                        key.reserve(1024);
-                    }
-                    let retained = retained("v".repeat(if n % 5 == 0 { 32 * 1024 } else { 1024 }));
-                    let old = Retained {
-                        checkpoint: retained.checkpoint.clone(),
-                        state: retained.state.clone(),
-                    };
-                    let rank = ((n * 17 % 11) as i64, 0);
-                    let live = if n % 6 == 0 { bytes / 2 } else { 0 };
-                    let (now, events) =
-                        crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-                            current.admit_at_rank(key.clone(), retained, live, 23, rank)
-                        });
-                    let (before, old_events) =
-                        crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-                            predecessor_admit(&mut predecessor, key.clone(), old, live, 23, rank)
-                        });
-                    assert_eq!(now, before, "{count}/{bytes}/{n}");
-                    assert_eq!(events, old_events, "{count}/{bytes}/{n}");
-                    assert_eq!(current.clock, predecessor.clock);
-                    assert_eq!(current.resident_bound(), predecessor.resident_bound());
-                    let facts = |cache: &TranscriptCache<String>| {
-                        cache
-                            .entries
-                            .iter()
-                            .map(|(key, entry)| {
-                                (
-                                    key.clone(),
-                                    key.capacity(),
-                                    entry.retained.state.clone(),
-                                    entry.used,
-                                    entry.modified_hint,
-                                    entry.finalization_charge,
-                                    entry.e2_held_new_file,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    };
-                    assert_eq!(facts(&current), facts(&predecessor));
-                }
-            }
-        }
-    }
 
     /// [money] attached retail guard survives virtual self eviction and real admission.
     #[test]
@@ -1346,6 +1246,15 @@ mod tests {
             cache.remove(&key);
             assert_eq!(cache.resident_bound().unwrap(), before, "remove {key}");
         }
+        // origin/main Entry<String>: Retained + u64 + usize + (i64,i64)
+        // + usize + bool, rounded to eight bytes. Cache root: map + four usize.
+        let main_entry = std::mem::size_of::<Retained<String>>() + 48;
+        assert_eq!(std::mem::size_of::<Entry<String>>(), main_entry);
+        assert_eq!(std::mem::size_of::<TranscriptCache<String>>(), 56);
+        assert_eq!(
+            entry_slot_bytes::<String>(0),
+            Some(352 + 11 * (24 + main_entry))
+        );
         assert!(entry_overhead::<String>() > 0);
         assert_eq!(
             entry_overhead::<String>(),

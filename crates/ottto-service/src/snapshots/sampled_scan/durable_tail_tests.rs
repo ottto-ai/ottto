@@ -12109,7 +12109,8 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                     // The empty retained root and the incoming entry's node
                     // are both charged; the incoming inline state lives in
                     // that node, and only its heap is added separately.
-                    let minimum = cursor_bytes + side + empty_retained + incoming_slot + incoming_heap + custody_bytes;
+                    let minimum = cursor_bytes + side + empty_retained + incoming_slot + incoming_heap
+                        + retained.custody_extra(&key, custody_bytes).unwrap();
                     assert!(minimum < state_bytes());
                     let one_byte_short = TranscriptCache::with_byte_limit(minimum - 1);
                     assert!(!one_byte_short.insertion_fits(
