@@ -2640,7 +2640,7 @@ fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn desktop_identity_real_sync_rejected_body_stays_pending_exact_acked_retry_settles() {
+fn desktop_identity_real_sync_rejected_body_is_refused_exact_acked_retry_settles() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _manifests = SourceManifestTestGuard::new();
     let start = current_unix_seconds();
@@ -2673,9 +2673,11 @@ fn desktop_identity_real_sync_rejected_body_stays_pending_exact_acked_retry_sett
         "complete"
     );
     assert!(offered[0]["session_account_evidence"]["account_identifier_hash"].is_string());
-    assert_eq!(
-        serde_json::to_value(&refused.index).unwrap()["claude_desktop_identity_latches"][&key],
-        "identity_pending",
+    // A quarantined verdict is no ACK: Refused at this evidence digest.
+    assert!(
+        serde_json::to_value(&refused.index).unwrap()["claude_desktop_identity_latches"][&key]
+            .as_str()
+            .is_some_and(|latch| latch.starts_with("refused:")),
         "natural completion has no ACK"
     );
     let fingerprint = fingerprint_of(&offered[0]);

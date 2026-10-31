@@ -208,12 +208,16 @@ impl IdentityFixture {
         );
         item
     }
-    /// Each restart gets its own file, so a branch from an older index is not
-    /// refused by the save CAS against a sibling branch's later save.
     fn restart(&self, mut index: ScanIndex) -> ScanIndex {
-        static RESTARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = RESTARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = self.home.join(format!("index-{n}.json"));
+        let path = self.home.join("index.json");
+        index.save(&path).unwrap();
+        ScanIndex::load(&path).unwrap()
+    }
+    /// A branch from an older index restarts from its own fresh file, so the
+    /// save CAS against a sibling branch's later save does not refuse it.
+    fn restart_branch(&self, mut index: ScanIndex) -> ScanIndex {
+        let path = self.home.join("branch-index.json");
+        index.generation = 0;
         index.save(&path).unwrap();
         ScanIndex::load(&path).unwrap()
     }
@@ -503,7 +507,7 @@ fn desktop_identity_settles_on_this_bodys_ack_never_on_an_older_bodys_fingerprin
         &held,
     );
     assert!(matches!(f.latch(&working), Some(Refused(_))));
-    let (quiet, counts) = f.run(f.restart(working), "2026-08-02T07:15:00Z");
+    let (quiet, counts) = f.run(f.restart_branch(working), "2026-08-02T07:15:00Z");
     assert!(quiet.result.snapshots.is_empty());
     assert_eq!((quiet.native_bytes, counts), (0, Reoffers::default()));
 }
