@@ -4450,12 +4450,11 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
         );
         assert_eq!(modes.0, 1);
         index.save(&index_path).unwrap();
+        first.durable_write_after_save(lock, source, &index).unwrap();
         assert_eq!(
-            first
-                .durable_write_after_save(lock, source, &index)
-                .unwrap()
-                .written,
-            1
+            first.durable_counters(source).unwrap().1.records_written,
+            1,
+            "native settlement wrote each record once before effects"
         );
         let key = local_index_key(&fixture.file.0);
         let old = sampled_scan::durable_tail::seed_pinned_v1(&first, source, &key, &index);
@@ -4692,12 +4691,11 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
         );
         assert_eq!(modes.0, 1);
         index.save(&index_path).unwrap();
+        cache.durable_write_after_save(lock, source, &index).unwrap();
         assert_eq!(
-            cache
-                .durable_write_after_save(lock, source, &index)
-                .unwrap()
-                .written,
-            1
+            cache.durable_counters(source).unwrap().1.records_written,
+            1,
+            "native settlement wrote each record once before effects"
         );
         fixture.file.append(&usage(source, 130, 1, "fixture-model"));
         let (mut index, _, modes) =

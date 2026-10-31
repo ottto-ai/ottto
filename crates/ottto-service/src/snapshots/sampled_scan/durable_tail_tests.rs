@@ -260,12 +260,11 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
         assert_eq!(first.snapshots[0].input_tokens, 100);
         assert!(cache.retained().unwrap().peek(&key).is_some());
         index.save(&index_path).unwrap();
+        cache.durable_write_after_save(lock, source, &index).unwrap();
         assert_eq!(
-            cache
-                .durable_write_after_save(lock, source, &index)
-                .unwrap()
-                .written,
-            1
+            cache.durable_counters(source).unwrap().1.records_written,
+            1,
+            "native settlement wrote each record once before effects"
         );
         cache.retained().unwrap().clear();
         let entry = serde_json::to_value(&index.files[&key]).unwrap();
@@ -559,12 +558,11 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
         assert_eq!(first.snapshots[0].input_tokens, 100);
         assert!(cache.retained().unwrap().peek(&key).is_some());
         index.save(&index_path).unwrap();
+        cache.durable_write_after_save(lock, source, &index).unwrap();
         assert_eq!(
-            cache
-                .durable_write_after_save(lock, source, &index)
-                .unwrap()
-                .written,
-            1
+            cache.durable_counters(source).unwrap().1.records_written,
+            1,
+            "native settlement wrote each record once before effects"
         );
         let checkpoint = cache
             .retained()
@@ -11300,12 +11298,11 @@ fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
             "genuine Full, no seeded debt"
         );
         index.save(&index_path).unwrap();
+        cache.durable_write_after_save(lock, source, &index).unwrap();
         assert_eq!(
-            cache
-                .durable_write_after_save(lock, source, &index)
-                .unwrap()
-                .written,
-            1
+            cache.durable_counters(source).unwrap().1.records_written,
+            1,
+            "native settlement wrote each record once before effects"
         );
         let record = {
             let mut stores = cache.durable().unwrap();
