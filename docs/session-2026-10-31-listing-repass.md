@@ -11,8 +11,10 @@ re-arms, and records no walk problem or census count, so it can only delay a
 generation's discovery, never complete it. Codex keeps its "no selection while
 directories are pending" rule only for the first walk. A file the generation
 already saw that has no index entry (a hold, an oversized file) has no stamp,
-so the pass leaves it to its owner's floor. A Claude terminal-off rediscovery
-upgrades a pending re-listing root to its own full walk.
+so the pass leaves it to its owner's floor. Under the opt-in Claude
+terminal-off marker the pass does not start: terminal-off's own
+identity-aware rediscovery is the listing there, and it upgrades a pending
+re-listing root to its full walk.
 
 New files no longer wait for the oversized/unhealthy 6-hour floor: the pass
 finds them within about 30 minutes, without a hint or a restart.

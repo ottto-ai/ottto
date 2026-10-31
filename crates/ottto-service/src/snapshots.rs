@@ -26819,7 +26819,10 @@ impl OwnedSourceScan {
                 backfill_window_days,
                 discovery_retention!(index, &resource_probe.discovery_growth),
             );
-            start_due_listing_pass(traversal, collected_at);
+            if !(source == SnapshotSource::ClaudeCode && claude_terminal_off()) {
+                // Terminal-off's own identity-aware rediscovery is its listing.
+                start_due_listing_pass(traversal, collected_at);
+            }
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
         }
