@@ -33,7 +33,9 @@ fn archive_event_count(rows: &[Value], event: &str) -> u64 {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn unsettled_retained_archive_resends_zero_decoded_bytes_and_exact_ack_settles() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let key = local_index_key(&f.0);
@@ -98,7 +100,9 @@ fn unsettled_retained_archive_resends_zero_decoded_bytes_and_exact_ack_settles()
     ignore = "funded decoder needs validated heap layout"
 )]
 fn evicted_archive_retries_once_with_counted_bounded_decode() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let key = local_index_key(&f.0);
@@ -141,7 +145,9 @@ fn evicted_archive_retries_once_with_counted_bounded_decode() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn changed_archive_object_never_takes_prior_retained_copy() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let key = local_index_key(&f.0);
@@ -186,7 +192,9 @@ fn changed_archive_object_never_takes_prior_retained_copy() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn twin_without_content_equivalence_holds_archive_and_preserves_plain_body() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for equivalent in [false, true] {
         let plain_bytes = synthetic_rollout();
         let mut archive_bytes = plain_bytes.clone();
@@ -329,7 +337,9 @@ fn only_pending_sibling_resolution_restores_one_a1_eligibility() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn plain_retained_output_and_charge_are_unchanged_beside_archive_pressure() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let plain = f.0.with_file_name("rollout-plain-peer.jsonl");
     fs::write(
@@ -466,7 +476,9 @@ fn global_newest_archive_order_survives_small_pages_and_plain_fifo_is_first() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn only_pending_sibling_resolves_to_another_owner_then_exactly_one_a1() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap());
     let peer_owner = "2026-10-07T00-00-00-compressed-fixture";
     let peer =
@@ -547,7 +559,9 @@ fn only_pending_sibling_resolves_to_another_owner_then_exactly_one_a1() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn retained_archive_scope_mismatch_is_quiet_correction_residue_not_eviction_credit() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let key = local_index_key(&f.0);
@@ -593,7 +607,9 @@ fn retained_archive_scope_mismatch_is_quiet_correction_residue_not_eviction_cred
     ignore = "funded decoder needs validated heap layout"
 )]
 fn unavailable_retained_archive_scope_keeps_copy_and_defers_without_decode_credit() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let key = local_index_key(&f.0);
@@ -631,7 +647,9 @@ fn unavailable_retained_archive_scope_keeps_copy_and_defers_without_decode_credi
     ignore = "funded decoder needs validated heap layout"
 )]
 fn compressed_retained_save_never_writes_a_durable_record() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let index_path = f.0.parent().unwrap().join("retained-save-index.json");
@@ -652,7 +670,6 @@ fn compressed_retained_save_never_writes_a_durable_record() {
     assert_eq!(cache.durable_selected_count_for_test(), 0);
     // Normal admission and save: the compressed reduction is never offered.
     index.save(&index_path).unwrap();
-    cache.durable_fence_archives(writer, SnapshotSource::Codex);
     cache.durable_write_after_save(writer, SnapshotSource::Codex, &index);
     cache
         .durable_gc(writer, SnapshotSource::Codex, &index)
@@ -674,7 +691,9 @@ fn compressed_retained_save_never_writes_a_durable_record() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn plain_prepare_cannot_take_or_reuse_a_compressed_retained_entry() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let key = local_index_key(&f.0);
@@ -735,7 +754,9 @@ fn plain_prepare_cannot_take_or_reuse_a_compressed_retained_entry() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn claude_retained_reuse_is_unchanged_beside_archive_pressure() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let plain =
         f.0.with_file_name("11111111-2222-4333-8444-555555555555.jsonl");
@@ -852,7 +873,9 @@ fn claude_retained_reuse_is_unchanged_beside_archive_pressure() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn custody_precedes_retained_take_and_growing_archive_keeps_its_copy() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let key = local_index_key(&f.0);
     let cache = Arc::new(sampled_scan::SharedCache::default());
@@ -901,7 +924,9 @@ fn custody_precedes_retained_take_and_growing_archive_keeps_its_copy() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn new_archive_a1_with_exact_accepted_history_counts_reupgrade_full() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let key = local_index_key(&f.0);
     let (mut index, first) = finish_selector(retained_archive_scan(
@@ -952,7 +977,9 @@ fn new_archive_a1_with_exact_accepted_history_counts_reupgrade_full() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn activated_funded_decoder_pages_total_size_and_probe_refuses() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     assert_eq!(FIRST_READ_DECODED_LIMIT, 1 << 30);
     let cache = Arc::new(sampled_scan::SharedCache::default());
