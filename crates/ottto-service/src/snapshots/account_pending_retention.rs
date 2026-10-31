@@ -95,31 +95,12 @@ impl ClaudeAccountFamilyPending {
             })
     }
 
-    /// First equal predecessor creates the second endpoint. Later equal pushes
-    /// replace only that endpoint. A -> B -> A always starts distinct runs.
     pub(super) fn retain_previous_window(&mut self, old: ClaudeAccountFamilyPendingWindow) {
-        let len = self.previous_windows.len();
-        if len >= 2 {
-            let first = &self.previous_windows[len - 2];
-            let last = &self.previous_windows[len - 1];
-            if let (Some(a), Some(b), Some(c), Some(current)) = (
-                rfc3339_unix_seconds(&first.census_window_end),
-                rfc3339_unix_seconds(&last.census_window_end),
-                rfc3339_unix_seconds(&old.census_window_end),
-                rfc3339_unix_seconds(&self.census_window_end),
-            ) {
-                if a < b
-                    && b < c
-                    && c < current
-                    && first.strict_evidence() == last.strict_evidence()
-                    && last.strict_evidence() == old.strict_evidence()
-                {
-                    self.previous_windows[len - 1] = old;
-                    return;
-                }
-            }
-        }
-        self.previous_windows.push(old);
+        retain_run_endpoint(
+            &mut self.previous_windows,
+            old,
+            &self.current.census_window_end,
+        );
     }
 
     fn apply_checked_plan(&mut self, retained: Vec<usize>) -> Option<usize> {
@@ -174,6 +155,37 @@ impl ClaudeAccountFamilyPending {
         }
         Some(retained)
     }
+}
+
+/// First equal predecessor creates the second endpoint. Later equal pushes
+/// replace only that endpoint. A -> B -> A always starts distinct runs.
+fn retain_run_endpoint(
+    windows: &mut Vec<ClaudeAccountFamilyPendingWindow>,
+    old: ClaudeAccountFamilyPendingWindow,
+    current_end: &str,
+) {
+    let len = windows.len();
+    if len >= 2 {
+        let first = &windows[len - 2];
+        let last = &windows[len - 1];
+        if let (Some(a), Some(b), Some(c), Some(current)) = (
+            rfc3339_unix_seconds(&first.census_window_end),
+            rfc3339_unix_seconds(&last.census_window_end),
+            rfc3339_unix_seconds(&old.census_window_end),
+            rfc3339_unix_seconds(current_end),
+        ) {
+            if a < b
+                && b < c
+                && c < current
+                && first.strict_evidence() == last.strict_evidence()
+                && last.strict_evidence() == old.strict_evidence()
+            {
+                windows[len - 1] = old;
+                return;
+            }
+        }
+    }
+    windows.push(old);
 }
 
 /// Per-root decision summary: historical existence, the union of member keys,
