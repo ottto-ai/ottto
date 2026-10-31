@@ -1077,3 +1077,180 @@ fn native_m3_plain_flush_matrix_has_no_file_fsync_boundary() {
         "native temp commit added fsync"
     );
 }
+
+/// Native cold-store setup shared by transition tests. Scans stop before
+/// policy finalization, ACK and save; each driver chooses its settlement.
+pub(crate) mod native_cold {
+    use super::super::{durable_tail, SharedCache};
+    use crate::durable_tail_store::{self as store, DurableSource};
+    use crate::locked_state_dir::{test_locks, LockedStateDir};
+    use crate::snapshots::*;
+    use crate::transcript_acquisition::Scope;
+    use std::sync::Arc;
+
+    pub(crate) struct NativeColdStore {
+        pub(crate) writer: &'static crate::locked_state_dir::LockedStateDir,
+        pub(crate) source: SnapshotSource,
+        pub(crate) root: PathBuf,
+        pub(crate) sessions: PathBuf,
+        pub(crate) index_path: PathBuf,
+        pub(crate) namespace: Scope,
+        pub(crate) cache: Arc<SharedCache>,
+        pub(crate) index: ScanIndex,
+        scratch: Option<crate::test_scratch::ScratchDir>,
+    }
+    impl NativeColdStore {
+        pub(crate) fn new(source: SnapshotSource, tag: &str, namespace: Scope) -> Self {
+            let scratch = crate::test_scratch::ScratchDir::new(tag);
+            let mut fixture = Self::open(source, scratch.to_path_buf(), namespace);
+            fixture.scratch = Some(scratch);
+            fixture
+        }
+        pub(crate) fn open(source: SnapshotSource, root: PathBuf, namespace: Scope) -> Self {
+            let sessions = root.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let writer = test_locks::hold(&root);
+            let index_path = root.join("index.json");
+            let index = if index_path.exists() {
+                ScanIndex::load(&index_path).unwrap()
+            } else {
+                ScanIndex::default()
+            };
+            Self {
+                writer,
+                source,
+                root,
+                sessions,
+                index_path,
+                namespace,
+                cache: Arc::new(SharedCache::default()),
+                index,
+                scratch: None,
+            }
+        }
+        pub(crate) fn restart(&mut self) {
+            self.cache = Arc::new(SharedCache::default());
+            self.index = ScanIndex::load(&self.index_path).unwrap();
+        }
+        pub(crate) fn path(&self, session: &str) -> PathBuf {
+            self.sessions.join(format!("{session}.jsonl"))
+        }
+        pub(crate) fn key(&self, session: &str) -> String {
+            local_index_key(&self.path(session))
+        }
+        pub(crate) fn digest(&self, session: &str) -> store::Digest32 {
+            store::key_digest(
+                durable_tail::durable_source(self.source).unwrap(),
+                &self.key(session),
+            )
+        }
+        pub(crate) fn store_dir(&self) -> PathBuf {
+            store::store_dir_for_index(&self.index_path)
+        }
+    }
+
+    pub(crate) fn jsonl(lines: impl IntoIterator<Item = serde_json::Value>) -> String {
+        lines
+            .into_iter()
+            .map(|line| line.to_string() + "\n")
+            .collect()
+    }
+    pub(crate) fn save(index_path: &Path, index: &mut ScanIndex) {
+        index.save(index_path).unwrap();
+    }
+
+    pub(crate) fn cache(
+        source: SnapshotSource,
+        index: &Path,
+        namespace: &Scope,
+        capture: bool,
+    ) -> SharedCache {
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, index, namespace, capture);
+        cache
+    }
+    pub(crate) fn store(index: &Path, source: DurableSource) -> store::DurableTailStore {
+        store::DurableTailStore::new(store::store_dir_for_index(index), source)
+    }
+    pub(crate) fn acquisition(source: SnapshotSource) -> Option<store::AcquisitionFields> {
+        Some(store::AcquisitionFields {
+            acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(source),
+            protocol: AcquisitionProtocol::Legacy,
+        })
+    }
+    pub(crate) fn pending(
+        source: SnapshotSource,
+        binding: store::Binding,
+        certificate: crate::transcript_acquisition::DurableCertificate,
+        body: Vec<u8>,
+    ) -> store::PendingRecord {
+        store::PendingRecord {
+            acquisition: acquisition(source),
+            binding,
+            certificate,
+            body,
+            allowlist: super::allowlist_digest(source),
+        }
+    }
+
+    /// Advance production scanning only. The pre-step counters match native
+    /// drivers; source-specific finish/save/ACK remains with each caller.
+    pub(crate) fn scan(
+        mut owned: OwnedSourceScan,
+        steps: usize,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize), u64) {
+        for _ in 0..steps {
+            let (modes, bytes) = owned.sampling.as_ref().map_or(((0, 0, 0), 0), |s| {
+                (
+                    (s.full_files, s.tail_files, s.unchanged_files),
+                    s.native_bytes,
+                )
+            });
+            match owned.step(None) {
+                OwnedSourceScanStep::Pending(next) => owned = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => {
+                    return (index, scan, modes, bytes)
+                }
+            }
+        }
+        panic!("native fixture scan did not complete");
+    }
+
+    pub(crate) fn scan_modes(
+        owned: OwnedSourceScan,
+        steps: usize,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        let (index, scan, modes, _) = scan(owned, steps);
+        (index, scan, modes)
+    }
+    pub(crate) fn scan_reads(
+        owned: OwnedSourceScan,
+        steps: usize,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, u64)) {
+        let (index, scan, modes, bytes) = scan(owned, steps);
+        (index, scan, (modes.0, modes.1, bytes))
+    }
+    /// Real v3 streaming; no receipt is synthesized and flush stays explicit.
+    pub(crate) fn commit(
+        disk: &mut store::DurableTailStore,
+        writer: &dyn store::SingleWriter,
+        header: store::PreparedHeader,
+        body: &[u8],
+    ) -> store::ReceiptProof {
+        let prepared = disk
+            .prepare_stream(writer, header)
+            .unwrap()
+            .write(|out| {
+                out.write_all(body)
+                    .map_err(|_| crate::durable_tail_codec::Refuse::WriteFailed)?;
+                Ok(body.len())
+            })
+            .unwrap();
+        let committed = disk
+            .commit_stream(writer, prepared)
+            .unwrap()
+            .commit()
+            .unwrap();
+        disk.finish_stream(committed).unwrap()
+    }
+}

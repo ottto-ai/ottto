@@ -2,17 +2,13 @@
 use super::*;
 use crate::locked_state_dir::test_locks;
 use crate::snapshots::sampled_scan::codex_cursor;
+use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::transcript_acquisition::ReadPlan;
 use std::io::Read;
 
 const INDEX_KEYS: usize = 20_000;
 
-pub(super) fn fixture_acquisition(source: SnapshotSource) -> Option<store::AcquisitionFields> {
-    Some(store::AcquisitionFields {
-        acquired_revision: effective_revision(source),
-        protocol: AcquisitionProtocol::Legacy,
-    })
-}
+pub(super) use fixture::acquisition as fixture_acquisition;
 
 #[path = "m3_integrated_rederive_tests.rs"]
 mod integrated_rederive;
@@ -285,25 +281,10 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
             )
             .with_sampled_acquisition(cache.clone(), namespace.clone())
         };
-        let finish = |mut scan: OwnedSourceScan| {
-            let mut modes = (0, 0, 0);
-            for _ in 0..10_000 {
-                if let Some(context) = scan.sampling.as_ref() {
-                    modes = (context.full_files, context.tail_files, context.native_bytes);
-                }
-                match scan.step(None) {
-                    OwnedSourceScanStep::Pending(next) => scan = next,
-                    OwnedSourceScanStep::Complete {
-                        mut index,
-                        mut scan,
-                        ..
-                    } => {
-                        finalize_scan_after_policy(source, &mut scan, &mut index);
-                        return (index, scan, modes);
-                    }
-                }
-            }
-            panic!("scan did not complete");
+        let finish = |scan: OwnedSourceScan| {
+            let (mut index, mut scan, modes) = fixture::scan_reads(scan, 10_000);
+            finalize_scan_after_policy(source, &mut scan, &mut index);
+            (index, scan, modes)
         };
         let (mut index, first, _) = finish(start(ScanIndex::default()));
         assert_eq!(first.snapshots.len(), 1);
@@ -473,21 +454,7 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
             )
             .with_sampled_acquisition(cache.clone(), namespace.clone())
         };
-        let finish = |mut scan: OwnedSourceScan| {
-            let mut modes = (0, 0, 0);
-            for _ in 0..10_000 {
-                if let Some(context) = scan.sampling.as_ref() {
-                    modes = (context.full_files, context.tail_files, context.native_bytes);
-                }
-                match scan.step(None) {
-                    OwnedSourceScanStep::Pending(next) => scan = next,
-                    OwnedSourceScanStep::Complete { index, scan, .. } => {
-                        return (index, scan, modes)
-                    }
-                }
-            }
-            panic!("scan did not complete");
-        };
+        let finish = |scan: OwnedSourceScan| fixture::scan_reads(scan, 10_000);
         let (mut index, first, _) = finish(start(ScanIndex::default()));
         assert_eq!(first.snapshots.len(), 1);
         assert_eq!(first.snapshots[0].input_tokens, 100);
@@ -1009,7 +976,7 @@ fn admissible_codex_records_survive_above_the_retired_aggregate_disk_cap() {
     assert!(body.len() <= store::BODY_BYTES);
     let ds = DurableSource::Codex;
     let allowlist = codec::allowlist_digest(SnapshotSource::Codex);
-    let mut disk = DurableTailStore::new(store::store_dir_for_index(&root.join("index.json")), ds);
+    let mut disk = fixture::store(&root.join("index.json"), ds);
     let mut keys = Vec::new();
     for n in 0..40 {
         let key = store::key_digest(ds, &format!("session-{n}"));
@@ -1204,8 +1171,7 @@ fn hold_active_retains_exact_completion_for_one_later_batch_receipt() {
     let _clear = ClearWriteFaults;
     let source = SnapshotSource::ClaudeCode;
     let ds = DurableSource::ClaudeCode;
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(
+    let cache = fixture::cache(
         source,
         &root.join("index.json"),
         &Scope("completion".into()),
@@ -1312,7 +1278,7 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
         let cache = Arc::new(SharedCache::default());
         cache.durable_begin_pass(source, &index_path, &namespace, true);
         let run = |index| {
-            let mut scan = OwnedSourceScan::new(
+            let scan = OwnedSourceScan::new(
                 source,
                 std::slice::from_ref(&sessions),
                 index,
@@ -1326,20 +1292,9 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
                 true,
             )
             .with_sampled_acquisition(cache.clone(), namespace.clone());
-            for _ in 0..10_000 {
-                match scan.step(None) {
-                    OwnedSourceScanStep::Pending(next) => scan = next,
-                    OwnedSourceScanStep::Complete {
-                        mut index,
-                        mut scan,
-                        ..
-                    } => {
-                        finalize_scan_after_policy(source, &mut scan, &mut index);
-                        return (index, scan);
-                    }
-                }
-            }
-            panic!("production scan did not complete");
+            let (mut index, mut scan, _) = fixture::scan_modes(scan, 10_000);
+            finalize_scan_after_policy(source, &mut scan, &mut index);
+            (index, scan)
         };
         let (mut index, first) = run(ScanIndex::default());
         assert_eq!(first.snapshots.len(), 1, "real native output premise");
@@ -1550,8 +1505,7 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
     let certificate = certificate(&transcript, &Scope("dt-gc-file".into()));
     let source = SnapshotSource::Codex;
     let namespace = Scope("dt-gc".into());
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let cache = fixture::cache(source, &index_path, &namespace, false);
 
     let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!(
         {"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"}
@@ -1561,10 +1515,7 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
     for n in 0..INDEX_KEYS {
         index.files.insert(indexed_key(n), entry.clone());
     }
-    let mut store = DurableTailStore::new(
-        store::store_dir_for_index(&index_path),
-        durable_source(source).unwrap(),
-    );
+    let mut store = fixture::store(&index_path, durable_source(source).unwrap());
     let allowlist = codec::allowlist_digest(source);
     let context = store::context_digest(&namespace.0, None);
     let keys = [
@@ -1637,7 +1588,7 @@ fn fresh_index_cleanup_preserves_unproved_v3_records() {
         let namespace = Scope("fresh-index-v3".into());
         let ds = durable_source(source).unwrap();
         let key = store::key_digest(ds, "/synthetic/absent.jsonl");
-        let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        let mut disk = fixture::store(&index_path, ds);
         assert_eq!(
             disk.write_after_save(
                 lock,
@@ -1801,22 +1752,18 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
         .binding;
         let (reduction, checkpoint) = native_record(&path, &scope);
         let body = codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap();
-        let mut store = DurableTailStore::new(
-            store::store_dir_for_index(&index_path),
-            durable_source(source).unwrap(),
-        );
+        let mut store = fixture::store(&index_path, durable_source(source).unwrap());
         store
             .write_after_save(
                 lock,
                 index.generation,
                 0,
-                vec![PendingRecord {
-                    acquisition: fixture_acquisition(source),
+                vec![fixture::pending(
+                    source,
                     binding,
-                    certificate: certificate(&path, &scope),
+                    certificate(&path, &scope),
                     body,
-                    allowlist: codec::allowlist_digest(source),
-                }],
+                )],
             )
             .unwrap();
         let records = || {
@@ -1834,8 +1781,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             b"{}\n",
         )
         .unwrap();
-        let positive = SharedCache::default();
-        positive.durable_begin_pass(source, &index_path, &namespace, false);
+        let positive = fixture::cache(source, &index_path, &namespace, false);
         let restored = positive
             .durable_restore(
                 source,
@@ -1868,8 +1814,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             index.activate_effective_upload_body_witness_revision(3);
         }
         assert!(index.effective_upload_body_witness_revision_requires_adoption(&key));
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        let cache = fixture::cache(source, &index_path, &namespace, false);
         let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
         assert!(cache
             .durable_restore(
@@ -1968,10 +1913,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
         .unwrap()
         .binding;
         let (reduction, _) = native_record(&path, &scope);
-        let mut store = DurableTailStore::new(
-            store::store_dir_for_index(&index_path),
-            durable_source(source).unwrap(),
-        );
+        let mut store = fixture::store(&index_path, durable_source(source).unwrap());
         let receipt = store
             .write_after_save(
                 lock,
@@ -2016,8 +1958,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             Interpretation::of(SnapshotSource::Codex, &key, &index, false, &namespace)
                 .identity_contract
         );
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        let cache = fixture::cache(source, &index_path, &namespace, false);
         assert!(cache
             .durable_restore(
                 source,
@@ -2065,10 +2006,7 @@ pub(super) fn codex_budget_fixture(path: &Path, session: &str, call_id_bytes: Op
     if let Some(bytes) = call_id_bytes {
         lines.push(open_call(bytes));
     }
-    let text = lines
-        .iter()
-        .map(|line| line.to_string() + "\n")
-        .collect::<String>();
+    let text = fixture::jsonl(lines);
     std::fs::write(path, text).unwrap();
 }
 
@@ -2142,7 +2080,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 cache.durable_begin_pass(source, &index_path, &namespace, false);
                 let ds = durable_source(source).unwrap();
                 let store_key = store::key_digest(ds, &key);
-                let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+                let mut disk = fixture::store(&index_path, ds);
                 // Certificate source is irrelevant for preservation; it is never restored.
                 let cert_path = root.join("certificate.jsonl");
                 std::fs::write(&cert_path, b"{}\n").unwrap();
@@ -2429,7 +2367,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let key = "/synthetic/foreign-owner.jsonl";
     let cert_path = root.join("certificate.jsonl");
     std::fs::write(&cert_path, b"{}\n").unwrap();
-    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let mut disk = fixture::store(&index_path, ds);
     let pending = PendingRecord {
         acquisition: fixture_acquisition(source),
         binding: Binding {
@@ -2453,8 +2391,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let mut bytes = std::fs::read(&record_path).unwrap();
     bytes[8..10].copy_from_slice(&(store::FORMAT_V3 + 1).to_le_bytes());
     std::fs::write(&record_path, &bytes).unwrap();
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let cache = fixture::cache(source, &index_path, &namespace, false);
     assert!(
         cache
             .durable_hold(source, key, &ScanIndex::default(), &mut None)
@@ -2567,7 +2504,7 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
             let (_, cold_body) = run(Arc::new(SharedCache::default()), ScanIndex::default());
             let ds = durable_source(source).unwrap();
             let digest = store::key_digest(ds, &key);
-            let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+            let mut disk = fixture::store(&index_path, ds);
             disk.write_after_save(
                 lock,
                 1,
@@ -2740,7 +2677,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         }
         let ds = durable_source(source).unwrap();
         let digest = store::key_digest(ds, &key);
-        let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        let mut disk = fixture::store(&index_path, ds);
         disk.write_after_save(
             lock,
             1,
@@ -2769,8 +2706,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         ));
         // Acquire genuine native custody while the predecessor is still valid.
         // The following corruption is a later storage fault, not capture authority.
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        let cache = fixture::cache(source, &index_path, &namespace, false);
         let completed = if arm == "codec" {
             native_v3_completion(&cache, &path, source, reduction, checkpoint)
         } else {
@@ -2947,10 +2883,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     let key = local_index_key(&held);
     let gone_key = local_index_key(&gone);
     let digest = store::key_digest(DurableSource::ClaudeCode, &key);
-    let mut disk = DurableTailStore::new(
-        store::store_dir_for_index(&index_path),
-        DurableSource::ClaudeCode,
-    );
+    let mut disk = fixture::store(&index_path, DurableSource::ClaudeCode);
     index.save(&index_path).unwrap();
     seed.durable_write_after_save(lock, source, &index).unwrap();
     assert!(
@@ -3215,7 +3148,7 @@ fn save_without_per_pass_setup_keeps_valid_records() {
     std::fs::write(&transcript, b"{\"n\":1}\n").unwrap();
     let context = store::context_digest(&namespace.0, None);
     let (indexed, absent) = ("/synthetic/indexed.jsonl", "/synthetic/absent.jsonl");
-    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let mut disk = fixture::store(&index_path, ds);
     let pending = [indexed, absent]
         .iter()
         .map(|key| PendingRecord {
@@ -3265,8 +3198,7 @@ fn save_without_per_pass_setup_keeps_valid_records() {
         let after = [indexed, absent].map(|key| std::fs::read(path(key)).unwrap());
         assert_eq!(after, before, "empty_index={empty}");
     }
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let cache = fixture::cache(source, &index_path, &namespace, false);
     crate::snapshots::durable_after_save(&cache, &root, source, &index);
     assert_eq!(std::fs::read(path(indexed)).unwrap(), before[0]);
     assert_eq!(std::fs::read(path(absent)).unwrap(), before[1]);
@@ -3443,8 +3375,7 @@ fn store_unavailable_after_t14_breaker_is_not_missing() {
         .unwrap(),
     );
     let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let cache = fixture::cache(source, &index_path, &namespace, false);
     let attempt = || {
         cache.durable_restore(
             source,
@@ -3460,7 +3391,7 @@ fn store_unavailable_after_t14_breaker_is_not_missing() {
         attempt(),
         RestoreOutcome::Miss(MissClass::Missing)
     ));
-    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let mut disk = fixture::store(&index_path, ds);
     let keys: Vec<_> = (0..=store::T14_BREAKER)
         .map(|n| store::key_digest(ds, &format!("/synthetic/corrupt-{n}.jsonl")))
         .collect();
@@ -3618,10 +3549,7 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
     // refusal must precede that record IO too, not just restore_known.
     let lock = test_locks::hold(&root);
     let index_path = root.join("index.json");
-    let mut disk = DurableTailStore::new(
-        store::store_dir_for_index(&index_path),
-        DurableSource::Codex,
-    );
+    let mut disk = fixture::store(&index_path, DurableSource::Codex);
     disk.write_after_save(lock, 1, 0, vec![record.record.clone()])
         .unwrap();
     let record_path = disk.dir().join(format!(
@@ -3739,10 +3667,7 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
     .unwrap()
     .binding;
     let (reduction, _) = native_record(&path, &scope);
-    let mut store = DurableTailStore::new(
-        store::store_dir_for_index(&index_path),
-        DurableSource::ClaudeCode,
-    );
+    let mut store = fixture::store(&index_path, DurableSource::ClaudeCode);
     store
         .write_after_save(
             lock,
@@ -3767,8 +3692,7 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
         b"{}\n",
     )
     .unwrap();
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &namespace, capture);
+    let cache = fixture::cache(source, &index_path, &namespace, capture);
     let restored = cache
         .durable_restore(
             source,
@@ -3847,7 +3771,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
     index.save(&index_path).unwrap();
     let interp = Interpretation::of(source, &key, &index, false, &namespace);
     let expected = expected(ds, source, &key, &scope, &index, &interp, None).unwrap();
-    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let mut disk = fixture::store(&index_path, ds);
     assert_eq!(
         disk.write_after_save(
             lock,
@@ -3872,8 +3796,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
         .unwrap()
         .write_all(b"{}\n")
         .unwrap();
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let cache = fixture::cache(source, &index_path, &namespace, false);
     let mut parser = OwnedJsonlParser::new(
         File::open(&path).unwrap(),
         &path,
@@ -4211,15 +4134,14 @@ fn other_source_restore_after_return_release(
         .unwrap(),
     );
     index.save(&index_path).unwrap();
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let cache = fixture::cache(source, &index_path, &namespace, false);
     let interp = Interpretation::of(source, &key, &index, false, &namespace);
     let binding = expected(ds, source, &key, &scope, &index, &interp, None)
         .unwrap()
         .binding;
     let (reduction, _) = native_record_of(&path, &scope, source);
     let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
-    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let mut disk = fixture::store(&index_path, ds);
     assert_eq!(
         disk.write_after_save(
             lock,
@@ -4820,7 +4742,7 @@ fn a1a_scan_at(
     // Model an ordinary file born before its fixed August response timestamps.
     // The fold is constructed before the driver's per-file birth setter runs.
     claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
-        let mut scan = OwnedSourceScan::new_with_identity_capture(
+        let scan = OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::ClaudeCode,
             roots,
             index,
@@ -4835,19 +4757,7 @@ fn a1a_scan_at(
             false,
         )
         .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
-        for _ in 0..100_000 {
-            let context = scan.sampling.as_ref().unwrap();
-            let modes = (
-                context.full_files,
-                context.tail_files,
-                context.unchanged_files,
-            );
-            match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => scan = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
-            }
-        }
-        panic!("native transition did not finish");
+        fixture::scan_modes(scan, 100_000)
     })
 }
 
@@ -4879,10 +4789,7 @@ fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
     )
     .unwrap()
     .binding;
-    let mut disk = DurableTailStore::new(
-        store::store_dir_for_index(&root.join("index.json")),
-        DurableSource::ClaudeCode,
-    );
+    let mut disk = fixture::store(&root.join("index.json"), DurableSource::ClaudeCode);
     disk.write_after_save(
         lock,
         index.generation,
@@ -4924,8 +4831,7 @@ fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
             .unwrap()
             .source_file_fingerprint
             .clear();
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &root.join("index.json"), &ns, false);
+        let cache = fixture::cache(source, &root.join("index.json"), &ns, false);
         let (outcome, samples) = crate::transcript_acquisition::capture_sample_reads(|| {
             cache.durable_restore(
                 source,
@@ -5454,16 +5360,8 @@ fn b1g_scan(
     _index_path: &Path,
     committed: &mut ScanIndex,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-    let mut owned = b1g_owned(owner, roots, root, committed);
-    for _ in 0..100_000 {
-        let c = owned.sampling.as_ref().unwrap();
-        let mode = (c.full_files, c.tail_files, c.unchanged_files);
-        match owned.step(None) {
-            OwnedSourceScanStep::Pending(next) => owned = next,
-            OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, mode),
-        }
-    }
-    panic!("absent growth failed to complete");
+    let owned = b1g_owned(owner, roots, root, committed);
+    fixture::scan_modes(owned, 100_000)
 }
 
 /// [money] b1g absent growth twice overflow cancel restart exact body and idle.
@@ -6037,8 +5935,7 @@ fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
     let mut interpretation = Interpretation::of(source, &key, &index, false, &namespace);
     index.files.get_mut(&key).unwrap().size_bytes = 0;
     interpretation.accepted = Some(frozen);
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &root.join("index.json"), &namespace, false);
+    let cache = fixture::cache(source, &root.join("index.json"), &namespace, false);
     let outcome = cache.durable_restore(
         source,
         &key,
@@ -6118,7 +6015,7 @@ fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
         let run = |cache: Arc<SharedCache>, index| {
             // The fixed transcript timestamps follow this synthetic file birth.
             claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
-                let mut scan = OwnedSourceScan::new_with_identity_capture(
+                let scan = OwnedSourceScan::new_with_identity_capture(
                     source,
                     std::slice::from_ref(&sessions),
                     index,
@@ -6133,19 +6030,7 @@ fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
                     true,
                 )
                 .with_sampled_acquisition(cache.clone(), namespace.clone());
-                let mut modes = (0, 0, 0);
-                for _ in 0..10_000 {
-                    if let Some(context) = scan.sampling.as_ref() {
-                        modes = (context.full_files, context.tail_files, context.native_bytes);
-                    }
-                    match scan.step(None) {
-                        OwnedSourceScanStep::Pending(next) => scan = next,
-                        OwnedSourceScanStep::Complete { index, scan, .. } => {
-                            return (index, scan, modes)
-                        }
-                    }
-                }
-                panic!("warm S2 fixture did not finish");
+                fixture::scan_reads(scan, 10_000)
             })
         };
         let mut initial = ScanIndex::default();
@@ -6346,7 +6231,7 @@ impl O3Fixture {
         at: &str,
         days: u64,
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-        let mut owned = OwnedSourceScan::new_with_identity_capture(
+        let owned = OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::ClaudeCode,
             &self.roots,
             prior.clone(),
@@ -6361,15 +6246,7 @@ impl O3Fixture {
             false,
         )
         .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
-        for _ in 0..100_000 {
-            let c = owned.sampling.as_ref().unwrap();
-            let modes = (c.full_files, c.tail_files, c.unchanged_files);
-            match owned.step(None) {
-                OwnedSourceScanStep::Pending(next) => owned = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
-            }
-        }
-        panic!("native transition did not finish");
+        fixture::scan_modes(owned, 100_000)
     }
     fn owner(&self) -> crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture {
         let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
@@ -6477,17 +6354,13 @@ fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
     .unwrap()
     .binding;
     let (native, _) = native_record(&path, &scope);
-    let pending = PendingRecord {
-        acquisition: fixture_acquisition(source),
+    let pending = fixture::pending(
+        source,
         binding,
-        certificate: certificate(&path, &scope),
-        body: codec::encode(&native, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap(),
-        allowlist: codec::allowlist_digest(source),
-    };
-    let mut disk = DurableTailStore::new(
-        store::store_dir_for_index(&index_path),
-        DurableSource::ClaudeCode,
+        certificate(&path, &scope),
+        codec::encode(&native, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap(),
     );
+    let mut disk = fixture::store(&index_path, DurableSource::ClaudeCode);
     assert_eq!(
         disk.write_after_save(lock, old.generation, 0, vec![pending])
             .unwrap()
@@ -6505,8 +6378,7 @@ fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
     current.claude_money_birth_store.set_money_rule_version(3);
     assert!(!current.effective_upload_body_witness_revision_requires_adoption(&key));
     let accepted = serde_json::to_value(&current.files[&key]).unwrap();
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let cache = fixture::cache(source, &index_path, &namespace, false);
     let file = File::open(&path).unwrap();
     let mut counts = crate::local_resource_diagnostics::RestoreCounts::default();
     for growth in [false, true] {
@@ -6621,7 +6493,7 @@ fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
     let namespace = Scope("p3-warm-s2".into());
     let cache = Arc::new(SharedCache::default());
     let run = |cache: Arc<SharedCache>, index| {
-        let mut scan = OwnedSourceScan::new_with_identity_capture(
+        let scan = OwnedSourceScan::new_with_identity_capture(
             source,
             std::slice::from_ref(&sessions),
             index,
@@ -6636,17 +6508,7 @@ fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
             true,
         )
         .with_sampled_acquisition(cache, namespace.clone());
-        let mut modes = (0, 0, 0);
-        for _ in 0..10_000 {
-            if let Some(context) = scan.sampling.as_ref() {
-                modes = (context.full_files, context.tail_files, context.native_bytes);
-            }
-            match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => scan = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
-            }
-        }
-        panic!("warm S2 fixture did not finish");
+        fixture::scan_reads(scan, 10_000)
     };
     let (accepted, first, _) = run(cache.clone(), ScanIndex::default());
     let key = local_index_key(&path);
@@ -6735,18 +6597,16 @@ fn member_settlement_and_final_full_probes_reserve_before_any_classifier_io() {
     );
     let mut cert = store::tests::certificate(&path);
     cert.audit_debt_unix_seconds = Some(1);
-    let pending = PendingRecord {
-        acquisition: fixture_acquisition(source),
+    let pending = fixture::pending(
+        source,
         binding,
-        certificate: cert,
-        body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
-        allowlist: codec::allowlist_digest(source),
-    };
-    DurableTailStore::new(store::store_dir_for_index(&index_path), ds)
+        cert,
+        crate::snapshots::durable_store_fixture_body(source, 0, 0),
+    );
+    fixture::store(&index_path, ds)
         .write_after_save(lock, 1, 0, vec![pending])
         .unwrap();
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let cache = fixture::cache(source, &index_path, &namespace, false);
     let before = cache.durable_counters(source).unwrap().1;
     store::active::set_active_budget_for_test(Some(0));
     let mut due = None;
@@ -6831,7 +6691,7 @@ fn b4_structural_transition(near_cap: bool) {
     let cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(source, &index_path, &namespace, true);
     let run = |cache: Arc<SharedCache>, index, at: &str| {
-        let mut scan = OwnedSourceScan::new_with_identity_capture(
+        let scan = OwnedSourceScan::new_with_identity_capture(
             source,
             std::slice::from_ref(&sessions),
             index,
@@ -6846,17 +6706,7 @@ fn b4_structural_transition(near_cap: bool) {
             true,
         )
         .with_sampled_acquisition(cache, namespace.clone());
-        let mut modes = (0, 0, 0);
-        for _ in 0..10_000 {
-            if let Some(c) = scan.sampling.as_ref() {
-                modes = (c.full_files, c.tail_files, c.native_bytes);
-            }
-            match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => scan = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
-            }
-        }
-        panic!("scan did not finish");
+        fixture::scan_reads(scan, 10_000)
     };
     let (mut index, mut first, _) =
         run(cache.clone(), ScanIndex::default(), "2026-10-29T12:00:00Z");
@@ -7071,7 +6921,7 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
     let cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(source, &index_path, &namespace, true);
     let run = |index, at: &str| {
-        let mut scan = OwnedSourceScan::new_with_identity_capture(
+        let scan = OwnedSourceScan::new_with_identity_capture(
             source,
             std::slice::from_ref(&sessions),
             index,
@@ -7086,17 +6936,7 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
             true,
         )
         .with_sampled_acquisition(cache.clone(), namespace.clone());
-        let mut modes = (0, 0, 0);
-        for _ in 0..10_000 {
-            if let Some(c) = scan.sampling.as_ref() {
-                modes = (c.full_files, c.tail_files, c.native_bytes);
-            }
-            match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => scan = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
-            }
-        }
-        panic!("warm scan did not settle");
+        fixture::scan_reads(scan, 10_000)
     };
     let (mut index, mut first, _) = run(ScanIndex::default(), "2026-10-20T12:00:00Z");
     a0h_wire(&root, &mut index, &mut first);
@@ -7220,8 +7060,7 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     let scope = Scope("m3-post-save-file".into());
     let namespace = Scope("m3-post-save".into());
     let index_path = root.join("index.json");
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let cache = fixture::cache(source, &index_path, &namespace, false);
     let admit = |fingerprint: &str| {
         let (reduction, checkpoint) = native_record_of(&path, &scope, source);
         let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
@@ -7314,8 +7153,7 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     assert_ne!(std::fs::read(&record_path).unwrap(), a);
     assert_eq!(serde_json::to_value(&index.files[&key]).unwrap(), accepted);
     assert!(!cache.durable().unwrap().touched.contains(&key));
-    let fresh = SharedCache::default();
-    fresh.durable_begin_pass(source, &index_path, &namespace, false);
+    let fresh = fixture::cache(source, &index_path, &namespace, false);
     let loaded = ScanIndex::load(&index_path).unwrap();
     let interpretation = Interpretation::of(source, &key, &loaded, false, &namespace);
     let mut file = File::open(&path).unwrap();
@@ -7433,8 +7271,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     assert!(bound(&incoming, crate::transcript_cache::ENTRY_BYTES).is_some());
     // Use the production writer's current binding construction, rather than
     // coupling this fixture to the internal expected() signature.
-    let writer = SharedCache::default();
-    writer.durable_begin_pass(source, &index_path, &namespace, false);
+    let writer = fixture::cache(source, &index_path, &namespace, false);
     assert!(writer.insert_admitted(
         key.clone(),
         native_v3_completion(&writer, &path, source, incoming.state, incoming.checkpoint),
@@ -7448,10 +7285,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
             .written,
         1
     );
-    let store = DurableTailStore::new(
-        store::store_dir_for_index(&index_path),
-        DurableSource::Codex,
-    );
+    let store = fixture::store(&index_path, DurableSource::Codex);
     let records = || {
         std::fs::read_dir(store.dir())
             .unwrap()
@@ -7474,8 +7308,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     .unwrap();
     // Size the actual restored representation, including codec/rederive
     // capacities, rather than assuming that 256 KiB covers the native layout.
-    let sizing = SharedCache::default();
-    sizing.durable_begin_pass(source, &index_path, &namespace, false);
+    let sizing = fixture::cache(source, &index_path, &namespace, false);
     let (incoming, sizing_lease) = match sizing.durable_restore(
         source,
         &key,
@@ -7503,8 +7336,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     // Size both admission arms while this graph still owns its one process
     // lease, then dispose of it before any subsequent durable restore.
     let trials = [true, false].map(|fits| {
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        let cache = fixture::cache(source, &index_path, &namespace, false);
         READ_CALLS.with(|count| count.set(0));
         let inventory =
             codex_cursor::with_test_state_budget(INVENTORY_LIMIT, || page(&root, &paths, &cache));
@@ -7679,8 +7511,7 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
             .unwrap();
         }
         let _off = crate::snapshots::RestartRestoreForTest::disabled();
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &index_path, &scope, false);
+        let cache = fixture::cache(source, &index_path, &scope, false);
         cache.durable_skill_label_permission(source, true);
         cache.durable_write_after_save(lock, source, &index);
         if case == "unreadable" {
@@ -7995,13 +7826,7 @@ fn bounded_restore_certificate_edit_reasons_precede_decode_and_count_first_failu
             envelope_audit_debt: None,
             format: store::FORMAT_V3,
             index_generation: 1,
-            record: PendingRecord {
-                acquisition: fixture_acquisition(source),
-                binding,
-                certificate: certificate(&path, &scope),
-                body: vec![],
-                allowlist: codec::allowlist_digest(source),
-            },
+            record: fixture::pending(source, binding, certificate(&path, &scope), vec![]),
         };
         let original_length = record.record.certificate.length;
         match reason {
@@ -8176,8 +8001,7 @@ fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_re
         let mut index = ScanIndex::default();
         index.files.insert(key.clone(),serde_json::from_value(serde_json::json!({"size_bytes":3,"modified_unix_seconds":1,"source_file_fingerprint":"retire-held"})).unwrap());
         index.save(&index_path).unwrap();
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &index_path, &scope, false);
+        let cache = fixture::cache(source, &index_path, &scope, false);
         let mut binding = store::tests::binding("account", "scope", ("retire-held", None));
         binding.source = ds;
         binding.key = store::key_digest(ds, &key);
@@ -8294,8 +8118,7 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
         let ds = durable_source(source).unwrap();
         let index_path = root.join("index.json");
         let namespace = Scope("retired-missing".into());
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        let cache = fixture::cache(source, &index_path, &namespace, false);
         let mut binding = store::tests::binding("account", "old", ("accepted", None));
         binding.source = ds;
         binding.key = store::key_digest(ds, &key);
@@ -9937,10 +9760,7 @@ fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_resta
                 "accepted object was idle beyond W before the new edit/restart"
             );
             let survivor = {
-                let mut disk = DurableTailStore::new(
-                    store::store_dir_for_index(&f.index_path),
-                    DurableSource::ClaudeCode,
-                );
+                let mut disk = fixture::store(&f.index_path, DurableSource::ClaudeCode);
                 let mut record = store::tests::found(
                     disk.read(&store::key_digest(DurableSource::ClaudeCode, &f.key)),
                 );
@@ -10089,7 +9909,7 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
         let cache = Arc::new(SharedCache::default());
         cache.durable_begin_pass(source, &index_path, &namespace, true);
         let run = |cache: Arc<SharedCache>, index, at: &str| {
-            let mut scan = OwnedSourceScan::new_with_identity_capture(
+            let scan = OwnedSourceScan::new_with_identity_capture(
                 source,
                 std::slice::from_ref(&sessions),
                 index,
@@ -10104,24 +9924,9 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
                 true,
             )
             .with_sampled_acquisition(cache, namespace.clone());
-            let mut modes = (0, 0, 0);
-            for _ in 0..10_000 {
-                if let Some(context) = scan.sampling.as_ref() {
-                    modes = (context.full_files, context.tail_files, context.native_bytes);
-                }
-                match scan.step(None) {
-                    OwnedSourceScanStep::Pending(next) => scan = next,
-                    OwnedSourceScanStep::Complete {
-                        mut index,
-                        mut scan,
-                        ..
-                    } => {
-                        finalize_scan_after_policy(source, &mut scan, &mut index);
-                        return (index, scan, modes);
-                    }
-                }
-            }
-            panic!("native edit scanner did not finish");
+            let (mut index, mut scan, modes) = fixture::scan_reads(scan, 10_000);
+            finalize_scan_after_policy(source, &mut scan, &mut index);
+            (index, scan, modes)
         };
         let (mut index, first, _) =
             run(cache.clone(), ScanIndex::default(), "2026-10-29T12:00:00Z");
@@ -10298,13 +10103,7 @@ fn certificate_io_precedes_decode_and_rederive_refusals() {
         envelope_audit_debt: None,
         format: store::FORMAT_V3,
         index_generation: 1,
-        record: PendingRecord {
-            acquisition: fixture_acquisition(source),
-            binding,
-            certificate: certificate(&path, &scope),
-            body,
-            allowlist: codec::allowlist_digest(source),
-        },
+        record: fixture::pending(source, binding, certificate(&path, &scope), body),
     };
     let cache = SharedCache::default();
     let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source) else {
@@ -10509,8 +10308,7 @@ fn m1_setup_inventory_and_statvfs_failures_are_counted_and_retry_with_original_p
             let namespace = Scope("failure-attempt".into());
             let index_path = root.join("index.json");
             let key = local_index_key(&path);
-            let cache = SharedCache::default();
-            cache.durable_begin_pass(source, &index_path, &namespace, false);
+            let cache = fixture::cache(source, &index_path, &namespace, false);
             let (reduction, checkpoint) = native_record_of(&path, &scope, source);
             let expected_body =
                 codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
@@ -10670,8 +10468,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
 
         // Process 0: c's existing valid record.
         codex_budget_fixture(&c, session_c, None);
-        let prior = SharedCache::default();
-        prior.durable_begin_pass(source, &index_path, &namespace, false);
+        let prior = fixture::cache(source, &index_path, &namespace, false);
         let (reduction, checkpoint, _) = body_of(&c);
         admit(
             &prior,
@@ -10728,8 +10525,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
             let remainder = WRITE_PASS_BYTES - body_a.len() - body_b.len();
             assert!(remainder > 0 && body_c.len() > remainder, "{arm}");
         }
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        let cache = fixture::cache(source, &index_path, &namespace, false);
         // Capture from each actual native parse before injecting a later disk
         // fault. The storage fault must not be used to mint acquisition custody.
         let completed_a = native_v3_completion(&cache, &a, source, reduction_a, checkpoint_a);
@@ -10835,8 +10631,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
 
         // Restart: all three content-bearing records hold before native input.
         let loaded = ScanIndex::load(&index_path).unwrap();
-        let restart = SharedCache::default();
-        restart.durable_begin_pass(source, &index_path, &namespace, false);
+        let restart = fixture::cache(source, &index_path, &namespace, false);
         for (path, body) in [(&a, &body_a), (&b, &body_b), (&c, &body_c)] {
             let key = local_index_key(path);
             let interpretation = Interpretation::of(source, &key, &loaded, false, &namespace);
@@ -10931,10 +10726,7 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
         )
         .unwrap()
         .binding;
-        let mut disk = DurableTailStore::new(
-            store::store_dir_for_index(&index_path),
-            DurableSource::ClaudeCode,
-        );
+        let mut disk = fixture::store(&index_path, DurableSource::ClaudeCode);
         disk.write_after_save(
             lock,
             index.generation,
@@ -10967,8 +10759,7 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
             b"{}\n",
         )
         .unwrap();
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &index_path, &ns, false);
+        let cache = fixture::cache(source, &index_path, &ns, false);
         cache.durable_note_scope(source, &key, &scope);
         let taken = cache
             .durable_restore(
@@ -11139,8 +10930,7 @@ fn v3_counting_provenance_comes_from_each_decoded_reduction() {
         assert_eq!(fact.0, Some(0));
         assert_eq!(fact.1, version);
         if crate::heap_layout_bound::layout_supported() {
-            let cache = SharedCache::default();
-            cache.durable_begin_pass(source, &index_path, &namespace, false);
+            let cache = fixture::cache(source, &index_path, &namespace, false);
             let outcome = cache.durable_restore(
                 source,
                 &key,
@@ -11197,8 +10987,7 @@ fn v3_counting_provenance_comes_from_each_decoded_reduction() {
             assert_eq!(next.format, store::FORMAT_V3);
             assert_eq!(next.envelope_audit_debt, Some(due));
             assert_ne!(std::fs::read(&disk).unwrap(), bytes);
-            let restart = SharedCache::default();
-            restart.durable_begin_pass(source, &index_path, &namespace, false);
+            let restart = fixture::cache(source, &index_path, &namespace, false);
             let second = restart.durable_restore(
                 source,
                 &key,
@@ -11251,8 +11040,7 @@ fn v3_counting_provenance_comes_from_each_decoded_reduction() {
                 b"{}\n",
             )
             .unwrap();
-            let refused = SharedCache::default();
-            refused.durable_begin_pass(source, &index_path, &namespace, false);
+            let refused = fixture::cache(source, &index_path, &namespace, false);
             assert!(refused
                 .durable_restore(
                     source,
