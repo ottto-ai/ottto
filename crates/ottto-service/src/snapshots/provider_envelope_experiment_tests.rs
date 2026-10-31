@@ -340,6 +340,7 @@ fn native_comparison_paid_capture_population_reports_guard_viability_without_byp
                 opened_object_identity: "synthetic-descriptor-not-opened-evidence".into(),
                 fingerprint_changed_nanos: 0,
                 fingerprint_birth_nanos: 0,
+                withheld_content_stamp: None,
             }
         })
         .collect::<Vec<_>>();

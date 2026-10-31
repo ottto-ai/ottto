@@ -713,6 +713,7 @@ fn unavailable_birth_never_adopts_a_stored_ctime() {
             opened_object_identity: String::new(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         };
         let (mut file, live) = open_candidate_file_stat(source, &mut candidate).expect("open");
         let live = live.expect("unix object stat");

@@ -788,6 +788,7 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let disclose = |disclosure: &Disclosure| {
         let mut index = ScanIndex::default();
@@ -1900,13 +1901,14 @@ fn singleton_aggregate_page_budget_defers_via_pending_keeps_hint() {
         NOW,
         BACKFILL_WINDOW_DAYS,
     );
-    let traversal = index.traversal.as_mut().unwrap();
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        traversal,
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        None,
     );
+    let traversal = index.traversal.as_mut().unwrap();
+
     for pending in &mut traversal.pending_candidates {
         pending.watcher_hint = true;
     }
@@ -2909,6 +2911,7 @@ fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     }
 }
 
@@ -3570,13 +3573,14 @@ fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
         NOW,
         BACKFILL_WINDOW_DAYS,
     );
-    let walked = index.traversal.as_mut().unwrap();
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        walked,
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        None,
     );
+    let walked = index.traversal.as_mut().unwrap();
+
     let processed = fixture.file(SESSION);
     let pending = fixture.file(SESSION_B);
     let unobserved = fixture.file(SESSION_C);
@@ -3884,9 +3888,9 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
     );
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        None,
     );
     let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
         "type": "session_meta", "payload": {"id": SESSION_B}}));
@@ -3987,9 +3991,9 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
     );
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        None,
     );
     // SESSION already finished its census read; growth must not re-enroll it.
     index
@@ -4146,9 +4150,9 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
     );
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        None,
     );
     let flags = |index: &ScanIndex, path: &PathBuf| {
         index
@@ -4186,7 +4190,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         SnapshotSource::Codex,
         index.traversal.as_mut().unwrap(),
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     );
     assert!(!index
         .traversal
@@ -4196,9 +4200,9 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         .is_empty());
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        None,
     );
     assert!(index
         .traversal
@@ -4246,9 +4250,9 @@ fn new_date_directory_session_bypasses_2800_owed_rereads_within_two_pages() {
     );
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        None,
     );
     let budget = fixture.len(SESSION) * 4;
     cache.clear();
@@ -4983,6 +4987,7 @@ fn memo_wakes_on_the_conflicted_identity_set() {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let digest = |codex: &CodexTitleMetadata| {
         memo_digest(
@@ -6026,6 +6031,7 @@ fn one_writer_attributes_and_replays_held_totals() {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let key = local_index_key(&candidate.path);
     let mut index = ScanIndex::default();
@@ -7551,6 +7557,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let receipt = |tier: &str| -> AppliedTierReceipt {
         serde_json::from_value(json!({"version": 1, "derivation": "fixture",
@@ -7563,6 +7570,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
         index.files.insert(
             local_index_key(&candidate.path),
             ScanIndexEntry {
+                codex_fragment: None,
                 size_bytes: 8,
                 modified_unix_seconds: 0,
                 modified_unix_nanos: None,
@@ -7955,6 +7963,7 @@ fn join_member(path: PathBuf) -> CandidateFile {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     }
 }
 
@@ -14481,6 +14490,7 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     for cause in [ownership::CREATED, ownership::PARENT, ownership::PARSER] {
         let mut index = ScanIndex::default();

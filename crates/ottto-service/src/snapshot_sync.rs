@@ -777,8 +777,9 @@ impl LocalHoldSettlement {
         let account_holds_recorded = source == SnapshotSource::ClaudeCode
             && index.record_claude_account_deferred_holds(
                 scan_result.completed_parses(),
-                &account_deferred_fingerprints,
+                &disposition.account_deferred_tokens(&scan_result.snapshots),
             );
+        scan_result.remember_withheld_content(index);
         let progress_blocking_held_fingerprints = disposition.progress_blocking_held_fingerprints(
             &scan_result.snapshots,
             index,
@@ -821,6 +822,58 @@ impl LocalHoldSettlement {
 struct UploadIndexSettlement {
     index: ScanIndex,
     fully_settled: bool,
+}
+
+#[cfg(test)]
+pub(crate) mod withheld_support {
+    use super::*;
+    pub(crate) fn settle_withheld(
+        previous: &ScanIndex,
+        mut index: ScanIndex,
+        mut scan: crate::snapshots::SourceScanResult,
+    ) -> ScanIndex {
+        let mut previous = previous.clone();
+        previous.rehome_withheld_baseline(&index);
+        let mut disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+        disposition.defer_sessions(
+            scan.snapshots
+                .iter()
+                .map(|item| item.source_session_id.clone())
+                .collect(),
+        );
+        let holds = LocalHoldSettlement::classify(
+            SnapshotSource::ClaudeCode,
+            &mut index,
+            &mut scan,
+            &disposition,
+        );
+        assert!(
+            scan.snapshots.is_empty(),
+            "account-held bodies stay Unknown and never enter upload"
+        );
+        let progress = SnapshotUploadProgress::new(
+            "withheld-fixture".into(),
+            crate::snapshots::snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        );
+        settle_completed_upload(index, &previous, &progress, &holds).index
+    }
+
+    pub(crate) fn withheld_settled(index: &ScanIndex) -> bool {
+        upload_settled_without_account_holds(index, true)
+    }
+
+    pub(crate) fn deferred_tokens(
+        scan: &crate::snapshots::SourceScanResult,
+    ) -> BTreeMap<String, u64> {
+        let mut disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+        disposition.defer_sessions(
+            scan.snapshots
+                .iter()
+                .map(|item| item.source_session_id.clone())
+                .collect(),
+        );
+        disposition.account_deferred_tokens(&scan.snapshots)
+    }
 }
 
 /// A persisted account hold was never uploaded, so the backfill and replay it
@@ -3338,6 +3391,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         committable.save(index_path)?;
     }
     if let Some(scan) = correction_scan {
+        scan.report_discovery_growth_after_save(&committable);
         context_rearms.emit(scan.source);
     }
     Ok(committable)
@@ -5021,27 +5075,66 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         self.started.elapsed()
     }
     fn retained_bound(&self, limit: usize) -> Option<usize> {
-        let versions = crate::heap_layout_bound::bound(&self.daemon.codex_versions, limit)?;
-        let native = if crate::snapshots::claude_native_comparison::enabled() {
-            self.daemon
-                .native_comparison
-                .retained_bound(limit.checked_sub(versions)?)?
-        } else {
-            0
-        };
-        let owned = versions.checked_add(native)?;
-        let continuation = continuation::retained_bound(limit.checked_sub(owned)?)?;
-        owned.checked_add(continuation)
+        retained_with_withheld(
+            &self.daemon.transcript_cache.withheld_memo,
+            limit,
+            |limit| {
+                let versions = crate::heap_layout_bound::bound(&self.daemon.codex_versions, limit)?;
+                let native = if crate::snapshots::claude_native_comparison::enabled() {
+                    self.daemon
+                        .native_comparison
+                        .retained_bound(limit.checked_sub(versions)?)?
+                } else {
+                    0
+                };
+                let owned = versions.checked_add(native)?;
+                let continuation = continuation::retained_bound(limit.checked_sub(owned)?)?;
+                owned.checked_add(continuation)
+            },
+        )
+    }
+    fn retained_budget_unavailable(&mut self) {
+        self.daemon
+            .transcript_cache
+            .withheld_memo
+            .discard_retained();
+        self.discard_retained();
     }
     fn discard_retained(&mut self) {
         if crate::snapshots::claude_native_comparison::enabled() {
             self.daemon.native_comparison.discard_retained();
         }
         continuation::discard_retained();
+        self.daemon
+            .transcript_cache
+            .withheld_memo
+            .discard_if_refused();
     }
     fn boundary(&mut self, busy: impl Iterator<Item = SnapshotSource>) {
         self.retry
             .boundary(busy, self.home, self.support_dir, self.daemon);
+    }
+}
+
+// Existing retained graphs have priority over the advisory memo. Refusing only
+// the memo must not trigger the rotation's discard of admitted sibling graphs.
+pub(crate) fn retained_with_withheld(
+    memo: &crate::snapshots::withheld_account::Memo,
+    limit: usize,
+    other: impl FnOnce(usize) -> Option<usize>,
+) -> Option<usize> {
+    let owned = other(limit);
+    // Even when siblings are unsupported, price the portable memo against the
+    // available allowance so their discard preserves it only if it fits.
+    let remaining = limit.checked_sub(owned.unwrap_or(0))?;
+    match memo.retained_bound(remaining) {
+        Some(withheld) => owned?.checked_add(withheld),
+        None => {
+            // Frees all memo allocations; held population remains disclosed
+            // with unavailable details and no optional memo storage to charge.
+            memo.discard_if_refused();
+            owned
+        }
     }
 }
 
@@ -6408,6 +6501,9 @@ fn prepare_sync_source_inner(
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
     index.require_persistence_available()?;
+    if source == SnapshotSource::ClaudeCode {
+        daemon.transcript_cache.bind_withheld(&mut index);
+    }
     upload_progress.recover_ack_retirement_handoff(
         &mut index,
         &index_path,
@@ -6593,7 +6689,7 @@ fn prepare_sync_source_inner(
     } else {
         Vec::new()
     };
-    let committed_index = index.clone();
+    let mut committed_index = index.clone();
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
     // A replay re-reads everything and neither re-offers nor defers.
@@ -6668,6 +6764,7 @@ fn prepare_sync_source_inner(
         .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
         .with_codex_side_pass(codex_side_pass)
         .with_codex_versions(daemon.codex_versions.clone());
+    scan.rehome_withheld_baseline(&mut committed_index);
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
     } else if source == SnapshotSource::Codex {
@@ -8517,6 +8614,7 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    scan_result.report_discovery_growth_after_save(&index);
     context_rearm_counts.emit(source);
     note_codex_side_saved(daemon, &index_path, true, side_mark);
     #[cfg(unix)]
@@ -12606,6 +12704,7 @@ mod tests {
         index.files.insert(
             "synthetic/deferred.jsonl".into(),
             crate::snapshots::ScanIndexEntry {
+                codex_fragment: None,
                 size_bytes: 1,
                 modified_unix_seconds: 1,
                 modified_unix_nanos: Some(1),
