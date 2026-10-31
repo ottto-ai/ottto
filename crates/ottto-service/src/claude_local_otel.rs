@@ -1162,7 +1162,7 @@ fn decode_api_sidecar(
         allowance
     };
     let mut reader = BufReader::new((&file).take(limit));
-    let (rows, _) = decode_api_rows(&mut reader, session_id, &mut health);
+    let rows = decode_api_rows(&mut reader, session_id, &mut health);
     let bytes = limit - reader.get_ref().limit();
     health.oversized_files = u64::from(opened.len().max(bytes) >= MAX_EVIDENCE_FILE_BYTES);
     strict_budget::consumed(bytes);
@@ -1201,21 +1201,19 @@ fn decode_api_rows(
     reader: &mut impl BufRead,
     session_id: &str,
     health: &mut ClaudeLocalOtelLoadHealth,
-) -> (Vec<ClaudeLocalOtelEvidence>, u64) {
+) -> Vec<ClaudeLocalOtelEvidence> {
     let mut decoder = ApiSidecarDecoder::new(session_id, Vec::new());
     decoder.health = std::mem::take(health);
     let mut line = Vec::new();
-    let mut bytes = 0;
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
             Ok(0) => break,
-            Ok(read) => {
-                bytes += read as u64;
+            Ok(_) => {
                 #[cfg(test)]
                 API_READ_RECEIPT.with(|r| {
                     let (opens, bytes, force) = r.get();
-                    r.set((opens, bytes + read, force));
+                    r.set((opens, bytes + line.len(), force));
                 });
             }
             Err(_) => {
@@ -1231,7 +1229,7 @@ fn decode_api_rows(
     }
     let (rows, decoded_health) = decoder.into_output();
     *health = decoded_health;
-    (rows, bytes)
+    rows
 }
 
 // Both whole-file and paid-input readers use this same state transition.
@@ -3613,9 +3611,10 @@ mod tests {
         }
         let mut reader = FailingReader { calls: 0 };
         let mut health = ClaudeLocalOtelLoadHealth::default();
-        let (rows, bytes) = decode_api_rows(&mut reader, "sess-mixed", &mut health);
+        let before = API_READ_RECEIPT.with(|r| r.get().1);
+        let rows = decode_api_rows(&mut reader, "sess-mixed", &mut health);
         assert!(rows.is_empty());
-        assert_eq!(bytes, 0);
+        assert_eq!(API_READ_RECEIPT.with(|r| r.get().1) - before, 0);
         assert_eq!(reader.calls, 1);
         assert_eq!(health.unreadable_lines, 1);
         assert!(!health.is_complete());

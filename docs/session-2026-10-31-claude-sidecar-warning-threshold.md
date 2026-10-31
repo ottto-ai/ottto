@@ -14,7 +14,8 @@ cohort scheduler is unchanged; its separate oversized-root scheduling change mus
 supply actual paired bytes when choosing a protected allowance. On the current
 base the cohort scheduler still defers oversized roots; that scheduler change
 belongs to its separate owner. `oversized_root_alone` counts protected read
-observations, not distinct roots.
+observations, not distinct roots. A pair over 64 MiB can trigger this count
+while both individual files remain below the file-size warning.
 
 The optional whole-input native-comparison reader may still decline large inputs
 under its existing reservation; callers use the ordinary streaming path. Support
