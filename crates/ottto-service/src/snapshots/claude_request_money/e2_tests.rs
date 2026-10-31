@@ -152,8 +152,6 @@ fn publish(
     telemetry: TelemetryRead,
     index: &ScanIndex,
 ) -> Vec<SnapshotItem> {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     decide_page_copies(&mut items, index);
     if let Some(read) = read {
         attach_page(&mut items, read);
@@ -165,8 +163,10 @@ fn publish(
         );
     }
     {
-        finish_page(&mut items, index, telemetry)
-    };
+        let _resumed_prefix =
+            crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+        finish_page(&mut items, index, telemetry);
+    }
     items
 }
 fn rows_of(item: &SnapshotItem) -> impl Iterator<Item = &crate::snapshots::SnapshotModelUsage> {

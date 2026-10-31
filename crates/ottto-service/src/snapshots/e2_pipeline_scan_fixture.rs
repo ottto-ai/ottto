@@ -317,7 +317,7 @@ pub(crate) fn parse_ordinary(
     parse_ordinary_with_metadata(path, at, fingerprint, &ClaudeTitleMetadata::default(), true)
 }
 
-pub(crate) fn parse_ordinary_with_metadata(
+pub(super) fn parse_ordinary_with_metadata(
     path: &Path,
     at: &str,
     fingerprint: String,
