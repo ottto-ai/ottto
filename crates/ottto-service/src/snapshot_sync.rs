@@ -24959,6 +24959,26 @@ mod tests {
                     ));
                 }
                 settled_receipt(&f);
+                // Partial checkpoints leave the source-wide upload context
+                // unadopted, so every unchanged file stays selected under it
+                // (upload_context_receipt.rs:402). Production adopts it on a
+                // census-complete pass with no unsettled upload (snapshots.rs:8447)
+                // and saves that index. Run that quiet pass from the saved
+                // checkpoint first: all accepted bodies stay suppressed.
+                let recovery = f.progress.ack_recovery.take();
+                let adopted = |index: &ScanIndex| {
+                    serde_json::to_value(index).unwrap()["upload_context_fingerprint"]
+                        == "boundary-current-policy"
+                };
+                for _ in 0..3 {
+                    f.restart_preparation();
+                    assert!(f.items.is_empty(), "accepted bodies stay suppressed");
+                    f.working.save(&f.index_path).unwrap();
+                    if adopted(&f.working) {
+                        break;
+                    }
+                }
+                assert!(adopted(&f.working));
                 // Pruned C reopens: its rollout grows and the ordinary scan (the
                 // counted read owner) re-reads only that file into one definite
                 // body. With no head it uploads ordinarily and settles exactly.
@@ -24981,7 +25001,6 @@ mod tests {
                     std::io::Write::write_all(&mut grown, format!("{row}\n").as_bytes()).unwrap();
                 }
                 drop(grown);
-                let recovery = f.progress.ack_recovery.take();
                 let scan = f.restart_preparation();
                 f.progress.ack_recovery = recovery;
                 f.progress.freeze_custody_page(&f.items);
