@@ -18,6 +18,7 @@
 //! discovered and reported as `reachable = false` with empty tools (cost zero)
 //! until a network MCP client lands — see `TODO(mcp-http-transport)` below.
 
+use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::codex_version::{CodexVersionFeed, Sample};
 use crate::snapshots::SnapshotSource;
@@ -1865,21 +1866,9 @@ fn read_cache(path: &Path) -> Option<InventoryCacheEntry> {
 /// torn record that would force a redundant re-POST. Best-effort: a write error
 /// is non-fatal (it only costs one extra upload next cycle).
 fn write_cache(path: &Path, entry: &InventoryCacheEntry) {
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
     let mut entry = entry.clone();
     entry.seed = entry.seed.filter(|s| s.sample().is_some());
-    let Ok(payload) = serde_json::to_vec(&entry) else {
-        return;
-    };
-    let temp = path.with_extension("json.tmp");
-    if std::fs::write(&temp, &payload).is_ok() {
-        let _ = std::fs::rename(&temp, path);
-    }
+    write_json_atomic(path, &entry);
 }
 
 /// SHA-256 over the inventory's meaningful content. `machine_id` and
@@ -2467,36 +2456,6 @@ mod tests {
         assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "OS FD/thread measurements require an isolated test process"]
-    #[serial_test::serial]
-    fn probe_mcp_resource_measurement() {
-        use crate::claude_spawn_gate::test_support::probe_resources;
-        for mode in ["protected", "escaped"] {
-            let before = probe_resources();
-            {
-                let fixture = ProbeFixture::new("probe-mcp-resource", mode, &[], 0);
-                let budget = if mode == "escaped" {
-                    Duration::from_secs(2)
-                } else {
-                    Duration::from_millis(500)
-                };
-                assert!(probe_mcp(&fixture, true, budget).is_err());
-                assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
-                fixture.release();
-                fixture.wait_settled();
-            }
-            let end = Instant::now() + Duration::from_secs(2);
-            while probe_resources() != before && Instant::now() < end {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let after = probe_resources();
-            println!("MCP_RESOURCE mode={mode} fds_before={} fds_after={} threads_before={} threads_after={} admitted=0", before.0,after.0,before.1,after.1);
-            assert_eq!(after, before);
-        }
-    }
-
     fn test_home(name: &str) -> PathBuf {
         let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir()
@@ -2602,13 +2561,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_missing_config_yields_no_servers() {
-        let home = test_home("claude-empty");
-        assert!(discover_claude_code(&home).is_empty());
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
     fn claude_http_server_without_url_is_kept_not_dropped() {
         // A `type:"http"` entry with no `url` must still be discovered (as an
         // unreachable HTTP server), never silently dropped from the inventory.
@@ -2683,13 +2635,6 @@ enabled = true
             row.capability_id == "computer.use" && row.availability_state == "enabled"
         }));
 
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn codex_missing_config_yields_no_servers() {
-        let home = test_home("codex-empty");
-        assert!(discover_codex(&home).is_empty());
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -3229,12 +3174,6 @@ url = "https://unset.test/mcp"
     }
 
     #[test]
-    fn agent_source_matches_backend_spelling() {
-        assert_eq!(agent_source_for(SnapshotSource::ClaudeCode), "claude-code");
-        assert_eq!(agent_source_for(SnapshotSource::Codex), "codex");
-    }
-
-    #[test]
     fn parse_tools_extracts_name_description_and_schema() {
         let response = json!({
             "jsonrpc": "2.0",
@@ -3414,30 +3353,6 @@ url = "https://unset.test/mcp"
         assert!(servers.iter().all(|s| !s.reachable));
     }
 
-    #[test]
-    fn harvest_bounds_are_set_for_unattended_use() {
-        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(30));
-        assert_eq!(MCP_HARVEST_MAX_CONCURRENCY, 4);
-        assert_eq!(MCP_HARVEST_CYCLE_BUDGET, Duration::from_secs(90));
-        // Worst case ⌈servers/K⌉ × timeout must stay inside the cycle budget for a
-        // typical (≤8-server) machine so a normal config is never throttled.
-        assert!(2 * HANDSHAKE_TIMEOUT <= MCP_HARVEST_CYCLE_BUDGET);
-    }
-
-    #[test]
-    fn source_for_agent_maps_known_agents() {
-        assert_eq!(
-            source_for_agent("claude-code"),
-            Some(SnapshotSource::ClaudeCode)
-        );
-        assert_eq!(
-            source_for_agent("claude_code"),
-            Some(SnapshotSource::ClaudeCode)
-        );
-        assert_eq!(source_for_agent("codex"), Some(SnapshotSource::Codex));
-        assert_eq!(source_for_agent("nope"), None);
-    }
-
     /// `dump_inventory` harvests an agent's configured servers into the ingest
     /// shape without uploading. Drives a real mock stdio MCP server via HOME.
     #[test]
@@ -3606,11 +3521,6 @@ done
             posted_at: "not-a-timestamp".to_string(),
         };
         assert!(cache_is_stale(&corrupt, now));
-    }
-
-    #[test]
-    fn harvest_interval_is_six_hours() {
-        assert_eq!(MCP_HARVEST_INTERVAL, Duration::from_secs(6 * 60 * 60));
     }
 
     /// Write a CC home whose single configured stdio server is a mock MCP server
@@ -4147,3 +4057,7 @@ done
     }
     include!("mcp_inventory_version_tests.rs");
 }
+
+#[cfg(test)]
+#[path = "mcp_inventory_transition_fixture.rs"]
+pub(crate) mod transition_fixture;

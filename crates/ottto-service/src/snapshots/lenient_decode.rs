@@ -128,10 +128,6 @@ impl Holds {
             self.1.sum,
         )
     }
-    #[cfg(test)]
-    pub(super) fn clone_provenance_for_test(&self) -> impl Sized {
-        self.1
-    }
     pub(super) fn contains(&self, field: &str, key: &str) -> bool {
         self.0.get(field).is_some_and(|map| map.contains_key(key))
     }
@@ -334,6 +330,10 @@ impl Serialize for ScanIndex {
             claude_money_birth_store::BirthStore::is_empty
         );
         field!(claude_desktop_store_inventory, Option::is_none);
+        field!(
+            claude_copy_removals,
+            claude_request_money::copy_removals::CopyRemovals::is_empty
+        );
         field!(claude_desktop_completed_lineage, Option::is_none);
         if !self.claude_desktop_lineage_file_edges.is_empty() {
             // Keep this bounded value compact even when holds require pretty
@@ -441,6 +441,7 @@ pub(super) const FIELDS: &[&str] = &[
     "held_audit_progress",
     "claude_money_birth_store",
     "claude_desktop_store_inventory",
+    "claude_copy_removals",
     "claude_desktop_completed_lineage",
     "claude_desktop_lineage_file_edges",
     "claude_desktop_identity_latches",
@@ -888,6 +889,14 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
     reader.seek(SeekFrom::Start(0))?;
     Ok(resources)
 }
+/// Local money hints: damage drops the hint, never the index.
+fn optional_money_hint(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some("claude_money_birth_store" | "claude_copy_removals")
+    )
+}
+
 fn optional_census(name: Option<&str>) -> bool {
     matches!(
         name,
@@ -896,11 +905,11 @@ fn optional_census(name: Option<&str>) -> bool {
 }
 fn optional_resource_field(name: Option<&str>) -> bool {
     optional_census(name)
+        || optional_money_hint(name)
         || matches!(
             name,
             Some(
-                "claude_money_birth_store"
-                    | "claude_desktop_completed_lineage"
+                "claude_desktop_completed_lineage"
                     | "claude_desktop_lineage_file_edges"
                     | "claude_desktop_identity_latches"
             )
@@ -1670,12 +1679,18 @@ impl<R: BufRead + Seek> Decoder<R> {
                     self.family_spans.insert(name, value);
                 }
                 if !seen.insert(name) {
+                    if name == "claude_desktop_store_inventory" && pass == Pass::Full {
+                        with_claude_absence_counters(|counts| {
+                            counts.tombstone_decode_drops =
+                                counts.tombstone_decode_drops.saturating_add(1);
+                        });
+                    }
                     if name == "claude_request_census" {
                         index.claude_request_census = ClaudeRequestCensus::default();
                     } else if name == "claude_request_census_shadow" {
                         index.claude_request_census_shadow =
                             ClaudeRequestCensusShadowState::default();
-                    } else if name != "reread_guard" {
+                    } else if !matches!(name, "reread_guard" | "claude_desktop_store_inventory") {
                         return Err(Error::Refused("duplicate index field"));
                     }
                 } else {
@@ -1690,6 +1705,24 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
                         "reread_guard" => {} // TOMBSTONE: decode-and-drop.
+                        "claude_desktop_store_inventory" => {
+                            // No new refusal: this key was unknown to the last
+                            // release. A digest is 64 bytes plus its quotes, so
+                            // nothing wider is buffered; a bad value is dropped.
+                            let inventory: Option<String> = if value.len > 66 {
+                                Some(String::new())
+                            } else {
+                                self.history_scalar(value, Some(String::new()))?
+                            };
+                            if inventory.as_ref().is_some_and(|digest| digest.len() != 64) {
+                                with_claude_absence_counters(|counts| {
+                                    counts.tombstone_decode_drops =
+                                        counts.tombstone_decode_drops.saturating_add(1);
+                                });
+                            } else {
+                                index.claude_desktop_store_inventory = inventory;
+                            }
+                        }
                         "upload_ack_retirement_handoff" => {
                             // Damaged cleanup authority delays retirement; it must
                             // never discard identity custody or pause ingestion.
@@ -1921,9 +1954,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_desktop_store_cursor" => {
                             index.claude_desktop_store_cursor = self.typed(value)?
                         }
-                        "claude_desktop_store_inventory" => {
-                            index.claude_desktop_store_inventory = self.typed(value)?
-                        }
                         "claude_desktop_store_upper_bound" => {
                             index.claude_desktop_store_upper_bound = self.typed(value)?
                         }
@@ -2085,6 +2115,29 @@ impl<R: BufRead + Seek> Decoder<R> {
                             }
                             index.claude_money_birth_store = decoded.unwrap_or_default();
                         }
+                        "claude_copy_removals" => {
+                            // Like the birth table: a damaged or over-budget
+                            // value decodes as none (copies decide afresh).
+                            let decoded = if !value.resource
+                                && value.len
+                                    <= (claude_request_money::copy_removals::MAX_BYTES as u64) / 3
+                                        * 4
+                                        + 64
+                            {
+                                self.typed::<claude_request_money::copy_removals::CopyRemovals>(
+                                    value,
+                                )
+                                .ok()
+                            } else {
+                                None
+                            };
+                            if decoded.is_none() {
+                                self.counts.drops.activity += 1;
+                            }
+                            index.claude_copy_removals = decoded.unwrap_or_else(
+                                claude_request_money::copy_removals::CopyRemovals::missing,
+                            );
+                        }
                         "accepted_rebuild_incidence" => {
                             if value.len > CARRIED_ACK_BYTES_MAX as u64 {
                                 return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
@@ -2109,6 +2162,10 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
 
         if pass == Pass::Full {
+            if !seen.contains("claude_copy_removals") {
+                index.claude_copy_removals =
+                    claude_request_money::copy_removals::CopyRemovals::missing();
+            }
             // Migrate the old marker without granting later ACKs blanket retention.
             if index.accepted_incidence_pending_census
                 && index.accepted_rebuild_incidence.is_empty()
@@ -2345,8 +2402,6 @@ impl ScanIndex {
         self.decode_holds.1.count == 0 || self.decode_holds.1 == working.decode_holds.1
     }
     pub(super) fn decode_holds_family(&self, root: &str) -> bool {
-        #[cfg(test)]
-        SCOPE_VISITS.with(|count| count.set(count.get() + 1));
         !self.persistence_available()
             || self.decode_holds.2.contains(&repair_key(root))
             || [
@@ -2360,8 +2415,6 @@ impl ScanIndex {
             .any(|field| self.decode_holds.contains(field, root))
     }
     pub(crate) fn decode_holds_file(&self, key: &str) -> bool {
-        #[cfg(test)]
-        SCOPE_VISITS.with(|count| count.set(count.get() + 1));
         self.decode_holds.contains("files", key)
             || claude_index_path_member_ref(Path::new(key))
                 .is_some_and(|member| self.decode_holds_family(member.root))
@@ -2751,13 +2804,6 @@ pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
 
 fn repair_key(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
-}
-
-#[cfg(test)]
-thread_local! { static SCOPE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-#[cfg(test)]
-pub(super) fn scope_visits_for_test(reset: bool) -> usize {
-    SCOPE_VISITS.with(|count| if reset { count.replace(0) } else { count.get() })
 }
 
 #[cfg(test)]

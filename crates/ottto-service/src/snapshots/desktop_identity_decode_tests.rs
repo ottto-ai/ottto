@@ -29,6 +29,7 @@ fn read_registry(bytes: &[u8], fields: &'static [&'static str], pass: Pass) -> S
         counts: Counts::default(),
         family_spans: BTreeMap::new(),
         census_resources,
+        persistence_map: false,
     };
     decoder.index_fields(pass, fields).unwrap()
 }

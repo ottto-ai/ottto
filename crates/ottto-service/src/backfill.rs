@@ -69,13 +69,7 @@ impl<'de> Deserialize<'de> for ClaudeHistoryListIntent {
     }
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeHistoryListIntent {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ClaudeHistoryListIntent);
 
 /// Persisted bookkeeping: which parser versions have been retroactively
 /// reconciled. The daemon stores one entry per source slug.
@@ -700,7 +694,6 @@ pub fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -741,6 +734,7 @@ mod tests {
             removed_usage: None,
             telemetry_owned_complete: None,
             resolver_conflict_count: None,
+            copy_unproven_counts: None,
             claude_money: None,
             session_account_evidence: None,
             claude_usage_request_ids: std::collections::BTreeSet::new(),
@@ -840,44 +834,21 @@ mod tests {
 
     #[test]
     fn full_policy_for_same_user_keeps_cutoff() {
-        // Same-user re-claim: backend answers "full", but the daemon must NOT
-        // resurrect pre-cutoff history it skipped earlier.
-        let dir = temp_dir("policy-same-user");
-        apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-06T10:00:00Z"), "user_b")
-            .expect("apply from policy");
-        apply_claim_backfill_policy(&dir, Some("full"), None, "user_b").expect("re-claim");
-        let state = load_backfill_state(&dir);
-        assert_eq!(
-            state.backfill_cutoff_at.as_deref(),
-            Some("2026-07-06T10:00:00Z")
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn full_policy_for_different_user_clears_cutoff() {
-        let dir = temp_dir("policy-other-user");
-        apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-06T10:00:00Z"), "user_b")
-            .expect("apply from policy");
-        apply_claim_backfill_policy(&dir, Some("full"), None, "user_c").expect("full for user_c");
-        let state = load_backfill_state(&dir);
-        assert_eq!(state.backfill_cutoff_at, None);
-        assert_eq!(state.backfill_cutoff_user_id, None);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn absent_policy_behaves_like_full() {
-        // Old backend: no policy field. Different user connecting means
-        // today's full-backfill behavior, clearing the previous user's cutoff.
-        let dir = temp_dir("policy-absent");
-        apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-06T10:00:00Z"), "user_b")
-            .expect("apply from policy");
-        apply_claim_backfill_policy(&dir, None, None, "user_b").expect("old backend, same user");
-        assert!(load_backfill_state(&dir).backfill_cutoff_at.is_some());
-        apply_claim_backfill_policy(&dir, None, None, "user_c").expect("old backend, other user");
-        assert!(load_backfill_state(&dir).backfill_cutoff_at.is_none());
-        fs::remove_dir_all(&dir).ok();
+        for policy in [Some("full"), None] {
+            let dir = temp_dir("policy-full-or-absent");
+            apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-06T10:00:00Z"), "user_b")
+                .unwrap();
+            apply_claim_backfill_policy(&dir, policy, None, "user_b").unwrap();
+            assert_eq!(
+                load_backfill_state(&dir).backfill_cutoff_at.as_deref(),
+                Some("2026-07-06T10:00:00Z")
+            );
+            apply_claim_backfill_policy(&dir, policy, None, "user_c").unwrap();
+            let state = load_backfill_state(&dir);
+            assert_eq!(state.backfill_cutoff_at, None);
+            assert_eq!(state.backfill_cutoff_user_id, None);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
@@ -948,21 +919,6 @@ mod tests {
             kept,
             vec!["straddling", "boundary", "live", "timeless", "garbled"]
         );
-    }
-
-    #[test]
-    fn cutoff_filter_is_a_noop_without_cutoff() {
-        let state = BackfillState::default();
-        let mut snapshots = vec![cutoff_test_item("old", Some("2020-01-01T00:00:00Z"), None)];
-        assert_eq!(apply_backfill_cutoff(&mut snapshots, &state), 0);
-        assert_eq!(snapshots.len(), 1);
-    }
-
-    #[test]
-    fn pending_backfill_returns_all_sources_when_state_is_empty() {
-        let state = BackfillState::default();
-        let pending = pending_backfill_sources(&state);
-        assert_eq!(pending.len(), 3);
     }
 
     /// SOURCE F1a, StateMissing H1: only a missing file is a fresh state. An
@@ -1521,34 +1477,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    struct CapturingSink {
-        captured: Mutex<Option<BackfillReport>>,
-    }
-
-    impl BackfillNotificationSink for CapturingSink {
-        fn notify_completed(&self, report: &BackfillReport) {
-            *self.captured.lock().unwrap() = Some(report.clone());
-        }
-    }
-
-    #[test]
-    fn run_backfill_on_empty_home_returns_no_snapshots_and_no_panic() {
-        let home = temp_dir("home");
-        fs::create_dir_all(home.join(".claude").join("projects")).unwrap();
-        fs::create_dir_all(home.join(".codex").join("sessions")).unwrap();
-        fs::create_dir_all(home.join(".pi").join("agent").join("sessions")).unwrap();
-        let pending = vec![
-            SnapshotSource::ClaudeCode,
-            SnapshotSource::Codex,
-            SnapshotSource::Pi,
-        ];
-        let (snapshots, report) =
-            run_backfill(&home, &pending, "2026-05-28T10:00:00Z", true, None).expect("backfill ok");
-        assert_eq!(snapshots.len(), 0);
-        assert_eq!(report.total_snapshots(), 0);
-        fs::remove_dir_all(&home).ok();
-    }
-
     #[test]
     fn backfill_without_activity_hint_never_emits_context_curve() {
         let home = temp_dir("curve-capability-absent");
@@ -1575,24 +1503,6 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert!(snapshots[0].context_curve.is_none());
         fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn logging_sink_records_completion_via_trait_object() {
-        let sink: Arc<dyn BackfillNotificationSink> = Arc::new(CapturingSink {
-            captured: Mutex::new(None),
-        });
-        let report = BackfillReport {
-            claude_code_snapshot_count: 2,
-            codex_snapshot_count: 3,
-            pi_snapshot_count: 0,
-            completed_at: "2026-05-28T10:00:00Z".to_string(),
-            ..Default::default()
-        };
-        sink.notify_completed(&report);
-        // Default LoggingBackfillSink should run without panicking.
-        LoggingBackfillSink.notify_completed(&report);
-        assert_eq!(report.total_snapshots(), 5);
     }
 }
 

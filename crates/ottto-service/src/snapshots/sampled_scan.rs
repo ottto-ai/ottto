@@ -22,6 +22,8 @@ pub(crate) use durable_tail::MissClass;
 #[cfg(unix)]
 pub(crate) use durable_tail::RestoreOutcome;
 pub(super) mod side_ledger;
+#[cfg(all(test, unix))]
+pub(crate) mod transition_fixture;
 
 /// The retained-copy cache behind `SharedCache::retained`.
 pub(super) type RetainedCache = TranscriptCache<CachedJsonlReduction>;
@@ -148,6 +150,7 @@ impl CapPace {
 }
 
 pub(crate) struct SharedCache {
+    pub(crate) withheld_memo: withheld_account::Memo,
     inner: Mutex<RetainedCache>,
     cap_pace: Mutex<CapPace>,
     /// The resumable Codex job slot and held-singleton memo. Charged once,
@@ -166,6 +169,7 @@ pub(crate) struct SharedCache {
 impl Default for SharedCache {
     fn default() -> Self {
         Self {
+            withheld_memo: Default::default(),
             inner: Mutex::new(TranscriptCache::with_byte_limit(STATE_BYTES)),
             cap_pace: Mutex::new(CapPace::default()),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
@@ -182,6 +186,9 @@ impl std::fmt::Debug for SharedCache {
 }
 impl HeapLayoutBound for SharedCache {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        // The shared cache owns the memo allocation header even when empty.
+        // Its optional entries are priced separately by the rotation owner.
+        self.withheld_memo.heap_bound(c)?;
         if BLOCKING_RESIDENT_MEASURE.with(std::cell::Cell::get) {
             // P1-RETAIN R0's completion measure: wait for each lock, one at a
             // time and in lock order (`retained` checks this thread holds
@@ -211,6 +218,14 @@ impl SharedCache {
 }
 
 impl SharedCache {
+    /// Bind before constructor-time discovery/selection, which consults CONTENT.
+    pub(crate) fn bind_withheld(&self, index: &mut ScanIndex) {
+        index.withheld_memo = self.withheld_memo.clone();
+        index
+            .withheld_memo
+            .retain_held(&index.claude_account_deferred_holds);
+    }
+
     /// The retained-copy lock. Lock order: retained, then cursor, never the
     /// reverse; never twice on one thread (both checked in debug builds).
     pub(super) fn retained(&self) -> std::sync::LockResult<RetainedGuard<'_>> {
@@ -618,6 +633,11 @@ impl OwnedSourceScan {
         namespace: Scope,
     ) -> Self {
         self.durable_guard = Some(Arc::downgrade(&cache));
+        if self.source == SnapshotSource::ClaudeCode {
+            cache.bind_withheld(&mut self.index);
+            self.resource_probe
+                .set_withheld_memo(self.index.withheld_memo.clone());
+        }
         if matches!(
             self.source,
             SnapshotSource::ClaudeCode | SnapshotSource::Codex
@@ -2045,6 +2065,18 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn set_test_now(now: Option<u64>) {
     TEST_NOW.with(|clock| clock.set(now));
+}
+
+#[cfg(test)]
+pub(super) fn with_test_now<T>(now: u64, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_NOW.with(|clock| clock.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_NOW.with(|clock| clock.replace(Some(now))));
+    f()
 }
 
 pub(super) fn now_seconds() -> u64 {

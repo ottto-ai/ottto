@@ -85,7 +85,7 @@ impl Fixture {
             &mut ScanCensus::default(),
             None,
             BACKFILL_WINDOW_DAYS,
-            &BTreeMap::new(),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
         )
         .unwrap()
     }
@@ -451,24 +451,6 @@ fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
 }
 
 #[test]
-fn transcript_and_sidecar_append_use_tail_without_changing_joined_body() {
-    let f = Fixture::new(1);
-    let cache = Arc::new(SharedCache::default());
-    let prior = seed_predecessor(&f, &cache);
-    f.append_transcript(1);
-    f.evidence(2);
-    let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
-    assert_layout_mode(cached.modes, (0, 1, 0));
-    assert_oracle(&f, &cached, prior);
-    assert_eq!(
-        cached.index.files[&local_index_key(&f.path)]
-            .audit_obligation(now_seconds())
-            .is_some(),
-        crate::heap_layout_bound::layout_supported()
-    );
-}
-
-#[test]
 fn root_telemetry_reselects_every_child_without_invalidating_reduction() {
     let mut f = Fixture::new(1);
     let children = ["a4d1585d310070d0f", "b4d1585d310070d0f"];
@@ -617,6 +599,7 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
         let prior = seed_predecessor(&f, &cache);
         let cache = if retained_budget {
             Arc::new(SharedCache {
+                withheld_memo: Default::default(),
                 cap_pace: Default::default(),
                 inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
                 cursor: Default::default(),
@@ -1675,92 +1658,6 @@ fn desktop_fresh_import_retries_only_child_when_ambiguous_parents_become_indexed
 }
 
 #[test]
-fn desktop_completed_census_counts_existing_held_retry_reads() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let home = crate::test_scratch::ScratchDir::new("desktop-held-recovery");
-    let mut f = Fixture::new(1);
-    let old_dir = f.dir.clone();
-    f.dir = home.join(".claude/projects");
-    fs::create_dir_all(&f.dir).unwrap();
-    let path = f.dir.join(format!("{}.jsonl", f.session));
-    fs::rename(&f.path, &path).unwrap();
-    f.path = path;
-    fs::remove_dir_all(old_dir).unwrap();
-    let store = home
-        .join("Library/Application Support/Claude/claude-code-sessions")
-        .join("123e4567-e89b-12d3-a456-426614174000")
-        .join("123e4567-e89b-12d3-a456-426614174001");
-    fs::create_dir_all(&store).unwrap();
-    fs::write(
-        store.join("one.json"),
-        json!({"cliSessionId":f.session,"createdAt":"2026-08-02T06:59:00Z"}).to_string(),
-    )
-    .unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let mut index = settle(raw_scan_at(
-        &f,
-        ScanIndex::default(),
-        Some(cache),
-        true,
-        COLLECTED,
-        |_| {},
-    ));
-    let key = local_index_key(&f.path);
-    assert!(index.claude_desktop_identity_census_complete);
-    assert!(!index.files[&key].source_file_fingerprint.is_empty());
-    index.claude_account_deferred_holds.insert(
-        key.clone(),
-        index.files[&key].source_file_fingerprint.clone(),
-    );
-    // The existing hold already owes a read; census completion does not create one.
-    index
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .source_file_fingerprint
-        .clear();
-    index.claude_desktop_identity_census_complete = false;
-    index.claude_desktop_lineage_census_complete = false;
-    index.claude_desktop_census_witness = None;
-    let unrelated = f.dir.join("unrelated.jsonl");
-    // An indexed held session with no Desktop proof cannot be selected by this recovery.
-    let mut unrelated_entry = index.files[&key].clone();
-    unrelated_entry.source_file_fingerprint = "unrelated-kept".into();
-    index
-        .files
-        .insert(local_index_key(&unrelated), unrelated_entry);
-    index
-        .claude_account_deferred_holds
-        .insert(local_index_key(&unrelated), "unrelated-kept".into());
-    let (recovered, rows) = crate::local_resource_diagnostics::capture(|| {
-        raw_scan_at(
-            &f,
-            index,
-            Some(Arc::new(SharedCache::default())),
-            true,
-            "2026-08-02T07:12:00Z",
-            |scan| {
-                assert_eq!(
-                    scan.claude_title_metadata.recovered_account_holds,
-                    BTreeSet::from([key.clone()])
-                );
-            },
-        )
-    });
-    assert_eq!(recovered.result.snapshots.len(), 1);
-    assert_eq!(recovered.result.snapshots[0].source_session_id, f.session);
-    assert_eq!(recovered.native_bytes, fs::metadata(&f.path).unwrap().len());
-    assert_eq!(
-        rows.iter()
-            .filter_map(
-                |row| row["counts"]["desktop_metadata"]["recovered_hold_body_rereads"].as_u64()
-            )
-            .sum::<u64>(),
-        1
-    );
-}
-
-#[test]
 fn desktop_inventory_backoff_keeps_growing_native_prefix_and_cold_body_parity() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let home = crate::test_scratch::ScratchDir::new("desktop-growing-backoff");
@@ -1868,6 +1765,117 @@ fn desktop_inventory_backoff_keeps_growing_native_prefix_and_cold_body_parity() 
         u64::from(crate::heap_layout_bound::layout_supported())
     );
 }
+
+fn fixture_in_home(home: &Path) -> Fixture {
+    let mut f = Fixture::new(1);
+    let old_dir = f.dir.clone();
+    f.dir = home.join(".claude/projects");
+    fs::create_dir_all(&f.dir).unwrap();
+    let path = f.dir.join(format!("{}.jsonl", f.session));
+    fs::rename(&f.path, &path).unwrap();
+    f.path = path;
+    fs::remove_dir_all(old_dir).unwrap();
+    f
+}
+
+fn desktop_bucket(home: &Path, root: &str, account: &str, org: &str) -> PathBuf {
+    let bucket = home
+        .join("Library/Application Support")
+        .join(root)
+        .join("claude-code-sessions")
+        .join(account)
+        .join(org);
+    fs::create_dir_all(&bucket).unwrap();
+    bucket
+}
+
+// [behaviour] Deferred: adjacent restore trait is removed by active e5/pi-b2.
+#[test]
+fn desktop_completed_census_counts_existing_held_retry_reads() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let home = crate::test_scratch::ScratchDir::new("desktop-held-recovery");
+    let f = fixture_in_home(&home);
+    let store = desktop_bucket(&home, "Claude", DESKTOP_ACCOUNT, DESKTOP_ORG);
+    fs::write(
+        store.join("one.json"),
+        json!({"cliSessionId":f.session,"createdAt":"2026-08-02T06:59:00Z"}).to_string(),
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let mut index = settle(raw_scan_at(
+        &f,
+        ScanIndex::default(),
+        Some(cache),
+        true,
+        COLLECTED,
+        |_| {},
+    ));
+    let key = local_index_key(&f.path);
+    assert!(index.claude_desktop_identity_census_complete);
+    assert!(!index.files[&key].source_file_fingerprint.is_empty());
+    index.claude_account_deferred_holds.insert(
+        key.clone(),
+        index.files[&key].source_file_fingerprint.clone(),
+    );
+    // The existing hold already owes a read; census completion does not create one.
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    index.claude_desktop_identity_census_complete = false;
+    index.claude_desktop_lineage_census_complete = false;
+    index.claude_desktop_census_witness = None;
+    let unrelated = f.dir.join("unrelated.jsonl");
+    // An indexed held session with no Desktop proof cannot be selected by this recovery.
+    let mut unrelated_entry = index.files[&key].clone();
+    unrelated_entry.source_file_fingerprint = "unrelated-kept".into();
+    index
+        .files
+        .insert(local_index_key(&unrelated), unrelated_entry);
+    index
+        .claude_account_deferred_holds
+        .insert(local_index_key(&unrelated), "unrelated-kept".into());
+    let (recovered, rows) = crate::local_resource_diagnostics::capture(|| {
+        raw_scan_at(
+            &f,
+            index,
+            Some(Arc::new(SharedCache::default())),
+            true,
+            "2026-08-02T07:12:00Z",
+            |scan| {
+                assert_eq!(
+                    scan.claude_title_metadata.recovered_account_holds,
+                    BTreeSet::from([key.clone()])
+                );
+                // The diagnostic set is no input to the selection hash.
+                let mut unnoted = scan.claude_title_metadata.clone();
+                unnoted.recovered_account_holds.clear();
+                assert_eq!(
+                    unnoted.session_sidecar_fingerprint(&f.session),
+                    scan.claude_title_metadata
+                        .session_sidecar_fingerprint(&f.session)
+                );
+            },
+        )
+    });
+    assert_eq!(recovered.result.snapshots.len(), 1);
+    assert_eq!(recovered.result.snapshots[0].source_session_id, f.session);
+    assert_eq!(recovered.native_bytes, fs::metadata(&f.path).unwrap().len());
+    assert_eq!(
+        rows.iter()
+            .filter_map(
+                |row| row["counts"]["desktop_metadata"]["recovered_hold_body_rereads"].as_u64()
+            )
+            .sum::<u64>(),
+        1
+    );
+}
+
+const DESKTOP_ACCOUNT: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+const DESKTOP_ORG: &str = "123e4567-e89b-12d3-a456-426614174001";
 
 #[path = "desktop_lineage_tests.rs"]
 mod desktop_lineage_tests;

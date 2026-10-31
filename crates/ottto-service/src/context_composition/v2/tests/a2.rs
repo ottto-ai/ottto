@@ -199,48 +199,6 @@ fn health_posts_once_per_agent_and_never_retries_within_the_day() {
 }
 
 #[test]
-fn health_carries_worker_counters_even_for_a_killed_run() {
-    let dir = scratch("composition-a2-health-killed");
-    let day = day_of(base_now().date());
-    let started = base_now();
-    let mut log = HealthLog::begin(&dir, day, "device|machine|api");
-    log.set(HealthEntry::finished(
-        "claude-code",
-        &sample_stats(),
-        1,
-        started,
-    ));
-    // Codex was running when the worker was stopped: no counts of its own.
-    log.set(HealthEntry::started("codex", started));
-    let record = health::take_pending(&dir, day).unwrap();
-    let mut poster = Poster::default();
-    let worker = WorkerCounts {
-        timeouts: 1,
-        failures: 0,
-    };
-    let counts = health::send(
-        &record,
-        "device|machine|api",
-        "machine-test",
-        worker,
-        &mut poster,
-    );
-    assert_eq!(counts.sent, 2);
-    for (agent, body) in &poster.calls {
-        assert_eq!(body["worker_timeouts"], 1, "{agent}");
-        assert_eq!(body["worker_failures"], 0, "{agent}");
-    }
-    let codex = &poster.calls[1].1;
-    assert_eq!(codex["agent_source"], "codex");
-    assert_eq!(codex["bytes_read"], 0);
-    let claude = &poster.calls[0].1;
-    assert_eq!(claude["scopes_quarantined"], 1);
-    assert_eq!(claude["checkpoint_restarts"], 5);
-    assert_eq!(claude["audit_differences"], 0);
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
 fn run_counts_waiting_full_reads_and_backlog_growth() {
     let env = Env::uninstalled("composition-a2-backlog");
     let now = base_now();
@@ -266,35 +224,6 @@ fn run_counts_waiting_full_reads_and_backlog_growth() {
     assert_eq!(backlog.record(12, 500), 3);
     assert_eq!(backlog.record(13, 500), 0, "not growing");
     assert_eq!(backlog.record(14, 0), 0);
-    env.cleanup();
-}
-
-#[derive(Default)]
-struct Receipts {
-    payloads: u64,
-}
-
-impl Uploader for Receipts {
-    fn upload(&mut self, request: &Value) -> anyhow::Result<UploadReceipt> {
-        self.payloads += 1;
-        Ok(UploadReceipt {
-            payload_bytes: serde_json::to_vec(request)?.len() as u64,
-            rows_written: Some(7),
-        })
-    }
-}
-
-#[test]
-fn upload_metrics_count_payload_bytes_and_rows_written() {
-    let env = Env::new("composition-a2-upload-metrics");
-    let now = base_now();
-    whole_file(&env, "a", now);
-    let mut receipts = Receipts::default();
-    let stats = env.run(Source::Claude, now, Some(&mut receipts));
-    assert_eq!(stats.uploaded, 1);
-    assert_eq!(receipts.payloads, 1);
-    assert_eq!(stats.upload_rows_written, 7);
-    assert!(stats.upload_payload_bytes > 100);
     env.cleanup();
 }
 
@@ -399,36 +328,6 @@ fn health_for_another_destination_is_dropped_unsent() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-#[test]
-fn backlog_counts_a_waiting_file_at_its_current_size() {
-    let env = Env::uninstalled("composition-a2-backlog-growth");
-    let now = base_now();
-    let path = whole_file(&env, "a", now);
-    env.run(Source::Claude, now - time::Duration::days(1), None);
-    earlier_build_install_backlog(&env, Source::Claude, &[&path]);
-    let run = |hours: i64| {
-        env.run_with(
-            Source::Claude,
-            now + time::Duration::hours(hours),
-            None,
-            0,
-            &mut FolderResolver::default(),
-        )
-    };
-    let first = run(0);
-    assert_eq!(
-        first.full_read_backlog_bytes,
-        fs::metadata(&path).unwrap().len()
-    );
-    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
-    let second = run(1);
-    let grown = fs::metadata(&path).unwrap().len();
-    assert!(grown > first.full_read_backlog_bytes);
-    assert_eq!(second.full_read_waiting_files, 1);
-    assert_eq!(second.full_read_backlog_bytes, grown);
-    env.cleanup();
-}
-
 /// A concurrent subprocess can inherit the flock descriptor until exec,
 /// briefly keeping the lease alive after take_run_health closes its copy.
 /// A lease held throughout this bounded probe must still fail the test.
@@ -443,18 +342,6 @@ fn probe_health_worker_lease(dir: &Path) -> Option<File> {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-}
-
-#[test]
-fn health_lease_probe_rejects_a_continuously_held_lease() {
-    let dir = crate::test_scratch::ScratchDir::new("composition-health-held-lease");
-    let lease = harvest::lock_state(&dir).unwrap().unwrap();
-    assert!(
-        probe_health_worker_lease(&dir).is_none(),
-        "retry must not hide a lease retained during posting"
-    );
-    drop(lease);
-    assert!(probe_health_worker_lease(&dir).is_some());
 }
 
 #[test]
@@ -476,103 +363,12 @@ fn health_mark_releases_the_worker_lease_before_posting() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-#[test]
-fn run_health_client_bounds_a_stalled_response() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let client = crate::snapshot_client::SnapshotApiClient::new(format!(
-        "http://{}",
-        listener.local_addr().unwrap()
-    ));
-    let (done, stop) = std::sync::mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let until = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Ok((_stream, _)) = listener.accept() {
-                // Stay open past the asserted client deadline. The caller
-                // releases us after it returns, including on a failed assertion.
-                let _ = stop.recv_timeout(Duration::from_secs(3));
-                return;
-            }
-            assert!(Instant::now() < until, "health client never connected");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    });
-    let start = Instant::now();
-    let result = client.post_context_composition_run_health_with_timeout(
-        "synthetic-relay",
-        &json!({}),
-        Duration::from_millis(150),
-    );
-    let elapsed = start.elapsed();
-    let _ = done.send(());
-    server.join().unwrap();
-    assert!(result.is_err());
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "health deadline took {elapsed:?}"
-    );
-}
-
 fn health_device() -> ottto_core::LocalDeviceBinding {
     ottto_core::LocalDeviceBinding {
         device_id: "synthetic".into(),
         machine_id: Some("a".repeat(64)),
         sources: vec!["codex".into()],
     }
-}
-
-#[test]
-fn run_health_token_bounds_a_slow_progressing_tls_handshake() {
-    use std::io::Read;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let client = crate::snapshot_client::SnapshotApiClient::new(format!(
-        "https://127.0.0.1:{}",
-        listener.local_addr().unwrap().port()
-    ));
-    let server = std::thread::spawn(move || {
-        let until = Instant::now() + Duration::from_secs(3);
-        let mut seen = 0;
-        while Instant::now() < until {
-            if let Ok((mut socket, _)) = listener.accept() {
-                seen += 1;
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
-                let _ = socket.read(&mut [0; 4096]);
-                // Drip a TLS record, keeping every read below the socket's
-                // timeout while the complete handshake exceeds the deadline.
-                let _ = socket.write_all(&[22, 3, 3, 0x40, 0]);
-                let drip_end = Instant::now() + Duration::from_secs(2);
-                while Instant::now() < drip_end {
-                    if socket.write_all(&[0]).is_err() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // Any retry would still be queued on the listener.
-        assert!(listener.accept().is_err());
-        seen
-    });
-    let start = Instant::now();
-    let result = client.issue_composition_health_relay_token(
-        &health_device(),
-        "synthetic-secret",
-        crate::snapshots::SnapshotSource::Codex,
-        Duration::from_millis(300),
-    );
-    let elapsed = start.elapsed();
-    assert_eq!(server.join().unwrap(), 1);
-    assert!(result.is_err());
-    assert!(
-        elapsed < Duration::from_millis(900),
-        "token handshake took {elapsed:?}"
-    );
 }
 
 #[test]

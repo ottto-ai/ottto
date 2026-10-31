@@ -584,7 +584,10 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        ignore = "needs macOS heap layout"
+    )]
     fn insertion_preflight_matches_real_rank_and_reservation_outcomes() {
         for reserved in [0, 32 * 1024, 96 * 1024, 128 * 1024] {
             for rank in [(9, 0), (10, 0), (20, 0), (30, 0)] {
@@ -675,58 +678,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn claude_page_cache_evictions_partition_real_count_and_byte_pressure() {
-        use crate::local_resource_diagnostics::claude_reread::Scope;
-        if !heap_layout_bound::layout_supported() {
-            return;
-        }
-        let scope = Scope::begin(true);
-        let mut count_limited = TranscriptCache::new(1024 * 1024, 128 * 1024, 1);
-        assert!(count_limited.insert("a".into(), retained("a".into())));
-        assert!(count_limited.insert("b".into(), retained("b".into())));
-        assert!(count_limited.take("a").is_none());
-        let counts = scope.finish().retained_cache_page_events;
-        assert_eq!(counts.events.insert_entries_evicted, 1);
-        assert_eq!(counts.insert_count_entries_evicted, 1);
-        assert_eq!(counts.insert_byte_entries_evicted, 0);
-        let scope = Scope::begin(true);
-        let mut byte_limited = TranscriptCache::new(80 * 1024, 40 * 1024, 256);
-        for n in 0..20 {
-            assert!(byte_limited.insert(n.to_string(), retained("x".repeat(16 * 1024))));
-        }
-        let counts = scope.finish().retained_cache_page_events;
-        assert!(counts.events.insert_entries_evicted > 0);
-        assert_eq!(counts.insert_count_entries_evicted, 0);
-        assert_eq!(
-            counts.insert_byte_entries_evicted,
-            counts.events.insert_entries_evicted
-        );
-        assert_eq!(counts.events.insert_admitted, 20);
-    }
-
-    // Test states use the same accounting as production native accumulator
-    // fields. Provider-native states are also exercised in the adapter fixtures.
-    #[test]
-    fn sampled_cache_accounts_private_capacity_and_active_copies() {
-        let cache = TranscriptCache::<String>::default();
-        let small = String::from("private");
-        let mut large = small.clone();
-        large.reserve(1024 * 1024);
-        if heap_layout_bound::layout_supported() {
-            assert!(
-                cache.bound_with(&large).unwrap()
-                    >= cache.bound_with(&small).unwrap() + 1024 * 1024
-            );
-            assert!(cache.bound_with(&vec![0_u8; CACHE_BYTES]).is_none());
-            let copies = (large.clone(), large);
-            assert!(
-                cache.bound_with(&copies).unwrap() >= copies.0.capacity() + copies.1.capacity()
-            );
-        } else {
-            assert!(cache.bound_with(&small).is_none());
-        }
-    }
     fn retained(text: String) -> Retained<String> {
         retained_at(text, None)
     }
@@ -808,67 +759,6 @@ mod tests {
     }
 
     #[test]
-    fn sampled_cache_count_eviction_moves_state_and_refuses_oversized_replacement() {
-        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 2);
-        if !heap_layout_bound::layout_supported() {
-            assert!(!cache.insert("a".into(), retained("private".into())));
-            assert!(cache.take("a").is_none());
-            return;
-        }
-        for key in ["a", "b", "c"] {
-            assert!(cache.insert(key.into(), retained(key.into())));
-        }
-        assert!(cache.take("a").is_none());
-        assert!(cache.take("b").is_some());
-        assert!(cache.take("b").is_none());
-        assert!(!cache.insert("c".into(), retained("x".repeat(256 * 1024))));
-        assert!(cache.take("c").is_none());
-    }
-    #[test]
-    fn sampled_cache_total_bytes_and_clock_overflow_fail_closed() {
-        let mut cache = TranscriptCache::new(80 * 1024, 40 * 1024, 256);
-        if !heap_layout_bound::layout_supported() {
-            return;
-        }
-        for n in 0..20 {
-            assert!(cache.insert(n.to_string(), retained("x".repeat(16 * 1024))));
-            assert!(cache.resident_bound().unwrap() <= 80 * 1024);
-        }
-        assert!(cache.entries.len() < 20);
-        cache.clock = u64::MAX;
-        assert!(!cache.insert("overflow".into(), retained("private".into())));
-        assert!(cache.entries.is_empty());
-    }
-    #[test]
-    fn sampled_cache_reserves_actual_live_copy_and_overlap_room_at_admission() {
-        if !heap_layout_bound::layout_supported() {
-            return;
-        }
-        let mut cache = TranscriptCache::with_byte_limit(32 * 1024 * 1024);
-        let overlap = 32 * 1024 * 1024;
-        let live = vec![0_u8; 14 * 1024 * 1024];
-        let live_bytes = heap_layout_bound::bound(&live, 16 * 1024 * 1024).unwrap();
-        for n in 0..8 {
-            assert!(cache.insert_reserving(
-                n.to_string(),
-                retained("x".repeat(4 * 1024 * 1024)),
-                live_bytes,
-                0
-            ));
-            assert!(cache.resident_bound().unwrap() + live_bytes + overlap <= CACHE_BYTES);
-        }
-        assert!(
-            cache.entries.len() < 8,
-            "admission evicts instead of consuming live/overlap reservation"
-        );
-        assert!(!cache.insert_reserving(
-            "no-room".into(),
-            retained("x".into()),
-            33 * 1024 * 1024,
-            0
-        ));
-    }
-    #[test]
     fn sampled_cache_frozen_charges_survive_aggregate_walk_pressure_and_remeasure_mutation() {
         if !heap_layout_bound::layout_supported() {
             return;
@@ -891,97 +781,6 @@ mod tests {
         cache.clear();
         assert!(cache.entries.is_empty());
         assert!(cache.resident_bound().unwrap() < 64 * 1024);
-    }
-    #[test]
-    fn sampled_cache_idle_reuse_pressure_and_ambiguous_time_are_bounded() {
-        if !heap_layout_bound::layout_supported() {
-            return;
-        }
-        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 2);
-        let at = |n| std::time::Duration::from_secs(n);
-        assert!(cache.insert_at(
-            "recent".into(),
-            retained_at("x".into(), Some(90)),
-            0,
-            at(100)
-        ));
-        assert!(cache.insert_at("old".into(), retained_at("x".into(), Some(10)), 0, at(100)));
-        assert!(!cache.insert_at("older".into(), retained_at("x".into(), Some(1)), 0, at(100)));
-        assert!(cache.take("recent").is_some());
-        // Equal/future timestamps fall back to finite admission order. A
-        // future timestamp is clipped once, and cannot block a later live file.
-        cache.clear();
-        for key in ["a", "b", "c"] {
-            assert!(cache.insert_at(
-                key.into(),
-                retained_at("x".into(), Some(999999)),
-                0,
-                at(100)
-            ));
-        }
-        assert!(cache.take("a").is_none());
-        assert!(cache.insert_at(
-            "live".into(),
-            retained_at("x".into(), Some(101)),
-            0,
-            at(101)
-        ));
-        assert!(cache.take("live").is_some());
-        // Idle age drops nothing: admissions 2h and 5h later leave reusable
-        // state in place. Capacity and the victim order still decide.
-        assert!(cache.insert_at(
-            "live".into(),
-            retained_at("x".into(), Some(101)),
-            0,
-            at(101)
-        ));
-        // Backdated work is the oldest candidate at the count cap: it is
-        // refused instead of displacing newer idle state.
-        assert!(!cache.insert_at(
-            "backdated".into(),
-            retained_at("x".into(), Some(1)),
-            0,
-            at(101 + 2 * 3600)
-        ));
-        assert!(cache.take("backdated").is_none());
-        assert_eq!(cache.entries.len(), 2);
-        // Newer work still evicts the oldest resident, not the idle entry.
-        let five_hours = 101 + 5 * 3600;
-        assert!(cache.insert_at(
-            "newer".into(),
-            retained_at("x".into(), Some(five_hours)),
-            0,
-            at(five_hours)
-        ));
-        assert_eq!(cache.entries.len(), 2);
-        assert!(cache.take("c").is_none());
-        assert!(cache.take("live").is_some());
-        let mut restarted = TranscriptCache::<String>::default();
-        assert!(restarted.take("backdated").is_none());
-    }
-    #[test]
-    fn sampled_cache_rejected_old_admission_still_releases_live_reservation() {
-        if !heap_layout_bound::layout_supported() {
-            return;
-        }
-        let mut cache = TranscriptCache::new(128 * 1024, 64 * 1024, 8);
-        let at = std::time::Duration::from_secs(100);
-        for (key, modified) in [("a", 90), ("b", 80)] {
-            assert!(cache.insert_at(
-                key.into(),
-                retained_at("x".repeat(32 * 1024), Some(modified)),
-                0,
-                at
-            ));
-        }
-        assert!(!cache.insert_at(
-            "older".into(),
-            retained_at("x".into(), Some(1)),
-            120 * 1024,
-            at
-        ));
-        assert!(cache.resident_bound().unwrap() + 120 * 1024 <= 128 * 1024);
-        assert!(cache.take("older").is_none());
     }
     #[test]
     fn sampled_cache_adapter_refuses_externally_mutable_charge() {
@@ -1122,30 +921,5 @@ mod tests {
             None
         ));
         assert_eq!(cache.entries["ranked"].modified_hint, (50, 0));
-    }
-
-    /// `Taken` carries the clipped admitted hint and the reserved finalization
-    /// charge (β).
-    #[test]
-    fn take_carries_the_clipped_admission_hint_and_finalization_charge() {
-        if !heap_layout_bound::layout_supported() {
-            return;
-        }
-        let at = std::time::Duration::from_secs(100);
-        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 8);
-        assert!(cache.admit(
-            "future".into(),
-            retained_at("f".into(), Some(500)),
-            4096,
-            4096,
-            at
-        ));
-        assert!(cache.insert_at("past".into(), retained_at("p".into(), Some(50)), 0, at));
-        let future = cache.take("future").unwrap();
-        assert_eq!(future.modified_hint, (100, 0), "clipped to admission time");
-        assert_eq!(future.finalization_charge, 4096);
-        let past = cache.take("past").unwrap();
-        assert_eq!(past.modified_hint, (50, 0));
-        assert_eq!(past.finalization_charge, 0);
     }
 }

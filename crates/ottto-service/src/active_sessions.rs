@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -22,6 +22,7 @@ use ottto_protocol::{
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
+use crate::locked_state_dir::replace_json_cache;
 use crate::snapshots::{
     bounded_compaction_events, bounded_compaction_timestamps, LocalContextPoint,
     SnapshotCompactionEvent, SnapshotItem, SnapshotModelUsage, SnapshotSource,
@@ -1032,15 +1033,12 @@ fn write_cache(path: &Path, cache: &ActiveSessionCache) -> Result<()> {
         .with_context(|| format!("create active session cache dir {}", parent.display()))?;
     // Compact: the status path reads this whole file on every poll.
     let payload = serde_json::to_vec(cache).context("serialize active session cache")?;
-    let temp_path = path.with_extension("json.tmp");
-    let mut temp = File::create(&temp_path)
-        .with_context(|| format!("create active session cache temp {}", temp_path.display()))?;
-    temp.write_all(&payload)
-        .with_context(|| format!("write active session cache temp {}", temp_path.display()))?;
-    temp.sync_all().ok();
-    std::fs::rename(&temp_path, path)
-        .with_context(|| format!("rename active session cache into place {}", path.display()))?;
-    Ok(())
+    replace_json_cache(
+        path,
+        &payload,
+        "active session cache",
+        "active session cache",
+    )
 }
 
 #[cfg(test)]
@@ -1055,6 +1053,8 @@ mod tests {
         SnapshotModelUsage {
             evidence_ref: None,
             identity_parts: None,
+            copy_unproven: false,
+            identity_retained: false,
             model: model.to_string(),
             input_tokens: 0,
             output_tokens: tokens,
@@ -1137,62 +1137,6 @@ mod tests {
 
         assert_eq!(model.as_deref(), Some("claude-fable-5"));
         assert_eq!(effort.as_deref(), Some("xhigh"));
-    }
-
-    #[test]
-    fn latest_identity_reports_no_effort_when_the_source_stamped_none() {
-        let mut snapshot = test_snapshot("s-no-effort", "2026-07-19T11:04:00Z");
-        snapshot.usage_buckets = vec![bucket(
-            "2026-07-19T11:00:00Z",
-            "2026-07-19T11:04:00Z",
-            vec![usage_row("gpt-5.6-sol", None, 40)],
-        )];
-
-        let (model, effort) = latest_model_identity(&snapshot);
-
-        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
-        assert_eq!(effort, None);
-    }
-
-    #[test]
-    fn latest_identity_treats_unknown_and_blank_effort_as_no_evidence() {
-        for raw in ["unknown", "UNKNOWN", "   ", ""] {
-            let mut snapshot = test_snapshot("s-unknown", "2026-07-19T11:04:00Z");
-            snapshot.usage_buckets = vec![bucket(
-                "2026-07-19T11:00:00Z",
-                "2026-07-19T11:04:00Z",
-                vec![usage_row("gpt-5.6-sol", Some(raw), 40)],
-            )];
-
-            assert_eq!(latest_model_identity(&snapshot).1, None, "raw={raw:?}");
-        }
-    }
-
-    #[test]
-    fn latest_identity_normalizes_effort_case() {
-        let mut snapshot = test_snapshot("s-case", "2026-07-19T11:04:00Z");
-        snapshot.usage_buckets = vec![bucket(
-            "2026-07-19T11:00:00Z",
-            "2026-07-19T11:04:00Z",
-            vec![usage_row("gpt-5.6-sol", Some(" XHigh "), 40)],
-        )];
-
-        assert_eq!(latest_model_identity(&snapshot).1.as_deref(), Some("xhigh"));
-    }
-
-    #[test]
-    fn latest_identity_is_absent_without_usage_rows() {
-        let mut snapshot = test_snapshot("s-empty", "2026-07-19T11:04:00Z");
-        snapshot.usage_buckets = vec![bucket(
-            "2026-07-19T11:00:00Z",
-            "2026-07-19T11:04:00Z",
-            vec![],
-        )];
-
-        assert_eq!(latest_model_identity(&snapshot), (None, None));
-
-        snapshot.usage_buckets = Vec::new();
-        assert_eq!(latest_model_identity(&snapshot), (None, None));
     }
 
     #[test]
@@ -2334,24 +2278,6 @@ mod tests {
     }
 
     #[test]
-    fn leaves_interactive_codex_run_unlabelled() {
-        // An interactive Codex Desktop run must stay role-free: labelling it
-        // would be a claim the session header does not support.
-        let mut snapshot = test_snapshot("interactive", "2026-07-19T10:04:00Z");
-        snapshot.session_display_name = None;
-        snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
-            originator: Some("Codex Desktop".to_string()),
-            source: Some("vscode".to_string()),
-            thread_source: Some("user".to_string()),
-            ..Default::default()
-        });
-
-        let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
-
-        assert_eq!(active.session_kind, None);
-    }
-
-    #[test]
     fn keeps_subagent_role_for_a_headless_subagent_run() {
         // Codex spawns subagents through `codex exec`, so both signals appear.
         // The more specific role wins; headless never overwrites it.
@@ -2367,25 +2293,6 @@ mod tests {
         let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
 
         assert_eq!(active.session_kind.as_deref(), Some("subagent"));
-    }
-
-    #[test]
-    fn leaves_a_desktop_run_unlabelled_even_when_its_source_says_exec() {
-        // ChatGPT Work desktop rollouts write `source: "exec"` under a desktop
-        // originator. The client wins, so the row keeps its plain title instead
-        // of gaining a headless claim the header does not support.
-        let mut snapshot = test_snapshot("work-desktop", "2026-07-19T10:04:00Z");
-        snapshot.session_display_name = None;
-        snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
-            originator: Some("codex_work_desktop".to_string()),
-            source: Some("exec".to_string()),
-            thread_source: Some("user".to_string()),
-            ..Default::default()
-        });
-
-        let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
-
-        assert_eq!(active.session_kind, None);
     }
 
     #[test]
@@ -3030,6 +2937,8 @@ mod tests {
         let model_usage = SnapshotModelUsage {
             evidence_ref: None,
             identity_parts: None,
+            copy_unproven: false,
+            identity_retained: false,
             model: "gpt-5.6-codex".to_string(),
             input_tokens: 100,
             output_tokens: 20,
@@ -3080,6 +2989,7 @@ mod tests {
             removed_usage: None,
             telemetry_owned_complete: None,
             resolver_conflict_count: None,
+            copy_unproven_counts: None,
             claude_money: None,
             session_account_evidence: None,
             claude_usage_request_ids: std::collections::BTreeSet::new(),

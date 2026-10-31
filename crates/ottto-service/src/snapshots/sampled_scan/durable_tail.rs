@@ -987,6 +987,8 @@ impl SharedCache {
             return Err(MissClass::BudgetRefused);
         }
         stores.counters.restored += 1;
+        #[cfg(test)]
+        super::transition_fixture::reach(super::transition_fixture::CrashPoint::Restore);
         drop(stores);
         self.take(key).ok_or(MissClass::TakeLost)
     }
@@ -1599,20 +1601,6 @@ impl SharedCache {
         let store = stores.slot(source).as_ref()?.store.counters();
         Some((counters, store))
     }
-
-    /// Dev-only inspection of an existing slot. Never initializes a store or
-    /// opens records; the caller inventories its own scratch after releasing
-    /// this lock. The path must never enter aggregate output.
-    #[cfg(feature = "replay-harness")]
-    pub(crate) fn durable_replay_store(
-        &self,
-        snapshot_source: SnapshotSource,
-    ) -> Option<(PathBuf, Option<&'static str>)> {
-        let source = durable_source(snapshot_source)?;
-        let mut stores = self.durable()?;
-        let slot = stores.slot(source).as_ref()?;
-        Some((slot.dir.clone(), slot.store.disabled()))
-    }
 }
 
 /// The class returned by the attempted restore, never reconstructed from totals.
@@ -1752,6 +1740,10 @@ pub(crate) enum Failure {
 #[cfg(test)]
 #[path = "durable_tail_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "transition_seed.rs"]
+pub(crate) mod transition_seed;
 
 #[cfg(test)]
 #[path = "durable_tail_store_write_tests.rs"]

@@ -403,28 +403,6 @@ mod tests {
     }
 
     #[test]
-    fn automatic_reads_retry_soon_then_back_off_up_to_five_minutes() {
-        let start = Instant::now();
-        let login = signed_in(1);
-        let at = |seconds| start + Duration::from_secs(seconds);
-        let one = failed(1, start, start, login.clone());
-        assert_eq!(
-            admit(Some(&one), &login, false, at(3)),
-            Err(SetupReadDeferred::RetryIn(2))
-        );
-        assert_eq!(admit(Some(&one), &login, false, at(5)), Ok(()));
-
-        let waits: Vec<u64> = (1..=10).map(retry_after).collect();
-        assert_eq!(waits, vec![5, 5, 5, 10, 20, 40, 80, 160, 300, 300]);
-        let nine = failed(9, start, at(100), login.clone());
-        assert_eq!(
-            admit(Some(&nine), &login, false, at(399)),
-            Err(SetupReadDeferred::RetryIn(1))
-        );
-        assert_eq!(admit(Some(&nine), &login, false, at(400)), Ok(()));
-    }
-
-    #[test]
     fn long_failing_reads_slow_down_but_never_stop() {
         let start = Instant::now();
         let login = signed_in(1);

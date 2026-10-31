@@ -119,3 +119,11 @@ selects only the dependent child to recover its parent fact. Missing windows
 remain pending, with at most one resolution pass per cycle. No census transcript
 IO or recursive source-fingerprint dependency is introduced. Unrelated sessions
 and unambiguous parent links do not acquire these window dependencies.
+
+`lineage_parentless_while_incomplete{files}` counts distinct source files in
+finalized offers whose cached Desktop metadata identifies a child, whose lineage
+census is incomplete, and whose emitted facts/origin have no parent reference.
+It runs after held-body and semantic no-op removal, using resident metadata only;
+no read, persisted field, selector or attribution decision is added. Scratch is
+bounded by emitted page items. Retries can count the same file again; this is
+offered work, not distinct lifetime sessions or stored-body ACKs.

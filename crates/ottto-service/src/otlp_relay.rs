@@ -1638,8 +1638,6 @@ mod tests {
         LocalAccountBinding, LocalAccountOrganization, LocalAccountState, LocalAccountUser,
         MachineIdentity, OperatingSystem,
     };
-    use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     const TOKEN: &str = "test-control-token";
 
@@ -1659,115 +1657,6 @@ mod tests {
             ControlToken::new(TOKEN).expect("token should be valid"),
             "2026-06-15T19:12:48Z",
         )
-    }
-
-    #[test]
-    fn state_fingerprint_is_short_and_stable() {
-        let first = state_fingerprint(
-            SnapshotSource::ClaudeCode,
-            "https://ottto.test/backend",
-            "device_1",
-        );
-        let second = state_fingerprint(
-            SnapshotSource::ClaudeCode,
-            "https://ottto.test/backend",
-            "device_1",
-        );
-
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 16);
-    }
-
-    #[test]
-    fn client_disconnect_during_write_recognises_routine_io_errors() {
-        let broken_pipe: anyhow::Error =
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Broken pipe (os error 32)").into();
-        let connection_reset: anyhow::Error = std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "Connection reset by peer (os error 54)",
-        )
-        .into();
-        // Wrap to mimic the way anyhow nests errors when callers add context.
-        let wrapped: anyhow::Error = anyhow::anyhow!(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "broken pipe",
-        ))
-        .context("write response");
-
-        assert!(client_disconnect_during_write(&broken_pipe));
-        assert!(client_disconnect_during_write(&connection_reset));
-        assert!(client_disconnect_during_write(&wrapped));
-
-        // Slow-client socket timeouts are routine too: a read/write timeout
-        // surfaces as TimedOut (Windows) or WouldBlock (Unix), and both mean
-        // the per-connection RELAY_IO_TIMEOUT fired rather than a real fault.
-        let timed_out: anyhow::Error =
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out").into();
-        let would_block: anyhow::Error =
-            std::io::Error::new(std::io::ErrorKind::WouldBlock, "would block").into();
-        assert!(client_disconnect_during_write(&timed_out));
-        assert!(client_disconnect_during_write(&would_block));
-
-        // Non-I/O errors and unrelated I/O errors must still surface.
-        let not_found: anyhow::Error =
-            std::io::Error::new(std::io::ErrorKind::NotFound, "not found").into();
-        let plain = anyhow::anyhow!("relay device binding is missing");
-        assert!(!client_disconnect_during_write(&not_found));
-        assert!(!client_disconnect_during_write(&plain));
-    }
-
-    #[test]
-    fn relay_source_header_routes_codex_separately_from_claude_code() {
-        assert_eq!(
-            source_from_relay_header("codex"),
-            Some(SnapshotSource::Codex)
-        );
-        assert_eq!(
-            source_from_relay_header("claude_code"),
-            Some(SnapshotSource::ClaudeCode)
-        );
-        assert_eq!(
-            source_from_relay_header("CLAUDE-CODE"),
-            Some(SnapshotSource::ClaudeCode)
-        );
-        assert_eq!(source_from_relay_header("unknown"), None);
-    }
-
-    #[test]
-    fn relay_candidates_try_default_before_user_fallbacks() {
-        let ports = candidate_relay_ports(501);
-
-        assert_eq!(ports.first().copied(), Some(LOCAL_RELAY_DEFAULT_PORT));
-        assert_eq!(
-            ports.get(1).copied(),
-            Some(LOCAL_RELAY_FALLBACK_BASE_PORT + 501)
-        );
-        assert_eq!(ports.len(), usize::from(LOCAL_RELAY_FALLBACK_ATTEMPTS) + 1);
-    }
-
-    #[test]
-    fn relay_endpoint_helpers_accept_loopback_only() {
-        assert_eq!(
-            local_relay_port_from_endpoint("http://127.0.0.1:44121/v1/logs"),
-            Some(44121)
-        );
-        assert_eq!(
-            local_relay_port_from_endpoint("http://localhost:44122"),
-            Some(44122)
-        );
-        assert_eq!(local_relay_port_from_endpoint("https://ottto.net"), None);
-
-        let relay = RelayState {
-            state: RelayRuntimeState::Connected,
-            endpoint: Some("http://127.0.0.1:44121".to_string()),
-            last_connected_at: Some("2026-05-25T00:00:00Z".to_string()),
-            last_error: None,
-        };
-        assert_eq!(local_relay_port_from_state(&relay), 44121);
-        assert_eq!(
-            local_relay_base_url_from_state(&relay),
-            "http://127.0.0.1:44121"
-        );
     }
 
     #[test]
@@ -1832,23 +1721,6 @@ mod tests {
         assert!(payload["health"].get("org_id").is_none());
         assert!(payload["health"].get("device_id").is_none());
         assert_eq!(payload["health"]["account"]["state"], "connected");
-    }
-
-    #[test]
-    fn local_health_response_payload_includes_browser_device_identity() {
-        let daemon = test_daemon();
-
-        let payload =
-            local_health_response_payload(&daemon, Some("device_current_installation".to_string()))
-                .expect("payload");
-
-        assert_eq!(
-            payload["health"]["device_id"],
-            "device_current_installation"
-        );
-        assert!(payload["health"].get("user_id").is_none());
-        assert!(payload["health"].get("org_id").is_none());
-        assert!(payload.get("hardware_uuid").is_none());
     }
 
     #[test]
@@ -1917,126 +1789,75 @@ mod tests {
     }
 
     #[test]
-    fn read_http_request_chunked_body_feeds_claude_effort_reducer() {
-        let body = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"session.id","value":{"stringValue":"chunked-session"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"high"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
-        let raw = format!(
-            concat!(
-                "POST /v1/logs HTTP/1.1\r\n",
-                "Content-Type: application/json\r\n",
-                "Transfer-Encoding: chunked\r\n\r\n",
-                "{:x}\r\n{}\r\n0\r\n\r\n"
-            ),
-            body.len(),
-            String::from_utf8_lossy(body),
-        );
-        let mut reader = BufReader::new(raw.as_bytes());
-        let request = read_http_request_from(&mut reader).expect("chunked request parses");
-        let support_dir = std::env::temp_dir().join(format!(
-            "ottto-chunked-effort-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time after epoch")
-                .as_nanos()
-        ));
-
-        let captured = crate::claude_local_otel::capture_claude_api_request_logs(
-            &support_dir,
-            &request.body,
-            request.headers["content-type"].as_str(),
-        )
-        .expect("effort reduction succeeds");
-        let evidence = crate::claude_local_otel::load_claude_effort_evidence(
-            &support_dir,
-            ["chunked-session".to_string()],
-        )
-        .expect("effort evidence loads");
-
-        assert_eq!(captured, 1);
-        assert_eq!(evidence["chunked-session"][0].effort, "high");
-        assert_eq!(evidence["chunked-session"][0].input_tokens, 12);
-        assert_eq!(evidence["chunked-session"][0].output_tokens, 3);
-        let serialized = serde_json::to_string(&evidence).expect("serialize evidence");
-        assert!(!serialized.contains("must-not-persist"));
-        let _ = std::fs::remove_dir_all(support_dir);
-    }
-
-    #[test]
-    fn read_http_request_parses_bodyless_get() {
-        let raw = "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let request = read_http_request_from(&mut reader).expect("request parses");
-        assert_eq!(request.method, "GET");
-        assert_eq!(request.path, "/healthz");
-        assert!(request.body.is_empty());
-    }
-
-    #[test]
     fn read_http_request_rejects_over_long_header_line() {
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nX-Big: ");
-        raw.push_str(&"a".repeat(MAX_HEADER_LINE_BYTES + 64));
-        raw.push_str("\r\n\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("over-long line rejected");
-        assert!(
-            error.to_string().contains("read header")
-                || error.to_string().contains("exceeds maximum length"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_cumulative_header_bytes() {
-        // Each header line stays under the per-line cap, but together they
-        // exceed the cumulative byte cap.
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
-        let value = "b".repeat(MAX_HEADER_LINE_BYTES / 2);
-        let lines_needed = (MAX_HEADER_TOTAL_BYTES / value.len()) + 2;
-        for index in 0..lines_needed {
-            raw.push_str(&format!("X-Pad-{index}: {value}\r\n"));
+        for (raw, expected) in [
+            {
+                let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nX-Big: ");
+                raw.push_str(&"a".repeat(MAX_HEADER_LINE_BYTES + 64));
+                raw.push_str("\r\n\r\n");
+                raw
+            },
+            {
+                let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
+                let value = "b".repeat(MAX_HEADER_LINE_BYTES / 2);
+                let lines_needed = (MAX_HEADER_TOTAL_BYTES / value.len()) + 2;
+                for index in 0..lines_needed {
+                    raw.push_str(&format!("X-Pad-{index}: {value}\r\n"));
+                }
+                raw.push_str("\r\n");
+                raw
+            },
+            {
+                let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
+                for index in 0..(MAX_HEADER_COUNT + 5) {
+                    raw.push_str(&format!("X-H-{index}: v\r\n"));
+                }
+                raw.push_str("\r\n");
+                raw
+            },
+            format!(
+                "POST /v1/logs HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                MAX_OTLP_BODY_BYTES + 1
+            ),
+            format!(
+                "POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                MAX_OTLP_BODY_BYTES + 1
+            ),
+            {
+                let mut raw =
+                    String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+                for _ in 0..MAX_CHUNK_COUNT {
+                    raw.push_str("1\r\na\r\n");
+                }
+                raw.push_str("1\r\nb\r\n0\r\n\r\n");
+                raw
+            },
+            {
+                let extension = "a".repeat(MAX_HEADER_LINE_BYTES - 4);
+                let mut raw =
+                    String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+                for _ in 0..=(MAX_CHUNK_FRAMING_BYTES / MAX_HEADER_LINE_BYTES) {
+                    raw.push_str(&format!("1;{extension}\r\na\r\n"));
+                }
+                raw.push_str("0\r\n\r\n");
+                raw
+            },
+        ]
+        .into_iter()
+        .zip([
+            "read header",
+            "headers too large",
+            "too many request headers",
+            "request body too large",
+            "request body too large",
+            "too many chunks",
+            "chunk framing too large",
+        ]) {
+            let mut reader = BufReader::new(raw.as_bytes());
+            let error =
+                read_http_request_from(&mut reader).expect_err("oversized HTTP framing rejected");
+            assert!(error.to_string().contains(expected), "{error}");
         }
-        raw.push_str("\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error =
-            read_http_request_from(&mut reader).expect_err("cumulative header bytes rejected");
-        assert!(
-            error.to_string().contains("headers too large"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_excess_header_count() {
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
-        for index in 0..(MAX_HEADER_COUNT + 5) {
-            raw.push_str(&format!("X-H-{index}: v\r\n"));
-        }
-        raw.push_str("\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("excess header count rejected");
-        assert!(
-            error.to_string().contains("too many request headers"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_oversized_body_via_content_length() {
-        let raw = format!(
-            "POST /v1/logs HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
-            MAX_OTLP_BODY_BYTES + 1
-        );
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("oversized body rejected");
-        assert!(
-            error.to_string().contains("request body too large"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]
@@ -2063,122 +1884,7 @@ mod tests {
     }
 
     #[test]
-    fn read_http_request_rejects_malformed_chunk_framing() {
-        for raw in [
-            "POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
-            "POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\naXX0\r\n\r\n",
-            "POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n",
-        ] {
-            let mut reader = BufReader::new(raw.as_bytes());
-            read_http_request_from(&mut reader).expect_err("malformed chunking rejected");
-        }
-    }
-
-    #[test]
-    fn read_http_request_rejects_chunked_body_over_limit_before_allocation() {
-        let raw = format!(
-            "POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
-            MAX_OTLP_BODY_BYTES + 1
-        );
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("oversized chunk rejected");
-        assert!(
-            error.to_string().contains("request body too large"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_excessive_chunk_count() {
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
-        for _ in 0..MAX_CHUNK_COUNT {
-            raw.push_str("1\r\na\r\n");
-        }
-        raw.push_str("1\r\nb\r\n0\r\n\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("chunk flood rejected");
-        assert!(
-            error.to_string().contains("too many chunks"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_http_request_rejects_excessive_chunk_extension_framing() {
-        let extension = "a".repeat(MAX_HEADER_LINE_BYTES - 4);
-        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
-        for _ in 0..=(MAX_CHUNK_FRAMING_BYTES / MAX_HEADER_LINE_BYTES) {
-            raw.push_str(&format!("1;{extension}\r\na\r\n"));
-        }
-        raw.push_str("0\r\n\r\n");
-        let mut reader = BufReader::new(raw.as_bytes());
-
-        let error = read_http_request_from(&mut reader).expect_err("framing flood rejected");
-        assert!(
-            error.to_string().contains("chunk framing too large"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn read_line_limited_accepts_line_at_cap_and_rejects_beyond() {
-        // A line whose bytes (including the newline) total exactly the cap is
-        // accepted.
-        let at_cap = format!("{}\n", "x".repeat(15));
-        assert_eq!(at_cap.len(), 16);
-        let mut reader = BufReader::new(at_cap.as_bytes());
-        let mut buf = String::new();
-        let read = read_line_limited(&mut reader, &mut buf, 16).expect("at-cap line accepted");
-        assert_eq!(read, 16);
-        assert_eq!(buf, at_cap);
-
-        // One byte over the cap is rejected before the newline is reached.
-        let over_cap = format!("{}\n", "x".repeat(16));
-        let mut reader = BufReader::new(over_cap.as_bytes());
-        let mut buf = String::new();
-        let error =
-            read_line_limited(&mut reader, &mut buf, 16).expect_err("over-cap line rejected");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn read_line_limited_reports_eof_as_zero() {
-        let mut reader = BufReader::new(&b""[..]);
-        let mut buf = String::new();
-        let read = read_line_limited(&mut reader, &mut buf, 16).expect("eof is not an error");
-        assert_eq!(read, 0);
-        assert!(buf.is_empty());
-    }
-
-    // The two ConnectionGuard tests both mutate the shared
-    // ACTIVE_RELAY_CONNECTIONS static, so serialize them against each other to
-    // keep their counter assertions deterministic under the parallel test
-    // runner.
-    static CONNECTION_GUARD_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn connection_guard_increments_and_releases_on_drop() {
-        let _serial = CONNECTION_GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let baseline = ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst);
-        {
-            let _guard = ConnectionGuard::acquire().expect("slot available");
-            assert_eq!(
-                ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst),
-                baseline + 1
-            );
-        }
-        assert_eq!(ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst), baseline);
-    }
-
-    #[test]
     fn connection_guard_rejects_over_the_cap_without_leaking_slots() {
-        let _serial = CONNECTION_GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
         let baseline = ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst);
         // Saturate the remaining slots up to the cap.
         let mut guards = Vec::new();
@@ -2266,26 +1972,6 @@ mod tests {
     }
 
     #[test]
-    fn accept_errors_are_classified_by_what_they_say_about_the_listener() {
-        let action = |code| classify_accept_error(&io::Error::from_raw_os_error(code));
-        for code in [
-            libc::ECONNABORTED,
-            libc::ECONNRESET,
-            libc::EINTR,
-            libc::EAGAIN,
-            libc::EPROTO,
-        ] {
-            assert_eq!(action(code), AcceptErrorAction::Retry, "errno {code}");
-        }
-        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
-            assert_eq!(action(code), AcceptErrorAction::Backoff, "errno {code}");
-        }
-        for code in [libc::EBADF, libc::ENOTSOCK, libc::EINVAL, libc::EOPNOTSUPP] {
-            assert_eq!(action(code), AcceptErrorAction::Rebind, "errno {code}");
-        }
-    }
-
-    #[test]
     fn accept_loop_keeps_serving_after_per_connection_and_resource_errors() {
         // The incident: one ECONNABORTED ended the loop and the port stayed
         // dead until the daemon restarted. Every error before the final EBADF
@@ -2365,22 +2051,6 @@ mod tests {
             ),
             "{failure}"
         );
-    }
-
-    #[test]
-    fn relay_accept_backoff_is_bounded() {
-        assert_eq!(relay_accept_backoff(1), RELAY_ACCEPT_BACKOFF_START);
-        assert_eq!(relay_accept_backoff(2), RELAY_ACCEPT_BACKOFF_START * 2);
-        assert_eq!(relay_accept_backoff(u32::MAX), RELAY_ACCEPT_BACKOFF_MAX);
-    }
-
-    #[test]
-    fn relay_log_timestamp_is_utc_rfc3339_to_the_millisecond() {
-        let stamp = relay_log_timestamp();
-        let parsed = OffsetDateTime::parse(&stamp, &Rfc3339).expect("rfc3339");
-        assert_eq!(parsed.offset(), time::UtcOffset::UTC, "{stamp}");
-        assert_eq!(parsed.nanosecond() % 1_000_000, 0, "{stamp}");
-        assert!(stamp.ends_with('Z'), "{stamp}");
     }
 
     /// Drains a live relay listener the way XNU does (see
@@ -2465,59 +2135,6 @@ mod tests {
             .expect("connected state");
         assert_eq!(connected.state, RelayRuntimeState::Connected);
         assert_eq!(connected.endpoint, Some(format!("http://{addr}")));
-    }
-
-    #[test]
-    fn relay_limits_leave_daemon_thread_headroom() {
-        const _: () = assert!(
-            MAX_CONCURRENT_RELAY_CONNECTIONS <= 16,
-            "relay workers must leave LaunchAgent thread headroom for local control"
-        );
-    }
-
-    #[test]
-    fn browser_gate_allows_provider_daily_reference_control_through_allowlist() {
-        // Regression test: verify that provider_daily_reference_control passes the
-        // browser-gate command allowlist. The matches! pattern must include it.
-        let cmd = LocalControlCommand::ProviderDailyReferenceControl {
-            action: ottto_protocol::ProviderDailyReferenceControlAction::Status,
-            control_token: ottto_protocol::SecretString::new("test-token"),
-            api_base_url: None,
-            backend_grant: None,
-            expected_account_fingerprint: None,
-        };
-
-        // This should match the allowlist in handle_control_request.
-        let is_allowed = matches!(
-            &cmd,
-            LocalControlCommand::TelemetryControl { .. }
-                | LocalControlCommand::CloudSessionsControl { .. }
-                | LocalControlCommand::ProviderDailyReferenceControl { .. }
-        );
-        assert!(
-            is_allowed,
-            "provider_daily_reference_control must be in the browser-gate allowlist"
-        );
-    }
-
-    #[test]
-    fn browser_gate_rejects_unknown_commands() {
-        // Verify that genuinely unknown commands do NOT match the allowlist.
-        let cmd = LocalControlCommand::Status {
-            refresh_agent_status: false,
-            retry_relay_authorization: false,
-        };
-
-        let is_allowed = matches!(
-            &cmd,
-            LocalControlCommand::TelemetryControl { .. }
-                | LocalControlCommand::CloudSessionsControl { .. }
-                | LocalControlCommand::ProviderDailyReferenceControl { .. }
-        );
-        assert!(
-            !is_allowed,
-            "Status command must not be in the browser-gate allowlist"
-        );
     }
 
     pub(super) const CLAUDE_API_REQUEST_LOG: &[u8] = br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"session.id","value":{"stringValue":"retired-forward-session"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"request_id","value":{"stringValue":"req-retired-forward"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"high"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;

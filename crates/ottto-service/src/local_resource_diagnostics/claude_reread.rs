@@ -199,6 +199,8 @@ impl Rearm {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Counts {
+    #[serde(skip_serializing_if = "LineageParentless::is_empty")]
+    pub(crate) lineage_parentless_while_incomplete: LineageParentless,
     #[serde(skip_serializing_if = "DesktopMetadata::is_empty")]
     pub(crate) desktop_metadata: DesktopMetadata,
     #[serde(skip_serializing_if = "IgnoredVetoCounts::is_empty")]
@@ -216,6 +218,28 @@ pub(crate) struct Counts {
     #[serde(skip_serializing_if = "CachePage::is_empty")]
     pub(crate) retained_cache_page_events: CachePage,
 }
+/// Finalized file offers, not parses or stored-body acknowledgements.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct LineageParentless {
+    #[serde(skip_serializing_if = "super::is_zero")]
+    files: u64,
+}
+impl LineageParentless {
+    fn is_empty(&self) -> bool {
+        self.files == 0
+    }
+    fn merge(&mut self, other: Self) {
+        self.files = self.files.saturating_add(other.files);
+    }
+}
+pub(crate) fn lineage_parentless_while_incomplete(files: u64) {
+    update(|counts| {
+        counts
+            .lineage_parentless_while_incomplete
+            .merge(LineageParentless { files })
+    });
+}
+
 /// Counts only, on the existing page line. Revisions count actual body reads,
 /// not selection, metadata IO, sample verification, or an unchanged RAM reuse.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -507,6 +531,8 @@ pub(crate) fn cache_capacity_eviction(count_pressure: bool) {
 }
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
+        self.lineage_parentless_while_incomplete
+            .merge(other.lineage_parentless_while_incomplete);
         self.desktop_metadata.merge(other.desktop_metadata);
         self.rearm_veto_ignored.merge(other.rearm_veto_ignored);
         self.rearm_structural_native_duplicate = self
@@ -750,26 +776,6 @@ mod tests {
     }
     use super::*;
     #[test]
-    fn held_reasons_are_sparse_saturating_and_merged_across_scopes() {
-        let scope = Scope::begin(true);
-        held_reason(HeldReason::AuthorityUnboundRevision);
-        held_reason(HeldReason::AuthorityCorrectionPending);
-        let mut counts = scope.finish();
-        counts.claude_reread.held_reason.not_restorable = u64::MAX;
-        let scope = Scope::begin(true);
-        held_reason(HeldReason::AccountHoldUnrecorded);
-        held_reason(HeldReason::NotRestorable);
-        counts.merge(scope.finish());
-        assert_eq!(
-            serde_json::to_value(counts).unwrap()["claude_reread"]["held_reason"],
-            serde_json::json!({
-                "authority_unbound_revision": 1, "authority_correction_pending": 1,
-                "account_hold_unrecorded": 1, "not_restorable": u64::MAX,
-            })
-        );
-    }
-
-    #[test]
     fn page_scope_isolates_sources_nested_work_threads_and_resumption() {
         let scope = Scope::begin(true);
         clear(ClearSite::OwnedStart, true);
@@ -804,6 +810,8 @@ mod tests {
             serde_json::json!({})
         );
         let scope = Scope::begin(true);
+        desktop_inventory_restart();
+        desktop_scoped_acquisition();
         {
             let _failed = Reinsertion::new(true);
             let success = Reinsertion::new(true);

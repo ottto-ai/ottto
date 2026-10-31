@@ -505,6 +505,7 @@ fn start_codex_proof_job(
                     fingerprint_changed_nanos: 0,
                     fingerprint_birth_nanos: 0,
                     fingerprint_opened_identity: String::new(),
+                    withheld_content_stamp: None,
                 })
                 .ok()
             })

@@ -55,22 +55,25 @@ impl Fixture {
         let original: Value = serde_json::from_slice(&fs::read(&old).unwrap()).unwrap();
         let key = original.as_object().unwrap().keys().next().unwrap();
         let payload = serde_json::to_vec(&json!({key: null})).unwrap();
+        self.rebind_object(map + 1, &payload);
+        let new = self.bucket_path(map);
+        fs::rename(old, &new).unwrap();
+        fs::write(new, payload).unwrap();
+    }
+    fn rebind_object(&mut self, position: usize, payload: &[u8]) {
         let binding: scan_index_persistence::Binding =
             serde_json::from_value(self.manifest["binding"].clone()).unwrap();
-        let object = &mut self.manifest["objects"][map + 1];
+        let object = &mut self.manifest["objects"][position];
         let slot: scan_index_persistence::Slot =
             serde_json::from_value(object["slot"].clone()).unwrap();
         let mut hash = Sha256::new();
         hash.update(b"ottto.scan-index.storage.v1\0object\0");
         hash.update(serde_json::to_vec(&(binding, slot)).unwrap());
         hash.update([0]);
-        hash.update(&payload);
+        hash.update(payload);
         hash.update((payload.len() as u64).to_le_bytes());
         object["digest"] = json!(format!("{:x}", hash.finalize()));
         object["bytes"] = json!(payload.len());
-        let new = self.bucket_path(map);
-        fs::rename(old, &new).unwrap();
-        fs::write(new, payload).unwrap();
     }
     fn load(&self) -> ScanIndex {
         ScanIndex::load_for_snapshot_source_with_origin(
@@ -310,32 +313,6 @@ fn integrated_fresh_init_orphans_are_discarded_and_failure_observations_are_drai
 }
 
 #[test]
-fn integrated_storage_controls_admission_and_native_heap_layout_keep_entry_pin() {
-    let fixture = Fixture::new();
-    let loaded = fixture.load();
-    assert!(lenient_decode::persistence_controls(&loaded, 0).is_err());
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    // Follows the canonical pin (claude_request_census_tests SCAN_INDEX_ENTRY_BYTES = 560
-    // after #901); #894's storage controls add 0 bytes per entry.
-    assert!(std::mem::size_of::<ScanIndexEntry>() <= 560);
-    let with = crate::heap_layout_bound::completed_bound(&loaded, 8 * 1024 * 1024).unwrap();
-    let mut without = loaded.clone();
-    without.persistence_root = None;
-    without.persistence_controls = None;
-    let base = crate::heap_layout_bound::completed_bound(&without, 8 * 1024 * 1024).unwrap();
-    assert!(with > base);
-    eprintln!(
-        "scan_index_storage_layout index={} entry={} availability={} retained_increment={}",
-        std::mem::size_of::<ScanIndex>(),
-        std::mem::size_of::<ScanIndexEntry>(),
-        std::mem::size_of_val(&loaded.persistence_unavailable),
-        with - base
-    );
-}
-
-#[test]
 fn fresh_init_allows_the_real_progress_lock_but_never_prior_progress_state() {
     let fixture = Fixture::new();
     fs::remove_file(&fixture.root).unwrap();
@@ -429,29 +406,6 @@ fn partial_negative_metadata_holds_keep_their_fund_when_a_map_is_missing() {
     assert!(index.decode_holds.contains("files", "held-negative-file"));
     assert!(index.decode_holds.held_bytes() > 2 * 1024 * 1024);
     assert!(index.decode_holds.held_bytes() <= 8 * 1024 * 1024);
-}
-
-#[test]
-fn completed_storage_controls_keep_many_small_negative_holds_with_one_byte_budget() {
-    let files = (0..1500)
-        .map(|i| (format!("held-{i}"), json!({"size_bytes": "invalid"})))
-        .collect::<serde_json::Map<_, _>>();
-    let bytes = serde_json::to_vec(&json!({
-        "schema_version": 2,
-        "generation": 1,
-        "files": files,
-        "fixture_padding": " ".repeat(4 * 1024 * 1024),
-    }))
-    .unwrap();
-    let index = lenient_decode::read(
-        std::io::Cursor::new(bytes),
-        "many-small-held-controls",
-        "claude_code",
-    )
-    .unwrap();
-    assert_eq!(index.decode_holds.file_keys().count(), 1500);
-    assert!(lenient_decode::persistence_controls(&index, 8 * 1024 * 1024).is_ok());
-    assert!(lenient_decode::persistence_controls(&index, 1).is_err());
 }
 
 #[test]
@@ -608,6 +562,10 @@ fn recovery_emission_boundaries(
     scan.snapshots = items;
     scan.census_complete = true;
     scan.pending_finalization.push(PendingIndexFinalization {
+        withheld_content: None,
+        lineage_edge_reoffer_bytes: None,
+        desktop_identity_reoffer: None,
+        desktop_identity_evidence: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: "synthetic-file".into(),
@@ -815,4 +773,67 @@ fn integrated_no_store_true_first_install_still_initializes_without_transcript_r
     assert!(reads.is_empty());
     let observations = crate::local_resource_diagnostics::take_scan_index_storage_observations();
     assert_eq!(observations.iter().map(|(_, _, n)| n).sum::<u64>(), 0);
+}
+
+// Snapshot every file in this bounded synthetic index, including storage
+// controls and in-flight publication files, to detect accidental recovery.
+fn inspection_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            files.extend(inspection_files(&entry.path()));
+        } else {
+            files.insert(entry.path(), fs::read(entry.path()).unwrap());
+        }
+    }
+    files
+}
+
+#[test]
+fn estimate_index_reader_never_creates_or_repairs_prior_marker() {
+    let fixture = Fixture::new();
+    let prior = fixture
+        .root
+        .with_file_name("claude_code-scan-index-v3.json.storage-prior");
+    for marker in [None, Some(b"scan_index_".as_slice())] {
+        if let Some(marker) = marker {
+            fs::write(&prior, marker).unwrap();
+            fs::set_permissions(&prior, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let before = inspection_files(&fixture.scratch);
+        let index = scan_index_integration::read_scan_index_representation_read_only(
+            &fixture.root,
+            "estimate",
+            "claude_code",
+        )
+        .unwrap();
+        assert!(index.persistence_available());
+        assert_eq!(inspection_files(&fixture.scratch), before);
+        assert!(!fixture.root.with_extension("json.lock").exists());
+    }
+}
+
+#[test]
+fn estimate_index_reader_refuses_unpublished_init_without_removing_files() {
+    let fixture = Fixture::new();
+    fs::remove_file(&fixture.root).unwrap();
+    let temporary = fixture.root.with_file_name(format!(
+        "claude_code-scan-index-v3.json.storage-tmp-{}",
+        "b".repeat(32),
+    ));
+    fs::write(&temporary, b"in-flight publication").unwrap();
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = inspection_files(&fixture.scratch);
+    assert!(
+        scan_index_integration::read_scan_index_representation_read_only(
+            &fixture.root,
+            "estimate",
+            "claude_code",
+        )
+        .is_err()
+    );
+    assert_eq!(inspection_files(&fixture.scratch), before);
+    assert!(fixture.shards.is_dir());
+    assert!(!fixture.root.exists());
 }

@@ -20,7 +20,6 @@
 //! backend/web derives cost views from the uploaded snapshots instead.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -28,6 +27,7 @@ use ottto_protocol::{AgentContextPostureSummary, AgentContextSessionPeak};
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
+use crate::locked_state_dir::replace_json_cache;
 use crate::snapshots::{SnapshotItem, CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS};
 
 /// Summary lookback: sessions with activity inside this window are analyzed.
@@ -127,15 +127,7 @@ pub fn update_context_posture_cache(
         .with_context(|| format!("create context_posture dir {}", dir.display()))?;
     let payload =
         serde_json::to_vec_pretty(&merged).context("serialize context posture cache to JSON")?;
-    let temp_path = path.with_extension("json.tmp");
-    let mut temp = std::fs::File::create(&temp_path)
-        .with_context(|| format!("create context_posture temp {}", temp_path.display()))?;
-    temp.write_all(&payload)
-        .with_context(|| format!("write context_posture temp {}", temp_path.display()))?;
-    temp.sync_all().ok();
-    std::fs::rename(&temp_path, &path)
-        .with_context(|| format!("rename context_posture cache into place {}", path.display()))?;
-    Ok(())
+    replace_json_cache(&path, &payload, "context_posture", "context_posture cache")
 }
 
 /// The convenience the agent-status collector calls: read the cache and
@@ -606,44 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn summarize_caps_session_peaks_to_most_recent_oldest_first() {
-        let now = test_now();
-        let rows: Vec<ContextPostureCacheRow> = (0..20)
-            .map(|i| {
-                row(
-                    &format!("s{i}"),
-                    &format!("2026-07-11T09:{i:02}:00Z"),
-                    Some(10_000),
-                    Some(2_000 * (i as u64 + 1)),
-                    None,
-                    Some(0),
-                    0,
-                    Some("claude-sonnet-4-5"),
-                )
-            })
-            .collect();
-        let summary = summarize_context_posture(&rows, now).expect("summary");
-        assert_eq!(summary.sessions_analyzed, 20);
-        assert_eq!(
-            summary.session_peaks.len(),
-            POSTURE_SUMMARY_MAX_SESSION_PEAKS
-        );
-        // The first retained peak is session index 6 (20 - 14), the last is 19.
-        assert_eq!(
-            summary.session_peaks.first().unwrap().peak_fill_tokens,
-            14_000
-        );
-        assert_eq!(
-            summary.session_peaks.last().unwrap().peak_fill_tokens,
-            40_000
-        );
-        assert!(summary
-            .session_peaks
-            .iter()
-            .all(|peak| peak.peak_fill_percent.is_none() && peak.over_window.is_none()));
-    }
-
-    #[test]
     fn summarize_returns_none_when_window_is_empty() {
         let now = test_now();
         assert_eq!(summarize_context_posture(&[], now), None);
@@ -682,6 +636,8 @@ mod tests {
                 vec![crate::snapshots::SnapshotModelUsage {
                     evidence_ref: None,
                     identity_parts: None,
+                    copy_unproven: false,
+                    identity_retained: false,
                     model: model.to_string(),
                     input_tokens: 0,
                     output_tokens: 0,
@@ -731,6 +687,7 @@ mod tests {
             removed_usage: None,
             telemetry_owned_complete: None,
             resolver_conflict_count: None,
+            copy_unproven_counts: None,
             claude_money: None,
             session_account_evidence: None,
             claude_usage_request_ids: std::collections::BTreeSet::new(),

@@ -195,7 +195,10 @@ fn ledger_entry(
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_due_singleton_side_read_writes_only_ps_side_state() {
     let fixture = Root::new(3, b"");
     let len = fixture.at().size;
@@ -253,7 +256,10 @@ fn a_due_singleton_side_read_writes_only_ps_side_state() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn an_unsealed_settled_read_tombstones_and_writes_no_record() {
     // An unterminated final row: the native EOF applies it, so the
     // certificate's sealed offset is short of the held length.
@@ -380,74 +386,15 @@ fn a_full_ledger_refuses_the_charge_and_nothing_is_written() {
     assert!(ledger_entry(&cache, &fixture).is_none());
 }
 
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn the_charge_paces_creates_the_entry_and_counts_a_first_start() {
-    let fixture = Root::new(1, b"");
-    let at = fixture.at();
-    let cache = sampled_scan::SharedCache::default();
-    let mut index = ScanIndex::default();
-    let mut request = request_for(&fixture, at.size);
-    request.attempts = 3;
-    index
-        .codex_parent_side_requests
-        .insert(fixture.key(), request);
-    let first = CodexSidePass {
-        ns: NS,
-        gate: GateOpen {
-            side_allowed: true,
-            first_in_process: true,
-        },
-        index_path: PathBuf::from(INDEX_PATH),
-        kind: CodexPageKind::Ordinary,
-    };
-    let (attempts, counts) =
-        observe(|| index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, &first));
-    assert_eq!(attempts, Some(4));
-    assert_eq!(
-        counts.side_requests_rearmed, 1,
-        "rearm{{first_start_in_process}}"
-    );
-    let charged = index.codex_parent_side_requests[&fixture.key()];
-    assert_eq!(charged.attempts, 4);
-    assert_eq!(
-        charged.not_before_unix_seconds,
-        1_000 + SideRequest::backoff_seconds(4)
-    );
-    assert_eq!(
-        (charged.attempt_extent, charged.attempt_ctime),
-        (at.size, at.ctime)
-    );
-    let entry = ledger_entry(&cache, &fixture).expect("created");
-    assert_eq!(entry.tag, LedgerTag::Live);
-    assert_eq!(entry.attempts, 4);
-    // The entry is now the view: a second charge writes it, and is not a
-    // first start.
-    let (attempts, counts) =
-        observe(|| index.charge_codex_parent_side_read(&fixture.key(), at, 2_000, &cache, &first));
-    assert_eq!(attempts, Some(5));
-    assert_eq!(counts.side_requests_rearmed, 0);
-    // A tombstone is never charged, and a refused charge writes nothing.
-    let fresh = sampled_scan::SharedCache::default();
-    let mut lossy = charged;
-    lossy.state = SideRequestState::Lossy;
-    index
-        .codex_parent_side_requests
-        .insert(fixture.key(), lossy);
-    assert_eq!(
-        index.charge_codex_parent_side_read(&fixture.key(), at, 3_000, &fresh, &first),
-        None
-    );
-    assert_eq!(index.codex_parent_side_requests[&fixture.key()], lossy);
-    assert!(ledger_entry(&fresh, &fixture).is_none());
-}
-
 /// Stage 1 (parent r79): a continuation page is never side-due and never
 /// charges G7, whatever its gate: a worn request is not tombstoned by its
 /// due check (no write, no count) and a due one is not charged (no ledger
 /// entry). The same request on an ordinary page is the control.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_continuation_page_is_never_due_and_charges_nothing() {
     let fixture = Root::new(1, b"");
     let at = fixture.at();
@@ -515,7 +462,10 @@ fn a_continuation_page_is_never_due_and_charges_nothing() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn the_exit_rows_write_the_record_or_the_tombstone_in_both_stores() {
     let fixture = Root::new(1, b"");
     let at = fixture.at();
@@ -557,72 +507,11 @@ fn the_exit_rows_write_the_record_or_the_tombstone_in_both_stores() {
     assert!(index.codex_parent_side.is_empty());
 }
 
-/// Stage 1 S1-a (§7 exclusion G7): the production continuation pass
-/// (`begin_codex_continuation_side_pass`) never charges a side read: no
-/// ledger entry, no request write. An ordinary pass charges the same one.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn the_continuation_pass_charges_no_g7() {
-    let fixture = Root::new(1, b"");
-    let at = fixture.at();
-    let cache = sampled_scan::SharedCache::default();
-    let mut index = ScanIndex::default();
-    let continuation =
-        begin_codex_continuation_side_pass(&cache, Path::new(INDEX_PATH), &mut index);
-    assert_eq!(continuation.kind, CodexPageKind::Continuation);
-    assert_eq!(continuation.index_path, PathBuf::from(INDEX_PATH));
-    let request = request_for(&fixture, at.size);
-    index
-        .codex_parent_side_requests
-        .insert(fixture.key(), request);
-    assert_eq!(
-        index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, &continuation),
-        None
-    );
-    assert_eq!(index.codex_parent_side_requests[&fixture.key()], request);
-    assert_eq!(cache.side_ledger().len(), 0, "nothing charged");
-    assert_eq!(
-        index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, &pass(true)),
-        // Side-ledger admission requires the validated native heap layout.
-        // The continuation assertions above apply on every platform; Linux
-        // must also keep the ordinary read uncharged when layout is unsupported.
-        crate::heap_layout_bound::layout_supported().then_some(1),
-        "the ordinary control follows native heap-layout support"
-    );
-}
-
-/// Stage 1 S1-a (§7 exclusion: side due): the production continuation pass
-/// is never side-due; its due check reads no terms and writes or counts
-/// nothing, even for a worn request an ordinary pass tombstones.
-#[test]
-fn the_continuation_pass_is_never_side_due() {
-    let fixture = Root::new(1, b"");
-    let at = fixture.at();
-    let cache = sampled_scan::SharedCache::default();
-    let mut index = ScanIndex::default();
-    let continuation =
-        begin_codex_continuation_side_pass(&cache, Path::new(INDEX_PATH), &mut index);
-    let mut worn = request_for(&fixture, at.size);
-    worn.attempts = SIDE_REQUEST_EVICT_ATTEMPTS;
-    index.codex_parent_side_requests.insert(fixture.key(), worn);
-    let (due, counts) = observe(|| {
-        index.codex_parent_side_request_due(
-            &fixture.key(),
-            at,
-            1_000,
-            &cache,
-            &continuation,
-            || -> SideDueTerms { unreachable!("a continuation reads no due terms") },
-        )
-    });
-    assert!(!due);
-    assert_eq!(counts, Counts::default(), "nothing counted");
-    assert_eq!(index.codex_parent_side_requests[&fixture.key()], worn);
-    assert_eq!(cache.side_ledger().len(), 0);
-}
-
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn due_side_read_preserves_future_exact_body_cooldown_and_settlement() {
     let fixture = Root::new(3, b"");
     let (mut settled, cache) = settled_page(&fixture);

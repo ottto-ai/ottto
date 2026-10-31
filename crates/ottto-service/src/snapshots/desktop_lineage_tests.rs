@@ -359,7 +359,7 @@ fn desktop_lineage_legacy_upgrade_and_old_save_dropping_selector_fields_are_boun
         &mut ScanCensus::default(),
         rfc3339_unix_seconds(COLLECTED),
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        crate::snapshots::DiscoveryRetention::unverified(&index.files),
     )
     .unwrap();
     let entry = index

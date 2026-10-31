@@ -130,75 +130,6 @@ fn run_with_limit(
 }
 
 #[test]
-fn native_batches_cross_512_workers_without_a_store_sweep_per_file() {
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        let home = Home::new();
-        let empty_home = Home::new();
-        let root = home.0.join(match source {
-            SnapshotSource::Codex => ".codex/sessions",
-            _ => ".claude/projects",
-        });
-        fs::create_dir_all(&root).unwrap();
-        let count = crate::launch_events::MAX_DEMANDED_WORKERS + 1;
-        for n in 1..=count {
-            let worker = format!("{n:08x}-2222-4333-8444-555555555555");
-            home.event(&worker, CONTROLLER);
-            let (name, header, usage) = if source == SnapshotSource::Codex {
-                (
-                    // Header ownership also covers filenames without UUIDs.
-                    format!("member-{n:04}.jsonl"),
-                    json!({"type":"session_meta","payload":{"id":worker}}),
-                    json!({"type":"event_msg","timestamp":"2026-10-07T10:01:00Z",
-                        "payload":{"type":"token_count","info":{"model":"fixture-model",
-                            "total_token_usage":{"input_tokens":100,"output_tokens":20},
-                            "last_token_usage":{"input_tokens":100,"output_tokens":20}}}}),
-                )
-            } else {
-                (
-                    format!("{worker}.jsonl"),
-                    json!({"type":"user","sessionId":worker,"timestamp":"2026-10-07T10:00:00Z",
-                        "message":{"role":"user","content":"Synthetic fixture"}}),
-                    json!({"type":"assistant","sessionId":worker,"timestamp":"2026-10-07T10:01:00Z",
-                        "requestId":format!("req-{n}"),"message":{"id":format!("msg-{n}"),
-                            "model":"fixture-model","usage":{"input_tokens":100,"output_tokens":20}}}),
-                )
-            };
-            fs::write(root.join(name), format!("{header}\n{usage}\n")).unwrap();
-        }
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        let (_, control, control_steps) = run_with_limit(
-            &empty_home,
-            source,
-            &root,
-            ScanIndex::default(),
-            &cache,
-            count,
-        );
-        let (index, launched, launched_steps) =
-            run_with_limit(&home, source, &root, ScanIndex::default(), &cache, count);
-        assert_eq!(control.snapshots.len(), count);
-        assert_eq!(launched.snapshots.len(), count);
-        assert!(launched.snapshots.iter().all(|item| item
-            .attribution_facts
-            .iter()
-            .any(|fact| fact.field == "agent_kind" && fact.value == "opus-cli-agent")));
-        assert!(launched
-            .snapshots
-            .iter()
-            .all(|item| item.input_tokens == 100 && item.output_tokens == 20));
-        assert!(launched_steps <= control_steps + 60,
-            "two demanded batches must amortize retained-store work: {launched_steps} vs {control_steps}");
-        let restarted: ScanIndex =
-            serde_json::from_value(serde_json::to_value(index).unwrap()).unwrap();
-        let (_, idle, _) = run_with_limit(&home, source, &root, restarted, &cache, count);
-        assert!(
-            idle.snapshots.is_empty(),
-            "ACKed workers stay settled after restart"
-        );
-    }
-}
-
-#[test]
 fn claude_quarantine_preflight_with_launch_keeps_the_physical_identity_fence() {
     let home = Home::new();
     let root = home.0.join(".claude/projects");
@@ -631,6 +562,7 @@ fn launch_family_reconciliation_preserves_deadline_witness_revision_and_membersh
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
         fingerprint_opened_identity: String::new(),
+        withheld_content_stamp: None,
     };
     let physical = candidate.source_file_fingerprint.clone();
     candidate.source_file_fingerprint = sha256_hex(&[

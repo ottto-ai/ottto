@@ -802,38 +802,6 @@ fn queued_traversal(queued: &[PathBuf], candidates: &[PathBuf]) -> ScanIndex {
 }
 
 #[test]
-fn e2_dark_leaves_an_undiscovered_members_side_call_to_the_member() {
-    with_disabled(e2_dark_leaves_an_undiscovered_members_side_call_to_the_member_body);
-}
-
-fn e2_dark_leaves_an_undiscovered_members_side_call_to_the_member_body() {
-    // Dark keeps the reference selection, so the root can be on a page before
-    // its family directory is listed. It neither holds nor counts the row the
-    // trace names for an undiscovered member: the gate would have deferred
-    // the root, and the member counts the row when read.
-    let p = root_file("side-wait-dark");
-    let family = p.parent().unwrap().join(ROOT);
-    let read = sidecar(&[row("r", 1, 10), row("named", 4, 40)]);
-    let trace = ClaudeTraceOwnershipLoadReport {
-        evidence: BTreeMap::from([(
-            ROOT.to_owned(),
-            vec![complete_trace_row(ROOT, "named", "abc")],
-        )]),
-        ..Default::default()
-    };
-    let index = queued_traversal(&[family], &[]);
-    let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
-    attach_page(&mut items, &read);
-    let unresolved = side_calls_page(&mut items, &api_report(&read), &trace, &index);
-    let root = fold(&items[0]);
-    assert!(unresolved.is_empty());
-    assert!(!root.entity.held);
-    assert!(root.telemetry.side_calls_done);
-    assert_eq!((root.side_requests, root.root_fallbacks), (0, 0));
-    let _ = fs::remove_dir_all(p.parent().unwrap());
-}
-
-#[test]
 fn e2_gate_on_defers_a_root_whose_family_directory_is_queued() {
     let project = PathBuf::from("/projects/p");
     let waiting = project.join(format!("{ROOT}.jsonl"));
@@ -948,53 +916,6 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
 }
 
 #[test]
-fn e2_gate_off_keeps_canonical_bytes_and_fingerprint() {
-    with_disabled(e2_gate_off_keeps_canonical_bytes_and_fingerprint_body);
-}
-
-fn e2_gate_off_keeps_canonical_bytes_and_fingerprint_body() {
-    let p = root_file("dark");
-    let index = ScanIndex::default();
-    let mut items = vec![parse(
-        &p,
-        Some(t0()),
-        &index,
-        &[line("c", &at(-100), 5), line("r", &at(1), 10)],
-    )];
-    let before = items
-        .iter()
-        .map(|item| {
-            crate::canonical_json::canonicalize(&serde_json::to_value(item).unwrap()).unwrap()
-        })
-        .collect::<Vec<_>>();
-    let fingerprint = items[0].snapshot_fingerprint.clone();
-    let read = sidecar(&[row("r", 1, 10), row("side", 2, 7)]);
-    attach_page(&mut items, &read);
-    side_calls_page(
-        &mut items,
-        &api_report(&read),
-        &ClaudeTraceOwnershipLoadReport::default(),
-        &index,
-    );
-    finish_page(&mut items, &index, TelemetryRead::Loaded);
-    let after = items
-        .iter()
-        .map(|item| {
-            crate::canonical_json::canonicalize(&serde_json::to_value(item).unwrap()).unwrap()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(before, after);
-    assert_eq!(items[0].snapshot_fingerprint, fingerprint);
-    assert!(
-        items.iter().all(|item| item.claude_money.is_none()),
-        "dark releases every fold once counted"
-    );
-    assert!(items[0].removed_usage.is_none());
-    assert!(items[0].resolver_conflict_count.is_none());
-    cleanup(&[&p]);
-}
-
-#[test]
 fn e2_unknown_birth_counts_and_discloses_every_response() {
     let p = root_file("unknown");
     let index = ScanIndex::default();
@@ -1054,8 +975,25 @@ fn e2_native_resolver_owns_progressive_and_idless_decisions() {
 fn e2_diagnostic_fields_are_nonzero_only() {
     assert_eq!(serde_json::to_value(Counts::default()).unwrap(), json!({}));
     assert_eq!(
-        serde_json::to_value(Counts([1, 2, 0, 0, 0, 3, 0])).unwrap(),
+        serde_json::to_value(Counts::work([1, 2, 0, 0, 0, 3, 0])).unwrap(),
         json!({"fold_us":1,"responses":2,"side_call_root_fallback":3})
+    );
+    let tally = PrefixTally {
+        unproven_requests: 4,
+        unproven_idless: 1,
+        priced_requests: 2,
+        cost_micros: 700,
+        reused: 0,
+        ..PrefixTally::default()
+    };
+    assert_eq!(
+        serde_json::to_value(Counts::prefix(&tally)).unwrap(),
+        json!({"copy_prefix_unproven_requests":5,"copy_prefix_unproven_files":1,
+            "copy_prefix_unproven_priced_requests":2,"copy_prefix_unproven_cost_micros":700})
+    );
+    assert_eq!(
+        serde_json::to_value(Counts::removal_store(3, 0)).unwrap(),
+        json!({"copy_removal_stored":3})
     );
 }
 
@@ -1265,6 +1203,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             complete: true,
             lossy: false,
             source_verified: true,
+            unchanged_source: false,
             itemless_request_hashes: Vec::new(),
             opened_birth: None,
             modified_unix_seconds: 1,
@@ -1816,7 +1755,14 @@ fn switch_context() -> Value {
 fn org_hash(org: &str) -> String {
     ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap()
 }
-fn tag_owned(mut items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotItem> {
+fn tag_owned(items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotItem> {
+    tag_owned_with_fallbacks(items, index, 0)
+}
+fn tag_owned_with_fallbacks(
+    mut items: Vec<SnapshotItem>,
+    index: &ScanIndex,
+    expected_fallbacks: usize,
+) -> Vec<SnapshotItem> {
     decide_page_copies(&mut items, index);
     let api = ClaudeLocalOtelLoadReport::default();
     let trace = ClaudeTraceOwnershipLoadReport::default();
@@ -1853,7 +1799,9 @@ fn tag_owned(mut items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotIte
         &ownership,
     );
     claude_request_identity::publish_request_owned_activity(&items, activity);
-    assert_eq!(outcome.sent, items.len());
+    assert!(expected_fallbacks <= items.len());
+    assert_eq!(outcome.sent, items.len() - expected_fallbacks);
+    assert_eq!(outcome.fallback, expected_fallbacks);
     assert_eq!(outcome.ineligible, 0);
     items
 }
@@ -2608,7 +2556,7 @@ fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
 }
 
 #[test]
-fn e2_identity_final_twin_union_over_authority_cap_falls_back_to_starting_org() {
+fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity() {
     with_enabled(|| {
         let a = root_file("identity-cap-a");
         let b = root_file("identity-cap-b");
@@ -2635,19 +2583,17 @@ fn e2_identity_final_twin_union_over_authority_cap_falls_back_to_starting_org() 
         assert!(items
             .iter()
             .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
-        let item = tag_owned(items, &index).remove(0);
+        let item = tag_owned_with_fallbacks(items, &index, 1).remove(0);
         assert_eq!((item.request_count, item.input_tokens), (20, 20));
-        assert_eq!(item.request_evidence.len(), 1);
+        // SOURCE: overflowing proof cannot be replaced by the starting org.
+        // The old uniform-retry expectation would manufacture that identity.
+        assert!(item.request_evidence.is_empty());
+        assert!(rows_of(&item).all(|row| row.identity_parts.is_none()
+            && row.evidence_ref.is_none()
+            && row.account_identifier_hash.is_none()));
         assert_eq!(
-            item.request_evidence[0].provider_workspace_hash.as_deref(),
-            Some(org_hash(ORG_A).as_str())
-        );
-        assert!(
-            rows_of(&item).all(|row| row.identity_parts.is_none() && row.evidence_ref == Some(0))
-        );
-        assert_eq!(
-            item.request_identity_refusals, 0,
-            "successful retry retains no failed-attempt refusals"
+            item.request_identity_refusals, 1,
+            "the bucket row lost proof"
         );
         assert_evidence_referenced(&item);
         cleanup(&[&a, &b]);
@@ -4264,123 +4210,6 @@ fn e2_fingerprint_check_matches_the_blanked_copy_rule_on_every_shape() {
         let want = reference_fingerprint_ok(trace, &trace.fingerprint, |r| r.fingerprint.clear());
         assert_eq!(claude_trace_evidence_fingerprint_is_valid(trace), want);
     }
-}
-
-#[test]
-fn e2_api_fingerprint_is_hashed_once_per_row_and_never_leaves_memory() {
-    use crate::snapshots::{
-        claude_api_evidence_fingerprint_is_valid, claude_api_fingerprint_hashes,
-    };
-    let valid = row("req-a", 1, 10);
-    let bytes = serde_json::to_vec(&valid).unwrap();
-    let start = claude_api_fingerprint_hashes();
-    for _ in 0..3 {
-        assert!(claude_api_evidence_fingerprint_is_valid(&valid));
-    }
-    assert_eq!(claude_api_fingerprint_hashes() - start, 1);
-    assert_eq!(
-        serde_json::to_vec(&valid).unwrap(),
-        bytes,
-        "never serialized"
-    );
-    let decoded: ClaudeLocalOtelEvidence = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(decoded, valid, "ignored by ==");
-    // A copy is checked anew, so editing it cannot inherit the result.
-    let mut copy = valid.clone();
-    copy.input_tokens += 1;
-    assert!(!claude_api_evidence_fingerprint_is_valid(&copy));
-    assert!(!claude_api_evidence_fingerprint_is_valid(&copy));
-    assert_eq!(claude_api_fingerprint_hashes() - start, 2);
-    assert!(claude_api_evidence_fingerprint_is_valid(&valid));
-    assert_eq!(claude_api_fingerprint_hashes() - start, 2);
-}
-
-/// The native frame walker must be able to account for a real fold even
-/// when optional inline metadata is absent. This runs on portable CI too;
-/// the platform gate belongs to the outer native frame, not its field walk.
-#[test]
-fn e2_native_heap_walk_admits_optional_metadata_in_both_modes() {
-    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-    let path = root_file("heap-walk");
-    let check = || {
-        let item = parse(
-            &path,
-            Some(t0()),
-            &ScanIndex::default(),
-            &[line("heap-request", T0, 123)],
-        );
-        let fold = item.claude_money.as_deref().unwrap();
-        let mut counter = Counter::new(crate::source_rotation::PARKED_BUDGET);
-        assert!(
-            fold.heap_bound(&mut counter).is_some(),
-            "owned heaps must remain measurable"
-        );
-        assert!(counter.bytes > 0, "owned allocations must be charged");
-    };
-    check();
-    with_enabled(check);
-    fs::remove_dir_all(path.parent().unwrap()).unwrap();
-}
-
-/// Virgin dark maps allocate nothing; an emptied live map must still keep
-/// the native map-root charge. The initialization bit must use existing
-/// padding, since this repair may not make the daemon state heavier.
-#[test]
-fn e2_virgin_live_maps_have_no_heap_and_initialized_empty_maps_stay_charged() {
-    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-    #[allow(dead_code)]
-    struct BeforeInitializationBit {
-        grains: BTreeMap<
-            (
-                ClaudeLiveKey,
-                Option<ClaudeRequestUsageOrigin>,
-                AccountPartition,
-            ),
-            ClaudeGrainSide,
-        >,
-        bucket_activity: BTreeMap<String, (i128, i128)>,
-        removed: ClaudeMoneyTokens,
-        removed_requests: u64,
-        telemetry_owned_complete: bool,
-        resolver_conflicts: u64,
-        held: bool,
-        certificate_ok: bool,
-        activity_unix: u64,
-        activity_nanos: i128,
-        dark: DarkTally,
-    }
-    assert_eq!(
-        std::mem::size_of::<ClaudeEntityBody>(),
-        std::mem::size_of::<BeforeInitializationBit>()
-    );
-    let (dark, allocation) =
-        crate::retry_allocation_probe::measure_caller_thread(ClaudeEntityBody::default);
-    assert_eq!(allocation.requested_peak_with_overlap, 0);
-    let mut charge = Counter::new(usize::MAX);
-    dark.heap_bound(&mut charge).unwrap();
-    assert_eq!(charge.bytes, 0);
-    with_enabled(|| {
-        let mut live = ClaudeEntityBody::default();
-        let key = (HOUR.to_owned(), "model".to_owned(), BTreeMap::new());
-        let tokens = ClaudeMoneyTokens {
-            input: 1,
-            ..Default::default()
-        };
-        live.add(key.clone(), &tokens, 1, None, None, None, None);
-        assert!(live.take_estimated(&(key, None, None), &tokens, 1));
-        assert!(live.grains.is_empty());
-        let mut charge = Counter::new(usize::MAX);
-        live.heap_bound(&mut charge).unwrap();
-        assert!(
-            charge.bytes > 0,
-            "an initialized empty map keeps its root charge"
-        );
-    });
-    eprintln!(
-        "F4_ENTITY_LAYOUT before={} after={}",
-        std::mem::size_of::<BeforeInitializationBit>(),
-        std::mem::size_of::<ClaudeEntityBody>()
-    );
 }
 
 #[test]

@@ -876,18 +876,20 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
         "held-quiet",
     );
     fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-    let (mut index, _, modes) =
+    let (mut index, held_scan, modes) =
         production_scan(&fixture, source, index, Some(cache.clone()), "held-quiet");
     assert_eq!(modes, (0, 1, 0));
     let key = local_index_key(&fixture.file.0);
     let checkpoint = cache.retained_checkpoint(&key).unwrap();
     let due = checkpoint.audit_debt().unwrap().due_unix_seconds;
+    let deferred_tokens = crate::snapshot_sync::withheld_support::deferred_tokens(&held_scan);
     let held = index.file_snapshot_fingerprints[&key].clone();
     assert!(!held.is_empty());
     let fingerprint = index.files[&key].source_file_fingerprint.clone();
-    assert!(
-        index.record_claude_account_deferred_holds([(key.as_str(), fingerprint.as_str())], &held,)
-    );
+    assert!(index.record_claude_account_deferred_holds(
+        [(key.as_str(), fingerprint.as_str())],
+        &deferred_tokens,
+    ));
     assert!(index.claude_account_deferred_holds.contains_key(&key));
     fill_unavailable_audits(
         &mut index,
@@ -933,7 +935,7 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
     // now, but the scan's original slot reservation must remain intact.
     assert!(index.record_claude_account_deferred_holds(
         [(key.as_str(), fingerprint.as_str())],
-        &BTreeSet::new(),
+        &BTreeMap::new(),
     ));
     assert!(!index.claude_account_deferred_holds.contains_key(&key));
     let ((mut retired, _, modes, _), diagnostics) =
@@ -978,7 +980,7 @@ fn held_fresh_debt_at_cap_is_not_cap_full_or_a_new_marker() {
     let fixture = ScanFixture::new(source);
     fixture.file.append(&usage(source, 100, 0, "fixture-model"));
     let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (mut index, _, _) = production_scan(
+    let (mut index, held_scan, _) = production_scan(
         &fixture,
         source,
         ScanIndex::default(),
@@ -987,12 +989,14 @@ fn held_fresh_debt_at_cap_is_not_cap_full_or_a_new_marker() {
     );
     let key = local_index_key(&fixture.file.0);
     assert!(!index.files[&key].has_unverified_source());
+    let deferred_tokens = crate::snapshot_sync::withheld_support::deferred_tokens(&held_scan);
     let held = index.file_snapshot_fingerprints[&key].clone();
     assert!(!held.is_empty());
     let fingerprint = index.files[&key].source_file_fingerprint.clone();
-    assert!(
-        index.record_claude_account_deferred_holds([(key.as_str(), fingerprint.as_str())], &held,)
-    );
+    assert!(index.record_claude_account_deferred_holds(
+        [(key.as_str(), fingerprint.as_str())],
+        &deferred_tokens,
+    ));
     fill_unavailable_audits(
         &mut index,
         &key,
@@ -1067,7 +1071,7 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
         row
     };
     fixture.file.append(&held_row(100, 0));
-    let (next, _, modes) = production_scan(
+    let (next, held_scan, modes) = production_scan(
         &fixture,
         source,
         index,
@@ -1092,11 +1096,14 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
     fixture.file.0 = held_path;
     let held_key = local_index_key(&fixture.file.0);
     assert!(!index.files[&held_key].has_unverified_source());
+    let deferred_tokens = crate::snapshot_sync::withheld_support::deferred_tokens(&held_scan);
     let held = index.file_snapshot_fingerprints[&held_key].clone();
     assert!(!held.is_empty());
     let fingerprint = index.files[&held_key].source_file_fingerprint.clone();
-    assert!(index
-        .record_claude_account_deferred_holds([(held_key.as_str(), fingerprint.as_str())], &held,));
+    assert!(index.record_claude_account_deferred_holds(
+        [(held_key.as_str(), fingerprint.as_str())],
+        &deferred_tokens,
+    ));
     fill_unavailable_audits(
         &mut index,
         &quiet_key,
@@ -1215,7 +1222,7 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let namespace = "post-scan-release";
-        let (mut index, _, modes) = production_scan(
+        let (mut index, held_scan, modes) = production_scan(
             &fixture,
             source,
             ScanIndex::default(),
@@ -1225,10 +1232,13 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
         assert_eq!(modes, (1, 0, 0));
         let key = local_index_key(&fixture.file.0);
         let fingerprint = index.files[&key].source_file_fingerprint.clone();
+        let deferred_tokens = crate::snapshot_sync::withheld_support::deferred_tokens(&held_scan);
         let held = index.file_snapshot_fingerprints[&key].clone();
         assert!(!held.is_empty());
-        assert!(index
-            .record_claude_account_deferred_holds([(key.as_str(), fingerprint.as_str())], &held));
+        assert!(index.record_claude_account_deferred_holds(
+            [(key.as_str(), fingerprint.as_str())],
+            &deferred_tokens
+        ));
         let due = START + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
         fill_unavailable_audits(&mut index, &key, marked, due);
         let committed = index.clone();
@@ -1505,6 +1515,22 @@ fn cap_pace_overflow_is_counted_and_alarms_on_the_production_full() {
 
 #[test]
 fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
+    durable_quiet_retirement_faults(&[
+        "crash_before_writer",
+        "deferral",
+        "writer_error",
+        "receipt_before_index",
+        "scope_change",
+        "legacy_index_clear",
+    ]);
+}
+
+#[test]
+fn durable_debtless_record_index_save_failure_keeps_audit_due_on_restart() {
+    durable_quiet_retirement_faults(&["index_save_error"]);
+}
+
+fn durable_quiet_retirement_faults(faults: &[&str]) {
     use crate::durable_tail_store as store;
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -1519,14 +1545,7 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
     let _reset_writer = ResetWriter;
     let _clock = Clock::at(START);
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        for fault in [
-            "crash_before_writer",
-            "deferral",
-            "writer_error",
-            "receipt_before_index",
-            "scope_change",
-            "legacy_index_clear",
-        ] {
+        for &fault in faults {
             sampled_scan::set_test_now(Some(START));
             let fixture = ScanFixture::new(source);
             fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -1610,6 +1629,7 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
                 ScanIndex::load(&index_path).unwrap().files[&key].has_unverified_source(),
                 fault != "legacy_index_clear"
             );
+            let owed_due = index.files[&key].unverified_deadline();
             match fault {
                 "deferral" => {
                     sampled_scan::durable_tail::set_test_write_bytes(Some(0));
@@ -1644,7 +1664,7 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
                         0
                     );
                 }
-                "receipt_before_index" | "scope_change" => {
+                "receipt_before_index" | "scope_change" | "index_save_error" => {
                     assert_eq!(
                         cache
                             .durable_write_after_save(lock, source, &index)
@@ -1653,6 +1673,30 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
                         1
                     );
                     assert_eq!(fs::read(&record_path).unwrap()[311], 0);
+                    if fault == "index_save_error" {
+                        assert!(index.files[&key].audit_requires_full(START + 2 * 60 * 60));
+                        // Advance the real index CAS without changing its owed
+                        // marker. The retirement's second save must now fail.
+                        let mut advanced = ScanIndex::load(&index_path).unwrap();
+                        advanced.save(&index_path).unwrap();
+                        let committed = fs::read(&index_path).unwrap();
+                        assert_eq!(
+                            index.clone().save(&index_path).unwrap_err().to_string(),
+                            "local snapshot scan index changed concurrently"
+                        );
+                        assert_eq!(
+                            cache.durable_reconcile_retirements(
+                                lock,
+                                source,
+                                &mut index,
+                                &index_path
+                            ),
+                            0,
+                            "a durable receipt cannot authorize a failed index CAS"
+                        );
+                        assert_eq!(index.files[&key].unverified_deadline(), owed_due);
+                        assert_eq!(fs::read(&index_path).unwrap(), committed);
+                    }
                     if fault == "scope_change" {
                         cache.durable_begin_pass(
                             source,
@@ -1675,15 +1719,23 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
                 }
                 _ => {}
             }
-            if !matches!(fault, "receipt_before_index" | "scope_change") {
+            if !matches!(
+                fault,
+                "receipt_before_index" | "scope_change" | "index_save_error"
+            ) {
                 assert_eq!(fs::read(&record_path).unwrap(), predecessor);
             }
             drop(cache);
             let restart = begin();
+            let restart_index = ScanIndex::load(&index_path).unwrap();
+            if fault == "index_save_error" {
+                assert_eq!(restart_index.files[&key].unverified_deadline(), owed_due);
+                assert!(restart_index.files[&key].audit_requires_full(START + 2 * 60 * 60));
+            }
             let (mut loaded, _, modes) = production_scan(
                 &fixture,
                 source,
-                ScanIndex::load(&index_path).unwrap(),
+                restart_index,
                 Some(restart.clone()),
                 &scope.0,
             );
@@ -1697,6 +1749,19 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
             );
             if fault != "legacy_index_clear" {
                 assert!(loaded.files[&key].has_unverified_source());
+                if fault == "index_save_error" {
+                    assert_eq!(restart.durable_counters(source).unwrap().0.restored, 1);
+                    assert_eq!(loaded.files[&key].unverified_deadline(), owed_due);
+                    assert!(loaded.files[&key].audit_requires_full(START + 2 * 60 * 60));
+                    // None came from the real record, while the original index
+                    // deadline still selected this Unchanged quiet audit. The
+                    // successful reconcile below requires that audit to stage
+                    // a NEW retirement; restore alone cannot stage or clear it.
+                    assert_eq!(
+                        restart.retained_checkpoint(&key).unwrap().audit_debt(),
+                        None
+                    );
+                }
                 assert_eq!(
                     restart
                         .retained_checkpoint(&key)
@@ -1756,6 +1821,7 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
     }
 }
 
+/// [behaviour] Secure absence retires audit debt; account holds require a second spaced probe.
 #[test]
 fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1816,10 +1882,36 @@ fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() 
                     )
                 });
             assert_eq!(modes, (0, 0, 0));
+            let mut diagnostics = diagnostics;
+            if source == SnapshotSource::ClaudeCode {
+                assert!(retired.claude_account_deferred_holds.contains_key(&key));
+                assert!(retired.files[&key].has_unverified_source());
+                sampled_scan::set_test_now(Some(sampled_scan::now_seconds() + 600));
+                crate::snapshots::line_delivery_tests::next_walk(
+                    &mut retired,
+                    std::slice::from_ref(&fixture.root),
+                    NOW,
+                    BACKFILL_WINDOW_DAYS,
+                );
+                let ((next, _, modes), next_diagnostics) =
+                    crate::local_resource_diagnostics::capture(|| {
+                        production_scan(
+                            &fixture,
+                            source,
+                            retired,
+                            Some(cache.clone()),
+                            "absence-retirement",
+                        )
+                    });
+                assert_eq!(modes, (0, 0, 0));
+                retired = next;
+                diagnostics.extend(next_diagnostics);
+            }
             assert_eq!(
                 diagnostics
                     .iter()
-                    .filter(|row| row["stage"] == "audit_retired_absent")
+                    .filter(|row| row["stage"] == "native_collection_page"
+                        && row["counts"]["audit_retired_absent"]["events"] == 1)
                     .count(),
                 usize::from(ancestor != "unsafe")
             );
@@ -1871,6 +1963,7 @@ fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() 
     }
 }
 
+/// [behaviour] Protected history keeps custody while its absent audit retires.
 #[test]
 fn protected_codex_absence_retires_only_the_audit_obligation() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1907,7 +2000,17 @@ fn protected_codex_absence_retires_only_the_audit_obligation() {
     traversal.observed_index_keys.clear();
     traversal.reconciliation_upper_bound = Some(key.clone());
     let (done, diagnostics) = crate::local_resource_diagnostics::capture(|| {
-        reconcile_missing_index_entries_with_side(&mut index, 10, None, source)
+        let done = reconcile_missing_index_entries_with_side(&mut index, 10, None, source);
+        crate::local_resource_diagnostics::Probe::start().collection(
+            source.api_slug(),
+            crate::local_resource_diagnostics::CollectionCounts {
+                scanned_files: 0,
+                semantic_noops: 0,
+                sampled_acquisition: None,
+                full_causes: Default::default(),
+            },
+        );
+        done
     });
     assert!(done);
     assert!(!index.files[&key].has_unverified_source());
@@ -1919,7 +2022,8 @@ fn protected_codex_absence_retires_only_the_audit_obligation() {
     assert_eq!(
         diagnostics
             .iter()
-            .filter(|row| row["stage"] == "audit_retired_absent")
+            .filter(|row| row["stage"] == "native_collection_page"
+                && row["counts"]["audit_retired_absent"]["events"] == 1)
             .count(),
         1
     );
@@ -1995,8 +2099,9 @@ fn audit_absence_preserves_legacy_counting_evidence_or_retains_its_entry() {
     }
 }
 
+/// [behaviour] Hold-only removal requires stable rooted absence twice.
 #[test]
-fn hold_only_inventory_requires_secure_absence_and_keeps_observed_keys() {
+fn hold_only_inventory_requires_two_secure_absence_observations() {
     use std::os::unix::fs::symlink;
     for ancestor in [
         "present",
@@ -2039,15 +2144,26 @@ fn hold_only_inventory_requires_secure_absence_and_keeps_observed_keys() {
             NOW,
             BACKFILL_WINDOW_DAYS,
         );
+        crate::snapshots::line_delivery_tests::walk_all(&mut index, BACKFILL_WINDOW_DAYS);
         assert!(index.files.is_empty(), "held-new has no committed entry");
-        index.retain_observed_claude_account_deferred_holds(&BTreeSet::from([key.clone()]));
+        withheld_account::support::clock(&index.withheld_memo);
+        sampled_scan::set_test_now(Some(1_000));
+        withheld_account::support::clock(&index.withheld_memo);
+        index.probe_absent_claude_account_deferred_holds();
         assert!(
             index.claude_account_deferred_holds.contains_key(&key),
-            "observation alone keeps custody"
+            "one observation keeps custody"
         );
-        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            index.retain_observed_claude_account_deferred_holds(&BTreeSet::new())
-        });
+        crate::snapshots::line_delivery_tests::next_walk(
+            &mut index,
+            std::slice::from_ref(&fixture.root),
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+        );
+        sampled_scan::set_test_now(Some(1_600));
+        crate::local_resource_diagnostics::withheld_support::take_withheld();
+        withheld_account::support::clock(&index.withheld_memo);
+        index.probe_absent_claude_account_deferred_holds();
         let removed = matches!(ancestor, "present" | "missing");
         assert_eq!(
             !index.claude_account_deferred_holds.contains_key(&key),
@@ -2055,16 +2171,19 @@ fn hold_only_inventory_requires_secure_absence_and_keeps_observed_keys() {
             "{ancestor}"
         );
         assert_eq!(
-            rows.iter()
-                .filter(|row| row["stage"] == "withheld_hold_released"
-                    && row["counts"]["withheld_hold_released"]["deleted"] == 1)
-                .count(),
-            usize::from(removed)
+            crate::local_resource_diagnostics::withheld_support::take_withheld()[0],
+            if removed {
+                BTreeMap::from([("deleted", 1)])
+            } else {
+                BTreeMap::new()
+            }
         );
         assert!(index.files.is_empty(), "no membership invented");
+        sampled_scan::set_test_now(None);
     }
 }
 
+/// [behaviour] Inventory never probes an imported tail beyond the existing cap.
 #[test]
 fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
     let fixture = ScanFixture::new(SnapshotSource::ClaudeCode);
@@ -2088,7 +2207,9 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
         NOW,
         BACKFILL_WINDOW_DAYS,
     );
-    index.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    crate::snapshots::line_delivery_tests::walk_all(&mut index, BACKFILL_WINDOW_DAYS);
+    withheld_account::support::clock(&index.withheld_memo);
+    index.probe_absent_claude_account_deferred_holds();
     assert_eq!(
         index.claude_account_deferred_holds.len(),
         MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS + 1
@@ -2097,12 +2218,73 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
         index.claude_account_deferred_holds.contains_key(&eligible),
         "over-bound imported tail was not probed or dropped"
     );
+    // Indexed/hint callers can name an imported tail too; the central gate
+    // must keep it even with memo capacity and two spaced secure absences.
+    let members = index.observed_account_members();
+    for now in [1_000, 1_600] {
+        sampled_scan::set_test_now(Some(now));
+        assert!(!index.retire_absent_account_hold(&eligible, &members));
+        assert!(index.claude_account_deferred_holds.contains_key(&eligible));
+    }
     index
         .claude_account_deferred_holds
         .retain(|key, _| key == &eligible);
-    index.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    withheld_account::support::clock(&index.withheld_memo);
+    index.probe_absent_claude_account_deferred_holds();
+    assert_eq!(index.claude_account_deferred_hold_count(), 1);
+    crate::snapshots::line_delivery_tests::next_walk(
+        &mut index,
+        std::slice::from_ref(&fixture.root),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    sampled_scan::set_test_now(Some(sampled_scan::now_seconds() + 600));
+    withheld_account::support::clock(&index.withheld_memo);
+    index.probe_absent_claude_account_deferred_holds();
+    sampled_scan::set_test_now(None);
     assert!(
         index.claude_account_deferred_holds.is_empty(),
         "the next bounded inventory proves eligible absence"
     );
+    // A large missing population must leave some debt unadmitted rather than
+    // pin a descriptor for every key; admitted batches must still make progress.
+    for n in 0..80 {
+        index.claude_account_deferred_holds.insert(
+            local_index_key(&fixture.root.join(format!("missing-{n}.jsonl"))),
+            "held".into(),
+        );
+    }
+    sampled_scan::set_test_now(Some(1_000));
+    withheld_account::support::clock(&index.withheld_memo);
+    index.probe_absent_claude_account_deferred_holds();
+    crate::snapshots::line_delivery_tests::next_walk(
+        &mut index,
+        std::slice::from_ref(&fixture.root),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    sampled_scan::set_test_now(Some(1_600));
+    withheld_account::support::clock(&index.withheld_memo);
+    index.probe_absent_claude_account_deferred_holds();
+    let remaining = index.claude_account_deferred_hold_count();
+    assert!(
+        remaining > 0 && remaining < 80,
+        "descriptor admission keeps debt and makes progress"
+    );
+    for step in 2..=80 {
+        crate::snapshots::line_delivery_tests::next_walk(
+            &mut index,
+            std::slice::from_ref(&fixture.root),
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+        );
+        sampled_scan::set_test_now(Some(1_000 + step * 600));
+        withheld_account::support::clock(&index.withheld_memo);
+        index.probe_absent_claude_account_deferred_holds();
+        if index.claude_account_deferred_hold_count() == 0 {
+            break;
+        }
+    }
+    assert_eq!(index.claude_account_deferred_hold_count(), 0);
+    sampled_scan::set_test_now(None);
 }

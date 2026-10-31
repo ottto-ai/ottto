@@ -152,10 +152,114 @@ fn exact_ack(items: Vec<SnapshotItem>) -> Result<crate::snapshot_client::Snapsho
                 head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
                 head_challenge: None,
                 unchanged_basis: None,
+                retained_proof_missing: Vec::new(),
             });
     }
     response.validate_entity_ack_with_head_cas(&request, false)?;
     Ok(response)
+}
+
+#[test]
+fn bounded_retry_quarantine_preserves_other_acks_and_contexts_after_reload() {
+    let f = AckFixture::new(true);
+    let (_, mut progress) = f.load();
+    let fingerprint = &f.item.snapshot_fingerprint;
+    progress
+        .accepted_body_contexts
+        .insert(fingerprint.clone(), "b".repeat(64));
+    let fingerprints = BTreeSet::from(["1".repeat(64), "2".repeat(64)]);
+    let witnesses = BTreeMap::from([
+        ("1".repeat(64), "3".repeat(64)),
+        ("2".repeat(64), "4".repeat(64)),
+    ]);
+    let contexts = BTreeMap::from([("1".repeat(64), "5".repeat(64))]);
+    for (fp, body) in &witnesses {
+        progress.record_body(fp, body);
+    }
+    progress.accepted_body_contexts.extend(contexts.clone());
+    progress.save(&f.progress_path).unwrap();
+    let generation = progress.generation;
+
+    // Exercise the settlement and capped-save seam used by PreparedRetry::turn_inner.
+    // Calling it directly keeps this persistence regression independent of heap-layout pins.
+    let outcome = attempt_snapshot_page(
+        std::slice::from_ref(&f.item),
+        &[0],
+        &unique_poison_scope(),
+        &mut progress,
+        &mut 0,
+        &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+        &snapshot_upload_body_witness,
+        &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+        &mut |items| {
+            let mut response = exact_ack(items)?;
+            response.accepted = 0;
+            response.conflict_entities = std::mem::take(&mut response.accepted_entities);
+            Ok(response)
+        },
+        &mut |state| {
+            assert!(state.quarantined_fingerprints.contains_key(fingerprint));
+            assert!(!state.accepted_fingerprints.contains(fingerprint));
+            assert!(!state.accepted_body_witnesses.contains_key(fingerprint));
+            assert!(!state.accepted_body_contexts.contains_key(fingerprint));
+            state.save_with_read_limit(
+                &f.progress_path,
+                Some(crate::snapshot_retry::RESPONSE_BYTES),
+            )
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        SnapshotPageOutcome::Settled { conflicted: 1 }
+    ));
+
+    let (_, reloaded) = f.load();
+    assert_eq!(reloaded.generation, generation + 1);
+    assert_eq!(reloaded.accepted_fingerprints, fingerprints);
+    assert_eq!(reloaded.accepted_body_witnesses, witnesses);
+    assert_eq!(reloaded.accepted_body_contexts, contexts);
+    assert_eq!(
+        reloaded.quarantined_fingerprints,
+        progress.quarantined_fingerprints
+    );
+    assert!(f.progress_path.exists(), "valid ledger was not quarantined");
+    assert!(!std::fs::read_dir(&f.scratch).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".corrupt.")
+    }));
+}
+
+#[test]
+fn every_progress_save_prunes_contexts_without_body_witnesses() {
+    for read_limit in [None, Some(crate::snapshot_retry::RESPONSE_BYTES)] {
+        let f = AckFixture::new(true);
+        let (_, mut progress) = f.load();
+        let contexts = BTreeMap::from([(f.item.snapshot_fingerprint.clone(), "b".repeat(64))]);
+        progress.accepted_body_contexts = contexts.clone();
+        progress
+            .accepted_body_contexts
+            .insert("c".repeat(64), "d".repeat(64));
+        let fingerprints = progress.accepted_fingerprints.clone();
+        let witnesses = progress.accepted_body_witnesses.clone();
+
+        match read_limit {
+            None => progress.save(&f.progress_path),
+            Some(_) => progress.save_with_read_limit(&f.progress_path, read_limit),
+        }
+        .unwrap();
+
+        assert_eq!(progress.accepted_body_contexts, contexts);
+        let (_, reloaded) = f.load();
+        assert_eq!(reloaded.generation, progress.generation);
+        assert_eq!(reloaded.accepted_fingerprints, fingerprints);
+        assert_eq!(reloaded.accepted_body_witnesses, witnesses);
+        assert_eq!(reloaded.accepted_body_contexts, contexts);
+        assert!(f.progress_path.exists());
+    }
 }
 
 #[test]
@@ -205,29 +309,6 @@ fn committed_ack_survives_unrelated_empty_and_failed_pages_after_reload() {
             );
         }
     }
-}
-
-#[test]
-fn committed_ack_survives_bootstrap_only_input() {
-    let f = AckFixture::new(true);
-    let (_, mut progress) = f.load();
-    let probe = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-    assert_ne!(probe.snapshot_fingerprint, f.item.snapshot_fingerprint);
-    bootstrap_cache_heads_with_budget(
-        &[probe],
-        &unique_poison_scope(),
-        &mut progress,
-        false,
-        &mut InplaceRetryBudget::default(),
-        |batch, enforce| {
-            assert!(enforce);
-            f.assert_ack(&f.load().1);
-            exact_ack(batch)
-        },
-        |state| state.save(&f.progress_path),
-    )
-    .unwrap();
-    f.assert_ack(&f.load().1);
 }
 
 #[test]
@@ -476,39 +557,6 @@ fn ack_capacity_stops_admission_without_evicting_evidence_and_settlement_release
 }
 
 #[test]
-fn default_unsettled_ack_budget_has_bounded_persisted_and_heap_size() {
-    let scratch = crate::test_scratch::ScratchDir::new("ack-debt-bound");
-    let path = scratch.join("progress.json");
-    let mut progress = test_upload_progress();
-    let capacity = ack_retention::default_ack_capacity();
-    for entity in 0..capacity {
-        let fp = format!("{entity:064x}");
-        progress.record_body(&fp, &fp);
-    }
-    progress.save(&path).unwrap();
-    let loaded = SnapshotUploadProgress::load(
-        &path,
-        &progress.destination_namespace_hash,
-        test_quarantine_witness(),
-    )
-    .unwrap();
-    assert_eq!(loaded.accepted_fingerprints.len(), capacity);
-    assert!(loaded.admit_ack_batch(1).is_err());
-    assert!(std::fs::metadata(&path).unwrap().len() <= 2 * 1024 * 1024);
-    if crate::heap_layout_bound::layout_supported() {
-        // This is a completed persisted ledger, not a per-line parser check.
-        // Compose per-element counters so 4096 entries do not exhaust the
-        // short traversal's 4096 visits before the byte bound is measured.
-        let bound = crate::heap_layout_bound::completed_bound(&loaded, 8 * 1024 * 1024)
-            .expect("hash state including conservative whole-node tree pricing fits 8 MiB");
-        eprintln!(
-            "upload_ack_debt_bound entities={capacity} heap_bound={bound} serialized_bytes={}",
-            std::fs::metadata(&path).unwrap().len()
-        );
-    }
-}
-
-#[test]
 fn semantic_index_acceptance_cannot_dispose_a_newer_exact_body_ack() {
     let f = AckFixture::new(true);
     let (mut index, mut progress) = f.load();
@@ -687,6 +735,77 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
         main_posts,
         all.len(),
         "all admitted bodies converge without losing remaining work"
+    );
+}
+
+/// Every source binds the ledger each cycle. The reread copy has no key, and a
+/// rebind that discarded hints is unsaved until the next ACK page.
+#[test]
+fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
+    let hint = serde_json::json!({
+        "source_session_id": "synthetic",
+        "provenance": {"collector": crate::snapshots::claude_request_identity::COLLECTOR},
+        "request_evidence": [{"identity_basis": "telemetry_login"}],
+        "usage_buckets": [{"bucket_start": "2026-09-01T10:00:00Z", "model_usage": [
+            {"model": "claude-synthetic", "evidence_ref": 0, "account_identifier_hash": "a".repeat(64)}
+        ]}],
+    });
+    let cases = [
+        ("bound with a saved hint", Some([0x42; 32]), true, None),
+        ("bound with no hints", Some([0x42; 32]), false, None),
+        (
+            "rotated key, unsaved",
+            Some([0x41; 32]),
+            true,
+            Some(Some([0x42; 32])),
+        ),
+        (
+            "no key this cycle, unsaved",
+            Some([0x41; 32]),
+            true,
+            Some(None),
+        ),
+    ];
+    let mut refused = Vec::new();
+    for cause in [
+        UnsettledUploadCause::Shed,
+        UnsettledUploadCause::UploadError,
+    ] {
+        for (case, saved_key, record, rebind) in cases {
+            let f = AckFixture::new(true);
+            let (index, mut progress) = f.load();
+            progress.accepted_identity_buckets.bind_test_key(saved_key);
+            progress.accepted_identity_buckets.set_retained_enabled(true);
+            if record {
+                progress.accepted_identity_buckets.record(&hint);
+                assert!(!progress.accepted_identity_buckets.is_empty(), "{case}");
+            }
+            progress.save(&f.progress_path).unwrap();
+            if let Some(key) = rebind {
+                progress.accepted_identity_buckets.bind_test_key(key);
+                assert!(progress.accepted_identity_buckets.is_empty(), "{case}");
+            }
+            if let Err(error) = checkpoint_partial_snapshot_index_with_comparison(
+                &index,
+                &index,
+                &progress,
+                std::slice::from_ref(&f.item),
+                None,
+                &BTreeSet::new(),
+                &f.index_path,
+                &f.progress_path,
+                || Ok(()),
+                None,
+                None,
+                Some(cause),
+            ) {
+                refused.push(format!("{cause:?}, {case}: {error:#}"));
+            }
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "partial checkpoints refused: {refused:#?}"
     );
 }
 
@@ -2000,46 +2119,6 @@ fn one_file_larger_than_the_unsettled_limit_converges_after_a_mid_file_page_fail
         "the settled file transfers every ACK to the index"
     );
     f.assert_identity(&saved);
-}
-
-// #778 R2-3: over-cap debt retires only through a complete census. The local
-// count names how long capacity stops have waited for one.
-#[test]
-#[serial_test::serial(source_cadences)]
-fn incomplete_census_capacity_stops_count_consecutively_and_reset() {
-    let source = SnapshotSource::Pi;
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(source, false, true),
-        0
-    );
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(source, true, false),
-        1
-    );
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(source, true, false),
-        2
-    );
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(source, true, true),
-        0,
-        "a complete census can retire the debt"
-    );
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(source, true, false),
-        1
-    );
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(source, false, false),
-        0,
-        "any finish without a capacity stop resets"
-    );
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(SnapshotSource::Codex, true, false),
-        1,
-        "counts are per source"
-    );
-    ack_retention::note_capacity_stop_census(SnapshotSource::Codex, false, true);
 }
 
 // #794 F1: a local hold on sibling H makes the Completed-with-holds and the

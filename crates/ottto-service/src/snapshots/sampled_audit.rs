@@ -236,6 +236,9 @@ impl ScanIndex {
             .get_mut(key)
             .expect("validated entry")
             .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        if claude_terminal_off() {
+            with_open_backoff(|backoff| backoff.keys.remove(key));
+        }
         true
     }
 }
@@ -367,11 +370,21 @@ pub(super) fn progress_debt(index: &ScanIndex, key: &str, now: u64) -> Option<Au
 }
 
 pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
-    index
+    let obligation = index
         .files
         .get(key)
-        .and_then(|entry| entry.audit_obligation(now))
-        .or_else(|| progress_debt(index, key, now))
+        .and_then(|entry| entry.audit_obligation(now));
+    if claude_terminal_off() {
+        // The earliest of the entry, progress and failed-open obligations.
+        return obligation
+            .into_iter()
+            .chain(progress_debt(index, key, now))
+            .map(|debt| debt.due_unix_seconds)
+            .chain(failed_open_debt(key, now))
+            .min()
+            .map(|due_unix_seconds| AuditDebt { due_unix_seconds });
+    }
+    obligation.or_else(|| progress_debt(index, key, now))
 }
 
 /// A held key the slot may serve: bounded, still awaiting restoration, and
@@ -499,9 +512,10 @@ impl OpenBackoff {
     }
     fn blocked(&self, key: &str, now: u64) -> bool {
         self.keys.get(key).is_some_and(|failure| {
-            (failure.failures >= OPEN_PARK_FAILURES
-                || (self.page < failure.retry_page
-                    && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
+            (!claude_terminal_off() || failure.failures > 0)
+                && (failure.failures >= OPEN_PARK_FAILURES
+                    || (self.page < failure.retry_page
+                        && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
                 && open_stamp(key) == failure.stamp
         })
     }
@@ -569,15 +583,44 @@ fn open_blocked(key: &str, now: u64) -> bool {
     with_open_backoff(|backoff| backoff.blocked(key, now))
 }
 
+/// All candidate admissions share this stat-wake check, before secure open.
+pub(super) fn candidate_open_blocked(key: &str, now: u64) -> bool {
+    if !claude_terminal_off() {
+        return false;
+    }
+    open_blocked(key, now)
+}
+/// Scheduling only: an existing failed-open obligation may retry when its
+/// own throttle expires; a successful ordinary open is not such a retry.
+pub(super) fn failed_open_retry_ready(key: &str, now: u64) -> bool {
+    if !claude_terminal_off() {
+        return false;
+    }
+    with_open_backoff(|memo| {
+        memo.keys.get(key).is_some_and(|f| f.failures > 0) && !memo.blocked(key, now)
+    })
+}
+pub(super) fn failed_open_debt(key: &str, now: u64) -> Option<u64> {
+    if !claude_terminal_off() {
+        return None;
+    }
+    with_open_backoff(|backoff| backoff.owed(key)).filter(|due| now >= *due)
+}
+
 /// Census-line counts: keys whose progress open failed and are still owed
 /// (backing off or parked), and the age of the oldest first failure.
 pub(super) fn held_audit_open_failed(now: u64) -> (usize, u64) {
     with_open_backoff(|backoff| {
         (
-            backoff.keys.len(),
             backoff
                 .keys
                 .values()
+                .filter(|failure| failure.failures > 0)
+                .count(),
+            backoff
+                .keys
+                .values()
+                .filter(|failure| failure.failures > 0)
                 .map(|failure| now.saturating_sub(failure.first_failed))
                 .max()
                 .unwrap_or(0),
@@ -600,15 +643,29 @@ mod open_backoff_tests;
 
 /// The queued progress Full for `key` passed its secure open: the slot's
 /// turn is spent, so the next preparation rotates to a fresh interval, and
-/// any failed-open backoff ends.
+/// any failed-open backoff ends. Terminal-off clears throttling, NOT the
+/// owed verification: another key may own the slot, so it retains the exact
+/// numeric due in the bounded map until a marker/native acquisition carries
+/// it or a completed source verification retires it.
 pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
+    let terminal_off = claude_terminal_off();
     if let Some(slot) = index
         .held_audit_progress
         .as_mut()
         .filter(|slot| slot.key == key)
     {
         slot.attempted = true;
-        with_open_backoff(|backoff| backoff.keys.remove(key));
+        if !terminal_off {
+            with_open_backoff(|backoff| backoff.keys.remove(key));
+        }
+    }
+    if terminal_off {
+        with_open_backoff(|backoff| {
+            if let Some(failure) = backoff.keys.get_mut(key) {
+                failure.failures = 0;
+                failure.retry_page = backoff.page;
+            }
+        });
     }
 }
 
@@ -619,28 +676,56 @@ struct HeldAuditOpenParked {
     held_audit_open_failed_keys: usize,
 }
 
-/// The queued progress Full for `key` failed its secure open. Back the key
-/// off (or park it), then rotate the turn, wrapping to `key` itself when no
-/// other member is eligible, but keep the owed due: a failed open never
-/// re-arms a later deadline.
-pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
-    let Some(due) = index
-        .held_audit_progress
-        .as_ref()
-        .filter(|slot| slot.key == key && !slot.attempted)
-        .map(|slot| slot.due)
-    else {
-        return;
-    };
+// All actual failed opens of an already owed key, including constructor
+// preflight, share the bounded failure record. No census/ACK state changes.
+fn record_open_failure(key: &str, due: u64, now: u64) -> RecordedFailure {
     let (recorded, keys) =
         with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
-    if let Some(parked) = recorded.parked {
+    if let Some(parked) = recorded.parked.as_ref() {
         // Counts only; no path or id. Once per park.
         crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
             held_audit_open_failures: parked.failures,
             held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
             held_audit_open_failed_keys: keys,
         });
+    }
+    recorded
+}
+pub(super) fn candidate_open_failed(key: &str, now: u64) {
+    if !claude_terminal_off() {
+        return;
+    }
+    if let Some(due) = failed_open_debt(key, now) {
+        record_open_failure(key, due, now);
+    }
+}
+
+/// The queued progress Full for `key` failed its secure open. Back the key
+/// off (or park it), then rotate the turn, wrapping to `key` itself when no
+/// other member is eligible, but keep the owed due: a failed open never
+/// re-arms a later deadline.
+pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
+    let terminal_off = claude_terminal_off();
+    let Some(due) = index
+        .held_audit_progress
+        .as_ref()
+        .filter(|slot| slot.key == key && !slot.attempted)
+        .map(|slot| slot.due)
+        // failed_open_debt is None with the switch OFF.
+        .or_else(|| failed_open_debt(key, now))
+    else {
+        return;
+    };
+    let recorded = record_open_failure(key, due, now);
+    // An ordinary admission can be a previously failed key while another
+    // member owns the progress slot. Its failure must not steal that turn.
+    if terminal_off
+        && index
+            .held_audit_progress
+            .as_ref()
+            .is_some_and(|slot| slot.key != key)
+    {
+        return;
     }
     let previous = index.held_audit_progress.take();
     // Rule 7: an overflow-evicted key may retry, so it takes the next turn,
@@ -662,9 +747,17 @@ pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
 fn schedule_held_audit_progress(index: &mut ScanIndex, now: u64) -> Option<String> {
     with_open_backoff(|backoff| {
         backoff.page = backoff.page.saturating_add(1);
-        backoff
-            .keys
-            .retain(|key, _| awaits_hold_deadline_restoration(index, key));
+        // Restoring a plain-v2 hold changes its representation, not its
+        // failed-open obligation. Keep the same-stat park and original D
+        // until source verification discharges them (or the entry is gone).
+        backoff.keys.retain(|key, _| {
+            awaits_hold_deadline_restoration(index, key)
+                || claude_terminal_off()
+                    && index
+                        .files
+                        .get(key)
+                        .is_some_and(ScanIndexEntry::has_unverified_source)
+        });
     });
     let previous = index.held_audit_progress.clone();
     let keep = previous.as_ref().is_some_and(|slot| {
@@ -723,6 +816,7 @@ impl OwnedSourceScan {
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
             fingerprint_opened_identity: String::new(),
+            withheld_content_stamp: None,
         };
         // Mirror candidate conversion's census observation. An old queued
         // age rejection must not delete a successful recovery at settlement.
@@ -878,6 +972,7 @@ mod tests {
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
             fingerprint_opened_identity: String::new(),
+            withheld_content_stamp: None,
         }
     }
     fn index() -> ScanIndex {
@@ -887,6 +982,75 @@ mod tests {
         index.confirmed_empty_files.insert(key);
         index
     }
+    /// [behaviour] Virtual recovery keeps grown keys observed without reading before due.
+    #[test]
+    fn virtual_recovery_keeps_grown_keys_observed_without_reading_before_due() {
+        use crate::snapshots::claude_request_census::{
+            ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
+        };
+        let mut index = index();
+        let mut candidate = candidate();
+        let key = local_index_key(&candidate.path);
+        let record =
+            Record::synthetic_for_test(&"a".repeat(64), 1, Shape::IdentityIncomplete, vec![1])
+                .with_unverified_for_test(true);
+        index
+            .claude_request_census_mut_for_test()
+            .insert_for_test(&key, record);
+        let now = 10 * 86_400;
+        let due = now + 100;
+        index.held_audit_progress = Some(HeldAuditProgress {
+            key: key.clone(),
+            due,
+            attempted: false,
+        });
+        candidate.size_bytes += 1;
+        candidate.source_file_fingerprint = "changed".into();
+        assert!(awaits_hold_deadline_restoration(&index, &key));
+        assert!(
+            discovery_retention!(index).owes_with_len(
+                SnapshotSource::ClaudeCode,
+                &candidate.path,
+                candidate.size_bytes
+            ),
+            "growth stays discoverable, never dropped"
+        );
+        let decide = |index: &ScanIndex, candidate: &CandidateFile, at| {
+            index.candidate_decision_in_window(candidate, at, Some(at), 7)
+        };
+        let mut recent = candidate.clone();
+        recent.modified_unix_seconds = now;
+        assert_eq!(
+            decide(&index, &recent, now),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::TranscriptChanged)
+            ),
+            "recent growth preserves main's immediate selection"
+        );
+        assert_eq!(
+            decide(&index, &candidate, due - 1).0,
+            CandidateDecision::Skip,
+            "scheduling future virtual debt cannot acquire the grown file"
+        );
+        assert_eq!(
+            decide(&index, &candidate, due),
+            (CandidateDecision::Parse, Some(CandidateParseReason::Audit)),
+            "due read retains its counted audit cause"
+        );
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        assert_eq!(
+            decide(&index, &candidate, due - 1).0,
+            CandidateDecision::Parse,
+            "genuine external rearm is not hidden by the virtual delay"
+        );
+    }
+
     #[test]
     fn cap_retry_keeps_durable_custody_without_a_traversal_or_marker() {
         let mut index = index();
@@ -1374,6 +1538,7 @@ mod provenance_tests {
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
             fingerprint_opened_identity: String::new(),
+            withheld_content_stamp: None,
         };
         let key = local_index_key(&candidate.path);
         for reset in [None, Some("semantic_sync:v1"), Some("unknown-provenance")] {
@@ -1458,28 +1623,68 @@ pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) 
     }
 }
 
-// To be replaced by #876's implementation at merge. Exact round-18 copy
-// from e3/withheld-age-exempt at 5df3fc370c10b3ce0e0d9f98ec46f044c2388c54.
 /// Positive removal only: a file or intermediate directory is NotFound beneath
 /// a readable ancestor securely reached from a configured, readable root.
 /// Missing roots, symlinks and permission errors keep the audit and account debt.
 /// This is absence authority, never source verification or census credit.
 pub(super) fn proven_absent(path: &Path, roots: &[PathBuf]) -> bool {
+    absence_parent(path, roots).is_some()
+}
+
+/// Pin the nearest existing parent so its inode cannot be reused between probes.
+/// Depth binds the missing component when an intermediate directory is absent.
+#[derive(Debug)]
+pub(super) struct AbsenceParent {
+    directory: File,
+    depth: usize,
+}
+impl AbsenceParent {
+    pub(super) fn same_parent(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.depth == other.depth
+                && self
+                    .directory
+                    .metadata()
+                    .ok()
+                    .zip(other.directory.metadata().ok())
+                    .is_some_and(|(a, b)| a.dev() == b.dev() && a.ino() == b.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (self, other);
+            false
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for AbsenceParent {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            directory: _,
+            depth: _,
+        } = self;
+        c.add(0)
+    }
+}
+
+pub(super) fn absence_parent(path: &Path, roots: &[PathBuf]) -> Option<AbsenceParent> {
     #[cfg(unix)]
     {
         roots
             .iter()
-            .any(|root| proven_absent_beneath_root(path, root).unwrap_or(false))
+            .find_map(|root| proven_absent_beneath_root(path, root).ok().flatten())
     }
     #[cfg(not(unix))]
     {
         let _ = (path, roots);
-        false
+        None
     }
 }
 
 #[cfg(unix)]
-fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool> {
+fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<Option<AbsenceParent>> {
     fn open_directory(parent: &File, name: &std::ffi::CStr) -> std::io::Result<File> {
         // Match open_candidate_beneath_root: every directory is readable and
         // no component below the configured root may redirect through a link.
@@ -1528,26 +1733,26 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
             .components()
             .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
     {
-        return Ok(false);
+        return Ok(None);
     }
     // Preserve the nofollow check on the root's final component even when its
     // configured spelling has a trailing separator or `/.`.
     let root: PathBuf = root.components().collect();
     let Ok(relative) = path.strip_prefix(&root) else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut names = Vec::new();
     for component in relative.components() {
         let Component::Normal(name) = component else {
-            return Ok(false);
+            return Ok(None);
         };
         let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
-            return Ok(false);
+            return Ok(None);
         };
         names.push(name);
     }
     let Some((final_name, parents)) = names.split_last() else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut root_options = fs::OpenOptions::new();
     root_options
@@ -1568,7 +1773,7 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
         }
     }
     if !name_absent(directories.last().expect("opened ancestor"), missing_name)? {
-        return Ok(false);
+        return Ok(None);
     }
 
     // A removed/replaced ancestor can leave a readable but detached descriptor.
@@ -1577,15 +1782,21 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
     // or recreation (even an empty directory) keeps the debt.
     let mut directory = root_options.open(&root)?;
     if !same_directory(&directory, &directories[0])? {
-        return Ok(false);
+        return Ok(None);
     }
     for (name, original) in parents.iter().zip(&directories[1..]) {
         directory = open_directory(&directory, name)?;
         if !same_directory(&directory, original)? {
-            return Ok(false);
+            return Ok(None);
         }
     }
-    name_absent(&directory, missing_name)
+    if !name_absent(&directory, missing_name)? {
+        return Ok(None);
+    }
+    Ok(Some(AbsenceParent {
+        directory,
+        depth: directories.len(),
+    }))
 }
 
 #[cfg(all(test, unix))]

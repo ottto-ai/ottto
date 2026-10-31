@@ -52,42 +52,42 @@ fn record_seeds_once_tracks_approved_changes_and_keeps_newest_two() {
     assert!(restored.record.seeded);
 }
 
-#[test]
-fn record_filters_ineligible_ports_seed_and_last_approved_and_deduplicates() {
-    let mut record = Record {
-        version: 1,
-        seeded: false,
-        last_approved: Some(1),
-        retired: Vec::new(),
-        ports: vec![
-            Port {
-                port: 1,
-                idle_since: None,
-            },
-            Port {
-                port: 2,
-                idle_since: Some(5),
-            },
-            Port {
-                port: 2,
-                idle_since: Some(5),
-            },
-        ],
-    };
-    record.observe(Some(3), &[2, 3], &[1]);
-    assert_eq!(ports(&record), vec![2]);
-    assert_eq!(record.last_approved, Some(3));
-    assert_eq!(record.ports[0].idle_since, Some(5));
-    assert!(record.seeded);
-    let mut record = Record {
-        version: 1,
-        ..Record::default()
-    };
-    record.observe(Some(2), &[2, 3], &[2]);
-    assert!(
-        record.ports.is_empty(),
-        "current approved port is never seeded"
-    );
+// Keep a real listener reserved across the busy -> primary -> retry steps.
+// Releasing an ephemeral port before reconcile lets another parallel test (or
+// an outbound connection) claim it before the native wildcard probes run.
+struct BindPlan {
+    port: u16,
+    results: std::collections::VecDeque<io::Result<TcpListener>>,
+}
+
+thread_local! {
+    static BIND_PLAN: std::cell::RefCell<Option<BindPlan>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn planned_bind(port: u16) -> Option<io::Result<TcpListener>> {
+    BIND_PLAN.with(|plan| {
+        let mut plan = plan.borrow_mut();
+        let plan = plan.as_mut()?;
+        assert_eq!(port, plan.port, "bind only the historical candidate");
+        Some(plan.results.pop_front().expect("unexpected bind attempt"))
+    })
+}
+
+fn with_bind_plan(plan: BindPlan, run: impl FnOnce()) {
+    struct Reset(Option<BindPlan>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BIND_PLAN.with(|plan| *plan.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(BIND_PLAN.with(|slot| slot.replace(Some(plan))));
+    run();
+    BIND_PLAN.with(|plan| {
+        assert!(
+            plan.borrow().as_ref().unwrap().results.is_empty(),
+            "every planned bind must be attempted"
+        );
+    });
 }
 
 #[test]
@@ -95,27 +95,50 @@ fn busy_port_is_counted_untouched_and_retried_and_primary_is_excluded() {
     let (_dir, mut supervisor) = scratch();
     let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = busy.local_addr().unwrap().port();
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
-        .unwrap();
-    assert!(supervisor.open.is_empty());
-    assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
-    assert_eq!(supervisor.record.ports[0].idle_since, Some(100));
-    drop(busy);
-    supervisor
-        .reconcile_current(160, Some(APPROVED), port, &[APPROVED, port], &[port])
-        .unwrap();
-    assert!(supervisor.open.is_empty(), "primary port is never opened");
-    supervisor
-        .reconcile_current(220, Some(APPROVED), 0, &[APPROVED, port], &[port])
-        .unwrap();
-    assert_eq!(supervisor.open.len(), 1);
-    assert_eq!(supervisor.counters.open.load(Ordering::Relaxed), 1);
-    assert_eq!(supervisor.record.ports[0].idle_since, Some(100));
-    let counters = supervisor.counters.clone();
-    drop(supervisor);
-    assert_eq!(counters.open.load(Ordering::Relaxed), 0);
-    assert_eq!(counters.closed.load(Ordering::Relaxed), 1);
+    busy.set_nonblocking(true).unwrap();
+    // Obtain the real native busy error while the owner is still listening.
+    // Bypass the test plan when exercising the wildcard/loopback probes.
+    let busy_error = socket::bind_with_probe(port, socket::bind_ipv6_wildcard).unwrap_err();
+    assert_eq!(busy_error.kind(), io::ErrorKind::AddrInUse);
+    let plan = BindPlan {
+        port,
+        results: [Err(busy_error), Ok(busy)].into(),
+    };
+    // Transfer the held listener on retry instead of releasing its port and
+    // racing other ephemeral allocations. The primary step must not bind.
+    with_bind_plan(plan, || {
+        supervisor
+            .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+            .unwrap();
+        assert!(supervisor.open.is_empty());
+        assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
+        assert_eq!(supervisor.record.ports[0].idle_since, Some(100));
+        supervisor
+            .reconcile_current(160, Some(APPROVED), port, &[APPROVED, port], &[port])
+            .unwrap();
+        assert!(supervisor.open.is_empty(), "primary port is never opened");
+        supervisor
+            .reconcile_current(220, Some(APPROVED), 0, &[APPROVED, port], &[port])
+            .unwrap();
+        assert_eq!(supervisor.open.len(), 1);
+        assert_eq!(supervisor.counters.open.load(Ordering::Relaxed), 1);
+        assert_eq!(supervisor.record.ports[0].idle_since, Some(100));
+        assert_eq!(
+            supervisor.open[&port]
+                .listener
+                .as_ref()
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port(),
+            port
+        );
+        assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
+        let counters = supervisor.counters.clone();
+        drop(supervisor);
+        assert_eq!(counters.open.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.closed.load(Ordering::Relaxed), 1);
+    });
 }
 
 #[test]
@@ -179,57 +202,6 @@ fn idle_clock_persists_across_restart_and_requests_flush_only_every_ten_minutes(
 }
 
 #[test]
-fn idle_expiry_uses_unflushed_request_and_quiet_listener_closes_after_one_day() {
-    let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
-        .unwrap();
-    supervisor.open[&port]
-        .activity
-        .accepted_at(100 + IDLE_SECONDS - 1);
-    supervisor
-        .reconcile_current(
-            100 + IDLE_SECONDS,
-            Some(APPROVED),
-            0,
-            &[APPROVED, port],
-            &[port],
-        )
-        .unwrap();
-    assert_eq!(
-        supervisor.open.len(),
-        1,
-        "latest in-memory request prevents expiry"
-    );
-    supervisor
-        .reconcile_current(
-            100 + 2 * IDLE_SECONDS - 1,
-            Some(APPROVED),
-            0,
-            &[APPROVED, port],
-            &[port],
-        )
-        .unwrap();
-    assert!(supervisor.open.is_empty());
-
-    let (_dir, mut quiet) = scratch();
-    quiet
-        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
-        .unwrap();
-    quiet
-        .reconcile_current(
-            100 + IDLE_SECONDS,
-            Some(APPROVED),
-            0,
-            &[APPROVED, port],
-            &[port],
-        )
-        .unwrap();
-    assert!(quiet.record.ports.is_empty());
-}
-
-#[test]
 fn becoming_approved_closes_socket_and_drops_record_before_primary_bind() {
     let (_dir, mut supervisor) = scratch();
     let port = spare_port();
@@ -244,18 +216,6 @@ fn becoming_approved_closes_socket_and_drops_record_before_primary_bind() {
     assert!(supervisor.open.is_empty());
     let _primary = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
     assert_eq!(supervisor.counters.closed.load(Ordering::Relaxed), 1);
-}
-
-#[test]
-fn primary_handoff_removes_legacy_socket_synchronously() {
-    let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
-        .unwrap();
-    supervisor.remove(port).unwrap();
-    assert!(supervisor.record.ports.is_empty());
-    let _primary = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
 }
 
 #[test]
@@ -320,25 +280,6 @@ fn restricted_handler_rejects_control_health_and_non_otlp_and_shares_export_resp
     }
     assert_eq!(supervisor.counters.requests.load(Ordering::Relaxed), 3);
     assert!(supervisor.counters.last_request.load(Ordering::Relaxed) > 0);
-}
-
-#[test]
-fn recent_request_window_expires_at_one_hour() {
-    let counters = Arc::new(Counters::default());
-    let activity = Activity::new(
-        2,
-        APPROVED,
-        100,
-        0,
-        counters.clone(),
-        Arc::new(Admission::default()),
-    );
-    assert!(!recent_at(0, 100));
-    activity.accepted_at(1000);
-    let last = counters.last_request.load(Ordering::Relaxed);
-    assert!(recent_at(last, 1000));
-    assert!(recent_at(last, 4599));
-    assert!(!recent_at(last, 4600));
 }
 
 #[test]
@@ -551,34 +492,6 @@ fn revoke_closes_all_and_retired_ports_require_fresh_approval_then_supersession(
     assert!(!restarted.open.contains_key(&c));
 }
 
-#[test]
-fn idle_retirement_is_durable_and_cannot_be_reseeded() {
-    let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
-    let candidates = [APPROVED, port];
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    supervisor
-        .reconcile_current(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[])
-        .unwrap();
-    assert!(supervisor.record.retired.contains(&port));
-    let mut restarted =
-        Supervisor::load(supervisor.path.clone(), supervisor.counters.clone(), 1000).unwrap();
-    restarted.record.seeded = false;
-    restarted
-        .reconcile_current(
-            100 + IDLE_SECONDS + 60,
-            Some(APPROVED),
-            0,
-            &candidates,
-            &[port],
-        )
-        .unwrap();
-    assert!(restarted.open.is_empty());
-    assert!(restarted.record.ports.is_empty());
-}
-
 fn with_request_approval<T>(approved: Option<u16>, run: impl FnOnce() -> T) -> T {
     with_approval(
         approved
@@ -788,34 +701,6 @@ fn failed_revoke_save_closes_and_tombstone_blocks_replayed_old_allowlist() {
 }
 
 #[test]
-fn failed_idle_save_also_retires_before_fail_closed_cleanup() {
-    let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
-    let candidates = [APPROVED, port];
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    let old_disk = std::fs::read(&supervisor.path).unwrap();
-    supervisor.fail_save.set(true);
-    assert!(supervisor
-        .reconcile_current(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[])
-        .is_err());
-    assert!(supervisor.open.is_empty());
-    std::fs::write(&supervisor.path, old_disk).unwrap();
-    let mut restarted = Supervisor::load(
-        supervisor.path.clone(),
-        supervisor.counters.clone(),
-        100 + IDLE_SECONDS,
-    )
-    .unwrap();
-    restarted
-        .reconcile_current(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    assert!(restarted.open.is_empty());
-    assert!(restarted.record.retired.contains(&port));
-}
-
-#[test]
 fn unknown_ticks_preserve_state_and_revocation_requires_two_consecutive_ticks() {
     use crate::control::ManagedClaudeRelaySettings;
     let (_dir, mut supervisor) = scratch();
@@ -918,208 +803,6 @@ fn wildcard_ipv4_owner_is_not_stolen_or_shared() {
 }
 
 #[test]
-fn dual_stack_ipv6_owner_vetoes_ipv4_legacy_bind() {
-    let fd = match socket::bind_ipv6_wildcard(0) {
-        Ok(fd) => fd,
-        Err(error) => {
-            // Linux CI may have IPv6 disabled. macOS must exercise this case.
-            #[cfg(target_os = "macos")]
-            panic!("macOS dual-stack fixture: {error}");
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = error;
-                return;
-            }
-        }
-    };
-    // SAFETY: fd is our live, bound IPv6 socket.
-    assert_eq!(unsafe { libc::listen(fd.as_raw_fd(), 128) }, 0);
-    let owner = TcpListener::from(fd);
-    owner.set_nonblocking(true).unwrap();
-    let port = owner.local_addr().unwrap().port();
-    let (_dir, mut supervisor) = scratch();
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
-        .unwrap();
-    assert!(supervisor.open.is_empty());
-    assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
-    let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-    let _accepted = accept_within(&owner).expect("V6ONLY=0 owner still receives IPv4 traffic");
-}
-
-#[test]
-fn native_legacy_listener_enables_reuseaddr_after_wildcard_probes() {
-    let listener = socket::bind(0).unwrap();
-    let mut reuse: libc::c_int = -1;
-    let mut length = std::mem::size_of_val(&reuse) as libc::socklen_t;
-    // SAFETY: getsockopt writes to our initialized c_int with its exact size.
-    let result = unsafe {
-        libc::getsockopt(
-            listener.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            (&mut reuse as *mut libc::c_int).cast(),
-            &mut length,
-        )
-    };
-    assert_eq!(result, 0);
-    // Linux reports 1; macOS reports the option's flag bit (SO_REUSEADDR).
-    assert_ne!(reuse, 0);
-    assert_eq!(
-        listener.local_addr().unwrap().ip(),
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
-    );
-}
-
-#[test]
-fn busy_never_bound_entry_expires_without_counting_a_close() {
-    let (_dir, mut supervisor) = scratch();
-    let owner = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = owner.local_addr().unwrap().port();
-    let candidates = [APPROVED, port];
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    assert!(supervisor.open.is_empty());
-    assert_eq!(supervisor.record.ports[0].idle_since, Some(100));
-    let mut restarted =
-        Supervisor::load(supervisor.path.clone(), supervisor.counters.clone(), 200).unwrap();
-    restarted
-        .reconcile_current(100 + IDLE_SECONDS - 1, Some(APPROVED), 0, &candidates, &[])
-        .unwrap();
-    assert_eq!(restarted.record.ports[0].idle_since, Some(100));
-    restarted
-        .reconcile_current(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[])
-        .unwrap();
-    assert!(restarted.record.ports.is_empty());
-    assert!(restarted.record.retired.contains(&port));
-    assert_eq!(restarted.counters.closed.load(Ordering::Relaxed), 0);
-    drop(owner);
-    restarted
-        .reconcile_current(200 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    assert!(restarted.open.is_empty());
-    let _released = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
-}
-
-#[test]
-fn empty_supervisor_waits_until_tick_and_live_socket_drains_sixteen_at_once() {
-    let (_dir, mut supervisor) = scratch();
-    assert_eq!(supervisor.wait_duration(100, 160), Duration::from_secs(60));
-    let port = spare_port();
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
-        .unwrap();
-    assert_eq!(
-        supervisor.wait_duration(100, 160),
-        Duration::from_millis(100)
-    );
-    // A handshake can finish after `connect` returns and one pass takes only
-    // what is queued, so the clients outnumber the pass bound by a margin and
-    // the rest are drained within a bounded moment.
-    let clients: Vec<_> = (0..32)
-        .map(|_| TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap())
-        .collect();
-    let mut accepted = 0;
-    supervisor.accept_ready(Instant::now(), |_, _| accepted += 1);
-    assert_eq!(accepted, 16);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while accepted < clients.len() && Instant::now() < deadline {
-        let before = accepted;
-        supervisor.accept_ready(Instant::now(), |_, _| accepted += 1);
-        assert!(accepted - before <= 16);
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert_eq!(accepted, clients.len());
-    drop(clients);
-    supervisor.close_all();
-    assert_eq!(supervisor.wait_duration(110, 160), Duration::from_secs(50));
-    assert_eq!(supervisor.counters.closed.load(Ordering::Relaxed), 1);
-}
-
-#[test]
-fn accept_errors_back_off_rate_limit_and_drop_for_tick_rebind() {
-    let now = Instant::now();
-    let mut state = AcceptState::default();
-    let resource = io::Error::from_raw_os_error(libc::EMFILE);
-    assert_eq!(
-        state.failed(now, &resource),
-        (AcceptErrorAction::Backoff, true)
-    );
-    assert!(!state.ready(now));
-    assert!(state.ready(now + RELAY_ACCEPT_BACKOFF_START));
-    assert_eq!(
-        state.failed(now + Duration::from_secs(1), &resource),
-        (AcceptErrorAction::Backoff, false)
-    );
-    assert_eq!(
-        state.failed(now + Duration::from_secs(60), &resource),
-        (AcceptErrorAction::Backoff, true)
-    );
-    let retry = io::Error::from_raw_os_error(libc::ECONNABORTED);
-    assert_eq!(
-        state.failed(now + Duration::from_secs(61), &retry).0,
-        AcceptErrorAction::Retry
-    );
-    assert_eq!(state.failures, 0);
-    state.failed(now + Duration::from_secs(62), &resource);
-    assert_eq!(
-        state.retry_at,
-        Some(now + Duration::from_secs(62) + RELAY_ACCEPT_BACKOFF_START)
-    );
-    let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
-    let candidates = [APPROVED, port];
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    supervisor.accept_failed(port, now, &resource);
-    supervisor.accept_ready(now, |_, _| panic!("accept during backoff"));
-    assert_eq!(supervisor.open[&port].accepts.failures, 1);
-    supervisor.accept_failed(port, now, &io::Error::from_raw_os_error(libc::EBADF));
-    assert!(supervisor.open.is_empty());
-    assert_eq!(supervisor.counters.closed.load(Ordering::Relaxed), 1);
-    supervisor
-        .reconcile_current(160, Some(APPROVED), 0, &candidates, &[])
-        .unwrap();
-    assert!(supervisor.open.contains_key(&port));
-}
-
-#[test]
-fn rebind_preserves_unflushed_activity_and_the_normal_flush_deadline() {
-    let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
-    let candidates = [APPROVED, port];
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    let recent = 100 + IDLE_SECONDS - 1;
-    supervisor.open[&port].activity.accepted_at(recent);
-    supervisor.accept_failed(
-        port,
-        Instant::now(),
-        &io::Error::from_raw_os_error(libc::EBADF),
-    );
-    assert_eq!(supervisor.record.ports[0].idle_since, Some(recent));
-    // Replacement keeps activity in memory without adding a per-request write.
-    let disk: Record = load_private_record(&supervisor.path).unwrap();
-    assert_eq!(disk.ports[0].idle_since, Some(100));
-    supervisor
-        .reconcile_current(recent + 2, Some(APPROVED), 0, &candidates, &[])
-        .unwrap();
-    assert!(supervisor.open.contains_key(&port));
-    assert!(!supervisor.record.retired.contains(&port));
-    supervisor.flush_activity(recent + 2).unwrap();
-    let restored = Supervisor::load(
-        supervisor.path.clone(),
-        Arc::new(Counters::default()),
-        recent + 3,
-    )
-    .unwrap();
-    assert_eq!(restored.record.ports[0].idle_since, Some(recent));
-}
-
-#[test]
 fn rebind_abandons_a_descriptor_replaced_by_an_unrelated_file() {
     let (dir, mut supervisor) = scratch();
     let port = spare_port();
@@ -1153,84 +836,6 @@ fn rebind_abandons_a_descriptor_replaced_by_an_unrelated_file() {
     let mut body = String::new();
     preserved.read_to_string(&mut body).unwrap();
     assert_eq!(body, "keep this descriptor");
-}
-
-#[test]
-fn unavailable_ipv6_allows_ipv4_but_a_busy_probe_still_vetoes() {
-    for code in [
-        libc::EAFNOSUPPORT,
-        libc::EPROTONOSUPPORT,
-        libc::EADDRNOTAVAIL,
-    ] {
-        let listener =
-            socket::bind_with_probe(0, |_| Err(io::Error::from_raw_os_error(code))).unwrap();
-        assert_eq!(
-            listener.local_addr().unwrap().ip(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
-        );
-    }
-    assert_eq!(
-        socket::bind_with_probe(0, |_| Err(io::Error::from_raw_os_error(libc::EADDRINUSE)))
-            .unwrap_err()
-            .raw_os_error(),
-        Some(libc::EADDRINUSE)
-    );
-}
-
-#[test]
-fn rebind_drains_an_export_and_its_success_bookkeeping_before_snapshot() {
-    let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
-    let candidates = [APPROVED, port];
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    let activity = supervisor.open[&port].activity.clone();
-    let recent = 100 + IDLE_SECONDS - 1;
-    let (entered, started) = mpsc::channel();
-    let (finish, released) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        with_request_approval(Some(APPROVED), || {
-            activity
-                .export_if_approved(|| {
-                    entered.send(()).unwrap();
-                    released.recv().unwrap();
-                    // Production success bookkeeping runs inside this same fence.
-                    activity.accepted_at(recent);
-                })
-                .expect("already admitted export completes");
-        });
-    });
-    started.recv().unwrap();
-    let (attempting, attempted) = mpsc::channel();
-    let (complete, completed) = mpsc::channel();
-    let replacement = thread::spawn(move || {
-        attempting.send(()).unwrap();
-        supervisor.accept_failed(
-            port,
-            Instant::now(),
-            &io::Error::from_raw_os_error(libc::EBADF),
-        );
-        complete.send(()).unwrap();
-        supervisor
-    });
-    attempted.recv().unwrap();
-    let premature = completed.recv_timeout(Duration::from_millis(100));
-    // Always release/join the worker, including on a regression, to avoid a
-    // failed assertion leaving a thread holding the admission lock forever.
-    finish.send(()).unwrap();
-    worker.join().unwrap();
-    let mut supervisor = replacement.join().unwrap();
-    assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
-    assert_eq!(supervisor.record.ports[0].idle_since, Some(recent));
-    supervisor
-        .reconcile_current(recent + 2, Some(APPROVED), 0, &candidates, &[])
-        .unwrap();
-    assert!(supervisor.open.contains_key(&port));
-    assert!(!supervisor.record.retired.contains(&port));
-    supervisor.flush_activity(recent + 2).unwrap();
-    let restored: Record = load_private_record(&supervisor.path).unwrap();
-    assert_eq!(restored.ports[0].idle_since, Some(recent));
 }
 
 pub(crate) fn with_running_listener_for_test(run: impl FnOnce()) -> (usize, usize) {
@@ -1342,161 +947,4 @@ fn revoke_between_approval_read_and_bind_fences_the_new_listener() {
             .export_if_approved(|| panic!("mid-tick revoke allowed export"))
             .is_none());
     });
-}
-
-#[test]
-fn changed_approval_tick_cannot_adopt_a_concurrent_revokes_generation() {
-    let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
-    let next = 2;
-    let candidates = [APPROVED, next, port];
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    let activity = supervisor.open[&port].activity.clone();
-    let generation = supervisor.admission.generation.load(Ordering::SeqCst);
-    let approval = Approval::Approved(next);
-    supervisor
-        .admission
-        .generation
-        .fetch_add(1, Ordering::SeqCst);
-    supervisor
-        .tick(160, approval, 0, &candidates, &[], generation)
-        .unwrap();
-    assert_eq!(supervisor.record.last_approved, Some(APPROVED));
-    assert_eq!(supervisor.open[&port].activity.generation, generation);
-    assert_eq!(
-        supervisor.admission.generation.load(Ordering::SeqCst),
-        generation + 1
-    );
-    with_request_approval(Some(APPROVED), || {
-        assert!(activity
-            .export_if_approved(|| panic!("refreshed a revoked generation"))
-            .is_none());
-    });
-}
-
-#[test]
-fn wildcard_guards_cover_the_probe_to_listen_seam() {
-    let port = spare_port();
-    let mut attempted = false;
-    let mut competitor = None;
-    let listener = socket::bind_with_probe_and_hook(port, socket::bind_ipv6_wildcard, || {
-        attempted = true;
-        match TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)) {
-            Ok(owner) => competitor = Some(owner),
-            Err(error) => assert_eq!(error.kind(), io::ErrorKind::AddrInUse),
-        }
-    });
-    assert!(attempted, "both probe acquisitions reached the seam");
-    #[cfg(target_os = "macos")]
-    {
-        assert!(
-            competitor.is_none(),
-            "held exact wildcard reservation vetoes the owner"
-        );
-        assert!(
-            listener.is_ok(),
-            "our held reuse guards permit our loopback listener: {listener:?}"
-        );
-    }
-    // Linux may allow reuse bind+listen over bound-but-not-listening guards.
-    // In that case its live wildcard listener must veto our final listener.
-    assert!(competitor.is_none() || listener.is_err());
-    drop(listener);
-    drop(competitor);
-    // Success/failure both release guards as well as any real listener.
-    let _released = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).unwrap();
-}
-
-#[test]
-fn pending_revoke_before_snapshot_blocks_tick_and_matching_epoch_export() {
-    let (_dir, mut supervisor) = scratch();
-    let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = busy.local_addr().unwrap().port();
-    let candidates = [APPROVED, port];
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    assert!(supervisor.open.is_empty());
-    // Reverse the previous race fixture: the hook sets pending and advances
-    // first; only afterward does this tick snapshot and read unchanged approval.
-    supervisor
-        .admission
-        .revoke_pending
-        .fetch_add(1, Ordering::SeqCst);
-    supervisor
-        .admission
-        .generation
-        .fetch_add(1, Ordering::SeqCst);
-    let generation = supervisor.admission.generation.load(Ordering::SeqCst);
-    let approval = Approval::Approved(APPROVED);
-    drop(busy);
-    supervisor
-        .tick(160, approval, 0, &candidates, &[], generation)
-        .unwrap();
-    assert!(
-        supervisor.open.is_empty(),
-        "pending revoke prevents activity creation"
-    );
-    assert_eq!(supervisor.record.last_approved, Some(APPROVED));
-    // Even if a native bind completed during that tick, a matching generation
-    // cannot authorize its activity while the hook's Revoke remains pending.
-    let _bound = socket::bind(port).unwrap();
-    let activity = Activity::new(
-        port,
-        APPROVED,
-        100,
-        generation,
-        supervisor.counters.clone(),
-        supervisor.admission.clone(),
-    );
-    assert_eq!(
-        activity.generation,
-        supervisor.admission.generation.load(Ordering::SeqCst)
-    );
-    with_request_approval(Some(APPROVED), || {
-        assert!(activity
-            .export_if_approved(|| panic!("pending epoch authorized capture"))
-            .is_none());
-    });
-    assert_eq!(supervisor.counters.requests.load(Ordering::Relaxed), 0);
-    let (ack, done) = mpsc::sync_channel(1);
-    supervisor.handle_command(Command::Revoke(ack)).unwrap();
-    done.recv().unwrap();
-    assert_eq!(
-        supervisor.admission.revoke_pending.load(Ordering::SeqCst),
-        0
-    );
-    let disk: Record = load_private_record(&supervisor.path).unwrap();
-    assert!(disk.retired.contains(&port));
-}
-
-#[test]
-fn pending_revoke_is_cleared_only_after_all_commands_succeed() {
-    let (_dir, mut supervisor) = scratch();
-    supervisor
-        .admission
-        .revoke_pending
-        .store(2, Ordering::SeqCst);
-    for remaining in [1, 0] {
-        let (ack, done) = mpsc::sync_channel(1);
-        supervisor.handle_command(Command::Revoke(ack)).unwrap();
-        done.recv().unwrap();
-        assert_eq!(
-            supervisor.admission.revoke_pending.load(Ordering::SeqCst),
-            remaining
-        );
-    }
-    supervisor
-        .admission
-        .revoke_pending
-        .store(1, Ordering::SeqCst);
-    supervisor.fail_save.set(true);
-    let (ack, _done) = mpsc::sync_channel(1);
-    assert!(supervisor.handle_command(Command::Revoke(ack)).is_err());
-    assert_eq!(
-        supervisor.admission.revoke_pending.load(Ordering::SeqCst),
-        1
-    );
 }

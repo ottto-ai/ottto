@@ -409,6 +409,7 @@ mod tests {
                 fingerprint_changed_nanos: 0,
                 fingerprint_birth_nanos: 0,
                 fingerprint_opened_identity: String::new(),
+                withheld_content_stamp: None,
             };
             roots.insert(
                 root.clone(),

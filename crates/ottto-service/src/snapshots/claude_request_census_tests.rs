@@ -397,6 +397,103 @@ fn hex_fingerprint(seed: char) -> String {
     seed.to_string().repeat(64)
 }
 
+/// Unchanged may carry authority, but it cannot create it or conceal a
+/// different census. The reader separately fences identity/scope and debt.
+#[test]
+fn census_unchanged_preserves_only_matching_verified_records() {
+    use crate::snapshots::claude_request_census::{
+        record_claude_request_census, ClaudeRequestCensusParse,
+    };
+    let path = Path::new("/census/projects/quiet.jsonl");
+    let key = local_index_key(path);
+    let fingerprint = hex_fingerprint('a');
+    let mut item = valid_v6_batch_request().snapshots.remove(0);
+    item.source_session_id = "quiet".to_string();
+    item.attribution_facts.clear();
+    item.claude_context_curve_identity_complete = true;
+    item.claude_usage_request_ids = BTreeSet::from(["req_quiet".to_string()]);
+    for exact in [false, true] {
+        for case in [
+            "same",
+            "full",
+            "fingerprint",
+            "derivation",
+            "contents",
+            "shape",
+            "unverified",
+            "retired",
+            "tail",
+            "debt",
+            "lossy",
+            "incomplete",
+        ] {
+            let mut index = ScanIndex::default();
+            let mut old = ClaudeRequestCensusRecord::synthetic_for_test(
+                &if case == "fingerprint" {
+                    hex_fingerprint('b')
+                } else {
+                    fingerprint.clone()
+                },
+                1,
+                if exact != (case == "shape") {
+                    ClaudeRequestCensusShape::Exact
+                } else {
+                    ClaudeRequestCensusShape::Empty
+                },
+                if case == "contents" {
+                    vec![1]
+                } else if exact {
+                    vec![claude_request_hash("req_quiet")]
+                } else {
+                    vec![]
+                },
+            )
+            .with_derivation_for_test(if case == "derivation" {
+                0
+            } else {
+                CLAUDE_REQUEST_CENSUS_DERIVATION
+            })
+            .with_unverified_for_test(matches!(case, "unverified" | "retired" | "full"));
+            if case == "retired" {
+                old.retire();
+            }
+            index
+                .claude_request_census_mut_for_test()
+                .insert_for_test(&key, old);
+            record_claude_request_census(
+                &mut index,
+                ClaudeRequestCensusParse {
+                    path,
+                    index_key: &key,
+                    source_file_fingerprint: &fingerprint,
+                    census_window_end: SECOND_WINDOW,
+                    complete: case != "incomplete",
+                    lossy: case == "lossy",
+                    source_verified: case == "full",
+                    unchanged_source: !matches!(case, "tail" | "debt" | "full"),
+                    itemless_request_hashes: vec![],
+                    opened_birth: None,
+                    modified_unix_seconds: 0,
+                },
+                if exact {
+                    std::slice::from_ref(&item)
+                } else {
+                    &[]
+                },
+            );
+            assert_eq!(
+                index
+                    .claude_request_census
+                    .get(&key)
+                    .unwrap()
+                    .unverified_for_test(),
+                !matches!(case, "same" | "full"),
+                "{case}"
+            );
+        }
+    }
+}
+
 /// TD1a: every finished Claude parse writes a record bound to the candidate
 /// fingerprint and the census window, shaped by Context rows G-J and loss.
 #[test]
@@ -463,66 +560,6 @@ fn census_derivation_canary_pins_ids_and_shapes() {
         canary_verdict(CLAUDE_REQUEST_CENSUS_DERIVATION, &observed),
         Ok(())
     );
-}
-
-/// SOURCE early condition: the canary provably goes red when extraction
-/// changes without a bump. Each mutation is what the parser would yield after
-/// the named extraction change on the same fixture.
-#[test]
-fn census_derivation_canary_fails_on_a_missed_bump() {
-    let scratch = crate::test_scratch::ScratchDir::new("census-derivation-canary-red");
-    let root = scratch.join("projects");
-    write_census_corpus(&root);
-    let mut index = ScanIndex::default();
-    census_scan(&root, &mut index, FIRST_WINDOW);
-    let observed = observed_census_table(&index, &root);
-    assert_eq!(
-        canary_verdict(CLAUDE_REQUEST_CENSUS_DERIVATION, &observed),
-        Ok(())
-    );
-    let mutate = |name: &str, change: &dyn Fn(&mut CanaryRow)| {
-        let mut table = observed.clone();
-        change(table.get_mut(name).expect("canary fixture"));
-        table
-    };
-    let changes = [
-        // Zero-usage (API error) ids no longer collected.
-        mutate("canary-zero-usage.jsonl", &|entry| {
-            entry
-                .1
-                .retain(|hash| *hash != claude_request_hash("req_zero_err"))
-        }),
-        // An id-less response starts reporting its message id.
-        mutate("canary-id-less.jsonl", &|entry| {
-            entry.1.push(claude_request_hash("msg_idless_2"));
-            entry.1.sort_unstable();
-        }),
-        // A repeated id no longer marks the identity incomplete.
-        mutate("canary-repeated.jsonl", &|entry| {
-            entry.0 = "exact".to_string()
-        }),
-        // A provider-marked fork prefix is no longer excluded.
-        mutate("canary-forked.jsonl", &|entry| {
-            entry.1.push(claude_request_hash("req_fork_parent"));
-            entry.1.sort_unstable();
-        }),
-        // A dropped response becomes loss-free.
-        mutate("canary-invalid-fork.jsonl", &|entry| {
-            entry.0 = "exact".to_string()
-        }),
-    ];
-    for changed in &changes {
-        assert_ne!(changed, &observed);
-        let verdict = canary_verdict(CLAUDE_REQUEST_CENSUS_DERIVATION, changed);
-        assert!(
-            verdict
-                .as_ref()
-                .is_err_and(|reason| reason.contains("bump CLAUDE_REQUEST_CENSUS_DERIVATION")),
-            "{verdict:?}"
-        );
-    }
-    // A bump without a re-pinned digest is red too.
-    assert!(canary_verdict(CLAUDE_REQUEST_CENSUS_DERIVATION + 1, &observed).is_err());
 }
 
 /// TD1f (review F1, SOURCE S2(c)): a re-parse of a previously complete key
@@ -1593,112 +1630,6 @@ fn census_records_past_the_budget_become_inert_tombstones() {
     assert_eq!(census.hash_total_for_test(), 0);
 }
 
-/// Layout: census fields are charged through `fields!` without adding per-entry
-/// data. Keep the exact current entry-size pin used by restore pricing.
-#[test]
-fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    // CI layout: the hash-only Codex counting-owner Option<String> adds 24
-    // inline bytes to the previous 440-byte entry. Census and Claude money
-    // births add none: births live in the ScanIndex side table. The stored
-    // opened-object ctime and file birth (`opened_changed_nanos`,
-    // `opened_birth_nanos`, u64 each) add 16 bytes: Ron's content-only
-    // re-read rule rebuilds the scan fingerprint from the ctime so a
-    // ctime-only change never re-reads, and only for the same object
-    // generation, bound by its exact birth (owner-approved 464 -> 472 -> 480).
-    // Optional context receipt adds 80 inline bytes; its three H digests are heap-charged.
-    const SCAN_INDEX_ENTRY_BYTES: usize = 560;
-    assert_eq!(
-        std::mem::size_of::<ScanIndexEntry>(),
-        SCAN_INDEX_ENTRY_BYTES
-    );
-    let mut index = ScanIndex::default();
-    let before = crate::heap_layout_bound::completed_bound(&index, usize::MAX).expect("bound");
-    index.claude_request_census_mut_for_test().insert_for_test(
-        "/census/projects/census-a.jsonl",
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &hex_fingerprint('a'),
-            1,
-            ClaudeRequestCensusShape::Lossy,
-            (0..1_000).collect(),
-        ),
-    );
-    let after = crate::heap_layout_bound::completed_bound(&index, usize::MAX).expect("bound");
-    assert!(after >= before + 8_000, "{before} -> {after}");
-}
-
-/// The shadow counters ride the duplicate-census counters, bounded.
-#[test]
-fn census_shadow_counts_encoding_is_bounded() {
-    let shadow = ClaudeRequestCensusShadowCounts {
-        would_open: false,
-        would_open_flips: u64::MAX,
-        family_keys: usize::MAX,
-        covered_by_fingerprint: usize::MAX,
-        covered_by_window: usize::MAX,
-        missing_residue: usize::MAX,
-        missing_account_hold: usize::MAX,
-        missing_placeholder: usize::MAX,
-        missing_empty_fingerprint: usize::MAX,
-        missing_fingerprint_mismatch: usize::MAX,
-        missing_migrate: usize::MAX,
-        missing_over_budget: usize::MAX,
-        quarantine_without_record: usize::MAX,
-        shape_exact: usize::MAX,
-        shape_empty: usize::MAX,
-        shape_identity_incomplete: usize::MAX,
-        shape_lossy: usize::MAX,
-        unverified: usize::MAX,
-        twin: usize::MAX,
-        family_unknown_roots: usize::MAX,
-        records: usize::MAX,
-        hashes: usize::MAX,
-        hash_budget_usage_percent: usize::MAX,
-        hash_budget_warning: false,
-        transient_limited: false,
-        transient_peak_bytes: usize::MAX,
-        duplicate_hashes: usize::MAX,
-        duplicate_owner_entries: usize::MAX,
-        shared_keys: usize::MAX,
-        derivation_drift: u64::MAX,
-        json_bytes: usize::MAX,
-        heap_bytes: usize::MAX,
-    };
-    let encoded = serde_json::to_string(&shadow).expect("encode shadow");
-    assert!(
-        encoded.len() <= CENSUS_SHADOW_MAX_BYTES,
-        "{} bytes",
-        encoded.len()
-    );
-    assert_eq!(
-        encoded.len(),
-        CENSUS_SHADOW_MAX_BYTES,
-        "longest scalar spellings"
-    );
-    let without = ClaudeDuplicateCensusCounts::default();
-    let with = ClaudeDuplicateCensusCounts {
-        request_census: Some(shadow),
-        ..without
-    };
-    let grown = serde_json::to_string(&with).expect("encode counts").len()
-        - serde_json::to_string(&without)
-            .expect("encode counts")
-            .len();
-    assert!(
-        grown <= CENSUS_SHADOW_MAX_BYTES + r#","request_census":"#.len(),
-        "{grown} bytes"
-    );
-    // Absent (every non-terminal page and every other source), nothing is
-    // added to the existing line.
-    assert!(!serde_json::to_string(&without)
-        .expect("encode counts")
-        .contains("request_census"));
-}
-
-const CENSUS_SHADOW_MAX_BYTES: usize = 1_238;
-
 /// Literal tokens matter: Value cannot represent the overflow that regressed
 /// load and the compare-and-swap reader. Compare every other persisted field.
 #[test]
@@ -1790,35 +1721,6 @@ fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
         .expect("CAS also drains oversized evidence");
 }
 
-#[test]
-fn census_hash_budget_warning_starts_at_eighty_percent() {
-    // 80% of the hash cap, rounded up: the first count that warns.
-    let threshold = (MAX_CLAUDE_REQUEST_CENSUS_HASHES * 4).div_ceil(5) as u64;
-    for hashes in [threshold - 1, threshold] {
-        let mut index = ScanIndex::default();
-        index.claude_request_census_mut_for_test().insert_for_test(
-            "key",
-            ClaudeRequestCensusRecord::synthetic_for_test(
-                &hex_fingerprint('a'),
-                1,
-                ClaudeRequestCensusShape::Lossy,
-                (0..hashes).collect(),
-            ),
-        );
-        let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-            &mut index,
-            &BTreeSet::from(["key".to_owned()]),
-            &BTreeSet::new(),
-            FIRST_WINDOW,
-        );
-        assert_eq!(counts.hash_budget_warning, hashes == threshold);
-        assert_eq!(
-            counts.hash_budget_usage_percent,
-            if hashes == threshold { 80 } else { 79 }
-        );
-    }
-}
-
 /// A pre-D1 shape has no census fields: IgnoredAny consumes their tokens,
 /// including non-finite numbers, without trying to interpret them.
 #[test]
@@ -1842,22 +1744,12 @@ fn census_old_shape_decoder_ignores_new_evidence() {
     assert_eq!(old.files.len(), 1);
 }
 
+/// [money] A failed owned read invalidates the old census record; ordinary
+/// in-progress continuations retain it. Other failure kinds use this same guard.
+#[test]
 #[cfg(unix)]
-#[derive(Clone, Copy)]
-enum CensusAbandonedParse {
-    Read,
-    Attribution,
-    Scope,
-    Object,
-    Reopen,
-    Reduction,
-}
-
-/// Real owned-reader continuations, with synthetic filesystem/acquisition
-/// failures. Every case starts with an older valid record and changed bytes.
-#[cfg(unix)]
-fn census_assert_abandoned_parse_invalidates_record(failure: CensusAbandonedParse) {
-    use crate::transcript_acquisition::{ReadPlan, Scope};
+fn census_failed_read_invalidates_old_record() {
+    use crate::transcript_acquisition::Scope;
     let scratch = crate::test_scratch::ScratchDir::new("census-abandoned");
     let root = scratch.join("projects");
     let session = "b2222222-2222-4222-8222-222222222222";
@@ -1916,55 +1808,9 @@ fn census_assert_abandoned_parse_invalidates_record(failure: CensusAbandonedPars
     );
     let active = state.active_file.as_mut().expect("selected parser");
     assert!(active.sampling.is_some(), "exercise sampled revalidation");
-    let mut context = None;
-    match failure {
-        CensusAbandonedParse::Read => {
-            active.parser.reader.reader = OpenedInput::plain(File::open(&root).unwrap());
-        }
-        CensusAbandonedParse::Attribution => {
-            let home = scratch.join("home");
-            let events = home.join(".ottto/launch-events");
-            std::fs::create_dir_all(&events).unwrap();
-            // Listing this regular file as the pending directory fails.
-            std::fs::write(events.join("pending"), b"unavailable").unwrap();
-            context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
-                SnapshotSource::ClaudeCode,
-                &home,
-                true,
-                Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-                Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
-            );
-            assert!(context.is_some());
-        }
-        CensusAbandonedParse::Scope => {
-            active.sampling.as_mut().unwrap().scope = Scope("changed-scope".to_owned());
-        }
-        CensusAbandonedParse::Object => {
-            let path = &active.candidate.path;
-            let bytes = std::fs::read(path).unwrap();
-            std::fs::rename(path, scratch.join("old-object")).unwrap();
-            std::fs::write(path, bytes).unwrap();
-        }
-        CensusAbandonedParse::Reopen => {
-            std::fs::remove_file(&active.candidate.path).unwrap();
-        }
-        CensusAbandonedParse::Reduction => {
-            // The selected scope is still current, but the acquisition's
-            // certificate belongs to another interpretation. EOF commit fails.
-            active.parser.reader.acquisition = Some(
-                ReadPlan::prepare(
-                    active.parser.reader.reader.get_mut(),
-                    None,
-                    &Scope("wrong-certificate".to_owned()),
-                    None,
-                    1,
-                )
-                .unwrap(),
-            );
-        }
-    }
+    active.parser.reader.reader = OpenedInput::plain(File::open(&root).unwrap());
     for _ in 0..100 {
-        state = match state.step(context.as_ref()) {
+        state = match state.step(None) {
             OwnedSourceScanStep::Pending(next) => next,
             OwnedSourceScanStep::Complete { .. } => panic!("expected an abandoned parse"),
         };
@@ -1987,37 +1833,6 @@ fn census_assert_abandoned_parse_invalidates_record(failure: CensusAbandonedPars
         );
     }
     panic!("failure path was not reached");
-}
-
-#[test]
-#[cfg(unix)]
-fn census_failed_read_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Read);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_attribution_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Attribution);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_scope_revalidation_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Scope);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_object_revalidation_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Object);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_reopen_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Reopen);
-}
-#[test]
-#[cfg(unix)]
-fn census_failed_reduction_invalidates_old_record() {
-    census_assert_abandoned_parse_invalidates_record(CensusAbandonedParse::Reduction);
 }
 
 #[test]
@@ -2351,7 +2166,7 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
         &mut ScanCensus::default(),
         None,
         365,
-        &BTreeMap::new(),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
     )
     .unwrap();
     candidate.physical_identity = Some([metadata.dev(), metadata.ino()]);

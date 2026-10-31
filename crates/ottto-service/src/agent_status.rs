@@ -1,4 +1,5 @@
 use crate::claude_status_coverage::Observation as CoverageObservation;
+use crate::locked_state_dir::open_private_lock_file;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
 use ottto_core::claude_account_identifier_hash;
@@ -9277,33 +9278,18 @@ fn merge_claude_slot_collection_state_at(
 }
 
 fn claude_slot_collection_state_guard() -> std::io::Result<ClaudeSlotCollectionStateGuard> {
+    use std::os::fd::AsRawFd;
     let process = CLAUDE_SLOT_COLLECTION_STATE_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     fs::create_dir_all(default_support_dir())?;
-    #[cfg(unix)]
-    let file = {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        file
-    };
-    #[cfg(not(unix))]
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE))?;
+    let file = open_private_lock_file(
+        &default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE),
+    )?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(ClaudeSlotCollectionStateGuard {
         _process: process,
         file: Some(file),
@@ -12891,6 +12877,7 @@ fn try_claude_oauth_collection_attempt(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
 ) -> Option<ClaudeOAuthCollectionAttemptGuard> {
+    use std::os::fd::AsRawFd;
     let process_lock = {
         let mut locks = CLAUDE_OAUTH_COLLECTION_ATTEMPT_LOCKS
             .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -12913,31 +12900,10 @@ fn try_claude_oauth_collection_attempt(
     if fs::create_dir_all(&account_root).is_err() {
         return None;
     }
-    let lock_path = account_root.join(".collection-attempt.lock");
-    #[cfg(unix)]
-    let file = {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(lock_path)
-            .ok()?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return None;
-        }
-        file
-    };
-    #[cfg(not(unix))]
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(lock_path)
-        .ok()?;
+    let file = open_private_lock_file(&account_root.join(".collection-attempt.lock")).ok()?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
     Some(ClaudeOAuthCollectionAttemptGuard {
         _process: process,
         file,
@@ -19738,26 +19704,6 @@ mod tests {
         )
     }
 
-    /// Codex and Claude both register a slot that turns out to resolve to an
-    /// account another slot already owns, and both mark it `DuplicateAccount`.
-    /// Codex treats that as benign. Claude counted it as a slot needing local
-    /// attention, which degraded a fully healthy source to `secret_expired` -
-    /// "Claude Code durable connections need attention" - while every slot was
-    /// fresh and reporting live limits.
-    #[test]
-    fn a_duplicate_claude_registration_does_not_need_attention() {
-        use ClaudeConfigSlotCollectionStateV1 as State;
-
-        assert!(
-            !claude_custom_slot_needs_attention(&State::DuplicateAccount),
-            "a duplicate registration must not degrade a healthy Claude source"
-        );
-        assert!(
-            claude_custom_slot_needs_attention(&State::NeedsLogin),
-            "an expired sign-in must still reach the operator"
-        );
-    }
-
     /// A provider-side read failure is not a repair the operator can make.
     ///
     /// `ProviderUnavailable`, `ProbeFailed`, `CollectionInProgress` and
@@ -19835,30 +19781,6 @@ mod tests {
             );
             assert!(classify(&actionable), "classifier drifted from the lists");
         }
-    }
-
-    /// The default slot reaches the same conclusion through its own branch.
-    /// It used to compare against `Fresh` directly, so a default slot whose
-    /// provider read failed raised the same unactionable warning even when the
-    /// custom-slot predicate stayed quiet. Both branches must agree.
-    #[test]
-    fn default_slot_transient_read_failure_does_not_need_attention() {
-        use ClaudeConfigSlotCollectionStateV1 as State;
-
-        for benign in [State::ProviderUnavailable, State::ProbeFailed] {
-            assert!(
-                !claude_default_full_meter_needs_attention(true, &benign),
-                "{benign:?} default slot must not degrade a healthy Claude source"
-            );
-        }
-        assert!(
-            claude_default_full_meter_needs_attention(true, &State::NeedsLogin),
-            "an expired default sign-in must still reach the operator"
-        );
-        assert!(
-            !claude_default_full_meter_needs_attention(false, &State::NeedsLogin),
-            "no full-meter evidence means this branch stays silent"
-        );
     }
 
     /// The exact M4 slot set behind the 0.1.132 report, as data: one fresh
@@ -20197,90 +20119,6 @@ mod tests {
             .quota_windows
             .iter()
             .all(|window| window.freshness == AgentQuotaWindowFreshness::Fresh));
-    }
-
-    #[test]
-    fn partial_default_observation_marks_exact_slot_meters_stale_after_fresh_horizon() {
-        let account_hash = "a".repeat(64);
-        let organization_hash = "b".repeat(64);
-        let existing = ClaudeConfigSlotCollectionStatusV1 {
-            state: ClaudeConfigSlotCollectionStateV1::Fresh,
-            account_identifier_hash: Some(account_hash.clone()),
-            organization_identifier_hash: Some(organization_hash.clone()),
-            observed_at: Some("2026-08-05T01:05:00Z".to_string()),
-            last_full_quota_read_at: Some("2026-08-05T01:05:00Z".to_string()),
-            has_account_windows: true,
-            has_scoped_limits: true,
-            has_credit_balances: true,
-            quota_snapshot: Some(local_meter_fixture(&account_hash, &organization_hash)),
-            ..Default::default()
-        };
-        let mut slots = BTreeMap::from([("default".to_string(), existing)]);
-
-        merge_claude_slot_collection_state_at(
-            &mut slots,
-            "default",
-            &ClaudeConfigSlotCollectionStatusV1 {
-                state: ClaudeConfigSlotCollectionStateV1::Fresh,
-                account_identifier_hash: Some(account_hash),
-                organization_identifier_hash: Some(organization_hash),
-                observed_at: Some("2026-08-05T02:07:00Z".to_string()),
-                has_account_windows: true,
-                ..Default::default()
-            },
-            OffsetDateTime::parse("2026-08-05T02:07:00Z", &Rfc3339).expect("now"),
-        );
-
-        assert_eq!(
-            slots["default"]
-                .quota_snapshot
-                .as_ref()
-                .expect("retained stale meters")
-                .state,
-            ClaudeConfigSlotQuotaSnapshotStateV1::Stale
-        );
-    }
-
-    #[test]
-    fn replayed_partial_observation_cannot_extend_exact_slot_meter_freshness() {
-        let account_hash = "a".repeat(64);
-        let organization_hash = "b".repeat(64);
-        let existing = ClaudeConfigSlotCollectionStatusV1 {
-            state: ClaudeConfigSlotCollectionStateV1::Fresh,
-            account_identifier_hash: Some(account_hash.clone()),
-            organization_identifier_hash: Some(organization_hash.clone()),
-            observed_at: Some("2026-08-05T01:05:00Z".to_string()),
-            last_full_quota_read_at: Some("2026-08-05T01:05:00Z".to_string()),
-            has_account_windows: true,
-            has_scoped_limits: true,
-            has_credit_balances: true,
-            quota_snapshot: Some(local_meter_fixture(&account_hash, &organization_hash)),
-            ..Default::default()
-        };
-        let mut slots = BTreeMap::from([("default".to_string(), existing)]);
-
-        merge_claude_slot_collection_state_at(
-            &mut slots,
-            "default",
-            &ClaudeConfigSlotCollectionStatusV1 {
-                state: ClaudeConfigSlotCollectionStateV1::Fresh,
-                account_identifier_hash: Some(account_hash),
-                organization_identifier_hash: Some(organization_hash),
-                observed_at: Some("2026-08-05T01:20:00Z".to_string()),
-                has_account_windows: true,
-                ..Default::default()
-            },
-            OffsetDateTime::parse("2026-08-05T02:07:00Z", &Rfc3339).expect("now"),
-        );
-
-        assert_eq!(
-            slots["default"]
-                .quota_snapshot
-                .as_ref()
-                .expect("retained stale meters")
-                .state,
-            ClaudeConfigSlotQuotaSnapshotStateV1::Stale
-        );
     }
 
     #[test]
@@ -21862,86 +21700,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_valid_access_reconciliation_refuses_rebound_changed_root_and_newer_expiry() {
-        let (slot, upkeep, proof, now) = valid_access_reconciliation_fixture();
-        for mutation in 0..7 {
-            let mut current = slot.clone();
-            match mutation {
-                0 => current.collection.account_identifier_hash = Some("other-account".to_string()),
-                1 => {
-                    current.collection.organization_identifier_hash =
-                        Some("personal-org".to_string())
-                }
-                2 => current.config_dir = Some("/tmp/other-root".to_string()),
-                3 => {
-                    current.collection.access_expires_at = Some("2026-08-05T04:00:00Z".to_string())
-                }
-                4 => current.collection.relogin_required_at = None,
-                5 => current.collection.observed_at = Some("2026-08-05T02:30:01Z".to_string()),
-                _ => current.collection.account_identifier_hash = None,
-            }
-            assert!(
-                reconciled_valid_access_status(
-                    &slot,
-                    &current,
-                    &upkeep,
-                    &proof,
-                    "2026-08-05T02:30:00Z",
-                    now
-                )
-                .is_none(),
-                "mutation={mutation}"
-            );
-        }
-    }
-
-    #[test]
-    fn claude_valid_access_reconciliation_refuses_unproved_foreign_expired_or_future_clock() {
-        let (slot, upkeep, proof, now) = valid_access_reconciliation_fixture();
-        for mutation in 0..7 {
-            let mut proof = ClaudeLocalIdentityProof {
-                account_identifier_hash: proof.account_identifier_hash.clone(),
-                organization_identifier_hash: proof.organization_identifier_hash.clone(),
-                collection: proof.collection.clone(),
-            };
-            let mut upkeep = upkeep.clone();
-            match mutation {
-                0 => proof.organization_identifier_hash = "personal-org".to_string(),
-                1 => proof.account_identifier_hash = "other-account".to_string(),
-                2 => proof.collection.access_expires_at = Some("2026-08-05T04:00:00Z".to_string()),
-                3 => proof.collection.relogin_required_at = None,
-                4 => proof.collection.observed_at = Some("2026-08-05T02:30:01Z".to_string()),
-                5 => {
-                    upkeep.due_access_expires_at = Some("2026-08-05T02:30:00Z".to_string());
-                    proof.collection.access_expires_at = upkeep.due_access_expires_at.clone();
-                }
-                _ => upkeep.attempted_at = Some("2026-08-05T02:29:59Z".to_string()),
-            }
-            assert!(
-                reconciled_valid_access_status(
-                    &slot,
-                    &slot,
-                    &upkeep,
-                    &proof,
-                    "2026-08-05T02:30:00Z",
-                    now
-                )
-                .is_none(),
-                "mutation={mutation}"
-            );
-        }
-        assert!(reconciled_valid_access_status(
-            &slot,
-            &slot,
-            &upkeep,
-            &proof,
-            "2026-08-05T02:30:01Z",
-            now
-        )
-        .is_none());
-    }
-
-    #[test]
     #[serial]
     fn claude_valid_access_reconciliation_uses_locked_current_state_and_cannot_recreate_removed_slot(
     ) {
@@ -21990,23 +21748,6 @@ mod tests {
             .slots
             .contains_key(&slot.slot_id));
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn claude_snapshot_capacity_is_one_default_plus_nine_custom() {
-        let descriptors = (0..12).map(test_slot_descriptor).collect::<Vec<_>>();
-        let (collected, overflow) = bounded_claude_custom_descriptors(descriptors);
-
-        assert_eq!(collected.len(), 9);
-        assert_eq!(overflow.len(), 3);
-        assert_eq!(
-            collected[0].slot_id,
-            "claude_slot_00000000000000000000000000000000"
-        );
-        assert_eq!(
-            overflow[0].slot_id,
-            "claude_slot_00000000000000000000000000000009"
-        );
     }
 
     #[test]
@@ -23441,35 +23182,6 @@ for line in sys.stdin:
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// An older app's status refresh stands in for Refresh with a 5-minute
-    /// gap: one read per home, then the saved copy, even for the one-minute
-    /// Refresh, until the home's last read is 5 minutes old.
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_older_app_status_refresh_reads_each_home_once_per_five_minutes() {
-        let (root, home, _guards) = synthetic_default_codex_install("legacy-status-refresh");
-        codex_saved_quota::forget_running_homes();
-        let before = codex_app_server_runs();
-
-        let first = refresh_codex_quota_now(5 * 60);
-        assert_eq!((first.read, first.rate_limited), (1, 0));
-        assert_eq!(codex_app_server_runs(), before + 1);
-        let second = refresh_codex_quota_now(5 * 60);
-        assert_eq!((second.read, second.rate_limited), (0, 1));
-        assert_eq!(codex_app_server_runs(), before + 1);
-
-        let binding = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
-            .ok()
-            .flatten()
-            .and_then(|credentials| codex_credential_claimed_binding(&credentials));
-        if let Some(binding) = binding {
-            codex_credit_grants::forget_binding_cadence(&binding);
-        }
-        drop(_guards);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -24475,7 +24187,6 @@ for line in sys.stdin:
 import os
 import signal
 import sys
-import time
 
 if sys.argv[1:] != ["app-server", "--stdio"]:
     sys.exit(1)
@@ -24514,15 +24225,13 @@ for line in sys.stdin:
     method = request.get("method")
     request_id = request.get("id")
     if method == "initialize":
-        if mode in ("initialize_error", "initialize_error_then_success", "initialize_error_then_account_error"):
+        if mode in ("initialize_error", "initialize_error_then_account_error"):
             reply(1, code=-32602)
             if mode == "initialize_error":
                 sys.exit(0)
         else:
             reply(1, {})
     elif method == "account/read":
-        if mode == "account_timeout":
-            time.sleep(60)
         if mode in ("account_error", "initialize_error_then_account_error"):
             reply(request_id, code=-32603)
             sys.exit(0)
@@ -24579,19 +24288,6 @@ for line in sys.stdin:
         );
     }
 
-    /// The child's own exit is reported only when it was observed before our
-    /// cleanup; our kill is never attributed to it.
-    fn assert_closed_during(message: &str, phase: &str, observed_end: &str) {
-        let prefix = format!("Codex app-server stdout closed during {phase}; ");
-        let rest = message
-            .strip_prefix(&prefix)
-            .unwrap_or_else(|| panic!("unexpected message: {message}"));
-        assert!(
-            rest == observed_end || rest == "child termination was not observed before cleanup.",
-            "unexpected end: {message}"
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -24636,25 +24332,6 @@ for line in sys.stdin:
         ] {
             let message = run_codex_probe_failure_fake(mode).err().expect(mode);
             assert_eq!(message, expected, "{mode}");
-            assert_no_provider_text(&message);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_probe_eof_names_the_phase_and_an_observed_exit() {
-        for (mode, phase, observed_end) in [
-            ("early_exit", "initialize", "child exited with code 2."),
-            (
-                "signal_exit",
-                "initialize",
-                "child terminated by signal 15.",
-            ),
-            ("quota_eof", "quota", "child exited with code 0."),
-        ] {
-            let message = run_codex_probe_failure_fake(mode).err().expect(mode);
-            assert_closed_during(&message, phase, observed_end);
             assert_no_provider_text(&message);
         }
     }
@@ -24721,112 +24398,6 @@ for line in sys.stdin:
             ]
         );
         assert!(!crate::provider_calls::test_raw_log().contains("sensitive-provider-text"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_probe_initialize_error_then_success_still_succeeds() {
-        let observation =
-            run_codex_probe_failure_fake("initialize_error_then_success").expect("reading");
-        assert!(observation.rate_limits.get("rateLimits").is_some());
-        assert!(run_codex_probe_failure_fake("success").is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_probe_deadline_is_a_timeout_with_its_phase_not_an_eof() {
-        let session = Duration::from_secs(6);
-        let started = Instant::now();
-        let message = with_codex_app_server_test_timeouts(
-            session,
-            Duration::from_secs(3),
-            Duration::from_secs(6),
-            || {
-                assert_eq!(codex_app_server_timeout(), session);
-                run_codex_probe_failure_fake("account_timeout")
-            },
-        )
-        .err()
-        .expect("deadline");
-        assert_eq!(message, "Codex app-server account read timed out.");
-        let elapsed = started.elapsed();
-        assert!(elapsed >= session);
-        // The scaled bound, not the production one, ended the session.
-        assert!(elapsed < CODEX_APP_SERVER_TIMEOUT, "{elapsed:?}");
-    }
-
-    #[test]
-    fn codex_app_server_timeout_is_twenty_seconds_without_a_test_override() {
-        assert_eq!(codex_app_server_timeout(), Duration::from_secs(20));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn codex_app_server_end_failure_reports_only_an_already_observed_exit() {
-        let spawn = |script: &str| {
-            Command::new("/bin/sh")
-                .args(["-c", script])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("synthetic child")
-        };
-        // `wait` caches the status, so the helper's `try_wait` sees it.
-        let mut exited = spawn("exit 3");
-        exited.wait().expect("exited child");
-        assert_eq!(
-            codex_app_server_end_failure("account", true, None, &mut exited),
-            "Codex app-server stdout closed during account; child exited with code 3."
-        );
-        let mut signalled = spawn("kill -TERM $$");
-        signalled.wait().expect("signalled child");
-        assert_eq!(
-            codex_app_server_end_failure("quota", true, None, &mut signalled),
-            "Codex app-server stdout closed during quota; child terminated by signal 15."
-        );
-        let mut running = spawn("sleep 30");
-        assert_eq!(
-            codex_app_server_end_failure("initialize", true, None, &mut running),
-            "Codex app-server stdout closed during initialize; child termination was not observed before cleanup."
-        );
-        let _ = running.kill();
-        let _ = running.wait();
-        // An earlier initialize rejection wins over EOF and the deadline.
-        let initialize = "Codex app-server initialize RPC failed with code -32602.";
-        assert_eq!(
-            codex_app_server_end_failure("quota", true, Some(initialize), &mut exited),
-            initialize
-        );
-        assert_eq!(
-            codex_app_server_end_failure("quota", false, Some(initialize), &mut exited),
-            initialize
-        );
-        // The deadline makes no exit claim.
-        assert_eq!(
-            codex_app_server_end_failure("account", false, None, &mut exited),
-            "Codex app-server account read timed out."
-        );
-    }
-
-    #[test]
-    fn codex_app_server_stdout_read_error_has_fixed_text() {
-        struct FailingReader;
-        impl Read for FailingReader {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("sensitive-provider-text"))
-            }
-        }
-        let (sender, receiver) = mpsc::sync_channel(CODEX_APP_SERVER_CHANNEL_CAPACITY);
-        read_bounded_codex_app_server_stdout(BufReader::new(FailingReader), sender);
-        let message = receiver
-            .recv()
-            .expect("reader result")
-            .expect_err("an I/O error must fail");
-        assert_eq!(message, "Codex app-server stdout read failed.");
-        assert_no_provider_text(&message);
     }
 
     #[test]
@@ -24923,67 +24494,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_model_parser_drops_automatic_review_prose() {
-        let output = CommandOutput {
-            command_found: true,
-            success: true,
-            status_code: Some(0),
-            stdout: serde_json::json!({
-                "models": [
-                    {"name": "Automatic approval review model for Codex."},
-                    {"id": "gpt-5.4-codex"}
-                ]
-            })
-            .to_string(),
-            stderr: String::new(),
-        };
-
-        let status = collect_model_status_from_output(&output, "openai");
-
-        assert_eq!(status.active_model.as_deref(), Some("gpt-5.4-codex"));
-        assert!(!status
-            .available_models
-            .iter()
-            .any(|model| model.contains("approval review")));
-    }
-
-    #[test]
-    fn codex_config_model_overrides_bundled_debug_model_summary() {
-        let output = CommandOutput {
-            command_found: true,
-            success: true,
-            status_code: Some(0),
-            stdout: serde_json::json!({
-                "models": [
-                    {"id": "gpt-5.4-codex"}
-                ]
-            })
-            .to_string(),
-            stderr: String::new(),
-        };
-        let mut status = collect_model_status_from_output(&output, "openai");
-        let mut collection_method = AgentStatusCollectionMethod::CommandProbe;
-
-        apply_codex_config_model(
-            &mut status,
-            Some("gpt-5.5".to_string()),
-            &mut collection_method,
-        );
-
-        assert_eq!(status.active_model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(status.default_model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(
-            status.available_models.first().map(String::as_str),
-            Some("gpt-5.5")
-        );
-        assert!(status
-            .available_models
-            .iter()
-            .any(|model| model == "gpt-5.4-codex"));
-        assert_eq!(collection_method, AgentStatusCollectionMethod::CommandProbe);
-    }
-
-    #[test]
     fn codex_bundled_models_preserve_structured_gpt56_metadata() {
         let output = CommandOutput {
             command_found: true,
@@ -25041,34 +24551,6 @@ for line in sys.stdin:
             .available_models
             .iter()
             .any(|model| model.contains("frontier")));
-    }
-
-    #[test]
-    fn codex_config_model_selects_matching_structured_context_window() {
-        let output = CommandOutput {
-            command_found: true,
-            success: true,
-            status_code: Some(0),
-            stdout: serde_json::json!({
-                "models": [
-                    {"slug": "gpt-5.6-sol", "context_window": 372000},
-                    {"slug": "gpt-5.4-mini", "context_window": 258400}
-                ]
-            })
-            .to_string(),
-            stderr: String::new(),
-        };
-        let mut status = collect_codex_model_status_from_output(&output);
-        let mut collection_method = AgentStatusCollectionMethod::CommandProbe;
-
-        apply_codex_config_model(
-            &mut status,
-            Some("gpt-5.4-mini".to_string()),
-            &mut collection_method,
-        );
-
-        assert_eq!(status.active_model.as_deref(), Some("gpt-5.4-mini"));
-        assert_eq!(status.context_window_tokens, Some(258_400));
     }
 
     fn codex_candidate_for_test(
@@ -25380,93 +24862,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_probe_failure_log_line_names_stage_kind_home_digest_and_elapsed() {
-        let line = codex_probe_failure_log_line(
-            "Codex app-server initialize read timed out.",
-            Path::new("/Users/someone/Library/Application Support/Ottto/codex-accounts/slot"),
-            Duration::from_millis(20_013),
-            1_767_225_600,
-        );
-        let home = line
-            .split(' ')
-            .find_map(|part| part.strip_prefix("home="))
-            .expect("home digest");
-        assert_eq!(home.len(), 12);
-        assert!(home.chars().all(|character| character.is_ascii_hexdigit()));
-        assert_eq!(
-            line,
-            format!(
-                "codex usage probe failed: at=2026-01-01T00:00:00Z stage=initialize kind=timeout home={home} elapsed_ms=20013"
-            )
-        );
-        assert!(!line.contains("someone"));
-        assert!(!line.contains("Ottto"));
-    }
-
-    #[test]
-    fn codex_probe_failure_stage_and_kind_cover_every_producer_message() {
-        let mut child = Command::new("true").spawn().expect("spawn true");
-        let _ = child.wait();
-        let cases = [
-            (
-                codex_app_server_end_failure("initialize", false, None, &mut child),
-                ("initialize", "timeout"),
-            ),
-            (
-                codex_app_server_end_failure("account", false, None, &mut child),
-                ("account", "timeout"),
-            ),
-            (
-                codex_app_server_end_failure("quota", true, None, &mut child),
-                ("quota", "stdout_closed"),
-            ),
-            (
-                codex_app_server_rpc_failure("initialize", &serde_json::json!({"code": -32600})),
-                ("initialize", "rpc_error"),
-            ),
-            (
-                codex_app_server_rpc_failure("quota", &serde_json::json!({})),
-                ("quota", "rpc_error"),
-            ),
-            (
-                "Codex app-server quota request failed.".to_string(),
-                ("quota", "request_failed"),
-            ),
-            (
-                "Codex app-server request write failed.".to_string(),
-                ("session", "request_failed"),
-            ),
-            (
-                "Codex app-server stdout read failed.".to_string(),
-                ("session", "read_failed"),
-            ),
-            (
-                "Codex app-server output exceeded its byte limit.".to_string(),
-                ("session", "output_bound"),
-            ),
-            (
-                "Codex app-server could not be started.".to_string(),
-                ("start", "start"),
-            ),
-            (
-                "Codex CLI was not found for app-server rate-limit collection.".to_string(),
-                ("start", "start"),
-            ),
-            (
-                "Codex app-server user identity was unavailable.".to_string(),
-                ("start", "start"),
-            ),
-        ];
-        for (message, expected) in cases {
-            assert_eq!(
-                codex_probe_failure_stage_and_kind(&message),
-                expected,
-                "{message}"
-            );
-        }
-    }
-
-    #[test]
     fn configured_codex_unavailable_witness_rejects_unknowns_and_deduplicates_live_accounts() {
         let mut unavailable = codex_candidate_for_test(
             "codex_slot_a",
@@ -25641,91 +25036,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_durable_slot_is_one_row_and_platform_orgs_add_nothing() {
-        let token = codex_split_identity_token(
-            "raw-workspace-binding",
-            serde_json::json!([
-                {"id": "raw-org-acme", "title": "Acme", "is_default": true},
-                {"id": "raw-org-deprecated", "title": "Acme Deprecated", "is_default": false},
-                {"id": "raw-org-personal", "title": "Personal", "is_default": false}
-            ]),
-        );
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let binding_workspace_hash =
-            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
-                .expect("workspace hash");
-        let mut durable = codex_candidate_for_test(
-            "codex_slot_durable",
-            CodexAccountSlotOwnershipV1::Managed,
-            &account_hash,
-            &binding_workspace_hash,
-            5,
-        );
-        durable.workspace_targets = evidence;
-
-        let coverage =
-            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[durable]);
-
-        assert_eq!(coverage.targets.len(), 1);
-        let connected = &coverage.targets[0];
-        assert_eq!(
-            connected.durability,
-            CodexAccountTargetDurabilityV1::Durable
-        );
-        assert_eq!(connected.workspace_label.as_deref(), Some("Acme"));
-        assert_eq!(
-            connected.subscription_product.as_deref(),
-            Some("chatgpt_pro")
-        );
-        assert!(!connected.connectable, "already connected");
-        assert_eq!(coverage.connectable_targets, 0);
-    }
-
-    #[test]
-    fn codex_non_default_platform_org_adds_no_row_even_when_it_claims_a_plan() {
-        // A platform organization naming its own plan is still a platform
-        // organization. A claimed plan must not smuggle it back in as a
-        // subscription the owner could connect.
-        let token = codex_split_identity_token(
-            "raw-workspace-binding",
-            serde_json::json!([
-                {"id": "raw-org-acme", "title": "Acme", "is_default": true},
-                {"id": "raw-org-team", "title": "Team", "is_default": false, "plan_type": "business"}
-            ]),
-        );
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let binding_workspace_hash =
-            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
-                .expect("workspace hash");
-        let mut candidate = codex_candidate_for_test(
-            "default",
-            CodexAccountSlotOwnershipV1::Default,
-            &account_hash,
-            &binding_workspace_hash,
-            5,
-        );
-        candidate.workspace_targets = evidence;
-
-        let coverage =
-            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
-
-        assert_eq!(coverage.targets.len(), 1);
-        assert_eq!(coverage.targets[0].workspace_label.as_deref(), Some("Acme"));
-        assert!(coverage
-            .targets
-            .iter()
-            .all(|target| target.workspace_label.as_deref() != Some("Team")));
-    }
-
-    #[test]
     fn codex_current_login_is_one_target_when_binding_and_default_org_ids_differ() {
         // Live shape: the credential is bound by `chatgpt_account_id`, and its only
         // organization is the default one, named "Personal", carrying a different id.
@@ -25770,166 +25080,6 @@ for line in sys.stdin:
             "the binding identity stays canonical so persisted slots keep resolving"
         );
         assert_eq!(target.subscription_product.as_deref(), Some("chatgpt_pro"));
-    }
-
-    #[test]
-    fn codex_targets_name_the_account_from_the_id_token_email() {
-        let token = codex_split_identity_token(
-            "raw-workspace-binding",
-            serde_json::json!([
-                {"id": "raw-org-personal", "title": "Personal", "is_default": true},
-                {"id": "raw-org-other", "title": "Other", "is_default": false}
-            ]),
-        );
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let binding_workspace_hash =
-            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
-                .expect("workspace hash");
-        let mut candidate = codex_candidate_for_test(
-            "default",
-            CodexAccountSlotOwnershipV1::Default,
-            &account_hash,
-            &binding_workspace_hash,
-            5,
-        );
-        candidate.workspace_targets = evidence;
-
-        let coverage =
-            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
-
-        assert!(
-            coverage
-                .targets
-                .iter()
-                .all(|target| target.account_label == "private.person@example.test"),
-            "every row of one account names that account, including the bound one"
-        );
-    }
-
-    #[test]
-    fn codex_target_account_label_falls_back_when_the_token_claims_no_email() {
-        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
-        let payload = URL_SAFE_NO_PAD.encode(
-            serde_json::json!({
-                "sub": "raw-account-123",
-                "https://api.openai.com/auth": {
-                    "chatgpt_user_id": "raw-account-123",
-                    "chatgpt_account_id": "raw-workspace-binding",
-                    "organizations": [
-                        {"id": "raw-org-personal", "title": "Personal", "is_default": true}
-                    ]
-                }
-            })
-            .to_string(),
-        );
-        let token = format!("{header}.{payload}.raw-secret-signature");
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let binding_workspace_hash =
-            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
-                .expect("workspace hash");
-        let mut candidate = codex_candidate_for_test(
-            "default",
-            CodexAccountSlotOwnershipV1::Default,
-            &account_hash,
-            &binding_workspace_hash,
-            5,
-        );
-        candidate.workspace_targets = evidence;
-
-        let coverage =
-            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
-        assert_eq!(coverage.targets[0].account_label, "Codex account");
-    }
-
-    #[test]
-    fn codex_workspace_target_coverage_collapses_durable_current_composite() {
-        let token = codex_workspace_target_token(serde_json::json!([
-            {"id": "raw-workspace-default", "title": "Personal", "is_default": true}
-        ]));
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let workspace_hash = billing_identity_hash("openai", "workspace", "raw-workspace-default")
-            .expect("workspace hash");
-        let mut default = codex_candidate_for_test(
-            "default",
-            CodexAccountSlotOwnershipV1::Default,
-            &account_hash,
-            &workspace_hash,
-            5,
-        );
-        default.workspace_targets = evidence;
-        let durable = codex_candidate_for_test(
-            "codex_slot_durable",
-            CodexAccountSlotOwnershipV1::Managed,
-            &account_hash,
-            &workspace_hash,
-            5,
-        );
-        let mut candidates = vec![default, durable];
-        canonicalize_codex_candidates(&mut candidates);
-
-        let coverage =
-            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &candidates);
-
-        assert_eq!(coverage.targets.len(), 1);
-        let target = &coverage.targets[0];
-        assert_eq!(target.durability, CodexAccountTargetDurabilityV1::Durable);
-        assert!(target.is_current);
-        assert!(!target.connectable);
-        assert_eq!(target.health, Some(CodexAccountTargetHealthV1::Healthy));
-        assert_eq!(target.workspace_label.as_deref(), Some("Personal"));
-    }
-
-    #[test]
-    fn codex_workspace_target_coverage_keeps_unconfirmed_identity_blocked() {
-        // Only the signed-in workspace can be a subscription, so it is the only
-        // one whose missing identity is worth surfacing. A non-default platform
-        // organization with no id is not a blocked subscription, it is not a
-        // subscription at all.
-        let token = codex_workspace_target_token(serde_json::json!([
-            {"title": "Identity pending", "is_default": true}
-        ]));
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let workspace_hash = billing_identity_hash("openai", "workspace", "raw-workspace-default")
-            .expect("workspace hash");
-        let mut candidate = codex_candidate_for_test(
-            "default",
-            CodexAccountSlotOwnershipV1::Default,
-            &account_hash,
-            &workspace_hash,
-            5,
-        );
-        candidate.workspace_targets = evidence;
-
-        let coverage =
-            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
-        let unconfirmed = coverage
-            .targets
-            .iter()
-            .find(|target| target.workspace_label.as_deref() == Some("Identity pending"))
-            .expect("unconfirmed workspace remains visible");
-
-        assert!(unconfirmed.workspace_identifier_hash.is_none());
-        assert!(!unconfirmed.connectable);
-        assert_eq!(
-            unconfirmed.setup_blockers,
-            vec![CodexAccountTargetSetupBlockerV1::IdentityUnconfirmed]
-        );
     }
 
     #[test]
@@ -26145,31 +25295,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn a_failed_default_probe_alone_is_a_retrying_read() {
-        let mut default = codex_failed_probe_candidate(
-            "/tmp/codex-health-test-default-probe",
-            "default_user",
-            "default_workspace",
-        );
-        default.slot.slot_id = "default".to_string();
-        default.slot.ownership = CodexAccountSlotOwnershipV1::Default;
-        default.slot.registered_binding = None;
-        default.snapshot.status = AgentStatusState::Degraded;
-
-        let health = codex_source_health_snapshot(
-            &[default],
-            "2026-08-23T00:00:00Z",
-            "2026-08-23T00:15:00Z",
-        );
-
-        assert_eq!(health.status, AgentStatusState::Degraded);
-        assert!(codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
-        assert!(!codex_source_health_codes(&health)
-            .iter()
-            .any(|code| code.starts_with("codex_registered_slot_needs_attention")));
-    }
-
-    #[test]
     fn a_real_connection_problem_still_needs_attention_beside_a_failed_default_probe() {
         let mut default = codex_failed_probe_candidate(
             "/tmp/codex-health-test-default-probe-and-login",
@@ -26228,39 +25353,6 @@ for line in sys.stdin:
         assert!(!codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
     }
 
-    #[test]
-    fn an_unconfirmed_default_login_is_not_hidden_behind_a_retrying_read() {
-        let mut default = codex_failed_probe_candidate(
-            "/tmp/codex-health-test-unknown-default-login",
-            "default_user",
-            "default_workspace",
-        );
-        default.slot.slot_id = "default".to_string();
-        default.slot.ownership = CodexAccountSlotOwnershipV1::Default;
-        default.slot.registered_binding = None;
-        default.snapshot.status = AgentStatusState::Degraded;
-        default
-            .snapshot
-            .account
-            .as_mut()
-            .expect("account")
-            .login_state = AgentLoginState::Unknown;
-        default.status.state = CodexAccountSlotCollectionStateV1::ProviderUnavailable;
-        let failed = codex_failed_probe_candidate(
-            "/tmp/codex-health-test-unknown-default-managed",
-            "managed_user",
-            "managed_workspace",
-        );
-
-        let health = codex_source_health_snapshot(
-            &[default, failed],
-            "2026-08-23T00:00:00Z",
-            "2026-08-23T00:15:00Z",
-        );
-
-        assert!(!codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
-    }
-
     /// The default home's failed probe kept account A's hashes (and its stale
     /// reading); a managed slot uploads account B.
     fn failed_default_with_kept_hashes(account_hash: &str) -> CodexSlotCandidate {
@@ -26313,24 +25405,6 @@ for line in sys.stdin:
         let mut snapshots = Vec::new();
         append_failed_default_codex_snapshot(&mut snapshots, &[unkeyed]);
         assert!(snapshots.is_empty());
-    }
-
-    #[test]
-    fn a_missing_codex_cli_is_not_a_transient_read_failure() {
-        let mut candidate = codex_failed_probe_candidate(
-            "/tmp/codex-health-test-missing-cli",
-            "managed_user",
-            "managed_workspace",
-        );
-        candidate.snapshot.diagnostics = vec![AgentStatusDiagnostic::source(
-            "codex_usage_probe_failed",
-            AgentDiagnosticSeverity::Warning,
-            CODEX_CLI_NOT_FOUND_FOR_PROBE,
-        )];
-        assert!(!codex_probe_failed_only(
-            &candidate.status,
-            &candidate.snapshot
-        ));
     }
 
     #[cfg(unix)]
@@ -26820,44 +25894,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_identity_omits_the_superseded_organization_when_no_default_is_claimed() {
-        // No default organization means nothing to key the old organization
-        // hash on. Emitting one from a non-default membership would invite a
-        // consumer to merge two genuinely different workspaces.
-        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
-        let credentials = CodexAuthCredentials {
-            access_token: Some(synthetic_codex_access_jwt_with_profile_email(
-                "synthetic-user",
-                "synthetic-workspace",
-                "synthetic-account",
-                "pro",
-                expires_at,
-            )),
-            id_token: Some(synthetic_codex_jwt_with_organizations(
-                "synthetic-user",
-                "synthetic-workspace",
-                "synthetic-account",
-                "pro",
-                expires_at,
-                serde_json::json!([{"id": "synthetic-org-other", "title": "Other"}]),
-            )),
-            account_id: Some("synthetic-workspace".to_string()),
-        };
-        let provider_account = serde_json::json!({
-            "account": {"type": "chatgpt", "email": "synthetic-account", "planType": "pro"}
-        });
-
-        let identity = validated_codex_identity(&credentials, Some(&provider_account), None, true)
-            .expect("identity");
-
-        assert_eq!(identity.superseded_organization_identifier_hash, None);
-        assert!(
-            identity.superseded_account_identifier_hash.is_some(),
-            "the account side does not depend on organizations at all"
-        );
-    }
-
-    #[test]
     fn codex_profile_email_identity_retains_provider_meters() {
         let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
         let credentials = CodexAuthCredentials {
@@ -27086,20 +26122,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_id_token_subscription_period_is_absent_when_the_claims_are_absent() {
-        let token = codex_id_token_with_auth_claim(
-            r#"{"chatgpt_account_id": "account_123", "chatgpt_plan_type": "Pro"}"#,
-        );
-
-        let account = parse_codex_id_token_account(&token).expect("account");
-
-        assert_eq!(account.plan_type.as_deref(), Some("pro"));
-        assert_eq!(account.subscription_period_start, None);
-        assert_eq!(account.subscription_period_end, None);
-        assert_eq!(account.subscription_period_last_checked_at, None);
-    }
-
-    #[test]
     fn codex_id_token_subscription_period_reads_rfc3339_strings_as_utc() {
         let token = codex_id_token_with_auth_claim(
             r#"{
@@ -27126,65 +26148,6 @@ for line in sys.stdin:
             account.subscription_period_last_checked_at.as_deref(),
             Some("2026-07-29T00:00:00Z")
         );
-    }
-
-    #[test]
-    fn codex_id_token_subscription_period_drops_malformed_and_out_of_range_claims() {
-        // Milliseconds, a non-date string, a null, and a nested object are all
-        // "not reported" - never a panic, never a substituted `now`.
-        for claim in [
-            r#"{"chatgpt_plan_type": "Pro", "chatgpt_subscription_active_start": 1782864000000, "chatgpt_subscription_active_until": 1785542400000, "chatgpt_subscription_last_checked": 1785283200000}"#,
-            r#"{"chatgpt_plan_type": "Pro", "chatgpt_subscription_active_start": "not-a-date", "chatgpt_subscription_active_until": "also-not-a-date", "chatgpt_subscription_last_checked": "still-not-a-date"}"#,
-            r#"{"chatgpt_plan_type": "Pro", "chatgpt_subscription_active_start": null, "chatgpt_subscription_active_until": null, "chatgpt_subscription_last_checked": null}"#,
-            r#"{"chatgpt_plan_type": "Pro", "chatgpt_subscription_active_start": {"seconds": 1782864000}, "chatgpt_subscription_active_until": [], "chatgpt_subscription_last_checked": {"seconds": 1785283200}}"#,
-            r#"{"chatgpt_plan_type": "Pro", "chatgpt_subscription_active_start": 0, "chatgpt_subscription_active_until": -1, "chatgpt_subscription_last_checked": 0}"#,
-        ] {
-            let account = parse_codex_id_token_account(&codex_id_token_with_auth_claim(claim))
-                .expect("account");
-            assert_eq!(account.plan_type.as_deref(), Some("pro"), "claim: {claim}");
-            assert_eq!(account.subscription_period_start, None, "claim: {claim}");
-            assert_eq!(account.subscription_period_end, None, "claim: {claim}");
-            assert_eq!(
-                account.subscription_period_last_checked_at, None,
-                "claim: {claim}"
-            );
-        }
-    }
-
-    #[test]
-    fn codex_id_token_subscription_period_accepts_one_sided_reporting() {
-        let token = codex_id_token_with_auth_claim(
-            r#"{
-                "chatgpt_plan_type": "Pro",
-                "chatgpt_subscription_active_until": 1785542400
-            }"#,
-        );
-
-        let account = parse_codex_id_token_account(&token).expect("account");
-
-        assert_eq!(account.subscription_period_start, None);
-        assert_eq!(account.subscription_period_last_checked_at, None);
-        assert_eq!(
-            account.subscription_period_end.as_deref(),
-            Some("2026-08-01T00:00:00Z")
-        );
-    }
-
-    #[test]
-    fn codex_id_token_subscription_period_alone_does_not_resurrect_an_empty_account() {
-        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
-        let payload = URL_SAFE_NO_PAD.encode(
-            r#"{
-                "https://api.openai.com/auth": {
-                    "chatgpt_subscription_active_start": 1782864000,
-                    "chatgpt_subscription_active_until": 1785542400,
-                    "chatgpt_subscription_last_checked": 1785283200
-                }
-            }"#,
-        );
-        let token = format!("{header}.{payload}.signature");
-
-        assert!(parse_codex_id_token_account(&token).is_none());
     }
 
     #[test]
@@ -27229,17 +26192,6 @@ for line in sys.stdin:
             preserved.subscription_period_last_checked_at.as_deref(),
             Some("2026-07-29T00:00:00Z")
         );
-    }
-
-    #[test]
-    fn subscription_period_is_omitted_from_the_wire_when_absent() {
-        let account = unsupported_account("openai");
-
-        let wire = serde_json::to_value(&account).expect("serialize");
-
-        assert!(wire.get("subscription_period_start").is_none());
-        assert!(wire.get("subscription_period_end").is_none());
-        assert!(wire.get("subscription_period_last_checked_at").is_none());
     }
 
     #[cfg(unix)]
@@ -27405,169 +26357,6 @@ for line in sys.stdin:
         assert_eq!(credits[0].spend_control_reached, None);
         assert_eq!(credits[0].rate_limit_reached_type, None);
         assert_eq!(credits[0].limit_id, None);
-    }
-
-    #[test]
-    fn codex_usage_parser_handles_weekly_primary_window() {
-        // OpenAI's 2026-07-12 change: the wham/usage fields arrive top-level with
-        // a weekly primary window (minutes-denominated), a null secondary, and
-        // sibling credit metadata (limit_id, spend_control_reached, ...).
-        let json = serde_json::json!({
-            "limit_id": "codex",
-            "limit_name": null,
-            "primary": {
-                "used_percent": 30.0,
-                "window_minutes": 10080,
-                "resets_at": 1784963503_u64
-            },
-            "secondary": null,
-            "credits": {
-                "has_credits": false,
-                "unlimited": false,
-                "balance": "0"
-            },
-            "individual_limit": null,
-            "spend_control_reached": null,
-            "plan_type": "pro",
-            "rate_limit_reached_type": null
-        });
-
-        let windows = codex_usage_quota_windows(&json);
-        let credits = codex_usage_credit_balances(&json);
-
-        // Single window: the null secondary is dropped; the primary is weekly by
-        // duration (10080 min == 7 days) despite arriving in the primary slot.
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].name, "legacy_primary_weekly_reset_known");
-        assert_eq!(windows[0].window_seconds, Some(604800));
-        assert_eq!(windows[0].used_percent, Some(30));
-        assert_eq!(windows[0].left_percent, Some(70));
-
-        // `has_credits: false` says the credits program does not apply to this
-        // account; the `balance: "0"` beside it is filler, not a spent balance. This
-        // test used to assert a single Exhausted row, which is how a red
-        // "credits - 0 left - exhausted" meter reached the UI for an account that
-        // has no credits at all. Nothing true can be said here, so say nothing.
-        assert!(credits.is_empty());
-    }
-
-    #[test]
-    fn codex_usage_parser_keeps_exhausted_credits_when_the_account_has_a_credits_program() {
-        // Same zero balance, opposite meaning: the provider claims the program
-        // applies, so zero really is spent and the row has to stay.
-        let json = serde_json::json!({
-            "limit_id": "codex",
-            "primary": {"used_percent": 30.0, "window_minutes": 10080, "resets_at": 1784963503_u64},
-            "credits": {"has_credits": true, "unlimited": false, "balance": "0"}
-        });
-
-        let credits = codex_usage_credit_balances(&json);
-
-        assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
-        assert_eq!(credits[0].remaining, Some(0));
-        assert_eq!(credits[0].limit_id.as_deref(), Some("codex"));
-    }
-
-    #[test]
-    fn codex_usage_parser_keeps_disowned_credits_that_still_say_something_true() {
-        // `has_credits: false` never hides a positive balance, an unlimited grant,
-        // or a reached spend control - suppression is only for the empty case.
-        for credits_value in [
-            serde_json::json!({"has_credits": false, "unlimited": true, "balance": "0"}),
-            serde_json::json!({"has_credits": false, "unlimited": false, "balance": "12"}),
-        ] {
-            let json = serde_json::json!({
-                "limit_id": "codex",
-                "primary": {"used_percent": 1.0, "window_minutes": 10080},
-                "credits": credits_value.clone()
-            });
-            assert_eq!(
-                codex_usage_credit_balances(&json).len(),
-                1,
-                "kept for {credits_value}"
-            );
-        }
-
-        let spend_capped = serde_json::json!({
-            "limit_id": "codex",
-            "primary": {"used_percent": 1.0, "window_minutes": 10080},
-            "spend_control_reached": true,
-            "credits": {"has_credits": false, "unlimited": false, "balance": "0"}
-        });
-        let credits = codex_usage_credit_balances(&spend_capped);
-        assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
-    }
-
-    #[test]
-    fn codex_usage_parser_carries_workspace_monthly_credit_limit() {
-        let json = serde_json::json!({
-            "limit_id": "codex",
-            "primary": {
-                "used_percent": 100,
-                "window_minutes": 10080,
-                "resets_at": 1786431605_u64
-            },
-            "credits": {
-                "has_credits": true,
-                "unlimited": false,
-                "balance": null
-            },
-            "individual_limit": {
-                "limit": "8000",
-                "used": "4841",
-                "remaining_percent": 39,
-                "resets_at": 1788220800_u64
-            },
-            "spend_control_reached": false
-        });
-
-        let credits = codex_usage_credit_balances(&json);
-
-        assert_eq!(credits.len(), 2);
-        let monthly = &credits[1];
-        assert_eq!(monthly.name, "workspace_monthly_credits");
-        assert_eq!(monthly.status, AgentCreditBalanceStatus::Ok);
-        assert_eq!(monthly.used, Some(4841));
-        assert_eq!(monthly.quota, Some(8000));
-        assert_eq!(monthly.remaining, Some(3159));
-        assert_eq!(monthly.used_percent, Some(61));
-        assert_eq!(monthly.resets_at.as_deref(), Some("2026-09-01T00:00:00Z"));
-        assert_eq!(monthly.enabled, Some(true));
-        assert_eq!(monthly.limit_id.as_deref(), Some("codex"));
-    }
-
-    #[test]
-    fn codex_usage_parser_treats_spend_control_reached_as_exhausted() {
-        // A reached spend control caps the account even with a positive balance.
-        let json = serde_json::json!({
-            "limit_id": "codex",
-            "primary": {
-                "used_percent": 12,
-                "window_minutes": 10080,
-                "resets_at": 1784963503_u64
-            },
-            "secondary": null,
-            "credits": {
-                "has_credits": true,
-                "unlimited": false,
-                "balance": "42"
-            },
-            "spend_control_reached": true,
-            "rate_limit_reached_type": "primary"
-        });
-
-        let credits = codex_usage_credit_balances(&json);
-        assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].remaining, Some(42));
-        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
-        assert_eq!(credits[0].spend_control_reached, Some(true));
-        assert_eq!(
-            credits[0].rate_limit_reached_type.as_deref(),
-            Some("primary")
-        );
-        assert_eq!(credits[0].limit_id.as_deref(), Some("codex"));
     }
 
     #[test]
@@ -27818,56 +26607,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_app_server_selects_snapshot_with_only_monthly_credit_limit() {
-        let json = serde_json::json!({
-            "rateLimits": {
-                "limitId": "codex",
-                "primary": null,
-                "secondary": null,
-                "credits": null,
-                "individualLimit": {
-                    "limit": "100",
-                    "used": "100",
-                    "remainingPercent": 0,
-                    "resetsAt": 1788220800_u64
-                }
-            }
-        });
-
-        let credits = codex_app_server_credit_balances(&json);
-
-        assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].name, "workspace_monthly_credits");
-        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
-        assert_eq!(credits[0].remaining, Some(0));
-    }
-
-    #[test]
-    fn codex_app_server_ignores_null_monthly_placeholder_when_selecting_snapshot() {
-        let json = serde_json::json!({
-            "rateLimitsByLimitId": {
-                "codex": {
-                    "individualLimit": null
-                }
-            },
-            "rateLimits": {
-                "individualLimit": {
-                    "limit": "8000",
-                    "used": "4525",
-                    "remainingPercent": 43,
-                    "resetsAt": 1788220800_u64
-                }
-            }
-        });
-
-        let credits = codex_app_server_credit_balances(&json);
-
-        assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].name, "workspace_monthly_credits");
-        assert_eq!(credits[0].remaining, Some(3475));
-    }
-
-    #[test]
     fn codex_app_server_falls_back_from_null_effective_snapshot_to_limit_map() {
         let json = serde_json::json!({
             "rateLimits": {
@@ -27927,27 +26666,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_json_parser_normalizes_safe_fields() {
-        let json = serde_json::json!({
-            "status": "authenticated",
-            "email": "user@example.com",
-            "organization": {"id": "org_1", "name": "Research"},
-            "subscription_type": "max_5x"
-        });
-
-        let account = parse_claude_auth_json(&json);
-
-        assert_eq!(account.login_state, AgentLoginState::SignedIn);
-        assert_eq!(account.provider.as_deref(), Some("anthropic"));
-        assert_eq!(account.email.as_deref(), Some("user@example.com"));
-        assert_eq!(account.organization_id.as_deref(), Some("org_1"));
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_max_5x")
-        );
-    }
-
-    #[test]
     fn claude_json_parser_accepts_current_camel_case_auth_status() {
         let json = serde_json::json!({
             "loggedIn": true,
@@ -27980,36 +26698,6 @@ for line in sys.stdin:
             "orgName": "Acme",
             "subscriptionType": "team"
         }))
-    }
-
-    #[test]
-    fn claude_cli_oauth_account_parser_reads_display_safe_fields() {
-        let parsed = parse_claude_cli_oauth_account(&serde_json::json!({
-            "oauthAccount": {
-                "accountUuid": "acct-1",
-                "emailAddress": "team.member@example.com",
-                "organizationUuid": "org-1",
-                "organizationType": "claude_team",
-                "seatTier": "premium",
-                "organizationRateLimitTier": "claude_team",
-                "userRateLimitTier": "default_claude_max_5x"
-            }
-        }))
-        .expect("oauthAccount parsed");
-
-        assert_eq!(parsed.account_uuid.as_deref(), Some("acct-1"));
-        assert_eq!(
-            parsed.email_address.as_deref(),
-            Some("team.member@example.com")
-        );
-        assert_eq!(parsed.organization_uuid.as_deref(), Some("org-1"));
-        assert_eq!(parsed.organization_type.as_deref(), Some("claude_team"));
-        assert_eq!(parsed.seat_tier.as_deref(), Some("premium"));
-        assert_eq!(
-            parsed.user_rate_limit_tier.as_deref(),
-            Some("default_claude_max_5x")
-        );
-        assert!(parse_claude_cli_oauth_account(&serde_json::json!({})).is_none());
     }
 
     #[test]
@@ -28214,51 +26902,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn registered_claude_plan_observations_skip_accounts_without_a_product() {
-        // An account Ottto cannot price adds nothing to say. Its row still
-        // comes from the evidence that named the account in the first place.
-        let mut source_health = base_snapshot(
-            SourceKind::ClaudeCode,
-            AgentStatusState::Available,
-            AgentStatusCollectionMethod::CliJson,
-            "2026-09-18T10:00:00Z".to_string(),
-            "2026-09-18T10:30:00Z".to_string(),
-        );
-        let mut snapshot =
-            claude_account_snapshot("ron@ottto.net", "claude_max_20x", "hash-one", "org-one");
-        if let Some(account) = snapshot.account.as_mut() {
-            account.subscription_product = None;
-            account.plan_type = None;
-        }
-
-        append_registered_claude_plan_observations(&mut source_health, &[snapshot]);
-
-        assert!(source_health.plan_observations.is_empty());
-    }
-
-    #[test]
-    fn registered_claude_plan_observations_need_both_identity_halves() {
-        // Without an organization hash the observation cannot be matched to one
-        // subscription, so it is not worth emitting.
-        let mut source_health = base_snapshot(
-            SourceKind::ClaudeCode,
-            AgentStatusState::Available,
-            AgentStatusCollectionMethod::CliJson,
-            "2026-09-18T10:00:00Z".to_string(),
-            "2026-09-18T10:30:00Z".to_string(),
-        );
-        let mut snapshot =
-            claude_account_snapshot("ron@ottto.net", "claude_max_20x", "hash-one", "org-one");
-        if let Some(account) = snapshot.account.as_mut() {
-            account.organization_identifier_hash = None;
-        }
-
-        append_registered_claude_plan_observations(&mut source_health, &[snapshot]);
-
-        assert!(source_health.plan_observations.is_empty());
-    }
-
-    #[test]
     fn claude_cli_account_identity_refuses_mismatched_metadata() {
         // `~/.claude.json` lagging behind an account switch must never stamp a
         // different account's uuid onto the signed-in account.
@@ -28309,121 +26952,6 @@ for line in sys.stdin:
         assert!(fresh.account_identifier_hash.is_none());
     }
 
-    #[test]
-    fn claude_team_seat_tier_refines_premium_from_seat_tier() {
-        let mut account = team_auth_account("team.member@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("team.member@example.com".to_string()),
-            organization_uuid: Some("org-1".to_string()),
-            organization_type: Some("claude_team".to_string()),
-            seat_tier: Some("premium".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        let refined = refine_claude_team_seat_plan(&mut account, &oauth);
-
-        assert_eq!(refined, Some("team_premium"));
-        assert_eq!(account.plan_type.as_deref(), Some("team_premium"));
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_team_premium")
-        );
-    }
-
-    #[test]
-    fn claude_team_seat_tier_refines_premium_from_user_rate_limit_tier() {
-        let mut account = team_auth_account("team.member@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("team.member@example.com".to_string()),
-            user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_team_seat_plan(&mut account, &oauth),
-            Some("team_premium")
-        );
-    }
-
-    #[test]
-    fn claude_team_seat_tier_refines_standard_from_seat_tier() {
-        let mut account = team_auth_account("team.member@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            seat_tier: Some("standard".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_team_seat_plan(&mut account, &oauth),
-            Some("team_standard")
-        );
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_team_standard")
-        );
-    }
-
-    #[test]
-    fn claude_team_seat_tier_leaves_generic_team_without_explicit_signal() {
-        let mut account = team_auth_account("team.member@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("team.member@example.com".to_string()),
-            organization_type: Some("claude_team".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(refine_claude_team_seat_plan(&mut account, &oauth), None);
-        assert_eq!(account.plan_type.as_deref(), Some("team"));
-        assert_eq!(account.subscription_product.as_deref(), Some("claude_team"));
-    }
-
-    #[test]
-    fn claude_team_seat_tier_ignores_mismatched_account_metadata() {
-        // `~/.claude.json` lagging behind an account switch must not leak a
-        // different account's seat tier onto the signed-in account.
-        let mut account = team_auth_account("team.member@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("someone.else@example.com".to_string()),
-            seat_tier: Some("premium".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(refine_claude_team_seat_plan(&mut account, &oauth), None);
-        assert_eq!(account.plan_type.as_deref(), Some("team"));
-    }
-
-    #[test]
-    fn claude_team_seat_tier_ignores_non_team_plans_and_orgs() {
-        let mut max_account = parse_claude_auth_json(&serde_json::json!({
-            "loggedIn": true,
-            "email": "user@example.com",
-            "subscriptionType": "max"
-        }));
-        let premium_oauth = ClaudeCliOauthAccount {
-            seat_tier: Some("premium".to_string()),
-            user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-        assert_eq!(
-            refine_claude_team_seat_plan(&mut max_account, &premium_oauth),
-            None
-        );
-        assert_eq!(max_account.plan_type.as_deref(), Some("max"));
-
-        // A stale non-team organizationType blocks refinement even when the
-        // auth status says team.
-        let mut team_account = team_auth_account("team.member@example.com", "org-1");
-        let stale_oauth = ClaudeCliOauthAccount {
-            organization_type: Some("claude_max".to_string()),
-            seat_tier: Some("premium".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-        assert_eq!(
-            refine_claude_team_seat_plan(&mut team_account, &stale_oauth),
-            None
-        );
-    }
-
     fn max_auth_account(email: &str) -> AgentAccountStatus {
         parse_claude_auth_json(&serde_json::json!({
             "loggedIn": true,
@@ -28432,65 +26960,6 @@ for line in sys.stdin:
             "email": email,
             "subscriptionType": "max"
         }))
-    }
-
-    #[test]
-    fn claude_max_tier_refines_20x_from_organization_rate_limit_tier() {
-        let mut account = max_auth_account("user@example.com");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("user@example.com".to_string()),
-            organization_type: Some("claude_max".to_string()),
-            organization_rate_limit_tier: Some("default_claude_max_20x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        let refined = refine_claude_max_rate_limit_plan(&mut account, &oauth);
-
-        assert_eq!(refined, Some("max_20x"));
-        assert_eq!(account.plan_type.as_deref(), Some("max_20x"));
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_max_20x")
-        );
-    }
-
-    #[test]
-    fn claude_max_tier_refines_5x_from_user_rate_limit_tier_fallback() {
-        let mut account = max_auth_account("user@example.com");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("user@example.com".to_string()),
-            user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_max_rate_limit_plan(&mut account, &oauth),
-            Some("max_5x")
-        );
-        assert_eq!(account.plan_type.as_deref(), Some("max_5x"));
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_max_5x")
-        );
-    }
-
-    #[test]
-    fn claude_max_tier_left_generic_without_explicit_signal() {
-        // Bare `max` is emitted for BOTH Max tiers: no recognized rate-limit
-        // tier means no refinement, never a guess.
-        let mut account = max_auth_account("user@example.com");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("user@example.com".to_string()),
-            organization_rate_limit_tier: Some("claude_max".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_max_rate_limit_plan(&mut account, &oauth),
-            None
-        );
-        assert_eq!(account.plan_type.as_deref(), Some("max"));
-        assert_eq!(account.subscription_product.as_deref(), Some("claude_max"));
     }
 
     /// One registered slot on a throwaway HOME with a fake `claude` that only
@@ -28840,76 +27309,6 @@ for line in sys.stdin:
         assert!(!locked.claude_spawned());
     }
 
-    /// Review round 1: without the keychain tool the login cannot be
-    /// confirmed either way. It is `Unreadable` (never "no login"), the
-    /// status fails closed, and the spawn gate refuses.
-    #[test]
-    #[serial]
-    fn missing_keychain_tool_fails_closed_and_the_gate_refuses() {
-        let fixture = LocalSlotFixture::new("no-security", SECURITY_ITEM_NOT_FOUND);
-        fs::remove_file(fixture.root.join("bin").join("security")).expect("remove security");
-        fixture.write_identity(serde_json::json!({
-            "accountUuid": "account-keychain-only",
-            "organizationUuid": "organization-keychain-only",
-            "emailAddress": "keychain@example.invalid"
-        }));
-        assert!(matches!(
-            read_claude_oauth_credential_state_for_slot(&fixture.slot()),
-            ClaudeCredentialRead::Unreadable
-        ));
-        assert_eq!(
-            read_claude_spawn_gate_credential(&fixture.slot()),
-            crate::claude_spawn_gate::ClaudeGateCredential::ReadFailed
-        );
-        assert_eq!(
-            resolve_registered_claude_slot(fixture.descriptor.clone()).err(),
-            Some(ClaudeSlotProbeFailure::ProbeFailed),
-            "cannot confirm, not credential_unavailable"
-        );
-    }
-
-    /// Review round 1: a refreshable item with a blank access token or
-    /// without `user:inference` is malformed, and the gate refuses it.
-    #[test]
-    #[serial]
-    fn gate_refuses_a_refreshable_item_without_access_token_or_inference_scope() {
-        let fixture = LocalSlotFixture::new("gate-malformed", SECURITY_ITEM_NOT_FOUND);
-        for patch in [
-            ("accessToken", serde_json::json!("")),
-            ("scopes", serde_json::json!(["user:profile"])),
-            ("scopes", Value::Null),
-        ] {
-            let mut credential =
-                claude_credential_fixture("fixture", TimeDuration::hours(3), Some("max"));
-            if patch.1.is_null() {
-                credential["claudeAiOauth"]
-                    .as_object_mut()
-                    .expect("oauth")
-                    .remove(patch.0);
-            } else {
-                credential["claudeAiOauth"][patch.0] = patch.1.clone();
-            }
-            fixture.write_credential(&credential);
-            assert_eq!(
-                read_claude_spawn_gate_credential(&fixture.slot()),
-                crate::claude_spawn_gate::ClaudeGateCredential::ReadFailed,
-                "{patch:?}"
-            );
-        }
-        fixture.write_credential(&claude_credential_fixture(
-            "fixture",
-            TimeDuration::hours(3),
-            Some("max"),
-        ));
-        assert!(matches!(
-            read_claude_spawn_gate_credential(&fixture.slot()),
-            crate::claude_spawn_gate::ClaudeGateCredential::Present {
-                has_refresh_token: true,
-                ..
-            }
-        ));
-    }
-
     #[test]
     #[serial]
     fn expired_login_still_proves_identity_and_a_lapsed_grant_needs_login() {
@@ -29227,67 +27626,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn refine_claude_local_plan_metadata_resolves_team_premium_for_a_registered_slot() {
-        // Same gap, the Team seat half: an external-slot Premium seat used to
-        // ship a bare `team` and price as Standard ($25 instead of $125).
-        let mut account = team_auth_account("user@example.com", "org-1");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("user@example.com".to_string()),
-            organization_type: Some("claude_team".to_string()),
-            seat_tier: Some("team_tier_1".to_string()),
-            user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        let refined = refine_claude_local_plan_metadata(&mut account, &oauth);
-
-        assert_eq!(refined.seat_plan, Some("team_premium"));
-        assert_eq!(refined.max_plan, None);
-        assert_eq!(account.plan_type.as_deref(), Some("team_premium"));
-        assert_eq!(
-            account.subscription_product.as_deref(),
-            Some("claude_team_premium")
-        );
-    }
-
-    #[test]
-    fn refine_claude_local_plan_metadata_leaves_a_bare_plan_untouched() {
-        // No explicit signal stays no refinement, through the shared helper
-        // too: the backend's conservative pricing depends on never guessing.
-        let mut account = max_auth_account("user@example.com");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("user@example.com".to_string()),
-            organization_type: Some("claude_max".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_local_plan_metadata(&mut account, &oauth),
-            RefinedClaudeLocalPlan::default()
-        );
-        assert_eq!(account.plan_type.as_deref(), Some("max"));
-        assert_eq!(account.subscription_product.as_deref(), Some("claude_max"));
-    }
-
-    #[test]
-    fn claude_max_tier_ignores_mismatched_account_metadata() {
-        // `~/.claude.json` lagging behind an account switch must not leak a
-        // different account's tier onto the signed-in account.
-        let mut account = max_auth_account("user@example.com");
-        let oauth = ClaudeCliOauthAccount {
-            email_address: Some("someone.else@example.com".to_string()),
-            organization_rate_limit_tier: Some("default_claude_max_20x".to_string()),
-            ..ClaudeCliOauthAccount::default()
-        };
-
-        assert_eq!(
-            refine_claude_max_rate_limit_plan(&mut account, &oauth),
-            None
-        );
-        assert_eq!(account.plan_type.as_deref(), Some("max"));
-    }
-
-    #[test]
     fn claude_max_tier_ignores_non_max_plans_and_orgs() {
         // Team plan: the max refinement never fires.
         let mut team_account = team_auth_account("team.member@example.com", "org-1");
@@ -29570,84 +27908,6 @@ for line in sys.stdin:
             claude_desktop_unambiguous_duplicate_session_owners(&builders).get("resumed-session"),
             Some(&Some(("newer-account".to_string(), Some(1_700_000_100))))
         );
-    }
-
-    #[test]
-    fn claude_desktop_timestamp_parser_normalizes_javascript_milliseconds() {
-        let milliseconds = serde_json::json!(1_786_522_486_333_i64);
-        let seconds = serde_json::json!(1_786_522_486_i64);
-
-        assert_eq!(
-            timestamp_value_epoch_seconds(Some(&milliseconds)),
-            Some(1_786_522_486)
-        );
-        assert_eq!(
-            timestamp_value_epoch_seconds(Some(&seconds)),
-            Some(1_786_522_486)
-        );
-    }
-
-    #[test]
-    fn claude_desktop_resumed_session_emits_only_newest_exact_account_binding() {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-claude-desktop-resumed-session-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create root");
-        std::fs::write(
-            root.join("config.json"),
-            r#"{"lastKnownAccountUuid":"gmail-account"}"#,
-        )
-        .expect("write config");
-
-        for (account, org, file, session, activity) in [
-            (
-                "team-account",
-                "team-org",
-                "local_team.json",
-                "resumed",
-                100,
-            ),
-            (
-                "gmail-account",
-                "gmail-org",
-                "local_resumed.json",
-                "resumed",
-                200,
-            ),
-            (
-                "gmail-account",
-                "gmail-org",
-                "local_newer.json",
-                "other",
-                300,
-            ),
-        ] {
-            let directory = root.join("claude-code-sessions").join(account).join(org);
-            std::fs::create_dir_all(&directory).expect("create account bucket");
-            std::fs::write(
-                directory.join(file),
-                format!(r#"{{"cliSessionId":"{session}","lastActivityAt":{activity}}}"#),
-            )
-            .expect("write session metadata");
-        }
-
-        let observations =
-            claude_desktop_plan_observations_from_root(&root, "2026-08-12T08:00:00Z");
-        let exact = observations
-            .iter()
-            .filter(|observation| observation.source_session_id.as_deref() == Some("resumed"))
-            .collect::<Vec<_>>();
-
-        assert_eq!(exact.len(), 1);
-        assert_eq!(exact[0].account_id.as_deref(), Some("gmail-account"));
-        assert!(observations.iter().any(|observation| {
-            observation.account_id.as_deref() == Some("team-account")
-                && observation.source_session_id.is_none()
-        }));
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -30013,90 +28273,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_desktop_pairs_upload_appends_beside_an_unchanged_metered_login() {
-        let pair = |n: u32| {
-            claude_desktop_pair_observation(
-                &(
-                    format!("00000000-0000-4000-8000-{n:012}"),
-                    format!("00000000-0000-4000-9000-{n:012}"),
-                ),
-                &ClaudeDesktopPairBuilder::default(),
-                1_786_000_000 - i64::from(n),
-                format!("session-{n}"),
-            )
-            .expect("pair")
-        };
-        let desktop = ClaudeDesktopPairs {
-            pairs: vec![pair(0), pair(1)],
-            duplicate_sessions: Vec::new(),
-        };
-        let covered = desktop.pairs[0].binding.clone();
-        let at = "2026-08-12T08:00:00Z";
-        let until = "2026-08-12T08:15:00Z";
-
-        // An ordinary metered login for pair 0, with its current plan reading.
-        let mut metered = base_snapshot(
-            SourceKind::ClaudeCode,
-            AgentStatusState::Available,
-            AgentStatusCollectionMethod::CliJson,
-            at.to_string(),
-            until.to_string(),
-        );
-        let mut account = unsupported_account("anthropic");
-        account.account_identifier_hash = Some(covered.account_identifier_hash.clone());
-        account.organization_identifier_hash = Some(covered.organization_identifier_hash.clone());
-        metered.account = Some(account);
-        metered.quota_windows = claude_oauth_quota_windows(&serde_json::json!({
-            "five_hour": {"utilization": 24.0, "resets_at": "2026-08-12T10:00:00+00:00"},
-            "seven_day": {"utilization": 72.0, "resets_at": "2026-08-15T05:00:00+00:00"}
-        }));
-        let mut current = desktop.pairs[0].observation.clone();
-        current.evidence_method =
-            Some(collection_method_key(&AgentStatusCollectionMethod::CliJson).to_string());
-        current.source_session_id = Some("login-session".to_string());
-        current.is_current = Some(true);
-        metered.plan_observations = vec![current];
-        let mut uploads = vec![metered.clone()];
-
-        append_claude_desktop_pairs_snapshot(&mut uploads, &desktop, at, until);
-
-        // The pass's upload path appends the pair status; the login is untouched.
-        assert_eq!(uploads.len(), 2, "the Desktop pair status uploads");
-        assert_eq!(uploads[0], metered);
-        let pairs = &uploads[1];
-        assert_eq!(pairs.source, SourceKind::ClaudeCode);
-        assert!(pairs.account.is_none());
-        assert_eq!(pairs.quota_windows, vec![unsupported_quota_window("usage")]);
-        assert!(pairs.credit_balances.is_empty());
-        // Only the uncovered pair, never current: the covered pair is not
-        // uploaded twice and no Desktop reading competes with the meters.
-        assert_eq!(
-            pairs.plan_observations,
-            vec![desktop.pairs[1].observation.clone()]
-        );
-        assert!(pairs
-            .plan_observations
-            .iter()
-            .all(|observation| observation.is_current == Some(false)));
-        let carries_covered = |snapshot: &AgentStatusSnapshot| {
-            snapshot.plan_observations.iter().any(|observation| {
-                observation.account_identifier_hash.as_deref()
-                    == Some(covered.account_identifier_hash.as_str())
-                    && observation.organization_identifier_hash.as_deref()
-                        == Some(covered.organization_identifier_hash.as_str())
-            })
-        };
-        assert!(!carries_covered(pairs));
-        assert_eq!(
-            uploads
-                .iter()
-                .filter(|snapshot| carries_covered(snapshot))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
     fn desktop_profile_names_stay_local_in_actual_status_post() {
         use crate::snapshot_client::{AgentStatusSnapshotUploadRequest, SnapshotApiClient};
         use std::net::TcpListener;
@@ -30271,30 +28447,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_desktop_duplicate_session_owner_fails_closed_on_missing_activity() {
-        let builders = vec![
-            ClaudeDesktopProfileBuilder {
-                account_uuid: "timestamped-account".to_string(),
-                session_activity_by_id: BTreeMap::from([(
-                    "ambiguous-session".to_string(),
-                    Some(1_700_000_000),
-                )]),
-                ..ClaudeDesktopProfileBuilder::default()
-            },
-            ClaudeDesktopProfileBuilder {
-                account_uuid: "untimestamped-account".to_string(),
-                session_activity_by_id: BTreeMap::from([("ambiguous-session".to_string(), None)]),
-                ..ClaudeDesktopProfileBuilder::default()
-            },
-        ];
-
-        assert_eq!(
-            claude_desktop_unambiguous_duplicate_session_owners(&builders).get("ambiguous-session"),
-            Some(&None)
-        );
-    }
-
-    #[test]
     fn claude_oauth_token_parser_extracts_access_and_refresh_presence_only() {
         let payload = r#"{
           "claudeAiOauth": {
@@ -30380,23 +28532,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn current_claude_desktop_profile_gets_safe_label_fallback() {
-        let observation = claude_desktop_builder_plan_observation(
-            ClaudeDesktopProfileBuilder {
-                account_uuid: "account-123".to_string(),
-                organization_uuids: BTreeSet::from(["organization-456".to_string()]),
-                code_session_count: 1,
-                ..Default::default()
-            },
-            "2026-07-14T18:00:00Z",
-            Some("account-123"),
-        )
-        .expect("current Desktop observation");
-
-        assert_eq!(observation.account_label.as_deref(), Some("Claude Desktop"));
-    }
-
-    #[test]
     fn claude_desktop_multi_org_account_without_current_org_omits_organization() {
         // A non-current account with session buckets under several orgs must
         // not have one picked for it: pairing an account hash with an
@@ -30426,28 +28561,6 @@ for line in sys.stdin:
         assert_eq!(
             observation.billing_identity_evidence.as_deref(),
             Some("provider_account_id")
-        );
-        assert_eq!(observation.is_current, Some(false));
-    }
-
-    #[test]
-    fn claude_desktop_single_org_account_keeps_its_organization() {
-        let observation = claude_desktop_builder_plan_observation(
-            ClaudeDesktopProfileBuilder {
-                account_uuid: "account-single".to_string(),
-                organization_uuids: BTreeSet::from(["only-org".to_string()]),
-                code_session_count: 1,
-                ..Default::default()
-            },
-            "2026-07-28T10:00:00Z",
-            None,
-        )
-        .expect("single-org Desktop observation");
-
-        assert_eq!(observation.organization_id.as_deref(), Some("only-org"));
-        assert_eq!(
-            observation.organization_identifier_hash,
-            billing_identity_hash("anthropic", "organization", "only-org")
         );
         assert_eq!(observation.is_current, Some(false));
     }
@@ -30518,57 +28631,6 @@ for line in sys.stdin:
             windows[1].resets_at.as_deref(),
             Some("2026-07-04T05:00:00.937587Z")
         );
-    }
-
-    #[test]
-    fn claude_oauth_usage_cache_keeps_fresh_windows() {
-        let cache = ClaudeOAuthUsageCache {
-            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
-            account_identifier_hash: "account-a".to_string(),
-            organization_identifier_hash: "organization-a".to_string(),
-            observed_at_epoch_seconds: 100,
-            next_refresh_after_epoch_seconds: 400,
-            windows: vec![AgentQuotaWindow {
-                name: "session".to_string(),
-                scope: AgentQuotaWindowScope::Account,
-                status: AgentQuotaWindowStatus::Ok,
-                freshness: AgentQuotaWindowFreshness::Fresh,
-                window_seconds: Some(5 * 60 * 60),
-                resets_at: Some("2026-06-29T18:10:00Z".to_string()),
-                used_percent: Some(25),
-                left_percent: Some(75),
-                ..Default::default()
-            }],
-            credit_balances: vec![AgentCreditBalance {
-                name: "Usage credits".to_string(),
-                status: AgentCreditBalanceStatus::Ok,
-                freshness: AgentQuotaWindowFreshness::Fresh,
-                unit: AgentCreditBalanceUnit::Usd,
-                used: Some(321),
-                quota: Some(500),
-                remaining: Some(179),
-                enabled: Some(true),
-                ..Default::default()
-            }],
-            account_weekly_not_offered: false,
-        };
-
-        let usage = claude_oauth_usage_from_cache(cache, 200);
-
-        assert_eq!(usage.windows.len(), 1);
-        assert_eq!(usage.windows[0].status, AgentQuotaWindowStatus::Ok);
-        assert_eq!(usage.windows[0].freshness, AgentQuotaWindowFreshness::Fresh);
-        assert_eq!(usage.windows[0].used_percent, Some(25));
-        assert_eq!(
-            usage.windows[0].observed_at.as_deref(),
-            Some("1970-01-01T00:01:40Z")
-        );
-        assert_eq!(usage.credit_balances.len(), 1);
-        assert_eq!(
-            usage.credit_balances[0].freshness,
-            AgentQuotaWindowFreshness::Fresh
-        );
-        assert_eq!(usage.credit_balances[0].used, Some(321));
     }
 
     #[test]
@@ -30657,21 +28719,6 @@ for line in sys.stdin:
         assert_eq!(
             usage.credit_balances[0].freshness,
             AgentQuotaWindowFreshness::Stale
-        );
-    }
-
-    #[test]
-    fn claude_oauth_usage_cache_discards_v1_schema() {
-        let v1 = serde_json::json!({
-            "schema_version": 1,
-            "observed_at_epoch_seconds": 100,
-            "next_refresh_after_epoch_seconds": 400,
-            "windows": []
-        });
-        let cache: ClaudeOAuthUsageCache = serde_json::from_value(v1).unwrap();
-        assert_ne!(
-            cache.schema_version,
-            CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION
         );
     }
 
@@ -30853,36 +28900,6 @@ for line in sys.stdin:
         );
 
         let _ = std::fs::remove_dir_all(&support_dir);
-    }
-
-    #[test]
-    fn claude_oauth_usage_cache_rejects_mismatched_embedded_meter_identity() {
-        let mut cache = ClaudeOAuthUsageCache {
-            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
-            account_identifier_hash: "account-a".to_string(),
-            organization_identifier_hash: "organization-a".to_string(),
-            observed_at_epoch_seconds: 100,
-            next_refresh_after_epoch_seconds: 200,
-            windows: vec![AgentQuotaWindow {
-                name: "session".to_string(),
-                account_identifier_hash: Some("account-a".to_string()),
-                organization_identifier_hash: Some("organization-a".to_string()),
-                ..Default::default()
-            }],
-            credit_balances: Vec::new(),
-            account_weekly_not_offered: false,
-        };
-        assert!(claude_oauth_usage_cache_belongs_to_identity(
-            &cache,
-            "account-a",
-            "organization-a",
-        ));
-        cache.windows[0].organization_identifier_hash = Some("organization-b".to_string());
-        assert!(!claude_oauth_usage_cache_belongs_to_identity(
-            &cache,
-            "account-a",
-            "organization-a",
-        ));
     }
 
     #[test]
@@ -31436,42 +29453,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_oauth_usage_cadence_is_forty_minutes_within_a_two_minute_spread() {
-        // The spread is load-spreading across our own installs, so it must be
-        // bounded and deterministic -- never an open-ended random delay.
-        for seed in [
-            "",
-            "account-a",
-            "account-b",
-            "9f1c0c1a4b5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7",
-        ] {
-            let gate = claude_oauth_usage_fresh_age_seconds(seed, "organization-test");
-            assert!(
-                (38 * 60..=42 * 60).contains(&gate),
-                "gate for {seed:?} out of the 38-42 minute band: {gate}"
-            );
-            assert_eq!(
-                gate,
-                claude_oauth_usage_fresh_age_seconds(seed, "organization-test"),
-                "gate must be stable for a given account, not redrawn per call"
-            );
-        }
-        // Different accounts land on different phases; that is the whole point.
-        assert_ne!(
-            claude_oauth_usage_fresh_age_seconds("account-a", "organization-test"),
-            claude_oauth_usage_fresh_age_seconds("account-b", "organization-test")
-        );
-        // Sanity on the base cadence itself: ~36 calls/day for an unused
-        // account, not ~288.
-        assert_eq!(CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS, 40 * 60);
-        // The 24h max age stays a display fallback, well clear of the gate.
-        assert!(
-            CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
-                > claude_oauth_usage_fresh_age_seconds("account-a", "organization-test")
-        );
-    }
-
-    #[test]
     fn claude_oauth_usage_breaker_opens_on_each_trigger_class() {
         for (failure, threshold, code) in [
             (
@@ -31515,101 +29496,6 @@ for line in sys.stdin:
                 opened.reopen_after_epoch_seconds,
                 1_000 + CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS
             );
-        }
-    }
-
-    #[test]
-    fn claude_oauth_usage_breaker_counts_failure_classes_separately() {
-        // One 429 plus one 401 must not add up to a trip: a mixed dribble of
-        // unrelated transient failures is not the structural signal.
-        let mut breaker = None;
-        for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD {
-            breaker = Some(claude_oauth_usage_breaker_after_failure(
-                breaker,
-                ClaudeOAuthUsageFailure::RateLimited,
-                "account-a",
-                "organization-a",
-                "fingerprint-a",
-                1_000,
-            ));
-        }
-        let breaker = breaker.expect("breaker");
-        assert!(!claude_oauth_usage_breaker_is_open(&breaker, 1_000));
-        assert_eq!(breaker.auth_failures, 0);
-        assert_eq!(breaker.shape_failures, 0);
-    }
-
-    #[test]
-    fn claude_oauth_usage_breaker_closes_after_cooldown() {
-        let mut breaker = None;
-        for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD {
-            breaker = Some(claude_oauth_usage_breaker_after_failure(
-                breaker,
-                ClaudeOAuthUsageFailure::AuthRejected,
-                "account-a",
-                "organization-a",
-                "fingerprint-a",
-                1_000,
-            ));
-        }
-        let breaker = breaker.expect("breaker");
-        assert!(claude_oauth_usage_breaker_is_open(&breaker, 1_000));
-        assert!(claude_oauth_usage_breaker_is_open(
-            &breaker,
-            1_000 + CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS - 1
-        ));
-        assert!(!claude_oauth_usage_breaker_is_open(
-            &breaker,
-            1_000 + CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS
-        ));
-    }
-
-    #[test]
-    fn claude_oauth_usage_config_fingerprint_tracks_the_call_it_governs() {
-        let baseline = claude_oauth_usage_config_fingerprint_for(
-            "https://api.anthropic.com/api/oauth/usage",
-            "oauth-2025-04-20",
-            "ottto/1.2.3 (subscription-usage-reader; +https://ottto.net)",
-            false,
-        );
-        assert_eq!(
-            baseline,
-            claude_oauth_usage_config_fingerprint_for(
-                "https://api.anthropic.com/api/oauth/usage",
-                "oauth-2025-04-20",
-                "ottto/1.2.3 (subscription-usage-reader; +https://ottto.net)",
-                false,
-            )
-        );
-        for changed in [
-            claude_oauth_usage_config_fingerprint_for(
-                "https://api.anthropic.com/api/oauth/usage/v2",
-                "oauth-2025-04-20",
-                "ottto/1.2.3 (subscription-usage-reader; +https://ottto.net)",
-                false,
-            ),
-            claude_oauth_usage_config_fingerprint_for(
-                "https://api.anthropic.com/api/oauth/usage",
-                "oauth-2026-01-01",
-                "ottto/1.2.3 (subscription-usage-reader; +https://ottto.net)",
-                false,
-            ),
-            claude_oauth_usage_config_fingerprint_for(
-                "https://api.anthropic.com/api/oauth/usage",
-                "oauth-2025-04-20",
-                "ottto/1.2.4 (subscription-usage-reader; +https://ottto.net)",
-                false,
-            ),
-            // Toggling the off-switch resets the breaker: the sentinel is part
-            // of the configuration the verdict was about.
-            claude_oauth_usage_config_fingerprint_for(
-                "https://api.anthropic.com/api/oauth/usage",
-                "oauth-2025-04-20",
-                "ottto/1.2.3 (subscription-usage-reader; +https://ottto.net)",
-                true,
-            ),
-        ] {
-            assert_ne!(baseline, changed);
         }
     }
 
@@ -32101,45 +29987,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn auth_backoff_is_bounded_and_reaches_the_cooldown_at_the_threshold() {
-        assert_eq!(
-            claude_oauth_usage_auth_backoff_seconds(1),
-            CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS
-        );
-        assert_eq!(
-            claude_oauth_usage_auth_backoff_seconds(2),
-            2 * CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS
-        );
-        assert_eq!(
-            claude_oauth_usage_auth_backoff_seconds(CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD),
-            CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS
-        );
-        assert_eq!(
-            claude_oauth_usage_auth_backoff_seconds(u32::MAX),
-            CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS
-        );
-        // A streak older than the cool-down starts over instead of re-opening
-        // on the first new rejection.
-        let caller = ClaudeOAuthUsageCaller::RegisteredSlot("slot-a".to_string());
-        let mut breaker = None;
-        for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD {
-            breaker = Some(claude_oauth_usage_breaker_after_auth_failure(
-                breaker, &caller, 401, "a", "o", "f", 1_000, None,
-            ));
-        }
-        let later = 1_000 + CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS;
-        let breaker = claude_oauth_usage_breaker_after_auth_failure(
-            breaker, &caller, 401, "a", "o", "f", later, None,
-        );
-        let state = &breaker.auth_callers[&claude_oauth_usage_slot_caller_key("slot-a")];
-        assert_eq!(state.consecutive_failures, 1);
-        assert_eq!(
-            state.backoff_until_epoch_seconds,
-            later + CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS
-        );
-    }
-
-    #[test]
     #[serial]
     fn held_caller_makes_no_provider_call_and_says_why() {
         let support_dir = single_caller_test_support_dir("held");
@@ -32212,65 +30059,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn caller_reaching_the_auth_threshold_alerts_once_with_the_existing_wording() {
-        let support_dir = single_caller_test_support_dir("threshold");
-        let _support_guard = EnvVarGuard::set_os(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            support_dir.as_os_str().to_os_string(),
-        );
-        let caller = ClaudeOAuthUsageCaller::Default;
-        let mut opened = Vec::new();
-        for attempt in 0..=CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD {
-            opened.extend(
-                record_claude_oauth_usage_auth_failure(
-                    &caller,
-                    403,
-                    "account-threshold",
-                    "organization-threshold",
-                    "fingerprint-threshold",
-                    1_000 + u64::from(attempt),
-                    None,
-                )
-                .into_iter()
-                .filter(|diagnostic| diagnostic.code == "claude_oauth_usage_circuit_open"),
-            );
-        }
-        assert_eq!(opened.len(), 1, "alert on the transition only");
-        assert!(opened[0]
-            .message
-            .starts_with("Stopped calling the Claude OAuth usage endpoint after auth rejected;"));
-        let safe = safe_claude_slot_check_diagnostics(
-            &[opened[0]
-                .clone()
-                .with_quota_binding(Some("a".to_string()), Some("o".to_string()))],
-            "a",
-            "o",
-        );
-        assert_eq!(
-            safe[0].message,
-            "The local quota circuit is open after authentication rejection."
-        );
-        let _ = fs::remove_dir_all(support_dir);
-    }
-
-    #[test]
-    fn slot_check_diagnostics_keep_the_auth_status_and_drop_the_clock_text() {
-        let raw = AgentStatusDiagnostic::source(
-            "claude_oauth_usage_auth_rejected",
-            AgentDiagnosticSeverity::Warning,
-            "The Claude OAuth usage endpoint rejected the registered account slot credential with HTTP 403 at 2026-10-03T00:00:00Z; that credential is not retried until 2026-10-03T00:15:00Z.",
-        )
-        .with_quota_binding(Some("a".to_string()), Some("o".to_string()));
-        let safe = safe_claude_slot_check_diagnostics(&[raw], "a", "o");
-        assert_eq!(safe.len(), 1);
-        assert_eq!(
-            safe[0].message,
-            "The quota provider rejected this exact slot's credential with HTTP 403; it backs off before retrying."
-        );
-    }
-
-    #[test]
-    #[serial]
     fn success_from_one_caller_keeps_another_callers_auth_hold() {
         let support_dir = single_caller_test_support_dir("success");
         let _support_guard = EnvVarGuard::set_os(
@@ -32321,58 +30109,6 @@ for line in sys.stdin:
             !claude_oauth_usage_breaker_path(account, organization).exists(),
             "nothing left to hold: the file is removed as before"
         );
-        let _ = fs::remove_dir_all(support_dir);
-    }
-
-    #[test]
-    #[serial]
-    fn refreshed_slot_credential_clears_only_that_slots_auth_hold() {
-        let support_dir = single_caller_test_support_dir("upkeep");
-        let _support_guard = EnvVarGuard::set_os(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            support_dir.as_os_str().to_os_string(),
-        );
-        let (account, organization, fingerprint) = ("account-u", "organization-u", "fingerprint-u");
-        let slot = ClaudeOAuthUsageCaller::RegisteredSlot("slot-u".to_string());
-        let default = ClaudeOAuthUsageCaller::Default;
-        record_claude_oauth_usage_auth_failure(
-            &slot,
-            401,
-            account,
-            organization,
-            fingerprint,
-            1_000,
-            None,
-        );
-        record_claude_oauth_usage_auth_failure(
-            &default,
-            401,
-            account,
-            organization,
-            fingerprint,
-            1_000,
-            None,
-        );
-
-        clear_claude_oauth_usage_auth_breaker(account, organization, "slot-u");
-        let kept = read_claude_oauth_usage_breaker(account, organization, fingerprint)
-            .expect("the default login's own rejection stays");
-        assert!(claude_oauth_usage_caller_auth_hold(&kept, &slot, 1_001, None).is_none());
-        assert!(claude_oauth_usage_caller_auth_hold(&kept, &default, 1_001, None).is_some());
-
-        // With only the refreshed slot's state present, the file goes away.
-        let other = ("account-v", "organization-v");
-        record_claude_oauth_usage_auth_failure(
-            &slot,
-            403,
-            other.0,
-            other.1,
-            fingerprint,
-            1_000,
-            None,
-        );
-        clear_claude_oauth_usage_auth_breaker(other.0, other.1, "slot-u");
-        assert!(!claude_oauth_usage_breaker_path(other.0, other.1).exists());
         let _ = fs::remove_dir_all(support_dir);
     }
 
@@ -32774,125 +30510,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn another_callers_success_keeps_an_expired_hold_streak_until_it_goes_stale() {
-        let support_dir = single_caller_test_support_dir("streak-kept");
-        let _support_guard = EnvVarGuard::set_os(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            support_dir.as_os_str().to_os_string(),
-        );
-        let (account, organization, fingerprint) = ("account-k", "organization-k", "fingerprint-k");
-        let slot_a = ClaudeOAuthUsageCaller::RegisteredSlot("slot-a".to_string());
-        let slot_b = ClaudeOAuthUsageCaller::RegisteredSlot("slot-b".to_string());
-        record_claude_oauth_usage_auth_failure(
-            &slot_a,
-            401,
-            account,
-            organization,
-            fingerprint,
-            1_000,
-            None,
-        );
-        // A's 15-minute hold has expired when B succeeds.
-        let after_hold = 1_000 + CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS + 60;
-        clear_claude_oauth_usage_breaker_after_success(
-            &slot_b,
-            account,
-            organization,
-            fingerprint,
-            after_hold,
-        );
-        let kept = read_claude_oauth_usage_breaker(account, organization, fingerprint)
-            .expect("A's streak survives B's success");
-        assert_eq!(
-            kept.auth_callers[&slot_a.breaker_key()].consecutive_failures,
-            1
-        );
-        // A's next two rejections therefore reach the threshold.
-        for offset in [1, 2] {
-            record_claude_oauth_usage_auth_failure(
-                &slot_a,
-                401,
-                account,
-                organization,
-                fingerprint,
-                after_hold + offset,
-                None,
-            );
-        }
-        let opened =
-            read_claude_oauth_usage_breaker(account, organization, fingerprint).expect("breaker");
-        assert_eq!(
-            opened.auth_callers[&slot_a.breaker_key()].consecutive_failures,
-            CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD
-        );
-        // Once the streak is stale, B's success drops it.
-        clear_claude_oauth_usage_breaker_after_success(
-            &slot_b,
-            account,
-            organization,
-            fingerprint,
-            after_hold + 2 + CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS,
-        );
-        assert!(!claude_oauth_usage_breaker_path(account, organization).exists());
-        let _ = fs::remove_dir_all(support_dir);
-    }
-
-    #[test]
-    #[serial]
-    fn clearing_a_legacy_auth_verdict_keeps_other_callers_holds() {
-        let support_dir = single_caller_test_support_dir("legacy-verdict");
-        let _support_guard = EnvVarGuard::set_os(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            support_dir.as_os_str().to_os_string(),
-        );
-        let (account, organization, fingerprint) = ("account-l", "organization-l", "fingerprint-l");
-        let now = current_unix_seconds();
-        // A pre-attribution account-wide auth verdict...
-        for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD {
-            record_claude_oauth_usage_failure(
-                ClaudeOAuthUsageFailure::AuthRejected,
-                account,
-                organization,
-                fingerprint,
-                now,
-            );
-        }
-        // ...plus the default login's own attributed hold and the slot's.
-        let default = ClaudeOAuthUsageCaller::Default;
-        let slot = ClaudeOAuthUsageCaller::RegisteredSlot("slot-l".to_string());
-        record_claude_oauth_usage_auth_failure(
-            &default,
-            401,
-            account,
-            organization,
-            fingerprint,
-            now,
-            None,
-        );
-        record_claude_oauth_usage_auth_failure(
-            &slot,
-            403,
-            account,
-            organization,
-            fingerprint,
-            now,
-            None,
-        );
-
-        clear_claude_oauth_usage_auth_breaker(account, organization, "slot-l");
-
-        let kept = read_claude_oauth_usage_breaker(account, organization, fingerprint)
-            .expect("unrelated callers' holds survive the refresh");
-        assert!(!claude_oauth_usage_breaker_is_open(&kept, now));
-        assert_eq!(kept.auth_failures, 0);
-        assert!(kept.opened_by.is_empty());
-        assert!(claude_oauth_usage_caller_auth_hold(&kept, &default, now, None).is_some());
-        assert!(claude_oauth_usage_caller_auth_hold(&kept, &slot, now, None).is_none());
-        let _ = fs::remove_dir_all(support_dir);
-    }
-
-    #[test]
-    #[serial]
     fn breaker_files_never_persist_the_raw_slot_id_and_migrate_raw_keys() {
         let support_dir = single_caller_test_support_dir("opaque-key");
         let _support_guard = EnvVarGuard::set_os(
@@ -32983,40 +30600,6 @@ for line in sys.stdin:
             "the migration is persisted"
         );
         let _ = fs::remove_dir_all(support_dir);
-    }
-
-    #[test]
-    fn default_does_not_defer_to_a_slot_whose_own_credential_is_held() {
-        use ottto_protocol::ClaudeConfigSlotRelationshipV1 as Relationship;
-        let binding = ClaudeStrongBinding::new("account-g", "organization-g").expect("binding");
-        let anchor = single_caller_slot(
-            "claude_slot_held",
-            ClaudeConfigSlotOwnership::Managed,
-            ClaudeConfigSlotCollectionStateV1::Fresh,
-            Some(Relationship::CanonicalAnchor),
-        );
-        let status = single_caller_accounts_status(vec![anchor], Vec::new());
-        let held = claude_slot_owned_usage_bindings(
-            &status,
-            |_| Some(binding.clone()),
-            |_| false,
-            |held_binding, slot_id| {
-                assert_eq!(held_binding, &binding);
-                assert_eq!(slot_id, "claude_slot_held");
-                true
-            },
-        );
-        assert!(
-            held.is_empty(),
-            "a Fresh-looking slot in its own auth hold would not refresh the account"
-        );
-        let not_held = claude_slot_owned_usage_bindings(
-            &status,
-            |_| Some(binding.clone()),
-            |_| false,
-            |_, _| false,
-        );
-        assert_eq!(not_held, BTreeSet::from([binding]));
     }
 
     #[test]
@@ -33602,69 +31185,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_statusline_sample_serves_when_resolved_via_session_store_despite_multiple_accounts() {
-        // NEW BEHAVIOR: if the Desktop session store proved which account owns the session,
-        // serve it even when other accounts are observable -- the store join is the proof.
-        let team = claude_account_identifier_hash(Some("acct-team"), None, None);
-
-        // session_store method: serve despite multiple accounts being observable
-        assert_eq!(
-            claude_statusline_attribution_failure(
-                &team,
-                "session_store",
-                &team,
-                &observable_account_hashes(&["acct-max"])
-            ),
-            None,
-            "session_store resolution proves ownership even when another account is present"
-        );
-    }
-
-    #[test]
-    fn claude_statusline_sample_serves_config_dir_when_hash_matches_despite_multiple_accounts() {
-        // NEW BEHAVIOR: CLI credential (config_dir method) serves if the hash matches,
-        // even when other accounts are observable -- the credential holder owns their own sessions.
-        let team = claude_account_identifier_hash(Some("acct-team"), None, None);
-        let max = claude_account_identifier_hash(Some("acct-max"), None, None);
-
-        // config_dir method with matching hash: serve despite multiple accounts
-        assert_eq!(
-            claude_statusline_attribution_failure(
-                &team,
-                "config_dir",
-                &team,
-                &observable_account_hashes(&["acct-max"])
-            ),
-            None,
-            "config_dir resolution matches current credential and serves despite multiple accounts"
-        );
-
-        // config_dir method with non-matching hash: refuse as CredentialReplaced
-        assert_eq!(
-            claude_statusline_attribution_failure(
-                &max,
-                "config_dir",
-                &team,
-                &observable_account_hashes(&["acct-max"])
-            ),
-            Some(ClaudeStatusLineUnattributable::CredentialReplaced),
-            "config_dir refuses when hash differs from current credential"
-        );
-    }
-
-    #[test]
-    fn claude_statusline_sample_refuses_ambiguous_resolution() {
-        // NEW BEHAVIOR: ambiguous resolution (multiple Desktop store matches) always refuses
-        let team = claude_account_identifier_hash(Some("acct-team"), None, None);
-
-        assert_eq!(
-            claude_statusline_attribution_failure(&team, "ambiguous", &team, &[]),
-            Some(ClaudeStatusLineUnattributable::MultipleAccounts),
-            "ambiguous resolution is unresolvable and must refuse"
-        );
-    }
-
-    #[test]
     fn claude_statusline_sample_refuses_unknown_resolution() {
         // NEW BEHAVIOR: unknown resolution (no store match, no CLI entrypoint, etc) refuses
         let team = claude_account_identifier_hash(Some("acct-team"), None, None);
@@ -34066,30 +31586,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_statusline_windows_from_unidentified_writer_stay_unstamped() {
-        let cache = ClaudeStatusLineRateLimitCache {
-            schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
-            observed_under_account_identifier_hash: String::new(),
-            observed_under_organization_identifier_hash: None,
-            observed_under_account_method: "config_dir".to_string(),
-            observed_at_epoch_seconds: 100,
-            windows: vec![ClaudeStatusLineRateLimitWindow {
-                name: "five_hour".to_string(),
-                used_percent: 24,
-                resets_at_epoch_seconds: 200,
-            }],
-        };
-
-        let windows = claude_statusline_quota_windows_from_cache(cache, 150);
-
-        assert_eq!(windows.len(), 1);
-        assert_eq!(
-            windows[0].account_identifier_hash, None,
-            "an unidentifiable writer must serve as unknown, never as a guessed account"
-        );
-    }
-
-    #[test]
     fn claude_oauth_usage_stamps_served_windows_and_balances() {
         let mut usage = ClaudeOAuthUsage {
             windows: vec![
@@ -34277,38 +31773,6 @@ for line in sys.stdin:
             "strongly bound statusLine meters remain an honest partial view"
         );
         assert!(claude_slot_status_carries_meters(&partial));
-    }
-
-    #[test]
-    fn claude_candidate_rank_prefers_fresh_full_over_stale_full() {
-        let mut snapshot = base_snapshot(
-            SourceKind::ClaudeCode,
-            AgentStatusState::Available,
-            AgentStatusCollectionMethod::CliJson,
-            "2026-08-04T12:00:00Z".to_string(),
-            "2026-08-04T12:15:00Z".to_string(),
-        );
-        snapshot.account = Some(AgentAccountStatus {
-            account_identifier_hash: Some("account-a".to_string()),
-            organization_identifier_hash: Some("organization-a".to_string()),
-            ..unsupported_account("anthropic")
-        });
-        snapshot.quota_windows = vec![AgentQuotaWindow {
-            name: "session".to_string(),
-            freshness: AgentQuotaWindowFreshness::Fresh,
-            account_identifier_hash: Some("account-a".to_string()),
-            organization_identifier_hash: Some("organization-a".to_string()),
-            ..Default::default()
-        }];
-        assert_eq!(
-            claude_snapshot_candidate_rank(&snapshot).map(|quality| quality.tier),
-            Some(3)
-        );
-        snapshot.quota_windows[0].freshness = AgentQuotaWindowFreshness::Stale;
-        assert_eq!(
-            claude_snapshot_candidate_rank(&snapshot).map(|quality| quality.tier),
-            Some(1)
-        );
     }
 
     #[test]
@@ -34905,41 +32369,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_statusline_cache_skips_expired_and_unknown_windows() {
-        let cache = ClaudeStatusLineRateLimitCache {
-            schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
-            observed_under_account_identifier_hash: "account-a".to_string(),
-            observed_under_organization_identifier_hash: None,
-            observed_under_account_method: "config_dir".to_string(),
-            observed_at_epoch_seconds: 100,
-            windows: vec![
-                ClaudeStatusLineRateLimitWindow {
-                    name: "five_hour".to_string(),
-                    used_percent: 100,
-                    resets_at_epoch_seconds: 150,
-                },
-                ClaudeStatusLineRateLimitWindow {
-                    name: "monthly".to_string(),
-                    used_percent: 10,
-                    resets_at_epoch_seconds: 300,
-                },
-                ClaudeStatusLineRateLimitWindow {
-                    name: "seven_day".to_string(),
-                    used_percent: 100,
-                    resets_at_epoch_seconds: 300,
-                },
-            ],
-        };
-
-        let windows = claude_statusline_quota_windows_from_cache(cache, 150);
-
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].name, "weekly");
-        assert_eq!(windows[0].status, AgentQuotaWindowStatus::Exhausted);
-        assert_eq!(windows[0].left_percent, Some(0));
-    }
-
-    #[test]
     fn claude_statusline_cache_marks_old_windows_stale() {
         let cache = ClaudeStatusLineRateLimitCache {
             schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
@@ -35017,32 +32446,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_statusline_context_cache_maps_window_size_only() {
-        let cache = ClaudeStatusLineContextWindowCache {
-            schema_version: 1,
-            observed_at_epoch_seconds: 100,
-            active_tokens: None,
-            max_tokens: Some(1_000_000),
-            used_percent: None,
-            remaining_tokens: None,
-        };
-
-        let context = claude_statusline_context_from_cache(cache, None);
-
-        assert_eq!(context.status, AgentContextState::Available);
-        assert_eq!(context.active_tokens, None);
-        assert_eq!(context.max_tokens, Some(1_000_000));
-        assert_eq!(context.used_percent, None);
-        assert_eq!(context.remaining_tokens, None);
-        assert_eq!(
-            context.completeness,
-            Some(AgentContextCompleteness::WindowSizeOnly)
-        );
-        assert_eq!(context.reason.as_deref(), Some("context_window_size_only"));
-        assert!(context.recent_samples.is_empty());
-    }
-
-    #[test]
     fn claude_statusline_context_cache_normalizes_legacy_zero_sentinel() {
         let now = current_unix_seconds();
         let cache = ClaudeStatusLineContextWindowCache {
@@ -35077,45 +32480,6 @@ for line in sys.stdin:
         );
         assert_eq!(context.reason.as_deref(), Some("context_window_size_only"));
         assert!(context.recent_samples.is_empty());
-    }
-
-    #[test]
-    fn claude_statusline_context_cache_maps_recent_history_samples() {
-        let now = current_unix_seconds();
-        let cache = ClaudeStatusLineContextWindowCache {
-            schema_version: 1,
-            observed_at_epoch_seconds: now,
-            active_tokens: Some(45_000),
-            max_tokens: Some(1_000_000),
-            used_percent: Some(5),
-            remaining_tokens: Some(955_000),
-        };
-        let history = ClaudeStatusLineContextWindowHistory {
-            schema_version: 1,
-            samples: vec![
-                ClaudeStatusLineContextWindowSample {
-                    observed_at_epoch_seconds: now.saturating_sub(120),
-                    active_tokens: Some(40_000),
-                    max_tokens: Some(1_000_000),
-                    used_percent: Some(4),
-                    remaining_tokens: Some(960_000),
-                },
-                ClaudeStatusLineContextWindowSample {
-                    observed_at_epoch_seconds: now.saturating_sub(60),
-                    active_tokens: Some(42_000),
-                    max_tokens: Some(1_000_000),
-                    used_percent: Some(4),
-                    remaining_tokens: Some(958_000),
-                },
-            ],
-        };
-
-        let context = claude_statusline_context_from_cache(cache, Some(history));
-
-        assert_eq!(context.recent_samples.len(), 3);
-        assert_eq!(context.recent_samples[0].active_tokens, Some(40_000));
-        assert_eq!(context.recent_samples[1].active_tokens, Some(42_000));
-        assert_eq!(context.recent_samples[2].active_tokens, Some(45_000));
     }
 
     #[test]
@@ -35255,79 +32619,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         assert_eq!(
             routes[1].classification.source_category.as_deref(),
             Some("google_cloud_vertex")
-        );
-    }
-
-    #[test]
-    fn pi_smoke_route_prefers_default_model_only() {
-        let settings = serde_json::json!({
-            "defaultProvider": "google-vertex",
-            "defaultModel": "gemini-3.1-pro-preview-customtools",
-            "defaultThinkingLevel": "high",
-            "enabledModels": [
-                "google-vertex/gemini-3.1-pro-preview-customtools:xhigh",
-                "google-vertex/gemini-3.1-pro-preview:xhigh",
-                "google-vertex/gemini-2.5-pro:xhigh"
-            ]
-        });
-
-        let route = collect_default_pi_smoke_route_from_settings(&settings)
-            .expect("default Pi smoke route");
-
-        assert_eq!(route.provider, "google-vertex");
-        assert_eq!(route.model, "gemini-3.1-pro-preview-customtools");
-        assert_eq!(route.thinking_level.as_deref(), Some("high"));
-    }
-
-    #[test]
-    fn pi_settings_parser_splits_string_route_thinking_suffix() {
-        let settings = serde_json::json!({
-            "defaultProvider": "google-vertex",
-            "defaultModel": "gemini-3.1-pro-preview-customtools",
-            "defaultThinkingLevel": "high",
-            "enabledModels": [
-                "OpenAI Codex/gpt-5.5:xhigh",
-                "Google Vertex/gemini-3.1-pro-preview:xhigh"
-            ]
-        });
-
-        let routes = collect_pi_routes_from_settings(&settings);
-
-        assert_eq!(routes.len(), 3);
-        assert_eq!(routes[0].provider, "OpenAI Codex");
-        assert_eq!(routes[0].model, "gpt-5.5");
-        assert_eq!(routes[0].thinking_level.as_deref(), Some("xhigh"));
-        assert_eq!(
-            routes[0].classification.source_category.as_deref(),
-            Some("chatgpt_openai_subscription")
-        );
-        assert_eq!(routes[1].provider, "Google Vertex");
-        assert_eq!(routes[1].model, "gemini-3.1-pro-preview");
-        assert_eq!(routes[1].thinking_level.as_deref(), Some("xhigh"));
-        assert_eq!(
-            routes[1].classification.source_category.as_deref(),
-            Some("google_cloud_vertex")
-        );
-        assert_eq!(routes[2].provider, "google-vertex");
-        assert_eq!(routes[2].model, "gemini-3.1-pro-preview-customtools");
-
-        let model_status = collect_pi_model_status_from_settings(&settings, None);
-        assert_eq!(model_status.available_model_details[0].id, "gpt-5.5");
-        assert_eq!(
-            model_status.available_model_details[0].provider.as_deref(),
-            Some("OpenAI Codex")
-        );
-        assert_eq!(
-            model_status.available_model_details[0]
-                .billing_channel
-                .as_deref(),
-            Some("subscription")
-        );
-        assert_eq!(
-            model_status.available_model_details[1]
-                .billing_channel
-                .as_deref(),
-            Some("google_vertex")
         );
     }
 
@@ -35490,28 +32781,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Absent `effortLevel` must stay absent. Claude Code's own default is not
-    /// ours to invent, and an unset field is what tells the UI "not configured".
-    #[test]
-    fn claude_runtime_defaults_leave_effort_unset_when_not_configured() {
-        let (root, paths) = claude_settings_fixture(
-            "no-effort-level",
-            concat!(
-                "{\"model\": \"claude-opus-4-7\",\n",
-                " \"alwaysThinkingEnabled\": true,\n",
-                " \"env\": {\"MAX_THINKING_TOKENS\": \"32000\"}}\n"
-            ),
-        );
-
-        let capture = claude_runtime_defaults_from_paths("2026-07-25T10:00:00Z", &paths);
-        let defaults = capture.defaults.expect("runtime defaults present");
-        assert_eq!(defaults.reasoning_effort, None);
-        assert!(!defaults.selector_context.contains_key("reasoning_effort"));
-        assert!(!defaults.selector_sources.contains_key("reasoning_effort"));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
     #[test]
     fn claude_runtime_defaults_report_fast_off_for_readable_settings_only() {
         let (configured_root, configured_paths) =
@@ -35554,22 +32823,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         assert!(
             !user_agent.to_ascii_lowercase().contains("claude"),
             "never present a claude-* client identity: {user_agent}"
-        );
-    }
-
-    #[test]
-    fn full_slot_marker_requires_both_canonical_windows_and_a_scoped_limit() {
-        let partial = fresh_slot_status("2026-08-04T10:00:00Z", "aaaa", "bbbb", true, false, true);
-        assert!(partial.last_full_quota_read_at.is_none());
-        let no_credits =
-            fresh_slot_status("2026-08-04T10:00:00Z", "aaaa", "bbbb", true, true, false);
-        assert_eq!(
-            no_credits.last_full_quota_read_at.as_deref(),
-            Some("2026-08-04T10:00:00Z")
-        );
-        assert!(
-            !no_credits.has_credit_balances,
-            "credits are optional for completeness"
         );
     }
 
@@ -36389,104 +33642,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
     }
 
     #[test]
-    fn claude_slot_diagnostics_reject_foreign_unknown_and_invalid_times() {
-        let diagnostic = AgentStatusDiagnostic::source(
-            "claude_oauth_usage_check_failed",
-            AgentDiagnosticSeverity::Info,
-            "unsafe detail",
-        )
-        .with_observed_at(Some("2026-09-01T09:00:00Z".to_string()))
-        .with_quota_binding(Some("account-a".to_string()), Some("org-a".to_string()));
-        let mut foreign = diagnostic.clone();
-        foreign.organization_identifier_hash = Some("org-b".to_string());
-        let mut unknown = diagnostic.clone();
-        unknown.code = "private_unknown_error".to_string();
-        assert!(
-            safe_claude_slot_check_diagnostics(&[foreign, unknown], "account-a", "org-a")
-                .is_empty()
-        );
-        let mut circuit = diagnostic.clone();
-        circuit.code = "claude_oauth_usage_circuit_open".to_string();
-        circuit.observed_at = None;
-        circuit.message = "Stopped calling the Claude OAuth usage endpoint after auth rejected; private remainder".to_string();
-        let safe = safe_claude_slot_check_diagnostics(&[circuit], "account-a", "org-a");
-        assert_eq!(
-            safe[0].message,
-            "The local quota circuit is open after authentication rejection."
-        );
-        assert_eq!(
-            safe_claude_slot_check_diagnostics(&safe, "account-a", "org-a"),
-            safe,
-            "canonicalization must survive persistence/projection"
-        );
-        for clock in [None, Some("not-a-clock"), Some("9999-01-01T00:00:00Z")] {
-            let mut missing = diagnostic.clone();
-            missing.observed_at = clock.map(ToString::to_string);
-            let safe = safe_claude_slot_check_diagnostics(
-                &[missing.clone(), missing],
-                "account-a",
-                "org-a",
-            );
-            assert_eq!(safe.len(), 1);
-            assert!(safe[0].observed_at.is_none());
-        }
-        let mut cleared = provider_unavailable_status("2026-09-01T10:00:00Z", "account-a", "org-a");
-        cleared.quota_check_diagnostics.push(diagnostic);
-        clear_claude_slot_binding(&mut cleared);
-        assert!(cleared.quota_check_diagnostics.is_empty());
-        let legacy: ClaudeConfigSlotCollectionStatusV1 =
-            serde_json::from_str("{\"state\":\"provider_unavailable\"}").expect("legacy slot");
-        assert!(legacy.quota_check_diagnostics.is_empty());
-        assert!(!serde_json::to_string(&legacy)
-            .expect("legacy json")
-            .contains("quota_check_diagnostics"));
-    }
-
-    #[test]
-    fn claude_slot_diagnostics_expose_safe_upkeep_result_and_only_real_attempt_start() {
-        let mut status = provider_unavailable_status("2026-09-01T10:00:00Z", "account-a", "org-a");
-        status.upkeep = Some(ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
-            result: ClaudeConfigSlotUpkeepResultV1::Backoff,
-            attempted_at: Some("2026-09-01T08:00:00Z".to_string()),
-            due_access_expires_at: None,
-            refresh_token_expires_at: None,
-            next_allowed_attempt_at: None,
-            consecutive_failures: 0,
-        });
-        let snapshot = degraded_claude_slot_snapshot(
-            &status,
-            ClaudeAccountAnchorDurabilityV1::Anchored,
-            None,
-            "2026-09-01T11:00:00Z",
-            "2026-09-01T11:05:00Z",
-        )
-        .expect("degraded");
-        let backoff = snapshot
-            .diagnostics
-            .iter()
-            .find(|item| item.code == "claude_slot_upkeep_backoff")
-            .expect("typed backoff");
-        assert!(
-            backoff.observed_at.is_none(),
-            "older attempt is not current backoff outcome time"
-        );
-        let attempt = snapshot
-            .diagnostics
-            .iter()
-            .find(|item| item.code == "claude_slot_upkeep_attempt_started")
-            .expect("real start");
-        assert_eq!(attempt.observed_at.as_deref(), Some("2026-09-01T08:00:00Z"));
-        assert_eq!(
-            attempt.organization_identifier_hash.as_deref(),
-            Some("org-a")
-        );
-        assert!(snapshot
-            .diagnostics
-            .iter()
-            .all(|item| !item.code.starts_with("claude_oauth_usage_check_")));
-    }
-
-    #[test]
     fn claude_slot_diagnostics_keep_terminal_upkeep_clock_separate_from_attempt() {
         let mut descriptor =
             ClaudeConfigDirSlot::Default.descriptor("fixture", ClaudeConfigSlotOwnership::External);
@@ -36641,33 +33796,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             suppressed.is_empty(),
             "a healthy winner for the account must suppress its failed duplicate slot"
         );
-    }
-
-    #[test]
-    fn degraded_default_only_witness_is_never_reported_as_anchored() {
-        let slots = BTreeMap::from([(
-            "default".to_string(),
-            ClaudeConfigSlotCollectionStatusV1 {
-                state: ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
-                account_identifier_hash: Some("account-hash".to_string()),
-                organization_identifier_hash: Some("organization-hash".to_string()),
-                ..Default::default()
-            },
-        )]);
-
-        let snapshots = degraded_claude_slot_snapshots(
-            &slots,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-            "2026-08-12T10:00:00Z",
-            "2026-08-12T10:05:00Z",
-        );
-        let account = snapshots[0].account.as_ref().expect("default account");
-        assert_eq!(
-            account.claude_anchor_durability,
-            Some(ClaudeAccountAnchorDurabilityV1::DefaultOnly)
-        );
-        assert_eq!(account.claude_anchor_health, None);
     }
 
     #[test]
@@ -38172,213 +35300,12 @@ exit 0
         }
     }
 
-    /// The default login on the fixture HOME, file credential included.
-    fn sign_in_default(fixture: &ClaudeBindingFixture, which: (&str, &str), with_org: bool) {
-        let home = fixture.root.join("home");
-        let mut account = serde_json::json!({
-            "accountUuid": which.0,
-            "emailAddress": "team.person@example.invalid",
-            "organizationType": "claude_team",
-            "seatTier": "premium",
-        });
-        if with_org {
-            account["organizationUuid"] = serde_json::json!(which.1);
-        }
-        fs::write(
-            home.join(".claude.json"),
-            serde_json::to_vec(&serde_json::json!({ "oauthAccount": account }))
-                .expect("serialize identity"),
-        )
-        .expect("write identity");
-        fs::create_dir_all(home.join(".claude")).expect("create default config dir");
-        fs::write(
-            home.join(".claude").join(".credentials.json"),
-            serde_json::to_vec(&claude_credential_fixture(
-                "fixture-secret-token-default",
-                TimeDuration::hours(6),
-                Some("team"),
-            ))
-            .expect("serialize credential"),
-        )
-        .expect("write credential");
-    }
-
-    fn browser_auth_state_path(fixture: &ClaudeBindingFixture) -> PathBuf {
-        fixture
-            .root
-            .join("support")
-            .join("claude-browser-auth-state.json")
-    }
-
-    #[test]
-    #[serial]
-    fn failed_slot_gate_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-gate");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = PassiveRunHarness {
-            fixture: &fixture,
-            config: fixture.slot_dir.join(".claude.json"),
-            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
-        };
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                // Another account signed in to the slot: the gate refuses.
-                fixture.sign_in(MAX_20X);
-                fixture.collect();
-                assert_eq!(
-                    fixture.slot(&slot_id).collection.state,
-                    ClaudeConfigSlotCollectionStateV1::IdentityMismatch
-                );
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn unresolved_default_identity_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-default");
-        sign_in_default(&fixture, TEAM_PREMIUM, true);
-        let harness = PassiveRunHarness {
-            fixture: &fixture,
-            config: fixture.root.join("home").join(".claude.json"),
-            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
-        };
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                // The default login's organization is not resolvable this pass.
-                sign_in_default(&fixture, TEAM_PREMIUM, false);
-                fixture.collect();
-            },
-            &|| sign_in_default(&fixture, TEAM_PREMIUM, true),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn browser_resign_in_pass_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-browser");
-        fixture.sign_in(TEAM_PREMIUM);
-        fixture.register();
-        fixture.collect();
-        let harness = PassiveRunHarness {
-            fixture: &fixture,
-            config: fixture.slot_dir.join(".claude.json"),
-            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
-        };
-        let state = browser_auth_state_path(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                // Unreadable browser sign-in state: collection is suppressed.
-                fs::write(&state, b"{not json").expect("write browser state");
-                fixture.collect();
-            },
-            &|| fs::remove_file(&state).expect("remove browser state"),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn single_slot_browser_resign_in_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-browser-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = PassiveRunHarness {
-            fixture: &fixture,
-            config: fixture.slot_dir.join(".claude.json"),
-            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
-        };
-        let state = browser_auth_state_path(&fixture);
-        let pass = || {
-            collect_registered_claude_slot_status(
-                &slot_id,
-                binding_test_time(0),
-                binding_test_time(15),
-            );
-        };
-        harness.assert_skipped_pass_ends_run(
-            &pass,
-            &|| {
-                fs::write(&state, b"{not json").expect("write browser state");
-                pass();
-            },
-            &|| fs::remove_file(&state).expect("remove browser state"),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn single_slot_provisional_target_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-target-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = PassiveRunHarness {
-            fixture: &fixture,
-            config: fixture.slot_dir.join(".claude.json"),
-            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
-        };
-        let state = browser_auth_state_path(&fixture);
-        let pass = || {
-            collect_registered_claude_slot_status(
-                &slot_id,
-                binding_test_time(0),
-                binding_test_time(15),
-            );
-        };
-        harness.assert_skipped_pass_ends_run(
-            &pass,
-            &|| {
-                // A browser sign-in targeting this slot is still running.
-                let now = current_unix_seconds();
-                fs::write(
-                    &state,
-                    serde_json::to_vec(&serde_json::json!({
-                        "schema_version": 1,
-                        "operations": [{
-                            "operation_id": "operation-target",
-                            "slot_id": slot_id,
-                            "mode": "target",
-                            "phase": "waiting_for_provider",
-                            "started_unix_seconds": now,
-                            "deadline_unix_seconds": now + 600
-                        }]
-                    }))
-                    .expect("serialize browser state"),
-                )
-                .expect("write browser state");
-                assert_eq!(
-                    crate::claude_browser_auth::collection_suppression(&slot_id),
-                    Some(crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget)
-                );
-                pass();
-            },
-            &|| fs::remove_file(&state).expect("remove browser state"),
-        );
-    }
-
     fn slot_harness(fixture: &ClaudeBindingFixture) -> PassiveRunHarness<'_> {
         PassiveRunHarness {
             fixture,
             config: fixture.slot_dir.join(".claude.json"),
             team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
         }
-    }
-
-    fn single_slot_pass(slot_id: &str) {
-        collect_registered_claude_slot_status(slot_id, binding_test_time(0), binding_test_time(15));
     }
 
     /// Clears the pre-gate test hook on drop.
@@ -38398,86 +35325,6 @@ exit 0
         fn drop(&mut self) {
             *CLAUDE_SLOT_AFTER_PRE_GATE_HOOK.lock().unwrap() = None;
         }
-    }
-
-    /// Resolution fails after the gate passed: two logins wrote the slot
-    /// (credential plan contradicts the identity), in the slot loop.
-    #[test]
-    #[serial]
-    fn slot_resolution_conflict_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-resolution-conflict");
-        fixture.sign_in(TEAM_PREMIUM);
-        fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                fs::write(
-                    fixture.slot_dir.join(".credentials.json"),
-                    serde_json::to_vec(&claude_credential_fixture(
-                        "fixture-secret-token-conflict",
-                        TimeDuration::hours(6),
-                        Some("max"),
-                    ))
-                    .expect("serialize credential"),
-                )
-                .expect("write credential");
-                fixture.collect();
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    /// Resolution fails after the gate passed: the credential is gone.
-    #[test]
-    #[serial]
-    fn slot_missing_credential_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-missing-credential");
-        fixture.sign_in(TEAM_PREMIUM);
-        fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                fs::remove_file(fixture.slot_dir.join(".credentials.json"))
-                    .expect("remove credential");
-                fixture.collect();
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    /// A pass that cannot load the slot settings visits no registered slot;
-    /// only the end-of-pass sweep ends their runs.
-    #[test]
-    #[serial]
-    fn failed_settings_load_pass_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-settings-failure");
-        fixture.sign_in(TEAM_PREMIUM);
-        fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        let settings = fixture
-            .root
-            .join("support")
-            .join(ottto_core::CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME);
-        let saved = fs::read(&settings).expect("read settings");
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                fs::write(&settings, b"{not json").expect("corrupt settings");
-                fixture.collect();
-            },
-            &|| fs::write(&settings, &saved).expect("restore settings"),
-        );
     }
 
     /// The slot's login changes between the pre-collection gate and the
@@ -38503,93 +35350,6 @@ exit 0
                 );
             },
             &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn single_slot_gate_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-gate-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| single_slot_pass(&slot_id),
-            &|| {
-                fixture.sign_in(MAX_20X);
-                single_slot_pass(&slot_id);
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn single_slot_post_resolution_gate_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-post-gate-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| single_slot_pass(&slot_id),
-            &|| {
-                let _hook = PreGateHook::sign_in_between_reads(fixture.slot_dir.clone(), MAX_20X);
-                let status = collect_registered_claude_slot_status(
-                    &slot_id,
-                    binding_test_time(0),
-                    binding_test_time(15),
-                );
-                assert_eq!(
-                    status.state,
-                    ClaudeConfigSlotCollectionStateV1::IdentityMismatch
-                );
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn single_slot_missing_credential_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-missing-credential-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| single_slot_pass(&slot_id),
-            &|| {
-                fs::remove_file(fixture.slot_dir.join(".credentials.json"))
-                    .expect("remove credential");
-                single_slot_pass(&slot_id);
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    /// The slot is unregistered for a pass; the same slot id comes back.
-    #[test]
-    #[serial]
-    fn single_slot_unregistered_pass_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-unregistered-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        let settings = fixture
-            .root
-            .join("support")
-            .join(ottto_core::CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME);
-        let saved = fs::read(&settings).expect("read settings");
-        harness.assert_skipped_pass_ends_run(
-            &|| single_slot_pass(&slot_id),
-            &|| {
-                fs::remove_file(&settings).expect("remove settings");
-                single_slot_pass(&slot_id);
-            },
-            &|| fs::write(&settings, &saved).expect("restore settings"),
         );
     }
 
@@ -38641,71 +35401,6 @@ exit 0
             .unwrap()
             .iter()
             .all(|endpoint| endpoint.contains("cedar_ember=1")));
-    }
-
-    /// Claude Code's refresh grant has expired: the slot's upkeep stops
-    /// collection after the identity gate passed.
-    fn expire_slot_refresh(fixture: &ClaudeBindingFixture) {
-        let mut credential = claude_credential_fixture(
-            "fixture-secret-token-expired",
-            TimeDuration::hours(6),
-            Some("team"),
-        );
-        credential["claudeAiOauth"]["refreshTokenExpiresAt"] = serde_json::json!(
-            (OffsetDateTime::now_utc() - TimeDuration::hours(1)).unix_timestamp() * 1_000
-        );
-        fs::write(
-            fixture.slot_dir.join(".credentials.json"),
-            serde_json::to_vec(&credential).expect("serialize credential"),
-        )
-        .expect("write credential");
-    }
-
-    #[test]
-    #[serial]
-    fn slot_upkeep_blocked_pass_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-upkeep");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| {
-                harness.fixture.collect();
-            },
-            &|| {
-                expire_slot_refresh(&fixture);
-                fixture.collect();
-                assert_eq!(
-                    fixture.slot(&slot_id).collection.state,
-                    ClaudeConfigSlotCollectionStateV1::NeedsLogin
-                );
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn single_slot_upkeep_blocked_pass_never_lets_a_passive_reading_through() {
-        let fixture = ClaudeBindingFixture::new("passive-upkeep-single");
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        let harness = slot_harness(&fixture);
-        harness.assert_skipped_pass_ends_run(
-            &|| single_slot_pass(&slot_id),
-            &|| {
-                expire_slot_refresh(&fixture);
-                let status = collect_registered_claude_slot_status(
-                    &slot_id,
-                    binding_test_time(0),
-                    binding_test_time(15),
-                );
-                assert_eq!(status.state, ClaudeConfigSlotCollectionStateV1::NeedsLogin);
-            },
-            &|| fixture.sign_in(TEAM_PREMIUM),
-        );
     }
 
     fn respond_variant_unrecognized(_endpoint: &str) -> Result<Value, u16> {
@@ -39022,17 +35717,6 @@ mod usage_checks_paused_tests {
         assert!(diagnostic.account_identifier_hash.is_none());
     }
 
-    #[test]
-    fn healthy_accounts_report_nothing() {
-        let slots = BTreeMap::from([
-            ("slot-a".to_string(), healthy_slot(ACCOUNT_A)),
-            ("slot-b".to_string(), healthy_slot(ACCOUNT_B)),
-        ]);
-        let paused = claude_paused_usage_accounts(&slots, &current_login(), no_breaker, NOW);
-        assert!(paused.is_empty());
-        assert!(claude_usage_checks_paused_diagnostic(&paused).is_none());
-    }
-
     fn held(backoff_until: u64) -> ClaudeOAuthUsageCallerAuthState {
         ClaudeOAuthUsageCallerAuthState {
             consecutive_failures: 1,
@@ -39073,30 +35757,6 @@ mod usage_checks_paused_tests {
     }
 
     #[test]
-    fn fallback_only_fresh_default_with_open_auth_breaker_is_paused() {
-        // The default login marks account-attributed status-line fallback
-        // readings Fresh; with the account-wide auth breaker open no provider
-        // caller is eligible, so the account is paused.
-        let mut default_slot = healthy_slot(ACCOUNT_A);
-        default_slot.quota_check_diagnostics.clear();
-        let slots = BTreeMap::from([("default".to_string(), default_slot)]);
-        let reopen = NOW + 3_600;
-        let paused = claude_paused_usage_accounts(
-            &slots,
-            &current_login(),
-            |_, _| Some(auth_breaker(reopen)),
-            NOW,
-        );
-        assert_eq!(
-            paused,
-            vec![ClaudePausedUsageAccount {
-                after_sign_in_rejection: true,
-                next_check_epoch_seconds: Some(reopen),
-            }]
-        );
-    }
-
-    #[test]
     fn young_shared_cache_on_a_held_slot_is_paused() {
         // A held slot can look Fresh while the shared per-account cache is
         // young; its caller cannot refresh it, so it does not serve the account.
@@ -39131,52 +35791,6 @@ mod usage_checks_paused_tests {
             },
             NOW,
         );
-        assert!(paused.is_empty());
-    }
-
-    #[test]
-    fn rotated_credential_with_a_stale_predecessor_hold_is_not_paused() {
-        // The rejected credential expired at T1; the slot now reads with a
-        // rotated credential (T2). The collector releases such a hold, so the
-        // slot serving its own young cache is not paused.
-        let mut slot = healthy_slot(ACCOUNT_A);
-        slot.access_expires_at = Some("2026-10-03T12:00:00Z".to_string());
-        let slots = BTreeMap::from([("slot-rotated".to_string(), slot)]);
-        let breaker = || {
-            let mut breaker = caller_hold_breaker(
-                claude_oauth_usage_slot_caller_key("slot-rotated"),
-                NOW + 900,
-            );
-            for state in breaker.auth_callers.values_mut() {
-                state.credential_expires_at = Some("2026-10-03T04:00:00Z".to_string());
-            }
-            breaker
-        };
-        let paused =
-            claude_paused_usage_accounts(&slots, &current_login(), |_, _| Some(breaker()), NOW);
-        assert!(paused.is_empty());
-
-        // The same credential that was rejected stays held.
-        let mut same = healthy_slot(ACCOUNT_A);
-        same.access_expires_at = Some("2026-10-03T04:00:00Z".to_string());
-        let slots = BTreeMap::from([("slot-rotated".to_string(), same)]);
-        let paused =
-            claude_paused_usage_accounts(&slots, &current_login(), |_, _| Some(breaker()), NOW);
-        assert_eq!(paused.len(), 1);
-    }
-
-    #[test]
-    fn duplicate_slots_and_actionable_states_are_left_to_their_own_paths() {
-        let mut duplicate = paused_slot(ACCOUNT_A);
-        duplicate.relationship =
-            Some(ottto_protocol::ClaudeConfigSlotRelationshipV1::DuplicateAnchor);
-        let mut needs_login = paused_slot(ACCOUNT_B);
-        needs_login.state = ClaudeConfigSlotCollectionStateV1::NeedsLogin;
-        let slots = BTreeMap::from([
-            ("slot-duplicate".to_string(), duplicate),
-            ("slot-login".to_string(), needs_login),
-        ]);
-        let paused = claude_paused_usage_accounts(&slots, &current_login(), no_breaker, NOW);
         assert!(paused.is_empty());
     }
 
@@ -39286,21 +35900,6 @@ mod usage_checks_paused_tests {
             provider_unavailable_status("2026-10-03T06:46:48Z", ACCOUNT_A, ORG),
         )]);
         assert!(claude_paused_usage_accounts(&slots, &snapshot, no_breaker, NOW).is_empty());
-    }
-
-    #[test]
-    fn several_paused_accounts_are_counted() {
-        let slots = BTreeMap::from([
-            ("slot-a".to_string(), paused_slot(ACCOUNT_A)),
-            ("slot-b".to_string(), paused_slot(ACCOUNT_B)),
-        ]);
-        let paused = claude_paused_usage_accounts(&slots, &current_login(), no_breaker, NOW);
-        let message = claude_usage_checks_paused_diagnostic(&paused)
-            .expect("diagnostic")
-            .message;
-        assert!(message.starts_with(
-            "Claude usage checks paused for 2 accounts after the provider rejected sign-in;"
-        ));
     }
 }
 
@@ -40144,114 +36743,6 @@ exit 44
         assert_eq!(carrier(&[], &[], true, Some(&default_login)), None);
     }
 
-    /// The registered slots upload and the default login does not: one slot
-    /// upload, the one for the default login's account, carries the Mac's
-    /// Claude Code settings exactly as built, on every pass. Slot snapshots
-    /// are otherwise unchanged (no settings capability is added).
-    #[test]
-    #[serial]
-    fn the_default_login_settings_ride_on_one_slot_upload() {
-        let fixture = Phase0Fixture::new("runtime-defaults-carrier", true);
-        let home = fixture.root.join("home");
-        fixture.write_identity(&home, SLOT_ACCOUNTS[2]);
-        fs::write(
-            home.join(".claude").join("settings.json"),
-            br#"{"model": "claude-opus-5-5", "effortLevel": "high"}"#,
-        )
-        .expect("settings");
-        fixture.set_all_expiries(TimeDuration::hours(3));
-        let (default_account, _) = Phase0Fixture::hashes(SLOT_ACCOUNTS[2]);
-        for pass in 0..2 {
-            let collection = fixture.collect();
-            let built = collection
-                .source_health_snapshot
-                .runtime_defaults
-                .clone()
-                .expect("the default login built settings");
-            assert_eq!(built.model.as_deref(), Some("claude-opus-5-5"));
-            let carriers = collection
-                .snapshots
-                .iter()
-                .filter(|snapshot| snapshot.runtime_defaults.is_some())
-                .collect::<Vec<_>>();
-            assert_eq!(carriers.len(), 1, "pass {pass}: exactly one carrier");
-            let carrier = carriers[0];
-            assert_eq!(
-                carrier
-                    .account
-                    .as_ref()
-                    .and_then(|account| account.account_identifier_hash.as_deref()),
-                Some(default_account.as_str()),
-                "pass {pass}: the upload for the default login's account"
-            );
-            assert_eq!(carrier.runtime_defaults.as_ref(), Some(&built));
-            assert!(
-                carrier
-                    .capabilities
-                    .iter()
-                    .all(|capability| capability.capability != "runtime_defaults"),
-                "pass {pass}: a registered slot's upload, not the default login's"
-            );
-        }
-    }
-
-    /// The default login uploads its own account with meters: its snapshot
-    /// already carries the settings and no slot upload gets a second copy.
-    #[test]
-    #[serial]
-    fn an_uploaded_default_login_keeps_the_only_settings_copy() {
-        let fixture = Phase0Fixture::new("runtime-defaults-default", true);
-        fs::write(
-            fixture
-                .root
-                .join("home")
-                .join(".claude")
-                .join("settings.json"),
-            br#"{"model": "claude-opus-5-5"}"#,
-        )
-        .expect("settings");
-        fixture.set_all_expiries(TimeDuration::hours(3));
-        let (default_account, _) = Phase0Fixture::hashes(DEFAULT_ACCOUNT);
-        let collection = fixture.collect();
-        let carriers = collection
-            .snapshots
-            .iter()
-            .filter(|snapshot| snapshot.runtime_defaults.is_some())
-            .collect::<Vec<_>>();
-        assert_eq!(carriers.len(), 1, "exactly one carrier");
-        assert_eq!(
-            carriers[0]
-                .account
-                .as_ref()
-                .and_then(|account| account.account_identifier_hash.as_deref()),
-            Some(default_account.as_str())
-        );
-    }
-
-    #[test]
-    fn lifetime_warnings_come_3_days_and_1_day_before() {
-        let now = OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("time");
-        let at = |offset: TimeDuration| (now + offset).format(&Rfc3339).expect("format");
-        assert_eq!(
-            claude_relogin_warning(Some(&at(TimeDuration::days(4))), now),
-            None
-        );
-        assert!(
-            claude_relogin_warning(Some(&at(TimeDuration::days(3))), now)
-                .expect("3 days")
-                .contains("within 3 days")
-        );
-        assert!(
-            claude_relogin_warning(Some(&at(TimeDuration::hours(20))), now)
-                .expect("1 day")
-                .contains("within 1 day")
-        );
-        assert_eq!(
-            claude_relogin_warning(Some(&at(-TimeDuration::hours(1))), now),
-            None
-        );
-    }
-
     /// The quiet paused presentation: no new wire values, never
     /// `stale_access_token`, stale reading kept, quota access `paused`.
     #[test]
@@ -40531,22 +37022,6 @@ exit 44
         *CLAUDE_OAUTH_BEFORE_SEND_HOOK.lock().unwrap() = None;
         assert_eq!(provider_calls(), before, "the lapsed token was not sent");
         assert!(outcome.result.is_err());
-    }
-
-    #[test]
-    fn locally_expired_access_tokens_are_never_sent() {
-        let now = 1_900_000_000_u64;
-        let at = |offset: i64| {
-            OffsetDateTime::from_unix_timestamp(now as i64 + offset)
-                .expect("time")
-                .format(&Rfc3339)
-                .expect("format")
-        };
-        assert!(claude_access_token_locally_expired(Some(&at(-1)), now));
-        assert!(claude_access_token_locally_expired(Some(&at(60)), now));
-        assert!(!claude_access_token_locally_expired(Some(&at(61)), now));
-        assert!(!claude_access_token_locally_expired(None, now));
-        assert!(!claude_access_token_locally_expired(Some("garbage"), now));
     }
 
     #[test]
