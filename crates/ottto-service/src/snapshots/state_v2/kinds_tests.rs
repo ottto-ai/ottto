@@ -81,15 +81,7 @@ fn commit_populate(db: &mut sqlite::Sqlite, index: &ScanIndex) {
 /// [regress] v2 hydration's closed catalogue includes its own growth raw holds.
 #[test]
 fn owned_kinds_are_admitted_without_adding_v1_growth_slots() {
-    for kind in [
-        kinds_files::KINDS,
-        kinds_census::KINDS,
-        kinds_accounts::KINDS,
-        kinds_misc::KINDS,
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for (kind, _) in catalogue::OWNED {
         assert_eq!(RecordKind::parse(kind).unwrap().name(), *kind);
     }
     // Names no semantic group owns refuse like any other unknown kind.

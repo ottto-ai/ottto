@@ -1409,7 +1409,7 @@ fn positions_and_current_pointer_survive_retirement_without_renumbering() {
 }
 
 fn test_record(key: String) -> RowKey {
-    RowKey::record("v1_field.files", key.into_bytes(), 0).unwrap()
+    RowKey::record("raw_hold.files", key.into_bytes(), 0).unwrap()
 }
 
 /// [format] an over-cap control refuses before its capability parse, and the

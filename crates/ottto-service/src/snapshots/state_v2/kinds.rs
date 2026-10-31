@@ -88,7 +88,10 @@ pub(super) fn hydrate_txn_with_hooks(
             let RowKey::Record { kind, .. } = &header.key else {
                 bail!("state_v2_record_kind");
             };
-            ensure!(owns_kind(kind.name()), "state_v2_unmapped_kind");
+            ensure!(
+                catalogue::group(kind.name()).is_some(),
+                "state_v2_unmapped_kind"
+            );
         }
         after = page.last().map(|h| h.key.clone());
     }
@@ -104,19 +107,6 @@ pub(super) fn hydrate_txn_with_hooks(
     hooks.on_open(index.generation, &cx.committed)?;
     cx.valid = true;
     Ok((index, cx))
-}
-
-fn owns_kind(kind: &str) -> bool {
-    [
-        kinds_files::KINDS,
-        kinds_census::KINDS,
-        kinds_accounts::KINDS,
-        kinds_misc::KINDS,
-    ]
-    .iter()
-    .filter(|group| group.contains(&kind))
-    .count()
-        == 1
 }
 
 /// The owner supplies the complete MISC dirty-field plan for the save. No history-wide encoding is used to guess that plan.
@@ -254,16 +244,10 @@ pub(super) fn private_paths(
         }
         RowKey::RequestSet(_) => interning::private_paths(header, value, emit),
         RowKey::Record { kind, .. } => {
-            let extract = if kinds_files::KINDS.contains(&kind.name()) {
-                kinds_files::private_paths
-            } else if kinds_census::KINDS.contains(&kind.name()) {
-                kinds_census::private_paths
-            } else if kinds_accounts::KINDS.contains(&kind.name()) {
-                kinds_accounts::private_paths
-            } else if kinds_misc::KINDS.contains(&kind.name()) {
-                kinds_misc::private_paths
-            } else {
-                bail!("state_v2_unmapped_kind")
+            let extract = match catalogue::group(kind.name()) {
+                Some(catalogue::Group::Misc) => kinds_misc::private_paths,
+                Some(_) => mapper::private_paths,
+                None => bail!("state_v2_unmapped_kind"),
             };
             extract(header, value, emit)
         }
@@ -281,16 +265,10 @@ pub(super) fn references(
         }
         RowKey::RequestSet(_) => Ok(()),
         RowKey::Record { kind, .. } => {
-            let extract = if kinds_files::KINDS.contains(&kind.name()) {
-                kinds_files::references
-            } else if kinds_census::KINDS.contains(&kind.name()) {
-                kinds_census::references
-            } else if kinds_accounts::KINDS.contains(&kind.name()) {
-                kinds_accounts::references
-            } else if kinds_misc::KINDS.contains(&kind.name()) {
-                kinds_misc::references
-            } else {
-                bail!("state_v2_unmapped_kind")
+            let extract = match catalogue::group(kind.name()) {
+                Some(catalogue::Group::Misc) => kinds_misc::references,
+                Some(_) => mapper::references,
+                None => bail!("state_v2_unmapped_kind"),
             };
             extract(header, value, emit)
         }
