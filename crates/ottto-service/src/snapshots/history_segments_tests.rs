@@ -281,6 +281,33 @@ fn shared_cut_halves_oversized_windows_and_skips_small_or_recent_bodies() {
     assert!(split(SnapshotSource::Codex, &unbalanced, &cut).is_none());
 }
 
+/// [money][regress] A row is priced only when every request in it is
+/// priced, while the session total still counts the priced requests. The cut
+/// follows that rule instead of leaving the whole body over the limit.
+#[test]
+fn shared_cut_keeps_partially_priced_rows() {
+    for source in SOURCES {
+        let mut full = session(source, 30);
+        full.usage_buckets[5].model_usage[1].cost_usd = None;
+        full.model_usage[1].cost_usd = None;
+        let cut = plan(source, &full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
+        let (segments, live) = split(source, &full, &cut).unwrap();
+        assert_eq!(segments.len(), 4, "{source:?}");
+        assert_conserved(&full, &segments, &live);
+        let priced = |item: &SnapshotItem| {
+            item.model_usage
+                .iter()
+                .find(|row| row.model == "model-priced")
+                .and_then(|row| row.cost_usd.clone())
+        };
+        assert!(priced(&segments[0]).is_none());
+        assert!(segments[1..]
+            .iter()
+            .all(|segment| priced(segment).is_some()));
+        assert!(priced(&live).is_some());
+    }
+}
+
 /// [off=main] Without the capability the page is untouched, byte for byte.
 #[test]
 fn shared_cut_off_keeps_the_page() {

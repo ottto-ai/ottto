@@ -255,21 +255,22 @@ fn row_costs(row: &SnapshotModelUsage) -> [&Option<String>; 5] {
 }
 
 impl RowSum {
-    /// `None` when a count overflows, a cost does not parse, or one cost
-    /// field is present on some rows and absent on others.
+    /// `None` when a count overflows or a cost does not parse. Costs sum by
+    /// the daemon's complete-cost rule: one unpriced row leaves the summed
+    /// field unpriced, as the scan and the request-owned emitter sum them.
     fn add(&mut self, row: &SnapshotModelUsage) -> Option<()> {
         for (total, value) in self.counts.iter_mut().zip(row_counts(row)) {
             *total = total.checked_add(value)?;
         }
         for (total, text) in self.costs.iter_mut().zip(row_costs(row)) {
-            let value = text.as_deref().map(picos).map(|value| value.ok_or(()));
-            *total = match (self.rows == 0, *total, value) {
-                (_, _, Some(Err(()))) => return None,
-                (true, _, None) => None,
-                (true, _, Some(Ok(value))) => Some(value),
-                (false, None, None) => None,
-                (false, Some(total), Some(Ok(value))) => Some(total.checked_add(value)?),
-                (false, _, _) => return None,
+            let value = match text.as_deref() {
+                Some(text) => Some(picos(text)?),
+                None => None,
+            };
+            *total = if self.rows == 0 {
+                value
+            } else {
+                super::add_complete_cost(*total, value)
             };
         }
         self.rows += 1;
@@ -403,9 +404,12 @@ fn segment_body(
             for (field, (slot, full_value)) in fields.iter_mut().zip(cost_fields(cost)).enumerate()
             {
                 if full_value.is_some() {
+                    // Priced rows only: a session total counts priced
+                    // requests even inside an unpriced row, so what this
+                    // window's rows cannot show stays with the live body.
                     let mut total = 0u128;
-                    for sum in sums.values() {
-                        total = total.checked_add(sum.costs[field]?)?;
+                    for cost in sums.values().filter_map(|sum| sum.costs[field]) {
+                        total = total.checked_add(cost)?;
                     }
                     *slot = Some(super::usd_picos_string(total));
                 }
@@ -584,11 +588,10 @@ fn split_conserving(full: &SnapshotItem, plan: &Plan) -> Option<(Vec<SnapshotIte
                 *sum = sum.checked_add(value)?;
             }
             for (sum, value) in total.costs.iter_mut().zip(part.costs) {
-                *sum = match (total.rows == 0, *sum, value) {
-                    (true, _, value) => value,
-                    (false, Some(sum), Some(value)) => Some(sum.checked_add(value)?),
-                    (false, None, None) => None,
-                    _ => return None,
+                *sum = if total.rows == 0 {
+                    value
+                } else {
+                    super::add_complete_cost(*sum, value)
                 };
             }
             total.rows += 1;
