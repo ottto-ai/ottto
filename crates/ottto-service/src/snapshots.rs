@@ -93699,21 +93699,15 @@ impl crate::heap_layout_bound::HeapLayoutBound for fn(&Value, &mut SnapshotAccum
         c.add(0)
     }
 }
-macro_rules! inline_scan_enum { ($t:ty; $($pattern:pat),*) => {
-    impl crate::heap_layout_bound::HeapLayoutBound for $t {
-        const STABLE_HEAP: bool = true;
-        fn heap_bound(&self,c:&mut crate::heap_layout_bound::Counter)->Option<()> {
-            match self { $($pattern => c.add(0)),* }
-        }
-    }
-}; }
-inline_scan_enum!(CandidateDecision; Self::Skip,Self::Migrate,Self::Parse,Self::ReconcileLegacy);
-inline_scan_enum!(ClaudeCompactionKind; Self::LegacySummary,Self::CurrentBoundary);
-inline_scan_enum!(SnapshotQuarantineDisposition; Self::RetryPending,Self::UnprovenTerminal,Self::SupersededTerminal);
-inline_scan_enum!(ClaudeUsageAuthorityQuarantineDisposition; Self::RetryPending,Self::UnprovenTerminal);
-inline_scan_enum!(SnapshotSource; Self::Pi,Self::Codex,Self::ClaudeCode);
-inline_scan_enum!(CodexOwnershipBoundary; Self::Undetermined,Self::AllLocal,Self::AwaitingLegacyTrigger,
-    Self::AwaitingParentPrefix,Self::Ordinal { start: _ },Self::NativeCreatedThread,Self::AmbiguousFork);
+crate::heap_layout_bound::unit_enum!(true;
+    CandidateDecision: Skip | Migrate | Parse | ReconcileLegacy;
+    ClaudeCompactionKind: LegacySummary | CurrentBoundary;
+    SnapshotQuarantineDisposition: RetryPending | UnprovenTerminal | SupersededTerminal;
+    ClaudeUsageAuthorityQuarantineDisposition: RetryPending | UnprovenTerminal;
+    SnapshotSource: Pi | Codex | ClaudeCode;
+    CodexOwnershipBoundary: Undetermined | AllLocal | AwaitingLegacyTrigger | AwaitingParentPrefix
+        | Ordinal { start: _ } | NativeCreatedThread | AmbiguousFork;
+);
 
 crate::heap_layout_bound::fields!(JsonlReadReport; physical_line_count, parsed_json_line_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count);
 crate::durable_tail_codec::durable_struct!(JsonlReadReport {
