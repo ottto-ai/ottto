@@ -16,7 +16,12 @@ pub mod claude_local_otel;
 pub(crate) mod claude_refresher;
 mod claude_session_registrations;
 pub(crate) mod claude_spawn_gate;
-pub(crate) mod claude_status_coverage;
+/// The retired `transcript_email` status-coverage feed. Only its key type
+/// stays: `OrgMarkers` keeps a never-written slot of it so the pinned durable
+/// allowlist digest, and with it every warm-cache record, is unchanged.
+pub(crate) mod claude_status_coverage {
+    pub(crate) type HomeKey = [u8; 32];
+}
 pub mod claude_upkeep;
 pub mod client_report;
 pub mod cloud_sessions;

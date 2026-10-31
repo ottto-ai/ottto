@@ -20700,9 +20700,6 @@ impl SnapshotAccumulator {
         {
             return Vec::new();
         }
-        if let Some(markers) = self.claude_org_markers.as_deref_mut() {
-            markers.bind_home(path);
-        }
         let Some(source_session_id) = self
             .source_session_id
             .clone()

@@ -158,42 +158,6 @@ mod tests {
     }
 
     #[test]
-    fn transcript_folder_keys_match_registered_descriptor_spellings() {
-        use crate::claude_status_coverage::{home_key, transcript_home_key};
-        let home = Path::new("/synthetic/user");
-        // Scan roots and status descriptors both read the registry's own
-        // string; the folder key is lexical, so equal strings key equally.
-        let spellings = [
-            "/synthetic/user/slot-a",
-            "/synthetic/user/slot-a/",
-            "/synthetic/user//slot-a",
-            "/synthetic/user/./slot-a",
-            "/synthetic/projects/slot-b",
-        ];
-        let dirs = spellings.iter().map(PathBuf::from).collect::<Vec<_>>();
-        let roots = compose_roots(SnapshotSource::ClaudeCode, home, &[], &dirs);
-        for spelling in spellings {
-            let key = home_key(Path::new(spelling));
-            let root = roots
-                .iter()
-                .find(|root| root.parent().map(home_key) == Some(key))
-                .expect("registered folder has a scan root");
-            assert_eq!(
-                transcript_home_key(&root.join("-synthetic-repo").join("session.jsonl")),
-                Some(key),
-                "{spelling}"
-            );
-        }
-        let default_root = home.join(".claude").join("projects");
-        assert!(roots.contains(&default_root));
-        assert_eq!(
-            transcript_home_key(&default_root.join("-synthetic-repo").join("session.jsonl")),
-            Some(home_key(&home.join(".claude"))),
-            "the default folder keys as the default"
-        );
-    }
-
-    #[test]
     fn registered_claude_folders_include_default_once_without_account_inputs() {
         let home = Path::new("/synthetic/user");
         let slots = [

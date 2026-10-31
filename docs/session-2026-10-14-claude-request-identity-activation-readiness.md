@@ -1,5 +1,9 @@
 # Contract 5 activation readiness: owner refusals, census backoff, cohort token, hex logins
 
+> Partly superseded 2026-10-31: `TRANSCRIPT_EMAIL_ENABLED` and the
+> status-coverage feed were deleted while still off. See
+> `session-2026-10-11-claude-request-identity-rows.md`.
+
 Contract 5 (`claude_code_jsonl:own_request_identity_rows:v1`) merged dark. This
 change closes the defects found in the dark-merge review and adds the gates an
 emitting build needs. It turns nothing on: `EMISSION_ENABLED`,

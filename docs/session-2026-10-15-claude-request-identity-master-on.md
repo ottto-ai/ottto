@@ -1,5 +1,9 @@
 # Contract 5 master-on: emission compiled in, cache and cross-root gaps closed
 
+> Partly superseded 2026-10-31: `TRANSCRIPT_EMAIL_ENABLED` and the
+> status-coverage feed were deleted while still off. See
+> `session-2026-10-11-claude-request-identity-rows.md`.
+
 Date: 2026-10-15.
 
 `claude_request_identity::EMISSION_ENABLED` is now `true`.
