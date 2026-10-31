@@ -1320,7 +1320,7 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     for cause in [
-        "obligation_overflow",
+        "write_cleanup_failed",
         "namespace_pending",
         "receipt_unreconciled",
     ] {
@@ -1441,17 +1441,11 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
                         .is_err());
                 }
             }
-            if cause == "obligation_overflow" {
-                let mut next = records[store::MAX_BATCH].clone();
-                next.body =
-                    store::tests::pending(next.binding.clone(), next.certificate.clone(), 2).body;
-                assert_eq!(
-                    slot.store
-                        .write_after_save(lock, 2, 0, vec![next])
-                        .unwrap()
-                        .written,
-                    0
-                );
+            if cause == "write_cleanup_failed" {
+                // Capacity now defers before I/O; it no longer disables the
+                // store. Establish the disabled-store precondition directly,
+                // preserving the real pending obligations built above.
+                slot.store.disable(cause);
             }
         }
         // Remove the injected failure: no retirement/reconciliation may erase custody.
