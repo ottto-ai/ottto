@@ -17,9 +17,7 @@ use super::aggregate::{
     all_kinds, day_of, kind_from_str, kind_position, part_from_str, part_position, Aggregate,
     Contribution, Day, Sink, Slot, Window, ALL_PARTS,
 };
-use super::checkpoint::{
-    install_path, Checkpoint, CopiedMode, Index, ParseState, Status, StoredParse,
-};
+use super::checkpoint::{install_path, Checkpoint, CopiedMode, Index, ParseState, StoredParse};
 use super::decode::{claude_never_counted, codex_never_counted, content_chars_and_images, Raw};
 use super::file::{new_parse_state, read_lines, LineSink, LineStats, Names, Source};
 use super::harvest::{begin_run, run_source, Run, SourceStats};

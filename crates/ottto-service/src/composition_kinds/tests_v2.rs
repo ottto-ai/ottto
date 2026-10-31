@@ -1817,7 +1817,6 @@ const PARTS: [Part; 31] = [
 struct WireFixture {
     kinds: Vec<String>,
     part_kind: BTreeMap<String, String>,
-    top_file_parts: Vec<String>,
 }
 
 fn wire_fixture() -> WireFixture {
@@ -1842,7 +1841,6 @@ fn wire_fixture() -> WireFixture {
             .iter()
             .map(|(part, kind)| (part.clone(), kind.as_str().expect("string").to_string()))
             .collect(),
-        top_file_parts: strings(&fixture["top_file_parts"]),
     }
 }
 
