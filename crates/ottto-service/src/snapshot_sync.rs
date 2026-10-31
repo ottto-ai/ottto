@@ -1371,6 +1371,27 @@ fn attach_head_conflict_answers(
     attached
 }
 
+/// Answer framing must not turn an otherwise retryable conflict into a local
+/// oversized-body poison verdict. Keep the stale-base offer and recovery debt.
+fn hold_oversized_head_conflict_answers(
+    source: SnapshotSource,
+    snapshots: &mut [SnapshotItem],
+    policy: SnapshotUploadPolicy,
+) -> usize {
+    let mut held = 0;
+    for item in snapshots {
+        if item.cache_conflict_answer.is_some()
+            && crate::snapshots::snapshot_item_wire_size(source, item, policy)
+                > crate::snapshots::MAX_SNAPSHOT_ITEM_WIRE_BYTES
+        {
+            item.cache_conflict_answer = None;
+            head_conflict::note("wire_capacity_hold");
+            held += 1;
+        }
+    }
+    held
+}
+
 fn effective_snapshot_upload_body_witness(
     snapshot: &SnapshotItem,
     progress: &SnapshotUploadProgress,
@@ -8154,10 +8175,13 @@ fn finish_sync_source(
     // The same hook every resend path calls; nothing held is left by now.
     index.retain_claude_history_emission_permitted(&mut scan_result.snapshots);
     // After bootstrap set each base, so an answer never borrows a fresh head.
-    let head_conflict_answers = attach_head_conflict_answers(
+    let mut head_conflict_answers = attach_head_conflict_answers(
         &mut scan_result.snapshots,
         &upload_progress,
         current_unix_seconds(),
+    );
+    head_conflict_answers = head_conflict_answers.saturating_sub(
+        hold_oversized_head_conflict_answers(source, &mut scan_result.snapshots, upload_policy),
     );
     if head_conflict_answers > 0 {
         eprintln!(
@@ -22669,7 +22693,7 @@ mod tests {
     mod history_upgrade_pipeline_tests {
         include!("snapshot_sync/history_upgrade_pipeline_tests.rs");
     }
-    mod claude_money_e2_pipeline_tests {
+    pub(in crate::snapshot_sync) mod claude_money_e2_pipeline_tests {
         include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
     }
     mod p12_pipeline_original_tests {

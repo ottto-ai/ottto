@@ -8125,7 +8125,7 @@ pub fn apply_upload_policy(
     }
 }
 
-fn snapshot_item_wire_size(
+pub(crate) fn snapshot_item_wire_size(
     source: SnapshotSource,
     item: &SnapshotItem,
     policy: SnapshotUploadPolicy,

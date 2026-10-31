@@ -143,6 +143,12 @@ fn cycle_with_transport(
     progress
         .active_quarantine_retries
         .insert(item.snapshot_fingerprint.clone());
+    let source = if crate::snapshots::claude_request_money::is_request_owned_literal(item) {
+        SnapshotSource::ClaudeCode
+    } else {
+        SnapshotSource::Codex
+    };
+    hold_oversized_head_conflict_answers(source, &mut items, SnapshotUploadPolicy::default());
     let mut wire = Value::Null;
     let mut accepted_count = 0;
     let result = upload_resumable_batches_with_body_witness(
@@ -197,6 +203,7 @@ fn revision_v2(item: &SnapshotItem) -> String {
 
 #[test]
 fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
+    super::tests::claude_money_e2_pipeline_tests::money_equivalence_tests::assert_head_conflict_account_placement();
     let item = item();
     let key = cache_session_key(&item.source_session_id);
     let mut progress = progress_with_stale_head(&item);
@@ -678,6 +685,49 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
         reserved,
         "pacing-boundary crossing cannot evade admission reserve"
     );
+    let mut near_cap = item.clone();
+    near_cap.cache_base_head_etag = Some(stale_head());
+    near_cap.session_display_name = Some(String::new());
+    let policy = SnapshotUploadPolicy::default();
+    let size = crate::snapshots::snapshot_item_wire_size(SnapshotSource::Codex, &near_cap, policy);
+    near_cap.session_display_name =
+        Some("x".repeat(crate::snapshots::MAX_SNAPSHOT_ITEM_WIRE_BYTES - size));
+    assert_eq!(
+        crate::snapshots::snapshot_item_wire_size(SnapshotSource::Codex, &near_cap, policy),
+        crate::snapshots::MAX_SNAPSHOT_ITEM_WIRE_BYTES
+    );
+    let original = serde_json::to_vec(&near_cap).unwrap();
+    let challenges = progress.head_conflict_challenges.clone();
+    // The same near-cap body remains safe after the late optional attachment.
+    progress
+        .head_conflict_challenges
+        .get_mut(&key)
+        .unwrap()
+        .answer_attempts = 0;
+    assert_eq!(
+        attach_head_conflict_answers(std::slice::from_mut(&mut near_cap), &progress, u64::MAX),
+        1
+    );
+    head_conflict::REFUSALS.with(|counts| counts.borrow_mut().clear());
+    assert_eq!(
+        hold_oversized_head_conflict_answers(
+            SnapshotSource::Codex,
+            std::slice::from_mut(&mut near_cap),
+            policy
+        ),
+        1
+    );
+    assert!(near_cap.cache_conflict_answer.is_none());
+    assert_eq!(
+        serde_json::to_vec(&near_cap).unwrap(),
+        original,
+        "body and usage unchanged"
+    );
+    assert_eq!(
+        progress.head_conflict_challenges[&key].challenge,
+        challenges[&key].challenge
+    );
+    head_conflict::REFUSALS.with(|counts| assert_eq!(&*counts.borrow(), &["wire_capacity_hold"]));
     let mut withheld = vec![item.clone()];
     withheld[0].cache_base_head_etag = Some("2".repeat(64));
     withheld[0].cache_observations = None;
