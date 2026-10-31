@@ -2729,6 +2729,9 @@ impl SharedCache {
         index: &ScanIndex,
         page: &mut HistoryPage,
     ) -> bool {
+        if !restart_restore::enabled() {
+            return true;
+        }
         let mut reserved = page.clone();
         let mut retired = Vec::new();
         for member in members.iter().filter(|member| {
