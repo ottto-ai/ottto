@@ -80,19 +80,8 @@ impl ClaudeAccountFamilyPendingWindow {
 }
 
 impl ClaudeAccountFamilyPending {
-    pub(super) fn retirement_observations(
-        &self,
-    ) -> impl Iterator<Item = (Option<u64>, ConsumerProjection<'_>, bool)> {
-        self.previous_windows
-            .iter()
-            .chain(std::iter::once(&self.current))
-            .map(|window| {
-                (
-                    rfc3339_unix_seconds(&window.census_window_end),
-                    window.consumer_projection(),
-                    std::ptr::eq(window, &self.current),
-                )
-            })
+    pub(super) fn history_summary(&self) -> HistorySummary {
+        HistorySummary::fold(&self.previous_windows)
     }
 
     pub(super) fn retain_previous_window(&mut self, old: ClaudeAccountFamilyPendingWindow) {
@@ -230,6 +219,45 @@ impl HistorySummary {
             }
         }
         summary
+    }
+
+    /// Each member's newest evidence across the archive and `current`, as
+    /// (member, account, invalid, revision). `None` refuses the family: a
+    /// boundary is unparsable or an archived window is not older than
+    /// current. Current is then strictly newest and wins its own members.
+    pub(super) fn members_with<'a>(
+        &'a self,
+        current: &'a ClaudeAccountFamilyPendingWindow,
+    ) -> Option<impl Iterator<Item = (&'a String, &'a str, bool, Option<&'a String>)>> {
+        let current_end = rfc3339_unix_seconds(&current.census_window_end)?;
+        if self.unparsable
+            || self
+                .newest_boundary
+                .is_some_and(|newest| newest >= current_end)
+        {
+            return None;
+        }
+        let current = current.consumer_projection();
+        let archived = self
+            .latest
+            .iter()
+            .filter(move |(member, _)| !current.member_keys.contains_key(*member))
+            .map(|(member, (_, account, invalid, revision))| {
+                (member, account.as_str(), *invalid, revision.as_ref())
+            });
+        Some(
+            current
+                .members()
+                .map(move |(member, revision)| {
+                    (
+                        member,
+                        current.account_identifier_hash,
+                        current.invalid,
+                        revision,
+                    )
+                })
+                .chain(archived),
+        )
     }
 }
 
