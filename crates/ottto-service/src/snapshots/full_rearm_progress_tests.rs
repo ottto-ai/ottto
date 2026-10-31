@@ -1166,23 +1166,8 @@ fn always_on_terminal_at(
     (rearm.reread(index, &disposition), parent, state)
 }
 
-/// The family root's paired sidecars for `req_1`: a dark row, or one with
-/// complete request identity (login and organization). `account_checked`
-/// keeps the legacy account check on the row; covering one of the parent's
-/// four requests, it withholds the session account for incomplete request
-/// evidence. Unchecked, the account stays unknown and contract 5 does not
-/// tag the body (`valid_login`).
-fn write_parent_sidecars(rearm: &Rearm, support: &Path, identity: bool, account_checked: bool) {
-    write_sidecar_rows(
-        rearm,
-        support,
-        identity,
-        &[("req_1", "", 10, account_checked)],
-    );
-}
-
 /// Paired rows for each `(request, agent, output tokens, account checked)`,
-/// with the fixture's own token counts; otherwise as `write_parent_sidecars`.
+/// with the fixture's own token counts and optional complete request identity.
 fn write_sidecar_rows(
     rearm: &Rearm,
     support: &Path,
