@@ -11129,24 +11129,27 @@ fn claude_family_members_unobserved_where(
         .collect::<BTreeSet<_>>();
     index
         .files
-        .keys()
-        .filter(|index_key| {
+        .iter()
+        .filter(|(index_key, entry)| {
             let Some((root_session_id, member)) =
                 claude_index_path_family_member(Path::new(index_key.as_str()))
             else {
                 return false;
             };
-            !(covered.contains(&member)
-                || index.confirmed_empty_files.contains(*index_key)
-                || excused_root(&root_session_id)
-                || (quarantine_excused
-                    && index
-                        .claude_usage_authority_quarantine
-                        .get(&root_session_id)
-                        .zip(index.claude_usage_family_witnesses.get(&root_session_id))
-                        .is_some_and(|(quarantine, witness)| {
-                            claude_usage_authority_preserves_pending(quarantine, witness)
-                        })))
+            // A re-stamped family's still-owed member is verified at its own
+            // selection; until then it is unobserved (`evidence_owed`).
+            entry.evidence_owed
+                || !(covered.contains(&member)
+                    || index.confirmed_empty_files.contains(*index_key)
+                    || excused_root(&root_session_id)
+                    || (quarantine_excused
+                        && index
+                            .claude_usage_authority_quarantine
+                            .get(&root_session_id)
+                            .zip(index.claude_usage_family_witnesses.get(&root_session_id))
+                            .is_some_and(|(quarantine, witness)| {
+                                claude_usage_authority_preserves_pending(quarantine, witness)
+                            })))
         })
         .count()
 }
@@ -32617,6 +32620,7 @@ impl OwnedSourceScan {
                     index,
                     &mut evidence_owed_page,
                     &candidate,
+                    &census_window_end,
                     &mut decision,
                     &mut parse_reason,
                 );

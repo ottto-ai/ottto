@@ -5,6 +5,8 @@
 //! Switch -> `terminal_off::policy::local_switch!` once #977/#1004 is on main.
 //!
 //! The traversal resolves an owed, unchanged member at selection:
+//! - (a) its stored occurrences are bound to this revision: re-stamp them into
+//!   the current census window, no read (Lead B ruling 1 conditions a-d);
 //! - (c) cap-invalid family, unchanged, its occurrences still do not fit:
 //!   stays owed, no read, no credit (Lead B Q3, RF1 #992 KeepOwedNoCredit);
 //! - otherwise one counted `Rearmed` parse; with the fingerprint kept the
@@ -182,6 +184,7 @@ pub(super) fn resolve(
     index: &mut ScanIndex,
     page: &mut Page,
     candidate: &CandidateFile,
+    census_window_end: &str,
     decision: &mut CandidateDecision,
     reason: &mut Option<CandidateParseReason>,
 ) {
@@ -189,12 +192,36 @@ pub(super) fn resolve(
     let Some(entry) = index.files.get(&key).filter(|entry| entry.evidence_owed) else {
         return;
     };
-    if *decision != CandidateDecision::Skip
-        || entry.source_file_fingerprint != candidate.source_file_fingerprint
-    {
-        // A changed or otherwise selected member parses; its record clears it.
+    let family = claude_index_path_family_member(&candidate.path);
+    if entry.source_file_fingerprint != candidate.source_file_fingerprint {
+        // A real change parses fresh evidence, never against its carried copy.
+        if let Some((root, member)) = family.filter(|_| enabled()) {
+            if let Some(pending) = index
+                .claude_usage_family_pending
+                .get_mut(&root)
+                .filter(|pending| pending.census_window_end == census_window_end)
+            {
+                pending.member_occurrences.remove(&member);
+                pending.member_request_id_hashes.remove(&member);
+            }
+        }
         return;
     }
+    if *decision != CandidateDecision::Skip {
+        // Otherwise selected: the parse records a fresh entry.
+        return;
+    }
+    if let Some((root, member)) = family.filter(|_| enabled()) {
+        if restamp(index, &key, &root, &member, census_window_end) {
+            if let Some(entry) = index.files.get_mut(&key) {
+                entry.evidence_owed = false;
+            }
+            return;
+        }
+    }
+    let Some(entry) = index.files.get(&key) else {
+        return;
+    };
     let member = claude_index_path_member_ref(&candidate.path).map(|member| member.root);
     let kept = enabled()
         && member.is_some_and(|root| {
@@ -223,4 +250,68 @@ pub(super) fn resolve(
         *decision = CandidateDecision::Parse;
         *reason = Some(CandidateParseReason::Rearmed);
     }
+}
+
+/// (a) Lead B ruling 1 (2026-10-31): an unchanged member's stored occurrences
+/// count as an observation in this census window, no read, only when
+/// (a) the fingerprint is unchanged (the caller), (b) the scan identity and
+/// request-identity contracts are unchanged since storage, (c) the stored
+/// occurrences are valid and are exactly the request ids its current census
+/// record read at this revision, and (d) only window membership moves: the
+/// family's stored evidence is stamped with this window, nothing else.
+/// A stale family moves only while every other member with stored evidence
+/// is still owed: each is verified at its own selection, and owed members
+/// stay unobserved for fence coverage until then.
+fn restamp(index: &mut ScanIndex, key: &str, root: &str, member: &str, window: &str) -> bool {
+    let (Some(entry), Some(pending)) = (
+        index.files.get(key),
+        index.claude_usage_family_pending.get(root),
+    ) else {
+        return false;
+    };
+    let bound = !index.claude_request_identity_contract_changed
+        && entry.scan_identity_version.as_deref() == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+        && !pending.invalid
+        && pending
+            .member_occurrences
+            .get(member)
+            .zip(pending.member_request_id_hashes.get(member))
+            .is_some_and(|(occurrences, hashes)| {
+                occurrences.keys().eq(hashes.iter())
+                    && index.claude_request_census.get(key).is_some_and(|record| {
+                        record.current_for(&entry.source_file_fingerprint)
+                            && record_hashes(hashes).as_deref() == Some(record.request_hashes())
+                    })
+            });
+    if !bound {
+        return false;
+    }
+    if pending.census_window_end != window {
+        let others_owed = index.files.iter().all(|(other, entry)| {
+            other == key
+                || entry.evidence_owed
+                || claude_index_path_member_ref(Path::new(other)).map_or(true, |m| m.root != root)
+                || claude_index_path_family_member(Path::new(other))
+                    .is_some_and(|(_, other)| !pending.member_occurrences.contains_key(&other))
+        });
+        if !others_owed {
+            return false;
+        }
+        if let Some(pending) = index.claude_usage_family_pending.get_mut(root) {
+            pending.census_window_end = window.to_owned();
+        }
+    }
+    true
+}
+
+/// Pending keys request ids by full SHA-256 hex; a census record keeps the
+/// sorted 8-byte prefixes (`claude_request_hash`).
+fn record_hashes(hashes: &BTreeSet<String>) -> Option<Vec<u64>> {
+    let mut prefixes = hashes
+        .iter()
+        .map(|hash| u64::from_str_radix(hash.get(..16)?, 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    Some(prefixes)
 }
