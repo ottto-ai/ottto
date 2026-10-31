@@ -18038,6 +18038,27 @@ mod tests {
             head_conflict::REFUSALS
                 .with(|counts| assert_eq!(&*counts.borrow(), &["invalid_shape"]));
         }
+        // Even deeply malformed optional content is isolated from the outer
+        // progress decoder. Syntactically truncated whole JSON is still corrupt.
+        let deep = "[".repeat(256) + "0" + &"]".repeat(256);
+        let mut raw = serde_json::to_string(&expected).unwrap();
+        raw.pop();
+        raw.push_str(",\"head_conflict_challenges\":{\"");
+        raw.push_str(&"a".repeat(64));
+        raw.push_str("\":{\"challenge\":");
+        raw.push_str(&deep);
+        raw.push_str("}}}");
+        std::fs::write(&path, raw).unwrap();
+        head_conflict::REFUSALS.with(|counts| counts.borrow_mut().clear());
+        let restored = SnapshotUploadProgress::load(
+            &path,
+            &known.destination_namespace_hash,
+            test_quarantine_witness(),
+        )
+        .unwrap();
+        assert!(path.exists());
+        assert_eq!(serde_json::to_value(restored).unwrap(), expected);
+        head_conflict::REFUSALS.with(|counts| assert_eq!(&*counts.borrow(), &["invalid_shape"]));
         assert_eq!(
             std::fs::read_dir(&root)
                 .unwrap()

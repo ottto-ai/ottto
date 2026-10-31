@@ -1,6 +1,7 @@
 //! Optional, bounded recovery metadata; never authority for money or receipts.
 use super::{ack_retention, is_snapshot_fingerprint, HeadConflictChallenge};
-use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,12 +29,6 @@ where
     D: Deserializer<'de>,
 {
     struct Recovery;
-    impl Recovery {
-        fn invalid(self) -> BTreeMap<String, HeadConflictChallenge> {
-            note("invalid_shape");
-            BTreeMap::new()
-        }
-    }
     impl<'de> Visitor<'de> for Recovery {
         type Value = BTreeMap<String, HeadConflictChallenge>;
 
@@ -51,8 +46,8 @@ where
                     note("capacity_hold");
                     continue;
                 }
-                let value = map.next_value::<serde_json::Value>()?;
-                let record = serde_json::from_value::<HeadConflictChallenge>(value);
+                let value = map.next_value::<Box<serde_json::value::RawValue>>()?;
+                let record = serde_json::from_str::<HeadConflictChallenge>(value.get());
                 match record {
                     Ok(record)
                         if is_snapshot_fingerprint(&key)
@@ -70,29 +65,17 @@ where
             }
             Ok(records)
         }
-
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            while seq.next_element::<IgnoredAny>()?.is_some() {}
-            Ok(self.invalid())
-        }
-        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
-            Ok(self.invalid())
-        }
-        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
-            Ok(self.invalid())
-        }
-        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
-            Ok(self.invalid())
-        }
-        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
-            Ok(self.invalid())
-        }
-        fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
-            Ok(self.invalid())
-        }
-        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-            Ok(self.invalid())
+    }
+    // Consume the optional JSON value first. Its own shape/depth errors cannot
+    // escape into the containing money ledger's decoder. RawValue uses the
+    // existing serde_json raw_value feature and retains no parsed unbounded map.
+    let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+    let mut decoder = serde_json::Deserializer::from_str(raw.get());
+    match decoder.deserialize_map(Recovery) {
+        Ok(records) => Ok(records),
+        Err(_) => {
+            note("invalid_shape");
+            Ok(BTreeMap::new())
         }
     }
-    deserializer.deserialize_any(Recovery)
 }
