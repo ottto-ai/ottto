@@ -891,20 +891,22 @@ impl ApcFixture {
         let no_custody = crate::snapshots::sampled_scan::SharedCache::default();
         let fully_settled = finish_selected_settlement(
             &mut index,
-            &scan,
-            &committed_index,
-            &progress,
-            &candidates,
-            &cutoff_candidates,
-            settlement.fully_settled,
-            body_drains,
-            None,
-            self.audit_release.get().then_some(AccountAuditRelease {
-                previous: &committed_index,
-                cache: &no_custody,
-                roots: std::slice::from_ref(&self.root),
-                backfill_window_days: 183,
-            }),
+            SelectedSettlementInputs {
+                scan: &scan,
+                committed_index: &committed_index,
+                progress: &progress,
+                candidates: &candidates,
+                cutoff_candidates: &cutoff_candidates,
+                transport_fully_settled: settlement.fully_settled,
+                body_drains,
+                comparison: None,
+                audit_release: self.audit_release.get().then_some(AccountAuditRelease {
+                    previous: &committed_index,
+                    cache: &no_custody,
+                    roots: std::slice::from_ref(&self.root),
+                    backfill_window_days: 183,
+                }),
+            },
         )
         .expect("no paid restore");
         let census_complete = scan.census_complete;
@@ -1310,20 +1312,22 @@ impl ApcFixture {
         let no_custody = crate::snapshots::sampled_scan::SharedCache::default();
         let fully_settled = finish_selected_settlement(
             &mut index,
-            &scan,
-            &committed_index,
-            &progress,
-            &candidates,
-            &cutoff_candidates,
-            settlement.fully_settled,
-            body_drains,
-            None,
-            self.audit_release.get().then_some(AccountAuditRelease {
-                previous: &committed_index,
-                cache: &no_custody,
-                roots: std::slice::from_ref(&self.root),
-                backfill_window_days: 183,
-            }),
+            SelectedSettlementInputs {
+                scan: &scan,
+                committed_index: &committed_index,
+                progress: &progress,
+                candidates: &candidates,
+                cutoff_candidates: &cutoff_candidates,
+                transport_fully_settled: settlement.fully_settled,
+                body_drains,
+                comparison: None,
+                audit_release: self.audit_release.get().then_some(AccountAuditRelease {
+                    previous: &committed_index,
+                    cache: &no_custody,
+                    roots: std::slice::from_ref(&self.root),
+                    backfill_window_days: 183,
+                }),
+            },
         )
         .expect("no paid restore");
         let census_complete = scan.census_complete;

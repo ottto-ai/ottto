@@ -1122,27 +1122,38 @@ fn settle_upload_corrections_after_selection(
     transport_fully_settled && !blocking
 }
 
+struct SelectedSettlementInputs<'a> {
+    scan: &'a SourceScanResult,
+    committed_index: &'a ScanIndex,
+    progress: &'a SnapshotUploadProgress,
+    candidates: &'a [crate::snapshots::ClaudeProofCorrectionCandidate],
+    cutoff_candidates: &'a [crate::snapshots::ClaudeCutoffCorrectionCandidate],
+    transport_fully_settled: bool,
+    body_drains: crate::snapshots::ClaudeProofBodyDrains,
+    comparison: Option<&'a mut crate::snapshots::claude_native_comparison::Completion>,
+    audit_release: Option<AccountAuditRelease<'a>>,
+}
+
 /// The finish order after save selection, shared with the proof-correction
 /// pipeline harness so its regressions guard this order: correction settle,
 /// native paid restore, account-audit release (which can clear a drained
 /// entry's revision), then the body-drain restore. Returns whether the page
 /// is fully settled.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the settle inputs plus the finish's optional paid restore and audit release"
-)]
 fn finish_selected_settlement(
     index: &mut ScanIndex,
-    scan: &SourceScanResult,
-    committed_index: &ScanIndex,
-    progress: &SnapshotUploadProgress,
-    candidates: &[crate::snapshots::ClaudeProofCorrectionCandidate],
-    cutoff_candidates: &[crate::snapshots::ClaudeCutoffCorrectionCandidate],
-    transport_fully_settled: bool,
-    mut body_drains: crate::snapshots::ClaudeProofBodyDrains,
-    comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
-    audit_release: Option<AccountAuditRelease<'_>>,
+    inputs: SelectedSettlementInputs<'_>,
 ) -> Result<bool, crate::source_rotation::LocalRefusal> {
+    let SelectedSettlementInputs {
+        scan,
+        committed_index,
+        progress,
+        candidates,
+        cutoff_candidates,
+        transport_fully_settled,
+        mut body_drains,
+        comparison,
+        audit_release,
+    } = inputs;
     let mut fully_settled = settle_upload_corrections_after_selection(
         index,
         scan,
@@ -8473,20 +8484,22 @@ fn finish_sync_source(
     // facts. No-body completion must share that exact durable checkpoint.
     upload_fully_settled = finish_selected_settlement(
         &mut index,
-        &scan_result,
-        &committed_index,
-        &upload_progress,
-        &claude_proof_correction_candidates,
-        &claude_cutoff_corrections,
-        upload_fully_settled,
-        claude_proof_body_drains,
-        comparison_completion.as_mut(),
-        (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
-            previous: &committed_index,
-            cache: &daemon.transcript_cache,
-            roots: claude_scan_roots.as_deref().unwrap_or_default(),
-            backfill_window_days: receipt_window_days,
-        }),
+        SelectedSettlementInputs {
+            scan: &scan_result,
+            committed_index: &committed_index,
+            progress: &upload_progress,
+            candidates: &claude_proof_correction_candidates,
+            cutoff_candidates: &claude_cutoff_corrections,
+            transport_fully_settled: upload_fully_settled,
+            body_drains: claude_proof_body_drains,
+            comparison: comparison_completion.as_mut(),
+            audit_release: (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
+                previous: &committed_index,
+                cache: &daemon.transcript_cache,
+                roots: claude_scan_roots.as_deref().unwrap_or_default(),
+                backfill_window_days: receipt_window_days,
+            }),
+        },
     )?;
     let mut retired_upload_acks = upload_progress.stage_selected_ack_retirement(
         &committed_index,
