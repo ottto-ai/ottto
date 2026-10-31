@@ -4513,6 +4513,43 @@ fn stale_start_clear_cause_matches_the_actual_traversal_start_reason() {
 }
 
 
+/// [regress] A resumed Codex page erased outstanding Claude full_cause tags.
+#[test]
+fn resumed_codex_page_preserves_claude_full_cause() {
+    use crate::transcript_acquisition::{FullReason, ReadMode};
+    let key = carry_key(CARRY_ROOT, None);
+    let mut entry = manifest_index_entry(Some("accepted"));
+    entry.source_file_fingerprint = "proven".into();
+    rearm_cause::clear(&key, &mut entry, rearm_cause::Cause::ContextChanged);
+
+    let mut codex = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        &[],
+        &mut codex,
+        CARRY_FAILED,
+        BACKFILL_WINDOW_DAYS,
+    );
+    assert_eq!(
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            &[],
+            &mut codex,
+            CARRY_FAILED,
+            BACKFILL_WINDOW_DAYS,
+        ),
+        TraversalProgress::Resumed,
+    );
+    let mode = ReadMode::Full(FullReason::StateMissing);
+    let probe = crate::local_resource_diagnostics::Probe::start();
+    probe.rearm_full_selected(&key, mode);
+    probe.rearm_full_completed(&key, mode, 123);
+    assert_eq!(
+        serde_json::to_value(probe.rearm_fulls()).unwrap(),
+        json!({"rearm_cleared{context_changed}": {"count": 1, "completed_native_bytes": 123}}),
+    );
+}
+
 const TERMINAL_OFF_DESTINATION: &str = "terminal-off-destination";
 
 /// Containment's red-retry fixture: the same failed window and families as

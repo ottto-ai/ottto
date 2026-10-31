@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Merge a pull request only after the Public CI (ci.yml) pull-request checks
-# passed on the pull-request run for the PR's current head commit: the macOS
-# "Rust contracts" job and the Linux "Public surface checks", "Rust advisory
-# audit" and "Dependency review" jobs. When the base requires a merge queue,
-# enqueue the checked head and wait for GitHub to merge it.
+# Enqueue a pull request only after the Public CI (ci.yml) pull-request checks
+# passed on the pull-request run for the PR's current head commit, then wait
+# for the merge queue to merge it. The base branch must have a merge queue:
+# "Rust contracts" (macOS) is skipped on pull requests and runs only there.
 
 # Job names from .github/workflows/ci.yml; every other check is informational.
 # Only check runs of that workflow count, so a same-named job elsewhere cannot
@@ -31,9 +30,10 @@ usage() {
 Usage: pr_merge_when_mac_green.sh [--repo <owner/name>] [--interval <seconds>]
                                   [--timeout <seconds>] <pr-number>
 
-Marks the PR ready for review if it is a draft, then waits until each of the
-Public CI pull-request checks
-  "Rust contracts"          (macOS)
+Refuses at once unless the base branch has a merge queue. Marks the PR ready
+for review if it is a draft, then waits until each of the Public CI
+pull-request checks
+  "Rust contracts"          (macOS; skipped on pull requests counts as passed)
   "Public surface checks"   (Linux)
   "Rust advisory audit"     (Linux)
   "Dependency review"       (Linux)
@@ -41,14 +41,9 @@ completed with conclusion success. For each name only the newest check run of
 that exact name counts, and only on a pull_request workflow run of this PR and
 its current base branch for the PR's head commit. Other checks (for example
 "Rust tests (Linux)") are ignored. Once all four passed and the PR is
-MERGEABLE it runs:
-  gh pr merge <pr> --squash --match-head-commit <head-sha>
-
-If the base branch requires a merge queue, "Rust contracts" may also be skipped
-on the PR run; the three Linux checks must still succeed. The guard instead
-enqueues exactly <head-sha> with GitHub's enqueuePullRequest mutation
-(expectedHeadOid; independent of the repository's auto-merge setting) and waits
-until merged, removed from the queue, the head changes, or timeout.
+MERGEABLE it enqueues exactly <head-sha> with GitHub's enqueuePullRequest
+mutation (expectedHeadOid; independent of the repository's auto-merge setting)
+and waits until merged, removed from the queue, the head changes, or timeout.
 The queue's configured merge method applies; no administrator bypass is used.
 Rerunning the guard for a PR that is already queued resumes the wait.
 
@@ -66,11 +61,12 @@ Options:
 Exit codes:
   0  merged
   2  usage error or missing tool
-  3  refused: PR is not open, or has merge conflicts (CONFLICTING)
+  3  refused: PR is not open, has merge conflicts (CONFLICTING), or the base
+     branch has no merge queue
   4  a required check finished without success, or PR removed from merge queue
   5  the PR head changed while waiting; rerun for the new head
   6  timed out waiting for required checks or the merge queue
-  7  a gh command failed (view, rules, ready, or merge)
+  7  a gh command failed (view, rules, ready, or enqueue)
 USAGE
 }
 
@@ -178,7 +174,6 @@ checks_status() {
     || return 1
   jq -nr \
     --argjson required "$REQUIRED_CHECKS" \
-    --argjson queue_mode "$queue_mode" \
     --arg workflow "$CI_WORKFLOW" \
     --arg sha "$sha" \
     --argjson pr "$pr" \
@@ -206,7 +201,7 @@ checks_status() {
               state: (if . == null then "missing"
                 elif .status != "completed" then "pending"
                 elif .conclusion == "success" then "success"
-                elif $queue_mode and $name == "Rust contracts" and .conclusion == "skipped"
+                elif $name == "Rust contracts" and .conclusion == "skipped"
                   then "success"
                 elif .conclusion == "skipped" or .conclusion == "neutral"
                   then "notready:\(.conclusion)"
@@ -355,8 +350,10 @@ base="$(pr_field baseRefName)"
 base_path="$(printf '%s' "$base" | jq -sRr @uri)"
 rules="$(gh api "repos/{owner}/{repo}/rules/branches/$base_path")" \
   || die "$EXIT_GH" "could not read rules for base branch $base"
-queue_mode="$(printf '%s' "$rules" | jq -r 'if type == "array" then any(.[]; .type == "merge_queue") else error("expected rules array") end')" \
+has_queue="$(printf '%s' "$rules" | jq -r 'if type == "array" then any(.[]; .type == "merge_queue") else error("expected rules array") end')" \
   || die "$EXIT_GH" "invalid rules response for base branch $base"
+[ "$has_queue" = true ] \
+  || die "$EXIT_REFUSED" "no merge queue on $base: \"Rust contracts\" runs only in the merge queue, so this guard cannot merge"
 head_sha="$(pr_field headRefOid)"
 [ -n "$head_sha" ] || die "$EXIT_GH" "gh pr view $pr returned no headRefOid"
 
@@ -382,24 +379,17 @@ while :; do
       success\|*)
         mergeable="$(pr_field mergeable)"
         if [ "$mergeable" = MERGEABLE ]; then
-          if [ "$queue_mode" = true ]; then
-            log "all required PR checks passed on $head_sha; enqueuing PR #$pr"
-            if ! enqueue; then
-              # A rerun after a timeout finds the PR already queued (or just
-              # merged); resume waiting instead of reporting a gh failure.
-              if already_queued; then
-                log "PR #$pr is already in the merge queue or merged; resuming the wait"
-              else
-                die "$EXIT_GH" "enqueueing PR #$pr at $head_sha failed"
-              fi
+          log "all required PR checks passed on $head_sha; enqueuing PR #$pr"
+          if ! enqueue; then
+            # A rerun after a timeout finds the PR already queued (or just
+            # merged); resume waiting instead of reporting a gh failure.
+            if already_queued; then
+              log "PR #$pr is already in the merge queue or merged; resuming the wait"
+            else
+              die "$EXIT_GH" "enqueueing PR #$pr at $head_sha failed"
             fi
-            wait_for_queue
           fi
-          log "all required checks passed on $head_sha; merging PR #$pr"
-          gh pr merge "$pr" --squash --match-head-commit "$head_sha" \
-            || die "$EXIT_GH" "gh pr merge $pr failed"
-          log "merged PR #$pr at head $head_sha"
-          exit 0
+          wait_for_queue # exits
         fi
         log "all required checks passed; mergeability is ${mergeable:-unknown}, waiting"
         ;;

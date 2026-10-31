@@ -26,9 +26,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[cfg(feature = "replay-harness")]
-    #[command(hide = true)]
-    ReplayHarness(ottto_service::snapshot_sync::replay_harness::Args),
     #[command(hide = true)]
     ContextCompositionWorker,
     #[command(hide = true)]
@@ -207,12 +204,6 @@ enum ServiceCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    // Replay exits before even the normal daemon's Keychain/UI setup.
-    #[cfg(feature = "replay-harness")]
-    if let Some(Command::ReplayHarness(args)) = cli.command {
-        std::process::exit(ottto_service::snapshot_sync::replay_harness::run(args));
-    }
-
     // Administrative planning exits before Keychain or daemon initialization.
     if let Some(Command::ClaudeCopyPrefixReread {
         ref scope,
@@ -246,8 +237,6 @@ fn main() -> Result<()> {
     ottto_core::disable_keychain_user_interaction();
 
     match cli.command.unwrap_or(Command::Status { json: true }) {
-        #[cfg(feature = "replay-harness")]
-        Command::ReplayHarness(_) => unreachable!("replay handled before service startup"),
         Command::ClaudeCopyPrefixReread { .. } => {
             unreachable!("administrative command handled before startup")
         }
