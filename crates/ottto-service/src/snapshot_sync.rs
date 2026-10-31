@@ -22497,13 +22497,15 @@ mod tests {
             .snapshots
             .iter()
             .map(|item| {
+                let version = crate::snapshot_client::snapshot_ack_body_witness_version(item)?;
+                // As the backend's entity ACK does, the digest travels only with
+                // a witness version.
                 Ok(serde_json::json!({
                     "source_session_id": item.source_session_id,
                     "snapshot_fingerprint": item.snapshot_fingerprint,
                     "occurrence_count": 1,
-                    "body_witness_version":
-                        crate::snapshot_client::snapshot_ack_body_witness_version(item)?,
-                    "body_witness_digest": snapshot_upload_body_witness(item),
+                    "body_witness_version": version,
+                    "body_witness_digest": version.map(|_| snapshot_upload_body_witness(item)),
                     "head_etag": headed.then_some(head),
                 }))
             })
