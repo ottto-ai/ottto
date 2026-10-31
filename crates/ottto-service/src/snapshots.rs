@@ -46715,12 +46715,7 @@ impl ScanIndex {
             };
             if root == root_session_id {
                 let revision = std::mem::take(&mut entry.source_file_fingerprint);
-                // A re-armed entry has no revision; any well-formed one pairs it.
-                let revision = if revision.is_empty() {
-                    "5".repeat(64)
-                } else {
-                    revision
-                };
+                assert!(!revision.is_empty(), "{member} is indexed at a revision");
                 members.insert(member, revision);
             }
         }

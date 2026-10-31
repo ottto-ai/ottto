@@ -1067,7 +1067,10 @@ fn settle_index_after_upload(
 
 /// Correction completion depends on the final selected file/empty facts. In
 /// particular, the last M2 no-body drain must precede the completion decision.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the selected index, page facts, correction candidates and drain ledger"
+)]
 fn settle_upload_corrections_after_selection(
     index: &mut ScanIndex,
     scan: &SourceScanResult,
