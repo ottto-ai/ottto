@@ -206,7 +206,7 @@ impl codex_file_join::HeaderInventory {
                     }
                 }
             }
-            self.classify_compressed_families();
+            self.mark_validated_families();
         }
         let after = self.custody_after.as_ref().map_or(Unbounded, Excluded);
         if let Some((key, entry)) = index.files.range::<String, _>((after, Unbounded)).next() {
@@ -457,50 +457,6 @@ pub(super) fn parent_unbound(
 }
 
 impl codex_file_join::HeaderInventory {
-    pub(super) fn classify_compressed_families(&mut self) {
-        fn logical(path: &Path) -> &str {
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            name.strip_suffix(".zst").unwrap_or(name)
-        }
-        self.headers.sort_unstable_by(|a, b| {
-            a.owner
-                .cmp(&b.owner)
-                .then_with(|| logical(&a.candidate.path).cmp(logical(&b.candidate.path)))
-                .then_with(|| {
-                    is_compressed_codex_rollout(Some(&a.candidate.path), None)
-                        .cmp(&is_compressed_codex_rollout(Some(&b.candidate.path), None))
-                })
-        });
-        let mut start = 0;
-        while start < self.headers.len() {
-            let end = start
-                + self.headers[start..].partition_point(|h| h.owner == self.headers[start].owner);
-            let mut at = start;
-            let mut members = 0;
-            let mut archive = false;
-            while at < end {
-                let next = at
-                    + self.headers[at..end].partition_point(|h| {
-                        logical(&h.candidate.path) == logical(&self.headers[at].candidate.path)
-                    });
-                let plain =
-                    !is_compressed_codex_rollout(Some(&self.headers[at].candidate.path), None);
-                for i in at..next {
-                    let compressed =
-                        is_compressed_codex_rollout(Some(&self.headers[i].candidate.path), None);
-                    self.headers[i].plain_twin = plain && compressed;
-                    archive |= compressed;
-                    members += usize::from(!self.headers[i].plain_twin);
-                }
-                at = next;
-            }
-            if archive && members > 1 {
-                self.mark_custody_range(start, end, CodexZstCause::FamilyUnproven);
-            }
-            start = end;
-        }
-    }
-
     pub(super) fn plain_twin(&self, path: &Path) -> bool {
         self.headers
             .binary_search_by(|h| h.candidate.path.as_os_str().cmp(path.as_os_str()))

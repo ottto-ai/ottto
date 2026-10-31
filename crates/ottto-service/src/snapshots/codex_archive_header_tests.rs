@@ -80,8 +80,13 @@ fn header_inventory(
         &BTreeSet::from([local_index_key(&f.0)]),
         Some(&directories),
     );
-    inventory.archive_work.allowed = true;
+    let mut work = funded_header_work();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        // Selected admission acquires the header; inventory reads only its
+        // same-stamp facts and never decodes.
+        state
+            .inventory_archive_header(&f.candidate(), Some(cache), &mut work)
+            .unwrap();
         while inventory.step_with_archive(&CodexTitleMetadata::default(), state, Some(cache))
             != codex_file_join::HeaderStep::Complete
         {}
@@ -90,16 +95,13 @@ fn header_inventory(
     assert_eq!(inventory.headers.len(), 1);
     assert_eq!(inventory.headers[0].owner, "compressed-fixture");
     assert_eq!(cache.cursor_reserved(), 0, "no parked decoder");
-    assert_eq!(
-        inventory.read_bytes as u64,
-        inventory.archive_work.physical_bytes
-    );
+    assert_eq!(inventory.read_bytes, 0, "inventory never reads archives");
     let before = rows
         .iter()
         .filter(|r| r["stage"] == "codex_zst_input")
         .count();
     assert_eq!(before, 0, "inventory has no Full/encoding row");
-    assert_eq!(decodes(&rows), usize::from(inventory.read_bytes > 0));
+    assert_eq!(decodes(&rows), usize::from(work.physical_bytes > 0));
     let (_, witness_rows) = crate::local_resource_diagnostics::capture(|| {
         assert_eq!(
             codex_file_join::header_reduction_witness(&f.candidate(), state.archive_header(&f.0))
@@ -437,8 +439,7 @@ fn invalid_archive_does_not_hold_live_plain_on_next_pass() {
     let mut dirs = codex_file_join::DirectoryCensus::new();
     dirs.observe(&root, &fs::metadata(&root).unwrap());
     let paths = BTreeSet::from([local_index_key(&f.0), local_index_key(&plain)]);
-    let mut inventory = codex_file_join::HeaderInventory::new(&[root], &paths, Some(&dirs));
-    inventory.archive_work.allowed = true;
+    let inventory = codex_file_join::HeaderInventory::new(&[root], &paths, Some(&dirs));
     let mut live = super::super::codex_zst_refusal_tests::candidate(&plain);
     live.size_bytes = fs::metadata(&plain).unwrap().len();
     let ((_, result), rows) = crate::local_resource_diagnostics::capture(|| {
@@ -485,12 +486,6 @@ fn invalid_archive_does_not_hold_live_plain_on_next_pass() {
         .snapshots
         .iter()
         .any(|item| item.source_session_id == "compressed-fixture"));
-    assert!(rows.iter().any(
-        |r| r["counts"]["codex_zst_refused"]["CompressedHeaderInvalid"]
-            .as_u64()
-            .unwrap_or(0)
-            > 0
-    ));
 }
 
 /// [behaviour] A Full read accepts a 70 KiB header and settles once.
@@ -744,68 +739,6 @@ fn double_uuid_archive_has_named_owner_hold_no_replacement_or_redecode() {
     let (_, result, rows, _) = archive_pass(&f, checkpoint(&state), true, None);
     assert_eq!(decodes(&rows), 0);
     assert!(result.snapshots.is_empty());
-}
-
-/// [behaviour] An inventory step charges decoded bytes to the page and keeps physical accounting.
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "funded decoder needs validated heap layout"
-)]
-fn inventory_step_charges_decoded_bytes_to_page_and_keeps_physical_inventory_accounting() {
-    let _lock = ARCHIVE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
-    let root = f.0.parent().unwrap().to_owned();
-    let mut dirs = codex_file_join::DirectoryCensus::new();
-    dirs.observe(&root, &fs::metadata(&root).unwrap());
-    let paths = BTreeSet::from([local_index_key(&f.0)]);
-    let mut inventory = codex_file_join::HeaderInventory::new(&[root], &paths, Some(&dirs));
-    inventory.archive_work.allowed = true; // synthetic AC + utility permission
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let mut scan = OwnedSourceScan::new(
-        SnapshotSource::Codex,
-        &[],
-        ScanIndex::default(),
-        NOW,
-        BACKFILL_WINDOW_DAYS,
-        10,
-        false,
-        None,
-        &[],
-        false,
-        true,
-    )
-    .with_sampled_acquisition(cache, Scope("inventory-budget-test".into()));
-    scan.index.archive_pass.power = true; // synthetic pacing permission
-    scan.identified_candidates = VecDeque::from([f.candidate()]);
-    scan.codex_join_inventory = Some(inventory);
-    scan.codex_join_prepared = false;
-    let limits = sampled_scan::codex_cursor::Limits::current();
-    let before = scan.codex_page.singleton_remaining(limits);
-    for _ in 0..1000 {
-        match scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => {
-                let inventory = next.codex_join_inventory.as_ref().unwrap();
-                if inventory.archive_work.decoded_bytes > 0 {
-                    assert_eq!(
-                        next.codex_page.singleton_remaining(limits),
-                        before - inventory.archive_work.decoded_bytes
-                    );
-                    assert_eq!(
-                        inventory.read_bytes as u64,
-                        inventory.archive_work.physical_bytes
-                    );
-                    assert!(inventory.archive_work.physical_bytes > 0);
-                    return;
-                }
-                scan = next;
-            }
-            OwnedSourceScanStep::Complete { .. } => panic!("inventory read was not charged"),
-        }
-    }
-    panic!("inventory budget test did not reach its step");
 }
 
 /// [money] Plain sibling output: an unreadable segment holds its filename owner, not unrelated
@@ -1960,17 +1893,22 @@ fn selector_scan(
     index: ScanIndex,
     cache: Arc<sampled_scan::SharedCache>,
     candidates: VecDeque<CandidateFile>,
-    allowed: bool,
+    power: bool,
 ) -> OwnedSourceScan {
     let root = f.0.parent().unwrap().to_owned();
-    let paths = candidates
+    let paths: BTreeSet<String> = candidates
         .iter()
         .map(|c| local_index_key(&c.path))
         .collect();
     let mut directories = codex_file_join::DirectoryCensus::new();
     directories.observe(&root, &fs::metadata(&root).unwrap());
-    let mut inventory = codex_file_join::HeaderInventory::new(&[root], &paths, Some(&directories));
-    inventory.archive_work.allowed = allowed;
+    let mut inventory = codex_file_join::HeaderInventory::new(
+        std::slice::from_ref(&root),
+        &paths,
+        Some(&directories),
+    );
+    // Production feed: metadata-only F3 inventory; selected admission reads headers.
+    inventory.feed_prepared = false;
     let mut scan = OwnedSourceScan::new(
         SnapshotSource::Codex,
         &[],
@@ -1986,11 +1924,16 @@ fn selector_scan(
     )
     .with_sampled_acquisition(cache, Scope("selector-archive-test".into()));
     scan.identified_candidates = candidates;
-    scan.census.observed_index_keys.extend(paths);
+    scan.census
+        .observed_index_keys
+        .extend(paths.iter().cloned());
     scan.codex_join_inventory = Some(inventory);
     scan.codex_join_prepared = false;
     scan.census_unix_seconds = None;
-    scan.index.archive_pass.power = true;
+    scan.index.archive_pass.power = power;
+    let traversal = scan.index.traversal.as_mut().unwrap();
+    traversal.codex_rollout_paths = paths;
+    traversal.scan_roots = vec![root];
     scan
 }
 
@@ -2094,11 +2037,7 @@ fn production_inventory_denial_holds_scoped_and_sibling_progresses() {
             gate != "battery",
         );
         if gate == "cpu" {
-            scan.codex_join_inventory
-                .as_mut()
-                .unwrap()
-                .archive_work
-                .cpu_micros = 30_000_000;
+            scan.index.archive_pass.cpu = 30_000_000;
         }
         if gate == "page" {
             let remaining = scan
@@ -2189,11 +2128,6 @@ fn bound_header_marker_survives_restart_without_inventory_redecode() {
             ));
         });
         assert_eq!(decodes(&rows), expected);
-        assert!(!state.files[&local_index_key(&f.0)]
-            .archive
-            .as_ref()
-            .unwrap()
-            .invalid_header(&f.0, &fs::metadata(&f.0).unwrap()));
         state = checkpoint(&state);
     }
     // A bound is not a validity claim: the one full decode refuses this junk,
@@ -2653,7 +2587,6 @@ fn warm_archive_evidence_changed_stamp_defers_without_unselected_header_read() {
     let mut directories = codex_file_join::DirectoryCensus::new();
     directories.observe(&root, &fs::metadata(&root).unwrap());
     let mut inventory = codex_file_join::HeaderInventory::new(&[root], &paths, Some(&directories));
-    inventory.cached_archives_only = true;
     assert!(inventory.retain_cached_archives(&index, &paths).is_none());
     let before = serde_json::to_value(&index.files[&key]).unwrap();
     // Warm fact selected by F3, then object changes before inventory consumes it.
@@ -3073,28 +3006,6 @@ fn power_plain_sibling(f: &ArchiveFixture) -> CandidateFile {
     candidate
 }
 
-// Exercise the activated metadata-only F3 feed rather than the predecessor's
-// explicit header-inventory admission seam used by selector_scan's callers.
-fn activated_selector_scan(
-    f: &ArchiveFixture,
-    index: ScanIndex,
-    cache: Arc<sampled_scan::SharedCache>,
-    candidates: VecDeque<CandidateFile>,
-) -> OwnedSourceScan {
-    let paths = candidates
-        .iter()
-        .map(|candidate| local_index_key(&candidate.path))
-        .collect();
-    let mut scan = selector_scan(f, index, cache, candidates, false);
-    let inventory = scan.codex_join_inventory.as_mut().unwrap();
-    inventory.feed_prepared = false;
-    inventory.cached_archives_only = true;
-    let traversal = scan.index.traversal.as_mut().unwrap();
-    traversal.codex_rollout_paths = paths;
-    traversal.scan_roots = vec![f.0.parent().unwrap().to_owned()];
-    scan
-}
-
 /// [behaviour] Power loss after construction defers without a read or attempt; plain progresses.
 #[test]
 fn archive_power_loss_after_construction_defers_without_read_or_attempt_and_plain_progresses() {
@@ -3108,11 +3019,12 @@ fn archive_power_loss_after_construction_defers_without_read_or_attempt_and_plai
         let decoders = codex_zst_refusal_tests::decoder_construction_count();
         let (((state, result), rows), before) =
             crate::snapshot_sync::with_archive_power(&[Some(true), denied], || {
-                let mut scan = activated_selector_scan(
+                let mut scan = selector_scan(
                     &f,
                     ScanIndex::default(),
                     cache.clone(),
                     VecDeque::from([plain, f.candidate()]),
+                    true,
                 );
                 assert!(scan.index.archive_pass.power, "constructed while Allowed");
                 scan.index.archive_pass.cpu = 123;
@@ -3173,11 +3085,12 @@ fn archive_power_loss_between_header_and_body_preserves_paid_header_and_plain_pr
         let ((state, result), rows) = crate::snapshot_sync::with_archive_power(
             &[Some(true), Some(true), Some(true), denied],
             || {
-                let scan = activated_selector_scan(
+                let scan = selector_scan(
                     &f,
                     ScanIndex::default(),
                     cache.clone(),
                     VecDeque::from([plain, f.candidate()]),
+                    true,
                 );
                 crate::local_resource_diagnostics::capture(|| finish_selector(scan))
             },
@@ -3241,11 +3154,12 @@ fn activated_selector_reaches_inherited_header_claim_starvation_and_resets_on_pr
         .unwrap()
         .unwrap();
     for attempt in 1..=14 {
-        let scan = activated_selector_scan(
+        let scan = selector_scan(
             &f,
             ScanIndex::default(),
             cache.clone(),
             VecDeque::from([f.candidate()]),
+            true,
         );
         let ((index, result), rows) =
             crate::local_resource_diagnostics::capture(|| finish_selector(scan));
@@ -3275,11 +3189,12 @@ fn activated_selector_reaches_inherited_header_claim_starvation_and_resets_on_pr
         );
     }
     occupied.close();
-    let scan = activated_selector_scan(
+    let scan = selector_scan(
         &f,
         ScanIndex::default(),
         cache.clone(),
         VecDeque::from([f.candidate()]),
+        true,
     );
     let ((index, result), rows) =
         crate::local_resource_diagnostics::capture(|| finish_selector(scan));

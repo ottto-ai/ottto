@@ -214,16 +214,12 @@ impl ValidatedHeader {
             return None;
         }
         let value: Value = serde_json::from_slice(bytes).ok()?;
-        let meta = codex_session_meta_payload(&value)?;
+        let (owner, created_unix_ms) = codex_file_join::owning_header(&value).ok()?;
         let digest = Sha256::new().chain_update(bytes).chain_update(b"\n");
         Some(Self {
-            owner: resolve_codex_identity_option(codex_identity_at(meta, &["id"]))?,
+            owner,
             digest: format!("{:x}", digest.finalize()),
-            created_unix_ms: meta
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(|ts| OffsetDateTime::parse(ts, &Rfc3339).ok())
-                .and_then(|ts| i64::try_from(ts.unix_timestamp_nanos() / 1_000_000).ok()),
+            created_unix_ms,
         })
     }
     fn filename_matches(&self, path: &Path) -> bool {
@@ -404,15 +400,6 @@ impl ArchiveEvidence {
     fn header_bound_pending(&self) -> bool {
         use ArchiveDisposition::*;
         self.header_bound_reached && matches!(self.disposition, HeaderValidated | Pending { .. })
-    }
-    pub(super) fn invalid_header(&self, path: &Path, metadata: &std::fs::Metadata) -> bool {
-        let bound = self.header_for(path).is_some();
-        !bound
-            && !self.header_bound_pending()
-            && (self.header_attempted
-                || !matches!(self.disposition, ArchiveDisposition::HeaderValidated))
-            && crate::transcript_acquisition::FileStamp::capture(metadata.clone())
-                .is_ok_and(|stamp| self.stamp.same_content(&stamp))
     }
     pub(super) fn matches(&self, file: &File) -> bool {
         file.metadata()
@@ -979,19 +966,16 @@ impl super::ScanIndex {
         };
         evidence.header_attempted = true;
         self.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
-        let mut bytes = Vec::new();
         let result = (|| -> Result<HeaderRead> {
-            (&mut input)
-                .take(codex_file_join::MAX_HEADER_BYTES as u64)
-                .read_until(b'\n', &mut bytes)?;
+            let line = codex_file_join::read_header_line(&mut input)?;
             let evidence = self.files[&key].archive.as_ref().expect("header attempt");
             anyhow::ensure!(
                 evidence.matches(input.get_ref()),
                 "archive changed during header read"
             );
-            if bytes.len() == codex_file_join::MAX_HEADER_BYTES && !bytes.ends_with(b"\n") {
+            let Some(bytes) = line else {
                 return Ok(HeaderRead::BoundReached);
-            }
+            };
             let header =
                 ValidatedHeader::from_bytes(&bytes).context("invalid archive owning header")?;
             anyhow::ensure!(

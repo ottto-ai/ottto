@@ -27575,10 +27575,9 @@ impl OwnedSourceScan {
                     .held_owners
                     .extend(census.archive_terminal_sessions.iter().cloned());
                 // Keep the full roster at construction for 0b's family-wide guard.
-                // Ordinary inventory must never acquire an unseen archive header.
-                // Cached-feed filtering follows the paged owner-wide custody scan.
+                // Inventory never acquires an unseen archive header (same-stamp
+                // facts only); cached-feed filtering follows the paged custody scan.
                 inventory.feed_prepared = false;
-                inventory.cached_archives_only = true;
                 inventory.complete &= traversal.pending_directories.is_empty();
                 inventory
             });
@@ -27937,27 +27936,11 @@ impl OwnedSourceScan {
                         inventory.feed_prepared = true;
                         pending!();
                     }
-                    let decoded_before = inventory.archive_work.decoded_bytes;
-                    // Ordinary construction leaves permission false: cached feed only.
-                    // The gate is per step, never latched, so a deferral yields.
-                    let allowed = inventory.archive_work.allowed;
-                    let remaining = codex_page
-                        .singleton_remaining(sampled_scan::codex_cursor::Limits::current());
-                    inventory.archive_work.allowed = allowed
-                        && codex_page.archive_ready(&index.archive_pass)
-                        && remaining >= 2 * codex_file_join::MAX_HEADER_BYTES as u64;
-                    if inventory.archive_work.allowed {
-                        crate::context_composition::set_utility_qos();
-                    }
                     let done = inventory.step_with_archive(
                         &codex_title_metadata,
                         index,
                         sampling.as_ref().map(|context| &context.cache),
                     );
-                    inventory.archive_work.allowed = allowed;
-                    index.archive_pass.started |=
-                        inventory.archive_work.decoded_bytes > decoded_before;
-                    codex_page.charge(false, inventory.archive_work.decoded_bytes - decoded_before);
                     if done != codex_file_join::HeaderStep::Complete {
                         pending!();
                     }
@@ -29221,13 +29204,7 @@ impl OwnedSourceScan {
                 if let Some(delivery) = line_delivery.as_mut() {
                     delivery.begin_armed(&active, &roots);
                 }
-                let archive_started = active
-                    .parser
-                    .reader
-                    .reader
-                    .is_compressed()
-                    .then(crate::context_composition::thread_cpu_micros);
-                index.archive_pass.started |= archive_started.is_some();
+                index.archive_pass.started |= active.parser.reader.reader.is_compressed();
                 let mut group_end = None;
                 let stepped = if active.group.is_some() {
                     // A group job: one record of the current member, or one
@@ -29281,17 +29258,6 @@ impl OwnedSourceScan {
                         .consumed_bytes()
                         .saturating_sub(before_body_read),
                 );
-                if let (Some(started), Some(inventory)) =
-                    (archive_started, codex_join_inventory.as_mut())
-                {
-                    // Unknown CPU exhausts the header work: unknown is denied.
-                    inventory.archive_work.cpu_micros =
-                        inventory.archive_work.cpu_micros.saturating_add(
-                            started
-                                .zip(crate::context_composition::thread_cpu_micros())
-                                .map_or(u64::MAX, |(started, ended)| ended.saturating_sub(started)),
-                        );
-                }
                 if let Some(header) = active.parser.reader.header_validated.take() {
                     if let Some(evidence) = index
                         .files

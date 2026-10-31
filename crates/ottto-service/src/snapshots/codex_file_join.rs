@@ -190,14 +190,11 @@ fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usiz
     anyhow::ensure!(before.is_file(), "Codex header is not a regular file");
     let stamp = FileStamp::capture(before.clone())?;
     let mut reader = BufReader::with_capacity(1024, file.take((MAX_HEADER_BYTES + 1) as u64));
-    let mut bytes = Vec::new();
     #[cfg(all(test, unix))]
     header_cache_tests::READ_CALLS.with(|calls| calls.set(calls.get() + 1));
-    reader.read_until(b'\n', &mut bytes)?;
-    anyhow::ensure!(
-        bytes.len() <= MAX_HEADER_BYTES && bytes.last() == Some(&b'\n'),
-        "Codex header exceeds its read bound"
-    );
+    let bytes = read_header_line(&mut reader)?
+        .filter(|bytes| bytes.last() == Some(&b'\n'))
+        .context("Codex header exceeds its read bound")?;
     let after = reader.get_ref().get_ref().metadata()?;
     let witness = metadata_witness(&before);
     anyhow::ensure!(
@@ -208,14 +205,21 @@ fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usiz
     let read_bytes = (MAX_HEADER_BYTES + 1) - reader.get_ref().limit() as usize;
     Ok((bytes, witness, read_bytes, stamp))
 }
-type ReadHeader = (CachedHeader, String);
-fn read_header(candidate: &CandidateFile) -> Result<ReadHeader> {
-    let (bytes, witness, read_bytes, stamp) = read_header_bytes(candidate)?;
-    #[cfg(test)]
-    codex_zst_refusal_tests::jsonl_parse_attempted();
-    let value: Value = serde_json::from_slice(&bytes)?;
+/// The one bounded first-record read over an opened input: a plain file or a
+/// funded archive decoder, each keeping its own physical/decoded limits.
+/// `None` means the bound was reached before a newline.
+pub(super) fn read_header_line(input: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    input
+        .take(MAX_HEADER_BYTES as u64)
+        .read_until(b'\n', &mut bytes)?;
+    Ok((bytes.len() < MAX_HEADER_BYTES || bytes.ends_with(b"\n")).then_some(bytes))
+}
+/// Pure owning-header facts (owner, creation ms) of a parsed first record,
+/// shared by plain and archive headers.
+pub(super) fn owning_header(value: &Value) -> Result<(String, Option<i64>)> {
     let meta =
-        codex_session_meta_payload(&value).context("Codex first record is not a owning header")?;
+        codex_session_meta_payload(value).context("Codex first record is not a owning header")?;
     let owner = resolve_codex_identity_option(codex_identity_at(meta, &["id"]))
         .context("Codex header lacks ownership")?;
     let created_unix_ms = meta
@@ -223,6 +227,14 @@ fn read_header(candidate: &CandidateFile) -> Result<ReadHeader> {
         .and_then(Value::as_str)
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
         .and_then(|created| i64::try_from(created.unix_timestamp_nanos() / 1_000_000).ok());
+    Ok((owner, created_unix_ms))
+}
+type ReadHeader = (CachedHeader, String);
+fn read_header(candidate: &CandidateFile) -> Result<ReadHeader> {
+    let (bytes, witness, read_bytes, stamp) = read_header_bytes(candidate)?;
+    #[cfg(test)]
+    codex_zst_refusal_tests::jsonl_parse_attempted();
+    let (owner, created_unix_ms) = owning_header(&serde_json::from_slice(&bytes)?)?;
     Ok((
         CachedHeader {
             stamp,
@@ -393,8 +405,6 @@ pub(super) struct HeaderInventory {
     pub(super) complete: bool,
     /// Negative owner scope is collected one retained entry per step, before F3.
     pub(super) feed_prepared: bool,
-    /// Normal inventory uses only same-stamp archive facts, never a decoder.
-    pub(super) cached_archives_only: bool,
     pub(super) feed_after: Option<String>,
     pub(super) feed_peak: usize,
     pub(super) custody_next: usize,
@@ -418,7 +428,6 @@ pub(super) struct HeaderInventory {
     pub(super) deferred_archives: BTreeSet<String>,
     /// Bound archives held by name with a resolved family sibling (value: twin).
     pub(super) family_held: BTreeMap<String, bool>,
-    pub(super) archive_work: codex_compressed_input::HeaderWork,
     pub(super) reuse_hits: usize,
     pub(super) reuse_misses: usize,
     pub(super) bytes_avoided: usize,
@@ -444,6 +453,79 @@ pub(super) enum HeaderStep {
     Pending,
     Deferred,
     Complete,
+}
+
+/// Logical rollout name: an archive and its plain twin share it.
+fn logical_name(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    Some(name.strip_suffix(".zst").unwrap_or(name))
+}
+/// Filename owners of an archive key: negative scope only, never ownership.
+fn archive_owners(key: &str) -> Vec<String> {
+    codex_session_id_candidates_from_path(&Path::new(key).with_extension(""))
+}
+#[derive(Default)]
+struct Family<'a> {
+    /// Logical names of validated plain members.
+    plain: Vec<Option<&'a str>>,
+    /// Logical names of validated archive members.
+    archives: Vec<Option<&'a str>>,
+    /// Archives known by name only (no validated header).
+    named: usize,
+    /// An unresolved (deferred) archive names this owner.
+    deferred: bool,
+}
+impl Family<'_> {
+    fn twin(&self, name: Option<&str>) -> bool {
+        name.is_some() && self.plain.contains(&name)
+    }
+}
+/// Family classification of one archive. Never an ACK, an ownership proof,
+/// permission to decode, or permission to retire another carrier.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FamilyClass {
+    /// A validated plain member has the same logical name.
+    pub(super) twin: bool,
+    /// Validated headers alone show a second non-twin member.
+    pub(super) validated_sibling: bool,
+    /// A validated plain, or a second archive by any evidence.
+    pub(super) sibling: bool,
+    /// An unresolved archive shares a filename owner.
+    pub(super) deferred: bool,
+}
+pub(super) struct FamilyTable<'a>(BTreeMap<String, Family<'a>>);
+impl FamilyTable<'_> {
+    fn class<'o>(
+        &self,
+        owners: impl IntoIterator<Item = &'o str>,
+        name: Option<&str>,
+    ) -> FamilyClass {
+        let mut class = FamilyClass::default();
+        for family in owners.into_iter().filter_map(|owner| self.0.get(owner)) {
+            let members =
+                family.plain.len() + family.archives.iter().filter(|n| !family.twin(**n)).count();
+            class.twin |= family.twin(name);
+            class.validated_sibling |= members > 1;
+            class.sibling |= !family.plain.is_empty() || family.archives.len() + family.named > 1;
+            class.deferred |= family.deferred;
+        }
+        class
+    }
+    /// One validated archive header, by its validated owner.
+    fn validated_class(&self, header: &HeaderWitness) -> FamilyClass {
+        self.class(
+            [header.owner.as_str()],
+            logical_name(&header.candidate.path),
+        )
+    }
+    /// One archive key by filename owners; selected admission uses the same.
+    pub(super) fn archive_class(&self, key: &str) -> FamilyClass {
+        let owners = archive_owners(key);
+        self.class(
+            owners.iter().map(String::as_str),
+            logical_name(Path::new(key)),
+        )
+    }
 }
 
 impl HeaderInventory {
@@ -558,71 +640,98 @@ impl HeaderInventory {
         // read_bytes is NOT reset: repeated real edits reach the existing bound.
         crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::OwnerUnproven);
     }
+    /// D5: the one family facts table. Validated headers (plain or archive,
+    /// keyed by header owner) and archives known only by name (bound, unknown
+    /// or held; keyed by filename owners) stay separate evidence classes.
+    pub(super) fn family_table(&self) -> FamilyTable<'_> {
+        let mut table = BTreeMap::<String, Family>::new();
+        for header in &self.headers {
+            let family = table.entry(header.owner.clone()).or_default();
+            let name = logical_name(&header.candidate.path);
+            if codex_archive_path(&header.candidate.path) {
+                family.archives.push(name);
+            } else {
+                family.plain.push(name);
+            }
+        }
+        for key in self.first_read_archives.union(&self.held_archives) {
+            for owner in archive_owners(key) {
+                table.entry(owner).or_default().named += 1;
+            }
+        }
+        for key in &self.deferred_archives {
+            for owner in archive_owners(key) {
+                table.entry(owner).or_default().deferred = true;
+            }
+        }
+        FamilyTable(table)
+    }
+    /// Custody phase: a validated archive with a validated plain twin is
+    /// skipped without decoding; any other validated second member holds
+    /// every archive of that owner (FamilyUnproven). Plain members never hold.
+    pub(super) fn mark_validated_families(&mut self) {
+        let table = self.family_table();
+        let classes = self
+            .headers
+            .iter()
+            .map(|h| codex_archive_path(&h.candidate.path).then(|| table.validated_class(h)))
+            .collect::<Vec<_>>();
+        let owners = self
+            .headers
+            .iter()
+            .zip(&classes)
+            .filter(|(_, class)| class.is_some_and(|c| c.validated_sibling))
+            .map(|(h, _)| h.owner.clone())
+            .collect::<BTreeSet<_>>();
+        for (header, class) in self.headers.iter_mut().zip(classes) {
+            header.plain_twin = class.is_some_and(|c| c.twin);
+        }
+        for owner in owners {
+            self.mark_custody_owner(&owner, CodexZstCause::FamilyUnproven);
+        }
+    }
     /// 0a r3 (Lead B 2026-10-29): a bound archive X with a resolved sibling of
     /// its filename owner (a validated plain P, or another bound, invalid or
     /// validated archive) is held by name, quietly: X never decodes and P keeps
     /// publishing exactly as without X. Only unresolved (deferred) siblings
     /// defer X; once they resolve, X takes its one A1 read or is held.
     pub(super) fn classify_bound_archives(&mut self) {
-        let owners_of =
-            |key: &str| codex_session_id_candidates_from_path(&Path::new(key).with_extension(""));
-        let mut plain = BTreeMap::<&str, Vec<&Path>>::new();
-        let mut archives = BTreeMap::<String, usize>::new();
-        for header in &self.headers {
-            if is_compressed_codex_rollout(Some(&header.candidate.path), None) {
-                *archives.entry(header.owner.clone()).or_default() += 1;
-            } else {
-                plain
-                    .entry(&header.owner)
-                    .or_default()
-                    .push(&header.candidate.path);
-            }
-        }
-        for key in self.first_read_archives.union(&self.held_archives) {
-            for owner in owners_of(key) {
-                *archives.entry(owner).or_default() += 1;
-            }
-        }
-        let pending = self
-            .deferred_archives
-            .iter()
-            .flat_map(|key| owners_of(key))
-            .collect::<BTreeSet<_>>();
-        let mut held = self.family_held.clone();
-        let validated = self
+        let table = self.family_table();
+        let mut held = Vec::new();
+        let mut deferred = Vec::new();
+        for header in self
             .headers
             .iter()
             .filter(|h| codex_archive_path(&h.candidate.path))
-            .map(|h| local_index_key(&h.candidate.path))
-            .collect::<BTreeSet<_>>();
-        for key in self.first_read_archives.union(&validated) {
-            let owners = owners_of(key);
-            let name = Path::new(key).with_extension("");
-            let name = name.file_name();
-            if owners
-                .iter()
-                .any(|o| plain.contains_key(o.as_str()) || archives.get(o).is_some_and(|n| *n > 1))
-            {
-                let twin = owners
-                    .iter()
-                    .filter_map(|o| plain.get(o.as_str()))
-                    .flatten()
-                    .any(|p| p.file_name() == name);
-                held.insert(key.clone(), twin);
-            } else if owners.iter().any(|o| pending.contains(o)) {
-                self.deferred_archives.insert(key.clone());
+        {
+            let key = local_index_key(&header.candidate.path);
+            let class = table.archive_class(&key);
+            if class.sibling {
+                held.push((key, class.twin));
+            } else if class.deferred {
+                deferred.push(key);
             }
         }
+        for key in &self.first_read_archives {
+            let class = table.archive_class(key);
+            if class.sibling {
+                held.push((key.clone(), class.twin));
+            } else if class.deferred {
+                deferred.push(key.clone());
+            }
+        }
+        drop(table);
+        self.family_held.extend(held);
+        self.deferred_archives.extend(deferred);
         // A held family owner never holds or refuses its plain member.
         self.held_owners = self
             .first_read_archives
             .iter()
-            .filter(|key| !held.contains_key(*key))
+            .filter(|key| !self.family_held.contains_key(*key))
             .chain(&self.deferred_archives)
             .chain(&self.held_archives)
-            .flat_map(|key| owners_of(key))
+            .flat_map(|key| archive_owners(key))
             .collect();
-        self.family_held = held;
     }
     pub(super) fn resumable_for(&self, owner: Option<&String>, custody_deferred: bool) -> bool {
         !self.decode_unknown
@@ -660,7 +769,6 @@ impl HeaderInventory {
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
             feed_prepared: true,
-            cached_archives_only: false,
             feed_after: None,
             feed_peak: 0,
             custody_next: 0,
@@ -681,7 +789,6 @@ impl HeaderInventory {
             first_read_archives: BTreeSet::new(),
             deferred_archives: BTreeSet::new(),
             family_held: BTreeMap::new(),
-            archive_work: codex_compressed_input::HeaderWork::default(),
             reuse_hits: 0,
             reuse_misses: 0,
             bytes_avoided: 0,
@@ -799,7 +906,7 @@ impl HeaderInventory {
         metadata: &CodexTitleMetadata,
         cache: Option<&sampled_scan::SharedCache>,
     ) -> bool {
-        self.step_inner(metadata, &mut ScanIndex::default(), cache, None) == HeaderStep::Complete
+        self.step_inner(metadata, &mut ScanIndex::default(), cache) == HeaderStep::Complete
     }
     pub(super) fn step_with_archive(
         &mut self,
@@ -807,14 +914,13 @@ impl HeaderInventory {
         index: &mut ScanIndex,
         cache: Option<&Arc<sampled_scan::SharedCache>>,
     ) -> HeaderStep {
-        self.step_inner(metadata, index, cache.map(Arc::as_ref), cache)
+        self.step_inner(metadata, index, cache.map(Arc::as_ref))
     }
     fn step_inner(
         &mut self,
         metadata: &CodexTitleMetadata,
         index: &mut ScanIndex,
         cache: Option<&sampled_scan::SharedCache>,
-        archive_cache: Option<&Arc<sampled_scan::SharedCache>>,
     ) -> HeaderStep {
         if !self.cache_pruned {
             self.cache_pruned = true;
@@ -908,8 +1014,6 @@ impl HeaderInventory {
             return HeaderStep::Pending;
         }
 
-        let mut excluded = false;
-        let mut deferred = false;
         let result = (|| -> Result<Option<HeaderWitness>> {
             let stat = fs::symlink_metadata(&path)?;
             anyhow::ensure!(
@@ -945,41 +1049,12 @@ impl HeaderInventory {
             );
             if compressed {
                 // Archives have their own FD-bound evidence and never consult
-                // or populate the optional plain header fact cache.
-                let before = self.archive_work.physical_bytes;
-                let result = if self.cached_archives_only {
-                    // Metadata-only accessor: permission to decode is separate.
-                    // In particular a rewrite after F3 cannot turn a cache miss
-                    // into an unselected header decode (#878 composition).
-                    Ok(index
-                        .archive_header(&candidate.path)
-                        .cloned()
-                        .map(codex_compressed_input::HeaderRead::Validated)
-                        .unwrap_or(codex_compressed_input::HeaderRead::Deferred))
-                } else {
-                    index.inventory_archive_header(
-                        &candidate,
-                        archive_cache,
-                        &mut self.archive_work,
-                    )
-                };
-                excluded = index
-                    .files
-                    .get(&key)
-                    .and_then(|e| e.archive.as_ref())
-                    .is_some_and(|a| a.invalid_header(&candidate.path, &stat));
-                self.read_bytes = self
-                    .read_bytes
-                    .saturating_add((self.archive_work.physical_bytes - before) as usize);
-                let header = match result? {
-                    codex_compressed_input::HeaderRead::Validated(header) => header,
-                    codex_compressed_input::HeaderRead::BoundReached => {
-                        return Ok(None);
-                    }
-                    codex_compressed_input::HeaderRead::Deferred => {
-                        deferred = true;
-                        return Ok(None);
-                    }
+                // or populate the optional plain header fact cache. Inventory
+                // reads only same-stamp facts: a header is acquired solely by
+                // selected-candidate admission (`inventory_archive_header`), so
+                // a rewrite after F3 cannot turn a miss into a decode (#878).
+                let Some(header) = index.archive_header(&candidate.path).cloned() else {
+                    return Ok(None);
                 };
                 let stamp = index
                     .files
@@ -1049,24 +1124,15 @@ impl HeaderInventory {
         })();
         match result {
             Ok(Some(header)) => self.headers.push(header),
+            // Only an archive without same-stamp facts: it waits in custody.
             Ok(None) => {
                 self.held_owners
                     .extend(codex_session_id_candidates_from_path(
                         &Path::new(&key).with_extension(""),
                     ));
-                if deferred {
-                    self.pending.push_back(PathBuf::from(&key));
-                    self.deferred_archives.insert(key);
-                    return HeaderStep::Deferred;
-                }
-                self.first_read_archives.insert(key);
-            }
-            Err(_) if excluded => {
-                self.held_owners
-                    .extend(codex_session_id_candidates_from_path(
-                        &Path::new(&key).with_extension(""),
-                    ));
-                self.held_archives.insert(key);
+                self.pending.push_back(PathBuf::from(&key));
+                self.deferred_archives.insert(key);
+                return HeaderStep::Deferred;
             }
             Err(_) => {
                 if !compressed {
@@ -1164,7 +1230,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; cached_archives_only, feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, decode_after, decode_done, decode_unknown, decode_peak, decode_refused_peak, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
+crate::heap_layout_bound::fields!(HeaderInventory; feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, decode_after, decode_done, decode_unknown, decode_peak, decode_refused_peak, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -4861,8 +4927,6 @@ pub(in crate::snapshots) mod header_cache_tests {
             let mut census = DirectoryCensus::new();
             census.observe(&sessions, &fs::metadata(&sessions).unwrap());
             let mut inventory = HeaderInventory::new(&[sessions], &all, Some(&census));
-            inventory.archive_work.allowed = true;
-            inventory.archive_work.cpu_micros = 30_000_000;
             while inventory.step_with_archive(&CodexTitleMetadata::default(), index, Some(&cache))
                 != HeaderStep::Complete
             {}
@@ -5334,13 +5398,6 @@ pub(in crate::snapshots) mod header_cache_tests {
                                 "unrelated cursor keeps ordinary completeness semantics"
                             );
                         }
-                        assert_eq!(
-                            (
-                                inventory.archive_work.physical_bytes,
-                                inventory.archive_work.decoded_bytes
-                            ),
-                            (0, 0)
-                        );
                         assert!(inventory
                             .headers
                             .iter()

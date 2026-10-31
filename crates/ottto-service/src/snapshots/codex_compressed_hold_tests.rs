@@ -777,9 +777,6 @@ fn inventory(
     directories.observe(root, &fs::metadata(root).unwrap());
     let mut inventory =
         codex_file_join::HeaderInventory::new(&[root.to_owned()], &paths, Some(&directories));
-    // This direct component seam models admitted archive headers. Production
-    // discovery stays .jsonl-only; cached evidence cannot bypass the QoS gate.
-    inventory.archive_work.allowed = true;
     while inventory.step_with_archive(&CodexTitleMetadata::default(), index, None)
         != codex_file_join::HeaderStep::Complete
     {}
@@ -1798,8 +1795,6 @@ fn home_inventory(
         &paths.iter().map(|p| local_index_key(p)).collect(),
         Some(&dirs),
     );
-    // Explicit admission permission for this synthetic multi-home seam only.
-    inv.archive_work.allowed = true;
     while inv.step_with_archive(&CodexTitleMetadata::default(), index, None)
         != codex_file_join::HeaderStep::Complete
     {}
