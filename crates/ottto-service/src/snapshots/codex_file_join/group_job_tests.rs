@@ -3306,6 +3306,7 @@ fn group_pass(
 /// job-start capture and the one settlement; both are exercised.
 #[cfg(unix)]
 fn grouped_missing_carriers_mark_each_member_until_verified(paged: bool) {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let source = SnapshotSource::Codex;
     let root = if paged {
         paged_corpus("missing-carrier")

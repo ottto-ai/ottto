@@ -1486,6 +1486,7 @@ fn refused_then_conflicted_holding(
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn durable_store_is_written_only_under_the_state_dir_lock() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("durable_store_is_written_only_under_the_state_dir_lock") {
         return;
     }
@@ -1667,6 +1668,7 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore") {
         return;
     }

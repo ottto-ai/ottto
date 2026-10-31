@@ -4981,6 +4981,7 @@ fn o3_negative_spend_crosses_full_positional_and_named_readers() {
 /// [format] o3 ambiguous negative evidence refuses through every reader.
 #[test]
 fn o3_ambiguous_negative_evidence_refuses_through_every_reader() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let release = format!(
         "upgrade_state_missing:{}",
         ottto_core::compiled_release_version()
