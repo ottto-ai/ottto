@@ -90,17 +90,41 @@ fn unique_spends<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_map(Unique)
 }
 
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Wire {
+    #[serde(deserialize_with = "unique_spends")]
+    replayed: BTreeMap<String, BTreeSet<KeyHash>>,
+    closed: bool,
+}
+
+/// V2 owns this evidence after publication, even with restart_restore OFF.
+/// Read the same wire shape through the strict mapper guard, without native
+/// v1's decode-and-drop switch policy, release filtering or damage repair.
+/// SOURCE: release names L, key digests H, closed N; reservations are transient.
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(super) struct Persisted(pub State);
+impl<'de> Deserialize<'de> for Persisted {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.replayed.values().any(|keys| keys.len() > MAX_KEYS) {
+            return Err(serde::de::Error::custom("upgrade replay key bound"));
+        }
+        Ok(Self(State {
+            replayed: wire.replayed,
+            closed: wire.closed,
+            reservations: BTreeMap::new(),
+        }))
+    }
+}
+
 impl<'de> Deserialize<'de> for State {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        #[derive(Default, Deserialize)]
-        #[serde(default)]
-        struct Wire {
-            #[serde(deserialize_with = "unique_spends")]
-            replayed: BTreeMap<String, BTreeSet<KeyHash>>,
-            closed: bool,
-        }
         // Preserve duplicate members until the typed decoder can reject them;
         // a Value would silently keep the last member and erase negative proof.
         if !restart_restore::enabled() {

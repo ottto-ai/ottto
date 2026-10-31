@@ -505,6 +505,11 @@ pub(super) fn hydrate_txn(
         "state_v2_unknown_presence_field"
     );
     macro_rules! load {
+        (o3_replay,$kind:literal) => {
+            let saved: super::super::upgrade_replay::Persisted =
+                read_field("reread_guard", $kind, tx, cx)?;
+            index.o3_replay = saved.0;
+        };
         ($field:ident,$kind:literal) => {
             index.$field = read_field(wire_slot(stringify!($field)), $kind, tx, cx)?;
         };
@@ -591,6 +596,15 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
     model: &ScanIndex,
 ) -> std::result::Result<bool, A::Error> {
     macro_rules! check {
+        (o3_replay,$kind:literal) => {
+            if field == "reread_guard" {
+                codec::check_field(
+                    map,
+                    &super::super::upgrade_replay::Persisted(Default::default()),
+                )?;
+                return Ok(true);
+            }
+        };
         ($field:ident,$kind:literal) => {
             if field == wire_slot(stringify!($field)) {
                 codec::check_field(map, &model.$field)?;

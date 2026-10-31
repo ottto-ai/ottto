@@ -138,6 +138,60 @@ fn all_groups_share_one_snapshot_and_roundtrip_real_v1_without_losing_context_or
     let expected = 1 + index.claude_usage_family_pending.len();
     assert_eq!(owners, expected);
 }
+/// [regress] M3's replay slot must hydrate with restart_restore OFF without
+/// dropping negative spends or bypassing v2's nested unknown-field refusal.
+#[test]
+fn m3_replay_evidence_survives_v2_with_either_restart_policy() {
+    use crate::snapshots::{upgrade_replay::Persisted, RestartRestoreForTest};
+    for enabled in [false, true] {
+        let _policy = if enabled {
+            RestartRestoreForTest::enabled()
+        } else {
+            RestartRestoreForTest::disabled()
+        };
+        for evidence in [
+            serde_json::json!({"replayed":{},"closed":false}),
+            serde_json::json!({"replayed":{"upgrade_state_missing:prior":["a".repeat(32)]},"closed":true}),
+        ] {
+            let (_scratch, mut db) = Scratch::store();
+            let mut index = fixture();
+            index.o3_replay = serde_json::from_value::<Persisted>(evidence.clone())
+                .unwrap()
+                .0;
+            commit_populate(&mut db, &index);
+            let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+            assert_eq!(serde_json::to_value(&restored.o3_replay).unwrap(), evidence);
+            assert_eq!(
+                codec::inventory(
+                    serde_json::to_vec(&serde_json::json!({"reread_guard":evidence}))
+                        .unwrap()
+                        .as_slice()
+                ),
+                Ok(())
+            );
+            let mut unknown = evidence;
+            unknown["future_spend"] = true.into();
+            assert_eq!(
+                codec::inventory(
+                    serde_json::to_vec(&serde_json::json!({"reread_guard":unknown}))
+                        .unwrap()
+                        .as_slice()
+                ),
+                Err(codec::Pause::Unknown)
+            );
+            let mut tx = db.begin(TxnMode::Write).unwrap();
+            tx.put(RowInput {
+                key: &RowKey::record("v1_field.reread_guard", Vec::new(), 0).unwrap(),
+                fixed: &Fixed::None,
+                value_version: 1,
+                value: &codec::Json(&unknown),
+            })
+            .unwrap();
+            assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+            assert!(hydrate(&mut db, Scratch::binding()).is_err());
+        }
+    }
+}
 /// [format] incomplete census group cannot escape as a partially hydrated graph.
 #[test]
 fn incomplete_census_group_cannot_escape_as_a_partially_hydrated_graph() {
