@@ -73,6 +73,10 @@ pub(in super::super) fn roundtrip_rows(index: &ScanIndex, path: &Path) -> ScanIn
 
 use import::Mapper;
 
+/// CCR2 of #938's persisted copy-removals fixture plus one prefix-hold debt
+/// file, with definite metadata (shared by the format and inventory tests).
+pub(super) const CCR2_DEFINITE: &str = "Q0NSMgACAAAAEhWSo6RMxEDjJVe1q0p5xwAAAAAAAAAAAQAAAAhTn1hKY1r1cpjByPzdpVwCAAAAAQAAAAAAAAACAAAAAAAAAJGPX3TzuiqIHEpSPndxZkoBAAAAAAAAAAAAAAA";
+
 /// Install synthetic custody without lifting the production conversion/R1 gate.
 /// All subsequent loads, saves and receipt replay use the real route.
 pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIndex {

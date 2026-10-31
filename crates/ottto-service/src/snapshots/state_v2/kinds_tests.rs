@@ -759,7 +759,7 @@ fn census_evidence_larger_than_the_projected_row_cap_roundtrips() {
 #[test]
 fn copy_removals_roundtrip_checked_v1_bytes_through_v2() {
     use crate::snapshots::claude_money_birth_store::location_key;
-    const DEFINITE: &str = "Q0NSMgACAAAAEhWSo6RMxEDjJVe1q0p5xwAAAAAAAAAAAQAAAAhTn1hKY1r1cpjByPzdpVwCAAAAAQAAAAAAAAACAAAAAAAAAJGPX3TzuiqIHEpSPndxZkoBAAAAAAAAAAAAAAA";
+    const DEFINITE: &str = super::super::money_test_support::CCR2_DEFINITE;
     const LOST: &str = "Q0NSMgECAAAAEhWSo6RMxEDjJVe1q0p5xwAAAAAAAAAAAQAAAAhTn1hKY1r1cpjByPzdpVwCAAAAAQAAAAAAAAACAAAAAAAAAJGPX3TzuiqIHEpSPndxZkoBAAAAAAAAAAAAAAA";
     let (copy, held) = (
         location_key("/synthetic/copy.jsonl"),

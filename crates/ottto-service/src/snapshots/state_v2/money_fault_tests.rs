@@ -252,15 +252,39 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
         "valid original must reach inventory"
     );
     // #915 has no mapper on this main: every prospective representation is
-    // refused by original inventory, while its v1 bytes stay available.
-    for (field, value) in [
-        ("claude_request_census", json!({"~lost":["synthetic-file"]})),
-        ("claude_request_census", json!({"~saturated":true})),
+    // refused by original inventory, while its v1 bytes stay available. The
+    // mapped #938 copy removals pause only when malformed; checked CCR2 passes.
+    for (field, value, expected, case) in [
+        (
+            "claude_request_census",
+            json!({"~lost":["synthetic-file"]}),
+            Err(import::Pause::UnknownClass),
+            "unmapped",
+        ),
+        (
+            "claude_request_census",
+            json!({"~saturated":true}),
+            Err(import::Pause::UnknownClass),
+            "unmapped",
+        ),
         (
             "claude_census_money_marks",
             json!({"lost":["synthetic-file"],"saturated":true}),
+            Err(import::Pause::UnknownClass),
+            "unmapped",
         ),
-        ("claude_copy_removals", json!({"synthetic-file":1})),
+        (
+            "claude_copy_removals",
+            json!({"synthetic-file":1}),
+            Err(import::Pause::UnknownClass),
+            "malformed mapped",
+        ),
+        (
+            "claude_copy_removals",
+            json!(money_test_support::CCR2_DEFINITE),
+            Ok(()),
+            "checked mapped",
+        ),
     ] {
         let mut raw = json!({"schema_version":2,"files":{}});
         raw[field] = value;
@@ -268,8 +292,8 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(
             import::ClaudeMapper.inventory_context(&path).map(|_| ()),
-            Err(import::Pause::UnknownClass),
-            "unmapped {field}"
+            expected,
+            "{case} {field}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         for suffix in [".v1-readonly", ".v2.sqlite.import", ".v2.sqlite"] {
