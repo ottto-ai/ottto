@@ -147,9 +147,4 @@ impl Drop for SideReadGuard {
         self.finish(true);
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for SideReadGuard {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; SideReadGuard);

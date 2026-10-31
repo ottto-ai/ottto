@@ -349,6 +349,91 @@ fn sticky_budget_preserves_accepted_old_bucket_and_refuses_new_when_full() {
     assert!(measured.accepted_retained > 0);
     assert_eq!(measured.item_bytes, identity::item_bytes(&second));
 }
+/// [money] [regress] #909 P0 (05f7bf85: 582 hours over 6 accounts, untagged
+/// baseline over the cap): the context curve and cache observations are shed
+/// before any money tag. Every accepted share keeps its tag; totals unchanged.
+#[test]
+fn sticky_budget_sheds_curve_and_cache_before_stripping_any_tag() {
+    let (mut item, mut proof) = sticky_session(48);
+    item.session_display_name = Some("x".into());
+    item.workspace_display_label = Some("x".into());
+    item.repository_label = Some("x".into());
+    let mut accepted = identity::AcceptedBuckets::for_test();
+    sticky_apply(&mut item, &proof, &accepted).unwrap();
+    let clean = stripped(&item);
+    let overhead = identity::item_bytes(&item) - identity::item_bytes(&clean);
+    let (mut padded, filler) =
+        sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - overhead - 1_024);
+    proof.extend(filler);
+    let mut first = padded.clone();
+    assert!(matches!(
+        sticky_apply(&mut first, &proof, &accepted).unwrap(),
+        Tagged::Sent { .. }
+    ));
+    assert_eq!(first.request_identity_refusals, 0);
+    assert!(first.request_evidence.len() >= 2, "several accounts");
+    accepted.record(&serde_json::to_value(&first).unwrap());
+    let mut expected = padded.clone();
+    sticky_apply(&mut expected, &proof, &accepted).unwrap();
+
+    padded.context_curve = Some(max_fractional_context_curve_fixture());
+    let curve_points = padded.context_curve.as_ref().unwrap().retained_point_count;
+    let upsert = crate::snapshots::cache_adapter_tests::cache_fixture_item()
+        .cache_observations
+        .unwrap()
+        .operations
+        .remove(0);
+    padded.cache_observations = Some(cache_observations::CacheObservations {
+        schema_version: 1,
+        operations: (0..cache_observations::MAX_OPERATIONS)
+            .map(|n| {
+                let mut operation = upsert.clone();
+                let cache_observations::Operation::Upsert { observation } = &mut operation else {
+                    panic!("fixture upsert");
+                };
+                observation.event_id = format!("cache:{n:064x}");
+                operation
+            })
+            .collect(),
+        coverage: "complete".into(),
+        omitted_observation_count: Some(0),
+    });
+    assert!(
+        identity::item_bytes(&padded) > identity::MAX_ITEM_BYTES,
+        "untagged baseline with display leaves is over the cap"
+    );
+    let (result, records) = crate::local_resource_diagnostics::capture(|| {
+        sticky_apply(&mut padded, &proof, &accepted).unwrap()
+    });
+    assert!(matches!(result, Tagged::Sent { .. }));
+    assert!(identity::item_bytes(&padded) <= identity::MAX_ITEM_BYTES);
+    let shed = records
+        .iter()
+        .find_map(|row| row["counts"].get("claude_request_identity_last_over_cap_components"))
+        .expect("a fitting shed is recorded");
+    let bytes = |key: &str| shed[key].as_u64().unwrap();
+    assert!(bytes("after_shed") <= identity::MAX_ITEM_BYTES as u64);
+    assert_eq!(
+        ["context_curve", "cache_observations", "identity", "usage_buckets", "rest"]
+            .map(bytes)
+            .iter()
+            .sum::<u64>(),
+        bytes("item")
+    );
+    assert!(padded.context_curve.as_ref().unwrap().retained_point_count < curve_points);
+    let cache = padded.cache_observations.take().unwrap();
+    assert_eq!(cache.coverage, "partial");
+    assert!(cache.operations.len() < cache_observations::MAX_OPERATIONS);
+    assert_eq!(cache.omitted_observation_count, None);
+    sticky_assert_reconciled(&padded);
+    // Only the display leaves changed: tags, shares, refusals and totals match.
+    padded.context_curve = None;
+    padded.snapshot_fingerprint = expected.snapshot_fingerprint.clone();
+    assert_eq!(
+        serde_json::to_value(&padded).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+}
 #[test]
 fn sticky_overflow_protects_open_hour_drops_oldest_as_differs_and_restores_only_held_proof() {
     let (mut first, proof) = sticky_session(576);

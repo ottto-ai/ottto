@@ -5,7 +5,7 @@ mod decoder_0_1_201 {
 }
 
 fn retention_fixture() -> (PathBuf, String, ScanIndex) {
-    let (dir, root, items) = claude_account_family_fixture();
+    let (dir, root, items) = claude_account_family_fixture(false);
     let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
     let mut index = d2_family_index(&dir, &root);
     apply_claude_effort_evidence_with_index(

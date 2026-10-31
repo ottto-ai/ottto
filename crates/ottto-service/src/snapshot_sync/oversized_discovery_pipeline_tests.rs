@@ -410,12 +410,15 @@ fn oversized_shed_upload_is_reoffered_at_the_original_retry_deadline() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
-    // Legacy demotion hold; E2 literals bypass it. Gate-on local holds and the
-    // same six-hour floor: oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // Legacy demotion hold; E2 literals bypass it, so only the listed held
+    // family reaches it (real list, loaded by every page after an unlisted
+    // baseline). Gate-on local holds and the same six-hour floor:
+    // oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor.
+
     let _manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("oversized-blocking-hold-floor");
     fixture.baseline();
+    fixture.list_held(&[PIPELINE_HELD_SESSION]);
     let revision = fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
     let oversized = fixture.root.join(format!("{OVERSIZED_SESSION}.jsonl"));
     std::fs::File::create(&oversized)
@@ -461,6 +464,7 @@ fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
     let (seed, starts) = walk(at);
     assert_eq!(starts.len(), 1);
     assert_eq!(seed.iter().map(|page| page.held.len()).sum::<usize>(), 1);
+    assert_listed_fold_absent(&seed, PIPELINE_HELD_SESSION);
     let held = seed
         .iter()
         .flat_map(|page| page.held.iter())
@@ -505,6 +509,7 @@ fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
         assert_eq!(starts.len(), 1, "exactly one re-walk at the floor");
         assert_eq!(starts[0]["counts"]["reason"], "terminal_unhealthy_retry");
         assert_eq!(retry.iter().map(|page| page.held.len()).sum::<usize>(), 1);
+        assert_listed_fold_absent(&retry, PIPELINE_HELD_SESSION);
         assert!(
             retry.iter().any(|page| page.held.contains(&held)),
             "the same demoted body is offered to real hold classification again"
@@ -650,9 +655,10 @@ fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
     if !c1a_layout_supported("oversized-e2-hold-floor") {
         return;
     }
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+
     let _manifests = SourceManifestTestGuard::new();
     let mut fixture = c1a_fixture("oversized-e2-hold-floor");
+    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&fixture.support, &[]);
     fixture.owned_base_preparation = true;
     fixture.local_holds.insert(REARM_ROOT.to_owned());
     let oversized = oversized_create(&fixture);
@@ -731,10 +737,13 @@ fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
 #[serial(source_manifests)]
 fn terminal_off_real_hold_renews_floor_and_three_pages_do_not_requeue_it() {
     let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("terminal-off-real-hold-renewal");
     fixture.baseline();
+    // Real demotion classification needs ordinary money: list only the held
+    // family after the unlisted baseline; every page loads the list.
+    fixture.list_held(&[PIPELINE_HELD_SESSION]);
     let revision = fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
     let cycle = PipelineCycle {
         replay_generation: "terminal-off-held-replay",
@@ -777,6 +786,7 @@ fn terminal_off_real_hold_renews_floor_and_three_pages_do_not_requeue_it() {
         1,
         "real hold classified once then parked across three pages"
     );
+    assert_listed_fold_absent(&seed, PIPELINE_HELD_SESSION);
     assert!(
         held_reads(&seed_reads) <= 1,
         "the seed's three-page hold reads the held transcript at most once: {seed_reads:?}"
