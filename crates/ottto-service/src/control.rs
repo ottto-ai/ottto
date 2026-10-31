@@ -9294,11 +9294,6 @@ fn reattach_required_state(error: &LocalApiError) -> Option<ReattachRequiredStat
     })
 }
 
-#[cfg(test)]
-fn reattach_required_message(error: &LocalApiError) -> Option<StableMessage> {
-    reattach_required_state(error).map(|state| state.message)
-}
-
 fn agent_read_timeout_message(error: &LocalApiError) -> Option<String> {
     let LocalApiError::TimedOut(reason) = error else {
         return None;
@@ -15004,14 +14999,6 @@ fn claude_code_settings_has_relay_env(body: &str) -> bool {
     claude_code_settings_relay_port(body).is_some()
 }
 
-#[cfg(test)]
-fn claude_code_settings_has_relay_env_for_base(body: &str, relay_base_url: &str) -> bool {
-    claude_code_settings_relay_port(body).is_some_and(|port| {
-        crate::otlp_relay::local_relay_base_url_for_port(port)
-            == relay_base_url.trim_end_matches('/')
-    })
-}
-
 fn claude_code_settings_relay_port(body: &str) -> Option<u16> {
     let Ok(settings) = serde_json::from_str::<serde_json::Value>(body) else {
         return None;
@@ -17511,31 +17498,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_status_read_reuses_only_fresh_annotation_of_unchanged_settings() {
-        let annotated_at = std::time::Instant::now();
-        let within = annotated_at + std::time::Duration::from_secs(29);
-        let expired = annotated_at + super::CODEX_ACCOUNTS_STATUS_READ_REUSE;
-        assert!(super::status_read_reusable(
-            &"slots-a",
-            annotated_at,
-            &"slots-a",
-            within
-        ));
-        assert!(!super::status_read_reusable(
-            &"slots-a",
-            annotated_at,
-            &"slots-b",
-            within
-        ));
-        assert!(!super::status_read_reusable(
-            &"slots-a",
-            annotated_at,
-            &"slots-a",
-            expired
-        ));
-    }
-
-    #[test]
     fn codex_prepare_target_resolves_only_daemon_authored_exact_composite() {
         let account_hash = "a".repeat(64);
         let workspace_hash = "b".repeat(64);
@@ -17613,40 +17575,6 @@ mod tests {
     }
 
     #[test]
-    fn reattach_excerpt_preserves_false_reconnect_capability() {
-        let body = serde_json::json!({
-            "detail": {
-                "code": "reattach_required",
-                "message": "Cross-account replacement requires browser approval",
-                "reason": "revoked_cross_account_predecessor",
-                "device_name": "Previous Mac",
-                "can_reconnect": false,
-            }
-        })
-        .to_string();
-        let excerpt = super::safe_backend_body_excerpt(&body).expect("reattach excerpt");
-        let error = LocalApiError::Backend(BackendErrorDetails {
-            kind: BackendErrorKind::Rejected,
-            endpoint: "https://api.ottto.net/api/v1/setup-claims/[claim]/local-client/complete"
-                .to_string(),
-            status: Some(401),
-            body_excerpt: Some(excerpt),
-            reason_code: None,
-        });
-
-        let message = reattach_required_message(&error).expect("typed reattach message");
-        assert!(
-            !reattach_required_state(&error)
-                .expect("typed reattach state")
-                .can_reconnect
-        );
-        assert!(message.text.contains("predecessor was revoked"));
-        assert!(!message
-            .text
-            .contains("Reconnect it with the saved credential"));
-    }
-
-    #[test]
     fn backend_endpoint_redacts_device_credential_preparation_id() {
         assert_eq!(
             super::safe_backend_endpoint(
@@ -17708,36 +17636,6 @@ mod tests {
         assert!(!joined.contains("top_level"));
         assert!(!joined.contains("trailing"));
         assert!(joined.contains("…redacted…"));
-    }
-
-    #[test]
-    fn codex_managed_config_preview_extracts_unfenced_otel_table() {
-        // The 0.1.9x upgrades rewrote configs without the legacy fence; the
-        // managed region is the bare otel table. Mirrors a real on-disk file.
-        let body = concat!(
-            "model = \"gpt-5.2\"\n",
-            "otel.environment = \"prod\"\n",
-            "otel.log_user_prompt = false\n",
-            "otel.exporter.\"otlp-http\" = { endpoint = \"http://127.0.0.1:44621/v1/logs\" }\n",
-            "\n",
-            "[profiles.fast]\n",
-            "model_reasoning_effort = \"low\"\n",
-        );
-        let preview = super::codex_managed_config_preview(Some(body))
-            .expect("unfenced otel table yields a preview");
-        assert_eq!(preview["path"], "~/.codex/config.toml");
-        let lines: Vec<String> = preview["lines"]
-            .as_array()
-            .expect("lines array")
-            .iter()
-            .map(|line| line.as_str().expect("line string").to_string())
-            .collect();
-        let joined = lines.join("\n");
-        assert!(joined.contains("otel.environment = \"prod\""));
-        assert!(joined.contains("http://127.0.0.1:44621/v1/logs"));
-        // Only the managed region is reported — user config never leaks.
-        assert!(!joined.contains("model = \"gpt-5.2\""));
-        assert!(!joined.contains("profiles.fast"));
     }
 
     #[test]
@@ -17978,85 +17876,6 @@ for line in sys.stdin:
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Each read refreshes the token, so the CLI rewrites `auth.json` during
-    /// a read that then fails. That rewrite is not a new sign-in: the spacing
-    /// keeps growing, and after the long-failure window automatic reads slow
-    /// to one per 15 minutes. They never stop, and a person's check still
-    /// reads at once.
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_waiting_check_spacing_survives_the_reads_own_credential_rewrite() {
-        let _guard = lock_backend_test_env();
-        let root = control_test_root("codex-check-rewrite")
-            .canonicalize()
-            .expect("canonical Codex account test root");
-        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
-        let runs = root.join("app-server-runs");
-        write_signed_out_fake_codex(&root.join("bin"), &runs, None);
-        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
-        let clock = crate::agent_status::SetupGateTestClock::frozen_at(std::time::Instant::now());
-        let operation_id = "codex_setup_0123456789abcdef0123456789abcdef";
-        let home = open_waiting_codex_setup(operation_id);
-        let auth = home.join("auth.json");
-        write_signed_out_fake_codex(&root.join("bin"), &runs, Some(&auth));
-        write_synthetic_codex_auth(&home, "{}");
-
-        // (seconds after the first read, runs expected after checks then).
-        let schedule = [
-            (0, 1),
-            (4, 1),
-            // Three short retries after the sign-in...
-            (5, 2),
-            (10, 3),
-            (15, 4),
-            // ...then the spacing doubles from 10 s.
-            (24, 4),
-            (25, 5),
-            (44, 5),
-            (45, 6),
-            (84, 6),
-            (85, 7),
-            (164, 7),
-            (165, 8),
-            (324, 8),
-            (325, 9),
-            // Still within the window: due 300 s after the last read.
-            (1799, 10),
-            // The window is over: one read per 15 minutes after the last.
-            (1800, 10),
-            (1799 + 899, 10),
-            (1799 + 900, 11),
-            (1799 + 1799, 11),
-            (1799 + 1800, 12),
-        ];
-        for (seconds, expected_runs) in schedule {
-            clock.set(seconds);
-            check_waiting_codex_setup(operation_id, 2, false);
-            assert_eq!(
-                counted_lines(&runs),
-                expected_runs,
-                "runs after the checks at {seconds} s"
-            );
-        }
-        let rewrites = fs::read_to_string(&auth)
-            .expect("credential")
-            .matches('\n')
-            .count();
-        assert_eq!(rewrites, 12, "every read rewrote the credential");
-
-        // A person's check reads at once, at most once per 5 s.
-        clock.set(1799 + 1801);
-        check_waiting_codex_setup(operation_id, 1, true);
-        assert_eq!(counted_lines(&runs), 12);
-        clock.set(1799 + 1805);
-        check_waiting_codex_setup(operation_id, 2, true);
-        assert_eq!(counted_lines(&runs), 13);
-
-        drop(clock);
-        let _ = fs::remove_dir_all(root);
-    }
-
     /// A synthetic `auth.json` whose live tokens claim `user` in `workspace`.
     /// A new `expires_at` is a new token for the same sign-in.
     #[cfg(unix)]
@@ -18084,95 +17903,6 @@ for line in sys.stdin:
             "account_id": workspace,
         })
         .to_string()
-    }
-
-    /// A reconnect keeps the home and its credential, and the person signs in
-    /// again to the same account and workspace while the old token is still
-    /// live. With a credential that names its account, the read's own token
-    /// refresh still continues the run, but a rewrite made between reads (the
-    /// new sign-in) is read at once, once, and the run keeps its spacing.
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_waiting_check_reads_a_same_account_sign_in_at_once() {
-        let _guard = lock_backend_test_env();
-        let root = control_test_root("codex-check-same-account")
-            .canonicalize()
-            .expect("canonical Codex account test root");
-        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
-        let runs = root.join("app-server-runs");
-        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
-        let clock = crate::agent_status::SetupGateTestClock::frozen_at(std::time::Instant::now());
-        let operation_id = "codex_setup_0123456789abcdef0123456789abcdef";
-        let home = open_waiting_codex_setup(operation_id);
-        let auth = home.join("auth.json");
-        write_signed_out_fake_codex(&root.join("bin"), &runs, Some(&auth));
-        let expires_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_secs() as i64
-            + 24 * 60 * 60;
-        write_synthetic_codex_auth(
-            &home,
-            &synthetic_codex_auth_with_claims("synthetic-user", "synthetic-workspace", expires_at),
-        );
-
-        // The read's own rewrite does not restart the run: the spacing grows.
-        for (seconds, expected_runs) in [
-            (0, 1),
-            (4, 1),
-            (5, 2),
-            (10, 3),
-            (15, 4),
-            (24, 4),
-            (25, 5),
-            (44, 5),
-        ] {
-            clock.set(seconds);
-            check_waiting_codex_setup(operation_id, 2, false);
-            assert_eq!(
-                counted_lines(&runs),
-                expected_runs,
-                "runs after the checks at {seconds} s"
-            );
-        }
-        assert_eq!(
-            fs::read_to_string(&auth)
-                .expect("credential")
-                .matches('\n')
-                .count(),
-            5,
-            "every read rewrote the credential"
-        );
-
-        // The person signs in again to the same account; the next due read
-        // would be at 45 s, then 85 s. The new credential is read at once,
-        // once.
-        clock.set(30);
-        write_synthetic_codex_auth(
-            &home,
-            &synthetic_codex_auth_with_claims(
-                "synthetic-user",
-                "synthetic-workspace",
-                expires_at + 60,
-            ),
-        );
-        check_waiting_codex_setup(operation_id, 2, false);
-        assert_eq!(counted_lines(&runs), 6);
-        // That read continued the run: six failures, so 40 s after it, not
-        // the short retries of a new run.
-        clock.set(35);
-        check_waiting_codex_setup(operation_id, 2, false);
-        assert_eq!(counted_lines(&runs), 6);
-        clock.set(69);
-        check_waiting_codex_setup(operation_id, 2, false);
-        assert_eq!(counted_lines(&runs), 6);
-        clock.set(70);
-        check_waiting_codex_setup(operation_id, 2, false);
-        assert_eq!(counted_lines(&runs), 7);
-
-        drop(clock);
-        let _ = fs::remove_dir_all(root);
     }
 
     /// A fake `codex` for the daemon-run sign-in. `login` follows the mode in
@@ -18634,28 +18364,6 @@ for line in sys.stdin:
         )));
     }
 
-    /// A sign-in nobody finishes is stopped at the deadline.
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_daemon_sign_in_times_out_and_ends_the_cli() {
-        let fixture = SignInFixture::new("codex-sign-in-timeout", Duration::from_secs(1));
-        fixture.set("login-mode", "wait");
-        open_waiting_codex_setup(SIGN_IN_OPERATION);
-        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
-        let ended = fixture.ended();
-        assert_eq!(
-            sign_in_outcome(&ended),
-            Some(ottto_protocol::CodexAccountSignInOutcomeV1::TimedOut)
-        );
-        assert_eq!(
-            ended.setup_operation.state,
-            CodexAccountSetupOperationStateV1::SetupStopped
-        );
-        assert!(!process_alive(fixture.login_pids()[0]));
-        assert_eq!(fixture.app_server_runs(), 0);
-    }
-
     /// `codex login` exits 0 when stopped too: without a new credential the
     /// sign-in failed, whatever the exit status. A busy sign-in port starts
     /// nothing.
@@ -18693,42 +18401,6 @@ for line in sys.stdin:
         );
         assert_eq!(fixture.login_pids().len(), 2, "no login started");
         assert_eq!(fixture.app_server_runs(), 0);
-    }
-
-    /// A failed account read after the sign-in is retried once; a second
-    /// failure ends `check_failed` after exactly two reads.
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_daemon_sign_in_retries_a_failed_account_read_once() {
-        let fixture = SignInFixture::new("codex-sign-in-retry", Duration::from_secs(60));
-        fixture.set("login-mode", "success");
-        fixture.set("failing-reads", "1 2");
-        open_waiting_codex_setup(SIGN_IN_OPERATION);
-        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
-        let ended = fixture.ended();
-        assert_eq!(
-            sign_in_outcome(&ended),
-            Some(ottto_protocol::CodexAccountSignInOutcomeV1::CheckFailed)
-        );
-        assert_eq!(
-            ended.setup_operation.state,
-            CodexAccountSetupOperationStateV1::SetupFailed
-        );
-        assert_eq!(fixture.app_server_runs(), 2);
-
-        // The retry succeeds: one failed read, then the identity read and
-        // the pinned-workspace read.
-        fixture.set("failing-reads", "3");
-        let operation = "codex_setup_8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d";
-        open_waiting_codex_setup(operation);
-        start_codex_sign_in(1, operation).expect("start sign-in");
-        let ended = fixture.ended();
-        assert_eq!(
-            sign_in_outcome(&ended),
-            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
-        );
-        assert_eq!(fixture.app_server_runs(), 5);
     }
 
     /// The pinned-workspace read fails: `workspace_not_kept`.
@@ -18932,153 +18604,6 @@ for line in sys.stdin:
         assert!(home.join("auth.json").is_file());
     }
 
-    /// A daemon restart during a reconnect never verifies the home's
-    /// credential, changed or not: the run ends `interrupted`, and the
-    /// connected home stays.
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_daemon_sign_in_restart_during_a_reconnect_interrupts() {
-        let fixture =
-            SignInFixture::new("codex-sign-in-reconnect-restart", Duration::from_secs(60));
-        let (slot_id, home, account, workspace) = fixture.connected_account(SIGN_IN_OPERATION);
-        let runs = fixture.app_server_runs();
-        let operation = "codex_setup_bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc";
-        reconnect_codex_account(1, operation.to_string(), &slot_id, account, workspace)
-            .expect("reconnect");
-        FileCodexAccountSlotSettingsStore::default()
-            .begin_sign_in(
-                1,
-                operation,
-                "2026-10-15T12:00:00Z".to_string(),
-                "2026-10-15T12:10:00Z".to_string(),
-            )
-            .expect("record run")
-            .expect("new run");
-        let auth_body = fs::read_to_string(home.join("auth.json")).expect("credential");
-        write_synthetic_codex_auth(&home, &format!("{auth_body}\n"));
-
-        crate::codex_sign_in::recover_at_startup();
-        let ended = fixture.ended();
-        assert_eq!(
-            sign_in_outcome(&ended),
-            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Interrupted)
-        );
-        assert_eq!(
-            ended.setup_operation.state,
-            CodexAccountSetupOperationStateV1::SetupStopped
-        );
-        assert_eq!(fixture.app_server_runs(), runs);
-        assert!(home.join("auth.json").exists(), "the connected home stays");
-        assert_eq!(ended.managed_slots.len(), 1);
-    }
-
-    /// A stop that comes while the run starts (here: while a quota read of
-    /// the home holds its lock) starts no `codex login`.
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_daemon_sign_in_stopped_while_starting_launches_nothing() {
-        let fixture = SignInFixture::new("codex-sign-in-stop-starting", Duration::from_secs(60));
-        fixture.set("login-mode", "wait");
-        let home = open_waiting_codex_setup(SIGN_IN_OPERATION);
-        let stopper = crate::agent_status::with_codex_home_read_lock(&home, || {
-            start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
-            let stopper = std::thread::spawn(|| {
-                stop_waiting_for_codex_account(1, SIGN_IN_OPERATION).expect("stop")
-            });
-            std::thread::sleep(Duration::from_millis(300));
-            stopper
-        });
-        let stopped = crate::codex_sign_in::present(stopper.join().expect("stopper"));
-        assert_eq!(
-            sign_in_outcome(&stopped),
-            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Cancelled)
-        );
-        assert!(fixture.login_pids().is_empty(), "no codex login started");
-        assert!(crate::codex_sign_in::wait_until_idle(Duration::from_secs(
-            5
-        )));
-    }
-
-    /// A recorded run no worker runs (its recovery failed) ends on its own
-    /// once its deadline passed; one within its deadline is left alone.
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_daemon_sign_in_without_a_worker_ends_after_its_deadline() {
-        let fixture = SignInFixture::new("codex-sign-in-stale", Duration::from_secs(60));
-        let store = FileCodexAccountSlotSettingsStore::default();
-        open_waiting_codex_setup(SIGN_IN_OPERATION);
-        store
-            .begin_sign_in(
-                1,
-                SIGN_IN_OPERATION,
-                "2999-01-01T00:00:00Z".to_string(),
-                "2999-01-01T00:10:00Z".to_string(),
-            )
-            .expect("record run")
-            .expect("new run");
-        crate::codex_sign_in::end_stale_run();
-        assert!(store.active_sign_in().expect("read").is_some());
-        stop_waiting_for_codex_account(1, SIGN_IN_OPERATION).expect("stop");
-
-        let operation = "codex_setup_cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
-        open_waiting_codex_setup(operation);
-        store
-            .begin_sign_in(
-                1,
-                operation,
-                "2020-01-01T00:00:00Z".to_string(),
-                "2020-01-01T00:10:00Z".to_string(),
-            )
-            .expect("record run")
-            .expect("new run");
-        // The daemon's own scheduler pass ends it.
-        crate::agent_status::codex_scheduled_round_now(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .as_secs(),
-        );
-        let status = fixture.ended();
-        assert_eq!(
-            sign_in_outcome(&status),
-            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Interrupted)
-        );
-        assert_eq!(
-            status.setup_operation.state,
-            CodexAccountSetupOperationStateV1::SetupStopped
-        );
-    }
-
-    /// Removing a connected account during its reconnect sign-in ends
-    /// `codex login` first.
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_daemon_sign_in_ends_when_its_account_is_removed() {
-        let fixture = SignInFixture::new("codex-sign-in-remove", Duration::from_secs(60));
-        let (slot_id, home, account, workspace) = fixture.connected_account(SIGN_IN_OPERATION);
-        let operation = "codex_setup_dededededededededededededededede";
-        reconnect_codex_account(1, operation.to_string(), &slot_id, account, workspace)
-            .expect("reconnect");
-        fixture.set("login-mode", "wait");
-        start_codex_sign_in(1, operation).expect("start sign-in");
-        fixture.waiting_for_browser();
-        let pid = *fixture.login_pids().last().expect("login pid");
-        assert!(process_alive(pid));
-
-        let removed = remove_codex_account(1, &slot_id).expect("remove");
-        assert!(!process_alive(pid), "codex login still runs");
-        assert!(removed.managed_slots.is_empty());
-        assert!(!home.exists());
-        assert!(!crate::codex_sign_in::is_running(&removed.setup_operation));
-        assert!(crate::codex_sign_in::wait_until_idle(Duration::from_secs(
-            5
-        )));
-    }
-
     /// The real `codex` is a wrapper whose child listens on the port. A
     /// stop ends both, even when they ignore SIGTERM, so the port is free.
     #[cfg(target_os = "macos")]
@@ -19170,62 +18695,6 @@ for line in sys.stdin:
         assert_eq!(summary["secret_fields_present"], false);
     }
     use crate::agent_status::PiRouteClassification;
-    use ottto_protocol::{RepairAuthority, RepairAuthorityMode};
-
-    #[test]
-    fn setup_result_threads_setup_claim_url_from_backend_detail() {
-        // The verify browser-approval flow depends on `setup_claim_url` reaching
-        // the Swift app: when the backend detail carries it, the wire result must
-        // surface it; when it does not, the field must be JSON null (never a
-        // stale/borrowed value). `setup_result_from_detail` is the single builder
-        // shared by the setup-run, setup-answer, and setup-action paths, so
-        // guarding it here guards every entry point.
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_claim_url_thread".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: DIRECT_API_BASE_URL.to_string(),
-        };
-
-        let with_claim: SetupRunDetailApiResponse = serde_json::from_value(json!({
-            "run": {
-                "id": "setup_claim_url_thread",
-                "status": "waiting_for_user",
-                "machine_id": "machine_test"
-            },
-            "sources": [],
-            "next_action": null,
-            "next_question": null,
-            "setup_claim_url": "https://ottto.net/setup/claim?code=otsc_abc123"
-        }))
-        .expect("detail with setup_claim_url decodes");
-
-        let result = setup_result_from_detail(&connection, with_claim, false, Vec::new())
-            .expect("setup result builds");
-        assert_eq!(
-            result["setup_claim_url"],
-            json!("https://ottto.net/setup/claim?code=otsc_abc123")
-        );
-        assert_eq!(result["status"], json!("waiting_for_user"));
-
-        // Absent in the backend detail -> JSON null, never omitted or stale.
-        let without_claim: SetupRunDetailApiResponse = serde_json::from_value(json!({
-            "run": {
-                "id": "setup_claim_url_thread",
-                "status": "ready",
-                "machine_id": "machine_test"
-            },
-            "sources": [],
-            "next_action": null,
-            "next_question": null
-        }))
-        .expect("detail without setup_claim_url decodes");
-
-        let result_none = setup_result_from_detail(&connection, without_claim, false, Vec::new())
-            .expect("setup result builds");
-        assert_eq!(result_none["setup_claim_url"], serde_json::Value::Null);
-    }
 
     fn subscription_oauth_route() -> PiModelRoute {
         PiModelRoute {
@@ -19250,22 +18719,6 @@ for line in sys.stdin:
         route.classification.billing_channel = Some("usage".to_string());
         route.classification.subscription_product = None;
         route
-    }
-
-    #[test]
-    fn subscription_oauth_routes_are_detected_and_others_are_not() {
-        assert!(route_is_subscription_oauth(&subscription_oauth_route()));
-        assert!(!route_is_subscription_oauth(&live_pi_route()));
-
-        let mut api_key = subscription_oauth_route();
-        api_key.classification.auth_mode = Some("api_key".to_string());
-        api_key.classification.billing_channel = Some("usage".to_string());
-        assert!(!route_is_subscription_oauth(&api_key));
-
-        let mut gateway = subscription_oauth_route();
-        gateway.classification.auth_mode = Some("oauth".to_string());
-        gateway.classification.billing_channel = Some("usage".to_string());
-        assert!(!route_is_subscription_oauth(&gateway));
     }
 
     #[test]
@@ -19310,28 +18763,6 @@ for line in sys.stdin:
         assert_eq!(aggregate.status, SourceVerificationStatus::Warning);
         assert_eq!(aggregate.message.code, PI_OAUTH_REAUTH_CODE);
         assert!(!aggregate.verified);
-    }
-
-    #[test]
-    fn pi_verified_passive_route_aggregates_to_verified() {
-        let route = subscription_oauth_route();
-        let verified = pi_route_passive_result(
-            &route,
-            SourceVerificationStatus::Verified,
-            true,
-            3,
-            None,
-            None,
-            Some("2026-06-04T00:00:00Z".to_string()),
-            None,
-            "Pi route default route verification passed from recent usage.".to_string(),
-            Some(true),
-        );
-
-        let aggregate = pi_route_aggregate_result(vec![verified]);
-
-        assert_eq!(aggregate.status, SourceVerificationStatus::Verified);
-        assert!(aggregate.verified);
     }
 
     #[test]
@@ -19403,50 +18834,6 @@ for line in sys.stdin:
         assert_eq!(
             canonical_source.blocking_reason.as_deref(),
             Some("telemetry_disabled_by_admin")
-        );
-    }
-
-    #[test]
-    fn pi_reauth_repair_plan_is_actionable_not_blocked() {
-        let plan = RepairPlan {
-            plan_id: "plan".to_string(),
-            machine_id: "otm_test".to_string(),
-            source: SourceKind::Pi,
-            dry_run: false,
-            status: RepairPlanStatus::Blocked,
-            authority: RepairAuthority {
-                mode: RepairAuthorityMode::ServerBackedSetupAction,
-                server_backed: true,
-                terminal_approval_allowed: true,
-                browser_approval_required: false,
-                setup_run_id: None,
-                message: StableMessage {
-                    code: "placeholder".to_string(),
-                    text: "placeholder".to_string(),
-                },
-            },
-            actions: Vec::new(),
-            created_at: "2026-06-04T00:00:00Z".to_string(),
-        };
-
-        let result = build_pi_reauth_repair_plan(plan);
-
-        // The old behavior was Blocked / config_repair_not_supported / no actions.
-        assert_eq!(result.status, RepairPlanStatus::Proposed);
-        assert_eq!(result.authority.message.code, "pi_provider_reauth_required");
-        assert!(
-            result
-                .actions
-                .iter()
-                .any(|action| action.action == RepairActionKind::ReauthProvider),
-            "expected an actionable provider re-auth step"
-        );
-        assert!(
-            result
-                .actions
-                .iter()
-                .any(|action| action.action == RepairActionKind::VerifyTelemetry),
-            "expected a follow-up re-verify step"
         );
     }
 
@@ -19850,63 +19237,6 @@ for line in sys.stdin:
             pending_store.load().expect("original binding retained"),
             Some(pending)
         );
-    }
-
-    #[test]
-    #[serial]
-    fn new_claim_discards_abandoned_unauthorized_account_switch_preparation() {
-        let support_root = telemetry_key_store_root("credential-abandoned-switch");
-        let secret_root = telemetry_key_store_root("credential-abandoned-switch-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let candidate = format!("candidate-{}", "value".repeat(4));
-        let setup_run_token = format!("setup-{}", "abandoned".repeat(3));
-        let mut pending = test_pending_device_credential("preparation-abandoned", false);
-        pending.claim_commit = Some(PendingClaimCredentialCommit {
-            account: connected_account(),
-            connection: LocalConnectionBinding {
-                setup_run_id: "setup-abandoned".to_string(),
-                setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
-                machine_id: Some("machine-one".to_string()),
-                claim_code: Some("claim-abandoned".to_string()),
-                api_base_url: DEFAULT_API_BASE_URL.to_string(),
-            },
-            target_user_id: "user_test".to_string(),
-            setup_run_token_sha256: secret_sha256(&setup_run_token),
-            backfill_policy: None,
-            backfill_cutoff_at: None,
-        });
-        stage_pending_device_credential(&pending, &candidate).expect("stage abandoned candidate");
-        stage_pending_setup_run_token(&pending, &setup_run_token)
-            .expect("stage abandoned setup token");
-
-        discard_abandoned_unconfirmed_claim_credential().expect("discard abandoned claim");
-
-        assert!(FilePendingDeviceCredentialStore::default()
-            .load()
-            .expect("load cleared journal")
-            .is_none());
-        assert!(matches!(
-            KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT).load(),
-            Err(TokenStoreError::Missing)
-        ));
-        assert!(matches!(
-            KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT).load(),
-            Err(TokenStoreError::Missing)
-        ));
-
-        let replacement = test_pending_device_credential("preparation-replacement", false);
-        stage_pending_device_credential(&replacement, &candidate)
-            .expect("new claim can stage a distinct preparation");
-        clear_pending_device_credential(
-            &FilePendingDeviceCredentialStore::default(),
-            &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
-        )
-        .expect("clear replacement");
-        let _ = fs::remove_dir_all(support_root);
-        let _ = fs::remove_dir_all(secret_root);
     }
 
     #[test]
@@ -20394,149 +19724,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn startup_recovery_rejects_a_confirmed_journal_with_a_mismatched_secret() {
-        use ottto_core::token_store::FileControlTokenStore;
-
-        let support_root = telemetry_key_store_root("credential-recovery-secret-binding");
-        let secret_root = telemetry_key_store_root("credential-recovery-secret-binding-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let (mut pending, _) = seed_pending_recovery_fixture(
-            unused_loopback_base_url(),
-            true,
-            "2099-01-01T00:00:00Z",
-            &secret_root,
-        );
-        pending.confirmed_at = Some("2026-07-31T20:00:00Z".to_string());
-        FilePendingDeviceCredentialStore::default()
-            .save(&pending)
-            .expect("save confirmed journal");
-        FileControlTokenStore::new(secret_root.join(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT))
-            .save(&format!("candidate-{}", "replaced".repeat(4)))
-            .expect("replace pending candidate");
-
-        assert_eq!(
-            recover_pending_device_credential_at_startup(),
-            Err(LocalApiError::StatePoisoned)
-        );
-        assert_eq!(
-            FilePendingDeviceCredentialStore::default()
-                .load()
-                .expect("journal retained"),
-            Some(pending)
-        );
-        assert!(FileDeviceStore::default()
-            .load()
-            .expect("device remains absent")
-            .is_none());
-    }
-
-    #[test]
-    #[serial]
-    fn pending_status_preserves_exact_request_authority_and_candidate() {
-        let support_root = telemetry_key_store_root("credential-status-authority-binding");
-        let secret_root = telemetry_key_store_root("credential-status-authority-binding-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind status backend");
-        let address = listener.local_addr().expect("status backend address");
-        let (mut pending, candidate) = seed_pending_recovery_fixture(
-            format!("http://{address}"),
-            false,
-            "2099-01-01T00:00:00Z",
-            &secret_root,
-        );
-        pending.request_authority = Some(test_setup_claim_request_authority("prior-status-proof"));
-        FilePendingDeviceCredentialStore::default()
-            .save(&pending)
-            .expect("save authority-bound status journal");
-        let pending_for_server = pending.clone();
-        let server = thread::spawn(move || {
-            let (mut status, _) = listener.accept().expect("accept pending status");
-            let request = read_complete_http_request(&mut status);
-            assert!(request.contains(&format!(
-                "{DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER}: {candidate}"
-            )));
-            let body = json!({
-                "preparation_id": pending_for_server.preparation_id,
-                "status": "pending",
-                "expires_at": pending_for_server.expires_at,
-                "credential_generation": pending_for_server.credential_generation,
-                "device": {
-                    "id": pending_for_server.device.device_id,
-                    "machine_id": pending_for_server.device.machine_id,
-                    "sources": pending_for_server.device.sources,
-                }
-            });
-            write_json_response(&mut status, 200, "OK", &body.to_string());
-        });
-
-        assert_eq!(recover_pending_device_credential_at_startup(), Ok(false));
-        server.join().expect("status server");
-        assert_eq!(
-            FilePendingDeviceCredentialStore::default()
-                .load()
-                .expect("pending journal"),
-            Some(pending)
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn pruned_credential_probe_shares_snapshot_backoff_without_treating_a_hold_as_inactive() {
-        let support_root = telemetry_key_store_root("credential-pruned-shared-gate");
-        let secret_root = telemetry_key_store_root("credential-pruned-shared-gate-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind relay backend");
-        let api_base_url = format!("http://{}", listener.local_addr().unwrap());
-        let (pending, candidate) = seed_pending_recovery_fixture(
-            api_base_url.clone(),
-            false,
-            "2020-01-01T00:00:00Z",
-            &secret_root,
-        );
-        let server_listener = listener.try_clone().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = server_listener
-                .accept()
-                .expect("accept snapshot token request");
-            let request = read_complete_http_request(&mut stream);
-            assert!(request.contains("/relay-token"));
-            write_json_response(&mut stream, 401, "Unauthorized", r#"{"detail":"invalid"}"#);
-            stream
-        });
-        let client = crate::snapshot_client::SnapshotApiClient::new(&api_base_url);
-        assert!(client
-            .issue_relay_token(
-                &pending.device,
-                &candidate,
-                crate::snapshots::SnapshotSource::Codex
-            )
-            .is_err());
-        let _connection = server.join().expect("relay backend");
-        assert!(matches!(
-            probe_pruned_device_credential_authority(&pending, &candidate),
-            Err(LocalApiError::Backend(details)) if details.status == Some(401)
-        ));
-        listener.set_nonblocking(true).unwrap();
-        assert!(
-            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-        );
-        assert_eq!(
-            FilePendingDeviceCredentialStore::default().load().unwrap(),
-            Some(pending)
-        );
-    }
-
-    #[test]
-    #[serial]
     fn confirmed_pruned_preparation_recovers_via_normal_device_auth() {
         let support_root = telemetry_key_store_root("credential-pruned-confirmed");
         let secret_root = telemetry_key_store_root("credential-pruned-confirmed-secret");
@@ -20608,154 +19795,6 @@ for line in sys.stdin:
             .is_none());
     }
 
-    #[test]
-    #[serial]
-    fn expired_pruned_preparation_preserves_candidate_after_forbidden_probe() {
-        let support_root = telemetry_key_store_root("credential-pruned-forbidden");
-        let secret_root = telemetry_key_store_root("credential-pruned-forbidden-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
-        let address = listener.local_addr().expect("recovery backend address");
-        let (pending, candidate) = seed_pending_recovery_fixture(
-            format!("http://{address}"),
-            false,
-            "2020-01-01T00:00:00Z",
-            &secret_root,
-        );
-        let server = thread::spawn(move || {
-            let (mut status, _) = listener.accept().expect("accept pruned status");
-            let _ = read_complete_http_request(&mut status);
-            write_json_response(&mut status, 404, "Not Found", r#"{"detail":"pruned"}"#);
-            let (mut probe, _) = listener.accept().expect("accept forbidden relay probe");
-            let _ = read_complete_http_request(&mut probe);
-            write_json_response(&mut probe, 403, "Forbidden", r#"{"detail":"policy"}"#);
-        });
-
-        assert!(matches!(
-            recover_pending_device_credential_at_startup(),
-            Err(LocalApiError::Backend(details)) if details.status == Some(403)
-        ));
-        server.join().expect("recovery server");
-        assert_eq!(
-            FilePendingDeviceCredentialStore::default()
-                .load()
-                .expect("load pending"),
-            Some(pending)
-        );
-        assert_eq!(
-            KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT)
-                .load()
-                .expect("load pending candidate"),
-            candidate
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn superseded_preparation_status_clears_the_unauthorized_waiter() {
-        let support_root = telemetry_key_store_root("credential-superseded");
-        let secret_root = telemetry_key_store_root("credential-superseded-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
-        let address = listener.local_addr().expect("recovery backend address");
-        let (pending, _) = seed_pending_recovery_fixture(
-            format!("http://{address}"),
-            false,
-            "2099-01-01T00:00:00Z",
-            &secret_root,
-        );
-        thread::spawn(move || {
-            let (mut status, _) = listener.accept().expect("accept superseded status");
-            let _ = read_complete_http_request(&mut status);
-            let body = json!({
-                "preparation_id": pending.preparation_id,
-                "status": "superseded",
-                "expires_at": pending.expires_at,
-                "credential_generation": pending.credential_generation,
-                "device": {
-                    "id": pending.device.device_id,
-                    "machine_id": pending.device.machine_id,
-                    "sources": pending.device.sources,
-                }
-            });
-            write_json_response(&mut status, 200, "OK", &body.to_string());
-        });
-
-        assert_eq!(recover_pending_device_credential_at_startup(), Ok(false));
-        assert!(FilePendingDeviceCredentialStore::default()
-            .load()
-            .expect("load pending")
-            .is_none());
-    }
-
-    #[test]
-    #[serial]
-    fn offline_past_retention_keeps_pending_candidate() {
-        let support_root = telemetry_key_store_root("credential-offline-retained");
-        let secret_root = telemetry_key_store_root("credential-offline-retained-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let pending = seed_pending_recovery_fixture(
-            unused_loopback_base_url(),
-            false,
-            "2020-01-01T00:00:00Z",
-            &secret_root,
-        )
-        .0;
-
-        assert!(recover_pending_device_credential_at_startup().is_err());
-        assert_eq!(
-            FilePendingDeviceCredentialStore::default()
-                .load()
-                .expect("load pending"),
-            Some(pending)
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn confirm_server_failure_keeps_authorized_pending_candidate() {
-        let support_root = telemetry_key_store_root("credential-confirm-uncertain");
-        let secret_root = telemetry_key_store_root("credential-confirm-uncertain-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
-        let address = listener.local_addr().expect("recovery backend address");
-        let pending = seed_pending_recovery_fixture(
-            format!("http://{address}"),
-            true,
-            "2099-01-01T00:00:00Z",
-            &secret_root,
-        )
-        .0;
-        thread::spawn(move || {
-            let (mut confirm, _) = listener.accept().expect("accept uncertain confirm");
-            let _ = read_complete_http_request(&mut confirm);
-            write_json_response(&mut confirm, 503, "Unavailable", r#"{"detail":"retry"}"#);
-        });
-
-        assert!(recover_pending_device_credential_at_startup().is_err());
-        assert_eq!(
-            FilePendingDeviceCredentialStore::default()
-                .load()
-                .expect("load pending"),
-            Some(pending)
-        );
-        assert!(
-            crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
-        );
-    }
-
     fn seed_active_default_cloud_session_grant() -> crate::cloud_sessions::CloudSessionGrantStore {
         let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
         let device_id = "00000000-0000-4000-8000-000000000001";
@@ -20792,48 +19831,6 @@ for line in sys.stdin:
         grants
             .apply_backend_revocation(&revoked, device_id)
             .expect("confirm cleanup revocation");
-    }
-
-    #[test]
-    #[serial]
-    fn restart_guard_failure_never_confirms_authorized_preparation() {
-        let support_root = telemetry_key_store_root("credential-restart-guard-blocked");
-        let secret_root = telemetry_key_store_root("credential-restart-guard-blocked-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind guarded backend");
-        let address = listener.local_addr().expect("guarded backend address");
-        let (mut pending, _) = seed_pending_recovery_fixture(
-            format!("http://{address}"),
-            true,
-            "2099-01-01T00:00:00Z",
-            &secret_root,
-        );
-        pending.preconfirm_guards_passed = false;
-        FilePendingDeviceCredentialStore::default()
-            .save(&pending)
-            .expect("save unguarded pending");
-        let _grants = seed_active_default_cloud_session_grant();
-
-        assert_eq!(
-            recover_pending_device_credential_at_startup(),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        );
-        listener
-            .set_nonblocking(true)
-            .expect("make guarded listener nonblocking");
-        assert!(matches!(
-            listener.accept(),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-        ));
-        assert_eq!(
-            FilePendingDeviceCredentialStore::default()
-                .load()
-                .expect("load guarded pending"),
-            Some(pending)
-        );
     }
 
     #[test]
@@ -21114,42 +20111,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    #[serial]
-    fn explicit_doctor_retries_unchanged_credentials_but_status_and_untrusted_requests_do_not() {
-        let device = LocalDeviceBinding {
-            device_id: "doctor-retry-fixture".into(),
-            machine_id: None,
-            sources: vec!["codex".into()],
-        };
-        let base = "http://127.0.0.1:1/doctor-retry-fixture";
-        let mut rejected = crate::relay_auth::Probe::begin(base, &device, "same", "codex").unwrap();
-        rejected.reject(401);
-        for (retry, token, ok) in [
-            (false, "token", true),
-            (true, "wrong", false),
-            (true, "token", true),
-        ] {
-            let response = handle_request(
-                &daemon(),
-                LocalControlRequest {
-                    request_id: "doctor-reset".into(),
-                    protocol_version: PROTOCOL_VERSION,
-                    token: Some(token.into()),
-                    client_kind: Some(LocalClientKind::Cli),
-                    client_install_owner: None,
-                    command: LocalControlCommand::Status {
-                        refresh_agent_status: false,
-                        retry_relay_authorization: retry,
-                    },
-                },
-            );
-            assert_eq!(response.ok, ok);
-            let admitted = crate::relay_auth::Probe::begin(base, &device, "same", "codex");
-            assert_eq!(admitted.is_ok(), retry && ok);
-        }
-    }
-
-    #[test]
     fn handles_authenticated_status_request() {
         let response = handle_request(
             &daemon(),
@@ -21172,58 +20133,6 @@ for line in sys.stdin:
             response.payload.expect("payload").get("daemon"),
             Some(&serde_json::Value::String("running".to_string()))
         );
-    }
-
-    #[test]
-    fn status_and_account_commands_answer_with_effective_reconnect_after_auth_rejection() {
-        let daemon = daemon().with_account(connected_account());
-        let saved = daemon.account_for_trusted_client().expect("saved account");
-        daemon
-            .record_local_health_upload_failed(crate::LocalHealthUploadFailureKind::AuthRejected)
-            .expect("record upload failure");
-        let request = |command| LocalControlRequest {
-            request_id: "req_test".to_string(),
-            protocol_version: PROTOCOL_VERSION,
-            token: Some("token".to_string()),
-            client_kind: Some(LocalClientKind::Cli),
-            client_install_owner: None,
-            command,
-        };
-
-        for command in [
-            LocalControlCommand::Status {
-                refresh_agent_status: false,
-                retry_relay_authorization: false,
-            },
-            LocalControlCommand::AuthStatus,
-        ] {
-            let response = handle_request(&daemon, request(command));
-            assert!(response.ok, "{response:?}");
-            let payload = response.payload.expect("payload");
-            assert_eq!(payload["account"]["state"], "error");
-            assert_eq!(payload["account"]["message"]["code"], "reconnect_required");
-            assert_eq!(
-                payload["account"]["user"]["id"],
-                serde_json::json!(saved.user.as_ref().unwrap().id)
-            );
-            assert_eq!(
-                payload["canonical_health"]["account"]["state"],
-                "reconnect_required"
-            );
-        }
-
-        let response = handle_request(&daemon, request(LocalControlCommand::Account));
-        assert!(response.ok, "{response:?}");
-        let payload = response.payload.expect("payload");
-        assert_eq!(payload["state"], "error");
-        assert_eq!(payload["message"]["code"], "reconnect_required");
-        assert_eq!(
-            payload["user"]["id"],
-            serde_json::json!(saved.user.as_ref().unwrap().id)
-        );
-
-        // The saved binding is untouched.
-        assert_eq!(daemon.account_for_trusted_client().expect("account"), saved);
     }
 
     #[test]
@@ -21919,106 +20828,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn active_v23_target_replay_bypasses_worker_operation_lock_without_writes() {
-        let root = control_test_root("claude-browser-target-active-replay-lock");
-        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
-        let account = "a".repeat(64);
-        let organization = "b".repeat(64);
-        crate::agent_status::persist_one_claude_slot_collection_state(
-            "default",
-            &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-                state: ClaudeConfigSlotCollectionStateV1::Fresh,
-                account_identifier_hash: Some(account),
-                organization_identifier_hash: Some(organization),
-                observed_at: Some("2026-08-31T00:00:00Z".to_string()),
-                has_account_windows: true,
-                has_scoped_limits: true,
-                ..Default::default()
-            },
-        )
-        .expect("default identity");
-        let target_id = load_claude_config_slot_settings()
-            .expect("discover target")
-            .anchor_coverage
-            .accounts
-            .into_iter()
-            .find(|candidate| {
-                candidate.durability == ottto_protocol::ClaudeAccountAnchorDurabilityV1::DefaultOnly
-            })
-            .and_then(|candidate| candidate.target_id)
-            .expect("target");
-        let operation_id = "claude_setup_50505050505050505050505050505050";
-        let prepared = prepare_claude_account_target_mode(
-            1,
-            operation_id.to_string(),
-            target_id.clone(),
-            true,
-        )
-        .expect("sealed target");
-        let slot_id = prepared.setup_operation.slot_id.clone().expect("slot");
-        let config_dir = prepared
-            .managed_slots
-            .iter()
-            .find(|slot| slot.slot_id == slot_id)
-            .and_then(|slot| slot.config_dir.clone())
-            .expect("target root");
-        let state_path = root.join("claude-browser-auth-state.json");
-        let mut state: serde_json::Value =
-            serde_json::from_slice(&fs::read(&state_path).expect("sidecar state"))
-                .expect("sidecar json");
-        state["operations"][0]["phase"] = serde_json::json!("waiting_for_provider");
-        state["operations"][0]["slot_id"] = serde_json::json!(slot_id.clone());
-        state["operations"][0]["config_dir"] = serde_json::json!(config_dir);
-        state["operations"][0]["ceremony_baseline"] = serde_json::json!("baseline");
-        fs::write(
-            &state_path,
-            serde_json::to_vec_pretty(&state).expect("sidecar body"),
-        )
-        .expect("active sidecar");
-        let core_path = root.join(ottto_core::CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME);
-        let core_before = fs::read(&core_path).expect("core before replay");
-        let sidecar_before = fs::read(&state_path).expect("sidecar before replay");
-        let worker_lock = crate::claude_browser_auth::registry_mutation_guard(operation_id)
-            .expect("worker operation lock");
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let replay_operation_id = operation_id.to_string();
-        let replay_target_id = target_id.clone();
-        let replay = thread::spawn(move || {
-            let result = start_claude_browser_login(1, replay_operation_id, Some(replay_target_id));
-            result_tx.send(result).expect("send replay");
-        });
-        let replayed = result_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("active replay must not wait for the worker lock")
-            .expect("active replay");
-        assert_eq!(
-            replayed.setup_operation.slot_id.as_deref(),
-            Some(slot_id.as_str())
-        );
-        assert_eq!(
-            replayed
-                .setup_operation
-                .browser_auth
-                .as_ref()
-                .map(|browser| browser.phase),
-            Some(ottto_protocol::ClaudeBrowserAuthPhaseV1::WaitingForProvider)
-        );
-        assert_eq!(
-            fs::read(&core_path).expect("core after replay"),
-            core_before
-        );
-        assert_eq!(
-            fs::read(&state_path).expect("sidecar after replay"),
-            sidecar_before
-        );
-        drop(worker_lock);
-        replay.join().expect("replay thread");
-        crate::claude_browser_auth::release_ceremony(operation_id);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
     fn claude_account_check_orchestrates_full_partial_pause_and_rotation_without_fanout() {
         let root = control_test_root("claude-account-check-orchestration");
         let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
@@ -22540,55 +21349,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    #[serial]
-    fn claude_account_stop_before_validating_prevents_the_probe() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let root = control_test_root("claude-account-stop-before-validating");
-        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
-        let operation_id = "claude_setup_88888888888888888888888888888888";
-        let account_hash = "8".repeat(64);
-        let store = FileClaudeConfigSlotSettingsStore::default();
-        store
-            .prepare_managed_account(1, operation_id.to_string(), Some(account_hash.clone()))
-            .expect("prepare");
-        let probes = Arc::new(AtomicUsize::new(0));
-        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let thread_probes = Arc::clone(&probes);
-        let check = thread::spawn(move || {
-            check_claude_account_with_hooks(
-                1,
-                operation_id,
-                Some(&account_hash),
-                || {
-                    claimed_tx.send(()).expect("claimed");
-                    release_rx.recv().expect("release");
-                },
-                |_, _, _| {
-                    thread_probes.fetch_add(1, Ordering::SeqCst);
-                    unreachable!("stop won before Validating; collector must not run")
-                },
-            )
-        });
-        claimed_rx.recv().expect("check claimed operation guard");
-        let stopped = store
-            .stop_waiting(1, operation_id)
-            .expect("stop before CAS");
-        assert_eq!(
-            stopped.setup_operation.state,
-            ClaudeAccountSetupOperationState::SetupStopped
-        );
-        release_tx.send(()).expect("release check");
-        let result = check.join().expect("join check").expect("check result");
-        assert_eq!(
-            result.setup_operation.state,
-            ClaudeAccountSetupOperationState::SetupStopped
-        );
-        assert_eq!(probes.load(Ordering::SeqCst), 0);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn browser_claim_commands_accept_cli_token_authorization_boundary() {
         for command in [
             LocalControlCommand::AuthStart,
@@ -22669,26 +21429,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn setup_claim_completion_parses_without_backfill_policy_fields() {
-        // Old backend: the additive fields are absent and default to None,
-        // which downstream means today's full-backfill behavior.
-        let completed: SetupClaimCompleteResponse = serde_json::from_value(serde_json::json!({
-            "setup_run_id": "setup_1",
-            "setup_run_token": "otsr_test",
-            "setup_run_token_expires_at": "2026-07-06T11:00:00Z",
-            "machine_id": "machine_test",
-            "relay_device": null,
-            "relay_device_secret": null,
-            "connected_at": "2026-07-06T10:00:00Z",
-            "user": {"id": "user_1", "email": "ron@example.com", "display_name": null},
-            "organization": {"id": "org_1", "name": "Org"}
-        }))
-        .expect("old-backend completion parses");
-        assert_eq!(completed.backfill_policy, None);
-        assert_eq!(completed.backfill_cutoff_at, None);
-    }
-
-    #[test]
     fn setup_claim_completion_parses_backfill_policy_fields() {
         let completed: SetupClaimCompleteResponse = serde_json::from_value(serde_json::json!({
             "setup_run_id": "setup_1",
@@ -22709,28 +21449,6 @@ for line in sys.stdin:
             completed.backfill_cutoff_at.as_deref(),
             Some("2026-07-06T10:00:00Z")
         );
-    }
-
-    #[test]
-    fn auth_switch_account_without_staged_switch_is_invalid_request() {
-        let response = handle_request(
-            &daemon().with_account(connected_account()),
-            LocalControlRequest {
-                request_id: "req_switch_unstaged".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::AuthSwitchAccount {
-                    claim_code: "claim_never_staged".to_string(),
-                },
-            },
-        );
-
-        assert!(!response.ok);
-        let error = response.error.expect("error");
-        assert_eq!(error.code, CliErrorCode::InvalidRequest);
-        assert!(error.message.contains("staged account switch"));
     }
 
     #[test]
@@ -22766,49 +21484,6 @@ for line in sys.stdin:
             error.details.get("claim_code"),
             Some(&RedactedValue::String("claim_123".to_string()))
         );
-    }
-
-    #[test]
-    fn auth_claim_expiry_check_handles_past_future_and_garbage() {
-        assert!(auth_claim_is_expired("2000-01-01T00:00:00Z"));
-        assert!(!auth_claim_is_expired("2100-01-01T00:00:00Z"));
-        assert!(auth_claim_is_expired("not-a-timestamp"));
-        assert!(auth_claim_is_expired(""));
-    }
-
-    #[test]
-    #[serial]
-    fn auth_start_clears_backoff_after_starting_a_claim_but_not_after_backend_failure() {
-        let env = history_choice_test_env();
-        let secret_root = env.root.join("secrets");
-        fs::create_dir_all(&secret_root).unwrap();
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let (base, server) = scripted_json_backend(vec![(503, "{}"), (200, RECEIPT_CLAIM_SUCCESS)]);
-        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &base);
-        let daemon = daemon();
-        let authorization = RequestAuthorization::Token("token".to_string());
-        let device = LocalDeviceBinding {
-            device_id: "started-claim-retry-fixture".into(),
-            machine_id: None,
-            sources: vec!["codex".into()],
-        };
-        let mut rejected =
-            crate::relay_auth::Probe::begin(&base, &device, "same", "codex").unwrap();
-        rejected.reject(401);
-
-        assert!(matches!(
-            auth_start(&daemon, &authorization),
-            Err(LocalApiError::Backend(details)) if details.status == Some(503)
-        ));
-        assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
-        assert!(crate::relay_auth::Probe::begin(&base, &device, "same", "codex").is_err());
-
-        let response = auth_start(&daemon, &authorization).expect("start a new claim");
-        assert_eq!(response.account.state, LocalAccountState::ClaimPending);
-        assert_eq!(response.claim_code, "claim");
-        assert!(daemon.pending_auth_claim_snapshot().unwrap().is_some());
-        assert!(crate::relay_auth::Probe::begin(&base, &device, "same", "codex").is_ok());
-        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     #[test]
@@ -22996,62 +21671,6 @@ for line in sys.stdin:
         );
     }
 
-    #[test]
-    #[serial]
-    fn auth_rejected_upload_lets_sign_in_reconnect_the_connected_mac() {
-        let _guard = lock_backend_test_env();
-        let root = control_test_root("auth-rejected-sign-in");
-        let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
-        let daemon = daemon()
-            .with_account(connected_account())
-            .with_connection(Some(LocalConnectionBinding {
-                setup_run_id: "setup_current".to_string(),
-                setup_run_token_expires_at: "2100-01-01T00:00:00Z".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                claim_code: None,
-                api_base_url: "https://api.ottto.net".to_string(),
-            }));
-        let authorization = RequestAuthorization::Token("token".to_string());
-        daemon
-            .begin_auth_with_claim(crate::PendingAuthClaim {
-                claim_code: "claim_reconnect".to_string(),
-                claim_token: "token_reconnect".to_string(),
-                nonce: "nonce_reconnect".to_string(),
-                claim_url: "https://ottto.net/setup/claim?code=claim_reconnect".to_string(),
-                expires_at: "2100-01-01T00:00:00Z".to_string(),
-            })
-            .expect("begin claim");
-
-        // A bound user with a connection still reads as connected, so the
-        // connected-account gate is reached and refuses while Ottto has said
-        // nothing terminal.
-        let error = auth_start(&daemon, &authorization)
-            .expect_err("healthy connected Mac refuses a new claim");
-        assert!(matches!(
-            error,
-            LocalApiError::InvalidRequest(message) if message.contains("already connected")
-        ));
-
-        // Ottto rejects the relay credentials: the answer says reconnect, and
-        // the sign-in it points to is admitted over the bound account.
-        daemon
-            .record_local_health_upload_failed(crate::LocalHealthUploadFailureKind::AuthRejected)
-            .expect("record upload failure");
-        let response = auth_start(&daemon, &authorization).expect("reconnect claim is allowed");
-        assert_eq!(response.claim_code, "claim_reconnect");
-        assert_eq!(
-            response.account.user.as_ref().map(|user| user.id.as_str()),
-            connected_account()
-                .user
-                .as_ref()
-                .map(|user| user.id.as_str()),
-            "the reconnect claim keeps the bound user"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
     /// A connected Mac with a device credential and a setup run bound to
     /// `api_base_url`, inside hermetic support/secret directories.
     fn connected_binding_fixture(
@@ -23206,100 +21825,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    #[serial]
-    fn setup_terminal_refresh_reset_leaves_a_setup_run_attached_meanwhile() {
-        let _lock = lock_backend_test_env();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind gated backend");
-        let api_base_url = format!("http://{}", listener.local_addr().expect("backend address"));
-        let (request_seen_tx, request_seen) = mpsc::channel();
-        let (allow_response, allow_response_rx) = mpsc::channel::<()>();
-        let (response_sent_tx, response_sent) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept refresh");
-            let request = read_complete_http_request(&mut stream);
-            request_seen_tx.send(()).unwrap();
-            allow_response_rx.recv().unwrap();
-            write_json_response(
-                &mut stream,
-                401,
-                "Unauthorized",
-                r#"{"detail":"Setup run expired"}"#,
-            );
-            response_sent_tx.send(()).unwrap();
-            request
-        });
-        let (root, _guards, daemon, device) =
-            connected_binding_fixture("connected-setup-reattach-race", api_base_url.clone());
-        let authorization = RequestAuthorization::Token("token".to_string());
-        let reattached = LocalConnectionBinding {
-            setup_run_id: "run_reattached".to_string(),
-            setup_run_token_expires_at: "2100-01-01T00:00:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: Some("claim_reattached".to_string()),
-            api_base_url,
-        };
-
-        thread::scope(|scope| {
-            let login =
-                scope.spawn(|| setup_run(&daemon, &authorization, Vec::new(), None, None, None));
-            request_seen
-                .recv_timeout(Duration::from_secs(5))
-                .expect("login refreshes the bound run");
-            // Ottto answers that the old run ended. Before the login's reset
-            // runs, run B is attached the way the claim path does it: under
-            // the lifecycle lock, token, connection file, then daemon state.
-            let lifecycle_lock = lock_setup_run_binding();
-            allow_response.send(()).unwrap();
-            response_sent
-                .recv_timeout(Duration::from_secs(5))
-                .expect("terminal refresh answer sent");
-            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-                .save("otsr_reattached")
-                .unwrap();
-            FileConnectionStore::default().save(&reattached).unwrap();
-            daemon
-                .bind_setup_run_for_authorized_client(reattached.clone())
-                .unwrap();
-            drop(lifecycle_lock);
-            let error = login.join().unwrap().expect_err("the old run ended");
-            assert_eq!(cli_error(error).code, CliErrorCode::NeedsUserAction);
-        });
-        assert!(server
-            .join()
-            .expect("gated backend")
-            .starts_with("POST /api/v1/setup-runs/run_connected_setup/local-client/refresh"));
-
-        // Nothing of run B was cleared.
-        assert_eq!(
-            FileConnectionStore::default().load().unwrap(),
-            Some(reattached.clone())
-        );
-        assert_eq!(
-            daemon.connection_for_authorized_client().unwrap(),
-            Some(reattached)
-        );
-        assert_eq!(
-            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-                .load()
-                .unwrap(),
-            "otsr_reattached"
-        );
-        assert_eq!(
-            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-                .load()
-                .unwrap(),
-            "connected-secret"
-        );
-        assert_eq!(FileDeviceStore::default().load().unwrap(), Some(device));
-        assert_eq!(
-            daemon.status("token").unwrap().account.state,
-            LocalAccountState::Connected
-        );
-        assert_eq!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn account_gone_detection_matches_terminal_backend_failures() {
         let gone_404 = LocalApiError::Backend(BackendErrorDetails {
             kind: BackendErrorKind::Rejected,
@@ -23342,33 +21867,6 @@ for line in sys.stdin:
         assert!(!backend_error_indicates_account_gone(
             &LocalApiError::NetworkUnavailable
         ));
-    }
-
-    #[test]
-    #[serial]
-    fn logout_without_cloud_connection_points_to_local_only_escape_hatch() {
-        let support_root = telemetry_key_store_root("logout-missing-connection");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let response = handle_request(
-            &daemon().with_account(connected_account()),
-            LocalControlRequest {
-                request_id: "req_logout_missing_connection".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::AuthReset {
-                    local_only: false,
-                    forget_installation: false,
-                },
-            },
-        );
-
-        assert!(!response.ok);
-        let error = response.error.expect("error");
-        assert_eq!(error.code, CliErrorCode::InvalidRequest);
-        assert!(error.message.contains("--local-only"));
     }
 
     #[test]
@@ -23760,49 +22258,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn claim_completion_without_relay_device_credentials_does_not_request_sync() {
-        let support_root = telemetry_key_store_root("claim-complete-no-relay-device");
-        let secret_root = telemetry_key_store_root("claim-complete-no-relay-device-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-
-        let credentials = relay_device_credentials_from_claim_completion(
-            &SetupClaimCompleteResponse {
-                setup_run_id: "setup_claim".to_string(),
-                setup_run_token: "otsr_claim".to_string(),
-                setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-                machine_id: Some("machine_claim".to_string()),
-                relay_device: None,
-                relay_device_secret: None,
-                relay_device_credential_preparation: None,
-                connected_at: "2026-05-05T09:20:00Z".to_string(),
-                user: SetupClaimCompleteUser {
-                    id: "user_claim".to_string(),
-                    email: "claim@example.com".to_string(),
-                    display_name: None,
-                },
-                organization: SetupClaimCompleteOrganization {
-                    id: "org_claim".to_string(),
-                    name: "Claim Org".to_string(),
-                },
-                backfill_policy: None,
-                backfill_cutoff_at: None,
-            },
-            None,
-        )
-        .expect("materialize no claim relay device");
-
-        assert!(matches!(credentials, ClaimRelayDeviceCredential::None));
-        assert_eq!(
-            FileDeviceStore::default().load().expect("load device"),
-            None
-        );
-    }
-
-    #[test]
-    #[serial]
     fn claim_completion_accepts_only_the_modern_prepared_credential_shape() {
         let support_root = telemetry_key_store_root("claim-complete-prepared-device");
         let secret_root = telemetry_key_store_root("claim-complete-prepared-device-secret");
@@ -24055,21 +22510,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn account_binding_payloads_send_null_account_scope_when_unknown() {
-        let machine = MachineIdentity {
-            account_scope: None,
-            ..test_machine()
-        };
-
-        assert_eq!(
-            setup_run_attach_body(&machine).get("account_scope"),
-            Some(&serde_json::Value::Null),
-            "an unknown account scope must be explicit, never a fabricated value"
-        );
-    }
-
-    #[test]
-    #[serial]
     fn claim_completion_request_sends_existing_keychain_proof_stably_across_retries() {
         let support_root = telemetry_key_store_root("claim-complete-request-device");
         let secret_root = telemetry_key_store_root("claim-complete-request-device-secret");
@@ -24265,63 +22705,6 @@ for line in sys.stdin:
                 .expect("load exact pending candidate"),
             Some(pending)
         );
-    }
-
-    #[test]
-    #[serial]
-    fn first_device_claim_completion_omits_prior_credential_proof() {
-        let support_root = telemetry_key_store_root("claim-complete-first-device");
-        let secret_root = telemetry_key_store_root("claim-complete-first-device-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let captured = Arc::new(Mutex::new(None));
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind first claim backend");
-        let address = listener.local_addr().expect("first claim address");
-        let captured_for_server = captured.clone();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept first claim");
-            *captured_for_server.lock().expect("captured request lock") =
-                Some(read_complete_http_request(&mut stream));
-            write_json_response(
-                &mut stream,
-                200,
-                "OK",
-                r#"{"setup_run_id":"setup_first","setup_run_token":"otsr_first","setup_run_token_expires_at":"2026-05-05T10:30:00Z","machine_id":"machine_test","connected_at":"2026-05-05T09:20:00Z","user":{"id":"user_first","email":"first@example.com","display_name":null},"organization":{"id":"org_first","name":"First Org"}}"#,
-            );
-        });
-        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
-
-        complete_setup_claim(
-            &PendingAuthClaim {
-                claim_code: "claim_first".to_string(),
-                claim_token: "token_first".to_string(),
-                nonce: "nonce_first".to_string(),
-                claim_url: "https://ottto.net/setup/claim?code=claim_first".to_string(),
-                expires_at: "2026-05-05T09:30:00Z".to_string(),
-            },
-            &test_machine(),
-            None,
-        )
-        .expect("complete first setup claim");
-        server.join().expect("first claim server");
-
-        let request = captured
-            .lock()
-            .expect("captured request lock")
-            .clone()
-            .expect("first request");
-        let body: serde_json::Value =
-            serde_json::from_str(http_request_body(&request)).expect("first request body");
-        for field in [
-            "relay_device_id",
-            "relay_device_sources",
-            "prior_device_secret",
-            "identity_continuity_capability",
-        ] {
-            assert!(body.get(field).is_none(), "unexpected first-device {field}");
-        }
     }
 
     #[test]
@@ -24538,81 +22921,6 @@ for line in sys.stdin:
             .is_some());
     }
 
-    #[test]
-    #[serial]
-    fn logout_after_ottto_ended_the_run_cleans_up_locally_and_says_so() {
-        let _lock = lock_backend_test_env();
-        let expired = r#"{"detail":"Setup run expired"}"#;
-        let (api_base_url, server) = scripted_json_backend(vec![
-            (401, expired),
-            (401, r#"{"detail":"Setup run not found for this device"}"#),
-            (401, expired),
-            (401, expired),
-            // An older server has no device release route.
-            (404, r#"{"detail":"Not Found"}"#),
-        ]);
-        let (root, _guards, daemon, device) =
-            connected_binding_fixture("logout-ended-run", api_base_url);
-        let logout = |request_id: &str| {
-            handle_request(
-                &daemon,
-                LocalControlRequest {
-                    request_id: request_id.to_string(),
-                    protocol_version: PROTOCOL_VERSION,
-                    token: Some("token".to_string()),
-                    client_kind: Some(LocalClientKind::Cli),
-                    client_install_owner: None,
-                    command: LocalControlCommand::AuthReset {
-                        local_only: false,
-                        forget_installation: false,
-                    },
-                },
-            )
-        };
-
-        // Not an authoritative end of the run: logout fails, nothing is cleared.
-        let refused = logout("req_logout_unproven");
-        assert!(!refused.ok);
-        assert_eq!(
-            refused.error.expect("error").code,
-            CliErrorCode::BackendRejected
-        );
-        assert_eq!(
-            daemon.status("token").unwrap().account.state,
-            LocalAccountState::Connected
-        );
-        assert_eq!(
-            FileDeviceStore::default().load().unwrap(),
-            Some(device.clone())
-        );
-
-        let ended = logout("req_logout_ended_run");
-        assert!(ended.ok, "{ended:?}");
-        let payload = ended.payload.expect("payload");
-        assert_eq!(payload["local_only"], true);
-        assert_eq!(payload["cloud_disconnected"], false);
-        assert_eq!(payload["message"]["code"], "setup_run_already_ended");
-        assert_eq!(
-            daemon.status("token").unwrap().account.state,
-            LocalAccountState::NotConnected
-        );
-        assert!(FileDeviceStore::default().load().unwrap().is_none());
-        assert_eq!(
-            FileDeviceStore::new(default_prior_device_path())
-                .load()
-                .unwrap(),
-            Some(device)
-        );
-        let requests = server.join().expect("scripted backend");
-        assert!(requests[0].contains("/local-client/disconnect"));
-        assert!(requests[1].contains("/local-client/refresh"));
-        assert!(requests[2].contains("/local-client/disconnect"));
-        assert!(requests[3].contains("/local-client/refresh"));
-        assert!(requests[4].starts_with("POST /api/v1/telemetry/devices/device-connected/release "));
-        assert_eq!(requests.len(), 5);
-        let _ = fs::remove_dir_all(root);
-    }
-
     fn auth_reset_request(
         request_id: &str,
         local_only: bool,
@@ -24706,152 +23014,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn forget_installation_after_ottto_ended_the_run_releases_then_forgets() {
-        let _lock = lock_backend_test_env();
-        let expired = r#"{"detail":"Setup run expired"}"#;
-        let (api_base_url, server) = scripted_json_backend(vec![
-            (401, expired),
-            (401, expired),
-            (200, ENDED_RUN_RELEASED),
-        ]);
-        let (root, _guards, daemon, _device) =
-            connected_binding_fixture("forget-ended-run-release", api_base_url);
-        FileMachineStore::default()
-            .save(&LocalMachineBinding {
-                machine_id: "machine_test".to_string(),
-                installation_id: "oti_ended_run".to_string(),
-                hardware_uuid: None,
-            })
-            .unwrap();
-
-        let response = handle_request(
-            &daemon,
-            auth_reset_request("req_forget_ended_run_release", false, true),
-        );
-        let requests = server.join().expect("scripted backend");
-
-        assert!(response.ok, "{response:?}");
-        let payload = response.payload.expect("payload");
-        assert_eq!(payload["local_only"], false);
-        assert_eq!(payload["cloud_disconnected"], false);
-        assert_eq!(payload["device_released"], true);
-        assert_eq!(payload["message"]["code"], "installation_forgotten");
-        assert!(payload["message"]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("connection had expired")));
-        assert!(FileMachineStore::default().load().unwrap().is_none());
-        assert!(FileDeviceStore::default().load().unwrap().is_none());
-        assert!(requests[2].starts_with("POST /api/v1/telemetry/devices/device-connected/release "));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn ended_run_release_not_confirmed_keeps_todays_logout_outcomes() {
-        let _lock = lock_backend_test_env();
-        let expired = r#"{"detail":"Setup run expired"}"#;
-        for (name, release_status, release_body) in [
-            ("refused", 200, r#"{"device_released":false}"#),
-            ("old-server", 404, r#"{"detail":"Not Found"}"#),
-            ("unparsable", 200, r#"{"released":"yes"}"#),
-        ] {
-            // Forgetting the installation still fails with local state intact.
-            let (api_base_url, server) = scripted_json_backend(vec![
-                (401, expired),
-                (401, expired),
-                (release_status, release_body),
-            ]);
-            let (root, _guards, daemon, device) =
-                connected_binding_fixture(&format!("ended-run-no-release-{name}"), api_base_url);
-            let refused = handle_request(
-                &daemon,
-                auth_reset_request("req_forget_ended_run_unreleased", false, true),
-            );
-            let requests = server.join().expect("scripted backend");
-            assert!(!refused.ok, "{name}");
-            let error = refused.error.expect("error");
-            assert_eq!(error.code, CliErrorCode::BackendRejected, "{name}");
-            assert_eq!(error.code.exit_code(), 15, "{name}");
-            assert!(error.message.starts_with("Setup run expired."), "{name}");
-            assert_eq!(
-                daemon.status("token").unwrap().account.state,
-                LocalAccountState::Connected
-            );
-            assert_eq!(FileDeviceStore::default().load().unwrap(), Some(device));
-            assert_eq!(
-                KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-                    .load()
-                    .unwrap(),
-                "connected-secret"
-            );
-            assert!(requests[2].contains("/api/v1/telemetry/devices/device-connected/release"));
-
-            // A plain logout still falls back to the local-only cleanup.
-            let (api_base_url, server) = scripted_json_backend(vec![
-                (401, expired),
-                (401, expired),
-                (release_status, release_body),
-            ]);
-            let connection = LocalConnectionBinding {
-                api_base_url,
-                ..daemon
-                    .connection_for_authorized_client()
-                    .unwrap()
-                    .expect("connection")
-            };
-            FileConnectionStore::default().save(&connection).unwrap();
-            let daemon = daemon.with_connection(Some(connection));
-            let ended = handle_request(
-                &daemon,
-                auth_reset_request("req_logout_ended_run_unreleased", false, false),
-            );
-            server.join().expect("scripted backend");
-            assert!(ended.ok, "{name}: {ended:?}");
-            let payload = ended.payload.expect("payload");
-            assert_eq!(payload["local_only"], true);
-            assert!(payload["device_released"].is_null());
-            assert_eq!(payload["message"]["code"], "setup_run_already_ended");
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn ended_run_release_never_follows_a_redirect() {
-        let _lock = lock_backend_test_env();
-        let target = TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
-        target.set_nonblocking(true).expect("nonblocking");
-        let location = format!("http://{}/released", target.local_addr().unwrap());
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirecting backend");
-        let api_base_url = format!("http://{}", listener.local_addr().unwrap());
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept release");
-            let request = read_complete_http_request(&mut stream);
-            let response = format!(
-                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Type: application/json\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{{\"device_released\":true}}"
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write redirect");
-            request
-        });
-        let proof = device_release_proof(
-            "device-redirected".to_string(),
-            "secret-redirected".to_string(),
-        )
-        .expect("complete proof");
-
-        assert!(!release_device_without_setup_run(&api_base_url, &proof));
-        let request = server.join().expect("redirecting backend");
-        assert!(request.starts_with("POST /api/v1/telemetry/devices/device-redirected/release "));
-        assert!(matches!(
-            target.accept(),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-        ));
-    }
-
-    #[test]
-    #[serial]
     fn credential_backend_calls_never_follow_redirects_or_reach_a_host_logger() {
         use crate::retry_tls::credential_test_support::{
             assert_never_logged, install_host_logger, RedirectingBackend,
@@ -24940,30 +23102,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    #[serial]
-    fn local_only_logout_never_contacts_ottto() {
-        let _lock = lock_backend_test_env();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
-        listener.set_nonblocking(true).expect("nonblocking");
-        let api_base_url = format!("http://{}", listener.local_addr().unwrap());
-        let (root, _guards, daemon, _device) =
-            connected_binding_fixture("local-only-no-request", api_base_url);
-
-        let response = handle_request(
-            &daemon,
-            auth_reset_request("req_local_only_no_request", true, false),
-        );
-
-        assert!(response.ok, "{response:?}");
-        assert!(response.payload.expect("payload")["device_released"].is_null());
-        assert!(matches!(
-            listener.accept(),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-        ));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn disconnect_body_carries_release_proof_only_when_both_halves_exist() {
         let proof =
             device_release_proof("device_release".to_string(), "secret-release".to_string())
@@ -24992,20 +23130,6 @@ for line in sys.stdin:
         assert!(releasable_on_switch(&proof, None));
         assert!(releasable_on_switch(&proof, Some("device_new")));
         assert!(!releasable_on_switch(&proof, Some("device_old")));
-    }
-
-    #[test]
-    fn disconnect_response_device_released_defaults_false_for_older_servers() {
-        let legacy: SetupRunDisconnectResponse = serde_json::from_str(
-            r#"{"setup_run_id":"run","run_status":"disconnected","client_disconnected":true,"disconnected_at":"2026-10-18T12:00:00Z"}"#,
-        )
-        .expect("legacy disconnect response");
-        assert!(!legacy.device_released);
-        let released: SetupRunDisconnectResponse = serde_json::from_str(
-            r#"{"setup_run_id":"run","run_status":"disconnected","client_disconnected":true,"disconnected_at":"2026-10-18T12:00:00Z","device_released":true}"#,
-        )
-        .expect("release disconnect response");
-        assert!(released.device_released);
     }
 
     #[test]
@@ -25187,24 +23311,6 @@ for line in sys.stdin:
         assert_never_logged("synthetic-own-secret");
     }
 
-    #[test]
-    #[serial]
-    fn history_choice_receipt_transport_failure_keeps_proof_and_marker() {
-        let _lock = lock_backend_test_env();
-        let _env = history_choice_test_env();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
-        let stores = history_choice_test_stores();
-        history_choice_stage_test_release(&stores, &base, 100);
-        history_choice_store_test_receipt(&stores, 100);
-        let before = stores.receipt.load().unwrap();
-        assert!(history_choice_create(&base, &stores, 101).is_err());
-        assert_eq!(stores.receipt.load().unwrap(), before);
-        assert!(stores.marker.load().is_ok());
-        assert!(stores.proof.load().is_ok());
-    }
-
     struct HistoryChoiceFaultStore {
         inner: ottto_core::token_store::MemoryTokenStore,
         fail_load: std::sync::atomic::AtomicBool,
@@ -25325,135 +23431,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn history_choice_release_recovery_preserves_identity_reservation_witness() {
-        let _lock = lock_backend_test_env();
-        let (root, _guards, daemon, _) =
-            connected_binding_fixture("history-reservation", DEFAULT_API_BASE_URL.into());
-        let account = FileAccountStore::default().load().unwrap();
-        let reservation = reserve_identity_mutation(false).unwrap();
-        let stores = history_stores();
-        history_choice_stage_test_release(&stores, DEFAULT_API_BASE_URL, history_now());
-        {
-            let _identity_lock = lock_setup_run_binding();
-            assert_eq!(reservation.validate_locked(), Ok(()));
-        }
-        let pending = PendingAuthClaim {
-            claim_code: "claim".into(),
-            claim_token: "token".into(),
-            nonce: "nonce".into(),
-            claim_url: "https://ottto.net/setup/claim?code=claim".into(),
-            expires_at: "2030-01-01T00:00:00Z".into(),
-        };
-        assert!(matches!(
-            begin_durable_browser_claim(&daemon, pending),
-            Err(LocalApiError::IdentityMutationInProgress)
-        ));
-        clear_local_release(&stores).unwrap();
-        assert_eq!(FileAccountStore::default().load().unwrap(), account);
-        {
-            let _identity_lock = lock_setup_run_binding();
-            assert_eq!(reservation.validate_locked(), Ok(()));
-            let mut changed = account;
-            changed.message = Some(StableMessage {
-                code: "unrelated-authority-change".into(),
-                text: "synthetic".into(),
-            });
-            FileAccountStore::default().save(&changed).unwrap();
-            assert_eq!(
-                reservation.validate_locked(),
-                Err(LocalApiError::IdentityMutationInProgress)
-            );
-        }
-        drop(reservation);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn history_choice_interrupted_closed_cleanup_needs_no_deleted_proof() {
-        use ottto_core::token_store::MemoryTokenStore;
-        let _lock = lock_backend_test_env();
-        let _env = history_choice_test_env();
-        let (base, server) = scripted_json_backend(vec![(200, RECEIPT_CLAIM_SUCCESS)]);
-        let mut stores = history_choice_test_stores();
-        history_choice_stage_test_release(&stores, &base, 100);
-        history_choice_store_test_receipt(&stores, 100);
-        let marker = MemoryTokenStore::new();
-        marker.save(&stores.marker.load().unwrap()).unwrap();
-        stores.marker = Box::new(HistoryChoiceFaultStore {
-            inner: marker,
-            fail_load: false.into(),
-            fail_delete: true.into(),
-        });
-        assert!(clear_local_release(&stores).is_err());
-        assert!(matches!(stores.proof.load(), Err(TokenStoreError::Missing)));
-        assert!(
-            history_load::<LocalReleaseMarker>(stores.marker.as_ref())
-                .unwrap()
-                .unwrap()
-                .ceremony_closed
-        );
-        assert!(history_choice_create(&base, &stores, 101).is_ok());
-        let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with("POST /api/v1/setup-claims "));
-        assert!(matches!(
-            stores.marker.load(),
-            Err(TokenStoreError::Missing)
-        ));
-    }
-
-    #[test]
-    #[serial]
-    fn history_choice_receipt_missing_read_or_parse_failure_reissues_before_claim() {
-        use ottto_core::token_store::MemoryTokenStore;
-        let _lock = lock_backend_test_env();
-        let _env = history_choice_test_env();
-        for fault in ["missing", "read", "parse"] {
-            let (base, server) = scripted_json_backend(vec![
-                (
-                    200,
-                    r#"{"outcome":"receipt_issued","revocation_receipt":"otrr_reissued"}"#,
-                ),
-                (200, RECEIPT_CLAIM_SUCCESS),
-            ]);
-            let inner = MemoryTokenStore::new();
-            if fault == "parse" {
-                inner.save("{").unwrap();
-            }
-            let mut stores = history_choice_test_stores();
-            history_choice_stage_test_release(&stores, &base, 100);
-            stores.browser.save("{").unwrap();
-            assert!(
-                resume_history_browser_claim_with_stores(&test_machine(), &base, &stores)
-                    .unwrap()
-                    .is_none()
-            );
-            stores.receipt = Box::new(HistoryChoiceFaultStore {
-                inner,
-                fail_load: (fault == "read").into(),
-                fail_delete: false.into(),
-            });
-            assert_eq!(
-                history_choice_create(&base, &stores, 101)
-                    .unwrap()
-                    .claim_code,
-                "claim"
-            );
-            let requests = server.join().unwrap();
-            assert!(requests[0]
-                .starts_with("POST /api/v1/telemetry/devices/released-device/revocation-receipt "));
-            assert!(requests[0].contains("X-Ottto-Device-Secret: synthetic-own-secret"));
-            assert!(requests[1].starts_with("POST /api/v1/setup-claims "));
-            assert_eq!(
-                history_choice_request_body(&requests[1])["revocation_receipt"],
-                "otrr_reissued"
-            );
-        }
-    }
-
-    #[test]
-    #[serial]
     fn history_choice_receipt_failed_delete_recovers_same_claim_and_original_nonce() {
         use ottto_core::token_store::MemoryTokenStore;
         let _lock = lock_backend_test_env();
@@ -25537,29 +23514,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn history_choice_receipt_definitive_reissue_refusal_allows_unconfirmed_claim() {
-        let _lock = lock_backend_test_env();
-        let _env = history_choice_test_env();
-        for (status, body) in [
-            (401, r#"{"detail":{"code":"device_secret_invalid"}}"#),
-            (409, r#"{"detail":{"code":"ceremony_closed"}}"#),
-            (404, r#"{"detail":"Not Found"}"#),
-        ] {
-            let (base, server) =
-                scripted_json_backend(vec![(status, body), (200, RECEIPT_CLAIM_SUCCESS)]);
-            let stores = history_choice_test_stores();
-            history_choice_stage_test_release(&stores, &base, 100);
-            assert!(history_choice_create(&base, &stores, 101).is_ok());
-            let requests = server.join().unwrap();
-            assert!(requests[0].contains("/revocation-receipt "));
-            assert!(history_choice_request_body(&requests[1])
-                .get("revocation_receipt")
-                .is_none());
-        }
-    }
-
-    #[test]
-    #[serial]
     fn history_choice_receipt_marker_survives_reload_and_expires_at_24h() {
         let _lock = lock_backend_test_env();
         let _env = history_choice_test_env();
@@ -25585,116 +23539,6 @@ for line in sys.stdin:
         for store in [&reloaded.receipt, &reloaded.marker, &reloaded.proof] {
             assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
         }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn history_choice_receipt_definitive_4xx_closes_local_marker() {
-        let _lock = lock_backend_test_env();
-        let _env = history_choice_test_env();
-        for status in [400, 401, 404, 422] {
-            let (base, server) = scripted_json_backend(vec![(status, "{}")]);
-            let stores = history_choice_test_stores();
-            history_choice_stage_test_release(&stores, &base, 100);
-            history_choice_store_test_receipt(&stores, 100);
-            assert!(history_choice_create(&base, &stores, 101).is_err());
-            assert_eq!(server.join().unwrap().len(), 1);
-            for store in [&stores.receipt, &stores.marker, &stores.proof] {
-                assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
-            }
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn history_choice_registration_prepare_400_preserves_old_binding() {
-        let _lock = lock_backend_test_env();
-        let (base, server) = scripted_json_backend(vec![(
-            400,
-            r#"{"code":"history_choice_required","detail":"Setup claim session is pending: answer in the browser"}"#,
-        )]);
-        let (root, _guards, _, old_device) =
-            connected_binding_fixture("history-prepare-refusal", base.clone());
-        let session = InstallSessionApiResponse {
-            install_session_id: "install-existing".into(),
-            install_session_token: "synthetic-install-token".into(),
-        };
-        let error = prepare_telemetry_device_registration(&base, &session, &test_machine())
-            .err()
-            .expect("history refusal");
-        assert!(registration_history_choice_required(&error));
-        assert!(registration_history_choice_account(
-            &FileAccountStore::default().load().unwrap()
-        ));
-        assert_eq!(FileDeviceStore::default().load().unwrap(), Some(old_device));
-        assert!(FilePendingDeviceCredentialStore::default()
-            .load()
-            .unwrap()
-            .is_none());
-        assert_eq!(server.join().unwrap().len(), 1);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn history_choice_registration_action_reoffers_browser_without_failed_completion() {
-        let _lock = lock_backend_test_env();
-        let (base, server) = scripted_json_backend(vec![
-            (200, "{}"), // heartbeat before polling the next setup action
-            (
-                200,
-                r#"{"action":{"id":"action-history","action_type":"install_source","source":"codex"}}"#,
-            ),
-            (200, "{}"),
-            (
-                200,
-                r#"{"install_session_id":"install-history","install_session_token":"synthetic-install"}"#,
-            ),
-            (200, "{}"),
-            (
-                400,
-                r#"{"code":"history_choice_required","detail":"Setup claim session is pending: answer in the browser"}"#,
-            ),
-            (200, RECEIPT_CLAIM_SUCCESS),
-        ]);
-        let (root, _guards, daemon, old_device) =
-            connected_binding_fixture("history-action", base.clone());
-        let connection = FileConnectionStore::default().load().unwrap().unwrap();
-        let candidate = format!("candidate-{}", "value".repeat(4));
-        let mut pending = test_pending_device_credential("old-running-candidate", true);
-        pending.api_base_url = base.clone();
-        pending.expires_at = "2099-01-01T00:00:00Z".into();
-        stage_pending_device_credential(&pending, &candidate).unwrap();
-        let mut credentials = SetupRunCredentials {
-            setup_run_token: "synthetic-setup-token".into(),
-            connection: connection.clone(),
-        };
-        let results =
-            process_setup_actions(&daemon, &base, &mut credentials, &test_machine()).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status, "running");
-        let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 7);
-        assert!(requests.iter().all(|r| !r.contains("/complete ")));
-        assert_eq!(
-            daemon
-                .pending_auth_claim_snapshot()
-                .unwrap()
-                .unwrap()
-                .0
-                .claim_code,
-            "claim"
-        );
-        assert_eq!(
-            FilePendingDeviceCredentialStore::default().load().unwrap(),
-            Some(pending)
-        );
-        assert_eq!(FileDeviceStore::default().load().unwrap(), Some(old_device));
-        assert_eq!(
-            FileConnectionStore::default().load().unwrap(),
-            Some(connection)
-        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -25796,43 +23640,6 @@ for line in sys.stdin:
             before
         );
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn auth_reset_messages_state_whether_the_server_registration_was_released() {
-        let local_forget = auth_reset_message(true, None);
-        assert_eq!(local_forget.code, "installation_forgotten");
-        assert!(local_forget.text.contains("Ottto was not contacted"));
-        assert!(local_forget
-            .text
-            .contains("still registered to the previous Ottto account"));
-        assert!(local_forget.text.contains("(Disconnect)"));
-        assert!(local_forget
-            .text
-            .contains("`ottto logout --forget-installation --confirm` without --local-only"));
-        assert!(!local_forget.text.contains("account scope"));
-
-        let cloud_forget = auth_reset_message(true, Some(true));
-        assert_eq!(cloud_forget.code, "installation_forgotten");
-        assert!(cloud_forget
-            .text
-            .contains("server registration was released"));
-        assert!(!cloud_forget.text.contains("still registered"));
-
-        let cloud_forget_unreleased = auth_reset_message(true, Some(false));
-        assert!(cloud_forget_unreleased.text.contains("may still be active"));
-
-        let cloud = auth_reset_message(false, Some(true));
-        assert_eq!(cloud.code, "cloud_disconnect_complete");
-        assert!(cloud.text.contains("server registration was released"));
-        let cloud_unreleased = auth_reset_message(false, Some(false));
-        assert_eq!(cloud_unreleased.code, "cloud_disconnect_complete");
-        assert!(cloud_unreleased.text.contains("may still be active"));
-
-        assert_eq!(
-            auth_reset_message(false, None).code,
-            "local_disconnect_complete"
-        );
     }
 
     #[test]
@@ -25944,104 +23751,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    #[serial]
-    fn cloud_logout_without_device_secret_sends_no_release_proof() {
-        let root = telemetry_key_store_root("cloud-logout-no-release");
-        let support_root = root.join("support");
-        let secret_root = root.join("secrets");
-        fs::create_dir_all(&support_root).unwrap();
-        fs::create_dir_all(&secret_root).unwrap();
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        FileDeviceStore::default()
-            .save(&LocalDeviceBinding {
-                device_id: "device_without_secret".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            })
-            .unwrap();
-        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-            .save("setup-token-no-release")
-            .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind disconnect backend");
-        let address = listener.local_addr().expect("disconnect backend address");
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept disconnect");
-            let request = read_complete_http_request(&mut stream);
-            write_json_response(
-                &mut stream,
-                200,
-                "OK",
-                r#"{"setup_run_id":"run_no_release","run_status":"disconnected","client_disconnected":true,"disconnected_at":"2026-10-18T12:00:00Z"}"#,
-            );
-            request
-        });
-        let api_base_url = format!("http://{address}");
-        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
-
-        let response = handle_request(
-            &daemon()
-                .with_account(connected_account())
-                .with_connection(Some(LocalConnectionBinding {
-                    setup_run_id: "run_no_release".to_string(),
-                    setup_run_token_expires_at: "2026-10-18T13:00:00Z".to_string(),
-                    machine_id: Some("machine_test".to_string()),
-                    claim_code: None,
-                    api_base_url,
-                })),
-            LocalControlRequest {
-                request_id: "req_cloud_logout_no_release".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::AuthReset {
-                    local_only: false,
-                    forget_installation: false,
-                },
-            },
-        );
-        let request = server.join().expect("disconnect backend");
-
-        assert!(response.ok, "{response:?}");
-        let body: serde_json::Value =
-            serde_json::from_str(http_request_body(&request)).expect("disconnect body");
-        assert_eq!(body, json!({ "reason": "logout" }));
-        let payload = response.payload.expect("payload");
-        assert_eq!(payload["device_released"], false);
-        assert_eq!(payload["message"]["code"], "cloud_disconnect_complete");
-        assert!(payload["message"]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("may still be active")));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn cloud_forget_installation_without_connection_points_to_local_only_forget() {
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_cloud_forget_unconnected".to_string(),
-                protocol_version: ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::AuthReset {
-                    local_only: false,
-                    forget_installation: true,
-                },
-            },
-        );
-
-        assert!(!response.ok);
-        let error = response.error.expect("error");
-        assert_eq!(error.code, CliErrorCode::InvalidRequest);
-        assert!(error.message.contains("--local-only --forget-installation"));
-    }
-
-    #[test]
     fn raw_local_control_json_rejects_stale_protocol_version() {
         let response = handle_request_json_with_peer(
             &daemon(),
@@ -26050,31 +23759,6 @@ for line in sys.stdin:
         );
         let response: LocalControlResponse =
             serde_json::from_str(&response).expect("local control response");
-
-        assert!(!response.ok);
-        let error = response.error.expect("error");
-        assert_eq!(error.code, CliErrorCode::InvalidRequest);
-        assert!(error
-            .message
-            .contains("unsupported local control protocol_version 10"));
-    }
-
-    #[test]
-    fn typed_local_control_request_rejects_stale_protocol_version() {
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_typed_stale".to_string(),
-                protocol_version: 10,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::Status {
-                    refresh_agent_status: false,
-                    retry_relay_authorization: false,
-                },
-            },
-        );
 
         assert!(!response.ok);
         let error = response.error.expect("error");
@@ -26126,14 +23810,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn validated_api_base_url_accepts_direct_production_origin() {
-        assert_eq!(
-            validated_api_base_url(Some(DIRECT_API_BASE_URL)).expect("valid"),
-            DIRECT_API_BASE_URL.to_string()
-        );
-    }
-
-    #[test]
     fn agent_costs_url_encodes_local_client_query() {
         let connection = LocalConnectionBinding {
             setup_run_id: "setup_costs".to_string(),
@@ -26169,46 +23845,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn agent_sessions_url_encodes_local_client_query() {
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_sessions".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: DIRECT_API_BASE_URL.to_string(),
-        };
-        let url = agent_sessions_url(
-            DIRECT_API_BASE_URL,
-            &connection,
-            &AgentSessionsQuery {
-                limit: Some(25),
-                cursor: Some("next 123".to_string()),
-                range: Some("today".to_string()),
-                start_date: Some("2026-06-01".to_string()),
-                end_date: Some("2026-06-05".to_string()),
-                timezone: Some("America/Los_Angeles".to_string()),
-                source: Some("codex".to_string()),
-                model: Some("gpt-5.3 codex".to_string()),
-                billing_provider: Some("openai".to_string()),
-                billing_channel: Some("subscription".to_string()),
-                machine_id: Some("otm_test".to_string()),
-                source_plan_profile_id: Some("profile_123".to_string()),
-                min_cost: Some("1.25".to_string()),
-                max_cost: Some("7.5".to_string()),
-                sort_by: Some("cost".to_string()),
-                sort_dir: Some("desc".to_string()),
-                search: Some("roadmap review".to_string()),
-                all_machines: false,
-            },
-        );
-
-        assert_eq!(
-            url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_sessions/local-client/sessions?limit=25&cursor=next+123&range=today&start_date=2026-06-01&end_date=2026-06-05&source=codex&model=gpt-5.3+codex&billing_provider=openai&billing_channel=subscription&machine_id=otm_test&source_plan_profile_id=profile_123&min_cost=1.25&max_cost=7.5&sort_by=cost&sort_dir=desc&search=roadmap+review"
-        );
-    }
-
-    #[test]
     fn refresh_setup_run_token_refuses_untrusted_api_base() {
         // SECURITY (Codex High: "Verify refresh can leak device secret to
         // untrusted API base"): the device-secret refresh must fail closed when
@@ -26229,35 +23865,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn control_token_validation_base_defaults_to_production_without_env() {
-        let _guard = lock_backend_test_env();
-        let _env_guard = EnvVarGuard::remove("OTTTO_API_BASE_URL");
-        assert_eq!(
-            control_token_validation_base_url(None).expect("default base"),
-            DEFAULT_API_BASE_URL.to_string()
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn control_token_validation_base_honors_request_production_without_env() {
-        let _guard = lock_backend_test_env();
-        let _env_guard = EnvVarGuard::remove("OTTTO_API_BASE_URL");
-        // A request-supplied production backend is honored (the real backend
-        // rejects forged tokens), preserving legitimate prod behavior for both
-        // ottto.net/backend and api.ottto.net callers.
-        assert_eq!(
-            control_token_validation_base_url(Some(DIRECT_API_BASE_URL)).expect("direct base"),
-            DIRECT_API_BASE_URL.to_string()
-        );
-        assert_eq!(
-            control_token_validation_base_url(Some("https://api.ottto.net/v1")).expect("subpath"),
-            "https://api.ottto.net/v1".to_string()
-        );
-    }
-
-    #[test]
-    #[serial]
     fn control_token_validation_base_ignores_request_loopback_without_env() {
         let _guard = lock_backend_test_env();
         let _env_guard = EnvVarGuard::remove("OTTTO_API_BASE_URL");
@@ -26270,32 +23877,6 @@ for line in sys.stdin:
         assert_eq!(
             control_token_validation_base_url(Some("http://localhost:8787")).expect("fallback"),
             DEFAULT_API_BASE_URL.to_string()
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn control_token_validation_base_env_overrides_request() {
-        let _guard = lock_backend_test_env();
-        // Developer env override wins even when the request carries a production
-        // base, so dev/test pointed at a local backend keeps working.
-        let _env_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "http://localhost:8787");
-        assert_eq!(
-            control_token_validation_base_url(Some(DEFAULT_API_BASE_URL)).expect("env wins"),
-            "http://localhost:8787".to_string()
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn control_token_validation_base_honors_developer_env_localhost() {
-        let _guard = lock_backend_test_env();
-        // The localhost allowance is only reachable through the developer-
-        // controlled env var, never the request body.
-        let _env_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "http://localhost:8787/");
-        assert_eq!(
-            control_token_validation_base_url(None).expect("env base"),
-            "http://localhost:8787".to_string()
         );
     }
 
@@ -26382,26 +23963,6 @@ for line in sys.stdin:
         ));
         assert!(client_owner_conflict(
             InstallOwner::AppBundle,
-            InstallOwner::Dev
-        ));
-    }
-
-    #[test]
-    fn hosted_installer_client_can_report_app_bundle_service_health() {
-        assert!(!client_owner_conflict(
-            InstallOwner::HostedInstaller,
-            InstallOwner::AppBundle
-        ));
-        assert!(!client_owner_conflict(
-            InstallOwner::HostedInstaller,
-            InstallOwner::HostedInstaller
-        ));
-        assert!(client_owner_conflict(
-            InstallOwner::HostedInstaller,
-            InstallOwner::Homebrew
-        ));
-        assert!(client_owner_conflict(
-            InstallOwner::HostedInstaller,
             InstallOwner::Dev
         ));
     }
@@ -26546,77 +24107,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn update_state_hard_blocks_protocol_incompatible_app_bundle() {
-        let state = update_state_from_manifest(
-            release_manifest_for_update("0.2.0", Some("0.1.0"), Some(PROTOCOL_VERSION + 1)),
-            "0.1.0".to_string(),
-            ReleaseChannel::Dev,
-            Some("2026-05-20T00:00:00Z".to_string()),
-            Some("deadbeef".to_string()),
-            InstallOwner::AppBundle,
-        );
-
-        assert_eq!(state.status, UpdateStatus::UpdateAvailable);
-        assert_eq!(state.gate, UpdateGate::HardBlock);
-        assert_eq!(state.install_owner, InstallOwner::AppBundle);
-        assert_eq!(state.update_command, None);
-        assert!(state
-            .reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("requires local protocol"));
-    }
-
-    #[test]
-    fn update_state_avoids_owner_command_when_manifest_does_not_support_detected_owner() {
-        let mut manifest = release_manifest_for_update("0.2.0", Some("0.1.0"), None);
-        manifest.supported_install_owners = vec![InstallOwner::HostedInstaller];
-
-        let state = update_state_from_manifest(
-            manifest,
-            "0.1.0".to_string(),
-            ReleaseChannel::Dev,
-            Some("2026-05-20T00:00:00Z".to_string()),
-            Some("deadbeef".to_string()),
-            InstallOwner::Homebrew,
-        );
-
-        assert_eq!(state.status, UpdateStatus::UpdateAvailable);
-        assert_eq!(state.gate, UpdateGate::SoftWarn);
-        assert_eq!(state.install_owner, InstallOwner::Homebrew);
-        assert_eq!(state.update_command, None);
-        assert!(state
-            .update_instructions
-            .as_deref()
-            .unwrap_or_default()
-            .contains("does not advertise an update route"));
-    }
-
-    #[test]
-    fn update_state_rejects_manifest_without_supported_install_owners() {
-        let mut manifest = release_manifest_for_update("0.2.0", Some("0.1.0"), None);
-        manifest.supported_install_owners.clear();
-
-        let state = update_state_from_manifest(
-            manifest,
-            "0.1.0".to_string(),
-            ReleaseChannel::Dev,
-            Some("2026-05-20T00:00:00Z".to_string()),
-            Some("deadbeef".to_string()),
-            InstallOwner::Homebrew,
-        );
-
-        assert_eq!(state.status, UpdateStatus::Unknown);
-        assert_eq!(state.gate, UpdateGate::Unknown);
-        assert_eq!(state.update_command, None);
-        assert!(state
-            .reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("supported install owners"));
-    }
-
-    #[test]
     fn install_owner_detection_routes_known_install_paths() {
         assert_eq!(
             install_owner_for_path(Path::new(
@@ -26691,14 +24181,6 @@ for line in sys.stdin:
         assert!(!companion_peer_is_trusted(Some(&peer)));
     }
 
-    #[test]
-    fn companion_peer_without_euid_is_not_trusted() {
-        // A peer missing euid attribution (e.g. an older transport path) cannot
-        // be granted token-less companion trust.
-        let peer = LocalClientPeer::from_pid_and_euid(Some(std::process::id()), None);
-        assert!(!companion_peer_is_trusted(Some(&peer)));
-    }
-
     /// The requirement an internal build resolves to, and the one QA writes
     /// into a dev LaunchAgent when pointing a *release* daemon at a locally
     /// built Companion. An ad-hoc signature carries no team OU, so only the
@@ -26761,19 +24243,6 @@ for line in sys.stdin:
                 "requirement must demand our team: {text}"
             );
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn an_internal_daemon_requires_the_identifier_but_no_team() {
-        // macos_package.sh ad-hoc seals dev/preview/RC artifacts, so an
-        // internal tester's Companion has no Apple team to assert. Demanding
-        // one would break every internal install, so those keep the posture
-        // they have today.
-        assert_eq!(
-            resolve_companion_code_requirement(None, None, TEST_TEAM_ID, INTERNAL_BUILD),
-            CompanionCodeRequirement::Enforced(DEV_ADHOC_COMPANION_REQUIREMENT.to_string())
-        );
     }
 
     #[cfg(target_os = "macos")]
@@ -26912,27 +24381,6 @@ for line in sys.stdin:
                 "requirement should parse: {text}"
             );
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[serial]
-    fn companion_code_requirement_reads_its_overrides_from_the_environment() {
-        let _requirement = EnvVarGuard::remove("OTTTO_COMPANION_CODE_REQUIREMENT");
-        let _team_id = EnvVarGuard::remove("OTTTO_COMPANION_TEAM_ID");
-        assert_ne!(
-            companion_code_requirement(),
-            CompanionCodeRequirement::Enforced("identifier \"net.example.Other\"".to_string())
-        );
-
-        let _override = EnvVarGuard::set_str(
-            "OTTTO_COMPANION_CODE_REQUIREMENT",
-            "identifier \"net.example.Other\"",
-        );
-        assert_eq!(
-            companion_code_requirement(),
-            CompanionCodeRequirement::Enforced("identifier \"net.example.Other\"".to_string())
-        );
     }
 
     #[test]
@@ -27403,107 +24851,6 @@ for line in sys.stdin:
             FileAccountStore::default().load().unwrap().state,
             LocalAccountState::NotConnected
         );
-        assert!(FileDeviceStore::default().load().unwrap().is_none());
-    }
-
-    #[test]
-    #[serial]
-    fn staged_account_switch_keeps_old_identity_until_exact_cleanup_confirmation() {
-        let support_root = telemetry_key_store_root("auth-switch-cloud-session-cleanup");
-        let secret_root = telemetry_key_store_root("auth-switch-cloud-session-secrets");
-        fs::create_dir_all(&secret_root).unwrap();
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let old_account = connected_account();
-        let device_id = "00000000-0000-4000-8000-000000000001";
-        FileAccountStore::default().save(&old_account).unwrap();
-        FileDeviceStore::default()
-            .save(&LocalDeviceBinding {
-                device_id: device_id.to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            })
-            .unwrap();
-        let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
-        grants
-            .enable(
-                &crate::cloud_sessions::CloudSessionGrantSetup {
-                    installation_id: device_id.to_string(),
-                    organization_scope: "org_test".to_string(),
-                    effective_user_scope: "user_test".to_string(),
-                },
-                time::OffsetDateTime::now_utc(),
-            )
-            .unwrap();
-        grants.grant_create_request(device_id).unwrap();
-        let pending = grants.load().unwrap().unwrap();
-        let enabled = cloud_control_backend_grant(&pending, device_id, "enabled", 1);
-        grants.bind_backend_grant(&enabled, device_id).unwrap();
-
-        let daemon = daemon().with_account(old_account.clone());
-        let new_account = LocalAccountBinding {
-            state: LocalAccountState::Connected,
-            user: Some(LocalAccountUser {
-                id: "user_new".to_string(),
-                email: "new@example.com".to_string(),
-                display_name: None,
-            }),
-            organization: Some(LocalAccountOrganization {
-                id: "org_new".to_string(),
-                name: "New Org".to_string(),
-            }),
-            connected_at: Some("2026-05-05T10:00:00Z".to_string()),
-            last_refreshed_at: Some("2026-05-05T10:00:00Z".to_string()),
-            message: None,
-            can_reconnect: None,
-        };
-        daemon
-            .stage_account_switch_if_user_mismatch(StagedAccountSwitch {
-                claim_code: "claim_cloud_switch".to_string(),
-                new_account: new_account.clone(),
-                setup_run_id: "setup_cloud_switch".to_string(),
-                setup_run_token: "setup_token_new".to_string(),
-                setup_run_token_expires_at: "2026-05-05T11:00:00Z".to_string(),
-                machine_id: Some("machine_new".to_string()),
-                relay_device: None,
-                relay_device_secret: None,
-                relay_device_credential_preparation_id: None,
-                backfill_policy: None,
-                backfill_cutoff_at: None,
-            })
-            .unwrap()
-            .expect("switch staged");
-
-        let authorization = RequestAuthorization::Token("token".to_string());
-        assert!(matches!(
-            auth_switch_account(&daemon, &authorization, "claim_cloud_switch"),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
-        assert_eq!(FileAccountStore::default().load().unwrap(), old_account);
-        assert_eq!(
-            FileDeviceStore::default()
-                .load()
-                .unwrap()
-                .unwrap()
-                .device_id,
-            device_id
-        );
-        assert_eq!(
-            grants.load().unwrap().unwrap().status,
-            crate::cloud_sessions::CloudSessionGrantStatus::Paused
-        );
-
-        grants.revoke(time::OffsetDateTime::now_utc()).unwrap();
-        let revoked =
-            cloud_control_backend_grant(&grants.load().unwrap().unwrap(), device_id, "revoked", 2);
-        grants
-            .apply_backend_revocation(&revoked, device_id)
-            .unwrap();
-        let switched = auth_switch_account(&daemon, &authorization, "claim_cloud_switch")
-            .expect("confirmed cleanup permits switch");
-        assert_eq!(switched.account, new_account);
-        assert_eq!(FileAccountStore::default().load().unwrap(), new_account);
         assert!(FileDeviceStore::default().load().unwrap().is_none());
     }
 
@@ -27988,193 +25335,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn install_registration_never_mutates_backend_before_cloud_cleanup() {
-        let _guard = lock_backend_test_env();
-        let root = telemetry_key_store_root("install-reservation-active-grant");
-        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
-        let account = connected_account();
-        let device = LocalDeviceBinding {
-            device_id: "00000000-0000-4000-8000-000000000001".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            sources: vec!["codex".to_string(), "pi".to_string()],
-        };
-        FileAccountStore::default().save(&account).unwrap();
-        FileDeviceStore::default().save(&device).unwrap();
-        let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
-        let local = grants
-            .enable(
-                &crate::cloud_sessions::CloudSessionGrantSetup {
-                    installation_id: device.device_id.clone(),
-                    organization_scope: "org_test".to_string(),
-                    effective_user_scope: "user_test".to_string(),
-                },
-                time::OffsetDateTime::now_utc(),
-            )
-            .unwrap();
-        grants.grant_create_request(&device.device_id).unwrap();
-        grants
-            .bind_backend_grant(
-                &cloud_control_backend_grant(&local, &device.device_id, "enabled", 1),
-                &device.device_id,
-            )
-            .unwrap();
-        let grant_before = grants.load().unwrap().unwrap();
-        let (api_base, register_observed, operation_finished) =
-            observed_install_registration_server();
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_install_blocked".to_string(),
-            setup_run_token_expires_at: "2030-01-01T00:00:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: api_base.clone(),
-        };
-        let mut credentials = SetupRunCredentials {
-            setup_run_token: "otsr_install_blocked".to_string(),
-            connection: connection.clone(),
-        };
-        let daemon = daemon()
-            .with_account(account.clone())
-            .with_connection(Some(connection));
-        let action = SetupRunActionApiResponse {
-            id: "action_install_blocked".to_string(),
-            action_type: "install_source".to_string(),
-            source: Some("pi".to_string()),
-        };
-
-        let result = run_install_source_action(
-            &daemon,
-            &api_base,
-            &mut credentials,
-            &action,
-            &test_machine(),
-        );
-        // Observe until the operation completes, even when setup is slow.
-        let _ = operation_finished.send(());
-        assert!(
-            matches!(result, Err(LocalApiError::CloudSessionCleanupRequired)),
-            "actual install result: {result:?}"
-        );
-        assert!(
-            !register_observed
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap(),
-            "device registration must not reach backend before cleanup"
-        );
-        let grant_after = grants.load().unwrap().unwrap();
-        assert_eq!(
-            grant_after.status,
-            crate::cloud_sessions::CloudSessionGrantStatus::Paused
-        );
-        assert_eq!(grant_after.grant_scope_id, grant_before.grant_scope_id);
-        assert_eq!(
-            grant_after.account_fingerprint,
-            grant_before.account_fingerprint
-        );
-        assert_eq!(grant_after.backend_binding, grant_before.backend_binding);
-        assert_eq!(
-            grant_after.backend_create_pending,
-            grant_before.backend_create_pending
-        );
-        assert_eq!(FileDeviceStore::default().load().unwrap(), Some(device));
-    }
-
-    #[test]
-    #[serial]
-    fn install_registration_reservation_blocks_prepare_until_local_install() {
-        let _guard = lock_backend_test_env();
-        let root = telemetry_key_store_root("install-reservation-clean-race");
-        let secret_root = telemetry_key_store_root("install-reservation-clean-race-secret");
-        fs::create_dir_all(&secret_root).unwrap();
-        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let account = connected_account();
-        let old_device = LocalDeviceBinding {
-            device_id: "00000000-0000-4000-8000-000000000001".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            sources: vec!["codex".to_string(), "pi".to_string()],
-        };
-        FileAccountStore::default().save(&account).unwrap();
-        FileDeviceStore::default().save(&old_device).unwrap();
-        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-            .save("otdev_old_install")
-            .unwrap();
-        let (api_base, register_seen, allow_register) = controlled_install_registration_server();
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_install_reserved".to_string(),
-            setup_run_token_expires_at: "2030-01-01T00:00:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: api_base.clone(),
-        };
-        let worker_daemon = Arc::new(
-            daemon()
-                .with_account(account)
-                .with_connection(Some(connection.clone())),
-        );
-        let worker_api = api_base.clone();
-        let worker = thread::spawn(move || {
-            let mut credentials = SetupRunCredentials {
-                setup_run_token: "otsr_install_reserved".to_string(),
-                connection,
-            };
-            run_install_source_action(
-                worker_daemon.as_ref(),
-                &worker_api,
-                &mut credentials,
-                &SetupRunActionApiResponse {
-                    id: "action_install_reserved".to_string(),
-                    action_type: "install_source".to_string(),
-                    source: Some("pi".to_string()),
-                },
-                &test_machine(),
-            )
-        });
-        register_seen
-            .recv_timeout(Duration::from_secs(2))
-            .expect("registration reached controlled backend");
-        assert_ne!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
-
-        let prepare_action = CloudSessionsControlAction::Prepare;
-        let prepare_slug = cloud_sessions_action_slug(&prepare_action);
-        let validation_api = cloud_control_validation_server(
-            prepare_slug,
-            "install-race-prepare",
-            &old_device.device_id,
-        );
-        let _validation_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &validation_api);
-        assert!(matches!(
-            cloud_sessions_control(
-                prepare_action,
-                SecretString::new(test_control_token(prepare_slug, "codex", 240)),
-                None,
-                None,
-            ),
-            Err(LocalApiError::IdentityMutationInProgress)
-        ));
-        assert!(crate::cloud_sessions::CloudSessionGrantStore::default()
-            .load()
-            .unwrap()
-            .is_none());
-
-        allow_register.send(()).unwrap();
-        let result = worker
-            .join()
-            .unwrap()
-            .expect("registration installs after release");
-        assert_eq!(result.0, "succeeded");
-        assert_eq!(
-            FileDeviceStore::default()
-                .load()
-                .unwrap()
-                .unwrap()
-                .device_id,
-            "device_reserved_install"
-        );
-        assert_eq!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    #[serial]
     fn provider_idle_wait_releases_lifecycle_lock_and_revalidates_revoke_identity() {
         let _guard = lock_backend_test_env();
         let root = telemetry_key_store_root("cloud-session-provider-fence-lock-order");
@@ -28440,208 +25600,6 @@ for line in sys.stdin:
             assert!(!persisted.contains(raw_id));
         }
         assert!(!persisted.contains("header."));
-    }
-
-    #[test]
-    #[serial]
-    fn cloud_sessions_prepare_rebinds_only_an_outdated_bound_collector() {
-        let _guard = lock_backend_test_env();
-        let root = telemetry_key_store_root("cloud-session-control-version-rebind");
-        let accounts = FileAccountStore::new(root.join("account.json"));
-        let devices = FileDeviceStore::new(root.join("device.json"));
-        let grants = crate::cloud_sessions::CloudSessionGrantStore::new(root.join("grant.json"));
-        let checkpoints =
-            crate::cloud_sessions::CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
-        let token_uses = crate::cloud_sessions::CloudSessionControlTokenUseStore::new(
-            root.join("control-token-uses.json"),
-        );
-        accounts.save(&connected_account()).unwrap();
-        let device_id = "00000000-0000-4000-8000-000000000001";
-        devices
-            .save(&LocalDeviceBinding {
-                device_id: device_id.to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            })
-            .unwrap();
-
-        let run = |action: CloudSessionsControlAction,
-                   token_id: &str,
-                   backend_grant: Option<CloudSessionBackendGrantResponseV1>| {
-            let action_slug = cloud_sessions_action_slug(&action);
-            let api_base = cloud_control_validation_server(action_slug, token_id, device_id);
-            let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base);
-            cloud_sessions_control_with_stores(
-                action,
-                SecretString::new(test_control_token(action_slug, "codex", 240)),
-                None,
-                backend_grant,
-                &accounts,
-                &devices,
-                &grants,
-                &checkpoints,
-                &token_uses,
-            )
-        };
-
-        let initial = run(
-            CloudSessionsControlAction::Prepare,
-            "version-rebind-initial",
-            None,
-        )
-        .unwrap();
-        assert!(initial.backend_create_request.is_some());
-        let pending = grants.load().unwrap().unwrap();
-        grants
-            .bind_backend_grant(
-                &cloud_control_backend_grant(&pending, device_id, "enabled", 1),
-                device_id,
-            )
-            .unwrap();
-
-        let unchanged = run(
-            CloudSessionsControlAction::Prepare,
-            "version-rebind-unchanged",
-            None,
-        )
-        .unwrap();
-        assert!(unchanged.backend_create_request.is_none());
-        assert_eq!(
-            unchanged.status.runtime_state,
-            crate::cloud_sessions::CloudSessionRuntimeState::TransportDeferred
-        );
-
-        let mut persisted: serde_json::Value =
-            serde_json::from_slice(&fs::read(grants.path()).unwrap()).unwrap();
-        persisted["grant"]["collector_version"] = serde_json::Value::String("0.1.89".to_string());
-        fs::write(
-            grants.path(),
-            serde_json::to_vec_pretty(&persisted).unwrap(),
-        )
-        .unwrap();
-
-        let outdated = run(
-            CloudSessionsControlAction::Prepare,
-            "version-rebind-outdated",
-            None,
-        )
-        .unwrap();
-        let create = outdated.backend_create_request.unwrap();
-        assert_eq!(create.installation_id, device_id);
-        assert_eq!(create.collector_version, compiled_release_version());
-        assert_eq!(create.grant_scope_fingerprint, pending.grant_scope_id);
-        assert_eq!(
-            outdated.status.runtime_state,
-            crate::cloud_sessions::CloudSessionRuntimeState::ConsentRequired
-        );
-        assert!(!outdated.status.provider_cli_invocation_permitted);
-        let rebind = grants.load().unwrap().unwrap();
-        assert!(rebind.backend_create_pending);
-        assert_eq!(rebind.collector_version, "0.1.89");
-        assert_eq!(
-            rebind.backend_binding.as_ref().unwrap().grant_id,
-            "00000000-0000-4000-8000-000000000002"
-        );
-
-        // Model a lost Prepare response before the browser POST. Authenticated
-        // Status returns the exact persisted create request across retries,
-        // while preserving the old bound grant solely for exact cleanup.
-        let first_status = run(
-            CloudSessionsControlAction::Status,
-            "version-rebind-status-first",
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            first_status.status.reason_code,
-            "backend_grant_reconciliation_required"
-        );
-        assert_eq!(first_status.backend_create_request.as_ref(), Some(&create));
-        let second_status = run(
-            CloudSessionsControlAction::Status,
-            "version-rebind-status-second",
-            None,
-        )
-        .unwrap();
-        assert_eq!(second_status.backend_create_request, Some(create.clone()));
-        let kill_switch = EnvVarGuard::set_str("OTTTO_CODEX_CLOUD_SESSIONS_DISABLED", "1");
-        let policy_disabled_status = run(
-            CloudSessionsControlAction::Status,
-            "version-rebind-status-policy-disabled",
-            None,
-        )
-        .unwrap();
-        assert_eq!(policy_disabled_status.status.reason_code, "policy_disabled");
-        assert_eq!(
-            policy_disabled_status.backend_create_request,
-            Some(create.clone())
-        );
-        drop(kill_switch);
-        let still_pending = grants.load().unwrap().unwrap();
-        assert!(still_pending.backend_create_pending);
-        assert_eq!(
-            still_pending
-                .backend_binding
-                .as_ref()
-                .unwrap()
-                .grant_version,
-            1
-        );
-
-        // If local revoke wins just before the recovered POST response is
-        // bound, Bind stays locally revoked and retains only the exact newer
-        // grant epoch needed for compensating DELETE.
-        grants.revoke(time::OffsetDateTime::now_utc()).unwrap();
-        let bind_response = cloud_control_backend_grant(&still_pending, device_id, "enabled", 2);
-        let raced_bind = run(
-            CloudSessionsControlAction::Bind,
-            "version-rebind-bind-after-revoke",
-            Some(bind_response),
-        )
-        .unwrap();
-        assert_eq!(
-            raced_bind.status.runtime_state,
-            crate::cloud_sessions::CloudSessionRuntimeState::Revoked
-        );
-        assert_eq!(
-            raced_bind.status.reason_code,
-            "backend_revocation_confirmation_required"
-        );
-        assert!(raced_bind.backend_create_request.is_none());
-        let rebound = grants.load().unwrap().unwrap();
-        assert!(!rebound.backend_create_pending);
-        assert_eq!(rebound.backend_binding.as_ref().unwrap().grant_version, 2);
-
-        let pending_cleanup = run(
-            CloudSessionsControlAction::Status,
-            "version-rebind-status-cleanup",
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            pending_cleanup.status.reason_code,
-            "backend_revocation_confirmation_required"
-        );
-        assert!(pending_cleanup.backend_create_request.is_none());
-
-        let revoke = run(
-            CloudSessionsControlAction::Revoke,
-            "version-rebind-revoke",
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            revoke.backend_revoke_target.unwrap().grant_id,
-            "00000000-0000-4000-8000-000000000002"
-        );
-        let revoked_response = cloud_control_backend_grant(&rebound, device_id, "revoked", 3);
-        let confirmed = run(
-            CloudSessionsControlAction::ConfirmRevoked,
-            "version-rebind-confirm",
-            Some(revoked_response),
-        )
-        .unwrap();
-        assert_eq!(confirmed.status.reason_code, "revoked");
     }
 
     fn provider_daily_reference_backend_grant(
@@ -29280,49 +26238,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn telemetry_control_disable_without_indexed_key_removes_local_config() {
-        let _guard = lock_backend_test_env();
-        let store_root = telemetry_key_store_root("disable-no-index");
-        let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
-        let install_root = telemetry_key_store_root("disable-no-index-install");
-        let _home_guard = EnvVarGuard::set_path("HOME", &install_root);
-        let config_path = install_root.join(".codex/config.toml");
-        patch_codex_config_at(&config_path, &install_root.join("backups")).expect("seed config");
-
-        let api_base_url = control_token_validation_server(200);
-        let _api_base_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_telemetry_disable_no_index".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: None,
-                client_kind: Some(LocalClientKind::WebUi),
-                client_install_owner: None,
-                command: LocalControlCommand::TelemetryControl {
-                    action: TelemetryControlAction::DisableTelemetry,
-                    source: SourceKind::Codex,
-                    control_token: test_control_token("disable_telemetry", "codex", 300),
-                    api_base_url: Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
-                    key_id: None,
-                    organization_id: None,
-                    otlp_endpoint: None,
-                    ingest_key: None,
-                },
-            },
-        );
-
-        assert!(response.ok, "{response:?}");
-        let payload = response.payload.expect("payload");
-        assert_eq!(payload.get("key_id"), Some(&serde_json::Value::Null));
-        let config = fs::read_to_string(config_path).expect("read config");
-        assert!(!config.contains("# ottto:start"));
-        assert!(!config.contains("# ottto:end"));
-        assert!(!codex_config_has_relay_otel(&config));
-    }
-
-    #[test]
-    #[serial]
     fn telemetry_control_disable_preserves_key_when_fence_needs_review() {
         let _guard = lock_backend_test_env();
         let store_root = telemetry_key_store_root("disable-manual-fence");
@@ -29381,51 +26296,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn telemetry_control_status_returns_indexed_key_id() {
-        let _guard = lock_backend_test_env();
-        let store_root = telemetry_key_store_root("status-key");
-        let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
-        let store = TelemetryKeyStore::file_only(&store_root);
-        store
-            .save(&SourceKind::Codex, "key_status", "transit_secret_for_tests")
-            .expect("seed key");
-
-        let api_base_url = control_token_validation_server(200);
-        let _api_base_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_telemetry_status".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: None,
-                client_kind: Some(LocalClientKind::WebUi),
-                client_install_owner: None,
-                command: LocalControlCommand::TelemetryControl {
-                    action: TelemetryControlAction::Status,
-                    source: SourceKind::Codex,
-                    control_token: test_control_token("status", "codex", 300),
-                    api_base_url: Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
-                    key_id: None,
-                    organization_id: None,
-                    otlp_endpoint: None,
-                    ingest_key: None,
-                },
-            },
-        );
-
-        assert!(response.ok, "{response:?}");
-        assert_eq!(
-            response
-                .payload
-                .expect("payload")
-                .get("key_id")
-                .and_then(|value| value.as_str()),
-            Some("key_status")
-        );
-    }
-
-    #[test]
-    #[serial]
     fn uninstall_sweep_removes_indexed_telemetry_keys() {
         let _guard = lock_backend_test_env();
         let store_root = telemetry_key_store_root("uninstall");
@@ -29458,48 +26328,6 @@ for line in sys.stdin:
             .contains(&"keychain://ottto-telemetry-key-claude_code/key_uninstall".to_string()));
         assert!(matches!(
             store.load(&SourceKind::ClaudeCode, "key_uninstall"),
-            Err(TelemetryKeychainError::Missing)
-        ));
-    }
-
-    #[test]
-    #[serial]
-    fn telemetry_control_enable_needs_attention_when_agent_missing() {
-        let _guard = lock_backend_test_env();
-        let store_root = telemetry_key_store_root("missing-agent");
-        let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
-        let missing = AgentInstallationDetection {
-            source: SourceKind::ClaudeCode,
-            installed: false,
-            version: None,
-            config_path: None,
-            binary_path: None,
-            install_docs_url: Some("https://example.invalid/codex".to_string()),
-        };
-
-        let _api_base_guard =
-            EnvVarGuard::set_str("OTTTO_API_BASE_URL", &control_token_validation_server(200));
-        let response = telemetry_control_with_detector(
-            &daemon(),
-            TelemetryControlAction::EnableTelemetry,
-            SourceKind::ClaudeCode,
-            test_control_token("enable_telemetry", "claude_code", 300),
-            // Ignored for token validation (resolved via OTTTO_API_BASE_URL).
-            Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
-            Some("key_missing".to_string()),
-            Some("org_123".to_string()),
-            Some("https://api.ottto.net".to_string()),
-            Some(SecretString::new("transit_secret_for_tests")),
-            &|_| missing.clone(),
-        )
-        .expect("control result");
-
-        assert_eq!(response.status, ControlResultStatus::NeedsAttention);
-        assert!(!response.requires_restart);
-        assert_eq!(response.message.code, "agent_not_installed");
-        assert_eq!(response.installation, Some(missing));
-        assert!(matches!(
-            TelemetryKeyStore::file_only(&store_root).load(&SourceKind::ClaudeCode, "key_missing"),
             Err(TelemetryKeychainError::Missing)
         ));
     }
@@ -29562,105 +26390,6 @@ for line in sys.stdin:
             response.error.expect("error").code,
             CliErrorCode::LocalClientNotTrusted
         );
-    }
-
-    #[test]
-    #[serial]
-    fn telemetry_control_rejects_backend_rejected_token() {
-        let _guard = lock_backend_test_env();
-        let api_base_url = control_token_validation_server(401);
-        let _api_base_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_telemetry_backend_reject".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: None,
-                client_kind: Some(LocalClientKind::WebUi),
-                client_install_owner: None,
-                command: LocalControlCommand::TelemetryControl {
-                    action: TelemetryControlAction::Status,
-                    source: SourceKind::Codex,
-                    control_token: test_control_token("status", "codex", 300),
-                    api_base_url: Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
-                    key_id: None,
-                    organization_id: None,
-                    otlp_endpoint: None,
-                    ingest_key: None,
-                },
-            },
-        );
-
-        assert!(!response.ok);
-        assert_eq!(
-            response.error.expect("error").code,
-            CliErrorCode::LocalClientNotTrusted
-        );
-    }
-
-    #[test]
-    fn telemetry_control_requires_enable_materials() {
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_telemetry_missing_key".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: None,
-                client_kind: Some(LocalClientKind::WebUi),
-                client_install_owner: None,
-                command: LocalControlCommand::TelemetryControl {
-                    action: TelemetryControlAction::EnableTelemetry,
-                    source: SourceKind::Codex,
-                    control_token: test_control_token("enable_telemetry", "codex", 300),
-                    api_base_url: None,
-                    key_id: Some("key_123".to_string()),
-                    organization_id: Some("org_123".to_string()),
-                    otlp_endpoint: Some("https://api.ottto.net".to_string()),
-                    ingest_key: None,
-                },
-            },
-        );
-
-        assert!(!response.ok);
-        assert_eq!(
-            response.error.expect("error").code,
-            CliErrorCode::InvalidRequest
-        );
-    }
-
-    #[test]
-    fn pi_smoke_command_includes_route_provider_model_and_thinking() {
-        let route = PiModelRoute {
-            provider: "google-vertex".to_string(),
-            model: "gemini-2.5-flash-lite".to_string(),
-            thinking_level: Some("high".to_string()),
-            classification: crate::agent_status::PiRouteClassification {
-                model_provider: Some("google".to_string()),
-                billing_provider: Some("google".to_string()),
-                billing_channel: Some("google_vertex".to_string()),
-                auth_mode: Some("service_account".to_string()),
-                gateway_provider: None,
-                subscription_product: None,
-                source_category: Some("google_cloud_vertex".to_string()),
-            },
-        };
-
-        let command = pi_smoke_command(Some(&route));
-
-        assert_eq!(command.program, "pi");
-        assert!(command
-            .args
-            .windows(2)
-            .any(|args| args[0] == "--provider" && args[1] == "google-vertex"));
-        assert!(command
-            .args
-            .windows(2)
-            .any(|args| args[0] == "--model" && args[1] == "gemini-2.5-flash-lite"));
-        assert!(command
-            .args
-            .windows(2)
-            .any(|args| args[0] == "--thinking" && args[1] == "high"));
-        assert_eq!(command.args.last().map(String::as_str), Some(SMOKE_PROMPT));
     }
 
     #[test]
@@ -29872,54 +26601,6 @@ for line in sys.stdin:
     #[cfg(unix)]
     #[test]
     #[serial]
-    fn live_pi_census_error_returns_failed_without_spawning_smoke() {
-        let root = control_test_root("pi-live-census-error");
-        let home = root.join("home");
-        create_control_test_dir(&home);
-        let _home_guard = EnvVarGuard::set_path("HOME", &home);
-        let smoke_ran = std::cell::Cell::new(false);
-        let private_error = "/Users/private/operator/pi-census";
-
-        let result = run_pi_route_pre_smoke_with(
-            &live_pi_route(),
-            || {
-                Err(LocalApiError::LocalOperationFailed(
-                    private_error.to_string(),
-                ))
-            },
-            |_, _| {
-                smoke_ran.set(true);
-                panic!("smoke must not run after a census error")
-            },
-        );
-        let failed = match result {
-            Ok(_) => panic!("census error must fail before smoke"),
-            Err(failed) => *failed,
-        };
-
-        assert!(!smoke_ran.get());
-        assert_eq!(failed.status, SourceVerificationStatus::Failed);
-        assert!(!failed.verified);
-        assert!(!failed.command_succeeded);
-        assert_eq!(
-            failed.error_code.as_deref(),
-            Some(PI_SESSION_CENSUS_FAILED_CODE)
-        );
-        assert_eq!(failed.message.code, PI_SESSION_CENSUS_FAILED_CODE);
-        assert!(!failed.message.text.contains(private_error));
-        assert!(!failed.message.text.contains("/Users/"));
-        assert!(failed.message.text.contains("~/.pi/agent/sessions"));
-        let aggregate = pi_route_aggregate_result(vec![failed]);
-        assert_eq!(aggregate.status, SourceVerificationStatus::Failed);
-        assert_eq!(aggregate.message.code, PI_SESSION_CENSUS_FAILED_CODE);
-        assert!(!aggregate.message.text.contains(private_error));
-        assert!(!aggregate.message.text.contains("/Users/"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
     fn live_pi_root_replacement_during_smoke_cannot_verify_from_reopened_count() {
         let root = control_test_root("pi-live-root-replaced-during-smoke");
         let home = root.join("home");
@@ -29985,45 +26666,6 @@ for line in sys.stdin:
 
     #[cfg(unix)]
     #[test]
-    #[serial]
-    fn failed_live_pi_smoke_remains_primary_when_root_changes() {
-        let root = control_test_root("pi-live-root-replaced-after-failed-smoke");
-        let home = root.join("home");
-        create_control_test_dir(&home);
-        let sessions = home.join(".pi/agent/sessions");
-        let original = home.join(".pi/agent/sessions-original");
-        let _home_guard = EnvVarGuard::set_path("HOME", &home);
-
-        let (_, _, smoke) = run_pi_route_pre_smoke_with(
-            &live_pi_route(),
-            prepare_pi_live_session_census,
-            |_, _| {
-                fs::rename(&sessions, &original).expect("move held pre-smoke root");
-                fs::create_dir(&sessions).expect("create replacement session root");
-                SmokeResult {
-                    command_found: true,
-                    succeeded: false,
-                    exit_status: Some(23),
-                    duration_ms: 2,
-                    message: "fake Pi smoke failed".to_string(),
-                    diagnostic: Some("synthetic smoke failure".to_string()),
-                    error_code: Some("smoke_command_failed".to_string()),
-                    local_session_observed: Some(true),
-                }
-            },
-        )
-        .expect("failed smoke remains the primary route result");
-
-        assert!(!smoke.succeeded);
-        assert_eq!(smoke.exit_status, Some(23));
-        assert_eq!(smoke.error_code.as_deref(), Some("smoke_command_failed"));
-        assert_eq!(smoke.local_session_observed, None);
-        assert_eq!(smoke.message, "fake Pi smoke failed");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn live_pi_root_establishment_refuses_symlink_without_creating_beyond_it() {
         use std::os::unix::fs::symlink;
 
@@ -30035,31 +26677,6 @@ for line in sys.stdin:
         assert!(!outside.join("agent").exists());
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn live_pi_root_establishment_securely_reopens_an_eexist_race_winner() {
-        let home = control_test_root("pi-live-root-eexist");
-        let held_home = open_pi_session_root_direct_io(&home).expect("hold test HOME");
-        let pi = home.join(".pi");
-
-        let opened = open_or_create_pi_directory_component_with(
-            &held_home.directory,
-            ".pi".as_ref(),
-            |_, _| {
-                fs::create_dir(&pi).expect("race winner creates a real directory");
-                Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
-            },
-        )
-        .expect("secure reopen accepts a real EEXIST race winner");
-
-        let opened_metadata = opened.metadata().expect("opened race winner metadata");
-        let path_metadata = fs::metadata(&pi).expect("race winner path metadata");
-        assert!(opened_metadata.is_dir());
-        assert_eq!(opened_metadata.dev(), path_metadata.dev());
-        assert_eq!(opened_metadata.ino(), path_metadata.ino());
-        let _ = fs::remove_dir_all(home);
     }
 
     #[cfg(unix)]
@@ -30084,77 +26701,6 @@ for line in sys.stdin:
         assert!(!outside.join("agent").exists());
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn live_pi_root_establishment_preserves_existing_component_mode() {
-        let home = control_test_root("pi-live-existing-mode");
-        let pi = home.join(".pi");
-        fs::create_dir(&pi).expect("create existing .pi");
-        fs::set_permissions(&pi, fs::Permissions::from_mode(0o750)).expect("set existing .pi mode");
-
-        let opened = open_or_create_pi_session_root_from_home_io(&home)
-            .expect("securely complete existing Pi tree");
-
-        assert_eq!(
-            fs::metadata(&pi)
-                .expect("existing .pi metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o750,
-            "live Verify must not change an existing Pi directory mode"
-        );
-        assert_eq!(
-            opened
-                .directory
-                .metadata()
-                .expect("held sessions descriptor")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn passive_pi_session_selection_does_not_create_missing_root() {
-        let root = control_test_root("pi-passive-missing-root");
-        let home = root.join("home");
-        create_control_test_dir(&home);
-        let _home_guard = EnvVarGuard::set_path("HOME", &home);
-
-        let selection =
-            recent_pi_session_files(UNIX_EPOCH).expect("passive missing root remains no data");
-
-        assert!(selection.is_none());
-        assert!(!home.join(".pi").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(not(unix))]
-    #[test]
-    fn pi_session_import_refuses_unsupported_non_unix_target_before_path_access() {
-        let absent = Path::new("definitely-absent-pi-session-root");
-        for result in [
-            open_pi_session_root_from_home(absent),
-            open_pi_session_root_direct(absent),
-        ] {
-            let error = match result {
-                Ok(_) => panic!("non-Unix Pi session access must fail closed"),
-                Err(error) => error,
-            };
-            assert!(
-                error
-                    .to_string()
-                    .contains(PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON),
-                "unexpected refusal: {error}"
-            );
-        }
     }
 
     #[cfg(unix)]
@@ -30196,77 +26742,6 @@ for line in sys.stdin:
         assert_eq!(files, BTreeSet::from([real]));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_session_missing_root_remains_no_data() {
-        let root = control_test_root("pi-session-missing-root");
-        fs::remove_dir_all(&root).expect("remove Pi session root");
-
-        let files = pi_session_files_in(&root).expect("missing top-level root is no data");
-
-        assert!(files.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_session_traversal_refuses_a_vanished_candidate() {
-        let root = control_test_root("pi-session-vanished-candidate");
-        let vanished = root.join("vanished.jsonl");
-        let mut entries_seen = 0;
-        let mut files = BTreeSet::new();
-
-        let error = collect_pi_session_files(
-            &vanished,
-            1,
-            &mut entries_seen,
-            &mut files,
-            PI_SESSION_SAFETY_LIMITS,
-        )
-        .expect_err("a candidate that vanished after enumeration must refuse the census");
-
-        assert!(error.to_string().contains("could not inspect"));
-        assert!(files.is_empty());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_before_smoke_census_cannot_reclassify_existing_files_as_new() {
-        let root = control_test_root("pi-session-unreadable-before-smoke");
-        let blocked = root.join("blocked");
-        let preexisting = blocked.join("preexisting.jsonl");
-        fs::create_dir(&blocked).expect("create blocked session directory");
-        fs::write(&preexisting, b"preexisting\n").expect("write pre-existing session");
-        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000))
-            .expect("make session directory unreadable");
-
-        // Privileged Unix users may bypass mode bits. Exercise the portable
-        // permission-denied contract when this platform enforces them.
-        if fs::read_dir(&blocked).is_ok() {
-            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
-                .expect("restore readable session directory");
-            let _ = fs::remove_dir_all(root);
-            return;
-        }
-
-        let before = pi_session_files_in(&root);
-        assert!(
-            before.is_err(),
-            "an unreadable before-smoke subtree must not yield a partial baseline"
-        );
-
-        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
-            .expect("restore readable session directory");
-        let after = pi_session_files_in(&root).expect("read restored session tree");
-        assert_eq!(after, BTreeSet::from([preexisting]));
-        assert!(
-            before.ok().is_none(),
-            "failed baseline leaves no set from which pre-existing files can appear new"
-        );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -30320,64 +26795,6 @@ for line in sys.stdin:
             .expect_err("count/selection must refuse a replaced root");
         assert!(error.to_string().contains("session root changed"));
         let _ = fs::remove_dir_all(parent);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_session_live_census_refuses_root_replacement_between_censuses() {
-        let parent = control_test_root("pi-session-live-root-replacement");
-        let root = parent.join("sessions");
-        let original = parent.join("sessions-original");
-        fs::create_dir(&root).expect("create pre-smoke session root");
-        let baseline_session = root.join("baseline.jsonl");
-        fs::write(&baseline_session, b"baseline\n").expect("write baseline session");
-        let opened_root = open_pi_test_root(&root);
-        let files = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
-            .expect("capture complete pre-smoke census");
-        let before = PiSessionCensus {
-            root: opened_root,
-            files,
-        };
-
-        fs::rename(&root, &original).expect("move pre-smoke root generation");
-        fs::create_dir(&root).expect("create replacement root generation");
-        let replacement_session = root.join("preexisting-in-replacement.jsonl");
-        fs::write(&replacement_session, b"pre-existing\n")
-            .expect("write pre-existing replacement session");
-
-        let error = new_pi_route_session_files(&before)
-            .expect_err("a different real root generation must be refused before selection");
-
-        assert!(error.to_string().contains("session root changed"));
-        assert!(replacement_session.exists());
-        let _ = fs::remove_dir_all(parent);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_session_selection_refuses_descendant_swap_after_discovery() {
-        use std::os::unix::fs::symlink;
-
-        let root = control_test_root("pi-session-selection-swap");
-        let outside = control_test_root("pi-session-selection-swap-outside");
-        let nested = root.join("nested");
-        fs::create_dir(&nested).expect("create nested session directory");
-        let session = nested.join("session.jsonl");
-        fs::write(&session, b"inside\n").expect("write inside session");
-        fs::write(outside.join("session.jsonl"), b"outside-secret\n")
-            .expect("write outside session");
-        let opened_root = open_pi_test_root(&root);
-        let files = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
-            .expect("discover and validate inside session");
-
-        fs::rename(&nested, root.join("nested-original")).expect("move nested directory");
-        symlink(&outside, &nested).expect("replace nested directory with symlink");
-        let error = pi_session_files_modified_since(&opened_root, files, UNIX_EPOCH)
-            .expect_err("recent-file selection must refuse a descendant swap");
-        assert!(error.to_string().contains("session tree changed"));
-
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
     }
 
     #[cfg(unix)]
@@ -30582,88 +26999,6 @@ for line in sys.stdin:
         assert!(result.verified);
         assert_eq!(result.records_seen, 1);
         assert_eq!(result.message.code, "pi_route_warnings");
-    }
-
-    #[test]
-    fn pi_route_aggregate_accepts_local_only_session_evidence() {
-        let route_results = vec![
-            SourceRouteVerificationResult {
-                provider: Some("gcp-glm".to_string()),
-                model: Some("zai-org/glm-5-maas".to_string()),
-                model_provider: None,
-                billing_provider: Some("gcp-glm".to_string()),
-                billing_channel: Some("direct_api".to_string()),
-                auth_mode: Some("api_key".to_string()),
-                gateway_provider: None,
-                subscription_product: None,
-                source_category: Some("unknown".to_string()),
-                account_identifier_hash: None,
-                organization_identifier_hash: None,
-                credential_fingerprint_hash: None,
-                billing_identity_evidence: None,
-                billing_identity_confidence: ottto_protocol::AgentStatusConfidence::Unknown,
-                status: SourceVerificationStatus::Warning,
-                verified: true,
-                records_seen: 0,
-                last_record_id: None,
-                last_received_at: None,
-                smoke_after: Some("2026-06-26T08:00:00Z".to_string()),
-                command_found: true,
-                command_succeeded: true,
-                exit_status: Some(0),
-                duration_ms: 20_000,
-                diagnostic: None,
-                error_code: Some(PI_LOCAL_ONLY_CODE.to_string()),
-                local_session_observed: Some(true),
-                message: StableMessage {
-                    code: PI_LOCAL_ONLY_CODE.to_string(),
-                    text: "Pi route created a local session. Pi is local-only.".to_string(),
-                },
-                check: None,
-            },
-            SourceRouteVerificationResult {
-                provider: Some("google-vertex".to_string()),
-                model: Some("gemini-3.1-pro-preview".to_string()),
-                model_provider: Some("google".to_string()),
-                billing_provider: Some("google".to_string()),
-                billing_channel: Some("google_vertex".to_string()),
-                auth_mode: Some("service_account".to_string()),
-                gateway_provider: None,
-                subscription_product: None,
-                source_category: Some("google_cloud_vertex".to_string()),
-                account_identifier_hash: None,
-                organization_identifier_hash: None,
-                credential_fingerprint_hash: None,
-                billing_identity_evidence: None,
-                billing_identity_confidence: ottto_protocol::AgentStatusConfidence::Unknown,
-                status: SourceVerificationStatus::Failed,
-                verified: false,
-                records_seen: 0,
-                last_record_id: None,
-                last_received_at: None,
-                smoke_after: Some("2026-06-26T08:01:00Z".to_string()),
-                command_found: true,
-                command_succeeded: false,
-                exit_status: Some(1),
-                duration_ms: 7_000,
-                diagnostic: Some("Vertex route rejected credentials.".to_string()),
-                error_code: Some("smoke_command_failed".to_string()),
-                local_session_observed: Some(false),
-                message: StableMessage {
-                    code: "smoke_command_failed".to_string(),
-                    text: "Pi route failed smoke.".to_string(),
-                },
-                check: None,
-            },
-        ];
-
-        let result = pi_route_aggregate_result(route_results);
-
-        assert_eq!(result.status, SourceVerificationStatus::Warning);
-        assert!(result.verified);
-        assert_eq!(result.message.code, "pi_route_warnings");
-        assert!(result.message.text.contains("0 live and 1 local-only"));
-        assert!(!result.message.text.contains("No Pi model routes passed"));
     }
 
     #[test]
@@ -30974,62 +27309,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    fn codex_source_off_preserves_external_exporters_and_cleans_legacy_unfenced_owned_ones() {
-        let owned = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
-        let body = owned.replace(
-            "http://127.0.0.1:44621/v1/traces",
-            "https://collector.example/v1/traces",
-        );
-        let next = codex_source_off_body(&body).unwrap();
-        assert!(!next.contains("/v1/logs"));
-        assert!(!next.contains("/v1/metrics"));
-        assert!(next.contains("https://collector.example/v1/traces"));
-        assert_eq!(codex_source_off_body(&next).unwrap(), next);
-        let no_header = owned.replace("X-Ottto-Local-Relay", "External-Header");
-        assert_eq!(codex_source_off_body(&no_header).unwrap(), no_header);
-    }
-
-    #[test]
-    fn codex_source_off_removes_owned_exporters_outside_fence_and_preserves_custom_fields() {
-        let outside = format!("# ottto:start\notel.environment = \"prod\"\notel.log_user_prompt = false\n# ottto:end\n{}\n", render_codex_relay_toml_block_for_base("http://127.0.0.1:44621").lines().skip(2).collect::<Vec<_>>().join("\n"));
-        let next = codex_source_off_body(&outside).unwrap();
-        assert!(!next.contains("/v1/logs"));
-        assert!(!next.contains("/v1/traces"));
-        assert!(!next.contains("/v1/metrics"));
-        let custom = format!(
-            "# ottto:start\n{}\n# ottto:end\n",
-            render_codex_relay_toml_block_for_base("http://127.0.0.1:44621")
-                .replace("\"prod\"", "\"custom\"")
-                .replace("log_user_prompt = false", "log_user_prompt = true")
-        );
-        let next = codex_source_off_body(&custom).unwrap();
-        let doc = next.parse::<DocumentMut>().unwrap();
-        assert_eq!(doc["otel"]["environment"].as_str(), Some("custom"));
-        assert_eq!(doc["otel"]["log_user_prompt"].as_bool(), Some(true));
-        assert!(!next.contains("/v1/logs"));
-    }
-
-    #[test]
-    fn codex_source_off_preserves_table_scope_after_legacy_fence() {
-        let body = "# ottto:start\n[otel]\nenvironment = \"prod\"\nlog_user_prompt = false\nexporter = { otlp-http = { endpoint = \"http://127.0.0.1:44621/v1/logs\", headers = { X-Ottto-Local-Relay = \"codex\" } } }\n# ottto:end\ncustom_setting = true\n";
-        let next = codex_source_off_body(body).unwrap();
-        let doc = next.parse::<DocumentMut>().unwrap();
-        assert_eq!(doc["otel"]["custom_setting"].as_bool(), Some(true));
-        assert!(doc.get("custom_setting").is_none());
-        assert!(!next.contains("/v1/logs"));
-        assert_eq!(codex_source_off_body(&next).unwrap(), next);
-    }
-
-    #[test]
-    fn codex_source_off_handles_inline_otel_without_false_clean() {
-        let body = "otel = { exporter = { otlp-http = { endpoint = \"http://127.0.0.1:44621/v1/logs\", headers = { X-Ottto-Local-Relay = \"codex\" } } }, environment = \"custom\" }\n";
-        let next = codex_source_off_body(body).unwrap();
-        assert!(!next.contains("/v1/logs"));
-        assert!(next.contains("custom"));
-        assert_eq!(codex_source_off_body(&next).unwrap(), next);
-    }
-
-    #[test]
     fn codex_source_off_compare_before_replace_refuses_concurrent_edits() {
         let root = control_test_root("codex-source-off-edit-conflict");
         fs::create_dir_all(&root).unwrap();
@@ -31098,18 +27377,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    fn codex_source_off_ignores_marker_lines_in_multiline_values_and_comments() {
-        let owned = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
-        let prefix = "description = '''\n# ottto:start\n# ottto:end\n'''\n# example # ottto:end\n";
-        let body = format!("{prefix}{owned}\n# ottto:end\n");
-        let next = codex_source_off_body(&body).unwrap();
-        assert!(next.starts_with(prefix));
-        assert!(!next.contains("/v1/"));
-        assert_eq!(codex_source_off_body(&next).unwrap(), next);
-        assert_eq!(codex_source_off_body(prefix).unwrap(), prefix);
-    }
-
-    #[test]
     fn codex_source_off_orphan_refuses_unknown_ownership_without_backup_or_write() {
         let root = control_test_root("codex-orphan-fence-refusals");
         fs::create_dir_all(&root).unwrap();
@@ -31143,40 +27410,6 @@ X-API-Key = "otel_redacted"
             assert_eq!(fs::read(&path).unwrap(), body.as_bytes());
             assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         }
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn codex_source_off_orphan_repair_clears_verify_drift_and_is_idempotent() {
-        let root = control_test_root("codex-orphan-fence-repair");
-        fs::create_dir_all(&root).unwrap();
-        let path = root.join("config.toml");
-        let body = format!(
-            "{}\n# ottto:end\n",
-            render_codex_relay_toml_block_for_base("http://127.0.0.1:44621")
-        );
-        fs::write(&path, &body).unwrap();
-        let before = codex_config_state_at(&path, "config", "", false);
-        assert_eq!(before.drift[0].key, "codex.ottto_exporters");
-        assert_eq!(
-            config_drift_verification_result(SourceKind::Codex, before, false)
-                .message
-                .code,
-            "config_drift"
-        );
-        let repaired = reconcile_codex_source_off_at(&path, &root.join("backups")).unwrap();
-        assert!(repaired.changed && repaired.backup_created);
-        assert!(codex_config_state_at(&path, "config", "", false)
-            .drift
-            .is_empty());
-        let unchanged = reconcile_codex_source_off_at(&path, &root.join("backups")).unwrap();
-        assert!(!unchanged.changed && !unchanged.backup_created);
-        fs::write(&path, "# ottto:end\n[broken\n").unwrap();
-        let manual = codex_config_state_at(&path, "config", "", false);
-        let message = config_drift_verification_result(SourceKind::Codex, manual, false).message;
-        assert_eq!(message.code, "manual_fence_review_required");
-        assert!(message.text.contains("left it unchanged"));
-        assert!(!message.text.contains("Use Repair"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -31369,51 +27602,6 @@ X-API-Key = "otel_redacted"
     #[test]
     #[serial]
     #[cfg(unix)]
-    fn startup_relay_reuses_approved_free_port_without_rewriting_settings() {
-        let (root, _guards) = managed_claude_relay_fixture();
-        let port = startup_relay_candidates()[1];
-        let base = crate::otlp_relay::local_relay_base_url_for_port(port);
-        let settings = root.join(".claude/settings.json");
-        let support = root.join("support");
-        patch_claude_code_settings_at_with_relay_base(&settings, &test_machine(), &support, &base)
-            .unwrap();
-        let prepared = FileClaudeConfigSlotSettingsStore::default()
-            .prepare_managed_account_target(
-                1,
-                "claude_setup_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        let managed_root = prepared.managed_slots[0].config_dir.as_deref().unwrap();
-        provision_managed_claude_relay_settings(managed_root).unwrap();
-        let managed_settings = Path::new(managed_root).join("settings.json");
-        let default_before = fs::read(&settings).unwrap();
-        let managed_before = fs::read(&managed_settings).unwrap();
-
-        let listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
-        assert_eq!(listener.local_addr().unwrap().port(), port);
-        let bound_base = format!("http://{}", listener.local_addr().unwrap());
-        assert!(
-            !patch_claude_code_settings_at_with_relay_base(
-                &settings,
-                &test_machine(),
-                &support,
-                &bound_base,
-            )
-            .unwrap()
-            .changed
-        );
-        assert!(!repair_registered_managed_claude_relay_settings().unwrap());
-        assert_eq!(fs::read(&settings).unwrap(), default_before);
-        assert_eq!(fs::read(&managed_settings).unwrap(), managed_before);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    #[cfg(unix)]
     fn startup_relay_busy_preferred_port_uses_default_then_fallbacks() {
         let (root, _guards) = managed_claude_relay_fixture();
         let ports = startup_relay_candidates();
@@ -31466,40 +27654,6 @@ X-API-Key = "otel_redacted"
             listener.local_addr().unwrap().port(),
             crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT
         );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    #[cfg(unix)]
-    fn rebind_retries_busy_approved_port_instead_of_old_or_default_port() {
-        let (root, _guards) = managed_claude_relay_fixture();
-        let ports = startup_relay_candidates();
-        write_startup_relay_settings(
-            &root,
-            &crate::otlp_relay::local_relay_base_url_for_port(ports[1]),
-        );
-        let settings = root.join(".claude/settings.json");
-        let before = fs::read(&settings).unwrap();
-        let mut busy = Some(std::net::TcpListener::bind(("127.0.0.1", ports[1])).unwrap());
-        let mut attempts = 0;
-        let listener =
-            crate::otlp_relay::rebind_relay_listener(ports[0], &mut |old_port, attempt| {
-                attempts += 1;
-                let result =
-                    crate::otlp_relay::bind_replacement_local_relay_listener(old_port, attempt);
-                if attempts == 1 {
-                    assert!(
-                        result.is_err(),
-                        "must retry approved port even while default is free"
-                    );
-                    drop(busy.take());
-                }
-                result
-            });
-        assert_eq!(attempts, 2);
-        assert_eq!(listener.local_addr().unwrap().port(), ports[1]);
-        assert_eq!(fs::read(settings).unwrap(), before);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -31594,30 +27748,6 @@ X-API-Key = "otel_redacted"
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         server.join().unwrap();
         assert_eq!(fs::read(settings).unwrap(), before);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    #[cfg(unix)]
-    fn rebind_without_approval_keeps_old_default_and_fallback_chain() {
-        let (root, _guards) = managed_claude_relay_fixture();
-        FileDeviceStore::default()
-            .save(&LocalDeviceBinding {
-                device_id: "test".into(),
-                machine_id: None,
-                sources: vec!["codex".into()],
-            })
-            .unwrap();
-        let ports = startup_relay_candidates();
-        let bind =
-            || crate::otlp_relay::bind_replacement_local_relay_listener(ports[1], 1).unwrap();
-        let old = bind();
-        assert_eq!(old.local_addr().unwrap().port(), ports[1]);
-        let default = bind();
-        assert_eq!(default.local_addr().unwrap().port(), ports[0]);
-        let fallback = bind();
-        assert_eq!(fallback.local_addr().unwrap().port(), ports[2]);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -31776,49 +27906,6 @@ X-API-Key = "otel_redacted"
             )
             .contains_key(&finding.code)
         );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn managed_claude_relay_creation_reconnect_and_existing_registry_repair() {
-        let (root, _guards) = managed_claude_relay_fixture();
-        let store = FileClaudeConfigSlotSettingsStore::default();
-        let operation_id = "claude_setup_11111111111111111111111111111111";
-        let prepared = prepare_claude_account_legacy(1, operation_id.into(), None).unwrap();
-        let dir = prepared.managed_slots[0].config_dir.clone().unwrap();
-        assert!(Path::new(&dir).join("settings.json").exists());
-        let body = fs::read_to_string(Path::new(&dir).join("settings.json")).unwrap();
-        assert!(claude_code_settings_has_relay_env_for_base(
-            &body,
-            "http://127.0.0.1:48123"
-        ));
-        assert!(!body.contains("statusLine"));
-        assert!(!provision_managed_claude_relay_settings(&dir).unwrap());
-        fs::remove_file(Path::new(&dir).join("settings.json")).unwrap();
-        assert!(repair_registered_managed_claude_relay_settings().unwrap());
-        let provisional = ottto_core::prepare_managed_claude_provisional_root(
-            "claude_setup_22222222222222222222222222222222",
-        )
-        .unwrap()
-        .1;
-        assert!(!provision_managed_claude_relay_settings(&provisional).unwrap());
-        assert!(!store
-            .load()
-            .unwrap()
-            .managed_slots
-            .iter()
-            .any(|slot| slot.config_dir.as_deref() == Some(&provisional)));
-        let external = root.join("advanced");
-        fs::create_dir(&external).unwrap();
-        store
-            .register_path(1, external.to_str().unwrap().into())
-            .unwrap();
-        repair_registered_managed_claude_relay_settings().unwrap();
-        assert!(!external.join("settings.json").exists());
-        assert!(!provision_managed_claude_relay_settings(external.to_str().unwrap()).unwrap());
-        store.stop_waiting(1, operation_id).unwrap();
-        crate::claude_browser_auth::release_ceremony(operation_id);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -32004,84 +28091,6 @@ X-API-Key = "otel_redacted"
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    #[serial]
-    fn managed_claude_relay_refresh_preserves_custom_default_and_checks_prior_approval() {
-        let (root, _guards) = managed_claude_relay_fixture();
-        fs::create_dir(root.join(".claude/projects")).unwrap();
-        let prepared = FileClaudeConfigSlotSettingsStore::default()
-            .prepare_managed_account_target(
-                1,
-                "claude_setup_88888888888888888888888888888888".into(),
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        let path =
-            Path::new(prepared.managed_slots[0].config_dir.as_ref().unwrap()).join("settings.json");
-        let default = root.join(".claude/settings.json");
-        let canonical: serde_json::Value =
-            serde_json::from_slice(&fs::read(&default).unwrap()).unwrap();
-        for (key, value) in [
-            (
-                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-                "http://127.0.0.1:48123/collector/v1/logs",
-            ),
-            ("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", "grpc"),
-            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example"),
-            ("OTEL_LOGS_EXPORTER", "none"),
-        ] {
-            let mut customized = canonical.clone();
-            customized.as_object_mut().unwrap().remove("statusLine");
-            customized["env"][key] = json!(value);
-            let bytes = serde_json::to_vec(&customized).unwrap();
-            fs::write(&default, &bytes).unwrap();
-            reconcile_claude_statusline_for_agent_status_refresh(&daemon()).unwrap();
-            assert_eq!(fs::read(&default).unwrap(), bytes);
-            assert!(!path.exists());
-        }
-        fs::write(&default, r#"{"env":{"USER_FLAG":"keep"}}"#).unwrap();
-        reconcile_claude_statusline_for_agent_status_refresh(&daemon()).unwrap();
-        assert!(!path.exists());
-        let repaired: serde_json::Value =
-            serde_json::from_slice(&fs::read(&default).unwrap()).unwrap();
-        assert_eq!(repaired["env"]["USER_FLAG"], "keep");
-        reconcile_claude_statusline_for_agent_status_refresh(&daemon()).unwrap();
-        assert!(path.exists());
-        let bytes = fs::read(&path).unwrap();
-        reconcile_claude_statusline_for_agent_status_refresh(&daemon()).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn managed_claude_relay_disable_covers_provisional_browser_roots_and_missing_default() {
-        let (root, _guards) = managed_claude_relay_fixture();
-        let operation_id = "claude_setup_66666666666666666666666666666666";
-        crate::claude_browser_auth::prepare_generic(
-            FileClaudeConfigSlotSettingsStore::default().load().unwrap(),
-            operation_id,
-        )
-        .unwrap();
-        let roots = crate::claude_browser_auth::managed_telemetry_roots();
-        assert_eq!(roots.len(), 1);
-        provision_managed_claude_relay_settings(&roots[0]).unwrap();
-        fs::remove_dir_all(root.join(".claude")).unwrap();
-        assert!(disable_managed_claude_relay_settings().unwrap());
-        let default: serde_json::Value =
-            serde_json::from_slice(&fs::read(root.join(".claude/settings.json")).unwrap()).unwrap();
-        assert_eq!(default["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"], "0");
-        let provisional: serde_json::Value =
-            serde_json::from_slice(&fs::read(Path::new(&roots[0]).join("settings.json")).unwrap())
-                .unwrap();
-        assert_eq!(provisional["env"], json!({}));
-        assert!(!provision_managed_claude_relay_settings(&roots[0]).unwrap());
-        crate::claude_browser_auth::release_ceremony(operation_id);
-        fs::remove_dir_all(root).unwrap();
-    }
-
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -32143,32 +28152,6 @@ X-API-Key = "otel_redacted"
         let removed_bytes = fs::read(&path).unwrap();
         disable_managed_claude_relay_settings().unwrap();
         assert_eq!(fs::read(&path).unwrap(), removed_bytes);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn managed_claude_relay_default_user_env_disable_survives_refresh() {
-        let (root, _guards) = managed_claude_relay_fixture();
-        let path = root.join(".claude/settings.json");
-        fs::write(&path, r#"{"env":{"USER_FLAG":"keep"}}"#).unwrap();
-        disable_managed_claude_relay_settings().unwrap();
-        let off: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            off["env"],
-            json!({"USER_FLAG":"keep","CLAUDE_CODE_ENABLE_TELEMETRY":"0"})
-        );
-        fs::write(&path, r#"{"env":{"USER_FLAG":"keep","OTEL_EXPORTER_OTLP_ENDPOINT":"https://collector.example"}}"#).unwrap();
-        disable_managed_claude_relay_settings().unwrap();
-        let off: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            off["env"]["OTEL_EXPORTER_OTLP_ENDPOINT"],
-            "https://collector.example"
-        );
-        assert_eq!(off["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"], "0");
-        let before = fs::read(&path).unwrap();
-        reconcile_claude_statusline_for_agent_status_refresh(&daemon()).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), before);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -32282,111 +28265,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    fn patch_claude_code_settings_restores_missing_wrapper_without_settings_backup() {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-claude-wrapper-restore-test-{}-{}",
-            std::process::id(),
-            current_millis()
-        ));
-        let path = root.join("settings.json");
-        let backup_root = root.join("backups");
-        fs::create_dir_all(&root).expect("create temp dir");
-        fs::write(
-            &path,
-            r#"{"statusLine":{"type":"command","command":"jq -r '.model.display_name'"}}"#,
-        )
-        .expect("write settings");
-
-        patch_claude_code_settings_at(&path, &test_machine(), &backup_root)
-            .expect("patch settings");
-        let body = fs::read_to_string(&path).expect("read patched settings");
-        let backup_dir = backup_root.join("config-backups/claude_code");
-        assert_eq!(count_backup_files(&backup_dir), 1);
-        fs::remove_file(backup_root.join("claude-code-statusline.sh"))
-            .expect("remove statusLine wrapper");
-
-        let restored = patch_claude_code_settings_at(&path, &test_machine(), &backup_root)
-            .expect("restore wrapper");
-        let wrapper = fs::read_to_string(backup_root.join("claude-code-statusline.sh"))
-            .expect("read restored wrapper");
-
-        assert!(restored.changed);
-        assert!(!restored.created);
-        assert!(!restored.backup_created);
-        assert_eq!(
-            fs::read_to_string(&path).expect("read settings again"),
-            body
-        );
-        assert_eq!(count_backup_files(&backup_dir), 1);
-        assert!(wrapper.contains("ORIGINAL_STATUSLINE=''"));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn refresh_repair_installs_missing_claude_statusline_settings() {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-claude-refresh-install-test-{}-{}",
-            std::process::id(),
-            current_millis()
-        ));
-        let path = root.join("settings.json");
-        let support_dir = root.join("support");
-
-        let repaired = repair_claude_statusline_for_refresh_at(
-            &path,
-            &test_machine(),
-            &support_dir,
-            &crate::otlp_relay::default_local_relay_base_url(),
-        )
-        .expect("refresh repair");
-        let body = fs::read_to_string(&path).expect("read repaired settings");
-        let wrapper = fs::read_to_string(claude_statusline_wrapper_path(&support_dir))
-            .expect("read statusLine wrapper");
-
-        assert!(repaired.changed);
-        assert!(repaired.created);
-        assert!(!repaired.backup_created);
-        assert!(claude_code_settings_has_statusline_helper(&body));
-        assert!(wrapper.contains("claude-code-statusline"));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn refresh_repair_restores_missing_claude_statusline_wrapper() {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-claude-refresh-wrapper-test-{}-{}",
-            std::process::id(),
-            current_millis()
-        ));
-        let path = root.join("settings.json");
-        let support_dir = root.join("support");
-        fs::create_dir_all(&root).expect("create temp dir");
-
-        patch_claude_code_settings_at(&path, &test_machine(), &support_dir).expect("seed settings");
-        let body = fs::read_to_string(&path).expect("read seeded settings");
-        fs::remove_file(claude_statusline_wrapper_path(&support_dir))
-            .expect("remove statusLine wrapper");
-
-        let repaired = repair_claude_statusline_for_refresh_at(
-            &path,
-            &test_machine(),
-            &support_dir,
-            &crate::otlp_relay::default_local_relay_base_url(),
-        )
-        .expect("refresh repair");
-
-        assert!(repaired.changed);
-        assert!(!repaired.created);
-        assert!(!repaired.backup_created);
-        assert_eq!(
-            fs::read_to_string(&path).expect("read settings again"),
-            body
-        );
-        assert!(claude_statusline_wrapper_path(&support_dir).is_file());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn refresh_repair_preserves_user_claude_statusline_command() {
         let root = std::env::temp_dir().join(format!(
             "ottto-claude-refresh-user-statusline-test-{}-{}",
@@ -32478,14 +28356,6 @@ X-API-Key = "otel_redacted"
         assert!(source_patch_disabled(&SourceKind::Codex));
         assert!(!source_patch_disabled(&SourceKind::ClaudeCode));
         assert!(!source_patch_disabled(&SourceKind::Pi));
-    }
-
-    #[test]
-    #[serial]
-    fn source_patch_disabled_ignores_falsey_values() {
-        let _lock = lock_backend_test_env();
-        let _guard = EnvVarGuard::set_str("OTTTO_PATCH_CLAUDE_CODE_DISABLED", "false");
-        assert!(!source_patch_disabled(&SourceKind::ClaudeCode));
     }
 
     #[test]
@@ -32649,67 +28519,6 @@ X-API-Key = "otel_redacted"
             None,
         );
         assert!(matches!(result, Err(LocalApiError::InvalidRequest(_))));
-    }
-
-    #[test]
-    fn codex_source_off_config_state_requires_only_removal_of_owned_exporters() {
-        let root = control_test_root("codex-source-off-state");
-        fs::create_dir_all(&root).unwrap();
-        let path = root.join("config.toml");
-        assert!(codex_config_state_at(&path, "config", "", false)
-            .drift
-            .is_empty());
-        let external = "otel.exporter = \"none\"\n";
-        fs::write(&path, external).unwrap();
-        assert!(codex_config_state_at(&path, "config", "", false)
-            .drift
-            .is_empty());
-        patch_codex_config_at(&path, &root.join("backups")).unwrap_err();
-        fs::write(
-            &path,
-            render_codex_relay_toml_block_for_base("http://127.0.0.1:44621"),
-        )
-        .unwrap();
-        assert!(!codex_config_state_at(&path, "config", "", false)
-            .drift
-            .is_empty());
-        fs::write(&path, "[otel\n").unwrap();
-        assert!(!codex_config_state_at(&path, "config", "", false)
-            .drift
-            .is_empty());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "[otel\n");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn config_drift_verification_copy_points_to_app_repair() {
-        let missing = config_drift_verification_result(
-            SourceKind::Codex,
-            SourceConfigState {
-                discovered: false,
-                path_hint: Some("~/.codex/config.toml".to_string()),
-                fingerprint: None,
-                drift: vec![config_drift("codex.config_file", "present", "missing")],
-            },
-            false,
-        );
-        assert_eq!(missing.message.code, "config_missing");
-        assert!(missing.message.text.contains("Use Repair in the Ottto app"));
-        assert!(!missing.message.text.contains("ottto repair"));
-
-        let drifted = config_drift_verification_result(
-            SourceKind::Codex,
-            SourceConfigState {
-                discovered: true,
-                path_hint: Some("~/.codex/config.toml".to_string()),
-                fingerprint: Some("sha256:test".to_string()),
-                drift: vec![config_drift("otel.log_user_prompt", "false", "true")],
-            },
-            false,
-        );
-        assert_eq!(drifted.message.code, "config_drift");
-        assert!(drifted.message.text.contains("Use Repair in the Ottto app"));
-        assert!(!drifted.message.text.contains("ottto repair"));
     }
 
     #[test]
@@ -32903,47 +28712,6 @@ X-API-Key = "otel_redacted"
 
     #[test]
     #[serial]
-    fn verify_repair_restores_claude_statusline_wrapper_before_account_check() {
-        let _lock = lock_backend_test_env();
-        let root = control_test_root("verify-repair-claude-wrapper");
-        create_control_test_dir(&root.join(".claude"));
-        let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        let support_dir = root.join("support");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
-        let settings_path = root.join(".claude/settings.json");
-        patch_claude_code_settings_at(&settings_path, &test_machine(), &support_dir)
-            .expect("seed settings");
-        fs::remove_file(claude_statusline_wrapper_path(&support_dir))
-            .expect("remove statusLine wrapper");
-
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_verify_repair_claude_wrapper".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::Verify {
-                    source: SourceKind::ClaudeCode,
-                    repair: true,
-                },
-            },
-        );
-
-        assert!(response.ok, "{response:?}");
-        let result: SourceVerificationResult =
-            serde_json::from_value(response.payload.expect("payload"))
-                .expect("verification result");
-        assert_eq!(result.message.code, "account_not_connected");
-        assert!(result.config.drift.is_empty());
-        assert!(claude_statusline_wrapper_path(&support_dir).is_file());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    #[serial]
     fn verify_json_exposes_canonical_health_failure() {
         let _lock = lock_backend_test_env();
         let root = control_test_root("verify-canonical-health");
@@ -33125,141 +28893,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    #[serial]
-    fn fix_patch_disabled_blocks_claude_repair_writes() {
-        let _lock = lock_backend_test_env();
-        let root = control_test_root("fix-disabled-claude");
-        create_control_test_dir(&root.join(".claude"));
-        let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        let _disabled_guard = EnvVarGuard::set_str("OTTTO_PATCH_CLAUDE_CODE_DISABLED", "1");
-        let settings_path = root.join(".claude/settings.json");
-        let original = r#"{"env":{"EXISTING":"keep"}}"#;
-        fs::write(&settings_path, original).expect("write settings");
-
-        let response = handle_request(
-            &daemon(),
-            LocalControlRequest {
-                request_id: "req_fix_claude_disabled".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::Repair {
-                    source: SourceKind::ClaudeCode,
-                    dry_run: false,
-                },
-            },
-        );
-
-        assert!(response.ok);
-        let plan: RepairPlan =
-            serde_json::from_value(response.payload.expect("payload")).expect("repair plan");
-        assert_eq!(plan.status, RepairPlanStatus::Blocked);
-        assert_eq!(plan.authority.message.code, "patch_disabled");
-        assert!(plan.actions.is_empty());
-        assert_eq!(
-            fs::read_to_string(&settings_path).expect("read settings"),
-            original
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    #[serial]
-    fn remove_claude_code_env_ignores_patch_disabled_env() {
-        let _lock = lock_backend_test_env();
-        let root = std::env::temp_dir().join(format!(
-            "ottto-claude-env-remove-disabled-test-{}-{}",
-            std::process::id(),
-            current_millis()
-        ));
-        let env_path = root.join(".ottto/claude-telemetry.env");
-        let shell_path = root.join(".zshrc");
-        let backup_root = root.join("backups");
-        fs::create_dir_all(&root).expect("create temp dir");
-        fs::write(&shell_path, "alias ll='ls -la'\n").expect("write shell rc");
-        patch_claude_code_env_at(
-            &env_path,
-            &shell_path,
-            &test_machine(),
-            &backup_root,
-            &crate::otlp_relay::default_local_relay_base_url(),
-        )
-        .expect("seed env");
-
-        let _disabled_guard = EnvVarGuard::set_str("OTTTO_PATCH_CLAUDE_CODE_DISABLED", "1");
-        let removed = remove_claude_code_env_at(&env_path, &shell_path).expect("remove env");
-
-        assert!(removed.changed);
-        assert!(!env_path.exists());
-        assert!(!fs::read_to_string(&shell_path)
-            .expect("read shell rc")
-            .contains("# ottto:start"));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn patch_claude_code_settings_can_target_active_fallback_endpoint() {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-claude-settings-fallback-test-{}",
-            std::process::id()
-        ));
-        let path = root.join("settings.json");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("create temp dir");
-        fs::write(&path, r#"{"env":{"EXISTING":"keep"}}"#).expect("write settings");
-
-        let backup_root = root.join("backups");
-        let fallback = "http://127.0.0.1:44621";
-        patch_claude_code_settings_at_with_relay_base(
-            &path,
-            &test_machine(),
-            &backup_root,
-            fallback,
-        )
-        .expect("patch settings");
-        let body = fs::read_to_string(&path).expect("read settings");
-        let value: serde_json::Value = serde_json::from_str(&body).expect("json settings");
-        let env = value
-            .get("env")
-            .and_then(|value| value.as_object())
-            .expect("env object");
-
-        assert_eq!(
-            env.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
-                .and_then(|value| value.as_str()),
-            Some("http://127.0.0.1:44621/v1/logs")
-        );
-        assert_eq!(
-            env.get("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL")
-                .and_then(|value| value.as_str()),
-            Some("http/json")
-        );
-        assert!(claude_code_settings_has_relay_env(&body));
-        assert!(claude_code_settings_has_relay_env_for_base(&body, fallback));
-        assert!(!claude_code_settings_has_relay_env_for_base(
-            &body,
-            &crate::otlp_relay::default_local_relay_base_url()
-        ));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn claude_code_relay_env_rejects_incomplete_legacy_loopback_settings() {
-        let body = r#"{"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"1","OTEL_METRICS_EXPORTER":"otlp","OTEL_LOGS_EXPORTER":"otlp","OTEL_EXPORTER_OTLP_PROTOCOL":"http/protobuf","OTEL_EXPORTER_OTLP_LOGS_ENDPOINT":"http://127.0.0.1:43119/v1/logs","OTEL_EXPORTER_OTLP_METRICS_ENDPOINT":"http://127.0.0.1:43119/v1/metrics","OTEL_EXPORTER_OTLP_HEADERS":"X-Ottto-Local-Relay=claude_code","OTEL_RESOURCE_ATTRIBUTES":"service.name=claude-code"}}"#;
-
-        assert!(!claude_code_settings_has_relay_env(body));
-    }
-
-    #[test]
-    fn claude_code_statusline_detection_rejects_env_only_setup() {
-        let body = r#"{"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"1","CLAUDE_CODE_ENHANCED_TELEMETRY_BETA":"1","CLAUDE_CODE_OTEL_SHUTDOWN_TIMEOUT_MS":"10000","OTEL_METRICS_EXPORTER":"otlp","OTEL_LOGS_EXPORTER":"otlp","OTEL_TRACES_EXPORTER":"otlp","OTEL_EXPORTER_OTLP_PROTOCOL":"http/protobuf","OTEL_EXPORTER_OTLP_LOGS_ENDPOINT":"http://127.0.0.1:43119/v1/logs","OTEL_EXPORTER_OTLP_METRICS_ENDPOINT":"http://127.0.0.1:43119/v1/metrics","OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":"http://127.0.0.1:43119/v1/traces","OTEL_EXPORTER_OTLP_HEADERS":"X-Ottto-Local-Relay=claude_code","OTEL_RESOURCE_ATTRIBUTES":"service.name=claude-code,ottto.source=claude_code,ottto.machine_id=machine_test"}}"#;
-
-        assert!(claude_code_settings_has_relay_env(body));
-        assert!(!claude_code_settings_has_statusline_helper(body));
-    }
-
-    #[test]
     fn install_source_action_result_uses_setup_safe_metadata_keys() {
         let result = install_source_action_result(
             "install_session_test",
@@ -33312,48 +28945,6 @@ X-API-Key = "otel_redacted"
         assert_eq!(
             failed.get("error_code").and_then(serde_json::Value::as_str),
             Some("relay_unavailable")
-        );
-    }
-
-    #[test]
-    fn install_source_patch_disabled_result_uses_setup_safe_metadata_keys() {
-        let result = install_source_patch_disabled_result(
-            "install_session_test",
-            "device_test",
-            "codex",
-            "Codex telemetry config patching skipped by environment",
-        );
-        let object = result.as_object().expect("result object");
-        for key in object.keys() {
-            let lower = key.to_ascii_lowercase();
-            for forbidden in [
-                "authorization",
-                "bearer",
-                "cookie",
-                "device_secret",
-                "header",
-                "key",
-                "password",
-                "secret",
-                "token",
-            ] {
-                assert!(
-                    !lower.contains(forbidden),
-                    "install action result key should be backend-safe: {key}"
-                );
-            }
-        }
-        assert_eq!(
-            object
-                .get("local_changes")
-                .and_then(serde_json::Value::as_str),
-            Some("patch_disabled")
-        );
-        assert_eq!(
-            object
-                .get("config_patched")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
         );
     }
 
@@ -33481,86 +29072,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    #[serial]
-    fn verify_claude_expired_oauth_precedes_config_drift() {
-        let _lock = lock_backend_test_env();
-        let root = control_test_root("verify-claude-expired-auth-with-drift");
-        let support_root = root.join("support");
-        let secret_root = telemetry_key_store_root("verify-claude-expired-auth-with-drift-secret");
-        fs::create_dir_all(root.join(".claude")).expect("claude config dir");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        fs::write(
-            root.join(".claude/settings.json"),
-            r#"{"env":{"EXISTING":"keep"}}"#,
-        )
-        .expect("write drifted Claude settings");
-        let fake_claude = fake_binary_path(&root, "claude");
-        fs::write(
-            &fake_claude,
-            "#!/bin/sh\necho 'Token is expired. Run /login to sign in again.' >&2\nexit 1\n",
-        )
-        .expect("write fake Claude smoke");
-        #[cfg(unix)]
-        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755))
-            .expect("mark fake Claude executable");
-        let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let _path_guard = EnvVarGuard::set_os(
-            "OTTTO_COMMAND_SEARCH_PATH",
-            fake_claude
-                .parent()
-                .expect("fake binary parent")
-                .as_os_str()
-                .to_os_string(),
-        );
-        FileDeviceStore::default()
-            .save(&LocalDeviceBinding {
-                device_id: "device_test".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["claude_code".to_string()],
-            })
-            .expect("persist relay device binding");
-        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-            .save("device_secret_test")
-            .expect("persist relay device secret");
-        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-            .save("otsr_test")
-            .expect("persist setup token");
-        let daemon = daemon()
-            .with_account(connected_account())
-            .with_connection(Some(LocalConnectionBinding {
-                setup_run_id: "setup_test".to_string(),
-                setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                claim_code: None,
-                api_base_url: "https://api.ottto.net".to_string(),
-            }));
-
-        let result = verify_source(
-            &daemon,
-            &RequestAuthorization::TrustedCompanionApp,
-            SourceKind::ClaudeCode,
-            false,
-        )
-        .expect("verification should classify provider auth before drift");
-
-        assert_eq!(result.status, SourceVerificationStatus::ReconnectRequired);
-        assert_eq!(result.message.code, CLAUDE_OAUTH_REAUTH_REQUIRED_CODE);
-        assert!(!result.config.drift.is_empty());
-        assert_eq!(
-            daemon
-                .status_for_trusted_client()
-                .expect("status")
-                .account
-                .state,
-            LocalAccountState::Connected
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn usage_limited_smoke_failure_maps_to_warning_verification_result() {
         let smoke = SmokeResult {
             command_found: true,
@@ -33629,137 +29140,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    fn command_not_found_smoke_maps_to_non_blocking_cli_unavailable() {
-        // Desktop-app-only shape: presence was granted by config/usage
-        // metadata, but the CLI binary can't be executed. This must never be a
-        // blocking Failed — local session data keeps syncing.
-        let smoke = SmokeResult {
-            command_found: false,
-            succeeded: false,
-            exit_status: None,
-            duration_ms: 0,
-            message: "codex is not installed or not executable.".to_string(),
-            diagnostic: None,
-            error_code: Some("command_not_found".to_string()),
-            local_session_observed: None,
-        };
-
-        let result = smoke_failure_verification_result(
-            SourceKind::Codex,
-            &smoke,
-            Some("2026-05-06T12:00:00Z".to_string()),
-        );
-
-        assert_eq!(result.status, SourceVerificationStatus::Warning);
-        assert!(!result.verified);
-        assert_eq!(result.message.code, AGENT_CLI_UNAVAILABLE_CODE);
-        assert!(
-            result.message.text.contains("keeps syncing Codex activity"),
-            "copy names ongoing local sync: {}",
-            result.message.text
-        );
-        assert!(
-            result.message.text.contains("`codex`"),
-            "copy names the missing command: {}",
-            result.message.text
-        );
-    }
-
-    #[test]
-    fn soft_verify_timing_results_refresh_agent_status() {
-        let no_fresh = verification_result(
-            SourceKind::ClaudeCode,
-            SourceVerificationStatus::NoFreshTelemetry,
-            false,
-            0,
-            None,
-            None,
-            Some("2026-06-20T02:00:00Z".to_string()),
-            "no_fresh_telemetry",
-            "Ottto did not receive a fresh Claude Code verification signal after the smoke session.",
-        );
-        let smoke_timeout = verification_result(
-            SourceKind::Codex,
-            SourceVerificationStatus::Failed,
-            false,
-            0,
-            None,
-            None,
-            Some("2026-06-20T02:00:00Z".to_string()),
-            "smoke_timeout",
-            "Codex smoke session timed out before verification could complete.",
-        );
-        let command_failed = verification_result(
-            SourceKind::Codex,
-            SourceVerificationStatus::Failed,
-            false,
-            0,
-            None,
-            None,
-            Some("2026-06-20T02:00:00Z".to_string()),
-            "smoke_command_failed",
-            "Codex smoke session failed before verification could complete.",
-        );
-        let verification_unavailable = verification_result(
-            SourceKind::ClaudeCode,
-            SourceVerificationStatus::Failed,
-            false,
-            0,
-            None,
-            None,
-            Some("2026-06-20T02:00:00Z".to_string()),
-            "verification_service_unavailable",
-            "Could not reach Ottto verification. Check your network and retry.",
-        );
-
-        assert!(verification_result_should_refresh_agent_status(&no_fresh));
-        assert!(verification_result_should_refresh_agent_status(
-            &smoke_timeout
-        ));
-        assert!(verification_result_should_refresh_agent_status(
-            &verification_unavailable
-        ));
-        assert!(!verification_result_should_refresh_agent_status(
-            &command_failed
-        ));
-    }
-
-    #[test]
-    fn backend_verification_error_code_overrides_no_fresh_fallback() {
-        let smoke = SmokeResult {
-            command_found: true,
-            succeeded: true,
-            exit_status: Some(0),
-            duration_ms: 12_000,
-            message: "Codex smoke session completed.".to_string(),
-            diagnostic: None,
-            error_code: None,
-            local_session_observed: None,
-        };
-        let verification = SetupRunVerificationResponse {
-            verified: false,
-            records_seen: 0,
-            last_record_id: None,
-            last_received_at: None,
-            smoke_after: "2026-06-20T02:00:00Z".to_string(),
-            error_code: Some("telemetry_disabled_by_admin".to_string()),
-            clear_condition: Some("Turn telemetry on in Settings.".to_string()),
-        };
-
-        let code = verification_failure_code(&SourceKind::Codex, &smoke, &verification);
-        let message = verification_failure_message(
-            &SourceKind::Codex,
-            &smoke,
-            &code,
-            verification.clear_condition.as_deref(),
-        );
-
-        assert_eq!(code, "telemetry_disabled_by_admin");
-        assert!(message.contains("turned off in this workspace"));
-        assert!(!message.contains("fresh Codex verification signal"));
-    }
-
-    #[test]
     fn expired_setup_run_token_maps_to_reconnect_required_verification() {
         let error = LocalApiError::Backend(BackendErrorDetails {
             kind: BackendErrorKind::Rejected,
@@ -33778,21 +29158,6 @@ X-API-Key = "otel_redacted"
         assert_eq!(result.status, SourceVerificationStatus::ReconnectRequired);
         assert!(!result.verified);
         assert_eq!(result.message.code, "setup_run_token_expired");
-    }
-
-    #[test]
-    fn missing_refresh_binding_maps_to_reconnect_required_verification() {
-        let result = verification_result_for_backend_error(
-            SourceKind::Codex,
-            Some("2026-05-08T20:00:00Z".to_string()),
-            &LocalApiError::SetupRunConnectionMissing,
-        );
-
-        assert_eq!(result.status, SourceVerificationStatus::ReconnectRequired);
-        assert!(!result.verified);
-        assert_eq!(result.message.code, "setup_run_connection_missing");
-        assert!(result.message.text.contains("Use Sign in in the Ottto app"));
-        assert!(!result.message.text.contains("/apps"));
     }
 
     #[test]
@@ -33996,38 +29361,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    #[serial]
-    fn verify_without_local_account_points_to_app_sign_in() {
-        let _lock = lock_backend_test_env();
-        let root = control_test_root("verify-no-account");
-        create_control_test_dir(&root.join(".codex"));
-        let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        fs::write(root.join(".codex/config.toml"), "model = \"gpt-6.1-sol\"\n")
-            .expect("seed clean config");
-        let daemon = daemon().with_connection(Some(LocalConnectionBinding {
-            setup_run_id: "setup_stale".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: "https://api.ottto.net".to_string(),
-        }));
-
-        let result = verify_source(
-            &daemon,
-            &RequestAuthorization::TrustedCompanionApp,
-            SourceKind::Codex,
-            false,
-        )
-        .expect("verification should return actionable account state");
-
-        assert_eq!(result.status, SourceVerificationStatus::AccountNotConnected);
-        assert!(!result.verified);
-        assert_eq!(result.message.code, "account_not_connected");
-        assert!(result.message.text.contains("Use Sign in in the Ottto app"));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn backend_cli_error_message_omits_endpoint_details() {
         let error = cli_error(LocalApiError::Backend(BackendErrorDetails {
             kind: BackendErrorKind::Rejected,
@@ -34049,37 +29382,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    fn cli_error_messages_name_each_pairing_recovery_action() {
-        let error = |body: &str| {
-            cli_error_message(&LocalApiError::Backend(BackendErrorDetails {
-                kind: BackendErrorKind::Rejected,
-                endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
-                status: Some(409),
-                body_excerpt: Some(body.to_string()),
-                reason_code: None,
-            }))
-        };
-
-        let relay = error("Existing installation authority requires an explicit relay device");
-        assert!(relay.contains("Reconnect it"));
-        assert!(relay.contains("Replace it"));
-        let prior = error("Existing installation authority requires an explicit prior credential");
-        assert!(prior.contains("Replace it"));
-        assert!(prior.contains("ottto login"));
-        let multiple = error("The setup-claim installation has more than one active authority");
-        assert!(multiple.contains("multiple active registrations"));
-        assert!(multiple.contains("Replace it"));
-        let revoked = error(
-            r#"{"detail":{"reason":"revoked_cross_account_predecessor","message":"Cross-account takeover requires the exact active predecessor credential"}}"#,
-        );
-        assert!(revoked.contains("new signed-in owner"));
-        assert!(revoked.contains("revocation cutoff"));
-        let live = error("Cross-account takeover requires the exact active predecessor credential");
-        assert!(live.contains("live registration"));
-        assert!(live.contains("exact saved device credential"));
-    }
-
-    #[test]
     fn auth_complete_log_endpoint_redacts_claim_code() {
         assert_eq!(
             auth_complete_log_endpoint(
@@ -34095,39 +29397,6 @@ X-API-Key = "otel_redacted"
             auth_complete_log_endpoint("/api/v1/setup-claims/claim_private/status"),
             "/api/v1/setup-claims/claim_private/status"
         );
-    }
-
-    #[test]
-    fn pending_browser_claim_is_not_logged_as_backend_failure() {
-        let pending = LocalApiError::Backend(BackendErrorDetails {
-            kind: BackendErrorKind::Rejected,
-            endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
-            status: Some(400),
-            body_excerpt: Some(r#"{"detail":"Setup claim session is pending"}"#.to_string()),
-            reason_code: None,
-        });
-        assert!(auth_complete_error_is_pending(&pending));
-
-        let terminal = LocalApiError::Backend(BackendErrorDetails {
-            kind: BackendErrorKind::Rejected,
-            endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
-            status: Some(401),
-            body_excerpt: Some(
-                "Existing installation authority requires an explicit relay device".to_string(),
-            ),
-            reason_code: None,
-        });
-        assert!(!auth_complete_error_is_pending(&terminal));
-    }
-
-    #[test]
-    fn setup_connection_missing_maps_to_needs_user_action() {
-        let error = cli_error(LocalApiError::SetupRunConnectionMissing);
-
-        assert_eq!(error.code, CliErrorCode::NeedsUserAction);
-        assert_eq!(error.code.exit_code(), 60);
-        assert!(!error.retryable);
-        assert!(error.message.contains("Setup needs browser approval"));
     }
 
     #[test]
@@ -34167,81 +29436,6 @@ X-API-Key = "otel_redacted"
             &daemon,
             LocalControlRequest {
                 request_id: "req_setup_cancelled".to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::Setup {
-                    sources: vec![SourceKind::Codex],
-                    claim_code: None,
-                    setup_run_id: None,
-                    api_base_url: None,
-                },
-            },
-        );
-
-        assert!(!response.ok);
-        let error = response.error.expect("error");
-        assert_eq!(error.code, CliErrorCode::NeedsUserAction);
-        assert!(error.message.contains("Setup needs browser approval"));
-        assert_eq!(
-            daemon
-                .connection_for_authorized_client()
-                .expect("load connection"),
-            None
-        );
-        assert_eq!(
-            FileConnectionStore::default()
-                .load()
-                .expect("load persisted connection"),
-            None
-        );
-        assert!(KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-            .load()
-            .is_err());
-        assert!(!secret_root.join(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).exists());
-    }
-
-    #[test]
-    #[serial]
-    fn setup_clears_companion_token_expired_binding_before_requiring_fresh_claim() {
-        let _lock = lock_backend_test_env();
-        let support_root = control_test_root("setup-token-expired-binding");
-        let secret_root = telemetry_key_store_root("setup-token-expired-binding-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        fs::write(
-            secret_root.join(OTTTO_SETUP_RUN_TOKEN_ACCOUNT),
-            "otsr_stale",
-        )
-        .expect("setup-run token");
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_token_expired".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: setup_run_terminal_scan_server(
-                "setup_token_expired",
-                "Setup run companion token expired",
-            ),
-        };
-        FileConnectionStore::default()
-            .save(&connection)
-            .expect("persist connection binding");
-        let mut stale_overlay = connected_account();
-        stale_overlay.state = LocalAccountState::ClaimPending;
-        stale_overlay.user = None;
-        stale_overlay.organization = None;
-        let daemon = daemon()
-            .with_account(stale_overlay)
-            .with_connection(Some(connection));
-
-        let response = handle_request(
-            &daemon,
-            LocalControlRequest {
-                request_id: "req_setup_token_expired".to_string(),
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
@@ -34690,105 +29884,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    fn refresh_commit_writes_only_for_the_binding_it_belongs_to() {
-        let commit = |persisted: Option<LocalConnectionBinding>,
-                      token: Option<&str>,
-                      expected: &LocalConnectionBinding,
-                      refreshed: &LocalConnectionBinding| {
-            let connections = FakeSetupRunConnectionStore {
-                value: std::cell::RefCell::new(persisted),
-                ..Default::default()
-            };
-            let tokens = FakeSetupRunTokenStore {
-                value: std::cell::RefCell::new(token.map(str::to_string)),
-                ..Default::default()
-            };
-            let result = commit_refreshed_setup_run_binding_locked(
-                expected,
-                refreshed,
-                "otsr_minted",
-                &connections,
-                &tokens,
-            );
-            (result, connections.value.take(), tokens.value.take())
-        };
-        let run_a = refresh_binding("run_a", "2026-05-05T10:00:00Z");
-        let run_a_refreshed = refresh_binding("run_a", "2026-05-05T10:15:00Z");
-        let run_b = refresh_binding("run_b", "2026-05-05T10:05:00Z");
-        let run_c_refreshed = refresh_binding("run_c", "2026-05-05T10:15:00Z");
-
-        // Same binding: the new pair is written.
-        let (result, connection, token) = commit(
-            Some(run_a.clone()),
-            Some("otsr_a"),
-            &run_a,
-            &run_a_refreshed,
-        );
-        assert!(result.is_ok());
-        assert_eq!(connection, Some(run_a_refreshed.clone()));
-        assert_eq!(token.as_deref(), Some("otsr_minted"));
-
-        // The backend rebound to its latest run C; the persisted binding
-        // already names C while the in-memory binding still says A. Only the
-        // run id and expiry come from the refresh; the persisted record keeps
-        // its own other fields.
-        let persisted_c = LocalConnectionBinding {
-            claim_code: Some("claim_c".to_string()),
-            ..refresh_binding("run_c", "2026-05-05T10:00:00Z")
-        };
-        let committed_c = LocalConnectionBinding {
-            claim_code: Some("claim_c".to_string()),
-            ..run_c_refreshed.clone()
-        };
-        let (result, connection, token) =
-            commit(Some(persisted_c), Some("otsr_c"), &run_a, &run_c_refreshed);
-        assert_eq!(result.ok(), Some(committed_c.clone()));
-        assert_eq!(connection, Some(committed_c));
-        assert_eq!(token.as_deref(), Some("otsr_minted"));
-
-        // Replaced by a reconnect: nothing is written.
-        let (result, connection, token) = commit(
-            Some(run_b.clone()),
-            Some("otsr_b"),
-            &run_a,
-            &run_a_refreshed,
-        );
-        assert!(matches!(
-            result,
-            Err(LocalApiError::SetupRunConnectionMismatch)
-        ));
-        assert_eq!(connection, Some(run_b.clone()));
-        assert_eq!(token.as_deref(), Some("otsr_b"));
-
-        // Same run id against another API base is a different binding.
-        let other_base = LocalConnectionBinding {
-            api_base_url: "https://staging.ottto.net".to_string(),
-            ..run_a.clone()
-        };
-        let (result, connection, token) = commit(
-            Some(other_base.clone()),
-            Some("otsr_other"),
-            &run_a,
-            &run_a_refreshed,
-        );
-        assert!(matches!(
-            result,
-            Err(LocalApiError::SetupRunConnectionMismatch)
-        ));
-        assert_eq!(connection, Some(other_base));
-        assert_eq!(token.as_deref(), Some("otsr_other"));
-
-        // Removed by logout: nothing is written.
-        let (result, connection, token) = commit(None, None, &run_a, &run_a_refreshed);
-        assert!(matches!(
-            result,
-            Err(LocalApiError::SetupRunConnectionMissing)
-        ));
-        assert_eq!(connection, None);
-        assert_eq!(token, None);
-    }
-
-    #[test]
     fn refresh_commit_storage_failure_never_leaves_a_mixed_pair() {
         let run_a = refresh_binding("run_a", "2026-05-05T10:00:00Z");
         let run_c_refreshed = refresh_binding("run_c", "2026-05-05T10:15:00Z");
@@ -35208,76 +30303,6 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    fn agent_reads_reject_timezone_override_before_contacting_ottto() {
-        let daemon = daemon().with_account(connected_account());
-        let authorization = RequestAuthorization::Token("token".to_string());
-        let timezone = Some("America/Los_Angeles".to_string());
-        let results = [
-            agent_costs(
-                &daemon,
-                &authorization,
-                AgentCostsQuery {
-                    timezone: timezone.clone(),
-                    ..AgentCostsQuery::default()
-                },
-            ),
-            agent_sessions(
-                &daemon,
-                &authorization,
-                AgentSessionsQuery {
-                    timezone: timezone.clone(),
-                    ..AgentSessionsQuery::default()
-                },
-            ),
-            agent_context(
-                &daemon,
-                &authorization,
-                AgentContextQuery {
-                    timezone,
-                    ..AgentContextQuery::default()
-                },
-            ),
-        ];
-        for result in results {
-            let error = cli_error(result.expect_err("timezone override must be refused"));
-            assert_eq!(error.code, CliErrorCode::InvalidRequest);
-            assert!(error
-                .message
-                .contains("timezone saved in your account settings"));
-        }
-        assert!(reject_timezone_override(Some("  ")).is_ok());
-        assert!(reject_timezone_override(None).is_ok());
-    }
-
-    #[test]
-    fn backend_reason_codes_come_only_from_structured_fields() {
-        for (body, expected) in [
-            (
-                r#"{"error":"ResultsUnavailableError","detail":"Filtering by machine isn't available yet","request_id":"req_1","code":"machine_filter_unsupported"}"#,
-                Some("machine_filter_unsupported"),
-            ),
-            (
-                r#"{"detail":"timezone_query_unsupported"}"#,
-                Some("timezone_query_unsupported"),
-            ),
-            (
-                r#"{"detail":{"code":"reattach_required","message":"Reconnect"}}"#,
-                Some("reattach_required"),
-            ),
-            (r#"{"detail":"Setup run companion token expired"}"#, None),
-            (r#"{"detail":"expired"}"#, None),
-            (r#"{"code":"Not A Code"}"#, None),
-            ("Setup run expired machine_filter_unsupported", None),
-        ] {
-            assert_eq!(backend_reason_code(body).as_deref(), expected, "{body}");
-        }
-        assert_eq!(
-            backend_reason_code(&format!(r#"{{"code":"{}"}}"#, "a".repeat(65))),
-            None
-        );
-    }
-
-    #[test]
     fn backend_reason_code_drives_the_message_and_incidental_expiry_text_does_not() {
         let backend = |status: u16, body: &str| BackendErrorDetails {
             kind: BackendErrorKind::Rejected,
@@ -35498,113 +30523,6 @@ X-API-Key = "otel_redacted"
             "otsr_fresh_complete"
         );
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    #[serial]
-    fn setup_verify_action_backend_error_completes_failed_action() {
-        let _guard = lock_backend_test_env();
-        let root = control_test_root("setup-action-error-complete");
-        let fake_claude = fake_binary_path(&root, "claude");
-        fs::write(&fake_claude, "#!/bin/sh\nexit 0\n").expect("write fake Claude smoke");
-        #[cfg(unix)]
-        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755))
-            .expect("mark fake Claude executable");
-        let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        let _path_guard = EnvVarGuard::set_os(
-            "OTTTO_COMMAND_SEARCH_PATH",
-            fake_claude
-                .parent()
-                .expect("fake binary parent")
-                .as_os_str()
-                .to_os_string(),
-        );
-        let completed_body = Arc::new(Mutex::new(None));
-        let api_base_url = setup_verify_action_backend_error_server(completed_body.clone());
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_error_complete".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: api_base_url.clone(),
-        };
-        let daemon = daemon()
-            .with_account(connected_account())
-            .with_connection(Some(connection.clone()));
-
-        let mut credentials = SetupRunCredentials {
-            setup_run_token: "otsr_test".to_string(),
-            connection,
-        };
-        let results =
-            process_setup_actions(&daemon, &api_base_url, &mut credentials, &test_machine())
-                .expect("setup action should complete as failed instead of wedging");
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].action_type, "verify_source");
-        assert_eq!(results[0].source.as_deref(), Some("claude_code"));
-        assert_eq!(results[0].status, "failed");
-        assert!(results[0].verification.is_none());
-        let body_guard = completed_body.lock().expect("completed body lock");
-        let body = body_guard.as_ref().expect("complete body observed");
-        assert_eq!(
-            body.get("status").and_then(serde_json::Value::as_str),
-            Some("failed")
-        );
-        let result = body.get("result").expect("completion result");
-        assert_eq!(
-            result.get("error_code").and_then(serde_json::Value::as_str),
-            Some("backend_unavailable")
-        );
-        let message = result
-            .get("error_message")
-            .and_then(serde_json::Value::as_str)
-            .expect("safe error message");
-        assert!(message.contains("Ottto was unavailable"));
-        assert!(!message.contains("/api/v1"));
-        assert!(!message.contains("setup_error_complete"));
-        assert_eq!(
-            result.get("verified").and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn setup_timeout_preserves_safe_detail() {
-        let error = cli_error(LocalApiError::TimedOut(
-            "backend request timed out for /api/v1/setup-runs/[id]/local-client/verification"
-                .to_string(),
-        ));
-
-        assert_eq!(error.code, CliErrorCode::TimedOut);
-        assert_eq!(
-            error.details.get("detail"),
-            Some(&RedactedValue::String(
-                "backend request timed out for /api/v1/setup-runs/[id]/local-client/verification"
-                    .to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn agent_read_timeout_message_names_read_surface() {
-        let error = cli_error(LocalApiError::TimedOut(
-            "backend request timed out for /api/v1/setup-runs/[id]/local-client/costs".to_string(),
-        ));
-
-        assert_eq!(error.code, CliErrorCode::TimedOut);
-        assert_eq!(
-            error.message,
-            "Timed out loading Ottto costs. Retry in a moment or narrow the query."
-        );
-        assert_eq!(
-            error.details.get("detail"),
-            Some(&RedactedValue::String(
-                "backend request timed out for /api/v1/setup-runs/[id]/local-client/costs"
-                    .to_string()
-            ))
-        );
     }
 
     #[test]
@@ -36076,68 +30994,6 @@ X-API-Key = "otel_redacted"
         format!("http://{address}")
     }
 
-    fn setup_verify_action_backend_error_server(
-        completed_body: Arc<Mutex<Option<serde_json::Value>>>,
-    ) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind setup action backend");
-        let address = listener.local_addr().expect("local address");
-        thread::spawn(move || {
-            let mut next_action_calls = 0_u8;
-            for _ in 0..10 {
-                let (mut stream, _) = listener.accept().expect("accept setup action request");
-                let request = read_complete_http_request(&mut stream);
-                if request.contains("/local-client/heartbeat") {
-                    write_json_response(&mut stream, 200, "OK", "{}");
-                } else if request.contains("/local-client/next-action") {
-                    let body = if next_action_calls == 0 {
-                        r#"{"action":{"id":"action_verify_claude_code","action_type":"verify_source","source":"claude_code"}}"#
-                    } else {
-                        r#"{"action":null}"#
-                    };
-                    next_action_calls += 1;
-                    write_json_response(&mut stream, 200, "OK", body);
-                    if next_action_calls > 1 {
-                        break;
-                    }
-                } else if request.contains("/actions/action_verify_claude_code/events") {
-                    write_json_response(&mut stream, 200, "OK", "{}");
-                } else if request.contains("/local-client/verification-marker") {
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"source":"claude_code","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
-                    );
-                } else if request.contains("/local-client/verification") {
-                    write_json_response(
-                        &mut stream,
-                        503,
-                        "Service Unavailable",
-                        r#"{"detail":"warehouse timeout request_id=req_hidden"}"#,
-                    );
-                } else if request.contains("/actions/action_verify_claude_code/complete") {
-                    let body: serde_json::Value =
-                        serde_json::from_str(http_request_body(&request)).expect("complete json");
-                    *completed_body.lock().expect("completed body lock") = Some(body);
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"run":{"id":"setup_error_complete","status":"waiting_for_user","machine_id":"machine_test"},"sources":[{"source":"claude_code","detected":true,"readiness_percent":70,"state":"failed","missing_fields":[]}],"next_action":null,"next_question":null}"#,
-                    );
-                } else {
-                    write_json_response(
-                        &mut stream,
-                        404,
-                        "Not Found",
-                        r#"{"detail":"unexpected setup action request"}"#,
-                    );
-                }
-            }
-        });
-        format!("http://{address}")
-    }
-
     fn setup_run_cancelled_scan_server() -> String {
         setup_run_terminal_scan_server("setup_cancelled", "Setup run cancelled")
     }
@@ -36356,54 +31212,6 @@ X-API-Key = "otel_redacted"
             format!("http://{address}"),
             request_seen_rx,
             allow_response_tx,
-        )
-    }
-
-    fn controlled_install_registration_server() -> (String, mpsc::Receiver<()>, mpsc::Sender<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind install backend");
-        let address = listener.local_addr().expect("install backend address");
-        let (register_seen_tx, register_seen_rx) = mpsc::channel();
-        let (allow_register_tx, allow_register_rx) = mpsc::channel();
-        thread::spawn(move || {
-            for _ in 0..8 {
-                let (mut stream, _) = listener.accept().expect("accept install request");
-                let request = read_complete_http_request(&mut stream);
-                if request.contains("/local-client/install-sessions") {
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"install_session_id":"install_reserved","install_session_token":"install_token_reserved"}"#,
-                    );
-                } else if request.contains(
-                    "/api/v1/telemetry/devices/registration-preparations",
-                ) {
-                    register_seen_tx.send(()).unwrap();
-                    allow_register_rx.recv().unwrap();
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"preparation_id":"preparation_reserved_install","capability":"device_credential_prepare_confirm_v1","expires_at":"2099-01-01T00:00:00Z","credential_generation":2,"device":{"id":"device_reserved_install","machine_id":"machine_test","sources":["pi"]},"candidate_secret":"relay_reserved_install","identity_continuity_capability":"prior_device_credential_v1","credential_rotation_planned":true,"prior_device_id":"00000000-0000-4000-8000-000000000001"}"#,
-                    );
-                } else if request.contains(
-                    "/api/v1/telemetry/device-credential-preparations/preparation_reserved_install/confirm",
-                ) {
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"preparation_id":"preparation_reserved_install","status":"confirmed","confirmed_at":"2026-07-31T20:00:00Z","credential_generation":2,"device":{"id":"device_reserved_install","machine_id":"machine_test","sources":["pi"]},"identity_continuity_capability":"prior_device_credential_v1","credential_rotation_performed":true,"rotated_prior_device_id":"00000000-0000-4000-8000-000000000001"}"#,
-                    );
-                } else {
-                    write_json_response(&mut stream, 200, "OK", "{}");
-                }
-            }
-        });
-        (
-            format!("http://{address}"),
-            register_seen_rx,
-            allow_register_tx,
         )
     }
 
