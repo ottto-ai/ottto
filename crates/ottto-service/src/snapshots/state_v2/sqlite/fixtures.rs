@@ -4,7 +4,7 @@ use super::*;
 /// [regress] SQLite header conversion preserves typed representation refusals.
 #[test]
 fn unknown_record_kind_survives_sqlite_conversion_and_health_sanitization() {
-    let scratch = crate::test_scratch::ScratchDir::new("v2-unknown-record-kind");
+    let scratch = crate::test_scratch::ScratchDir::canonical("v2-unknown-record-kind");
     let mut db = Sqlite::create_import(&scratch.join("index.v2.sqlite.import")).unwrap();
     db.conn().unwrap().execute("INSERT INTO records(kind,key_bytes,position,value_version,header,value_digest,row_checksum,value_bytes,chunk_count,inline_value) VALUES('file.future',X'',0,1,NULL,zeroblob(16),zeroblob(16),0,0,X'')",[]).unwrap();
     let mut tx = db.begin(TxnMode::Read).unwrap();

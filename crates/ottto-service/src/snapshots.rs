@@ -94612,7 +94612,7 @@ mod state_v2_maintenance_lock_tests {
     /// [behaviour] maintenance reserves the next turn ahead of our normal work.
     #[test]
     fn maintenance_reserves_the_next_turn_ahead_of_our_normal_work() {
-        let root = crate::test_scratch::private_dir("ops-lock");
+        let root = crate::test_scratch::canonical_private_dir("ops-lock");
         let parent = root.join("snapshots/destinations").join("a".repeat(64));
         fs::create_dir_all(&parent).unwrap();
         let path = parent.join("claude_code-test-scan-index.json");

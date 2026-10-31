@@ -7,11 +7,7 @@ use std::path::PathBuf;
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
-        Self(
-            crate::test_scratch::private_dir("ottto-state-v2")
-                .canonicalize()
-                .unwrap(),
-        )
+        Self(crate::test_scratch::canonical_private_dir("ottto-state-v2"))
     }
     fn path(&self) -> PathBuf {
         self.0.join("index.v2.sqlite.import")

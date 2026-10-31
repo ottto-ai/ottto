@@ -1626,7 +1626,7 @@ mod codec_mapper_regressions {
     /// [format] read back counts aggregated references to repeated empty evidence.
     #[test]
     fn read_back_counts_aggregated_references_to_repeated_empty_evidence() {
-        let scratch = crate::test_scratch::ScratchDir::new("codec-ref-readback");
+        let scratch = crate::test_scratch::ScratchDir::canonical("codec-ref-readback");
         let index: ScanIndex = serde_json::from_value(serde_json::json!({
             "schema_version":2,"files":{},"claude_usage_family_pending":{"f":{
                 "census_window_end":"A","invalid":false,

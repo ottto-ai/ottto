@@ -586,7 +586,7 @@ mod ops_tests {
     /// accumulated by the enclosing preparation/acquisition pass.
     #[test]
     fn nested_load_preserves_enclosing_pass_diagnostics() {
-        let root = crate::test_scratch::private_dir("nested-v2-pass");
+        let root = crate::test_scratch::canonical_private_dir("nested-v2-pass");
         let parent = root.join("snapshots/destinations").join("a".repeat(64));
         std::fs::create_dir_all(&parent).unwrap();
         let path = parent.join("claude_code-test-scan-index.json");

@@ -183,7 +183,7 @@ fn migration_crash_child() {
 /// [format] crash between ddl and revision bump rolls back on restart.
 #[test]
 fn crash_between_ddl_and_revision_bump_rolls_back_on_restart() {
-    let dir = crate::test_scratch::private_dir("v2-migration-crash");
+    let dir = crate::test_scratch::canonical_private_dir("v2-migration-crash");
     let path = dir.join("fixture.sqlite");
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([

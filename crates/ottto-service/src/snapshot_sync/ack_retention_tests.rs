@@ -12,7 +12,7 @@ struct AckFixture {
 
 impl AckFixture {
     fn new(committed_ack: bool) -> Self {
-        let scratch = crate::test_scratch::ScratchDir::new("upload-ack-retention");
+        let scratch = crate::test_scratch::ScratchDir::canonical("upload-ack-retention");
         let sources = scratch.join("sources");
         std::fs::create_dir_all(&sources).unwrap();
         Self::write_source(&sources, "held");
