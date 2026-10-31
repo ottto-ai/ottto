@@ -3152,3 +3152,115 @@ fn returning_family_grown_held_counts_only_tombstoned_retry_pending_roots() {
     assert_eq!(index.claude_usage_authority_pending_count(), 2);
     assert_eq!(index.claude_returning_family_grown_held_count(), 0);
 }
+
+/// [money] F5 (Codex money audit: 38 observed-but-unindexed files, $202.81):
+/// a page read the file and the generation observed it, but the partial
+/// checkpoint kept the traversal without the unacknowledged entry. After a
+/// restart the file is read once, with the same usage a fresh scan counts, and
+/// never again; a second load in the same process queues nothing.
+#[test]
+fn codex_observed_unindexed_file_is_read_once_after_restart() {
+    let dir = temp_dir("f5-codex-observed-unindexed");
+    let root = dir.join("home/.codex/sessions");
+    fs::create_dir_all(&root).unwrap();
+    let session = "019fa111-2222-7333-8444-555555555555";
+    let path = root.join(format!("rollout-2026-10-29T10-00-00-{session}.jsonl"));
+    fs::write(
+        &path,
+        [
+            serde_json::json!({"type":"session_meta","payload":{"id":session}}),
+            serde_json::json!({"timestamp":"2026-10-29T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":12,"output_tokens":4}}}}),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>(),
+    )
+    .unwrap();
+    let key = local_index_key(&path);
+    let roots = [root.clone()];
+    let usage = |scan: &SourceScanResult| {
+        scan.snapshots
+            .iter()
+            .filter(|item| item.source_session_id == session)
+            .map(|item| {
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.reasoning_output_tokens,
+                    item.request_count,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected = usage(
+        &scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            &roots,
+            &mut ScanIndex::default(),
+            "2026-10-29T12:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+        )
+        .unwrap(),
+    );
+    assert_eq!(expected.len(), 1);
+    assert_eq!(expected[0].1, 4);
+
+    let mut orphaned = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        &roots,
+        &mut orphaned,
+        "2026-10-29T12:00:00Z",
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        &mut orphaned,
+        BACKFILL_WINDOW_DAYS,
+        None,
+    );
+    let traversal = orphaned.traversal.as_mut().unwrap();
+    assert!(traversal.observed_index_keys.contains(&key));
+    traversal.pending_candidates.clear();
+    assert!(!orphaned.files.contains_key(&key));
+    let index_path = dir.join("codex-index.json");
+    orphaned.save(&index_path).unwrap();
+    let support = dir.join("support");
+    fs::create_dir_all(&support).unwrap();
+    let load = || {
+        ScanIndex::load_for_snapshot_source_with_origin(
+            &index_path,
+            SnapshotSource::Codex,
+            &support,
+        )
+        .unwrap()
+        .0
+    };
+
+    let mut index = load();
+    assert!(
+        load().traversal.unwrap().pending_candidates.is_empty(),
+        "once per process: a later load of the same index queues nothing"
+    );
+    let mut read = Vec::new();
+    for minute in 1..=3 {
+        let mut scan = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            &format!("2026-10-29T12:0{minute}:00Z"),
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+        )
+        .unwrap();
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        read.extend(usage(&scan));
+    }
+    assert_eq!(read, expected, "read once, with a fresh scan's usage");
+    assert!(index.files.contains_key(&key));
+    let _ = fs::remove_dir_all(&dir);
+}
