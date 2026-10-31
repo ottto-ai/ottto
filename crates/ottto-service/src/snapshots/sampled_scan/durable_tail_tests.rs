@@ -5706,14 +5706,17 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
                 }
                 if refusal == "eligibility" {
-                    if let Some(context) = scan.sampling.as_mut() {
-                        context.audit_metadata_supported = false;
-                    }
+                    // #870 removed audit age/cap as reuse gates. A RAM copy
+                    // without its committed index binding is still ineligible.
+                    scan.index.files.remove(&key);
                 }
                 if refusal == "audit_cap" {
                     if let Some(context) = scan.sampling.as_mut() {
                         context.audit_slots = 0;
                     }
+                    // The cap funds NEW debt, so this row must be debt-free.
+                    scan.index.files.get_mut(&key).unwrap().scan_identity_version =
+                        Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
                 }
                 if refusal == "census" {
                     scan.state_census_complete = false;
@@ -11304,6 +11307,7 @@ fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
             1,
             "native settlement wrote each record once before effects"
         );
+        seed_pinned_v1(&cache, source, &key, &index);
         let record = {
             let mut stores = cache.durable().unwrap();
             store::tests::found(
