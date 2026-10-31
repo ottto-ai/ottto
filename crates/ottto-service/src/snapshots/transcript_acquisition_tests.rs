@@ -4450,12 +4450,13 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
         );
         assert_eq!(modes.0, 1);
         index.save(&index_path).unwrap();
+        first
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
         assert_eq!(
-            first
-                .durable_write_after_save(lock, source, &index)
-                .unwrap()
-                .written,
-            1
+            first.durable_counters(source).unwrap().1.records_written,
+            1,
+            "native settlement wrote each record once before effects"
         );
         let key = local_index_key(&fixture.file.0);
         let old = sampled_scan::durable_tail::seed_pinned_v1(&first, source, &key, &index);
@@ -4486,7 +4487,12 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
             warm.files[&key].codex_counting_v2,
             cold.files[&key].codex_counting_v2
         );
-        assert_eq!(fs::read(&record_path).unwrap(), old, "no eager migration");
+        let successor = fs::read(&record_path).unwrap();
+        assert_ne!(successor, old, "growth settled the native successor");
+        assert_eq!(
+            u16::from_le_bytes(successor[8..10].try_into().unwrap()),
+            store::FORMAT_V3
+        );
         let due = unix_seconds(SystemTime::now()).unwrap() + 120;
         let fingerprint = warm.files[&key].source_file_fingerprint.clone();
         assert!(warm.stage_sampled_audit(
@@ -4659,8 +4665,8 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
     }
 }
 
-/// Index save may clear a completed audit before its durable replacement.
-/// Restart must re-arm the audit, not freeze the old debt-bearing record.
+/// [regress] A native receipt retires completed audit debt before index save.
+/// Restart after omitting the post-save offer must Tail without rearming it.
 #[cfg(unix)]
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
@@ -4692,12 +4698,13 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
         );
         assert_eq!(modes.0, 1);
         index.save(&index_path).unwrap();
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
         assert_eq!(
-            cache
-                .durable_write_after_save(lock, source, &index)
-                .unwrap()
-                .written,
-            1
+            cache.durable_counters(source).unwrap().1.records_written,
+            1,
+            "native settlement wrote each record once before effects"
         );
         fixture.file.append(&usage(source, 130, 1, "fixture-model"));
         let (mut index, _, modes) =
@@ -4706,13 +4713,10 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
         let key = local_index_key(&fixture.file.0);
         assert!(index.files[&key].has_unverified_source());
         index.save(&index_path).unwrap();
-        assert_eq!(
-            cache
-                .durable_write_after_save(lock, source, &index)
-                .unwrap()
-                .written,
-            1
-        );
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
+        assert_eq!(cache.durable_counters(source).unwrap().1.records_written, 2);
         drop(cache);
         let record_path = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
             .unwrap()
@@ -4745,9 +4749,13 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
             "completed actual Full cleared carrier"
         );
         audited.save(&index_path).unwrap();
-        // Crash/failure/deferral before durable_write_after_save: old bytes survive.
+        // Native settlement precedes effects and index save. Skipping the
+        // post-save offer cannot resurrect the predecessor's completed debt.
+        assert_eq!(audit.durable_counters(source).unwrap().1.records_written, 1);
         drop(audit);
-        assert_eq!(fs::read(&record_path).unwrap(), old);
+        let successor = fs::read(&record_path).unwrap();
+        assert_ne!(successor, old);
+        assert_eq!(successor[311], 0, "the completed Full retired the old debt");
         fixture.file.append(&usage(source, 160, 2, "fixture-model"));
         let restart = begin();
         let loaded = ScanIndex::load(&index_path).unwrap();
@@ -4759,7 +4767,11 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
             &namespace.0,
         );
         let (_, cold, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
-        assert_eq!(modes.0, 1, "immediate re-armed audit progresses");
+        assert_eq!(
+            modes,
+            (0, 1, 0),
+            "native receipt already retired the old audit"
+        );
         assert_eq!(
             restart
                 .durable_counters(source)
@@ -4767,23 +4779,30 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
                 .0
                 .ineligible
                 .get("audit_carrier"),
-            Some(&1)
+            None
         );
         assert_eq!(
             restart.durable_counters(source).unwrap().0.durable_held,
             [0; 9]
         );
         assert_eq!(production_body(source, scan), production_body(source, cold));
-        assert!(!repaired.files[&key].has_unverified_source());
+        assert!(
+            repaired.files[&key].has_unverified_source(),
+            "new growth owes its own audit"
+        );
         repaired.save(&index_path).unwrap();
+        restart
+            .durable_write_after_save(lock, source, &repaired)
+            .unwrap();
         assert_eq!(
-            restart
-                .durable_write_after_save(lock, source, &repaired)
-                .unwrap()
-                .written,
+            restart.durable_counters(source).unwrap().1.records_written,
             1
         );
-        assert_eq!(fs::read(&record_path).unwrap()[311], 0);
+        assert_eq!(
+            fs::read(&record_path).unwrap()[311],
+            1,
+            "new Tail debt survives restart"
+        );
         drop(restart);
         fixture.file.append(&usage(source, 190, 3, "fixture-model"));
         let (_, _, modes) = production_scan(

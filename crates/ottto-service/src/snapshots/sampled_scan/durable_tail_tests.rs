@@ -260,12 +260,13 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
         assert_eq!(first.snapshots[0].input_tokens, 100);
         assert!(cache.retained().unwrap().peek(&key).is_some());
         index.save(&index_path).unwrap();
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
         assert_eq!(
-            cache
-                .durable_write_after_save(lock, source, &index)
-                .unwrap()
-                .written,
-            1
+            cache.durable_counters(source).unwrap().1.records_written,
+            1,
+            "native settlement wrote each record once before effects"
         );
         cache.retained().unwrap().clear();
         let entry = serde_json::to_value(&index.files[&key]).unwrap();
@@ -559,12 +560,13 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
         assert_eq!(first.snapshots[0].input_tokens, 100);
         assert!(cache.retained().unwrap().peek(&key).is_some());
         index.save(&index_path).unwrap();
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
         assert_eq!(
-            cache
-                .durable_write_after_save(lock, source, &index)
-                .unwrap()
-                .written,
-            1
+            cache.durable_counters(source).unwrap().1.records_written,
+            1,
+            "native settlement wrote each record once before effects"
         );
         let checkpoint = cache
             .retained()
@@ -1349,7 +1351,14 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
             for _ in 0..10_000 {
                 match scan.step(None) {
                     OwnedSourceScanStep::Pending(next) => scan = next,
-                    OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+                    OwnedSourceScanStep::Complete {
+                        mut index,
+                        mut scan,
+                        ..
+                    } => {
+                        finalize_scan_after_policy(source, &mut scan, &mut index);
+                        return (index, scan);
+                    }
                 }
             }
             panic!("production scan did not complete");
@@ -3789,6 +3798,15 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
             std::fs::write(&disk, &bytes).unwrap();
             std::fs::set_permissions(&disk, std::os::unix::fs::PermissionsExt::from_mode(0o600))
                 .unwrap();
+            if source == SnapshotSource::ClaudeCode {
+                // Exercise binding admission on growth, rather than M3's
+                // unconditional quiet-EOF hold before body restoration.
+                std::io::Write::write_all(
+                    &mut File::options().append(true).open(&path).unwrap(),
+                    b"{}\n",
+                )
+                .unwrap();
+            }
             let mut changed_namespace = namespace.clone();
             let mut changed_scope = scope.clone();
             match arm {
@@ -5177,7 +5195,9 @@ thread_local! {
     static RETAIL_READS: std::cell::RefCell<Vec<(u64, usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 pub(super) fn observe_retail(at: u64, n: usize, old: u64) {
-    RETAIL_READS.with(|reads| reads.borrow_mut().push((at, n, old)));
+    if n != 0 {
+        RETAIL_READS.with(|reads| reads.borrow_mut().push((at, n, old)));
+    }
 }
 fn retail_reads() -> Vec<(u64, usize, u64)> {
     RETAIL_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
@@ -5447,8 +5467,14 @@ fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
         None
     );
     index = held;
-    // Preserve genuine sampled debt; move its existing deadline past due as in
-    // the native audit fixtures. The source mtime is now more than W old.
+    // Preserve genuine sampled debt for discovery past W. Since #870,
+    // overdue ordinary checkpoints still Tail: age cannot authorize a Full.
+    // Use the existing independent head-edit cause for the counted Full below;
+    // leading JSON whitespace preserves every native money/body field.
+    let mut changed = std::fs::read(&path).unwrap();
+    changed.insert(0, b' ');
+    std::fs::write(&path, changed).unwrap();
+    // The source mtime is now more than W old.
     index
         .files
         .get_mut(&key)
@@ -5721,14 +5747,20 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
                 }
                 if refusal == "eligibility" {
-                    if let Some(context) = scan.sampling.as_mut() {
-                        context.audit_metadata_supported = false;
-                    }
+                    // #870 removed audit age/cap as reuse gates. A RAM copy
+                    // without its committed index binding is still ineligible.
+                    scan.index.files.remove(&key);
                 }
                 if refusal == "audit_cap" {
                     if let Some(context) = scan.sampling.as_mut() {
                         context.audit_slots = 0;
                     }
+                    // The cap funds NEW debt, so this row must be debt-free.
+                    scan.index
+                        .files
+                        .get_mut(&key)
+                        .unwrap()
+                        .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
                 }
                 if refusal == "census" {
                     scan.state_census_complete = false;
@@ -6245,34 +6277,38 @@ fn a1a_scan_at(
     index: ScanIndex,
     at: &str,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-    let mut scan = OwnedSourceScan::new_with_identity_capture(
-        SnapshotSource::ClaudeCode,
-        roots,
-        index,
-        at,
-        183,
-        100,
-        false,
-        Some(support),
-        &[],
-        false,
-        true,
-        false,
-    )
-    .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
-    for _ in 0..100_000 {
-        let context = scan.sampling.as_ref().unwrap();
-        let modes = (
-            context.full_files,
-            context.tail_files,
-            context.unchanged_files,
-        );
-        match scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => scan = next,
-            OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
+    // Model an ordinary file born before its fixed August response timestamps.
+    // The fold is constructed before the driver's per-file birth setter runs.
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            roots,
+            index,
+            at,
+            183,
+            100,
+            false,
+            Some(support),
+            &[],
+            false,
+            true,
+            false,
+        )
+        .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
+        for _ in 0..100_000 {
+            let context = scan.sampling.as_ref().unwrap();
+            let modes = (
+                context.full_files,
+                context.tail_files,
+                context.unchanged_files,
+            );
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
+            }
         }
-    }
-    panic!("native transition did not finish");
+        panic!("native transition did not finish");
+    })
 }
 
 /// [money] a1a 859 and restart with active carry restore tail zero full fresh census.
@@ -6849,6 +6885,13 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
             .unwrap()
             .path();
         let before = std::fs::read(&disk_path).unwrap();
+        // Quiet EOF deliberately grants no restore; real growth earns the
+        // permission whose cleared/reverted entry cases this test fences.
+        std::io::Write::write_all(
+            &mut File::options().append(true).open(&path).unwrap(),
+            b"{}\n",
+        )
+        .unwrap();
         let cache = SharedCache::default();
         cache.durable_begin_pass(source, &index_path, &ns, false);
         cache.durable_note_scope(source, &key, &scope);
@@ -7931,7 +7974,9 @@ fn a0h_scan(
     root: &Path,
     index: ScanIndex,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-    owner.scan(roots, root, index, 100, true, &BTreeMap::new(), &[])
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        owner.scan(roots, root, index, 100, true, &BTreeMap::new(), &[])
+    })
 }
 
 /// [money] stale growth gate keeps transient and future floors held and shares pacing.
@@ -9483,7 +9528,7 @@ fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
     ));
 }
 
-/// [money] warm shortened old file keeps accepted body floor without publication.
+/// [money] only an independent census proof releases the warm shortened-file floor.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -9496,100 +9541,167 @@ fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
     }
     use std::io::Write;
     assert!(crate::heap_layout_bound::layout_supported());
-    let root = crate::test_scratch::ScratchDir::new("p3-warm-floor");
-    let sessions = root.join("sessions");
-    std::fs::create_dir(&sessions).unwrap();
-    let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
-    native_fixture(&path);
-    let prefix = std::fs::metadata(&path).unwrap().len();
-    let row = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
+    for proved in [true, false] {
+        let root = crate::test_scratch::ScratchDir::new("p3-warm-floor");
+        let sessions = root.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+        native_fixture(&path);
+        let prefix = std::fs::metadata(&path).unwrap().len();
+        let row = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
         "timestamp":"2026-10-07T10:01:00Z","requestId":"req-p3-warm",
         "message":{"id":"msg-p3-warm","model":"fixture-model","usage":{"input_tokens":25,"output_tokens":3}}});
-    writeln!(
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap(),
-        "{row}"
-    )
-    .unwrap();
-    let source = SnapshotSource::ClaudeCode;
-    let namespace = Scope("p3-warm-s2".into());
-    let cache = Arc::new(SharedCache::default());
-    let run = |index| {
-        let mut scan = OwnedSourceScan::new_with_identity_capture(
-            source,
-            std::slice::from_ref(&sessions),
-            index,
-            "2026-10-29T12:00:00Z",
-            365,
-            100,
-            false,
-            None,
-            &[],
-            false,
-            true,
-            true,
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{row}"
         )
-        .with_sampled_acquisition(cache.clone(), namespace.clone());
-        let mut modes = (0, 0, 0);
-        for _ in 0..10_000 {
-            if let Some(context) = scan.sampling.as_ref() {
-                modes = (context.full_files, context.tail_files, context.native_bytes);
-            }
-            match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => scan = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
-            }
+        .unwrap();
+        let source = SnapshotSource::ClaudeCode;
+        let namespace = Scope("p3-warm-s2".into());
+        let cache = Arc::new(SharedCache::default());
+        let run = |cache: Arc<SharedCache>, index| {
+            // The fixed transcript timestamps follow this synthetic file birth.
+            claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+                let mut scan = OwnedSourceScan::new_with_identity_capture(
+                    source,
+                    std::slice::from_ref(&sessions),
+                    index,
+                    "2026-10-29T12:00:00Z",
+                    365,
+                    100,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                    true,
+                )
+                .with_sampled_acquisition(cache.clone(), namespace.clone());
+                let mut modes = (0, 0, 0);
+                for _ in 0..10_000 {
+                    if let Some(context) = scan.sampling.as_ref() {
+                        modes = (context.full_files, context.tail_files, context.native_bytes);
+                    }
+                    match scan.step(None) {
+                        OwnedSourceScanStep::Pending(next) => scan = next,
+                        OwnedSourceScanStep::Complete { index, scan, .. } => {
+                            return (index, scan, modes)
+                        }
+                    }
+                }
+                panic!("warm S2 fixture did not finish");
+            })
+        };
+        let mut initial = ScanIndex::default();
+        // Match sync preparation so publication permits request-owned literals.
+        initial.activate_effective_upload_body_witness_revision(
+            crate::snapshot_sync::effective_upload_body_witness_revision(source),
+        );
+        let (mut accepted, first, _) = run(cache.clone(), initial);
+        let key = local_index_key(&path);
+        assert_eq!(first.snapshots[0].input_tokens, 125);
+        assert!(
+            cache.retained().unwrap().peek(&key).is_some(),
+            "real warm premise"
+        );
+        let entry = serde_json::to_value(&accepted.files[&key]).unwrap();
+        let census = accepted.claude_request_census.get(&key).unwrap().clone();
+        assert!(
+            !census.unverified_for_test(),
+            "real source-verified census premise"
+        );
+        if !proved {
+            // Preserve the accepted entry and the reader's shorter-file observation;
+            // withdraw only the census's independent proof.
+            accepted
+                .claude_request_census
+                .insert_for_test(&key, census.with_unverified_for_test(true));
         }
-        panic!("warm S2 fixture did not finish");
-    };
-    let (accepted, first, _) = run(ScanIndex::default());
-    let key = local_index_key(&path);
-    assert_eq!(first.snapshots[0].input_tokens, 125);
-    assert!(
-        cache.retained().unwrap().peek(&key).is_some(),
-        "real warm premise"
-    );
-    let entry = serde_json::to_value(&accepted.files[&key]).unwrap();
-    let census = accepted.claude_request_census.get(&key).unwrap().clone();
-    let witness = accepted.files[&key].last_upload_body_witness.clone();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_len(prefix)
-        .unwrap();
-    File::open(&path)
-        .unwrap()
-        .set_times(
-            std::fs::FileTimes::new()
-                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
-        )
-        .unwrap();
-    assert!(sampled_audit::path_requires_recovery(
-        source,
-        &accepted.files,
-        &path,
-        prefix
-    ));
-    let (held, body, modes) = run(accepted);
-    assert!(
-        body.snapshots.is_empty(),
-        "cannot publish100 below accepted125"
-    );
-    assert_eq!(
-        body.unreadable_path_count, 0,
-        "known floor is census-neutral"
-    );
-    assert_eq!(
-        modes,
-        (0, 0, 0),
-        "no Full/Tail selection or native body before S2"
-    );
-    assert_eq!(serde_json::to_value(&held.files[&key]).unwrap(), entry);
-    assert_eq!(held.files[&key].last_upload_body_witness, witness);
-    assert_eq!(held.claude_request_census.get(&key), Some(&census));
+        let census = accepted.claude_request_census.get(&key).unwrap().clone();
+        let witness = accepted.files[&key].last_upload_body_witness.clone();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(prefix)
+            .unwrap();
+        File::open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+        assert!(sampled_audit::path_requires_recovery(
+            source,
+            &accepted.files,
+            &path,
+            prefix
+        ));
+        assert_eq!(
+            claude_request_census::proves_indexed_shrink(
+                &accepted,
+                &key,
+                prefix,
+                physical_identity(&std::fs::metadata(&path).unwrap()),
+            ),
+            proved,
+            "proof comes from the census, never the reader's shorter-file observation"
+        );
+        let mut cold_prior = accepted.clone();
+        let (mut held, mut body, modes) = run(cache.clone(), accepted);
+        if proved {
+            assert_eq!(body.snapshots.len(), 1, "proved shrink publishes");
+            assert_eq!(body.snapshots[0].input_tokens, 100);
+            assert_eq!(modes, (1, 0, prefix), "proved edit takes Full");
+            // OFF has no shrink discovery rescue. Give only the cold oracle
+            // the existing verification marker to select this old file; it
+            // grants no read authority. The fresh cache takes ordinary Full.
+            cold_prior
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .set_unverified_deadline(1);
+            let (mut cold_index, mut cold, cold_modes) = {
+                let _cold_restore = crate::snapshots::RestartRestoreForTest::disabled();
+                assert!(sampled_audit::path_requires_recovery(
+                    source,
+                    &cold_prior.files,
+                    &path,
+                    prefix
+                ));
+                run(Arc::new(SharedCache::default()), cold_prior)
+            };
+            assert_eq!(cold_modes, (1, 0, prefix), "independent cold Full");
+            assert_eq!(cold.snapshots.len(), 1);
+            assert_eq!(cold.snapshots[0].input_tokens, 100);
+            assert_eq!(
+                a0h_wire(&root, &mut held, &mut body),
+                a0h_wire(&root, &mut cold_index, &mut cold),
+                "proved-shrink publication money equals cold Full of the shortened file"
+            );
+            continue;
+        }
+        assert!(
+            body.snapshots.is_empty(),
+            "cannot publish 100 below accepted 125 without independent proof"
+        );
+        assert_eq!(
+            body.unreadable_path_count, 0,
+            "known floor is census-neutral"
+        );
+        assert_eq!(
+            modes,
+            (0, 0, 0),
+            "no Full/Tail selection or native body before S2"
+        );
+        assert_eq!(serde_json::to_value(&held.files[&key]).unwrap(), entry);
+        assert_eq!(held.files[&key].last_upload_body_witness, witness);
+        assert_eq!(held.claude_request_census.get(&key), Some(&census));
+    }
 }
 
 struct O3Fixture {
@@ -11310,13 +11422,15 @@ fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
             "genuine Full, no seeded debt"
         );
         index.save(&index_path).unwrap();
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
         assert_eq!(
-            cache
-                .durable_write_after_save(lock, source, &index)
-                .unwrap()
-                .written,
-            1
+            cache.durable_counters(source).unwrap().1.records_written,
+            1,
+            "native settlement wrote each record once before effects"
         );
+        seed_pinned_v1(&cache, source, &key, &index);
         let record = {
             let mut stores = cache.durable().unwrap();
             store::tests::found(
@@ -11997,6 +12111,30 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     let loaded = ScanIndex::load(&index_path).unwrap();
     let interpretation = Interpretation::of(source, &key, &loaded, false, &namespace);
     let mut file = File::open(&path).unwrap();
+    assert!(matches!(
+        fresh.durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut file,
+            &loaded,
+            &interpretation,
+        ),
+        RestoreOutcome::QuietPending
+    ));
+    assert_eq!(
+        fresh.durable_counters(source).unwrap().1.guard_verify_bytes,
+        0
+    );
+    std::io::Write::write_all(
+        &mut std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap(),
+        b"{}\n",
+    )
+    .unwrap();
     let restored = fresh.durable_restore(
         source,
         &key,
@@ -12024,8 +12162,8 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     assert_eq!(
         parser
             .prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_000)
-            .unwrap_or_else(|_| panic!("restored quiet checkpoint must prepare")),
-        crate::transcript_acquisition::ReadMode::Unchanged
+            .unwrap_or_else(|_| panic!("restored growing checkpoint must prepare")),
+        crate::transcript_acquisition::ReadMode::Tail
     );
 }
 

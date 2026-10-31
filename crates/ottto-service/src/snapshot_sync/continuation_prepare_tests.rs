@@ -961,10 +961,20 @@ fn ordinary_durable_continuation_to_eof(
                         "continuation parks EOF for ordinary settlement"
                     );
                     let (mut index, scan) = state.finish_ordinary_eof(|| {
+                        let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+                        index.activate_upload_context(cycle_upload_context(
+                            inputs.upload_policy,
+                            None,
+                            false,
+                        ));
+                        index.mark_context_curve_capability_disabled();
+                        index.activate_effective_upload_body_witness_revision(
+                            cycle_body_witness_revision(SnapshotSource::Codex),
+                        );
                         let mut ordinary = OwnedSourceScan::new(
                             SnapshotSource::Codex,
                             std::slice::from_ref(&root),
-                            ScanIndex::load(&fixture.index_path).unwrap(),
+                            index,
                             &at,
                             30,
                             10,

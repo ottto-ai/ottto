@@ -14834,12 +14834,13 @@ fn structural_restore_page_defer_does_not_spend_full_pace() {
     let (mut index, prefix) = page(&fixture, ScanIndex::default(), Some(cache.clone()));
     assert_eq!(prefix.snapshots.len(), 2);
     index.save(&index_path).unwrap();
+    cache
+        .durable_write_after_save(lock, source, &index)
+        .unwrap();
     assert_eq!(
-        cache
-            .durable_write_after_save(lock, source, &index)
-            .unwrap()
-            .written,
-        2
+        cache.durable_counters(source).unwrap().1.records_written,
+        2,
+        "native settlement wrote each record once before effects"
     );
     cache.retained().unwrap().clear();
     for session in [SESSION, SESSION_B] {

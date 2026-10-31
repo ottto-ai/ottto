@@ -131,6 +131,11 @@ fn scan(
                     &mut index,
                     snapshot_upload_body_witness,
                 );
+                if source == SnapshotSource::Codex {
+                    // The fixture accepts its finalized body. Production ends
+                    // this protected traversal after capturing recovery facts.
+                    scan.finish_codex_capture_boundary(&mut index);
+                }
                 return (index, scan.snapshots);
             }
         }
@@ -493,7 +498,12 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
                 "verified_extent" => {
                     entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into())
                 }
-                "future_revision" => entry.effective_upload_body_witness_revision = revision + 1,
+                "future_revision" => {
+                    entry.effective_upload_body_witness_revision =
+                        crate::snapshot_sync::effective_upload_body_witness_revision(
+                            SnapshotSource::ClaudeCode,
+                        ) + 1;
+                }
                 "not_due" => entry.set_unverified_deadline(
                     now_unix() + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS / 2,
                 ),
@@ -1081,7 +1091,7 @@ fn m3_d3_codex_strict_rebind_survives_save_and_load_and_refuses_a_with_one_full(
     assert!(!refused.disabled());
     let (counts, stats) = rig.counters();
     assert_eq!(
-        counts.ineligible.get("selection_cleared.stale_record"),
+        counts.ineligible.get("selection_cleared.stale_record_full"),
         Some(&1)
     );
     assert_eq!(counts.restored, 0);
@@ -1401,6 +1411,14 @@ fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
         );
         assert_eq!(publications.len(), 1);
         assert!(rig.cache.durable_store_faulted(rig.source));
+        let staged_due = working.files[&key]
+            .unverified_deadline()
+            .expect("the native Tail stages its audit obligation");
+        fs::write(
+            rig.root.join("pre-barrier-audit.json"),
+            serde_json::to_vec(&staged_due).unwrap(),
+        )
+        .unwrap();
         let marker = rig.root.join("point-reached");
         scan_hooks::set(
             if after {
@@ -1470,7 +1488,18 @@ fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
             rig.index.files[&key].source_file_fingerprint.is_empty(),
             after
         );
+        let staged_due: u64 =
+            serde_json::from_slice(&fs::read(scratch.join("pre-barrier-audit.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            rig.index.files[&key].unverified_deadline(),
+            after.then_some(staged_due),
+            "the barrier carries exactly the staged audit debt before ACK"
+        );
         entry["source_file_fingerprint"] = pre["source_file_fingerprint"].clone();
+        // The independently checked audit marker is scheduling metadata;
+        // every accepted fact and all other entry fields must stay PRE.
+        entry["scan_identity_version"] = pre["scan_identity_version"].clone();
         assert_eq!(
             entry, pre,
             "the barrier never fabricates accepted revision/extent/body"
@@ -1534,13 +1563,29 @@ fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
 fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let mut rig = Rig::new(SnapshotSource::Codex, "m3-singleton-group");
-    rig.create(CODEX_SESSION, 2);
+    let first = codex_file_join::tests::member(CODEX_SESSION, "rotation-a", 200, 200);
+    fs::write(
+        rig.path(CODEX_SESSION),
+        first
+            .iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
     assert_eq!(rig.pass().published(CODEX_SESSION), 1);
     rig.assert_native_record(CODEX_SESSION);
     let stale = fs::read(rig.record(CODEX_SESSION)).unwrap();
     let alias = rig.sessions.join("joined.jsonl");
-    fs::copy(rig.path(CODEX_SESSION), &alias).unwrap();
-    rig.append(CODEX_SESSION, 1);
+    // A copied cumulative-only file has no independent ownership chain.
+    // Use the production join fixture's contiguous native response proof.
+    let next = codex_file_join::tests::member(CODEX_SESSION, "rotation-b", 100, 300);
+    fs::write(
+        &alias,
+        next.iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
     rig.cache = Arc::new(SharedCache::default());
     let grouped = rig.pass();
     assert_eq!(

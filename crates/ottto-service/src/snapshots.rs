@@ -31931,6 +31931,7 @@ impl OwnedSourceScan {
                                     key,
                                     completed,
                                     finalization_charge.unwrap_or(0),
+                                    m3_publication == Some(NativePublication::Receipted),
                                 )
                             } else {
                                 context.cache.insert_admitted(

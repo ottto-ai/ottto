@@ -1777,7 +1777,7 @@ impl DurableTailStore {
         if !self.usable(Some(writer)) {
             return Ok(receipt);
         }
-        if !self.check_resources(writer, index_length) {
+        if !self.check_resources(writer, index_length)? {
             receipt
                 .deferred_keys
                 .extend(pending.iter().map(|record| record.binding.key));
@@ -1910,7 +1910,10 @@ impl DurableTailStore {
         let (mut on_disk, mut unlisted) = self
             .scan_disk()
             .inspect_err(|_| self.counters.store_write_failed[1] += 1)?;
-        let mut attempted = receipt.completed.len();
+        // Native staging and this post-save batch share the pass allowance.
+        // A declined native record must not bypass it through its RAM offer.
+        let mut attempted = self.stream_records + receipt.completed.len();
+        let mut encoded_pass_bytes = self.stream_bytes;
         for (record, content, prior, verified_prior) in dirty {
             if attempted >= MAX_BATCH {
                 receipt.deferred += 1;
@@ -1946,6 +1949,15 @@ impl DurableTailStore {
                 continue;
             }
             let bytes = encode(&stored);
+            if self.stream_records != 0
+                && encoded_pass_bytes
+                    .checked_add(bytes.len())
+                    .map_or(true, |bytes| bytes > WRITE_PASS_BYTES)
+            {
+                receipt.deferred += 1;
+                receipt.deferred_keys.push(key);
+                continue;
+            }
             let ack_bytes = if self.source == DurableSource::ClaudeCode {
                 BATCH_ACK_BYTES
             } else {
@@ -1973,6 +1985,7 @@ impl DurableTailStore {
                     .get_or_insert_with(|| Box::new([None; MAX_BATCH]));
             }
             attempted += 1;
+            encoded_pass_bytes = encoded_pass_bytes.saturating_add(bytes.len());
             let candidate = WireRecordIdentity::verified(&stored, &bytes);
             self.pending.insert(
                 key,

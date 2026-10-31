@@ -2548,7 +2548,9 @@ impl SharedCache {
             if restart_restore::enabled() && slot.store.resource_paused() {
                 if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
                     let index_len = std::fs::metadata(index_path).map_or(0, |m| m.len());
-                    slot.store.check_resources(writer, index_len);
+                    // This pass-start probe only refreshes an existing pause.
+                    // An I/O error keeps it held; the write path reports errors.
+                    let _ = slot.store.check_resources(writer, index_len);
                 }
             }
         }
@@ -6611,11 +6613,10 @@ impl SharedCache {
                         layout: unavailable,
                         gc: store.restore_unavailable_layout_gc,
                     },
-                    d3_claude_hold: (claude && (hold_keys > 0 || hold_alarm || hold_changed))
-                        .then_some(HoldAlarm {
-                            keys: hold_keys,
-                            oldest_age,
-                        }),
+                    d3_claude_hold: (claude && (hold_alarm || hold_changed)).then_some(HoldAlarm {
+                        keys: hold_keys,
+                        oldest_age,
+                    }),
                 },
             );
         }

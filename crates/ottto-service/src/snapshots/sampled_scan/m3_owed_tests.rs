@@ -157,14 +157,15 @@ fn n10_pacing_eviction_allows_growth_without_evicting_spent_authority() {
     let ((), _) = crate::local_resource_diagnostics::capture(|| {
         f.cache.durable_alarm(SnapshotSource::ClaudeCode);
     });
-    assert!(f.cache.retail_full(
-        "new-growing-key",
-        &f.file,
-        f.checkpoint.sealed_offset(),
-        std::time::SystemTime::UNIX_EPOCH
-            + Duration::from_secs(1_800_000_000 + 2 * store::MAX_RECORDS as u64)
-    ));
+    // Eviction is emitted by the admission that evicts, not by durable_alarm.
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+        assert!(f.cache.retail_full(
+            "new-growing-key",
+            &f.file,
+            f.checkpoint.sealed_offset(),
+            std::time::SystemTime::UNIX_EPOCH
+                + Duration::from_secs(1_800_000_000 + 2 * store::MAX_RECORDS as u64)
+        ));
         f.cache.durable_alarm(SnapshotSource::ClaudeCode);
     });
     let pace = alarms
