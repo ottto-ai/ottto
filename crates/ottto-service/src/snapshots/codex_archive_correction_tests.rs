@@ -164,7 +164,13 @@ fn transient_attempt_three_continues_and_six_decodes_exhaust_budget() {
     for attempt in 1..=6 {
         let (next, body, rows, _) = archive_pass(&f, index, true, None);
         index = next;
-        assert_eq!(decodes(&rows), 1);
+        // Discovery may read a prefix; replay/retain makes no new FULL decode.
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_zst_input")
+                .count(),
+            1
+        );
         assert_eq!(archive_evidence(&index, &f).decode_attempts, attempt);
         if attempt == 1 {
             // A transient EIO is not a sticky content refusal.

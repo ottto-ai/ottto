@@ -49,11 +49,12 @@ fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::
 }
 
 // Darwin receipt: zstd 1.5.7, WindowLogMax(23), 514 MiB decoded fixture,
-// Mac CI run 40942402563 log's decoder_allocation_receipt: actual-size peak
-// 13,009,088 bytes, plus 10%, rounded up to 64 KiB = 14,352,384 bytes.
+// Mac CI run 41213075990 decoder_allocation_receipt: actual-size peak
+// 13,156,560 bytes, plus 10%, rounded up to 64 KiB
+// = 14,483,456 bytes.
 // Paid inside unchanged STATE_BYTES; admission preserves the primary Tail floor.
 #[cfg(target_os = "macos")]
-const COMPRESSED_INPUT_CREDIT: usize = 14_352_384;
+const COMPRESSED_INPUT_CREDIT: usize = 14_483_456;
 // Other platforms retain CI run 40774588149's 8,894,448-byte requested peak
 // plus 10%, rounded up to 64 KiB. No non-Darwin credit change.
 #[cfg(not(target_os = "macos"))]
@@ -1263,11 +1264,11 @@ pub(in crate::snapshots) mod tests {
     fn decoder_credit_preserves_the_platform_receipt_and_margin() {
         #[cfg(target_os = "macos")]
         {
-            let measured_peak = 13_009_088_usize; // Mac run 40942402563, zstd 1.5.7.
+            let measured_peak = 13_156_560_usize; // Mac run 41213075990, zstd 1.5.7.
             assert!(
                 compressed_input_credit().unwrap() >= measured_peak + measured_peak.div_ceil(10)
             );
-            assert_eq!(compressed_input_credit().unwrap(), 14_352_384);
+            assert_eq!(compressed_input_credit().unwrap(), 14_483_456);
         }
         #[cfg(not(target_os = "macos"))]
         assert_eq!(compressed_input_credit().unwrap(), 9_830_400);
@@ -1809,7 +1810,13 @@ pub(in crate::snapshots) mod tests {
         let bytes = synthetic_rollout();
         let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
         let (mut index, result, rows, ends) = archive_pass(&f, ScanIndex::default(), true, None);
-        assert_eq!(decodes(&rows), 1);
+        // Discovery may read a prefix; replay/retain makes no new FULL decode.
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_zst_input")
+                .count(),
+            1
+        );
         assert!(ends.0.lock().unwrap().is_empty());
         assert_eq!(
             *ends.1.lock().unwrap(),
@@ -1878,7 +1885,13 @@ pub(in crate::snapshots) mod tests {
             assert_eq!(result.unreadable_path_count > 0, missing_body);
             retry_due(&mut state, &key);
             let (mut state, offered, rows, _) = archive_pass(&f, state, true, None);
-            assert_eq!(decodes(&rows), 1);
+            // Discovery may read a prefix; replay/retain makes no new FULL decode.
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r["stage"] == "codex_zst_input")
+                    .count(),
+                1
+            );
             assert_eq!(
                 rows.iter()
                     .filter(|r| r["stage"] == "codex_zst_first_read_retry")
@@ -1990,7 +2003,13 @@ pub(in crate::snapshots) mod tests {
             let before = sampled_scan::now_seconds();
             let (index, result, rows, _) = archive_pass(&f, state, true, None);
             let after = sampled_scan::now_seconds();
-            assert_eq!(decodes(&rows), 1);
+            // Discovery may read a prefix; replay/retain makes no new FULL decode.
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r["stage"] == "codex_zst_input")
+                    .count(),
+                1
+            );
             assert_eq!(result.snapshots.len(), 1);
             let ArchiveDisposition::Pending {
                 attempts,
@@ -2412,7 +2431,13 @@ pub(in crate::snapshots) mod tests {
                     input.close();
                 }
                 let (_, result, rows, _) = archive_pass(&f, index, true, None);
-                assert_eq!(decodes(&rows), 1);
+                // Discovery may read a prefix; replay/retain makes no new FULL decode.
+                assert_eq!(
+                    rows.iter()
+                        .filter(|r| r["stage"] == "codex_zst_input")
+                        .count(),
+                    1
+                );
                 assert_eq!(result.snapshots.len(), 1);
             }
         }
@@ -2486,16 +2511,24 @@ pub(in crate::snapshots) mod tests {
             }
             let (_, result, rows, _) = archive_pass(&f, checkpoint(&state), true, None);
             assert_eq!(
-                decodes(&rows),
+                rows.iter()
+                    .filter(|r| r["stage"] == "codex_zst_input")
+                    .count(),
                 1,
-                "a legacy terminal hold gets one funded custody retry"
+                "a legacy terminal hold gets one funded Full custody retry"
             );
             assert_eq!(result.snapshots.len(), 1);
             let mut changed = encoded.clone();
             changed.extend(zstd::stream::encode_all(&vec![b'\n'; n + 1][..], 1).unwrap());
             fs::write(&f.0, changed).unwrap();
             let (fresh, result, rows, _) = archive_pass(&f, state, true, None);
-            assert_eq!(decodes(&rows), 1);
+            // Discovery may read a prefix; replay/retain makes no new FULL decode.
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r["stage"] == "codex_zst_input")
+                    .count(),
+                1
+            );
             assert_eq!(result.snapshots.len(), 1);
             assert_pending(&fresh, &f.0, 1);
             assert!(!rows
@@ -2522,7 +2555,13 @@ pub(in crate::snapshots) mod tests {
             },
             || archive_pass(&f, ScanIndex::default(), true, None),
         );
-        assert_eq!(decodes(&rows), 1);
+        // Discovery may read a prefix; replay/retain makes no new FULL decode.
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_zst_input")
+                .count(),
+            1
+        );
         assert_pending(&index, &f.0, 1);
         assert!(result.snapshots.is_empty());
         assert!(!ends
@@ -3232,7 +3271,13 @@ pub(in crate::snapshots) mod tests {
                 },
             );
             let (mut index, result, rows, _) = archive_pass(&f, prior, true, None);
-            assert_eq!(decodes(&rows), 1);
+            // Discovery may read a prefix; replay/retain makes no new FULL decode.
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r["stage"] == "codex_zst_input")
+                    .count(),
+                1
+            );
             assert_eq!(result.snapshots.len(), 1);
             let bodies = result
                 .snapshots
@@ -3296,7 +3341,13 @@ pub(in crate::snapshots) mod tests {
         let roots = [f.0.parent().unwrap().to_owned()];
         let (index, result, rows, ends) =
             archive_pass_with(&f, ScanIndex::default(), true, None, &roots, |_| {});
-        assert_eq!(decodes(&rows), 1);
+        // Discovery may read a prefix; replay/retain makes no new FULL decode.
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_zst_input")
+                .count(),
+            1
+        );
         assert!(result.snapshots.is_empty());
         assert_pending(&index, &f.0, 1);
         assert!(!ends
@@ -3349,7 +3400,13 @@ pub(in crate::snapshots) mod tests {
         // old red generation cannot certify the parent's current census.
         saved.traversal = None;
         let (after, result, rows, _) = archive_pass_with(&f, saved, true, None, &roots, |_| {});
-        assert_eq!(decodes(&rows), 1);
+        // Discovery may read a prefix; replay/retain makes no new FULL decode.
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_zst_input")
+                .count(),
+            1
+        );
         assert_pending(&after, &f.0, 2);
         let child = result
             .snapshots

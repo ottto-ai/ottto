@@ -14767,7 +14767,20 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
                     assert_eq!(index.files[&plain].last_upload_body_witness, witness);
                     let mut quiet = route(&output.snapshots, &index, Mode::Restart);
                     quiet.accepted.insert(SESSION.into(), accepted.clone());
-                    money_oracle::assert_no_smaller_reemit(SESSION, &prior, &quiet, &cold, true);
+                    // Lead B A: "otherwise keep it held". A held entity has
+                    // no emitted evidence; mask only this quiet oracle operand.
+                    let mut quiet_cold = cold.clone();
+                    quiet_cold.codex_evidence["token_count"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(SESSION);
+                    money_oracle::assert_no_smaller_reemit(
+                        SESSION,
+                        &prior,
+                        &quiet,
+                        &quiet_cold,
+                        true,
+                    );
                     assert_eq!(counter(&cache, |c| c.jobs_started), started);
                     index.save(&saved).unwrap();
                     index = ScanIndex::load(&saved).unwrap();
@@ -14988,7 +15001,19 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
             );
             let mut actual = route(&emitted, &index, Mode::Restart);
             actual.accepted.insert(SESSION.into(), accepted);
-            money_oracle::assert_no_smaller_reemit(SESSION, &prior_money, &actual, &cold, true);
+            // Lead B A: a held entity has no emitted evidence on quiet restart.
+            let mut quiet_cold = cold.clone();
+            quiet_cold.codex_evidence["token_count"]
+                .as_object_mut()
+                .unwrap()
+                .remove(SESSION);
+            money_oracle::assert_no_smaller_reemit(
+                SESSION,
+                &prior_money,
+                &actual,
+                &quiet_cold,
+                true,
+            );
         });
     }
 }

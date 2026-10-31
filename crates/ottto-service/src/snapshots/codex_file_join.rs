@@ -656,13 +656,8 @@ impl HeaderInventory {
     /// D5: the one family facts table. Validated headers (plain or archive,
     /// keyed by header owner) and archives known only by name (bound, unknown
     /// or held; keyed by filename owners) stay separate evidence classes.
-    fn family_table(&self) -> FamilyTable<'_> {
+    fn family_table(&self, capacity: usize) -> FamilyTable<'_> {
         // Flat facts sort once; no owner tree rebuilt for each candidate.
-        // The admitted upper capacity includes two filename owners per key.
-        let capacity = self.headers.len()
-            + 2 * (self.first_read_archives.len()
-                + self.held_archives.len()
-                + self.deferred_archives.len());
         let mut facts = Vec::with_capacity(capacity);
         for header in &self.headers {
             facts.push((
@@ -752,102 +747,92 @@ impl HeaderInventory {
                 .is_ok()
     }
 
-    /// Charge the owner table, names, compact results and scratch before any
-    /// roster-sized allocation. Refusal retains the existing inventory debt.
-    fn family_bound(&self, index: Option<&ScanIndex>) -> Option<usize> {
-        use crate::heap_layout_bound::Counter;
-        // Measure the refused proposal too; this allocates no family scratch.
-        // Admission still uses the unchanged common parked-state budget.
-        let mut cost = Counter::new(usize::MAX);
-        cost.add(self.feed_peak)?;
-        cost.add(self.decode_peak)?;
-        cost.add(self.custody_peak)?;
-        cost.add(codex_compressed_holds::OWNER_LOOKUP_SLACK)?;
-        // Fact vector + grouped families + their name vectors + final compact
-        // results. Names borrow the inventory; key/owner bytes are charged here.
-        let slots = self.headers.len().checked_add(
-            2usize.checked_mul(
-                self.first_read_archives
-                    .len()
-                    .checked_add(self.held_archives.len())?
-                    .checked_add(self.deferred_archives.len())?,
-            )?,
-        )?;
-        cost.add(
-            slots.checked_mul(
-                std::mem::size_of::<(String, u8, Option<&str>)>()
-                    .checked_add(std::mem::size_of::<(String, Family<'_>)>())?,
-            )?,
-        )?;
-        cost.add(
-            self.headers
-                .len()
-                .checked_mul(8 * std::mem::size_of::<Option<&str>>())?,
-        )?;
-        let results = self
-            .headers
-            .len()
-            .checked_add(self.first_read_archives.len())?
-            .checked_add(self.held_archives.len())?
-            .checked_add(self.deferred_archives.len())?;
-        // Exact result capacity, plus the held/deferred Vecs' geometric growth.
-        cost.add(
-            results.checked_mul(
-                std::mem::size_of::<(String, FamilyClass)>()
-                    .checked_add(2 * std::mem::size_of::<(String, bool)>())?
-                    .checked_add(2 * std::mem::size_of::<String>())?,
-            )?,
-        )?;
-        let names = self
+    /// Fund live phases, rather than summing scratch that has already died.
+    /// The retained custody/feed owners keep their existing reservations.
+    fn family_bound(&self, index: Option<&ScanIndex>) -> Option<(usize, usize)> {
+        let base = self
+            .feed_peak
+            .checked_add(self.decode_peak)?
+            .checked_add(self.custody_peak)?
+            .checked_add(codex_compressed_holds::OWNER_LOOKUP_SLACK)?;
+        let mut facts = self.headers.len();
+        let mut owners = self
             .headers
             .iter()
-            .map(|h| (h.candidate.path.as_path(), h.owner.len()))
-            .chain(
-                self.first_read_archives
-                    .union(&self.held_archives)
-                    .map(|k| (Path::new(k), 0)),
-            )
-            .chain(self.deferred_archives.iter().map(|k| (Path::new(k), 0)))
-            .try_fold(0_usize, |bytes, (path, owner)| {
-                // One result key, up to two filename owners (bounded by the
-                // filename), and transient key/owner generation.
-                bytes.checked_add(
-                    path.as_os_str()
-                        .len()
-                        .checked_mul(2)?
-                        .checked_add(path.file_name().map_or(0, |n| n.len()).checked_mul(4)?)?
-                        .checked_add(owner.checked_mul(2)?)?,
-                )
-            })?;
-        cost.add(names)?;
-        if let Some(index) = index {
-            // Three negative owners per retained file at most (protected + two
-            // filename candidates), plus hash and filename-generation scratch.
-            cost.add(
-                index
-                    .files
+            .try_fold(0usize, |n, h| n.checked_add(h.owner.len()))?;
+        let mut keys = self.headers.iter().try_fold(0usize, |n, h| {
+            n.checked_add(h.candidate.path.as_os_str().len())
+        })?;
+        let mut results = self.headers.len();
+        for key in self
+            .first_read_archives
+            .union(&self.held_archives)
+            .chain(&self.deferred_archives)
+        {
+            // The existing filename parser has at most two small candidates;
+            // its transient allocation is covered by OWNER_LOOKUP_SLACK.
+            let candidates = archive_owners(key);
+            facts = facts.checked_add(candidates.len())?;
+            owners = candidates
+                .iter()
+                .try_fold(owners, |n, owner| n.checked_add(owner.capacity()))?;
+            keys = keys.checked_add(key.len())?;
+            results = results.checked_add(1)?;
+        }
+        let fact_bytes = facts.checked_mul(std::mem::size_of::<(String, u8, Option<&str>)>())?;
+        let table_bytes = facts
+            .checked_mul(std::mem::size_of::<(String, Family<'_>)>())?
+            .checked_add(
+                self.headers
                     .len()
-                    .checked_mul(3 * (std::mem::size_of::<(String, String)>() + 64))?,
-            )?;
-            cost.add(index.files.keys().try_fold(0_usize, |bytes, key| {
-                bytes.checked_add(key.len().checked_mul(5)?)
-            })?)?;
+                    .checked_mul(8 * std::mem::size_of::<Option<&str>>())?,
+            )?
+            .checked_add(owners)?;
+        let result_bytes = results
+            .checked_mul(std::mem::size_of::<(String, FamilyClass)>())?
+            .checked_add(keys)?;
+        // Owners move from facts into the table. The fact allocation is gone
+        // before results are built; the table is gone before holds are applied.
+        let fact_phase = base.checked_add(fact_bytes)?.checked_add(owners)?;
+        let table_phase = base.checked_add(fact_bytes)?.checked_add(table_bytes)?;
+        let result_phase = base.checked_add(table_bytes)?.checked_add(result_bytes)?;
+        let mut peak = fact_phase.max(table_phase).max(result_phase);
+        let mut carrier_phase = 0;
+        if let Some(index) = index {
+            // Classification scratch is released before the retained-carrier
+            // lookup is built. Only the compact results coexist with it.
+            carrier_phase = base
+                .checked_add(result_bytes)?
+                .checked_add(
+                    index
+                        .files
+                        .len()
+                        .checked_mul(3 * (std::mem::size_of::<(String, String)>() + 64))?,
+                )?
+                .checked_add(
+                    index
+                        .files
+                        .keys()
+                        .try_fold(0usize, |n, key| n.checked_add(key.len().checked_mul(5)?))?,
+                )?;
+            peak = self.family_peak.max(carrier_phase);
         }
-        if cost.bytes > crate::source_rotation::PARKED_BUDGET {
-            crate::local_resource_diagnostics::traversal_point(
-                "codex_zst_held",
-                "codex",
-                &BTreeMap::from([
-                    ("archive_classification_required_bytes", cost.bytes as u64),
-                    (
-                        "archive_classification_cap_bytes",
-                        crate::source_rotation::PARKED_BUDGET as u64,
-                    ),
-                ]),
-            );
-            return None;
-        }
-        Some(cost.bytes)
+        crate::local_resource_diagnostics::traversal_point(
+            "codex_zst_held",
+            "codex",
+            &BTreeMap::from([
+                ("archive_classification_fact_bytes", fact_phase as u64),
+                ("archive_classification_table_bytes", table_phase as u64),
+                ("archive_classification_result_bytes", result_phase as u64),
+                ("archive_classification_carrier_bytes", carrier_phase as u64),
+                ("archive_classification_required_bytes", peak as u64),
+                (
+                    "archive_classification_cap_bytes",
+                    crate::source_rotation::PARKED_BUDGET as u64,
+                ),
+            ]),
+        );
+        (peak <= crate::source_rotation::PARKED_BUDGET).then_some((peak, facts))
     }
 
     pub(super) fn prepare_archive_classification(&mut self, index: &ScanIndex) {
@@ -864,7 +849,11 @@ impl HeaderInventory {
             self.family_peak = 1;
             return;
         }
-        let Some(peak) = self.family_bound(Some(index)) else {
+        self.classify_bound_archives();
+        if !self.classification_ready() {
+            return;
+        }
+        let Some((peak, _)) = self.family_bound(Some(index)) else {
             // Optional archive preparation cannot turn ordinary plain work
             // into a custody-scratch failure. Archives retain their queued debt.
             self.archive_classes = Vec::new();
@@ -872,10 +861,6 @@ impl HeaderInventory {
             crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::AdmissionRefused);
             return;
         };
-        self.classify_bound_archives();
-        if !self.classification_ready() {
-            return;
-        }
         self.family_peak = peak;
         // Existing retained owners and plain filename locators are negative
         // scope only. Build once, instead of a full index walk per archive.
@@ -931,19 +916,16 @@ impl HeaderInventory {
     pub(super) fn classify_bound_archives(&mut self) {
         self.archive_classes = Vec::new();
         self.family_peak = 0;
-        let Some(peak) = self.family_bound(None) else {
+        let Some((peak, facts)) = self.family_bound(None) else {
             crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::AdmissionRefused);
             return;
         };
-        let table = self.family_table();
+        let table = self.family_table(facts);
         let mut classes = Vec::with_capacity(
             self.headers.len()
-                + self.first_read_archives.len()
-                + self.held_archives.len()
+                + self.first_read_archives.union(&self.held_archives).count()
                 + self.deferred_archives.len(),
         );
-        let mut held = Vec::new();
-        let mut deferred = Vec::new();
         for header in self
             .headers
             .iter()
@@ -952,12 +934,7 @@ impl HeaderInventory {
             let key = local_index_key(&header.candidate.path);
             let mut class = table.archive_class(&key);
             class.validated_sibling = table.validated_class(header).validated_sibling;
-            classes.push((key.clone(), class));
-            if class.sibling {
-                held.push((key, class.twin));
-            } else if class.deferred {
-                deferred.push(key);
-            }
+            classes.push((key, class));
         }
         for key in self
             .first_read_archives
@@ -966,11 +943,6 @@ impl HeaderInventory {
         {
             let class = table.archive_class(key);
             classes.push((key.clone(), class));
-            if class.sibling {
-                held.push((key.clone(), class.twin));
-            } else if class.deferred {
-                deferred.push(key.clone());
-            }
         }
         drop(table);
         classes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -986,8 +958,13 @@ impl HeaderInventory {
         });
         self.archive_classes = classes;
         self.family_peak = peak;
-        self.family_held.extend(held);
-        self.deferred_archives.extend(deferred);
+        for (key, class) in &self.archive_classes {
+            if class.sibling {
+                self.family_held.insert(key.clone(), class.twin);
+            } else if class.deferred {
+                self.deferred_archives.insert(key.clone());
+            }
+        }
         // A held family owner never holds or refuses its plain member.
         self.held_owners = self
             .first_read_archives

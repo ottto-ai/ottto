@@ -913,11 +913,6 @@ impl SharedCache {
             return Err(MissClass::AuditCarrier);
         }
         index.files.get(key).ok_or(MissClass::NoEntry)?;
-        // Archive reductions belong exclusively to the RAM replace-only domain
-        // (kept outside the pinned `expected`).
-        if codex_archive_path(Path::new(key)) {
-            return Err(MissClass::NoEntry);
-        }
         let expected = expected(
             source,
             snapshot_source,

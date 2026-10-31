@@ -1609,7 +1609,12 @@ fn sibling_inventory_at_population_cap_counts_shared_physical_keys_once() {
     inventory.first_read_archives = paths.clone();
     let shared = paths.last().unwrap().clone();
     inventory.deferred_archives.insert(shared.clone());
-    inventory.classify_bound_archives();
+    let (_, phases) =
+        crate::local_resource_diagnostics::capture(|| inventory.classify_bound_archives());
+    assert!(
+        inventory.classification_ready(),
+        "live classification phase refused: {phases:?}"
+    );
     assert_eq!(
         inventory.deferred_archives,
         BTreeSet::from([shared.clone()]),
@@ -1620,7 +1625,12 @@ fn sibling_inventory_at_population_cap_counts_shared_physical_keys_once() {
     inventory.held_archives.insert(held_peer);
     inventory.deferred_archives.insert(deferred_peer.clone());
     assert_eq!(paths.len() + 2, codex_file_join::MAX_HEADER_FILES);
-    inventory.classify_bound_archives();
+    let (_, phases) =
+        crate::local_resource_diagnostics::capture(|| inventory.classify_bound_archives());
+    assert!(
+        inventory.classification_ready(),
+        "live classification phase refused: {phases:?}"
+    );
     assert_eq!(
         inventory
             .family_held
