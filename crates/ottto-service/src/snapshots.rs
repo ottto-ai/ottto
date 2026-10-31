@@ -917,9 +917,9 @@ pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
 // consumes at most this many directory entries and then resumes next tick.
 pub const MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK: usize = 10_000;
 pub const MAX_WATCHER_HINTED_FILES_PER_TICK: usize = 256;
-/// R3: the gap between metadata-only re-listing passes of one kept
-/// generation (the cold cadence tier).
-const LISTING_INTERVAL_SECONDS: u64 = 30 * 60;
+/// The gap between metadata-only re-listing passes of one kept generation
+/// (the cold cadence tier).
+pub(crate) const LISTING_INTERVAL_SECONDS: u64 = 30 * 60;
 const UNHEALTHY_SCAN_RETRY_BASE_SECONDS: u64 = 60;
 const UNHEALTHY_SCAN_RETRY_MAX_SECONDS: u64 = 60 * 60;
 /// The retry attempt at which the exponential delay reaches its ceiling
@@ -2582,11 +2582,11 @@ struct ScanTraversalCounts {
     #[serde(skip_serializing_if = "ownership::Counts::is_empty")]
     causes: ownership::Counts,
     /// Re-listing passes this generation started; zero while its first walk
-    /// runs (R3).
+    /// runs.
     #[serde(skip_serializing_if = "is_zero_u64")]
     listing_generations: u64,
-    /// Changed files a re-listing pass queued that no watcher hint or earlier
-    /// walk had already queued: what the watcher missed (R4).
+    /// Files a re-listing pass queued that no watcher hint or earlier walk
+    /// had already queued: what the watcher missed.
     #[serde(skip_serializing_if = "is_zero_u64")]
     listing_changes_without_hint: u64,
 }
@@ -4601,10 +4601,11 @@ pub struct ScanIndexEntry {
 const _: () = assert!(std::mem::size_of::<ScanIndexEntry>() == 560);
 
 impl ScanIndexEntry {
-    /// R3's listing stamp: the same size (or a certified Codex EOF fragment
+    /// The listing stamp: the same size (or a certified Codex EOF fragment
     /// of it), the same mtime nanos and, when both are known, the same file
-    /// birth. ctime, mode, xattrs and links never count (Ron's re-read rule).
-    /// It only decides "unchanged"; acquisition still picks the read mode.
+    /// birth. ctime, mode, xattrs and links never count (the re-read rule:
+    /// content, never ctime). It only decides "unchanged"; acquisition still
+    /// picks the read mode.
     fn same_listing_stamp(
         &self,
         len: u64,
@@ -24748,7 +24749,7 @@ fn validated_codex_parent_ownership_ledgers(
 /// rebuilt from the live device and inode, the ledger's stored ctime and
 /// fresh content samples, still equals
 /// the ledger identity, had only ctime moved (chmod, xattr, hard link). It
-/// still validates (Ron's re-read rule, across scans) and is re-witnessed at
+/// still validates (the re-read rule: content, never ctime) and is re-witnessed at
 /// the live identity, so this page's after-parse fence and later scans
 /// compare the parent as it is now, and the parent itself is never re-read
 /// for a metadata-only change.
@@ -26818,8 +26819,10 @@ impl OwnedSourceScan {
                 backfill_window_days,
                 discovery_retention!(index, &resource_probe.discovery_growth),
             );
+            // Temporary exception, scoped to the Claude-only terminal-off
+            // switch and deleted with it (#1026): its own identity-aware
+            // rediscovery is the listing there.
             if !(source == SnapshotSource::ClaudeCode && claude_terminal_off()) {
-                // Terminal-off's own identity-aware rediscovery is its listing.
                 start_due_listing_pass(traversal, collected_at);
             }
             next_generation_hints =
@@ -26874,16 +26877,12 @@ impl OwnedSourceScan {
                 .pending_candidates
                 .iter()
                 .any(|candidate| candidate.census_member && !candidate.watcher_hint);
-        let selection_limit = if source == SnapshotSource::Codex
-            && traversal
-                .pending_directories
-                .iter()
-                .any(|directory| directory.census_member)
-        {
-            0
-        } else {
-            file_limit
-        };
+        let selection_limit =
+            if source == SnapshotSource::Codex && !traversal.pending_directories.is_empty() {
+                0
+            } else {
+                file_limit
+            };
         // Fresh data gets a bounded page of its own, at most every other
         // ordinary page. Mixing it behind 64 MiB of census revalidation
         // starves it; always putting it first can starve the census instead.
@@ -43550,10 +43549,11 @@ fn codex_fresh_data_pending(
     })
 }
 
-/// R3: once a kept generation's latest walk has finished, re-list its roots
+/// Once a kept generation's latest walk has finished, re-list its roots
 /// every `LISTING_INTERVAL_SECONDS`, metadata only. The pass queues only
-/// stamp changes and never starts a generation, so it re-arms nothing; it can
-/// only delay this generation's discovery, never complete it.
+/// files that need a read (`ScanIndex::listing_settled`) and never starts a
+/// generation, so it re-arms nothing; it can only delay this generation's
+/// discovery, never complete it.
 fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at: &str) {
     let Some(now) = rfc3339_unix_seconds(collected_at) else {
         return;
@@ -43584,26 +43584,36 @@ fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at:
         }));
 }
 
-/// R4: watcher hints go through the listing's stamp compare. An unchanged
-/// file (ctime-only events included) is dropped; a vanished one is kept for
-/// the exact removal path. Owner requests keep their unchanged files: a
-/// leased reason re-offer here, the audit retry by calling the queue directly.
+/// Watcher hints go through the listing's check: a settled file (ctime-only
+/// events included) is dropped; a vanished one is kept for the exact removal
+/// path. Owner requests keep their unchanged files: a leased reason re-offer
+/// here, the audit retry by calling the queue directly.
 fn changed_watcher_hints(index: &ScanIndex, hinted_paths: &[PathBuf]) -> Vec<PathBuf> {
     hinted_paths
         .iter()
         .filter(|path| {
-            let key = local_index_key(path);
-            index.reason_reoffer_leased(&key)
+            index.reason_reoffer_leased(&local_index_key(path))
                 || !fs::symlink_metadata(path).is_ok_and(|metadata| {
-                    metadata.is_file()
-                        && index
-                            .files
-                            .get(&key)
-                            .is_some_and(|entry| entry.same_listing_stamp_as(&metadata))
+                    metadata.is_file() && index.listing_settled(path, &metadata)
                 })
         })
         .cloned()
         .collect()
+}
+
+/// A hinted or re-listed path joins the census unless this generation
+/// already observed it on Codex (its growth is next-generation evidence) or
+/// Claude terminal-off owns discovery.
+fn fresh_path_census_member(
+    source: SnapshotSource,
+    traversal: &ScanTraversalCheckpoint,
+    path: &Path,
+) -> bool {
+    !(source == SnapshotSource::ClaudeCode && claude_terminal_off())
+        && (source != SnapshotSource::Codex
+            || !traversal
+                .observed_index_keys
+                .contains(&local_index_key(path)))
 }
 
 /// Returns how many Codex hints re-entered as next-generation evidence.
@@ -43655,11 +43665,17 @@ fn enqueue_watcher_hints(
             }
         }
         if let Some(&position) = pending.get(path) {
-            if source == SnapshotSource::Codex
-                || (source == SnapshotSource::ClaudeCode && claude_terminal_off())
-            {
-                if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
+            let member = fresh_path_census_member(source, traversal, path);
+            if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
+                if source == SnapshotSource::Codex
+                    || (source == SnapshotSource::ClaudeCode && claude_terminal_off())
+                {
                     candidate.watcher_hint = true;
+                }
+                // Claude/Pi: the hint joins the census as it would if nothing
+                // were queued for it (a re-listed or re-read non-member).
+                if source != SnapshotSource::Codex {
+                    candidate.census_member |= member;
                 }
             }
             continue;
@@ -43672,16 +43688,12 @@ fn enqueue_watcher_hints(
         else {
             continue;
         };
-        // K7 for singletons and re-reads (G1): a Codex path this generation
-        // already processed (observed and no longer pending) was read after
-        // `census_window_end`, so its growth is next-generation evidence. It
-        // is still read when the page budget allows, but it no longer holds
-        // the census; the next generation's walk re-reads it if it is stale.
-        let census_member = !(source == SnapshotSource::ClaudeCode && claude_terminal_off())
-            && (source != SnapshotSource::Codex
-                || !traversal
-                    .observed_index_keys
-                    .contains(&local_index_key(path)));
+        // A Codex path this generation already processed (observed and no
+        // longer pending) was read after `census_window_end`, so its growth
+        // is next-generation evidence. It is still read when the page budget
+        // allows, but it no longer holds the census; the next generation's
+        // walk re-reads it if it is stale.
+        let census_member = fresh_path_census_member(source, traversal, path);
         next_generation += u64::from(source == SnapshotSource::Codex && !census_member);
         // FIFO keeps an actively rewritten path from repeatedly jumping ahead
         // of an older remove/rename hint in a small bounded page.
@@ -44002,9 +44014,37 @@ fn advance_bounded_directory_traversal(
         source,
         index,
         backfill_window_days,
-        MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK,
+        directory_entries_per_tick(),
         growth,
     );
+}
+
+fn directory_entries_per_tick() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = TEST_DIRECTORY_ENTRIES.with(std::cell::Cell::get) {
+        return budget;
+    }
+    MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DIRECTORY_ENTRIES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Scaled per-tick directory budget for tests only, so a walk spans pages.
+#[cfg(test)]
+fn with_test_directory_entries<T>(budget: usize, run: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_DIRECTORY_ENTRIES.with(|slot| slot.set(None));
+        }
+    }
+    TEST_DIRECTORY_ENTRIES.with(|slot| slot.set(Some(budget)));
+    let _reset = Reset;
+    run()
 }
 
 fn advance_bounded_directory_traversal_with_budget(
@@ -44043,8 +44083,8 @@ fn advance_bounded_directory_traversal_with_budget(
         },
     );
     let mut remaining = max_entries;
-    // A re-listing pass (R3, directories without census membership) only
-    // queues stamp changes. Its walk problems and counts belong to the next
+    // A re-listing pass (directories without census membership) only queues
+    // files that need a read. Its walk problems and counts belong to the next
     // generation's first walk: it never turns this generation red or green,
     // moves its census counts or touches the Codex directory census.
     let mut relisted_counts = None;
@@ -44108,6 +44148,8 @@ fn advance_bounded_directory_traversal_with_budget(
         }
         if entries.len() > remaining {
             if remaining == max_entries {
+                // In a re-pass this count is restored with the others: the
+                // first walk owns the cap count for a too-wide directory.
                 traversal.counts.directory_entry_cap_exceeded_count += 1;
             } else {
                 traversal.pending_directories.push_front(directory);
@@ -44228,19 +44270,26 @@ fn advance_bounded_directory_traversal_with_budget(
             }
             if relisting {
                 let key = local_index_key(&path);
-                // Unchanged since its last read: seen, never queued. Missing
-                // state is the owed resolver's, not discovery's (#1025). A
-                // file this generation already saw with no entry (held,
-                // oversized) has no stamp; its owner's floor re-offers it.
-                let seen = match index.files.get(&key) {
-                    Some(entry) => entry.same_listing_stamp_as(&metadata),
-                    None => traversal.observed_index_keys.contains(&key),
+                // Settled since its last read: seen, never queued. A file
+                // this generation already saw with no entry (held, oversized)
+                // has no stamp; its owner's floor re-offers it.
+                let seen = if index.files.contains_key(&key) {
+                    index.listing_settled(&path, &metadata)
+                } else {
+                    traversal.observed_index_keys.contains(&key)
                 };
                 if seen {
                     traversal.observed_index_keys.insert(key);
                     continue;
                 }
+                // Oversized debt and its loss count are recorded together by
+                // the first walk only. An unrecorded file stays unobserved, so
+                // a later pass lists it again once it is readable.
+                if metadata.len() > max_jsonl_file_bytes(source) {
+                    continue;
+                }
             }
+            let census_member = !relisting || fresh_path_census_member(source, &traversal, &path);
             if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
                 // Record physically validated presence BEFORE any enqueue-only
                 // suppression, including ceiling skips of targeted-served keys.
@@ -44263,7 +44312,7 @@ fn advance_bounded_directory_traversal_with_budget(
             // Presence and enqueue authority are separate. A new-round walk
             // sees pending/floor-blocked files even when it adds no read work.
             traversal.counts.discovered_file_count += 1;
-            let newly_observed = traversal.observed_index_keys.insert(local_index_key(&path));
+            traversal.observed_index_keys.insert(local_index_key(&path));
             if metadata.len() > max_jsonl_file_bytes(source) {
                 traversal.counts.oversized_file_count += 1;
                 oversized_discovery::record(
@@ -44291,14 +44340,14 @@ fn advance_bounded_directory_traversal_with_budget(
                     existing.watcher_hint |= directory.watcher_hint;
                 }
             } else {
-                // A re-listed change is fresh data. Like a hint (K7), it joins
-                // the census only if this generation has not observed it.
+                // A re-listed change is fresh data and joins the census by
+                // the watcher-hint rule.
                 traversal.counts.listing_changes_without_hint += u64::from(relisting);
                 pending.insert(path.clone(), traversal.pending_candidates.len());
                 traversal.pending_candidates.push_back(ScanTraversalPath {
                     scan_root: directory.scan_root.clone(),
                     path,
-                    census_member: !relisting || newly_observed,
+                    census_member,
                     watcher_hint: relisting || directory.watcher_hint,
                 });
             }
@@ -45531,7 +45580,7 @@ fn opened_object_identity_and_stat_retained(
     Ok((identity, stat, content))
 }
 
-/// Ron's re-read rule: only content (size, mtime, sampled bytes) or
+/// The re-read rule: only content (size, mtime, sampled bytes) or
 /// output-relevant inputs may trigger a re-read; ctime, xattr, mode and
 /// hard-link flips never do. When this path's entry has the candidate's size
 /// and mtime and exactly its (known) file birth, the fingerprint uses the
@@ -49092,6 +49141,35 @@ impl ScanIndex {
                         .iter()
                         .any(|fingerprint| self.reason_reoffer_retries.contains_key(fingerprint))
                 })
+    }
+
+    /// A listed file needs no read: its stamp is unchanged since the last
+    /// read, nothing is owed on it (`DiscoveryRetention::owes`) and the
+    /// ordinary candidate gate skips it at that stamp. Stat-only: the file is
+    /// not opened. Any other answer queues it, as the first walk would.
+    fn listing_settled(&self, path: &Path, metadata: &fs::Metadata) -> bool {
+        let Some(entry) = self.files.get(&local_index_key(path)) else {
+            return false;
+        };
+        // `owes` first: it covers every account-held key, so the gate below
+        // never consults (or clears) a withheld content memo.
+        entry.same_listing_stamp_as(metadata)
+            && !discovery_retention!(self).owes(path)
+            && self.candidate_decision(&CandidateFile {
+                physical_identity: None,
+                scan_root: PathBuf::new(),
+                path: path.to_path_buf(),
+                size_bytes: metadata.len(),
+                modified_unix_seconds: entry.modified_unix_seconds,
+                modified_unix_nanos: entry.modified_unix_nanos.unwrap_or_default(),
+                source_file_fingerprint: entry.source_file_fingerprint.clone(),
+                legacy_source_file_fingerprint: String::new(),
+                legacy_config_reconciliation_required: false,
+                opened_object_identity: String::new(),
+                fingerprint_changed_nanos: 0,
+                fingerprint_birth_nanos: entry.opened_birth_nanos,
+                withheld_content_stamp: None,
+            }) == CandidateDecision::Skip
     }
 
     fn quarantine_requires_retry_body(&self, fingerprint: &str, body_witness: &str) -> bool {

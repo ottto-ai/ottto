@@ -1,26 +1,38 @@
-# Re-listing pass: queue only stamp changes (all sources)
+# Re-listing pass: queue only files that need a read (all sources)
 
 A kept generation whose first walk has finished re-lists its roots, metadata
-only, at most every 30 minutes. Each in-window file's stamp (size or certified
-Codex EOF fragment, mtime nanoseconds, file birth when known; never ctime) is
-compared with its index entry. Unchanged files are marked seen and never
-queued; changed or new files are queued as fresh data, and acquisition still
-chooses Tail or Full. A new file joins the census like a hint does; growth of
-an already observed file does not. The pass never starts a generation, never
-re-arms, and records no walk problem or census count, so it can only delay a
-generation's discovery, never complete it. Codex keeps its "no selection while
-directories are pending" rule only for the first walk. A file the generation
-already saw that has no index entry (a hold, an oversized file) has no stamp,
-so the pass leaves it to its owner's floor. Under the opt-in Claude
-terminal-off marker the pass does not start: terminal-off's own
+only, at most every 30 minutes. A listed file is skipped only when it is
+settled: its stamp (size or certified Codex EOF fragment, mtime nanoseconds,
+file birth when known; never ctime) equals its index entry, nothing is owed on
+it (empty fingerprint, unverified sampled generation, account hold), and the
+ordinary candidate gate skips it at that stamp. The check is stat-only; no file
+is opened. Every other file is queued as fresh data, and acquisition still
+chooses Tail or Full.
+
+A queued file joins the census by the watcher-hint rule: always for Claude and
+Pi, and for Codex only if this generation has not observed it yet. A hint that
+lands on a queued Claude/Pi non-member makes it a member. The pass never
+starts a generation, never re-arms, and records no walk problem or census
+count (the first walk owns them, including a too-wide directory), so it can
+only delay a generation's discovery, never complete it. Codex selects nothing
+while any directory is pending, re-listing included.
+
+A file the generation already saw that has no index entry (a hold, an
+oversized file) has no stamp, so the pass leaves it to its owner's floor. An
+oversized file found by a re-pass records no debt and stays unobserved: debt
+and loss count are recorded together by the first walk, and a later pass lists
+the file again once it is readable.
+
+Under the opt-in Claude terminal-off switch the pass does not start: its own
 identity-aware rediscovery is the listing there, and it upgrades a pending
-re-listing root to its full walk.
+re-listing root to its full walk. This is a temporary exception deleted with
+the switch (#1026).
 
 New files no longer wait for the oversized/unhealthy 6-hour floor: the pass
 finds them within about 30 minutes, without a hint or a restart.
 
-Watcher hints for existing files go through the same stamp compare, so a
-metadata-only event never queues an unchanged file. Owner re-enqueues (the
+Watcher hints for existing files go through the same settled check, so a
+metadata-only event never queues a settled file. Owner re-enqueues (the
 sampled-audit retry) bypass it.
 
 Counters: `listing_generations` and `listing_changes_without_hint` in the
