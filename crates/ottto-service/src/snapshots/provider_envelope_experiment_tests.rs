@@ -595,7 +595,6 @@ struct SelectionFixture {
     roots: [PathBuf; 1],
     paths: [PathBuf; 4], // A, audit B, uncommitted C, A's subagent
     index_path: PathBuf,
-    progress_path: PathBuf,
     previous: ScanIndex,
 }
 impl SelectionFixture {
@@ -646,14 +645,12 @@ impl SelectionFixture {
             .unwrap()
             .set_unverified_deadline(1);
         let index_path = scratch.join("index.json");
-        let progress_path = scratch.join("progress.json");
         previous.save(&index_path).unwrap();
         Self {
             _scratch: scratch,
             roots: [root],
             paths,
             index_path,
-            progress_path,
             previous,
         }
     }
@@ -681,16 +678,6 @@ impl SelectionFixture {
             }
         }
         panic!("bounded fixture native scan did not complete");
-    }
-    fn checkpoint(&self, index: &ScanIndex, scan: &SourceScanResult) -> ScanIndex {
-        crate::snapshot_sync::comparison_partial_checkpoint_for_test(
-            index,
-            &self.previous,
-            &scan.snapshots,
-            &self.index_path,
-            &self.progress_path,
-        )
-        .unwrap()
     }
 }
 

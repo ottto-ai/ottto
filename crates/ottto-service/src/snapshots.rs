@@ -55994,18 +55994,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn claude_duplicate_across_pages_stays_refused_without_reparse_loop() {
-        exercise_claude_partial_census_recovery(true, false);
-    }
-
-    fn claude_pending_census_recovers_without_releasing_future_quarantine() {
-        exercise_claude_partial_census_recovery(false, true);
-    }
-
-    fn claude_stable_owned_start_recovers_after_partial_conflict() {
-        exercise_claude_partial_census_recovery(false, false);
-    }
-
     #[test]
     fn claude_future_quarantine_preserves_cross_page_duplicate_refusal() {
         exercise_claude_partial_census_recovery(true, true);

@@ -1,4 +1,4 @@
-#[cfg(any(test, feature = "replay-harness"))]
+#[cfg(feature = "replay-harness")]
 mod loopback_backend;
 /// Isolated, advisory replay of production snapshot pages.
 #[doc(hidden)]
@@ -2992,34 +2992,6 @@ pub(crate) fn decode_hold_manifest_published_for_test(
         "2026-10-22T00:00:00Z",
     )?;
     Ok(cached_source_manifest(namespace, source).is_some())
-}
-
-// Test-only empty-ACK/shed boundary; invokes the real locked partial save.
-#[cfg(test)]
-pub(crate) fn comparison_partial_checkpoint_for_test(
-    index: &ScanIndex,
-    committed: &ScanIndex,
-    snapshots: &[SnapshotItem],
-    index_path: &Path,
-    progress_path: &Path,
-) -> Result<ScanIndex> {
-    let mut progress = SnapshotUploadProgress::load(
-        progress_path,
-        &format!("{:064x}", 587),
-        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    )?;
-    progress.save(progress_path)?;
-    checkpoint_partial_snapshot_index(
-        index,
-        committed,
-        &progress,
-        snapshots,
-        None,
-        &BTreeSet::new(),
-        index_path,
-        progress_path,
-        || Ok(()),
-    )
 }
 
 #[cfg(test)]

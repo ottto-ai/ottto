@@ -946,16 +946,6 @@ fn record_output(
     Some(output)
 }
 
-/// One response's #667 peak; production reads it through `completion_bounds`.
-#[cfg(test)]
-pub(super) fn decoded_response_peak_bound(
-    records: &OwnedVec<CompactClaudeResponseRecord>,
-    selectors: &ClaudeSelectorTable,
-    limit: usize,
-) -> Option<usize> {
-    decoded_response_bounds(records, selectors, limit).map(|bounds| bounds.peak)
-}
-
 /// `decoded_response_peak_bound`'s peak, and the response's merged output
 /// term. The output never decides `None` (R1a R1): its failure is
 /// `output: None`.

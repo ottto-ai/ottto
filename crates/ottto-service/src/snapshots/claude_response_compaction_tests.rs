@@ -1072,10 +1072,7 @@ fn x_out_e2_fold_worst_shapes_stay_within_e() {
             label,
             &with_cwd(rows(markers), &format!("/work/x-out-{label}")),
             &ClaudeTitleMetadata::default(),
-            FinishCase {
-                prepare,
-                ..FinishCase::default()
-            },
+            FinishCase { prepare },
         );
         let [item] = items.as_slice() else {
             panic!("{label}: {} items", items.len());

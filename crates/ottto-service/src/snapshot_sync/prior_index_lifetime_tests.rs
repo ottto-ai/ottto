@@ -75,7 +75,6 @@ impl Guard {
                 keep,
                 conflict_path,
                 retry_clock,
-                ..Default::default()
             };
         });
         Self
