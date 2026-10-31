@@ -1135,9 +1135,9 @@ mod tests {
     }
 
     /// [money] Lead B Q-B2: settling the deleted member through the page
-    /// merge drops only its entry. The accepted ledger and the member's ACKed
-    /// snapshot incidence stay byte-for-byte, and no zero or removal body is
-    /// built for its family.
+    /// merge drops its entry exactly as a live-parent removal does. The
+    /// accepted (ACKed) ledger stays byte-for-byte, and no zero or removal
+    /// body is built for its family.
     #[cfg(unix)]
     #[test]
     fn claude_member_of_deleted_directory_keeps_acked_usage_accepted() {
@@ -1170,7 +1170,7 @@ mod tests {
         let ledger = |index: &ScanIndex| {
             serde_json::to_vec(&(
                 &index.accepted_snapshot_fingerprints,
-                index.file_snapshot_fingerprints.get(&key),
+                index.accepted_snapshot_fingerprint_ledger_version,
             ))
             .unwrap()
         };
@@ -1186,11 +1186,7 @@ mod tests {
         }
         super::super::sampled_scan::set_test_now(None);
         assert!(!index.files.contains_key(&key), "the member was retired");
-        assert_eq!(
-            ledger(&index),
-            before,
-            "ACKed ledger and incidence unchanged"
-        );
+        assert_eq!(ledger(&index), before, "the accepted ledger is unchanged");
         for snapshot in pages.iter().flat_map(|page| &page.snapshots) {
             assert!(snapshot.removed_usage.is_none());
             assert!(snapshot.removed_request_count.is_none());
