@@ -235,19 +235,13 @@ pub(crate) enum UnselectedReason {
     Age,
     Size,
 }
-/// Why an owned frame continued serially instead of parking for a sibling.
-pub(crate) enum SerialFallbackCause {
-    UnsupportedLayout,
-    BoundNone,
-    BudgetExhausted,
-}
 /// Claude, Codex, Pi x (age, size, serial fallback causes), drained by that
 /// source's page line. Diagnostics only; never carried in a scan/frame graph.
 #[cfg(not(test))]
-static SOURCE_COUNTS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+static SOURCE_COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 #[cfg(test)]
 thread_local! {
-    static SOURCE_COUNTS: [AtomicU64; 15] = const { [const { AtomicU64::new(0) }; 15] };
+    static SOURCE_COUNTS: [AtomicU64; 12] = const { [const { AtomicU64::new(0) }; 12] };
 }
 fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
     let sources = ["claude_code", "codex", "pi"];
@@ -256,11 +250,11 @@ fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) 
     };
     #[cfg(test)]
     {
-        SOURCE_COUNTS.with(|slots| f(&slots[5 * slot + reason]))
+        SOURCE_COUNTS.with(|slots| f(&slots[4 * slot + reason]))
     }
     #[cfg(not(test))]
     {
-        f(&SOURCE_COUNTS[5 * slot + reason])
+        f(&SOURCE_COUNTS[4 * slot + reason])
     }
 }
 /// One skip decision, recorded after the gate decided; never a gate input.
@@ -268,14 +262,8 @@ pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
     source_count(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
 }
 /// One failed parking decision; no logging, resource probes or scan ownership.
-pub(crate) fn source_rotation_serial_fallback(source: &str, cause: SerialFallbackCause) {
-    let cause = match cause {
-        SerialFallbackCause::BoundNone if !crate::heap_layout_bound::layout_supported() => {
-            SerialFallbackCause::UnsupportedLayout
-        }
-        cause => cause,
-    };
-    source_count(source, 2 + cause as usize, |slot| {
+pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bool) {
+    source_count(source, 2 + usize::from(layout_supported), |slot| {
         slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
             .unwrap_or_else(|n| n)
     });
@@ -596,20 +584,11 @@ impl Probe {
                 .map(|(key, reason)| (key, source_count(source, reason, |n| n.swap(0, Relaxed))))
                 .filter(|(_, count)| *count > 0)
                 .collect(),
-            source_rotation_serial_fallback: [
-                ("unsupported_layout", SerialFallbackCause::UnsupportedLayout),
-                ("bound_none", SerialFallbackCause::BoundNone),
-                ("budget_exhausted", SerialFallbackCause::BudgetExhausted),
-            ]
-            .into_iter()
-            .map(|(key, cause)| {
-                (
-                    key,
-                    source_count(source, 2 + cause as usize, |n| n.swap(0, Relaxed)),
-                )
-            })
-            .filter(|(_, count)| *count > 0)
-            .collect(),
+            source_rotation_serial_fallback: [("unsupported_layout", 2), ("bound_refused", 3)]
+                .into_iter()
+                .map(|(key, reason)| (key, source_count(source, reason, |n| n.swap(0, Relaxed))))
+                .filter(|(_, count)| *count > 0)
+                .collect(),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
