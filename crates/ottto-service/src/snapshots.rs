@@ -34737,7 +34737,7 @@ impl OwnedSourceScan {
                             // attach its guard before fallible owned preparation.
                             if restored_durable && source == SnapshotSource::ClaudeCode {
                                 let Some(taken) = old.as_mut() else {
-                                    break 'cold_plan None;
+                                    break 'cold_plan Ok(None);
                                 };
                                 let plan = match crate::transcript_acquisition::ReadPlan::prepare(
                                     parser.reader.reader.get_mut(),
@@ -34747,15 +34747,25 @@ impl OwnedSourceScan {
                                     sampled_scan::now_seconds(),
                                 ) {
                                     Ok(plan) => plan,
-                                    Err(_) => {
+                                    Err(error) => {
+                                        // Preserve MAIN's prepare_io -> fresh Full
+                                        // fallback, but never return a cold graph
+                                        // without Q11 to ordinary warm reuse.
                                         drop(old.take());
                                         preparation_lease
                                             .take()
                                             .expect("cold transfer lease")
                                             .release();
-                                        claude_request_census::retain_held(index, &candidate);
-                                        census.record_unreadable(UnreadableCause::Reduction, 1);
-                                        pending!();
+                                        retained_offset = None;
+                                        returned_refusal = Some("prepare_io");
+                                        break 'cold_plan Err(sampled_jsonl::PrepareRejected {
+                                            error: error.into(),
+                                            taken: None,
+                                            refusal:
+                                                sampled_jsonl::PreparationRefusal::NonTransient(
+                                                    "prepare_io",
+                                                ),
+                                        });
                                     }
                                 };
                                 if plan.mode() == crate::transcript_acquisition::ReadMode::Tail {
@@ -34784,7 +34794,7 @@ impl OwnedSourceScan {
                                                 .release();
                                             if full {
                                                 paced_full_granted = true;
-                                                break 'cold_plan None;
+                                                break 'cold_plan Ok(None);
                                             }
                                             context.cache.durable_retail_hold(
                                                 source, reason, index, &candidate,
@@ -34793,22 +34803,24 @@ impl OwnedSourceScan {
                                         }
                                     }
                                 }
-                                Some(plan)
+                                Ok(Some(plan))
                             } else {
-                                None
+                                Ok(None)
                             }
                         };
                         #[cfg(not(unix))]
-                        let restored_plan = None;
+                        let restored_plan = Ok(None);
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);
-                        let mode = match parser.prepare_acquisition_owned_planned(
-                            old,
-                            &scope,
-                            debt,
-                            sampled_scan::now_seconds(),
-                            restored_plan,
-                        ) {
+                        let mode = match restored_plan.and_then(|plan| {
+                            parser.prepare_acquisition_owned_planned(
+                                old.take(),
+                                &scope,
+                                debt,
+                                sampled_scan::now_seconds(),
+                                plan,
+                            )
+                        }) {
                             Ok(mode) => mode,
                             Err(rejected) => {
                                 context.admission.prepare_failed =
