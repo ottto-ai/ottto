@@ -1890,6 +1890,10 @@ fn reconciliation_keeps_present_withheld_keys_and_retires_absent_ones() {
         set_old(&file(name));
     }
     let mut index = ScanIndex::default();
+    // Reconciliation itself may record the first NotFound. Use the same
+    // clock for that observation and the explicit 599/600-second probes.
+    sampled_scan::set_test_now(Some(1_000));
+    withheld_account::support::clock(&index.withheld_memo);
     for name in ["held", "old", "gone"] {
         let mut entry = super::tests::manifest_index_entry(Some(name));
         // Present controls are unchanged, not grown since the committed size.
@@ -1914,8 +1918,6 @@ fn reconciliation_keeps_present_withheld_keys_and_retires_absent_ones() {
     ));
     // The gone key is never a candidate: its release reads nothing.
     assert_eq!(candidates(&index), vec![file("held")]);
-    withheld_account::support::clock(&index.withheld_memo);
-    sampled_scan::set_test_now(Some(1_000));
     index.probe_absent_claude_account_deferred_holds();
     assert_eq!(index.claude_account_deferred_hold_count(), 2);
     next_walk(&mut index, &[root.projects()], NOW, 7);
@@ -2166,7 +2168,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
         // Growth is unread when the pathname changes; rename preserves mtime.
         append(&original, &assistant_line("rename-unread"));
         let modified = fs::metadata(&original).unwrap().modified().unwrap();
-        let (cold_index, cold_scan, _) = finish(OwnedSourceScan::new(
+        let (cold_index, mut cold_scan, _) = finish(OwnedSourceScan::new(
             source,
             &[root.projects()],
             ScanIndex::default(),
@@ -2179,7 +2181,6 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
             false,
             true,
         ));
-        let cold = scan_money(source, &cold_index, &cold_scan);
         if !known_generation {
             // Real legacy/unknown owner state, using its existing observation API.
             let birth = claude_context_file_birth::ClaudeOpenedBirth::from_metadata(
@@ -2192,6 +2193,13 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
         }
         let aged = now + time::Duration::days(731); // beyond min(requested=1000, 730 days)
         let at = aged.format(&Rfc3339).unwrap();
+        // The cold reference must be discovered before the age cutoff. Align
+        // only its collection clock with the aged route, then build both whole
+        // envelopes through scan_money; all usage and ownership fields remain.
+        for item in &mut cold_scan.snapshots {
+            item.collected_at = at.clone();
+        }
+        let cold = scan_money(source, &cold_index, &cold_scan);
         sampled_scan::set_test_now(Some(aged.unix_timestamp() as u64));
         if hint_only {
             // Walk A before the rename, then leave its candidate backlog open.
@@ -3668,12 +3676,14 @@ fn withheld_memo_survives_owner_cycles_and_discloses_budget_refusal() {
         }
         fn step(&mut self, _: (), _: Option<usize>) -> Step<(), ()> {
             let recorder = Recorder::default();
+            let mut index = self.index.clone();
+            self.cache.bind_withheld(&mut index);
             let ((index, _, _), counts) = capture(|| {
                 finish(
                     OwnedSourceScan::new(
                         SnapshotSource::ClaudeCode,
                         std::slice::from_ref(&self.root),
-                        self.index.clone(),
+                        index,
                         &days_from_now(0),
                         7,
                         10,
@@ -3725,28 +3735,33 @@ fn withheld_memo_survives_owner_cycles_and_discloses_budget_refusal() {
     let root = Root::new("ld-held-owner");
     let path = root.file(SESSION);
     append(&path, &assistant_line("u1"));
-    let (parsed, result, _) = finish(OwnedSourceScan::new(
-        SnapshotSource::ClaudeCode,
-        &[root.projects()],
-        ScanIndex::default(),
-        &days_from_now(0),
-        7,
-        10,
-        false,
-        None,
-        &[],
-        false,
-        true,
-    ));
-    let held = crate::snapshot_sync::withheld_support::settle_withheld(
-        &ScanIndex::default(),
-        parsed,
-        result,
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut previous = ScanIndex::default();
+    cache.bind_withheld(&mut previous);
+    let (parsed, result, _) = finish(
+        OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            &[root.projects()],
+            previous.clone(),
+            &days_from_now(0),
+            7,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(
+            cache.clone(),
+            crate::transcript_acquisition::Scope("owner-held".into()),
+        ),
     );
+    let held = crate::snapshot_sync::withheld_support::settle_withheld(&previous, parsed, result);
     let mut owner = Cycle {
         index: held,
         root: root.projects(),
-        cache: Arc::default(),
+        cache,
         rows: Vec::new(),
         reads: 0,
     };
