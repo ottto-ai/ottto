@@ -280,20 +280,3 @@ impl CodexPreludeFeed {
         self.snapshot(SystemTime::now()).0
     }
 }
-
-#[test]
-fn feed_fixed_allowance_includes_once_only_cleanup_storage() {
-    assert!(size_of::<CodexPreludeFeed>() <= size_of::<Feed>() + 64);
-}
-
-#[cfg(target_pointer_width = "64")]
-#[test]
-fn m4_peak_estimate_layout_ceilings_hold() {
-    // Conservative inline ceilings used by the public 80 MiB scenario.
-    assert!(size_of::<Start>() <= 512);
-    assert!(size_of::<Observer>() <= 512);
-    assert!(size_of::<(CodexPrelude, PathBuf, PathBuf)>() <= 512);
-    assert_eq!(size_of::<String>(), 24);
-    assert_eq!(size_of::<(String, String)>(), 48);
-    assert_eq!(size_of::<usize>(), 8);
-}

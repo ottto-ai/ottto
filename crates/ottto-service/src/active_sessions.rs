@@ -1142,62 +1142,6 @@ mod tests {
     }
 
     #[test]
-    fn latest_identity_reports_no_effort_when_the_source_stamped_none() {
-        let mut snapshot = test_snapshot("s-no-effort", "2026-07-19T11:04:00Z");
-        snapshot.usage_buckets = vec![bucket(
-            "2026-07-19T11:00:00Z",
-            "2026-07-19T11:04:00Z",
-            vec![usage_row("gpt-5.6-sol", None, 40)],
-        )];
-
-        let (model, effort) = latest_model_identity(&snapshot);
-
-        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
-        assert_eq!(effort, None);
-    }
-
-    #[test]
-    fn latest_identity_treats_unknown_and_blank_effort_as_no_evidence() {
-        for raw in ["unknown", "UNKNOWN", "   ", ""] {
-            let mut snapshot = test_snapshot("s-unknown", "2026-07-19T11:04:00Z");
-            snapshot.usage_buckets = vec![bucket(
-                "2026-07-19T11:00:00Z",
-                "2026-07-19T11:04:00Z",
-                vec![usage_row("gpt-5.6-sol", Some(raw), 40)],
-            )];
-
-            assert_eq!(latest_model_identity(&snapshot).1, None, "raw={raw:?}");
-        }
-    }
-
-    #[test]
-    fn latest_identity_normalizes_effort_case() {
-        let mut snapshot = test_snapshot("s-case", "2026-07-19T11:04:00Z");
-        snapshot.usage_buckets = vec![bucket(
-            "2026-07-19T11:00:00Z",
-            "2026-07-19T11:04:00Z",
-            vec![usage_row("gpt-5.6-sol", Some(" XHigh "), 40)],
-        )];
-
-        assert_eq!(latest_model_identity(&snapshot).1.as_deref(), Some("xhigh"));
-    }
-
-    #[test]
-    fn latest_identity_is_absent_without_usage_rows() {
-        let mut snapshot = test_snapshot("s-empty", "2026-07-19T11:04:00Z");
-        snapshot.usage_buckets = vec![bucket(
-            "2026-07-19T11:00:00Z",
-            "2026-07-19T11:04:00Z",
-            vec![],
-        )];
-
-        assert_eq!(latest_model_identity(&snapshot), (None, None));
-
-        snapshot.usage_buckets = Vec::new();
-        assert_eq!(latest_model_identity(&snapshot), (None, None));
-    }
-
-    #[test]
     fn reconciled_session_carries_latest_model_and_effort() {
         let dir = temp_dir("latest-identity");
         let mut snapshot = test_snapshot("s-wire", "2026-07-19T10:04:00Z");

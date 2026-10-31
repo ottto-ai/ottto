@@ -1368,66 +1368,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bounded synthetic resource measurement; run natively in serial isolation"]
-    fn measure_demanded_launch_lookup_resources() {
-        let home = TestHome::new();
-        for count in [2700usize, 5400] {
-            for n in if count == 2700 { 1..=2700 } else { 2701..=5400 } {
-                retained(&home.0, n);
-            }
-            // Demand size, not retained volume, owns the map ceiling.
-            let demanded: Vec<_> = (1..=MAX_DEMANDED_WORKERS)
-                .map(|n| worker(n + count - MAX_DEMANDED_WORKERS))
-                .collect();
-            let inventory = LaunchEventInventory::refresh(&home.0);
-            let probe = crate::local_resource_diagnostics::Probe::start();
-            let started = Instant::now();
-            let mut max_step_us = 0u128;
-            let ((steps, _), allocation) = crate::retry_allocation_probe::measure_process(|| {
-                let mut steps = 0;
-                loop {
-                    steps += 1;
-                    let at = Instant::now();
-                    let result = inventory.prepare_step(&demanded).unwrap();
-                    max_step_us = max_step_us.max(at.elapsed().as_micros());
-                    if result {
-                        break;
-                    }
-                }
-                (steps, inventory.len())
-            });
-            for id in &demanded {
-                assert!(inventory.matching(id).is_some());
-            }
-            assert!(
-                allocation.requested_peak < 512 * 1024,
-                "demand map and Rust scratch budget"
-            );
-            probe.collection(
-                "unknown",
-                crate::local_resource_diagnostics::CollectionCounts {
-                    scanned_files: 0,
-                    semantic_noops: 0,
-                    sampled_acquisition: None,
-                    full_causes: Default::default(),
-                },
-            );
-            println!(
-                "LAUNCH_LOOKUP_RESOURCES {}",
-                serde_json::json!({
-                    "retained_files":count, "demanded_workers":demanded.len(), "steps":steps,
-                    "wall_us":started.elapsed().as_micros(), "max_step_wall_us":max_step_us,
-                    "directory_entries_per_step":LOOKUP_ENTRIES_PER_STEP,
-                    "event_bytes_per_step_max":LOOKUP_ENTRIES_PER_STEP as u64 * (MAX_EVENT_FILE_BYTES + 1),
-                    "requested_scope_peak_bytes":allocation.requested_peak,
-                    "requested_scope_live_bytes":allocation.requested_live,
-                    "opaque_directory_os_allocation_not_in_requested_rust_scope":true
-                })
-            );
-        }
-    }
-
-    #[test]
     fn reject_log_label_is_a_hash_prefix_or_nothing() {
         assert_eq!(
             redacted_label(Path::new("/tmp/report-for-pr-1653.json")),

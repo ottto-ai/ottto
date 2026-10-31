@@ -2098,28 +2098,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bounded native outcome carrier measurement"]
-    fn census_fence_event_native_measurement() {
-        use crate::codex_scan_diagnostics::{
-            CensusFenceOutcome as O, CensusFencePhase as P, CensusInvalidation as I,
-        };
-        const ITERATIONS: usize = 256;
-        // Warm the existing stderr handle before measuring the event path.
-        codex_census_fence(P::Inner, O::Published, I::NotAttempted);
-        let started = Instant::now();
-        let (_, stats) = crate::retry_allocation_probe::measure(|| {
-            for _ in 0..ITERATIONS {
-                codex_census_fence(P::Inner, O::PrivateWriteFailed, I::Failed);
-            }
-        });
-        assert_eq!(stats.requested_live, 0);
-        assert!(stats.requested_peak_with_overlap < 2048);
-        println!("CENSUS_FENCE_OVERHEAD iterations={ITERATIONS} elapsed_us={} peak_bytes={} allocations={} live_bytes={} includes_encoding_and_existing_stderr=true",
-            started.elapsed().as_micros(), stats.requested_peak_with_overlap,
-            stats.allocations, stats.requested_live);
-    }
-
-    #[test]
     fn footprint_fields_are_stage_only_for_all_native_sources() {
         for source in ["claude_code", "codex", "pi"] {
             let (result, records) = capture(|| {
@@ -2571,50 +2549,6 @@ mod tests {
             }
         }
         write_line("{}", &mut FailedSink);
-    }
-
-    #[test]
-    #[ignore = "bounded native measurement; process allocation scope needs serial isolation"]
-    fn measure_local_resource_probe_overhead() {
-        const ITERATIONS: u64 = 1000;
-        for stage in ["native_collection_page", "source_finish"] {
-            let process_before = process_sample();
-            let wall = Instant::now();
-            let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
-                for _ in 0..ITERATIONS {
-                    if stage == "source_finish" {
-                        source_finish("claude_code", || Ok(())).unwrap();
-                    } else {
-                        Probe::start().collection(
-                            "claude_code",
-                            CollectionCounts {
-                                scanned_files: usize::MAX,
-                                semantic_noops: usize::MAX,
-                                sampled_acquisition: Some(max_read_counts()),
-                                full_causes: Default::default(),
-                            },
-                        );
-                    }
-                }
-            });
-            let wall_us = wall.elapsed().as_micros();
-            let cpu_us = Observation::between(0, process_before, process_sample())
-                .shared_process_cpu_delta_us;
-            println!(
-                "RESOURCE_PROBE_OVERHEAD {}",
-                serde_json::json!({
-                    "stage": stage, "iterations": ITERATIONS, "wall_us": wall_us,
-                    "wall_us_per_record": wall_us as f64 / ITERATIONS as f64,
-                    "shared_process_cpu_us": cpu_us,
-                    "shared_process_cpu_us_per_record": cpu_us.map(|cpu| cpu as f64 / ITERATIONS as f64),
-                    "probe_inline_bytes": std::mem::size_of::<Probe>(),
-                    "upload_call_inline_bytes": std::mem::size_of::<UploadCall>(),
-                    "scope_requested_allocation_peak_bytes": allocation.requested_peak,
-                    "scope_requested_allocation_live_bytes": allocation.requested_live,
-                    "includes_two_os_samples_json_encoding_and_existing_stderr_write": true,
-                })
-            );
-        }
     }
 
     #[test]

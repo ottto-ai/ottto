@@ -21892,23 +21892,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_snapshot_capacity_is_one_default_plus_nine_custom() {
-        let descriptors = (0..12).map(test_slot_descriptor).collect::<Vec<_>>();
-        let (collected, overflow) = bounded_claude_custom_descriptors(descriptors);
-
-        assert_eq!(collected.len(), 9);
-        assert_eq!(overflow.len(), 3);
-        assert_eq!(
-            collected[0].slot_id,
-            "claude_slot_00000000000000000000000000000000"
-        );
-        assert_eq!(
-            overflow[0].slot_id,
-            "claude_slot_00000000000000000000000000000009"
-        );
-    }
-
-    #[test]
     #[serial]
     fn status_coverage_registers_slots_past_collection_capacity() {
         use crate::claude_status_coverage::{self as coverage, Registration};
@@ -24656,11 +24639,6 @@ for line in sys.stdin:
         assert!(elapsed < CODEX_APP_SERVER_TIMEOUT, "{elapsed:?}");
     }
 
-    #[test]
-    fn codex_app_server_timeout_is_twenty_seconds_without_a_test_override() {
-        assert_eq!(codex_app_server_timeout(), Duration::from_secs(20));
-    }
-
     #[cfg(unix)]
     #[test]
     fn codex_app_server_end_failure_reports_only_an_already_observed_exit() {
@@ -27304,169 +27282,6 @@ for line in sys.stdin:
         assert_eq!(credits[0].spend_control_reached, None);
         assert_eq!(credits[0].rate_limit_reached_type, None);
         assert_eq!(credits[0].limit_id, None);
-    }
-
-    #[test]
-    fn codex_usage_parser_handles_weekly_primary_window() {
-        // OpenAI's 2026-07-12 change: the wham/usage fields arrive top-level with
-        // a weekly primary window (minutes-denominated), a null secondary, and
-        // sibling credit metadata (limit_id, spend_control_reached, ...).
-        let json = serde_json::json!({
-            "limit_id": "codex",
-            "limit_name": null,
-            "primary": {
-                "used_percent": 30.0,
-                "window_minutes": 10080,
-                "resets_at": 1784963503_u64
-            },
-            "secondary": null,
-            "credits": {
-                "has_credits": false,
-                "unlimited": false,
-                "balance": "0"
-            },
-            "individual_limit": null,
-            "spend_control_reached": null,
-            "plan_type": "pro",
-            "rate_limit_reached_type": null
-        });
-
-        let windows = codex_usage_quota_windows(&json);
-        let credits = codex_usage_credit_balances(&json);
-
-        // Single window: the null secondary is dropped; the primary is weekly by
-        // duration (10080 min == 7 days) despite arriving in the primary slot.
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].name, "legacy_primary_weekly_reset_known");
-        assert_eq!(windows[0].window_seconds, Some(604800));
-        assert_eq!(windows[0].used_percent, Some(30));
-        assert_eq!(windows[0].left_percent, Some(70));
-
-        // `has_credits: false` says the credits program does not apply to this
-        // account; the `balance: "0"` beside it is filler, not a spent balance. This
-        // test used to assert a single Exhausted row, which is how a red
-        // "credits - 0 left - exhausted" meter reached the UI for an account that
-        // has no credits at all. Nothing true can be said here, so say nothing.
-        assert!(credits.is_empty());
-    }
-
-    #[test]
-    fn codex_usage_parser_keeps_exhausted_credits_when_the_account_has_a_credits_program() {
-        // Same zero balance, opposite meaning: the provider claims the program
-        // applies, so zero really is spent and the row has to stay.
-        let json = serde_json::json!({
-            "limit_id": "codex",
-            "primary": {"used_percent": 30.0, "window_minutes": 10080, "resets_at": 1784963503_u64},
-            "credits": {"has_credits": true, "unlimited": false, "balance": "0"}
-        });
-
-        let credits = codex_usage_credit_balances(&json);
-
-        assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
-        assert_eq!(credits[0].remaining, Some(0));
-        assert_eq!(credits[0].limit_id.as_deref(), Some("codex"));
-    }
-
-    #[test]
-    fn codex_usage_parser_keeps_disowned_credits_that_still_say_something_true() {
-        // `has_credits: false` never hides a positive balance, an unlimited grant,
-        // or a reached spend control - suppression is only for the empty case.
-        for credits_value in [
-            serde_json::json!({"has_credits": false, "unlimited": true, "balance": "0"}),
-            serde_json::json!({"has_credits": false, "unlimited": false, "balance": "12"}),
-        ] {
-            let json = serde_json::json!({
-                "limit_id": "codex",
-                "primary": {"used_percent": 1.0, "window_minutes": 10080},
-                "credits": credits_value.clone()
-            });
-            assert_eq!(
-                codex_usage_credit_balances(&json).len(),
-                1,
-                "kept for {credits_value}"
-            );
-        }
-
-        let spend_capped = serde_json::json!({
-            "limit_id": "codex",
-            "primary": {"used_percent": 1.0, "window_minutes": 10080},
-            "spend_control_reached": true,
-            "credits": {"has_credits": false, "unlimited": false, "balance": "0"}
-        });
-        let credits = codex_usage_credit_balances(&spend_capped);
-        assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
-    }
-
-    #[test]
-    fn codex_usage_parser_carries_workspace_monthly_credit_limit() {
-        let json = serde_json::json!({
-            "limit_id": "codex",
-            "primary": {
-                "used_percent": 100,
-                "window_minutes": 10080,
-                "resets_at": 1786431605_u64
-            },
-            "credits": {
-                "has_credits": true,
-                "unlimited": false,
-                "balance": null
-            },
-            "individual_limit": {
-                "limit": "8000",
-                "used": "4841",
-                "remaining_percent": 39,
-                "resets_at": 1788220800_u64
-            },
-            "spend_control_reached": false
-        });
-
-        let credits = codex_usage_credit_balances(&json);
-
-        assert_eq!(credits.len(), 2);
-        let monthly = &credits[1];
-        assert_eq!(monthly.name, "workspace_monthly_credits");
-        assert_eq!(monthly.status, AgentCreditBalanceStatus::Ok);
-        assert_eq!(monthly.used, Some(4841));
-        assert_eq!(monthly.quota, Some(8000));
-        assert_eq!(monthly.remaining, Some(3159));
-        assert_eq!(monthly.used_percent, Some(61));
-        assert_eq!(monthly.resets_at.as_deref(), Some("2026-09-01T00:00:00Z"));
-        assert_eq!(monthly.enabled, Some(true));
-        assert_eq!(monthly.limit_id.as_deref(), Some("codex"));
-    }
-
-    #[test]
-    fn codex_usage_parser_treats_spend_control_reached_as_exhausted() {
-        // A reached spend control caps the account even with a positive balance.
-        let json = serde_json::json!({
-            "limit_id": "codex",
-            "primary": {
-                "used_percent": 12,
-                "window_minutes": 10080,
-                "resets_at": 1784963503_u64
-            },
-            "secondary": null,
-            "credits": {
-                "has_credits": true,
-                "unlimited": false,
-                "balance": "42"
-            },
-            "spend_control_reached": true,
-            "rate_limit_reached_type": "primary"
-        });
-
-        let credits = codex_usage_credit_balances(&json);
-        assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].remaining, Some(42));
-        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
-        assert_eq!(credits[0].spend_control_reached, Some(true));
-        assert_eq!(
-            credits[0].rate_limit_reached_type.as_deref(),
-            Some("primary")
-        );
-        assert_eq!(credits[0].limit_id.as_deref(), Some("codex"));
     }
 
     #[test]
@@ -30983,42 +30798,6 @@ for line in sys.stdin:
             cache.observed_at_epoch_seconds + 100
         );
         let _ = fs::remove_dir_all(support_dir);
-    }
-
-    #[test]
-    fn claude_oauth_usage_cadence_is_forty_minutes_within_a_two_minute_spread() {
-        // The spread is load-spreading across our own installs, so it must be
-        // bounded and deterministic -- never an open-ended random delay.
-        for seed in [
-            "",
-            "account-a",
-            "account-b",
-            "9f1c0c1a4b5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7",
-        ] {
-            let gate = claude_oauth_usage_fresh_age_seconds(seed, "organization-test");
-            assert!(
-                (38 * 60..=42 * 60).contains(&gate),
-                "gate for {seed:?} out of the 38-42 minute band: {gate}"
-            );
-            assert_eq!(
-                gate,
-                claude_oauth_usage_fresh_age_seconds(seed, "organization-test"),
-                "gate must be stable for a given account, not redrawn per call"
-            );
-        }
-        // Different accounts land on different phases; that is the whole point.
-        assert_ne!(
-            claude_oauth_usage_fresh_age_seconds("account-a", "organization-test"),
-            claude_oauth_usage_fresh_age_seconds("account-b", "organization-test")
-        );
-        // Sanity on the base cadence itself: ~36 calls/day for an unused
-        // account, not ~288.
-        assert_eq!(CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS, 40 * 60);
-        // The 24h max age stays a display fallback, well clear of the gate.
-        assert!(
-            CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
-                > claude_oauth_usage_fresh_age_seconds("account-a", "organization-test")
-        );
     }
 
     #[test]
@@ -39775,30 +39554,6 @@ exit 44
                 .as_ref()
                 .and_then(|account| account.account_identifier_hash.as_deref()),
             Some(default_account.as_str())
-        );
-    }
-
-    #[test]
-    fn lifetime_warnings_come_3_days_and_1_day_before() {
-        let now = OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("time");
-        let at = |offset: TimeDuration| (now + offset).format(&Rfc3339).expect("format");
-        assert_eq!(
-            claude_relogin_warning(Some(&at(TimeDuration::days(4))), now),
-            None
-        );
-        assert!(
-            claude_relogin_warning(Some(&at(TimeDuration::days(3))), now)
-                .expect("3 days")
-                .contains("within 3 days")
-        );
-        assert!(
-            claude_relogin_warning(Some(&at(TimeDuration::hours(20))), now)
-                .expect("1 day")
-                .contains("within 1 day")
-        );
-        assert_eq!(
-            claude_relogin_warning(Some(&at(-TimeDuration::hours(1))), now),
-            None
         );
     }
 

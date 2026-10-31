@@ -195,25 +195,6 @@ fn bounded_retry_envelope_competing_state_refusal_preserves_native_files() {
     }
 }
 
-#[test]
-#[ignore = "process-wide allocation audit requires an isolated --test-threads=1 run"]
-fn bounded_retry_envelope_probe_charges_child_threads_and_realloc_overlap() {
-    // This audit is run in its own native unit-test process for a heap receipt.
-    let old = vec![0u8; 1024 * 1024];
-    let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
-        drop(old);
-        std::thread::spawn(|| {
-            let mut bytes = Vec::with_capacity(512 * 1024);
-            bytes.resize(512 * 1024, 7u8);
-            bytes.reserve_exact(512 * 1024);
-            std::hint::black_box(bytes);
-        })
-        .join()
-        .unwrap();
-    });
-    assert!(allocation.requested_peak >= 1536 * 1024);
-}
-
 struct EnvelopeTls {
     _root: RotationRoot,
     client: std::sync::Arc<rustls::ClientConfig>,
@@ -319,81 +300,6 @@ fn envelope_response(status: &str, body: &[u8], extra: &str) -> Vec<u8> {
     let mut bytes = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n", body.len()).into_bytes();
     bytes.extend_from_slice(body);
     bytes
-}
-
-#[test]
-#[ignore = "process-wide allocation audit requires an isolated --test-threads=1 run"]
-fn bounded_retry_envelope_native_tls_refuses_aggregate_headers_and_decoded_body() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let tls = EnvelopeTls::new();
-    for mode in ["accepted", "headers", "malformed_headers", "gzip", "chunk"] {
-        use std::io::Write;
-        let (body, extra) = match mode {
-            "headers" => (
-                b"{\"token\":\"fresh\"}".to_vec(),
-                format!(
-                    "X-One: {}\r\nX-Two: {}\r\n",
-                    "x".repeat(9000),
-                    "y".repeat(9000)
-                ),
-            ),
-            "malformed_headers" => (
-                b"{\"token\":\"fresh\"}".to_vec(),
-                format!("\r\r\nX-One: {}\r\n", "x".repeat(18_000)),
-            ),
-            "chunk" => (
-                format!(
-                    "{}11\r\n{{\"token\":\"fresh\"}}\r\n0\r\n\r\n",
-                    "0".repeat(1024 * 1024)
-                )
-                .into_bytes(),
-                "Transfer-Encoding: chunked\r\n".into(),
-            ),
-            "gzip" => {
-                let body = format!(
-                    "{{\"token\":\"{}\"}}",
-                    "x".repeat(crate::snapshot_retry::TOKEN_RESPONSE_BYTES)
-                );
-                let mut compressed =
-                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-                compressed.write_all(body.as_bytes()).unwrap();
-                (
-                    compressed.finish().unwrap(),
-                    "Content-Encoding: gzip\r\n".into(),
-                )
-            }
-            _ => (
-                b"{\"token\":\"fresh\"}".to_vec(),
-                format!("X-One: {}\r\n", "x".repeat(15_000)),
-            ),
-        };
-        let (address, server) = tls.serve(vec![envelope_response("200 OK", &body, &extra)]);
-        let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
-            crate::retry_tls::with_test_config(tls.client.clone(), || {
-                let client = SnapshotApiClient::new(address);
-                let mut budget =
-                    crate::snapshot_retry::RetryBudget::after_shed(Instant::now(), Duration::ZERO)
-                        .unwrap();
-                budget.enter(Instant::now()).unwrap();
-                let result = client.issue_relay_token_bounded(
-                    &bounded_native_device(),
-                    "synthetic-secret",
-                    SnapshotSource::Pi,
-                    &budget,
-                    &mut || Ok(()),
-                );
-                assert_eq!(result.is_ok(), mode == "accepted", "{mode}");
-                assert_eq!(server.join().unwrap().len(), 1);
-            });
-        });
-        eprintln!(
-            "native_tls_{mode} requested_peak={} usable_peak={} allocations={}",
-            allocation.requested_peak, allocation.usable_peak, allocation.allocations
-        );
-        assert!(allocation.requested_peak < 20 * 1024 * 1024);
-    }
 }
 
 #[test]

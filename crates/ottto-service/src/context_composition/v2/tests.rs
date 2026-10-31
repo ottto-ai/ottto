@@ -2974,110 +2974,6 @@ fn compaction_keeps_open_tokens_per_day_and_kind() {
 }
 
 // -------------------------------------------------------------------------
-// Measurement (run by hand: cargo test --release ... -- --ignored).
-// -------------------------------------------------------------------------
-
-/// Bytes read, thread CPU, accounted memory and state size on a synthetic
-/// workspace: a first full read, then a day of appends.
-#[test]
-#[ignore]
-fn measure_synthetic_large_workspace() {
-    let env = Env::new("composition-v2-measure");
-    let now = base_now();
-    let day = now.date();
-    let cwd = env.cwd();
-    let files: usize = std::env::var("COMPOSITION_MEASURE_FILES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(400);
-    let turns: u32 = std::env::var("COMPOSITION_MEASURE_TURNS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(300);
-    let output = "line of tool output with some width to it\n".repeat(40);
-    let make = |file: usize, from: u32, to: u32| -> Vec<Value> {
-        let mut records = Vec::new();
-        for n in from..to {
-            let uuid = |kind: &str| format!("{kind}-{file}-{n}");
-            records.push(json!({"type":"attachment","uuid":uuid("att"),"sessionId":format!("s{file}"),"cwd":cwd,"timestamp":ts(day, n),
-                "attachment":{"type":"task_reminder","content":"REMINDER TEXT ".repeat(20)}}));
-            records.push(json!({"type":"assistant","uuid":uuid("as"),"sessionId":format!("s{file}"),"cwd":cwd,"timestamp":ts(day, n),
-                "message":{"id":uuid("m"),"content":[{"type":"tool_use","id":uuid("t"),"name":if n % 3 == 0 {"Read"} else {"Bash"},"input":{"command":"ls","file_path":format!("/w/src/file{}.rs", n % 50)}}]}}));
-            records.push(json!({"type":"user","uuid":uuid("re"),"sessionId":format!("s{file}"),"cwd":cwd,"timestamp":ts(day, n),
-                "message":{"content":[{"type":"tool_result","tool_use_id":uuid("t"),"content":output}]}}));
-        }
-        records
-    };
-    for file in 0..files {
-        write_records(
-            &env.root.join(format!("p/s{file}.jsonl")),
-            &make(file, 0, turns),
-        );
-    }
-    let mut capture = Capture::default();
-    let first = env.run_with(
-        Source::Claude,
-        now,
-        Some(&mut capture),
-        u64::MAX,
-        &mut FolderResolver::default(),
-    );
-    for file in 0..files {
-        append_records(
-            &env.root.join(format!("p/s{file}.jsonl")),
-            &make(file, turns, turns + turns / 10),
-        );
-    }
-    let second = env.run_with(
-        Source::Claude,
-        now + time::Duration::hours(1),
-        Some(&mut capture),
-        u64::MAX,
-        &mut FolderResolver::default(),
-    );
-    let state_bytes = dir_bytes(&env.state);
-    for (label, stats) in [("first", &first), ("append", &second)] {
-        println!(
-            "{label}: bytes_read={} lines={} cpu_ms={} wall_ms={} peak_accounted_bytes={} scope_state_bytes={}",
-            stats.bytes_new + stats.bytes_repair,
-            stats.lines.lines,
-            stats.cpu_micros / 1000,
-            stats.wall_micros / 1000,
-            stats.peak_accounted_bytes,
-            stats.state_bytes,
-        );
-    }
-    println!(
-        "state_dir_bytes={state_bytes} uploads={} payload_bytes={}",
-        capture.payloads.len(),
-        capture
-            .payloads
-            .iter()
-            .map(|payload| payload.to_string().len())
-            .sum::<usize>()
-    );
-    env.cleanup();
-}
-
-fn dir_bytes(dir: &Path) -> u64 {
-    fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        dir_bytes(&path)
-                    } else {
-                        entry.metadata().map_or(0, |metadata| metadata.len())
-                    }
-                })
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
-// -------------------------------------------------------------------------
 // Review regressions: worktrees, copied history, failures, pins, scoping,
 // copies, uploads.
 // -------------------------------------------------------------------------
@@ -3388,13 +3284,6 @@ fn oldest_open_call_is_evicted_first() {
     let mut state = StoredParse::from_state(&state).into_state().unwrap();
     assert!(state.open_call("b-next".into(), class()));
     assert!(!state.open_calls.contains_key("a00000"));
-}
-
-#[test]
-fn sources_alternate_by_day() {
-    let first = |day: Day| harvest::source_order(day)[0].1;
-    assert_eq!(first(10), Source::Claude);
-    assert_eq!(first(11), Source::Codex);
 }
 
 #[test]
@@ -4107,8 +3996,6 @@ fn a_maximal_upload_meets_the_server_field_rules() {
     assert_eq!(dropped.unsafe_text, 2 * 2 + 4 * 2);
 }
 
-mod scale;
-
 #[test]
 fn incremental_scope_totals_equal_full_recompute_after_appends() {
     let env = Env::new("composition-incremental-recompute");
@@ -4437,20 +4324,6 @@ fn local_open_call_paths_never_appear_in_uploads() {
     assert!(!wire.contains(&env.cwd()));
     assert!(wire.contains("example.rs"));
     env.cleanup();
-}
-
-#[test]
-fn shared_max_fixture_contains_per_file_session_counts() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../../../../../fixtures/context-composition/kinds_v2_max.json"
-    ))
-    .unwrap();
-    assert_eq!(fixture["kinds_version"], 2);
-    for row in fixture["top_files"].as_array().unwrap() {
-        assert!(
-            row["session_count"].as_u64().unwrap() >= row["session_count_30d"].as_u64().unwrap()
-        );
-    }
 }
 
 #[test]

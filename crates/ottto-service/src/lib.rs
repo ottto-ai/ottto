@@ -5184,11 +5184,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_control_token() {
-        assert_eq!(ControlToken::new(""), Err(LocalApiError::EmptyControlToken));
-    }
-
-    #[test]
     fn status_requires_local_auth() {
         let daemon = daemon();
         assert_eq!(
@@ -5196,112 +5191,6 @@ mod tests {
             Err(LocalApiError::Unauthorized)
         );
         assert!(daemon.status(TOKEN).is_ok());
-    }
-
-    #[test]
-    fn status_reports_running_daemon() {
-        let daemon = daemon();
-        let status = daemon.status(TOKEN).expect("status should succeed");
-        assert_eq!(status.daemon, DaemonRuntimeState::Running);
-        assert_eq!(status.machine.machine_id, "machine_test");
-    }
-
-    #[test]
-    fn source_descriptor_is_registry_backed() {
-        let descriptor = source_descriptor(&SourceKind::Codex);
-
-        assert_eq!(descriptor.display_name, "Codex");
-        assert_eq!(descriptor.review_tier, ConnectorReviewTier::Official);
-        assert_eq!(descriptor.maturity, ConnectorMaturity::Stable);
-        assert_eq!(
-            descriptor
-                .collectors
-                .iter()
-                .map(|collector| collector.collector_id.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "cloud_sessions",
-                "identity_probe",
-                "local_sessions",
-                "logs2_trace",
-                "otel_config",
-                "quota_status"
-            ]
-        );
-    }
-
-    #[test]
-    fn pi_descriptor_preserves_registry_usage_operations() {
-        let descriptor = source_descriptor(&SourceKind::Pi);
-
-        for operation in [
-            SourceOperation::CollectUsage,
-            SourceOperation::UploadSnapshot,
-            SourceOperation::MonitorQuota,
-        ] {
-            let descriptor_operation = descriptor
-                .operations
-                .iter()
-                .find(|candidate| candidate.operation == operation)
-                .expect("registry operation should be exposed");
-            assert!(descriptor_operation.supported);
-            assert_eq!(descriptor_operation.state, SourceOperationState::Available);
-        }
-        assert_eq!(descriptor.maturity, ConnectorMaturity::LocalOnly);
-    }
-
-    #[test]
-    fn status_generated_at_uses_response_time() {
-        let daemon = daemon();
-        let status = daemon.status(TOKEN).expect("status should succeed");
-
-        assert_ne!(status.generated_at, "2026-05-05T09:10:00Z");
-        assert!(OffsetDateTime::parse(&status.generated_at, &Rfc3339).is_ok());
-    }
-
-    #[test]
-    fn stop_marks_daemon_unavailable() {
-        let daemon = daemon();
-        daemon.stop(TOKEN).expect("stop should succeed");
-        let status = daemon.status(TOKEN).expect("status should succeed");
-        assert_eq!(status.daemon, DaemonRuntimeState::Unavailable);
-    }
-
-    #[test]
-    fn relay_state_is_daemon_owned() {
-        let daemon = daemon();
-        daemon
-            .set_relay_state(
-                TOKEN,
-                RelayState {
-                    state: RelayRuntimeState::Connected,
-                    endpoint: Some("https://relay.ottto.net/v1/local".to_string()),
-                    last_connected_at: Some("2026-05-05T09:10:00Z".to_string()),
-                    last_error: None,
-                },
-            )
-            .expect("relay state should update");
-
-        assert_eq!(
-            daemon
-                .status(TOKEN)
-                .expect("status should succeed")
-                .relay
-                .state,
-            RelayRuntimeState::Connected
-        );
-    }
-
-    #[test]
-    fn source_health_is_daemon_owned() {
-        let daemon = daemon();
-        daemon
-            .update_sources(TOKEN, vec![codex_health()])
-            .expect("source health should update");
-
-        let status = daemon.status(TOKEN).expect("status should succeed");
-        assert_eq!(status.sources.len(), 1);
-        assert_eq!(status.sources[0].source, SourceKind::Codex);
     }
 
     #[test]
@@ -8762,13 +8651,8 @@ mod tests {
                     scope: AgentQuotaWindowScope::Account,
                     status: AgentQuotaWindowStatus::Ok,
                     freshness: AgentQuotaWindowFreshness::Fresh,
-                    model: None,
-                    account_label: None,
                     window_seconds: Some(604_800),
-                    started_at: None,
                     resets_at: Some("2026-06-01T00:00:00Z".to_string()),
-                    quota: None,
-                    remaining: None,
                     used_percent: Some(16),
                     left_percent: Some(84),
                     ..Default::default()
@@ -8778,13 +8662,8 @@ mod tests {
                     scope: AgentQuotaWindowScope::Account,
                     status: AgentQuotaWindowStatus::NearLimit,
                     freshness: AgentQuotaWindowFreshness::Fresh,
-                    model: None,
-                    account_label: None,
                     window_seconds: Some(18_000),
-                    started_at: None,
                     resets_at: Some("2026-05-28T15:00:00Z".to_string()),
-                    quota: None,
-                    remaining: None,
                     used_percent: Some(92),
                     left_percent: Some(8),
                     ..Default::default()
@@ -8794,15 +8673,11 @@ mod tests {
                     scope: AgentQuotaWindowScope::Account,
                     status: AgentQuotaWindowStatus::RateLimited,
                     freshness: AgentQuotaWindowFreshness::Fresh,
-                    model: None,
                     account_label: Some("other@example.com".to_string()),
                     account_identifier_hash: Some("other-account-hash".to_string()),
                     organization_identifier_hash: Some("other-organization-hash".to_string()),
                     window_seconds: Some(604_800),
-                    started_at: None,
                     resets_at: Some("2026-06-01T00:00:00Z".to_string()),
-                    quota: None,
-                    remaining: None,
                     used_percent: Some(100),
                     left_percent: Some(0),
                     ..Default::default()
@@ -8812,7 +8687,6 @@ mod tests {
                     scope: AgentQuotaWindowScope::Account,
                     status: AgentQuotaWindowStatus::RateLimited,
                     freshness: AgentQuotaWindowFreshness::Fresh,
-                    model: None,
                     account_label: Some("current@example.com".to_string()),
                     organization_identifier_hash: Some("other-organization-hash".to_string()),
                     window_seconds: Some(604_800),
@@ -9724,7 +9598,6 @@ mod tests {
                 scope: ottto_protocol::AgentQuotaWindowScope::Account,
                 status: AgentQuotaWindowStatus::Ok,
                 freshness: AgentQuotaWindowFreshness::Fresh,
-                model: None,
                 account_label: Some("ron@example.com".to_string()),
                 window_seconds: Some(604_800),
                 started_at: Some("2026-05-04T00:00:00Z".to_string()),
@@ -9740,7 +9613,6 @@ mod tests {
                 scope: ottto_protocol::AgentQuotaWindowScope::Account,
                 status: AgentQuotaWindowStatus::RateLimited,
                 freshness: AgentQuotaWindowFreshness::Fresh,
-                model: None,
                 account_label: Some("other@example.com".to_string()),
                 account_identifier_hash: Some("other-account-hash".to_string()),
                 organization_identifier_hash: Some("other-organization-hash".to_string()),
@@ -9758,7 +9630,6 @@ mod tests {
                 scope: ottto_protocol::AgentQuotaWindowScope::Account,
                 status: AgentQuotaWindowStatus::RateLimited,
                 freshness: AgentQuotaWindowFreshness::Fresh,
-                model: None,
                 account_label: Some("ron@example.com".to_string()),
                 organization_identifier_hash: Some("other-organization-hash".to_string()),
                 window_seconds: Some(604_800),

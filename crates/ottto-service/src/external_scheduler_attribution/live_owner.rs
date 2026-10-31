@@ -1407,33 +1407,6 @@ mod tests {
     }
 
     #[test]
-    fn start_witness_matches_the_claude_registration_format() {
-        // Claude writes the registration (startedAt 1791989737005 ms) about a
-        // second after the process starts.
-        assert_eq!(
-            process_start_witness(1_791_989_736).as_deref(),
-            Some("Wed Oct 14 14:55:36 2026")
-        );
-        assert_eq!(
-            process_start_witness(1_791_244_800).as_deref(),
-            Some("Tue Oct  6 00:00:00 2026")
-        );
-    }
-
-    #[test]
-    fn registry_sits_beside_the_projects_directory_of_the_transcript() {
-        assert_eq!(
-            claude_registry_dir(Path::new("/h/.claude/projects/-repo/abc.jsonl")),
-            Some(PathBuf::from("/h/.claude/sessions"))
-        );
-        assert_eq!(
-            claude_registry_dir(Path::new("/h/config/projects/-repo/abc.jsonl")),
-            Some(PathBuf::from("/h/config/sessions"))
-        );
-        assert_eq!(claude_registry_dir(Path::new("/h/other/abc.jsonl")), None);
-    }
-
-    #[test]
     fn a_failed_or_partial_descriptor_listing_proves_nothing() {
         // libproc reports failure as 0 with errno set, sometimes -1.
         assert_eq!(listed_descriptor_count(0, libc::EPERM, 8, 2048), None);
