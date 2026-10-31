@@ -46,6 +46,7 @@ impl Budget {
     ) -> bool {
         self.admit_unit(source, index, std::slice::from_ref(candidate), ordinary)
     }
+    #[inline(never)]
     pub(super) fn admit_unit(
         &mut self,
         source: SnapshotSource,

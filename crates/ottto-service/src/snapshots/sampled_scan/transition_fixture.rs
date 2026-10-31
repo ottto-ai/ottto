@@ -255,6 +255,14 @@ impl CrashPoint {
         Self::RestartOne,
         Self::RestartTwo,
     ];
+    /// The executable native-M3 SIGKILL rows (m3_d3_tests::OrderPoint).
+    /// FileSynced is N/A: plain-flush engine: no fsync boundary.
+    /// The old-writer/M1 ALL matrix above keeps its historical row.
+    pub(crate) const NATIVE_M3: [Self; 3] = [
+        Self::Prepared,
+        Self::BeforeRename,
+        Self::BeforeNativeEffects,
+    ];
     /// Additional physical store edges wired on this fixture branch. The
     /// retirement edges refer to classified remove_keys, never temp cleanup.
     pub(crate) const STORE_EXTENSION: [Self; 6] = [
@@ -448,6 +456,21 @@ impl RouteResult {
             modes: (0, 0, 0),
             restored: 0,
         }
+    }
+}
+
+/// Test adapter observes the real native boundary without exposing the
+/// acquisition module or constructing a synthetic publication receipt.
+pub(crate) struct NativeEffectsObserver;
+impl NativeEffectsObserver {
+    pub(crate) fn new(callback: impl FnMut() + 'static) -> Self {
+        super::test_hooks::set(super::test_hooks::Point::BeforeNativeEffects, callback);
+        Self
+    }
+}
+impl Drop for NativeEffectsObserver {
+    fn drop(&mut self) {
+        super::test_hooks::clear();
     }
 }
 
@@ -718,22 +741,26 @@ pub(crate) mod money_oracle {
             result
         }
 
+        /// [format] quiet default accepts zero anchor reads.
         #[test]
         fn quiet_default_accepts_zero_anchor_reads() {
             assert_quiet_restart_zero_bytes(&quiet_result(0));
         }
 
+        /// [format] quiet default rejects anchor reads.
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_default_rejects_anchor_reads() {
             assert_quiet_restart_zero_bytes(&quiet_result(ANCHOR_WINDOW));
         }
 
+        /// [format] quiet anchor window accepts exact count.
         #[test]
         fn quiet_anchor_window_accepts_exact_count() {
             assert_quiet_restart_with_anchor_window(&quiet_result(ANCHOR_WINDOW), ANCHOR_WINDOW);
         }
 
+        /// [format] quiet anchor window rejects short count.
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_anchor_window_rejects_short_count() {
@@ -743,6 +770,7 @@ pub(crate) mod money_oracle {
             );
         }
 
+        /// [format] quiet anchor window rejects excess count.
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_anchor_window_rejects_excess_count() {
@@ -752,6 +780,7 @@ pub(crate) mod money_oracle {
             );
         }
 
+        /// [format] quiet anchor window rejects body bytes.
         #[test]
         fn quiet_anchor_window_rejects_body_bytes() {
             let baseline = quiet_result(ANCHOR_WINDOW);
@@ -778,6 +807,7 @@ pub(crate) mod money_oracle {
             }
         }
 
+        /// [format] quiet anchor window rejects other reads.
         #[test]
         #[should_panic(expected = "other I/O unmeasured/nonzero")]
         fn quiet_anchor_window_rejects_other_reads() {
@@ -786,6 +816,7 @@ pub(crate) mod money_oracle {
             assert_quiet_restart_with_anchor_window(&result, ANCHOR_WINDOW);
         }
 
+        /// [format] quiet anchor window rejects unmeasured anchors.
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_anchor_window_rejects_unmeasured_anchors() {
@@ -900,6 +931,7 @@ pub(crate) fn fail_store_at(point: CrashPoint, nth: usize) -> StoreFailure {
     StoreFailure { previous, hits }
 }
 
+/// [format] scan clock restores after nested scope and unwind.
 #[test]
 fn scan_clock_restores_after_nested_scope_and_unwind() {
     with_scan_clock(100, || {
@@ -911,6 +943,7 @@ fn scan_clock_restores_after_nested_scope_and_unwind() {
     });
 }
 
+/// [format] transition failure restores outer hook after unwind.
 #[test]
 fn transition_failure_restores_outer_hook_after_unwind() {
     use crate::durable_tail_store::test_hooks;
@@ -940,6 +973,7 @@ fn transition_failure_restores_outer_hook_after_unwind() {
 
 /// Protect the existing matrix while publishing new names for owners. This
 /// checks vocabulary only; it is not evidence that live call sites execute.
+/// [format] crash extension names are disjoint from the m1 matrix.
 #[test]
 fn crash_extension_names_are_disjoint_from_the_m1_matrix() {
     let mut names = BTreeSet::new();
@@ -952,4 +986,38 @@ fn crash_extension_names_are_disjoint_from_the_m1_matrix() {
     }
     assert_eq!(names.len(), 32);
     assert!(names.contains("BeforeCodexPublication"));
+}
+
+/// [format] native m3 plain flush matrix has no file fsync boundary.
+#[test]
+fn native_m3_plain_flush_matrix_has_no_file_fsync_boundary() {
+    assert!(CrashPoint::ALL.contains(&CrashPoint::FileSynced));
+    assert!(
+        !CrashPoint::NATIVE_M3.contains(&CrashPoint::FileSynced),
+        "plain-flush engine: no fsync boundary"
+    );
+    // Qualify the real native engine, not a synthetic crash edge. Any new
+    // file fsync on this path requires revisiting the design and its matrix.
+    let native = include_str!("../../durable_tail_store/stream.rs")
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap();
+    for forbidden in [".sync_all(", ".sync_data(", "libc::fsync(", ".sync()"] {
+        assert!(
+            !native.contains(forbidden),
+            "native-M3 added file fsync: {forbidden}"
+        );
+    }
+    let store = include_str!("../../durable_tail_store.rs");
+    let temp_commit = store
+        .split("fn commit(&mut self, path: &Path, prior: Option<Stamp>)")
+        .nth(1)
+        .unwrap()
+        .split("fn discard(")
+        .next()
+        .unwrap();
+    assert!(
+        !temp_commit.contains(".sync"),
+        "native temp commit added fsync"
+    );
 }

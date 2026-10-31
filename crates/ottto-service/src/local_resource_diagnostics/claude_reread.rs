@@ -313,7 +313,6 @@ pub(crate) fn desktop_recovered_hold_body_read() {
         *n = n.saturating_add(1);
     });
 }
-#[cfg(test)]
 pub(crate) fn desktop_scoped_acquisition() {
     update(|counts| {
         let n = &mut counts.desktop_metadata.scoped_acquisition_attempts;

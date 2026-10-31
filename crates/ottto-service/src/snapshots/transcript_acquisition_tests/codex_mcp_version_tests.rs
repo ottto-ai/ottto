@@ -261,9 +261,12 @@ fn shared_role_gate_excludes_comparison_side_and_other_sources() {
     });
 }
 
+/// [regress] Quiet private replay cannot strand an existing explicit reparse;
+/// the ordinary paced Full must still deliver the native MCP version consumer.
 #[test]
 #[cfg(unix)]
-fn current_writer_disk_restore_tail_and_unchanged_restart_twice() {
+fn current_writer_disk_restore_tail_and_paced_quiet_reparse() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -276,7 +279,7 @@ fn current_writer_disk_restore_tail_and_unchanged_restart_twice() {
     let scope = Scope("mcp-current-writer".into());
     let capture = true; // OwnedSourceScan::new captures identity outside a sync cycle.
     let mut index = ScanIndex::default();
-    for (restart, expected_modes) in [(1, 0, 0), (0, 1, 0), (0, 0, 1)].into_iter().enumerate() {
+    for (restart, expected_modes) in [(1, 0, 0), (0, 1, 0), (1, 0, 0)].into_iter().enumerate() {
         if restart == 1 {
             // No session_meta in either resumed suffix.
             f.file.append(&usage(source, 140, 1, "fixture-model"));
@@ -302,20 +305,59 @@ fn current_writer_disk_restore_tail_and_unchanged_restart_twice() {
         let cache = Arc::new(sampled_scan::SharedCache::default());
         cache.durable_begin_pass(source, &path, &scope, capture);
         let projection = feed(&f);
-        let (next, _, modes, _) = production_scan_at_with_setup(
-            &f,
-            source,
-            index,
-            Some(cache.clone()),
-            &scope.0,
-            NOW,
-            |s| s.codex_versions = Some(projection.clone()),
-        );
+        let (((next, _, modes, bytes), diagnostics), samples) =
+            crate::transcript_acquisition::capture_sample_reads(|| {
+                crate::local_resource_diagnostics::capture(|| {
+                    production_scan_at_with_setup(
+                        &f,
+                        source,
+                        index,
+                        Some(cache.clone()),
+                        &scope.0,
+                        NOW,
+                        |s| s.codex_versions = Some(projection.clone()),
+                    )
+                })
+            });
         assert_eq!(modes, expected_modes);
+        if restart == 2 {
+            assert!(
+                samples.is_empty(),
+                "quiet restore reads no transcript windows"
+            );
+            assert_eq!(
+                bytes.0,
+                f.file.0.metadata().unwrap().len(),
+                "the existing explicit selection takes one native Full"
+            );
+            let page = diagnostics
+                .iter()
+                .find(|row| row["stage"] == "native_collection_page")
+                .unwrap();
+            assert_eq!(
+                page["counts"]["full_causes"]["restore_outcome"]["pending"],
+                1
+            );
+            // The same explicit cause cannot spend a second Full in this window.
+            cache.retained().unwrap().clear();
+            let mut owed = next.clone();
+            owed.snapshot_activity_at.clear();
+            let (_, _, modes, bytes) = production_scan_at_with_setup(
+                &f,
+                source,
+                owed,
+                Some(cache.clone()),
+                &scope.0,
+                NOW,
+                |_| {},
+            );
+            assert_eq!(modes, (0, 0, 0));
+            assert_eq!(bytes, (0, 0));
+        }
         assert_eq!(projection.snapshot().0.unwrap().version(), Some("0.148.9"));
         assert_eq!(
             cache.durable_counters(source).unwrap().0.restored,
-            u64::from(restart != 0)
+            u64::from(restart == 1)
         );
         index = next;
         index.save(&path).unwrap();

@@ -323,6 +323,9 @@ impl Serialize for ScanIndex {
         field!(accepted_rebuild_pending_since_unix_seconds, Option::is_none);
         field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
         field!(codex_counting_tombstones, BTreeMap::is_empty);
+        if restart_restore::enabled() && !self.o3_replay.is_empty() {
+            map.serialize_entry("reread_guard", &self.o3_replay)?;
+        }
         field!(
             codex_counting_evicted_legacy,
             codex_counting_version::EvictedLegacyOwners::is_empty
@@ -423,7 +426,7 @@ pub(super) const FIELDS: &[&str] = &[
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
     "codex_counting_tombstones",
-    "reread_guard", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "reread_guard", // O3 negative spends only; keep the legacy positional slot.
     "codex_counting_evicted_legacy",
     "upload_ack_retirement_handoff",
     "held_audit_progress",
@@ -1633,7 +1636,9 @@ impl<R: BufRead + Seek> Decoder<R> {
                     } else if name == "claude_request_census_shadow" {
                         index.claude_request_census_shadow =
                             ClaudeRequestCensusShadowState::default();
-                    } else if !matches!(name, "reread_guard" | "claude_desktop_store_inventory") {
+                    } else if name == "reread_guard" && restart_restore::enabled() {
+                        index.o3_replay = upgrade_replay::State::refused();
+                    } else if name != "claude_desktop_store_inventory" && name != "reread_guard" {
                         return Err(Error::Refused("duplicate index field"));
                     }
                 } else {
@@ -1647,7 +1652,16 @@ impl<R: BufRead + Seek> Decoder<R> {
                         } => {}
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
-                        "reread_guard" => {} // TOMBSTONE: decode-and-drop.
+                        "reread_guard" if restart_restore::enabled() => {
+                            index.o3_replay =
+                                if value.len > claude_request_census::MAX_RAW_BYTES as u64 {
+                                    upgrade_replay::State::refused()
+                                } else {
+                                    self.history_scalar(value, upgrade_replay::State::refused())?
+                                };
+                        }
+                        // OFF retains main's decode-and-drop positional slot.
+                        "reread_guard" => {}
                         "claude_desktop_store_inventory" => {
                             // No new refusal: this key was unknown to the last
                             // release. A digest is 64 bytes plus its quotes, so
@@ -2468,7 +2482,7 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     validate_original(&mut std::io::Cursor::new(bytes)).inspect_err(|error| {
         note_refusal(error, "cas", "unattributed");
     })?;
-    let (normalized, duplicate_census, duplicate_shadow) =
+    let (normalized, duplicate_census, duplicate_shadow, duplicate_upgrade) =
         claude_request_census::normalized_bounded_bytes(bytes)?;
     bounded_shape(&normalized).inspect_err(|_| {
         note_refusal(
@@ -2483,6 +2497,9 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     }
     if duplicate_shadow {
         index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
+    }
+    if restart_restore::enabled() && duplicate_upgrade {
+        index.o3_replay = upgrade_replay::State::refused();
     }
     Ok(index)
 }

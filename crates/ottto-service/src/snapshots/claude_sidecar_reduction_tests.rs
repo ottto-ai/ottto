@@ -359,7 +359,7 @@ fn seed_predecessor(fixture: &Fixture, cache: &Arc<SharedCache>) -> ScanIndex {
     ));
     let bound = cache.inner.lock().unwrap().resident_bound();
     if crate::heap_layout_bound::layout_supported() {
-        assert!(bound.unwrap() <= STATE_BYTES);
+        assert!(bound.unwrap() <= state_bytes());
     } else {
         assert!(
             bound.is_none(),
@@ -942,10 +942,14 @@ mod durable_restart {
     fn seed_and_persist(f: &Fixture, state: &State) -> ScanIndex {
         let first = Arc::new(SharedCache::default());
         state.begin(&first);
-        let prior = seed_predecessor(f, &first);
+        let mut prior = seed_predecessor(f, &first);
+        prior.save(&state.index_path).unwrap();
         first.durable_write_after_save(state.lock, SOURCE, &prior);
-        let expected = usize::from(crate::heap_layout_bound::layout_supported());
-        assert_eq!(state.store_records(), expected);
+        assert_eq!(
+            state.store_records(),
+            usize::from(crate::heap_layout_bound::layout_supported()),
+            "native persistence requires this binary's supported restore layout"
+        );
         prior
     }
 
@@ -988,10 +992,28 @@ mod durable_restart {
         key
     }
 
-    /// F2 receipts after a write: the reduction was refused for its
-    /// selection and the key's older record was invalidated (only a
-    /// supported layout admits, and so selects, anything).
-    fn assert_selection_refused(cache: &SharedCache, state: &State) {
+    /// [regress] A rejected saved selection cannot rewrite the native record
+    /// already receipted for its actual acquisition. Claude preserves it;
+    /// restart must independently reproduce the cold body's money.
+    fn assert_selection_refused(cache: &SharedCache, state: &State, settled: &ScanIndex) {
+        let records = || {
+            fs::read_dir(crate::durable_tail_store::store_dir_for_index(
+                &state.index_path,
+            ))
+            .map(|entries| {
+                entries
+                    .map(|entry| {
+                        let path = entry.unwrap().path();
+                        let bytes = fs::read(&path).unwrap();
+                        (path, bytes)
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default()
+        };
+        let before = records();
+        let written = cache.durable_counters(SOURCE).unwrap().1.records_written;
+        cache.durable_write_after_save(state.lock, SOURCE, settled);
         let supported = u64::from(crate::heap_layout_bound::layout_supported());
         let (counters, store) = cache.durable_counters(SOURCE).unwrap();
         println!("{}", counters.summary(SOURCE, &store));
@@ -1003,28 +1025,39 @@ mod durable_restart {
                 .unwrap_or(0),
             supported
         );
-        assert_eq!(store.records_invalidated, supported);
-        assert_eq!(store.records_written, 0);
-        assert_eq!(state.store_records(), 0);
+        assert_eq!(store.records_invalidated, 0);
+        assert_eq!(
+            store.records_written, written,
+            "the rejected selection writes nothing"
+        );
+        assert_eq!(
+            records(),
+            before,
+            "the acquired predecessor is preserved byte-for-byte"
+        );
+        assert_eq!(state.store_records(), supported as usize);
     }
 
-    /// A fresh process after the settled save restores nothing for the key
-    /// and reads it Full, to the same bodies as a cold Full.
-    fn assert_fresh_restart_reads_full(f: &Fixture, state: &State, settled: ScanIndex) {
+    /// A native write-ahead acquisition may be ahead of the saved selection.
+    /// It restores Unchanged and still emits the cold Full's exact body.
+    /// A cleared selection also permits an independently proved acquisition (#865).
+    fn assert_fresh_restart_matches_full(f: &Fixture, state: &State, settled: ScanIndex) {
         let fresh = Arc::new(SharedCache::default());
         state.begin(&fresh);
         let cached = enriched(f, raw_scan(f, settled.clone(), Some(fresh.clone()), |_| {}));
-        assert_eq!(restored(&fresh), 0);
-        assert_layout_mode(cached.modes, (1, 0, 0));
+        let native = crate::heap_layout_bound::layout_supported();
+        assert_eq!(restored(&fresh), u64::from(native));
+        assert_eq!(cached.modes, if native { (0, 0, 1) } else { (1, 0, 0) });
         assert_oracle(f, &cached, settled);
     }
 
     /// F2, local-hold settlement on the real path: a pass admits a newer
     /// reduction, the file is held, settlement reverts its entry to the
     /// committed one. The held reduction is never bound to that entry, the
-    /// key's older record is invalidated, and a restart reads Full.
+    /// native acquisition's record survives; a restart matches a cold Full.
     #[test]
     fn a_held_reverted_selection_is_never_written_and_invalidates_the_old_record() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1042,22 +1075,22 @@ mod durable_restart {
             scanned.files[&key].source_file_fingerprint,
             prior.files[&key].source_file_fingerprint
         );
-        let settled = scanned.into_locally_held_keys_reverted(&prior, &held, &BTreeSet::new());
+        let mut settled = scanned.into_locally_held_keys_reverted(&prior, &held, &BTreeSet::new());
         assert_eq!(
             settled.files[&key].source_file_fingerprint,
             prior.files[&key].source_file_fingerprint
         );
-        second.durable_write_after_save(state.lock, SOURCE, &settled);
-        assert_selection_refused(&second, &state);
-        assert_fresh_restart_reads_full(&f, &state, settled);
+        settled.save(&state.index_path).unwrap();
+        assert_selection_refused(&second, &state, &settled);
+        assert_fresh_restart_matches_full(&f, &state, settled);
     }
 
-    /// F2, the cleared-fingerprint reparse case: settlement clears the held
-    /// entry's fingerprint (reparse debt). A restore refuses it before any
-    /// record is read, the write refuses and invalidates, and a restart
-    /// reads Full.
+    /// [format] F2, the cleared-fingerprint reparse case: settlement clears the held
+    /// entry's fingerprint (reparse debt). Post-save refuses that selection;
+    /// #865 still permits acquisition proof independent of the cleared entry.
     #[test]
-    fn a_cleared_fingerprint_never_restores_or_writes() {
+    fn a_cleared_fingerprint_reuses_only_a_proved_native_acquisition() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1071,10 +1104,11 @@ mod durable_restart {
             raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
         );
         let (scanned, held) = finalized_with_holds(run, &key);
-        let settled = scanned.into_locally_held_keys_reverted(&prior, &held, &held);
+        let mut settled = scanned.into_locally_held_keys_reverted(&prior, &held, &held);
         assert!(settled.files[&key].source_file_fingerprint.is_empty());
-        // The record of the committed selection is still on disk here; the
-        // cleared selection refuses before it is read.
+        // The independently acquired record remains on disk. A direct restore
+        // under a different file scope refuses it; the production restart below
+        // must prove the actual file scope before reusing it.
         let fresh = SharedCache::default();
         state.begin(&fresh);
         let namespace = Scope("sidecar-fixture".into());
@@ -1098,22 +1132,26 @@ mod durable_restart {
             .into_test_option()
             .is_none());
         let (counters, store) = fresh.durable_counters(SOURCE).unwrap();
-        assert_eq!(counters.ineligible.get("selection_cleared"), Some(&1));
+        // #865 selection-clear permits acquisition proof; it is no longer an
+        // early refusal. Unsupported layouts wrote no predecessor at all.
+        assert!(!counters.ineligible.contains_key("selection_cleared"));
+        let present = u64::from(crate::heap_layout_bound::layout_supported());
         assert_eq!(
             (counters.missing, store.records_read, counters.restored),
-            (0, 0, 0)
+            (1 - present, present, 0)
         );
-        second.durable_write_after_save(state.lock, SOURCE, &settled);
-        assert_selection_refused(&second, &state);
-        assert_fresh_restart_reads_full(&f, &state, settled);
+        settled.save(&state.index_path).unwrap();
+        assert_selection_refused(&second, &state, &settled);
+        assert_fresh_restart_matches_full(&f, &state, settled);
     }
 
     /// F2, a RAM reduction ahead of the saved selection: two passes in one
     /// process, then the save commits the first pass's entry. The resident
-    /// reduction (second pass) is never bound to it; the older record is
-    /// invalidated and a restart reads Full.
+    /// reduction (second pass) is never rebound to it. Its native record
+    /// survives and a restart independently matches the cold Full.
     #[test]
     fn a_reduction_ahead_of_the_saved_selection_is_never_written() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1129,15 +1167,18 @@ mod durable_restart {
         f.append_transcript(2);
         f.evidence(3);
         state.begin(&second);
+        // Round4 approved absent-upgrade growth pacing. This row requires a
+        // second acquisition (ahead of the saved selection), not a paced hold.
+        crate::snapshots::sampled_scan::durable_tail::tests::expire_full_pace(&second, &key);
         let ahead = raw_scan(&f, first_pass.index.clone(), Some(second.clone()), |_| {});
         assert_ne!(
             ahead.index.files[&key].source_file_fingerprint,
             first_pass.index.files[&key].source_file_fingerprint
         );
-        let saved = settle(first_pass);
-        second.durable_write_after_save(state.lock, SOURCE, &saved);
-        assert_selection_refused(&second, &state);
-        assert_fresh_restart_reads_full(&f, &state, saved);
+        let mut saved = settle(first_pass);
+        saved.save(&state.index_path).unwrap();
+        assert_selection_refused(&second, &state, &saved);
+        assert_fresh_restart_matches_full(&f, &state, saved);
     }
 
     /// E1 S2: a restart under the same (constant) capture restores the
@@ -1145,6 +1186,7 @@ mod durable_restart {
     /// mismatch, and the tailed body keeps the prefix's marker.
     #[test]
     fn a_constant_capture_restart_reads_no_full() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         capture_marked(&f);
         let state = State::new(&f);
@@ -1166,6 +1208,7 @@ mod durable_restart {
 
     #[test]
     fn restart_restores_then_tails_and_matches_cold_full() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1224,6 +1267,7 @@ mod durable_restart {
 
     #[test]
     fn e2_restart_tail_and_quiet_late_sidecar_match_cold_full_emitted_body() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let _gate = claude_request_money::e2::GateForTest::set(true);
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             for append_native in [true, false] {
@@ -1265,11 +1309,11 @@ mod durable_restart {
                 let cold = enriched_e2(&f, raw_scan(&f, prior, None, |_| {}));
                 assert_layout_mode(
                     warm.modes,
-                    if append_native { (0, 1, 0) } else { (0, 0, 1) },
+                    if append_native { (0, 1, 0) } else { (1, 0, 0) },
                 );
                 assert_eq!(
                     restored(&restarted),
-                    u64::from(crate::heap_layout_bound::layout_supported())
+                    u64::from(append_native && crate::heap_layout_bound::layout_supported())
                 );
                 assert_eq!(exact_bodies(&warm), exact_bodies(&cold));
                 // These persist into the next replay and copy-proof pass.
@@ -1304,8 +1348,9 @@ mod durable_restart {
                     assert_eq!(fs::read(&f.path).unwrap(), native_before);
                     if crate::heap_layout_bound::layout_supported() {
                         assert_eq!(
-                            warm.native_bytes, 0,
-                            "quiet sidecar does not reacquire native records"
+                            warm.native_bytes,
+                            fs::metadata(&f.path).unwrap().len(),
+                            "explicit quiet sidecar selection uses one ordinary Full"
                         );
                     }
                 }
@@ -1315,6 +1360,7 @@ mod durable_restart {
 
     #[test]
     fn restart_after_a_metadata_only_touch_restores_unchanged() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(2);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1328,16 +1374,14 @@ mod durable_restart {
             &f,
             raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
         );
-        assert_layout_mode(cached.modes, (0, 0, 1));
-        assert_eq!(
-            restored(&second),
-            u64::from(crate::heap_layout_bound::layout_supported())
-        );
+        assert_layout_mode(cached.modes, (1, 0, 0));
+        assert_eq!(restored(&second), 0);
         assert_oracle(&f, &cached, prior);
     }
 
     #[test]
     fn an_index_from_another_context_never_restores() {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);
@@ -1396,23 +1440,6 @@ mod durable_restart {
                     }
                 }
             }
-        }
-    }
-}
-
-trait RestoreTestOutcome {
-    fn into_test_option(
-        self,
-    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>;
-}
-impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
-    fn into_test_option(
-        self,
-    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
-        match self {
-            Self::Restored(taken) => Some(*taken),
-            Self::Miss(_) => None,
-            Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
         }
     }
 }

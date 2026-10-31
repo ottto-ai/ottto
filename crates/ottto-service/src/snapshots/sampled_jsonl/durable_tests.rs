@@ -264,7 +264,18 @@ fn full_read(path: &Path, source: SnapshotSource) -> (CachedJsonlReduction, Chec
 /// finishes with the money context the scan passes (the E2 fold's read
 /// context over an index holding the file), so the money fold is compared
 /// too.
-fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
+pub(super) fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
+    items_at(parser, path, source, None)
+}
+
+/// `items`, through the shared native body with an M3 PRE-finalization hook
+/// (`None`: the legacy wrapper itself).
+fn items_at(
+    parser: OwnedJsonlParser,
+    path: &Path,
+    source: SnapshotSource,
+    pre: Option<&mut dyn FnMut(crate::snapshots::PreFinalization<'_>)>,
+) -> Value {
     let identity = opened_object_identity(source, &mut File::open(path).unwrap()).unwrap();
     let mut index = ScanIndex::default();
     index.files.insert(
@@ -281,8 +292,8 @@ fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value
             path,
             twins: &twins,
         });
-    let parsed = parser
-        .finish_with_repository_identity(
+    let parsed = match pre {
+        None => parser.finish_with_repository_identity(
             &identity,
             path,
             COLLECTED,
@@ -292,8 +303,23 @@ fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value
             None,
             None,
             money,
-        )
-        .unwrap();
+        ),
+        Some(pre) => parser.finish_native(
+            crate::snapshots::FinishRequest {
+                expected_opened_object_identity: &identity,
+                path,
+                collected_at: COLLECTED,
+                source_file_fingerprint: "fp".into(),
+                codex_title_metadata: None,
+                claude_title_metadata: None,
+                attribution_context: None,
+                repository_identity: None,
+                money_context: money,
+            },
+            Some(pre),
+        ),
+    }
+    .unwrap();
     // The fold is not serialized (`serde(skip)`): compare its entity body.
     let money = parsed
         .snapshots
@@ -336,6 +362,16 @@ fn restore(
     let decoded = decode(body, source).expect("decode");
     let parser = rederive_parser(File::open(path).unwrap(), path, &decoded).unwrap();
     decoded.rederive(parser, &mut File::open(path).unwrap(), line_cap())
+}
+
+/// A later skill reference must not also create an unsupported opening-call
+/// obligation: close the native opening window with three ordinary user turns.
+fn skill_fixture_lines() -> Vec<String> {
+    let mut lines = claude_lines(1, 1);
+    for n in 4..7 {
+        lines.push(json!({"type":"user","sessionId":CLAUDE_SESSION,"uuid":format!("skill-window-{n}"),"timestamp":format!("2026-10-20T10:00:0{n}Z"),"message":{"role":"user","content":"synthetic later turn"}}).to_string());
+    }
+    lines
 }
 
 /// `pad` filler lines of about `width` bytes each.
@@ -565,8 +601,8 @@ const CODEX_IDS: [&str; 3] = ["call_CANARYL1cx", "call_CANARYL2cx", "call_CANARY
 
 /// The canary matrix: plain sessions, private instruction text on both
 /// sources (its reversible `ConfigDigest` included), and an email context
-/// with an org marker. Artifacts and skill names are `E` (Full, never
-/// stored): `e_class_canaries_never_persist`.
+/// with an org marker. Artifacts remain E; approved skill labels use PL-retained.
+/// `e_content_refuses_and_approved_mid_file_skills_persist` covers both.
 fn cases() -> Vec<Case> {
     const CODEX_CONTENT: &[&str] = &[
         "CANARY_PROMPT_cx",
@@ -815,10 +851,10 @@ fn org_marker_email_is_stored_only_as_a_domain_separated_digest() {
     assert_eq!(occurrences(&body, &separated).len(), 1);
 }
 
-/// F4 matrix, `E` classes: an artifact or a skill name refuses the record
-/// (the entry reads Full), so neither is ever stored.
+/// Other E content still refuses; the approved mid-file skill label now persists.
+/// [format] e content refuses and approved mid file skills persist.
 #[test]
-fn e_class_canaries_never_persist() {
+fn e_content_refuses_and_approved_mid_file_skills_persist() {
     let scratch = Scratch::new("artifact");
     let path = scratch.write("t.jsonl", &claude_lines(1, 1));
     let (mut reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
@@ -835,7 +871,7 @@ fn e_class_canaries_never_persist() {
         .err(),
         Some(Refuse::NonEmpty("SnapshotAccumulator.artifacts"))
     );
-    let mut skill = claude_lines(1, 1);
+    let mut skill = skill_fixture_lines();
     skill.push(
         json!({"type":"assistant","sessionId":CLAUDE_SESSION,"uuid":"u-9","parentUuid":"u-3",
             "timestamp":"2026-10-20T10:00:09Z","requestId":"req_skill",
@@ -850,14 +886,14 @@ fn e_class_canaries_never_persist() {
     let scratch = Scratch::new("skill");
     let path = scratch.write("t.jsonl", &skill);
     let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
-    assert_eq!(
+    assert!(
         encode(
             &reduction,
             crate::durable_tail_store::RECORD_BYTES,
             line_cap()
         )
-        .err(),
-        Some(Refuse::NonEmpty("SnapshotAccumulator.activity_skills"))
+        .is_ok(),
+        "a native mid-file SKILL.md label is now PL-retained"
     );
 }
 
@@ -1002,7 +1038,18 @@ fn restore_rederives_the_exact_retained_copy() {
 /// finishes to the same upload items as a cold Full of the grown file.
 #[test]
 fn restore_then_tail_matches_cold_full() {
-    for case in cases() {
+    let mut corpus = cases();
+    let mut skill = skill_fixture_lines();
+    skill.push(serde_json::json!({"type":"assistant","sessionId":CLAUDE_SESSION,"uuid":"skill-mid","timestamp":"2026-10-20T10:00:09Z","attributionSkill":"Review","message":{"id":"skill-mid","role":"assistant","model":"claude-opus-4-1","content":[{"type":"tool_use","id":"toolu-mid","name":"Read","input":{"file_path":"/synthetic/skills/Review/SKILL.md"}}],"usage":{"input_tokens":1,"output_tokens":1}}}).to_string());
+    corpus.push(Case {
+        source: SnapshotSource::ClaudeCode,
+        lines: skill,
+        appended: claude_lines(2, 2),
+        content: &[],
+        provider_ids: &[],
+        survivors: &[],
+    });
+    for case in corpus {
         let scratch = Scratch::new("tail");
         let path = scratch.write("t.jsonl", &case.lines);
         let (reduction, checkpoint) = full_read(&path, case.source);
@@ -1021,7 +1068,19 @@ fn restore_then_tail_matches_cold_full() {
         drop(file);
         let mut held = File::open(&path).unwrap();
         let (checkpoint, _) = certificate.restore(&mut held, scope()).unwrap();
-        let (restored, _) = restore(&path, &body, case.source).unwrap();
+        let (oracle, _) = restore(&path, &body, case.source).unwrap();
+        let (restored, _) = {
+            let decoded = decode(&body, case.source).unwrap();
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        }
+        .unwrap();
+        assert_eq!(full_digest(&restored), full_digest(&oracle));
         let mut continued = parser(&path, case.source);
         let mode = continued
             .prepare_acquisition(
@@ -1036,6 +1095,44 @@ fn restore_then_tail_matches_cold_full() {
             .unwrap();
         assert_eq!(mode, ReadMode::Tail, "{:?}", case.source);
         while !continued.step().unwrap() {}
+        let (cold_reduction, _) = full_read(&path, case.source);
+        assert_eq!(
+            serde_json::to_vec(&continued.accumulator.activity_summary()).unwrap(),
+            serde_json::to_vec(&cold_reduction.accumulator.activity_summary()).unwrap()
+        );
+        if case.source == SnapshotSource::ClaudeCode {
+            let attribution =
+                crate::session_attribution::SessionAttributionContext::from_activity_hint(
+                    case.source,
+                    &scratch.0,
+                    true,
+                    Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                    Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+                )
+                .unwrap();
+            let grouping = |acc: &SnapshotAccumulator| {
+                serde_json::to_vec(&attribution.grouping_facts(
+                    crate::session_attribution::SessionAttributionGroupingInput {
+                        source: case.source,
+                        origin: Some(&acc.origin),
+                        source_session_id: CLAUDE_SESSION,
+                        observed_at: COLLECTED,
+                        source_version: case.source.parser_version(),
+                        first_prompt: acc.first_prompt_material.as_deref(),
+                        provider_skills: &acc.provider_skills,
+                        activity_skills: &acc.activity_skills,
+                        repository_hash: None,
+                        source_started_at: acc.started_at.as_deref(),
+                        transcript_path: &path,
+                    },
+                ))
+                .unwrap()
+            };
+            assert_eq!(
+                grouping(&continued.accumulator),
+                grouping(&cold_reduction.accumulator)
+            );
+        }
         assert_eq!(
             items(continued, &path, case.source),
             cold_items(&path, case.source),
@@ -1117,7 +1214,10 @@ fn edits_after_the_checkpoint_refuse_restore() {
         .sum::<u64>();
     let record = |scratch: &Scratch| {
         let path = scratch.write("t.jsonl", &lines);
-        let (reduction, checkpoint) = full_read(&path, source);
+        let (mut reduction, checkpoint) = full_read(&path, source);
+        reduction
+            .accumulator
+            .note_activity_skills("/synthetic/skills/HeadLabel/SKILL.md");
         let body = encode(
             &reduction,
             crate::durable_tail_store::RECORD_BYTES,
@@ -1194,11 +1294,11 @@ fn edits_after_the_checkpoint_refuse_restore() {
 const ALLOWLIST_PINS: [(SnapshotSource, &str); 2] = [
     (
         SnapshotSource::ClaudeCode,
-        "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+        "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2",
     ),
     (
         SnapshotSource::Codex,
-        "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+        "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
     ),
 ];
 
@@ -1230,8 +1330,8 @@ fn allowlist_digest_binds_source_and_field_classes() {
         "X title",
         "X first_prompt_material",
         "X workspace_path",
-        "E provider_skills",
-        "E activity_skills",
+        "PL provider_skills",
+        "PL activity_skills",
         "I codex_turn_traces",
         "D activity_call_tools",
         "L activity_mcp_call_ids",
@@ -1401,11 +1501,11 @@ fn h_fields_are_audited() {
 }
 
 /// Full-fallback classes on a synthetic corpus, by the refusing field: a
-/// skill reference (E) and a first prompt past the 1 MiB head bound (not
-/// re-derivable) each read Full; plain sessions persist.
+/// approved skill references persist alongside plain sessions; a first prompt
+/// past the 1 MiB head bound still refuses toward native Full.
 #[test]
 fn fallback_classes_over_the_synthetic_corpus() {
-    let mut skill = claude_lines(1, 1);
+    let mut skill = skill_fixture_lines();
     skill.push(
         json!({"type":"assistant","sessionId":CLAUDE_SESSION,"uuid":"u-9","parentUuid":"u-3",
             "timestamp":"2026-10-20T10:00:09Z","requestId":"req_skill",
@@ -1441,14 +1541,14 @@ fn fallback_classes_over_the_synthetic_corpus() {
             ) => field,
             Err(Refuse::TooLarge) => "record_bytes",
             Err(Refuse::UnknownLabel) => "static_label",
+            Err(Refuse::WriteFailed) => "encode_io",
         };
         *tally.entry(class).or_default() += 1;
     }
     assert_eq!(
         tally,
         BTreeMap::from([
-            ("persisted", 2),
-            ("SnapshotAccumulator.activity_skills", 1),
+            ("persisted", 3),
             ("SnapshotAccumulator.first_prompt_material", 1),
         ])
     );
@@ -1457,21 +1557,22 @@ fn fallback_classes_over_the_synthetic_corpus() {
 /// Budget receipt (static): the bounds every restore and write is held to.
 #[test]
 fn budget_bounds_hold() {
-    use crate::durable_tail_store::{MAX_BATCH, MAX_RECORDS, RECORD_BYTES, STORE_BYTES};
+    use crate::durable_tail_store::{INVENTORY_BOUND, MAX_BATCH, MAX_RECORDS, RECORD_BYTES};
     // A restored copy is charged to the 31 MiB state budget like any
     // retained copy; one record never exceeds one cache entry.
     assert_eq!(RECORD_BYTES, crate::transcript_cache::ENTRY_BYTES);
     assert_eq!(MAX_RECORDS, crate::transcript_cache::CACHE_ENTRIES);
-    // Disk: at most 32 MiB per source store.
-    assert_eq!(STORE_BYTES, 32 * 1024 * 1024);
+    // Disk admission is independent of memo precision; the old writer inventories 512 keys.
+    assert_eq!(INVENTORY_BOUND, 512);
     // Per restore: one record read, two 4 KiB sample windows, a head
     // re-parse of at most 1 MiB and at most NAMED_LINES capped lines.
     assert_eq!(HEAD_BOUND, 1024 * 1024);
     assert_eq!(NAMED_LINES, 4);
-    // Beside the cache, outside its state budget: both stores' digest maps.
+    // Prepaid beside retained state: both stores' maps and the bounded
+    // diagnostic set (512 full 440-byte nodes plus one retained root).
     assert_eq!(
         crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
-        64 * 1024
+        1_978_368 + (2 * MAX_RECORDS + 1) * 440
     );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);
@@ -1522,7 +1623,7 @@ fn structurally_decodes(body: &[u8]) -> bool {
         SnapshotSource::Pi,
     ]
     .into_iter()
-    .any(|source| decode(body, source).is_ok())
+    .any(|source| decode_body(body, source).is_ok())
 }
 
 fn verified_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
@@ -1670,6 +1771,63 @@ fn structural_verifier_large_body_still_allocates_nothing() {
     );
 }
 
+fn assert_borrowed_count_identity(reduction: &CachedJsonlReduction) {
+    take_l_spans();
+    let rederive = rederive_digests(&reduction.accumulator, line_cap()).unwrap();
+    let mut old = Enc::bytes(crate::durable_tail_store::RECORD_BYTES);
+    reduction.put(&mut old).unwrap();
+    rederive.put(&mut old).unwrap();
+    let expected = old.into_bytes();
+    take_l_spans();
+    let (count, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let mut count = Enc::count(expected.len());
+        reduction.put(&mut count).unwrap();
+        rederive.put(&mut count).unwrap();
+        count.counted()
+    });
+    assert_eq!(stats.allocations, 0, "count must not allocate: {stats:?}");
+    assert_eq!(count, expected.len());
+    let (refused, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let mut count = Enc::count(expected.len() - 1);
+        reduction
+            .put(&mut count)
+            .and_then(|()| rederive.put(&mut count))
+    });
+    assert_eq!(refused, Err(Refuse::TooLarge));
+    assert_eq!(stats.allocations, 0, "refusal precedes any body allocation");
+    assert!(
+        take_l_spans().is_empty(),
+        "count is not a second L-span output"
+    );
+    let actual = encode(reduction, expected.len(), line_cap()).unwrap();
+    assert_eq!(
+        actual, expected,
+        "borrowed parts preserve the original codec bytes"
+    );
+    assert_eq!(actual.capacity(), actual.len());
+    assert_eq!(
+        encode(reduction, expected.len() - 1, line_cap()),
+        Err(Refuse::TooLarge)
+    );
+    let (_, options) = crate::durable_tail_codec::trace_verify(|| verify(&actual).unwrap());
+    assert!(options >= 5, "fixture must populate nested optional state");
+    take_l_spans();
+}
+
+/// [format] borrowed count exact encoding matches populated both source canaries.
+#[test]
+fn borrowed_count_exact_encoding_matches_populated_both_source_canaries() {
+    let scratch = Scratch::new("borrowed-count-canaries");
+    let mut covered = BTreeSet::new();
+    for case in cases() {
+        let path = scratch.write("nested.jsonl", &case.lines);
+        let (reduction, _) = full_read(&path, case.source);
+        covered.insert(case.source.api_slug());
+        assert_borrowed_count_identity(&reduction);
+    }
+    assert_eq!(covered, BTreeSet::from(["claude_code", "codex"]));
+}
+
 #[test]
 fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
     let scratch = Scratch::new("zst-refusal");
@@ -1694,4 +1852,944 @@ fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
             "refused before offset use"
         );
     });
+}
+
+/// [money] tail reuse allowance cannot block an independently due full.
+#[test]
+fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
+    use crate::transcript_cache::Retained;
+    let scratch = Scratch::new("tail-admission");
+    let path = scratch.write("native.jsonl", &["{}".into()]);
+    let source = SnapshotSource::ClaudeCode;
+    let (state, checkpoint) = full_read(&path, source);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{}\n")
+        .unwrap();
+    let mut due = parser(&path, source);
+    // Since #870, audit debt alone never forces a Full on a checkpoint; an
+    // independently owed Full (here a scope change) must not touch the gate.
+    let mode = due
+        .prepare_acquisition_with_reuse_gate(
+            Some(Retained {
+                checkpoint: checkpoint.clone(),
+                state: state.clone(),
+            }),
+            &Scope("durable-codec-test-other-scope".into()),
+            Some(crate::transcript_acquisition::AuditDebt {
+                due_unix_seconds: NOW,
+            }),
+            NOW,
+            |_, _| panic!("an owed Full never spends or checks a Tail allowance"),
+        )
+        .unwrap();
+    assert_eq!(mode, ReadMode::Full(FullReason::ScopeChanged));
+    let mut limited = parser(&path, source);
+    let calls = std::cell::Cell::new(0);
+    let mode = limited
+        .prepare_acquisition_with_reuse_gate(
+            Some(Retained { checkpoint, state }),
+            &scope(),
+            None,
+            NOW,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(false)
+            },
+        )
+        .unwrap();
+    assert_eq!(calls.get(), 1, "only the actual Tail asks for permission");
+    assert_eq!(mode, ReadMode::Full(FullReason::StateMissing));
+    while !limited.step().unwrap() {}
+    let (cold, _) = full_read(&path, source);
+    assert_eq!(
+        encode(&limited.reduction_copy(), 1 << 20, 1 << 20).unwrap(),
+        encode(&cold, 1 << 20, 1 << 20).unwrap(),
+        "fallback uses the fresh native reduction"
+    );
+}
+
+// M3 G1 (r6 native): the one native finish body and its PRE-finalization
+// seam. The seam is what `finish_with_repository_identity_prepared` stages
+// from; these controls pin where it runs and what it sees, without a store.
+
+/// The body bytes the seam's live view encodes to, and whether the
+/// scan-shared live inputs were detached while it ran.
+fn seam_body(live: crate::snapshots::PreFinalization<'_>) -> (Vec<u8>, bool) {
+    let detached = live.accumulator.codex_turn_traces.is_none()
+        && live.accumulator.codex_parent_ownership_ledgers.is_none();
+    let body = encode_parts(
+        live.accumulator,
+        live.report,
+        (
+            live.recognized_usage_drop_count,
+            live.positive_recognized_usage_count,
+            live.positive_usage_evidence,
+        ),
+        usize::MAX,
+        line_cap(),
+    )
+    .expect("a clean fixture encodes");
+    (body, detached)
+}
+
+/// [format] m3 seam live bytes equal retained copy and output equals legacy.
+#[test]
+fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let scratch = Scratch::new("m3-seam");
+        let lines = match source {
+            SnapshotSource::Codex => codex_lines(),
+            _ => claude_lines(2, 2),
+        };
+        let path = scratch.write("t.jsonl", &lines);
+        let traces = || Some(std::sync::Arc::new(Default::default()));
+        // Oracle: the copy a certified completion retains, then the legacy
+        // wrapper's output over the same parser.
+        let mut legacy = parser(&path, source);
+        legacy
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap();
+        while !legacy.step().unwrap() {}
+        legacy.accumulator.codex_turn_traces = traces();
+        // This fixture qualifies an encodable live state; first-prompt raw
+        // material is deliberately outside the durable codec's allowlist.
+        legacy.accumulator.first_prompt_material = None;
+        legacy.accumulator.first_prompt_title = None;
+        let retained = legacy.durable_test_reduction_copy();
+        let legacy = items(legacy, &path, source);
+        let mut live = parser(&path, source);
+        live.prepare_acquisition(None, &scope(), None, NOW).unwrap();
+        while !live.step().unwrap() {}
+        live.accumulator.codex_turn_traces = traces();
+        // This fixture qualifies an encodable live state; first-prompt raw
+        // material is deliberately outside the durable codec's allowlist.
+        live.accumulator.first_prompt_material = None;
+        live.accumulator.first_prompt_title = None;
+        let mut seen = Vec::new();
+        let at_seam = items_at(
+            live,
+            &path,
+            source,
+            Some(&mut |view: crate::snapshots::PreFinalization<'_>| seen.push(seam_body(view))),
+        );
+        assert_eq!(seen.len(), 1, "{source:?}: the seam runs exactly once");
+        let (body, detached) = &seen[0];
+        assert!(
+            detached,
+            "{source:?}: live scan inputs are detached at the seam"
+        );
+        assert_eq!(
+            body,
+            &encode_body(&retained, usize::MAX, line_cap()).unwrap(),
+            "{source:?}: PRE-finalization live bytes are the retained copy's bytes"
+        );
+        assert_eq!(
+            at_seam, legacy,
+            "{source:?}: the shared body publishes exactly the legacy output"
+        );
+    }
+}
+
+/// [format] m3 seam never runs before the held object is revalidated.
+#[test]
+fn m3_seam_never_runs_before_the_held_object_is_revalidated() {
+    let scratch = Scratch::new("m3-seam-refused");
+    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
+    let request = |expected: &'static str| crate::snapshots::FinishRequest {
+        expected_opened_object_identity: expected,
+        path: &path,
+        collected_at: COLLECTED,
+        source_file_fingerprint: "fp".into(),
+        codex_title_metadata: None,
+        claude_title_metadata: None,
+        attribution_context: None,
+        repository_identity: None,
+        money_context: None,
+    };
+    let mut calls = 0;
+    // An unfinished read and a changed opened object both fail before the
+    // seam: nothing is staged, so nothing needs discarding.
+    let unfinished = parser(&path, SnapshotSource::ClaudeCode);
+    let mut count = |_: crate::snapshots::PreFinalization<'_>| calls += 1;
+    assert!(unfinished
+        .finish_native(request("unused"), Some(&mut count))
+        .is_err());
+    let mut changed = parser(&path, SnapshotSource::ClaudeCode);
+    while !changed.step().unwrap() {}
+    assert!(changed
+        .finish_native(request("another opened object"), Some(&mut count))
+        .is_err());
+    assert_eq!(calls, 0);
+}
+
+/// [format] skill label bounds and consent preserve the whole native state.
+#[test]
+fn skill_label_bounds_and_consent_preserve_the_whole_native_state() {
+    let scratch = Scratch::new("label-bounds");
+    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
+    let (base, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    for label in [
+        "x".repeat(97),
+        "é".into(),
+        "a/b".into(),
+        "a\\b".into(),
+        "a\0b".into(),
+    ] {
+        let mut record = base.clone();
+        record.accumulator.note_provider_skill(Some(label));
+        let native = record.accumulator.provider_skills.clone();
+        assert_eq!(
+            encode_permitted(&record, usize::MAX, line_cap(), true).err(),
+            Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=provider}"))
+        );
+        assert_eq!(
+            record.accumulator.provider_skills, native,
+            "no filtering, truncation or recasing at persistence"
+        );
+    }
+    let mut record = base.clone();
+    record
+        .accumulator
+        .note_provider_skill(Some(format!("  {}  ", "A".repeat(96))));
+    record.accumulator.note_activity_skills(
+        "/synthetic/skills/FirstSpelling/SKILL.md /synthetic/skills/firstspelling/SKILL.md",
+    );
+    assert_eq!(
+        record.accumulator.provider_skills,
+        BTreeSet::from(["a".repeat(96)])
+    );
+    assert_eq!(
+        record.accumulator.activity_skills,
+        BTreeSet::from(["FirstSpelling".into()])
+    );
+    let body = encode_permitted(&record, usize::MAX, line_cap(), true).unwrap();
+    assert!(body_has_skill_labels(&body).unwrap());
+    let decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
+    assert!(
+        !decoded.permits_skill_labels(false),
+        "consent off never resurrects old labels"
+    );
+    assert!(decoded.permits_skill_labels(true));
+    assert_eq!(
+        encode_permitted(&record, usize::MAX, line_cap(), false).err(),
+        Some(Refuse::NonEmpty("skill_label_consent_off"))
+    );
+    assert!(
+        encode_permitted(&base, usize::MAX, line_cap(), false).is_ok(),
+        "empty sets need no label permission"
+    );
+    assert!(
+        encode_permitted(&record, usize::MAX, line_cap(), true).is_ok(),
+        "turn-on permits the next native save without a forced read"
+    );
+    record.accumulator.activity_skills.insert("bad/path".into());
+    assert_eq!(
+        encode_permitted(&record, usize::MAX, line_cap(), true).err(),
+        Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=activity}"))
+    );
+}
+
+/// [format] skill labels preserve native provider and activity caps.
+#[test]
+fn skill_labels_preserve_native_provider_and_activity_caps() {
+    let scratch = Scratch::new("label-cap");
+    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
+    let (mut record, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    for n in 0..33 {
+        record
+            .accumulator
+            .note_provider_skill(Some(format!("Provider{n:02}")));
+        record
+            .accumulator
+            .note_activity_skills(&format!("/synthetic/skills/Activity{n:02}/SKILL.md"));
+    }
+    record
+        .accumulator
+        .note_provider_skill(Some("Aardvark".into()));
+    record
+        .accumulator
+        .note_activity_skills("/synthetic/skills/Aardvark/SKILL.md");
+    assert!(!record.accumulator.provider_skills.contains("aardvark"));
+    assert!(!record.accumulator.activity_skills.contains("Aardvark"));
+    assert_eq!(
+        record.accumulator.provider_skills.len(),
+        crate::session_attribution::MAX_SKILL_FACTS + 1
+    );
+    assert_eq!(record.accumulator.activity_skills.len(), 33);
+    assert!(record.accumulator.provider_skills.contains("provider08"));
+    assert!(!record.accumulator.provider_skills.contains("provider09"));
+    assert!(record.accumulator.activity_skills.contains("Activity32"));
+    assert!(!record.accumulator.provider_skills.contains("provider33"));
+    assert!(!record.accumulator.activity_skills.contains("Activity33"));
+    let body = encode_permitted(&record, usize::MAX, line_cap(), true).unwrap();
+    let decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
+    assert_eq!(
+        decoded.reduction.accumulator.provider_skills,
+        record.accumulator.provider_skills
+    );
+    assert_eq!(
+        decoded.reduction.accumulator.activity_skills,
+        record.accumulator.activity_skills
+    );
+    record.accumulator.activity_skills.insert("extra".into());
+    assert_eq!(
+        encode_permitted(&record, usize::MAX, line_cap(), true).err(),
+        Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=activity}"))
+    );
+    record.accumulator.activity_skills.remove("extra");
+    // Native provider insertion stops at nine. Also pin the record codec's
+    // approved <=33 bound independently of that narrower native cap.
+    record.accumulator.provider_skills = (0..34).map(|n| format!("provider{n:02}")).collect();
+    assert_eq!(
+        encode_permitted(&record, usize::MAX, line_cap(), true).err(),
+        Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=provider}"))
+    );
+}
+
+/// [format] pl scope is closed and every other e field stays refusing.
+#[test]
+fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
+    let shape = shape_text();
+    let paths = |class: &str| {
+        h_paths(&shape.replace("H ", "digest ").replace(class, "H "))
+            .into_iter()
+            .map(|path| path.split(':').next().unwrap().to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        paths("PL "),
+        BTreeSet::from([
+            "SnapshotAccumulator.activity_skills".into(),
+            "SnapshotAccumulator.provider_skills".into()
+        ])
+    );
+    assert_eq!(
+        paths("E "),
+        [
+            "CodexPrelude.skills_body",
+            "OpeningCall.files",
+            "OrgMarkers.home",
+            "SelectorCapture.context.attribution",
+            "SnapshotAccumulator.codex_tier_replay",
+            "SnapshotAccumulator.claude_desktop_identity",
+            "SnapshotAccumulator.claude_desktop_spawn_lineage",
+            "SnapshotAccumulator.codex_parent_signatures",
+            "SnapshotAccumulator.codex_parent_prefix_proof",
+            "SnapshotAccumulator.codex_parent_proof_used",
+            "SnapshotAccumulator.codex_parent_proof_refusal",
+            "SnapshotAccumulator.codex_legacy_bootstrap_buffer",
+            "SnapshotAccumulator.artifacts",
+            "SnapshotAccumulator.claude_usage_request_ids",
+            "SnapshotAccumulator.claude_usage_occurrences",
+            "SnapshotAccumulator.cache_observations",
+            "SnapshotAccumulator.claude_fork_parent",
+            "SnapshotAccumulator.claude_money",
+            "SnapshotAccumulator.seen_pi_usage_keys",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+    );
+}
+
+/// Pi is not registered by this slice. Exercise the same decoded production
+/// content interface without granting Pi store/write authority (E5 owns that).
+/// [money] bounded pi prompt workspace tail matches cold body in two cycles.
+#[test]
+fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
+    let root = Scratch::new("pi-bounded-head-tail");
+    let source = SnapshotSource::Pi;
+    for cwd in [None, Some("/synthetic/pi-workspace")] {
+        let lines = vec![
+            json!({"type":"session","id":"synthetic-pi","cwd":cwd}).to_string(),
+            json!({"type":"message","role":"user","content":"Synthetic first prompt"}).to_string(),
+            json!({"type":"message","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input":20,"output":3},"timestamp":"2026-10-20T10:00:00Z"}}).to_string(),
+        ];
+        let path = root.write(if cwd.is_some() { "cwd" } else { "no-cwd" }, &lines);
+        for cycle in 0..2 {
+            let (native, checkpoint) = full_read(&path, source);
+            let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+            assert!(digests.first_prompt.is_some());
+            assert!(digests.session_start.is_none());
+            assert!(digests.agent_label.is_none());
+            let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+                native.put(e)?;
+                digests.put(e)
+            })
+            .unwrap();
+            let certificate = checkpoint
+                .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
+                .unwrap();
+            let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(append, "{}", json!({"type":"message","message":{"role":"user","content":format!("later prompt {cycle}")}})).unwrap();
+            drop(append);
+            let (checkpoint, _) = certificate
+                .restore(&mut File::open(&path).unwrap(), scope())
+                .unwrap();
+            let decoded = decode_body(&body, source).unwrap();
+            let (restored, receipt) = {
+                decoded
+                    .rederive_plan()
+                    .map_err(Refuse::NotRederivable)
+                    .and_then(|plan| {
+                        decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                    })
+                    .map(|(reduction, receipt, _)| (reduction, receipt))
+            }
+            .unwrap();
+            assert!(receipt.head_bytes <= HEAD_BOUND);
+            assert_eq!(
+                restored.accumulator.first_prompt_material,
+                native.accumulator.first_prompt_material
+            );
+            assert_eq!(
+                restored.accumulator.first_prompt_title,
+                native.accumulator.first_prompt_title
+            );
+            assert_eq!(restored.accumulator.workspace_path, cwd.map(PathBuf::from));
+            let mut tail = parser(&path, source);
+            assert_eq!(
+                tail.prepare_acquisition(
+                    Some(Retained {
+                        checkpoint,
+                        state: restored
+                    }),
+                    &scope(),
+                    None,
+                    NOW
+                )
+                .unwrap(),
+                ReadMode::Tail
+            );
+            while !tail.step().unwrap() {}
+            let actual = items(tail, &path, source);
+            assert_eq!(actual, cold_items(&path, source));
+            assert!(actual.to_string().contains("Synthetic first prompt"));
+        }
+    }
+}
+
+/// [format] bounded plan refuses unsupported codex boundaries and oversized marks without reads.
+#[test]
+fn bounded_plan_refuses_unsupported_codex_boundaries_and_oversized_marks_without_reads() {
+    let root = Scratch::new("unsupported-bounded");
+    let path = root.write("t", &codex_lines());
+    let (native, _) = full_read(&path, SnapshotSource::Codex);
+    let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+    for boundary in [
+        CodexOwnershipBoundary::AwaitingLegacyTrigger,
+        CodexOwnershipBoundary::AwaitingParentPrefix,
+        CodexOwnershipBoundary::AmbiguousFork,
+        CodexOwnershipBoundary::Undetermined,
+    ] {
+        let mut decoded = decode(&body, SnapshotSource::Codex).unwrap();
+        decoded.reduction.accumulator.codex_ownership_boundary = boundary;
+        assert!(decoded.rederive_plan().is_err());
+    }
+    let mut decoded = decode(&body, SnapshotSource::Codex).unwrap();
+    decoded.rederive.first_prompt = Some([0; 32]);
+    decoded.reduction.accumulator.durable_marks.first_prompt = Some(HEAD_BOUND + 1);
+    assert_eq!(decoded.rederive_plan().err(), Some("mark"));
+    let mut decoded = decode(&body, SnapshotSource::Codex).unwrap();
+    decoded.rederive.title = Some([0; 32]);
+    decoded.reduction.accumulator.durable_marks.title_line =
+        Some((HEAD_BOUND + 1, TITLE_LINE_BOUND + 1));
+    assert_eq!(decoded.rederive_plan().err(), Some("title"));
+}
+
+// F4: each H class fails atomically, and diagnostics identify only the class.
+// F7: concurrent appends at the physical sample/head/title read boundaries
+// preserve bounded replay and leave the appended suffix to ordinary Tail.
+const PRIVACY_CANARIES: [&str; 4] = [
+    "PRIVATE_LITERAL_DIAGNOSTICS_CANARY_20261030",
+    "PRIVATE_REPLAY_HEAD_CANARY_20261030",
+    "PRIVATE_REPLAY_PROMPT_CANARY_20261030",
+    "PRIVATE_REPLAY_LABEL_CANARY_20261030",
+];
+
+/// The support tests consume the actual replay errors and diagnostic lines,
+/// alongside the private input that must never be collected into a bundle.
+pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
+    fs::create_dir_all(root).unwrap();
+    let mut safe_log = String::new();
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let mut lines = match source {
+            SnapshotSource::ClaudeCode => claude_lines(2, 2),
+            SnapshotSource::Codex => codex_lines(),
+            SnapshotSource::Pi => vec![
+                json!({"type":"session","id":"synthetic-pi","cwd":"/synthetic/privacy"})
+                    .to_string(),
+                json!({"type":"message","role":"user","content":"Synthetic Pi prompt"}).to_string(),
+            ],
+        };
+        // Insert canaries in content, a head-only ignored field and an agent
+        // label. A malformed selector and raw-value key are native inputs too.
+        for line in &mut lines {
+            let mut v: Value = serde_json::from_str(line).unwrap();
+            v["private_head"] = json!(PRIVACY_CANARIES[1]);
+            if let Some(content) = v.pointer_mut("/message/content") {
+                if content.is_string() {
+                    *content = json!(PRIVACY_CANARIES[2]);
+                }
+            }
+            if source == SnapshotSource::Pi && v.get("role") == Some(&json!("user")) {
+                v["content"] = json!(PRIVACY_CANARIES[2]);
+            }
+            if v.pointer("/payload/type") == Some(&json!("user_message")) {
+                v["payload"]["message"] = json!(PRIVACY_CANARIES[2]);
+            }
+            if v.get("type") == Some(&json!("session_meta")) {
+                v["payload"]["source"] = json!({"subagent":{"thread_spawn":{"agent_path":format!("/agents/{}", PRIVACY_CANARIES[3])}}});
+            }
+            *line = v.to_string();
+        }
+        lines.insert(
+            0,
+            json!({"selector":{"model":[PRIVACY_CANARIES[0]]}, "private_head":PRIVACY_CANARIES[1]})
+                .to_string(),
+        );
+        let path = root.join(format!("{}-private.jsonl", source.api_slug()));
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let (native, _) = full_read(&path, source);
+        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+            native.put(e)?;
+            digests.put(e)
+        })
+        .unwrap();
+        for class in 0..5 {
+            let bad = decode_body(&body, source).unwrap().test_fence_body(class);
+            // A real caught panic is a failed test, with a content-free failure
+            // assertion. The subprocess test also inspects the panic hook sink.
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::local_resource_diagnostics::capture(|| {
+                    let decoded = decode_body(&bad, source).unwrap();
+                    decoded
+                        .rederive_plan()
+                        .map_err(Refuse::NotRederivable)
+                        .and_then(|plan| {
+                            decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                        })
+                        .map(|(reduction, receipt, _)| (reduction, receipt))
+                })
+            }));
+            assert!(
+                caught.is_ok(),
+                "replay must return a typed refusal without panicking"
+            );
+            let (result, rows) = caught.unwrap();
+            let error = result.err().expect("inconsistent H refuses atomically");
+            let text = format!("{error:?}\n{}\n", serde_json::to_string(&rows).unwrap());
+            for canary in PRIVACY_CANARIES {
+                assert!(!text.contains(canary));
+            }
+            safe_log.push_str(&text);
+        }
+        // Native raw-value handling accepts/reparses this physical input;
+        // bounded replay must explicitly refuse the special key, without
+        // reflecting either the input or serde's error payload.
+        // Value's raw-value map consumes exactly one field. A second outer
+        // field makes the native JSONL read lossy, so the certified full_read
+        // premise would fail before bounded replay. Keep the canary inside the
+        // raw JSON string; native parses it and bounded replay refuses the key.
+        let raw = json!({
+            "$serde_json::private::RawValue": json!({"ignored":PRIVACY_CANARIES[0]}).to_string()
+        })
+        .to_string()
+            + "\n";
+        fs::write(&path, raw + &lines.join("\n") + "\n").unwrap();
+        let (native, _) = full_read(&path, source);
+        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+            native.put(e)?;
+            digests.put(e)
+        })
+        .unwrap();
+        let result = {
+            let decoded = decode_body(&body, source).unwrap();
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        };
+        assert!(matches!(
+            result,
+            Err(Refuse::NotRederivable("raw_value_key"))
+        ));
+        safe_log.push_str(&format!("{:?}\n", result.err().unwrap()));
+        // Corrupt persisted bytes and a descriptor error exercise both error
+        // carriers without formatting a Value, prompt, title or label.
+        assert!(decode_body(&body[..body.len() - 1], source).is_err());
+        let fd = File::options().write(true).open(&path).unwrap();
+        let err = {
+            let decoded = decode_body(&body, source).unwrap();
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| decoded.rederive_content_planned(&fd, &plan))
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        }
+        .err()
+        .unwrap();
+        safe_log.push_str(&format!("{err:?}\n"));
+    }
+    for canary in PRIVACY_CANARIES {
+        assert!(!safe_log.contains(canary));
+    }
+    fs::write(root.join("replay-errors.log"), &safe_log).unwrap();
+    eprintln!("{safe_log}");
+    PRIVACY_CANARIES
+}
+
+/// [format] bounded replay errors logs and panics are content free.
+#[test]
+fn bounded_replay_errors_logs_and_panics_are_content_free() {
+    const CHILD: &str = "OTTTO_BOUNDED_REPLAY_PRIVACY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let root = Scratch::new("privacy-child");
+        replay_privacy_artifacts(&root.0);
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "snapshots::sampled_jsonl::durable::tests::bounded_replay_errors_logs_and_panics_are_content_free", "--nocapture"])
+        .env(CHILD, "1").output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for canary in PRIVACY_CANARIES {
+        assert!(
+            !stdout.contains(canary),
+            "content in stdout or panic payload"
+        );
+        assert!(!stderr.contains(canary), "content in log or panic payload");
+    }
+    assert!(
+        stdout.contains("1 passed"),
+        "child fixture must actually run"
+    );
+    assert!(
+        output.status.success(),
+        "privacy child must return typed errors without panic"
+    );
+}
+
+/// Pi remains unregistered here. This is the production codec/acquisition/
+/// native-finish/finalizer interface E5 will route after registration, with
+/// actual A < C < B extents and a real complete native body (no hand-built item).
+/// [money] codex pi restored tail race below accepted publishes complete native body.
+#[test]
+fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
+    let _on = RestartRestoreForTest::enabled();
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        let root = Scratch::new("pi-publication-race");
+        let pi_lines = vec![
+        json!({"type":"session","id":"synthetic-pi","cwd":"/synthetic/pi"}).to_string(),
+        json!({"type":"message","role":"user","content":"Synthetic first Pi prompt"}).to_string(),
+        json!({"type":"message","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input":20,"output":3},"timestamp":"2026-10-20T10:00:00Z"}}).to_string(),
+    ];
+        let lines = if source == SnapshotSource::Codex {
+            codex_lines()
+        } else {
+            pi_lines
+        };
+        let path = root.write("source.jsonl", &lines);
+        let (native, checkpoint) = full_read(&path, source);
+        let a = fs::metadata(&path).unwrap().len();
+        let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+        let body = Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
+            native.put(e)?;
+            digests.put(e)
+        })
+        .unwrap();
+        let certificate = checkpoint
+            .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
+            .unwrap();
+        let total_input = std::cell::Cell::new(100);
+        let total_output = std::cell::Cell::new(3);
+        let append = |n| {
+            let lines = if source == SnapshotSource::Codex {
+                total_input.set(total_input.get() + n);
+                total_output.set(total_output.get() + 3);
+                let mut total = codex_usage(total_input.get());
+                total["output_tokens"] = json!(total_output.get());
+                total["total_tokens"] = json!(total_input.get() + total_output.get());
+                vec![
+                    json!({"type":"turn_context","timestamp":COLLECTED,"payload":{"turn_id":format!("race-{n}"),"model":"gpt-5.2"}}),
+                    json!({"type":"event_msg","timestamp":COLLECTED,"payload":{"type":"task_started","turn_id":format!("race-{n}")}}),
+                    json!({"type":"event_msg","timestamp":COLLECTED,"payload":{"type":"token_count","info":{"last_token_usage":codex_usage(n),"total_token_usage":total}}}),
+                    json!({"type":"event_msg","timestamp":COLLECTED,"payload":{"type":"task_complete","turn_id":format!("race-{n}")}}),
+                ]
+            } else {
+                vec![
+                    json!({"type":"message","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input":n,"output":3},"timestamp":"2026-10-20T10:01:00Z"}}),
+                ]
+            };
+            let mut fd = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            for line in lines {
+                writeln!(fd, "{line}").unwrap();
+            }
+        };
+        append(30);
+        let c = fs::metadata(&path).unwrap().len();
+        append(40);
+        let b = fs::metadata(&path).unwrap().len();
+        let finish = |parser: OwnedJsonlParser| {
+            let identity = opened_object_identity(source, &mut File::open(&path).unwrap()).unwrap();
+            parser
+                .finish_with_repository_identity(
+                    &identity,
+                    &path,
+                    COLLECTED,
+                    "race-source".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        };
+        let mut accepted = parser(&path, source);
+        while !accepted.step().unwrap() {}
+        let accepted = finish(accepted);
+        assert!(accepted.report.complete());
+        assert!(!accepted.snapshots.is_empty());
+        let previous_entities: BTreeSet<String> = accepted
+            .snapshots
+            .iter()
+            .map(|i| snapshot_fingerprint(source, i))
+            .collect();
+        let previous_bodies: BTreeSet<String> = accepted
+            .snapshots
+            .iter()
+            .map(snapshot_upload_body_witness)
+            .collect();
+        let (checkpoint, _) = certificate
+            .restore_grown(&mut File::open(&path).unwrap(), scope())
+            .unwrap();
+        let (restored, _) = {
+            let decoded = decode_body(&body, source).unwrap();
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        }
+        .unwrap();
+        // The accepted extent remains B while the actual plan freezes C.
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(c)
+            .unwrap();
+        assert!(a < c && c < b);
+        let mut tail = parser(&path, source);
+        let mode = tail
+            .prepare_acquisition(
+                Some(Retained {
+                    checkpoint,
+                    state: restored,
+                }),
+                &scope(),
+                None,
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(mode, ReadMode::Tail);
+        let frozen = tail.reader.acquisition.as_ref().unwrap().frozen_length();
+        while !tail.step().unwrap() {}
+        let parsed = finish(tail);
+        assert!(parsed.report.complete());
+        let mut cold = parser(&path, source);
+        while !cold.step().unwrap() {}
+        assert_eq!(
+            serde_json::to_value(&parsed.snapshots).unwrap(),
+            serde_json::to_value(finish(cold).snapshots).unwrap()
+        );
+        let mut scan = SourceScanResult::empty(source);
+        scan.snapshots = parsed.snapshots;
+        scan.pending_finalization.push(PendingIndexFinalization {
+            restored_behind_accepted: sampled_scan::durable_tail::restored_tail_below_accepted(
+                source,
+                true,
+                mode,
+                Some(frozen),
+                Some(b),
+            ),
+            sampled_audit_verified: false,
+            codex_pending_recovery: false,
+            index_key: local_index_key(&path),
+            source_file_fingerprint: "race-source".into(),
+            previous_snapshot_fingerprint: Some(snapshot_file_entity_set_hex(&previous_entities)),
+            previous_upload_body_witness: Some(snapshot_file_upload_body_set_hex(&previous_bodies)),
+            parse_complete: parsed.report.complete(),
+            diagnostic_reason: FileReason::Complete,
+            parsed_snapshot_count: scan.snapshots.len(),
+            effective_upload_body_witness_revision:
+                crate::snapshot_sync::effective_upload_body_witness_revision(source),
+        });
+        let mut index = ScanIndex::default();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            finalize_scan_after_policy(source, &mut scan, &mut index)
+        });
+        assert!(!scan.snapshots.is_empty());
+        assert_eq!(
+            rows.iter()
+                .filter_map(|r| r["counts"]["restored_behind_accepted"]["published"].as_u64())
+                .sum::<u64>(),
+            1
+        );
+    }
+}
+
+/// [money] A certified PRE body cannot replace its predecessor after native
+/// finish reports loss. E5's Pi seal-boundaries fixture supplies the real
+/// cross-shape conflict; this unit seam covers the source-independent decision.
+#[test]
+fn native_finish_loss_keeps_predecessor_and_discloses_without_receipt_hold() {
+    use crate::snapshots::sampled_scan::durable_tail::{
+        FinishAcquisition, NativeFinishAttempt, PrepareOutcome,
+    };
+    let _on = RestartRestoreForTest::enabled();
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = Scratch::new("native-finish-loss");
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let _lock = crate::locked_state_dir::test_locks::hold(&root.0);
+    let source = SnapshotSource::Codex;
+    let path = root.write("source.jsonl", &codex_lines());
+    let key = local_index_key(&path);
+    let index_path = root.0.join("index.json");
+    let cache = sampled_scan::SharedCache::default();
+    let mut index = ScanIndex::default();
+    index.save(&index_path).unwrap();
+    let mut predecessor = None;
+    for loss in [
+        "none",
+        "dropped_usage",
+        "incomplete_parse",
+        "ownership",
+        "zero_snapshot",
+    ] {
+        cache.durable_begin_pass(source, &index_path, &scope(), false);
+        let held = File::open(&path).unwrap();
+        let identity = opened_object_identity(source, &mut held.try_clone().unwrap()).unwrap();
+        let mut live = parser(&path, source);
+        let mode = live.prepare_acquisition(None, &scope(), None, NOW).unwrap();
+        while !live.step().unwrap() {}
+        live.accumulator.first_prompt_material = None;
+        live.accumulator.first_prompt_title = None;
+        let SideCertificate::Certified { mut completed, .. } =
+            live.certify_without_retention(&scope(), NOW).unwrap()
+        else {
+            panic!("loss is unknown at certification")
+        };
+        let counting =
+            sampled_scan::durable_tail::ImmutableCounting::from_accumulator(&live.accumulator)
+                .unwrap();
+        bind_native_chain(
+            &cache,
+            &mut completed,
+            &NativeChainRequest {
+                source,
+                key: &key,
+                opened_object_identity: &identity,
+                mode,
+                counting: Some(counting),
+                held: &held,
+                index: &index,
+            },
+        );
+        let mut acquisition = FinishAcquisition::Certified(completed);
+        let mut preparation = None;
+        let mut native = live
+            .finish_native(
+                FinishRequest {
+                    expected_opened_object_identity: &identity,
+                    path: &path,
+                    collected_at: COLLECTED,
+                    source_file_fingerprint: "finish-loss".into(),
+                    codex_title_metadata: None,
+                    claude_title_metadata: None,
+                    attribution_context: None,
+                    repository_identity: None,
+                    money_context: None,
+                },
+                Some(&mut |view| {
+                    preparation = stage_preparation(&mut acquisition, view, |lease, view| {
+                        cache.prepare_live(lease, view)
+                    });
+                }),
+            )
+            .unwrap();
+        assert!(
+            matches!(preparation, Some(PrepareOutcome::Prepared(_))),
+            "a real successor was staged before finish: {loss}"
+        );
+        // Inject only the final native report at the unit boundary. The
+        // certificate, staged body, predecessor, and commit fences stay real.
+        match loss {
+            "dropped_usage" => {
+                native.recognized_usage_drop_count = 1;
+                native.dropped_usage_record_count = 1;
+            }
+            "incomplete_parse" => native.report.malformed_json_line_count = 1,
+            "ownership" => native.ownership_incomplete_file_count = 1,
+            "zero_snapshot" => native.zero_snapshot_usage_evidence = true,
+            _ => {}
+        }
+        let settled = settle_native_attempt(
+            &cache,
+            NativeFinishAttempt {
+                native: Ok(native),
+                acquisition,
+                preparation,
+            },
+            held,
+            NativeFence {
+                source,
+                key: &key,
+                path: &path,
+                expected_opened_object_identity: &identity,
+                committed_index: &index,
+            },
+        );
+        let native = settled.native.unwrap();
+        let record_path = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "rec"))
+            .unwrap();
+        let bytes = fs::read(record_path).unwrap();
+        if loss == "none" {
+            assert!(settled.publication.is_some_and(|p| p.publishes()));
+            predecessor = Some(bytes);
+        } else {
+            assert_eq!(bytes, *predecessor.as_ref().unwrap(), "{loss}");
+            assert!(settled.publication.is_none(), "native discloses {loss}");
+            assert!(
+                settled.completed.is_none(),
+                "lossy candidate is not retained"
+            );
+            if loss == "dropped_usage" {
+                assert_eq!(native.dropped_usage_record_count, 1);
+            }
+        }
+        // A buggy commit would publish this distinct generation even when
+        // the reduction bytes happen to equal the predecessor's body.
+        index.generation += 1;
+    }
 }

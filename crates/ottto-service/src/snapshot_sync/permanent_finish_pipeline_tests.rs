@@ -1524,6 +1524,10 @@ fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() {
+    run_on_scan_worker_stack(ack_huge_file_real_finish_body);
+}
+
+fn ack_huge_file_real_finish_body() {
     const ENTITIES: usize = 5000;
     let server = AckScriptedServer::new();
     let mut home = AckFinishHome::new(&server);

@@ -1188,9 +1188,17 @@ impl LockedStore {
                     || text == format!("{stem}.lock")
                 {
                     Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, false)?;
-                } else if text.strip_prefix(&temp_prefix).is_some_and(|suffix| {
-                    suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
-                }) {
+                } else if text == format!("{stem}.durable-tail") {
+                    check_directory(&open_at(
+                        &self.parent,
+                        name,
+                        libc::O_RDONLY | libc::O_DIRECTORY,
+                    )?)?;
+                } else if text == format!("{stem}.private-labels")
+                    || text.strip_prefix(&temp_prefix).is_some_and(|suffix| {
+                        suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                {
                     Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
                 } else {
                     bail!("scan_index_prior_state_requires_repair");
@@ -1968,6 +1976,14 @@ impl LockedStore {
                 temps = true;
             } else if text == format!("{stem}-upload-progress.lock") {
                 Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, false)?;
+            } else if text == format!("{stem}.durable-tail") {
+                check_directory(&open_at(
+                    &self.parent,
+                    name,
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                )?)?;
+            } else if text == format!("{stem}.private-labels") {
+                Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
             } else if text.starts_with(family)
                 && text != self.objects_name.to_str()?
                 && text != format!("{root}.lock")

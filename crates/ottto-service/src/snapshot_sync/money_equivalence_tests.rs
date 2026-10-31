@@ -198,9 +198,9 @@ fn receipt(name: &str, bodies: &[ReceiptBody]) {
 
 /// The disk arm's state directory (#806): the committed scan index and,
 /// beside it, the real durable store, under a test-held single-writer lock
-/// (#801). Every arm loads the SAME committed index from here. It is not an
-/// ancestor of the corpus support dir, so the RAM and cold arms hold no
-/// state-directory writer, exactly as before.
+/// (#801). Every arm loads the SAME committed index. A restart forks those
+/// committed bytes before the retained arm can replace its write-ahead record.
+/// Each arm keeps the production single-writer ownership of its own store.
 struct Disk {
     dir: PathBuf,
     index: PathBuf,
@@ -220,7 +220,32 @@ impl Disk {
     }
     /// A new owner: a restarted process with an empty RAM cache, whose pass
     /// begins on the store as the daemon's does.
-    fn owner(&self, source: SnapshotSource) -> E2ScanFixture {
+    fn owner(&mut self, source: SnapshotSource) -> E2ScanFixture {
+        // Native acquisition writes ahead of the index save. Each
+        // counterfactual arm needs the committed predecessor, even after
+        // the retained arm advances its own store on the same transcript.
+        if !self.index.exists() {
+            let owner = E2ScanFixture::default();
+            self.begin(&owner, source);
+            return owner;
+        }
+        let dir = self.dir.join("restart");
+        std::fs::create_dir(&dir).unwrap();
+        crate::locked_state_dir::test_locks::hold(&dir);
+        let index = dir.join("scan-index.json");
+        std::fs::copy(&self.index, &index).unwrap();
+        let old_store = crate::durable_tail_store::store_dir_for_index(&self.index);
+        let new_store = crate::durable_tail_store::store_dir_for_index(&index);
+        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+            .create(&new_store).unwrap();
+        if old_store.exists() {
+            for entry in std::fs::read_dir(old_store).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::copy(entry.path(), new_store.join(entry.file_name())).unwrap();
+            }
+        }
+        self.dir = dir;
+        self.index = index;
         let owner = E2ScanFixture::default();
         self.begin(&owner, source);
         owner
@@ -295,7 +320,7 @@ fn warm_claude(c: &Corpus, disk: &Disk) -> (E2ScanFixture, ScanIndex) {
 fn compare_claude(
     c: &Corpus,
     retained: &E2ScanFixture,
-    disk: &Disk,
+    disk: &mut Disk,
     prior: ScanIndex,
     mode: (usize, usize, usize),
 ) -> ReceiptBody {
@@ -308,7 +333,7 @@ fn compare_claude(
             &restart,
             [prior.clone(), prior.clone(), prior],
             mode,
-            mode,
+            if mode.2 > 0 { (mode.2, 0, 0) } else { mode },
         ),
     )
 }
@@ -336,8 +361,19 @@ fn claude_pages(
     let disk = c.raw(restart, disk_prior, 100, true, &[]);
     assert_eq!(
         disk.modes, disk_mode,
-        "disk arm must exercise the named restored acquisition"
+        "disk arm must exercise the authorized cold acquisition"
     );
+    if disk_mode.0 > 0 && mode.2 > 0 {
+        let counts = disk
+            .cache
+            .durable_counters(SnapshotSource::ClaudeCode)
+            .unwrap()
+            .0;
+        assert_eq!(
+            counts.resource_full.get("rederive_quiet"),
+            Some(&(disk_mode.0 as u64))
+        );
+    }
     assert_eq!(
         durable_restores(&disk.cache, SnapshotSource::ClaudeCode).1,
         (disk_mode.1 + disk_mode.2) as u64,
@@ -409,6 +445,7 @@ fn compare_claude_uploads(pages: &[Page; 3]) -> ReceiptBody {
 }
 
 fn claude_case(name: &str) {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported(name) {
         return;
     }
@@ -439,7 +476,7 @@ fn claude_case(name: &str) {
             // being suppressed as an unchanged body before real upload.
             c.evidence(&[api("r1", 10, 100)], &[]);
         }
-        let disk = Disk::new(&c);
+        let mut disk = Disk::new(&c);
         let (scanner, prior) = warm_claude(&c, &disk);
         let mut mode = (0, 1, 0);
         match name {
@@ -583,7 +620,7 @@ fn claude_case(name: &str) {
                     &disk.owner(SnapshotSource::ClaudeCode),
                     [prior.clone(), prior.clone(), prior],
                     (0, 0, 1),
-                    (0, 0, 1),
+                    (1, 0, 0),
                 );
                 finish_phase(&mut failed, false);
                 let failed_wire = compare_claude_uploads(&failed);
@@ -605,7 +642,7 @@ fn claude_case(name: &str) {
                     &disk.owner(SnapshotSource::ClaudeCode),
                     [tail_failed.index, full_failed.index, disk_prior],
                     (0, 0, 1),
-                    (0, 0, 1),
+                    (1, 0, 0),
                 );
                 finish_phase(&mut healthy, true);
                 let healthy_wire = compare_claude_uploads(&healthy);
@@ -638,7 +675,7 @@ fn claude_case(name: &str) {
         if mode.1 > 0 {
             input_clock(&path);
         }
-        receipt(name, &[compare_claude(&c, &scanner, &disk, prior, mode)]);
+        receipt(name, &[compare_claude(&c, &scanner, &mut disk, prior, mode)]);
     });
 }
 
@@ -703,20 +740,30 @@ fn other_wire(source: SnapshotSource, scan: &SourceScanResult) -> Vec<u8> {
     validate_snapshot_batch_request(&wire).unwrap();
     canonical(&wire)
 }
-fn codex_case(legacy: bool) {
-    let name = if legacy {
-        "codex_legacy_acked_sticky"
-    } else {
-        "codex_v2_sticky"
+fn codex_case(legacy: bool, content: bool) {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    let name = match (legacy, content) {
+        (true, false) => "codex_legacy_acked_sticky",
+        (false, false) => "codex_v2_sticky",
+        (true, true) => "codex_content_legacy",
+        (false, true) => "codex_content_v2",
     };
     if !supported(name) {
         return;
     }
     let c = corpus(name);
-    let disk = Disk::new(&c);
+    let mut disk = Disk::new(&c);
     let path = c.root.join("rollout.jsonl");
     let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z","payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}}).to_string()+"\n";
-    std::fs::write(&path, header + &codex_rows("turn-a", 10)).unwrap();
+    let content_prefix = if content {
+        [
+            json!({"type":"turn_context","timestamp":"2026-10-27T07:00:00Z",
+                "payload":{"turn_id":"turn-a","cwd":"/synthetic/codex","model":"gpt-5.2"}}),
+            json!({"type":"event_msg","timestamp":"2026-10-27T07:00:00Z",
+                "payload":{"type":"user_message","message":"Synthetic content-only replay prompt"}}),
+        ].iter().map(|line| line.to_string()+"\n").collect::<String>()
+    } else { String::new() };
+    std::fs::write(&path, header + &content_prefix + &codex_rows("turn-a", 10)).unwrap();
     input_clock(&path);
     let scanner = E2ScanFixture::default();
     let source = SnapshotSource::Codex;
@@ -753,6 +800,7 @@ fn codex_case(legacy: bool) {
         append(&path, &codex_rows("turn-c", 40));
         input_clock(&path);
     }
+    let restart = disk.owner(source);
     save_inputs(&c);
     let (tail_index, tail, modes) = other_page(&c, &scanner, source, prior.clone());
     assert_eq!(modes, (0, 1, 0), "must reuse retained Codex reduction");
@@ -760,7 +808,6 @@ fn codex_case(legacy: bool) {
     assert_eq!(modes, (1, 0, 0));
     // Disk arm (#806): a new owner restores the last commit's record from
     // the real store and Tails, never flipping the counting choice.
-    let restart = disk.owner(source);
     let (disk_index, restored, modes) = other_page(&c, &restart, source, prior);
     assert_eq!(modes, (0, 1, 0), "must restore the Codex record, then Tail");
     assert_eq!(durable_restores(&restart.cache, source).1, 1);
@@ -782,6 +829,9 @@ fn codex_case(legacy: bool) {
     assert_eq!(d, a, "disk-restored envelope differs from the RAM arm");
     assert_eq!(Sha256::digest(&a), Sha256::digest(&b));
     assert_eq!(Sha256::digest(&d), Sha256::digest(&b));
+    // The existing cross-build exporter has a fixed receipt catalog. This
+    // additional same-build content fence proof emits no catalog entry.
+    if content { return; }
     receipt(
         name,
         &[ReceiptBody {
@@ -793,11 +843,22 @@ fn codex_case(legacy: bool) {
 }
 #[test]
 fn codex_v2_sticky() {
-    codex_case(false);
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    codex_case(false, false);
 }
 #[test]
 fn codex_legacy_acked_sticky() {
-    codex_case(true);
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    codex_case(true, false);
+}
+
+/// [money] Content-only Legacy/V2 replay preserves the emitted body and never
+/// adds the restored prefix twice; a cold Full is the independent body oracle.
+#[test]
+fn codex_content_only_caller_matches_cold_full() {
+    for legacy in [false, true] {
+        codex_case(legacy, true);
+    }
 }
 
 /// Disk-only lifecycle fixtures (#806). scripts/money_equivalence.py counts
@@ -843,12 +904,13 @@ fn grow(path: &Path, request: &str, tokens: u64) {
 /// Full's bodies. Each arm continues from its own finished index.
 #[test]
 fn restart_between_pages() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let name = "restart_between_pages";
     if !supported(name) {
         return;
     }
     with_e2(|| {
-        let (c, disk, path, scanner, prior) = disk_corpus(name);
+        let (c, mut disk, path, scanner, prior) = disk_corpus(name);
         let mut priors = [prior.clone(), prior.clone(), prior];
         let mut bodies = Vec::new();
         for (request, tokens) in [("r2", 20), ("r3", 30)] {
@@ -867,6 +929,7 @@ fn restart_between_pages() {
         }
         assert_ne!(bodies[0].raw, bodies[1].raw, "the second page adds money");
         disk_verified(name, &bodies, 2);
+        off_disk_no_record_body(name);
     });
 }
 
@@ -880,12 +943,13 @@ fn restart_between_pages() {
 /// buildable in one test binary.
 #[test]
 fn upgrade_without_semantic_revision() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let name = "upgrade_without_semantic_revision";
     if !supported(name) {
         return;
     }
     with_e2(|| {
-        let (c, disk, path, scanner, prior) = disk_corpus(name);
+        let (c, mut disk, path, scanner, prior) = disk_corpus(name);
         let written = disk.record_bytes();
         assert_eq!(written.len(), 1);
         disk.begin(&scanner, SnapshotSource::ClaudeCode);
@@ -915,6 +979,7 @@ fn upgrade_without_semantic_revision() {
             (0, 1, 0),
         );
         disk_verified(name, &[compare_claude_pages(&c, pages)], 1);
+        off_disk_no_record_body(name);
     });
 }
 
@@ -925,12 +990,13 @@ fn upgrade_without_semantic_revision() {
 /// reduction. Its own commit then restores again on the next restart.
 #[test]
 fn downgrade_then_reupgrade() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let name = "downgrade_then_reupgrade";
     if !supported(name) {
         return;
     }
     with_e2(|| {
-        let (c, disk, path, _, prior) = disk_corpus(name);
+        let (c, mut disk, path, _, prior) = disk_corpus(name);
         let downgraded = E2ScanFixture::default();
         grow(&path, "r2", 20);
         let mut down = c.raw(&downgraded, prior, 100, true, &[]);
@@ -974,6 +1040,7 @@ fn downgrade_then_reupgrade() {
         );
         let restored = compare_claude_pages(&c, pages);
         disk_verified(name, &[refused, restored], 1);
+        off_disk_no_record_body(name);
     });
 }
 
@@ -981,6 +1048,7 @@ fn downgrade_then_reupgrade() {
 // commits. Do not remove an ignore until its stated production feature exists.
 macro_rules! pending {
     ($name:ident, $reason:literal) => {
+        /// [money] codex admission branches preserve emitted totals.
         #[test]
         #[ignore = $reason]
         fn $name() {
@@ -1016,3 +1084,226 @@ pending!(
     pi,
     "E1 design D1: Pi explicitly remains Full-on-change; no retained Pi reduction on main"
 );
+
+/// [money] Admission branches omitted by the native-authority sticky fixture. Check
+/// real scanner output against explicit additive totals, without a frozen parser.
+#[test]
+fn codex_admission_branches_preserve_emitted_totals() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("codex_admission_branches") {
+        return;
+    }
+    let usage = |n: u64| json!({"input_tokens":n,"cached_input_tokens":0,
+        "output_tokens":0,"reasoning_output_tokens":0,"total_tokens":n});
+    let ui = |id: u64, last: Option<u64>, total: u64| {
+        let mut row = json!({"type":"event_msg","timestamp":"2026-10-27T07:00:02Z",
+            "fixture_line":id,"payload":{"type":"token_count","info":{
+                "model":"gpt-5.2","total_token_usage":usage(total)}}});
+        if let Some(last) = last {
+            row["payload"]["info"]["last_token_usage"] = usage(last);
+        }
+        row
+    };
+    let event = |kind: &str, turn: &str| json!({"type":"event_msg",
+        "timestamp":"2026-10-27T07:00:01Z","payload":{"type":kind,"turn_id":turn}});
+    let start = || event("task_started", "a");
+    let close = || event("task_complete", "a");
+    let mut fallback = ui(1, Some(1), 1);
+    fallback["payload"]["info"].as_object_mut().unwrap().remove("model");
+    let mut dropped = ui(1, Some(1), 1);
+    dropped["timestamp"] = json!("invalid");
+    let mut explicit = ui(1, Some(1), 1);
+    explicit["payload"]["info"]["last_token_usage"]["request_count"] = json!(3);
+    explicit["payload"]["info"]["total_token_usage"]["request_count"] = json!(3);
+    let mut overflow = vec![start()];
+    overflow.extend((1..=66).map(|i| {
+        let mut row = ui(i, Some(1), i);
+        row["payload"]["info"]["model"] = json!(format!("fixture-model-{i}"));
+        row
+    }));
+    overflow.push(close());
+    let repeated = ui(2, Some(1), 1);
+    for (name, legacy, lines, expected) in [
+        ("unbound", false, vec![fallback.clone(), repeated.clone(), repeated], 2),
+        ("base-reset-zero-repeat", false, vec![start(), ui(1,None,5), ui(2,None,7),
+            ui(3,None,2), ui(4,Some(0),2), ui(5,Some(1),3), ui(6,Some(1),3), close()], 3),
+        ("legacy-reset", true, vec![ui(1,None,5),ui(2,None,7),ui(3,None,2),
+            ui(4,Some(0),2),ui(5,Some(1),3),ui(5,Some(1),3)],10),
+        ("closure-mismatch", false, vec![start(),ui(1,Some(1),1),event("task_started","b"),
+            ui(2,Some(1),2),event("task_complete","other")],2),
+        ("dropped-staging", false, vec![start(),dropped,ui(2,Some(1),2),close()],1),
+        ("pending-overflow", false, overflow,66),
+        ("model-fallback", true, vec![fallback,ui(2,Some(1),2)],2),
+        ("explicit-request-count", false, vec![start(),explicit,close()],1),
+        ("invalid-closure", false, vec![close(),event("task_complete",""),
+            event("task_complete", &"x".repeat(129)), start(),ui(1,Some(1),1),
+            event("task_complete", ""),close()],1),
+    ] {
+        let c = corpus(&format!("codex-admission-{name}"));
+        let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
+            "payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}});
+        let prefix = header.to_string()+"\n";
+        let text = std::iter::once(header).chain(lines).map(|v| v.to_string()+"\n").collect::<String>();
+        let path = c.root.join("rollout.jsonl");
+        if name == "dropped-staging" {
+            // Lead B: main quarantines the whole entity, including its valid
+            // sibling usage. Exercise that policy after a genuine disk restore
+            // and Tail, as well as from RAM and a cold byte-zero read.
+            let source = SnapshotSource::Codex;
+            let _cutover = crate::snapshots::TestCutover::set(0);
+            let mut disk = Disk::new(&c);
+            let scanner = E2ScanFixture::default();
+            disk.begin(&scanner, source);
+            std::fs::write(&path, prefix + &codex_rows("seed", 1)).unwrap();
+            input_clock(&path);
+            let (mut prior, seed, modes) = other_page(&c, &scanner, source, ScanIndex::default());
+            assert_eq!(modes, (1, 0, 0));
+            assert!(!seed.snapshots.is_empty());
+            prior.record_accepted_snapshot_fingerprints(&seed.snapshots.iter()
+                .map(|s| s.snapshot_fingerprint.clone()).collect());
+            let prior = disk.commit(&scanner.cache, source, &mut prior);
+            append(&path, text.split_once('\n').unwrap().1);
+            input_clock(&path);
+            let restart = disk.owner(source);
+            let arms = [
+                other_page(&c, &scanner, source, prior.clone()),
+                other_page(&c, &E2ScanFixture::default(), source, prior.clone()),
+                other_page(&c, &restart, source, prior.clone()),
+            ];
+            assert_eq!(arms[0].2, (0, 1, 0));
+            assert_eq!(arms[1].2, (1, 0, 0));
+            assert_eq!(arms[2].2, (0, 1, 0));
+            assert_eq!(durable_restores(&restart.cache, source).1, 1);
+            for (index, scan, _) in &arms {
+                assert_eq!(scan.dropped_usage_record_count, 1);
+                assert_eq!(scan.recognized_usage_drop_count, 1);
+                assert!(scan.snapshots.is_empty(), "quarantine emits neither money nor a $0 body");
+                let key = prior.files.keys().next().unwrap();
+                assert!(index.files.get(key).map_or(true, |entry|
+                    entry.source_file_fingerprint.is_empty()
+                        || entry.size_bytes < std::fs::metadata(&path).unwrap().len()),
+                    "the lossy extent never settles");
+                // An ordinary next generation still discovers the held file
+                // and counts its dropped usage; no manual re-arm is needed.
+                let (_, retry, _) = other_page(&c, &E2ScanFixture::default(), source, index.clone());
+                assert!(retry.snapshots.is_empty());
+                assert_eq!(retry.dropped_usage_record_count, 1);
+            }
+            let emitted = |scan: &SourceScanResult| serde_json::to_vec(&scan.snapshots).unwrap();
+            assert_eq!(emitted(&arms[0].1), emitted(&arms[1].1));
+            assert_eq!(emitted(&arms[2].1), emitted(&arms[1].1));
+            continue;
+        }
+        std::fs::write(&path, text).unwrap();
+        input_clock(&path);
+        let _cutover = crate::snapshots::TestCutover::set(if legacy { i64::MAX } else { 0 });
+        let (_, scan, _) = other_page(&c, &E2ScanFixture::default(), SnapshotSource::Codex, ScanIndex::default());
+        assert_eq!(scan.snapshots.iter().map(|s| s.input_tokens).sum::<u64>(), expected, "{name}");
+        if name == "explicit-request-count" {
+            assert_eq!(scan.snapshots.iter().map(|s| s.request_count).sum::<u64>(), 3);
+        }
+        let wire = other_wire(SnapshotSource::Codex, &scan);
+        assert!(!wire.is_empty(), "{name}: emitted body must validate");
+    }
+}
+
+// Reuse the three disk lifecycles' physical corpus and real uploader. This
+// additional cold owner has the store OFF; its complete envelopes must equal
+// the same prior's ordinary no-record Full, with no restore attempt.
+fn off_disk_no_record_body(name: &str) {
+    let (c, disk, path, _warm, prior) = disk_corpus(&format!("{name}-off"));
+    grow(&path, "off-growth", 20);
+    let before = disk.record_bytes();
+    let _off = crate::snapshots::RestartRestoreForTest::disabled();
+    let owner = E2ScanFixture::default();
+    disk.begin(&owner, SnapshotSource::ClaudeCode);
+    let full = c.raw(&E2ScanFixture::default(), prior.clone(), 100, true, &[]);
+    let disk_page = c.raw(&owner, prior.clone(), 100, true, &[]);
+    assert_eq!(disk_page.modes, (1, 0, 0));
+    assert_eq!(durable_restores(&owner.cache, SnapshotSource::ClaudeCode).0, 0);
+    let tail = c.raw(&E2ScanFixture::default(), prior, 100, true, &[]);
+    let mut pages = [tail, full, disk_page];
+    finish_claude_pages(&c, &mut pages);
+    compare_claude_uploads(&pages);
+    disk.commit(&pages[2].cache, SnapshotSource::ClaudeCode, &mut pages[2].index.clone());
+    assert_eq!(disk.record_bytes(), before, "OFF never refreshes restore records");
+}
+
+/// [money] Rename-before-ACK restart reconstructs exactly the cold complete body.
+#[test]
+fn native_successor_rename_before_ack_cold_reopen_preserves_money() {
+    successor_cold_reopen(None);
+}
+
+/// [money] Refused/not-stored successor remains unacknowledged across cold reopen.
+#[test]
+fn refused_or_not_stored_successor_cold_reopen_preserves_money() {
+    for disposition in ["refused", "not_stored"] {
+        successor_cold_reopen(Some(disposition));
+    }
+}
+
+fn successor_cold_reopen(disposition: Option<&str>) {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("successor-cold-reopen") { return; }
+    with_e2(|| {
+        let (c, mut disk, path, warm, prior) = disk_corpus(
+            &format!("successor-cold-reopen-{}", disposition.unwrap_or("before-ack")));
+        let progress_path = disk.dir.join("upload-progress.json");
+        let mut progress = e2_progress();
+        let mut accepted = c.raw(&E2ScanFixture::default(), ScanIndex::default(), 100, true, &[]);
+        accepted.enrich(&c);
+        accepted.finish();
+        assert_eq!(upload(&accepted.scan.snapshots, &mut progress, ack).0.unwrap(), ResumableUploadResult::Completed);
+        progress.save(&progress_path).unwrap(); // Existing receipts precede successor rename.
+        let accepted_fingerprints = progress.accepted_fingerprints.clone();
+        grow(&path, "next", 20);
+        let mut successor = c.raw(&warm, prior.clone(), 100, true, &[]);
+        successor.enrich(&c);
+        successor.finish();
+        let fulls = successor.modes.0;
+        if let Some(disposition) = disposition {
+            let _result = upload(&successor.scan.snapshots, &mut progress, |batch| {
+                let mut response = ack(batch)?;
+                if disposition == "not_stored" {
+                    response.unchanged_entities = std::mem::take(&mut response.accepted_entities);
+                    for entity in &mut response.unchanged_entities {
+                        entity.unchanged_basis = Some("usage_identical".into());
+                    }
+                } else {
+                    response.rejected_entities = std::mem::take(&mut response.accepted_entities).into_iter()
+                        .map(|entity| crate::snapshot_client::SnapshotEntityRejection {
+                            source_session_id: entity.source_session_id,
+                            snapshot_fingerprint: entity.snapshot_fingerprint,
+                            occurrence_count: entity.occurrence_count,
+                            reason: "usage_accounting_authority_downgrade".into(),
+                            detail: "synthetic refusal".into(), permanent: true,
+                        }).collect();
+                    response.accepted = 0;
+                    response.sessions_reconciled = 0;
+                }
+                Ok(response)
+            });
+            progress.save(&progress_path).unwrap();
+        }
+        // Lose acquisition memory without saving its new index or ACK. Keep
+        // the real renamed record, original index and durable upload progress.
+        drop(successor);
+        drop(warm);
+        let reloaded = SnapshotUploadProgress::load(&progress_path, &format!("{:064x}",99),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode)).unwrap();
+        assert_eq!(reloaded.accepted_fingerprints, accepted_fingerprints);
+        let reopened = disk.owner(SnapshotSource::ClaudeCode);
+        let mut actual = c.raw(&reopened, prior.clone(), 100, true, &[]);
+        let mut cold = c.raw(&E2ScanFixture::default(), prior, 100, true, &[]);
+        actual.enrich(&c); actual.finish();
+        cold.enrich(&c); cold.finish();
+        assert!(fulls + actual.modes.0 <= 1);
+        assert!(!actual.scan.snapshots.is_empty());
+        let (a, actual_wire, _) = upload(&actual.scan.snapshots, &mut e2_progress(), ack);
+        let (b, cold_wire, _) = upload(&cold.scan.snapshots, &mut e2_progress(), ack);
+        assert_eq!(a.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(b.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(actual_wire, cold_wire, "complete money and identity bodies survive cold reopen");
+    });
+}

@@ -923,42 +923,44 @@ fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
 #[serial(client_report)]
 #[serial(source_upload_deadlines)]
 fn sync_cycle_with_recovered_shed_leaves_sweep_settled() {
-    if !crate::heap_layout_bound::layout_supported() {
-        writeln!(
-            std::io::stderr().lock(),
-            "inplace_retry_sync_cycle: supported_positive=UNEXECUTED layout_supported=false"
-        )
-        .unwrap();
-        return;
-    }
-    clear_source_upload_deadlines_for_test();
-    let clean = inplace_retry_claude_cycle(false);
-    assert!(!clean.batch_posts.is_empty());
-    assert!(clean.waits.is_empty());
-    assert_eq!(clean.accepted, clean.offered);
+    run_on_scan_worker_stack(|| {
+        if !crate::heap_layout_bound::layout_supported() {
+            writeln!(
+                std::io::stderr().lock(),
+                "inplace_retry_sync_cycle: supported_positive=UNEXECUTED layout_supported=false"
+            )
+            .unwrap();
+            return;
+        }
+        clear_source_upload_deadlines_for_test();
+        let clean = inplace_retry_claude_cycle(false);
+        assert!(!clean.batch_posts.is_empty());
+        assert!(clean.waits.is_empty());
+        assert_eq!(clean.accepted, clean.offered);
 
-    let recovered = inplace_retry_claude_cycle(true);
-    clear_source_upload_deadlines_for_test();
+        let recovered = inplace_retry_claude_cycle(true);
+        clear_source_upload_deadlines_for_test();
 
-    assert_eq!(
-        recovered.batch_posts.len(),
-        clean.batch_posts.len() + 1,
-        "exactly one in-place resend"
-    );
-    assert_eq!(
-        recovered.batch_posts[0], recovered.batch_posts[1],
-        "the resend is the shed page"
-    );
-    assert_eq!(recovered.waits.len(), 1);
-    assert_eq!(
-        recovered.accepted, recovered.offered,
-        "every offered body is ACKed after the resend"
-    );
-    assert!(
-        !recovered.sweep_unsettled,
-        "a recovered page never marks the bounded sweep unsettled"
-    );
-    assert_eq!(recovered.sweep_unsettled, clean.sweep_unsettled);
-    assert_eq!(recovered.finished_ok, clean.finished_ok);
-    assert_eq!(recovered.last_error_code, clean.last_error_code);
+        assert_eq!(
+            recovered.batch_posts.len(),
+            clean.batch_posts.len() + 1,
+            "exactly one in-place resend"
+        );
+        assert_eq!(
+            recovered.batch_posts[0], recovered.batch_posts[1],
+            "the resend is the shed page"
+        );
+        assert_eq!(recovered.waits.len(), 1);
+        assert_eq!(
+            recovered.accepted, recovered.offered,
+            "every offered body is ACKed after the resend"
+        );
+        assert!(
+            !recovered.sweep_unsettled,
+            "a recovered page never marks the bounded sweep unsettled"
+        );
+        assert_eq!(recovered.sweep_unsettled, clean.sweep_unsettled);
+        assert_eq!(recovered.finished_ok, clean.finished_ok);
+        assert_eq!(recovered.last_error_code, clean.last_error_code);
+    });
 }

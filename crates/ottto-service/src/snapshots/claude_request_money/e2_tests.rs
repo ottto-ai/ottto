@@ -1279,6 +1279,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             index_key: &local_index_key(&off_page_path),
             source_file_fingerprint: &"a".repeat(64),
             census_window_end: "2026-08-02T09:00:00Z",
+            held_index_keys: &Default::default(),
             complete: true,
             lossy: false,
             source_verified: true,

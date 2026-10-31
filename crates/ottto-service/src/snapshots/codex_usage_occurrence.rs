@@ -58,7 +58,6 @@ impl CodexCounting {
         self.cutover_unix_ms
     }
 
-    #[cfg(test)]
     pub(super) fn durable_contract(&self) -> (Option<i64>, u8, u8) {
         (
             self.cutover_unix_ms,
@@ -81,6 +80,15 @@ impl CodexCounting {
             cutover_unix_ms,
             version: None,
             reducer: None,
+        }
+    }
+
+    pub(super) fn content_scratch(&self) -> Self {
+        Self {
+            evidence: self.evidence,
+            cutover_unix_ms: self.cutover_unix_ms,
+            version: self.version,
+            reducer: (self.version == Some(CountingVersion::V2)).then(Box::default),
         }
     }
 
@@ -624,6 +632,16 @@ impl SnapshotAccumulator {
         timestamp: Option<&str>,
         selector: &SelectorCapture,
     ) {
+        self.observe_codex_turn_lifecycle(value, true);
+        if !self.codex_counting_v2() {
+            return;
+        }
+        if string_eq_at(value, &["type"], "token_usage_record") {
+            self.admit_codex_native(value, timestamp, selector);
+        }
+    }
+
+    fn observe_codex_turn_lifecycle(&mut self, value: &Value, publish: bool) {
         let Some(counting) = self.codex_counting.as_mut() else {
             return;
         };
@@ -642,7 +660,11 @@ impl SnapshotAccumulator {
         let event = string_at(value, &["payload", "type"]);
         match event.as_deref() {
             Some("task_started") => {
-                self.close_codex_turn(None);
+                if let Some(pending) = self.close_codex_turn_content(None) {
+                    if publish {
+                        self.publish_codex_pending(&pending);
+                    }
+                }
                 let turn_id = string_at(value, &["payload", "turn_id"])
                     .filter(|id| !id.is_empty() && id.len() <= MAX_TURN_ID_BYTES);
                 if let Some(reducer) = self.codex_occurrence() {
@@ -669,28 +691,40 @@ impl SnapshotAccumulator {
             }
             Some("task_complete" | "turn_aborted") => {
                 let closing = string_at(value, &["payload", "turn_id"]);
-                self.close_codex_turn(closing.as_deref());
+                if let Some(pending) = self.close_codex_turn_content(closing.as_deref()) {
+                    if publish {
+                        self.publish_codex_pending(&pending);
+                    }
+                }
             }
             _ => {}
         }
+    }
+
+    pub(super) fn observe_codex_content_counting(&mut self, value: &Value) {
+        self.observe_codex_turn_lifecycle(value, false);
+        if !self.codex_counting_v2() {
+            return;
+        }
         if string_eq_at(value, &["type"], "token_usage_record") {
-            self.admit_codex_native(value, timestamp, selector);
+            let _ = self.note_codex_native_authority(value);
         }
     }
 
     /// Closure publishes a UI-only turn's staged rows. A later native for the
     /// closed turn adds nothing, which is exactly the Legacy outcome. Every
     /// explicit closure is final, including one whose start was never bound.
-    fn close_codex_turn(&mut self, closing_turn_id: Option<&str>) {
-        let Some(reducer) = self.codex_occurrence() else {
-            return;
-        };
+    fn close_codex_turn_content(
+        &mut self,
+        closing_turn_id: Option<&str>,
+    ) -> Option<OwnedMap<(String, RowKey), PendingRow>> {
+        let reducer = self.codex_occurrence()?;
         let closing = closing_turn_id.filter(|id| !id.is_empty() && id.len() <= MAX_TURN_ID_BYTES);
         let Some(turn) = reducer.turn.take() else {
             if let Some(closing) = closing {
                 reducer.remember_closed(closing.to_owned());
             }
-            return;
+            return None;
         };
         if closing_turn_id.is_some_and(|closing| closing != turn.id) {
             reducer.counters.turn_closure_mismatch += 1;
@@ -706,9 +740,7 @@ impl SnapshotAccumulator {
             ..
         } = turn;
         reducer.remember_closed(id);
-        if !native && !ui_published {
-            self.publish_codex_pending(&pending);
-        }
+        (!native && !ui_published).then_some(pending)
     }
 
     fn admit_codex_native(
@@ -717,13 +749,63 @@ impl SnapshotAccumulator {
         timestamp: Option<&str>,
         selector: &SelectorCapture,
     ) {
-        let native = native_record(value, self.source_session_id.as_deref());
-        let Some(reducer) = self.codex_occurrence() else {
+        let Some((native, money)) = self.note_codex_native_authority(value) else {
             return;
         };
+        let mut usage_selector = selector.clone();
+        if self.current_turn_is_priority() {
+            usage_selector.insert(
+                "service_tier",
+                "priority".to_string(),
+                "derived_from_logs_2",
+            );
+        }
+        let model = string_at(value, &["payload", "model"]);
+        let applied_tier = self.codex_tier_replay.as_mut().and_then(|replay| {
+            replay.selector(
+                value,
+                &mut usage_selector,
+                &self.current_selector,
+                model.as_deref().or(self.latest_model.as_deref()),
+                self.latest_reasoning_effort.as_deref(),
+                self.latest_turn_id.as_deref(),
+            )
+        });
+        // Match the UI price stamp after tier replay, on this row only. Codex
+        // input already includes cached input; price the original request's
+        // prompt, even when coverage admits only part of its usage.
+        if !usage_selector.context.contains_key("context_bucket") {
+            if let Some(bucket) = model
+                .as_deref()
+                .or(self.latest_model.as_deref())
+                .and_then(|model| provider_context_bucket(model, native.usage[0], timestamp))
+            {
+                usage_selector.insert(
+                    "context_bucket",
+                    bucket.to_string(),
+                    "derived_from_native_usage",
+                );
+            }
+        }
+        let effort = self.latest_reasoning_effort.clone();
+        self.add_usage_with_selector(
+            model,
+            native_money(&money),
+            usage_selector,
+            timestamp,
+            effort,
+        );
+        if let Some(replay) = self.codex_tier_replay.as_mut() {
+            replay.admitted(applied_tier);
+        }
+    }
+
+    fn note_codex_native_authority(&mut self, value: &Value) -> Option<(NativeRecord, T6)> {
+        let native = native_record(value, self.source_session_id.as_deref());
+        let reducer = self.codex_occurrence()?;
         let Some(native) = native else {
             reducer.counters.native_not_authority += 1;
-            return;
+            return None;
         };
         let mut money = reducer.cover(&native);
         let bound = reducer
@@ -778,55 +860,10 @@ impl SnapshotAccumulator {
             }
         }
         if money[..5].iter().all(|value| *value == 0) {
-            return;
+            return None;
         }
         reducer.counters.native_counted += 1;
-        let mut usage_selector = selector.clone();
-        if self.current_turn_is_priority() {
-            usage_selector.insert(
-                "service_tier",
-                "priority".to_string(),
-                "derived_from_logs_2",
-            );
-        }
-        let model = string_at(value, &["payload", "model"]);
-        let applied_tier = self.codex_tier_replay.as_mut().and_then(|replay| {
-            replay.selector(
-                value,
-                &mut usage_selector,
-                &self.current_selector,
-                model.as_deref().or(self.latest_model.as_deref()),
-                self.latest_reasoning_effort.as_deref(),
-                self.latest_turn_id.as_deref(),
-            )
-        });
-        // Match the UI price stamp after tier replay, on this row only. Codex
-        // input already includes cached input; price the original request's
-        // prompt, even when coverage admits only part of its usage.
-        if !usage_selector.context.contains_key("context_bucket") {
-            if let Some(bucket) = model
-                .as_deref()
-                .or(self.latest_model.as_deref())
-                .and_then(|model| provider_context_bucket(model, native.usage[0], timestamp))
-            {
-                usage_selector.insert(
-                    "context_bucket",
-                    bucket.to_string(),
-                    "derived_from_native_usage",
-                );
-            }
-        }
-        let effort = self.latest_reasoning_effort.clone();
-        self.add_usage_with_selector(
-            model,
-            native_money(&money),
-            usage_selector,
-            timestamp,
-            effort,
-        );
-        if let Some(replay) = self.codex_tier_replay.as_mut() {
-            replay.admitted(applied_tier);
-        }
+        Some((native, money))
     }
 
     /// V2 counterpart of the shared UI path. Returns the occurrence-admitted
@@ -844,6 +881,73 @@ impl SnapshotAccumulator {
         implicit_request_count: Option<u64>,
         effort: Option<String>,
     ) -> Option<UsageTotals> {
+        let (resolved_model, delta, bound) = self.decide_codex_usage(
+            model,
+            usage,
+            last_usage,
+            usage_event_identity,
+            implicit_request_count,
+        )?;
+        if !bound {
+            self.add_usage_with_selector(
+                Some(resolved_model),
+                delta.clone(),
+                selector,
+                timestamp,
+                effort,
+            );
+            return Some(delta);
+        }
+        let reducer = self.codex_occurrence()?;
+        let turn = reducer.turn.as_mut()?;
+        if turn.native {
+            reducer.counters.ui_in_native_turn_not_counted += 1;
+            add_t6(
+                &mut reducer.counters.ui_in_native_turn_not_counted_usage,
+                &totals_t6(&delta),
+            );
+            return Some(delta);
+        }
+        if !turn.ui_published {
+            match self.stage_codex_ui(
+                &resolved_model,
+                &delta,
+                selector.clone(),
+                timestamp,
+                effort.as_deref(),
+            ) {
+                Staging::Staged | Staging::Dropped => return Some(delta),
+                Staging::Overflow => {
+                    let reducer = self.codex_occurrence()?;
+                    reducer.counters.pending_overflow_flushes += 1;
+                    let turn = reducer.turn.as_mut()?;
+                    turn.ui_published = true;
+                    turn.staged_events = 0;
+                    let pending = std::mem::replace(&mut turn.pending, OwnedMap::new());
+                    self.publish_codex_pending(&pending);
+                }
+            }
+        }
+        self.add_usage_with_selector(
+            Some(resolved_model),
+            delta.clone(),
+            selector,
+            timestamp,
+            effort,
+        );
+        Some(delta)
+    }
+
+    /// Shared admission decision, with no publication/staging. `false` is
+    /// the unbound span admitted before the bound equal-total repeat filter.
+    pub(super) fn decide_codex_usage(
+        &mut self,
+        model: Option<String>,
+        usage: UsageTotals,
+        last_usage: Option<UsageTotals>,
+        usage_event_identity: Option<String>,
+        implicit_request_count: Option<u64>,
+    ) -> Option<(String, UsageTotals, bool)> {
         let resolved_model = model
             .or_else(|| self.latest_model.clone())
             .unwrap_or_else(|| "unknown".to_string());
@@ -903,14 +1007,7 @@ impl SnapshotAccumulator {
         if reducer.turn.is_none() {
             reducer.counters.ui_in_unbound_span += 1;
             reducer.note_ui(tuple);
-            self.add_usage_with_selector(
-                Some(resolved_model),
-                legacy_delta.clone(),
-                selector,
-                timestamp,
-                effort,
-            );
-            return Some(legacy_delta);
+            return Some((resolved_model, legacy_delta, false));
         }
         // Rule 2: same `last` and same total as the previous UI candidate with
         // no native between is a re-emission. A decreased total never matches.
@@ -931,43 +1028,7 @@ impl SnapshotAccumulator {
             );
             return None;
         };
-        let turn = reducer.turn.as_mut()?;
-        if turn.native {
-            reducer.counters.ui_in_native_turn_not_counted += 1;
-            add_t6(
-                &mut reducer.counters.ui_in_native_turn_not_counted_usage,
-                &totals_t6(&delta),
-            );
-            return Some(delta);
-        }
-        if !turn.ui_published {
-            match self.stage_codex_ui(
-                &resolved_model,
-                &delta,
-                selector.clone(),
-                timestamp,
-                effort.as_deref(),
-            ) {
-                Staging::Staged | Staging::Dropped => return Some(delta),
-                Staging::Overflow => {
-                    let reducer = self.codex_occurrence()?;
-                    reducer.counters.pending_overflow_flushes += 1;
-                    let turn = reducer.turn.as_mut()?;
-                    turn.ui_published = true;
-                    turn.staged_events = 0;
-                    let pending = std::mem::replace(&mut turn.pending, OwnedMap::new());
-                    self.publish_codex_pending(&pending);
-                }
-            }
-        }
-        self.add_usage_with_selector(
-            Some(resolved_model),
-            delta.clone(),
-            selector,
-            timestamp,
-            effort,
-        );
-        Some(delta)
+        Some((resolved_model, delta, true))
     }
 
     /// Resolves the row exactly as publication would at this record, without
@@ -1129,7 +1190,6 @@ fn pending_row_content_bytes(
 
 /// Heap charge of the fixed reducer state at its id caps: the boxed reducer,
 /// two response ids, the open turn id, the closed-turn ring and the filter.
-#[cfg(test)]
 pub(super) const fn max_fixed_heap_bytes() -> usize {
     std::mem::size_of::<OccurrenceReducer>()
         + std::mem::align_of::<OccurrenceReducer>()
@@ -1246,3 +1306,55 @@ crate::durable_tail_codec::durable_struct!(OccurrenceCounters {
     N closed_filter_hit_unconfirmed_native_usage: T6,
     N pending_overflow_flushes: u64,
 });
+
+#[cfg(test)]
+mod content_decision_tests {
+    use super::*;
+    /// [money] unbound equal totals precede bound repeat filter and physical duplicates.
+    #[test]
+    fn unbound_equal_totals_precede_bound_repeat_filter_and_physical_duplicates() {
+        for bound in [false, true] {
+            let mut acc = SnapshotAccumulator::new(SnapshotSource::Codex);
+            let mut counting = CodexCounting::new(AckEvidence::None, None);
+            counting.version = Some(CountingVersion::V2);
+            counting.reducer = Some(Box::default());
+            acc.codex_counting = Some(Box::new(counting));
+            if bound {
+                acc.observe_codex_content_counting(
+                    &serde_json::json!({"payload":{"type":"task_started","turn_id":"t"}}),
+                );
+            }
+            let usage = UsageTotals {
+                input_tokens: 10,
+                output_tokens: 2,
+                request_count: 1,
+                ..Default::default()
+            };
+            for (identity, admitted) in [("a", true), ("b", !bound), ("b", false)] {
+                acc.codex_occurrence().unwrap().line_ui =
+                    Some(([10, 0, 0, 2, 0, 12], [10, 0, 0, 2, 0, 12]));
+                assert_eq!(
+                    acc.decide_codex_usage(
+                        None,
+                        usage.clone(),
+                        Some(usage.clone()),
+                        Some(identity.into()),
+                        Some(1)
+                    )
+                    .is_some(),
+                    admitted
+                );
+            }
+            assert!(
+                acc.usage_buckets.is_empty(),
+                "scratch decisions cannot publish or stage money"
+            );
+            assert!(acc
+                .codex_occurrence()
+                .unwrap()
+                .turn
+                .as_ref()
+                .is_none_or(|turn| turn.pending.is_empty()));
+        }
+    }
+}

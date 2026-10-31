@@ -57,6 +57,7 @@ impl E2ScanFixture {
             false,
             &scope,
             capture,
+            true,
         );
     }
 

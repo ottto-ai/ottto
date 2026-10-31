@@ -641,6 +641,7 @@ fn recovery_emission_boundaries(
     scan.snapshots = items;
     scan.census_complete = true;
     scan.pending_finalization.push(PendingIndexFinalization {
+        restored_behind_accepted: false,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: "synthetic-file".into(),
@@ -912,3 +913,7 @@ fn estimate_index_reader_refuses_unpublished_init_without_removing_files() {
     assert!(fixture.shards.is_dir());
     assert!(!fixture.root.exists());
 }
+
+// F10: count surviving complete offers at the real post-policy finalizer.
+// Parser completion and an equal body suppressed as a semantic noop are not
+// publication. This runs portably; production Pi registration remains E5's.

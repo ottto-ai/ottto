@@ -579,9 +579,9 @@ impl RearmFixture {
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index)
         };
         assert!(
-            comparison_completion
-                .as_ref()
-                .is_none_or(|completion| { !completion.ordinary_terminal_retained_for_test() }),
+            comparison_completion.as_ref().map_or(true, |completion| {
+                !completion.ordinary_terminal_retained_for_test()
+            }),
             "ordinary terminal graph is retired by the actual evidence/fold stage before upload"
         );
         let comparison_after_fold = comparison_requested(&comparison_completion);
@@ -690,7 +690,7 @@ impl RearmFixture {
             snapshot_upload_body_witness,
             |items| {
                 offered.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
-                actual_upload = if target.is_none_or(|session| {
+                actual_upload = if target.map_or(true, |session| {
                     items.iter().any(|item| item.source_session_id == session)
                 }) {
                     upload
@@ -1358,6 +1358,7 @@ fn p12_novel_import_experiment_base_exit_reveals_unmet_original_prelude() {
 #[test]
 #[ignore = "UNMET historical strict-fence aspiration; superseded by explicit native_comparison_novel_import_base_parity"]
 fn native_comparison_original_novel_import_oracle() {
+    run_on_scan_worker_stack(|| {
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_original_novel_import: supported_positive=UNEXECUTED original_body_ran=false original_passed=false").unwrap();
         return;
@@ -1367,6 +1368,7 @@ fn native_comparison_original_novel_import_oracle() {
     // Its own serial guard owns source_manifests; no nested serial lock here.
     novel_import_recovers_after_owner_coverage_then_stops_reading();
     writeln!(std::io::stderr().lock(), "native_comparison_original_novel_import: original_body_ran=true original_passed=true page_files=2 actual_SourcePreparation=true actual_existing_frame_budget=true exact_body_ACK_validator=true").unwrap();
+    });
 }
 
 fn native_comparison_interrupted_correction_is_terminal_base(upload: RearmUpload) {
@@ -1452,17 +1454,21 @@ fn native_comparison_interrupted_correction_is_terminal_base(upload: RearmUpload
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
 fn native_comparison_shed_corrective_parse_partial_save_and_terminal_use_base() {
+    run_on_scan_worker_stack(|| {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_interrupted_correction_is_terminal_base(RearmUpload::Shed);
+    });
 }
 
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_pending_ack_corrective_parse_partial_save_and_terminal_use_base() {
+    run_on_scan_worker_stack(|| {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_interrupted_correction_is_terminal_base(RearmUpload::AckLost);
+    });
 }
 
 // Separate naturally bootstrapped selected histories, sharing the SAME immutable
@@ -1561,6 +1567,7 @@ fn native_comparison_assert_old_bindings(before: &serde_json::Value, index: &Sca
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_novel_import_base_parity() {
+    run_on_scan_worker_stack(|| {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
@@ -1693,11 +1700,13 @@ fn native_comparison_novel_import_base_parity() {
         native_comparison_assert_old_bindings(&base_before, index);
     }
     writeln!(std::io::stderr().lock(),"native_comparison_novel_parity: parity_body_ran=true exact_same_physical_revisions=true independent_natural_bootstrap=true exact_offered_ACKed_bytes_head_collector_evidence_tags=true empty_tag_fixture=true old_A_selected_bodies_bindings_names_unchanged=true settled_coverage_false=true no_S_pending_owner_or_tag_evidence=true quiet_base3_candidate0=true import_reads_base4_candidate1=true later_quiet0=true historical_strict_fence_oracle=UNMET_SUPERSEDED installed_savings_proved=false").unwrap();
+    });
 }
 
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
+    run_on_scan_worker_stack(|| {
     if !crate::heap_layout_bound::layout_supported() {
         eprintln!("native_comparison_deferred_no_target: supported_positive=UNEXECUTED");
         return;
@@ -1764,11 +1773,13 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
         Some(1)
     );
     eprintln!("native_comparison_deferred_no_target: actual_SourcePreparation=true enough_target_capacity=true native_files=1 target_finish_calls=0 no_offer_or_checkpoint=true new_local_debt_visible=true abandoned_before_save_BASE=true");
+    });
 }
 
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
+    run_on_scan_worker_stack(|| {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use sha2::{Digest, Sha256};
@@ -1922,9 +1933,13 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     );
     assert!(quiet.iter().all(|page| page.offered.is_empty()));
     writeln!(std::io::stderr().lock(),"native_comparison_real_copy_hit: hit_body_ran=true quiet0_before_hit=true deliberate_policy_defer=true eligible_family3_page_cap4=true copy_withheld_until_samewindow_native=true selected_restore_debt3=true copy_not_fake_empty=true exact_pair_saved=true no_positive_copied_posture_or_tags=true bounded_copy_liveness=true").unwrap();
+    });
 }
 
+#[inline(never)]
 fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool) {
+    run_on_scan_worker_stack(move || {
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} supported_positive=UNEXECUTED").unwrap();
         return;
@@ -2097,6 +2112,7 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
         "partial selected debt/restart must recover within ordinary bounded generations"
     );
     writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} body_ran=true N_defer_Nplus1_BASE_offer=true restart_between_N_Nplus1_checked={restart} exact_BASE_owner_outcome_checked={restart} actual_copy_offer=true actual_terminal_native_fold=true partial_CAS_save=true unACKed_copy_not_committed=true prior_bindings_preserved=true no_borrowed_posture=true eventual_exact_ACK=true").unwrap();
+    });
 }
 
 #[test]
@@ -2135,6 +2151,7 @@ fn native_comparison_copy_offer_ack_loss_restart_recovers() {
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
+    run_on_scan_worker_stack(|| {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use sha2::{Digest, Sha256};
@@ -2231,6 +2248,7 @@ fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
         "exact own C5 head, bytes, identity basis and per-request tags equal base"
     );
     writeln!(std::io::stderr().lock(), "native_comparison_own_C5: body_ran=true actual_hint_capture_and_emission=true own_telemetry_tags_positive=true base_exact_bytes_equal=true no_borrowed_identity=true transcript_settled_false=true exact_wire_ACK_save=true").unwrap();
+    });
 }
 
 /// One representative matched-source usefulness run. Padding is ignored
@@ -2239,6 +2257,7 @@ fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_deferred_policy_resource_usefulness() {
+    run_on_scan_worker_stack(|| {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
@@ -2567,4 +2586,5 @@ fn native_comparison_deferred_policy_resource_usefulness() {
     );
 
     eprintln!("native_comparison_deferred_usefulness: quiet_base_reads={base_quiet_reads} quiet_candidate_reads={candidate_quiet_reads} quiet_base_logical_native_bytes={base_quiet_bytes} quiet_candidate_logical_native_bytes={candidate_quiet_bytes} base_total_reads={base_total_reads} candidate_total_reads={candidate_total_reads} base_copy_reads_including_followup={base_copy_reads_all} candidate_copy_reads_including_followup={candidate_copy_reads_all} deferrals={deferrals} max_consecutive_deferrals={max_consecutive} base_copy_parses={base_copy_parses} candidate_copy_parses={candidate_copy_parses} hit_extra_logical_bytes={hit_extra_bytes} net_logical_bytes_saved={} full_2000family_admission=UNPROVED installed_RSS_savings=UNPROVED", saved_bytes - hit_extra_bytes);
+    });
 }

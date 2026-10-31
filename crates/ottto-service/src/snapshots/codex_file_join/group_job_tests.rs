@@ -1632,6 +1632,8 @@ fn group_with_legacy_tee_is_byte_charged() {
     )
     .unwrap();
     let sampling = active.sampling.replace(sampled_scan::Active {
+        restored_behind_accepted: false,
+        no_record: false,
         key: String::new(),
         scope: Scope("group-fixture".into()),
         mode: crate::transcript_acquisition::ReadMode::Tail,
@@ -2911,6 +2913,10 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
 #[cfg(unix)]
 #[test]
 fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store::{self as store, SingleWriter};
     use std::io::Read;
     let (root, _) = fixture();
@@ -2959,7 +2965,9 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
     disk.write_after_save(
         &writer,
         1,
+        0,
         vec![store::PendingRecord {
+            acquisition: None,
             binding: store::Binding {
                 source: store::DurableSource::Codex,
                 key: digest,
@@ -2986,7 +2994,7 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
     let cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(source, &index_path, &scope, false);
     assert_eq!(
-        cache.durable_full_hold(source, &key, true),
+        cache.durable_full_hold(source, &key, true).unwrap(),
         None,
         "initial group rebuild attempt"
     );
@@ -3014,7 +3022,8 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
     let (index, result) = next_generation(&root, index, &cache, 1);
     assert!(
         result.census_complete,
-        "a known_corrupt group must not make source census red"
+        "a known_corrupt group must not make source census red: {result:?}; {:?}",
+        cache.durable_counters(source)
     );
     assert_eq!(result.unreadable_path_count, 0);
     assert_eq!(index.files[&key].last_snapshot_fingerprint, accepted);
@@ -3027,7 +3036,7 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
         .iter()
         .any(|item| item.source_session_id == peer_owner));
     let (counts, stats) = cache.durable_counters(source).unwrap();
-    assert_eq!(counts.durable_held, [0; 5]);
+    assert_eq!(counts.durable_held, [0; 9]);
     assert_eq!(counts.not_persisted.get("known_corrupt_held"), Some(&1));
     assert_eq!(stats.t14_rebuild_full_started, 1);
     assert_eq!(fs::read(&record).unwrap(), corrupt);
@@ -3040,10 +3049,13 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
 #[cfg(unix)]
 #[test]
 fn durable_hold_on_one_member_holds_the_joined_group() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
     let mut scanned = Vec::new();
-    for held in [false, true] {
+    for refused_members in 0..=2 {
+        let held = refused_members > 0;
         let (root, _) = fixture();
+        let _writer = crate::locked_state_dir::test_locks::hold(&root);
         let cache = Arc::new(SharedCache::default());
         let index_path = root.join("index.json");
         let namespace = Scope("group-fixture".into());
@@ -3057,34 +3069,48 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
         let record = dir.join(format!("{hex}.rec"));
         let bytes = [
             b"ottto-dt".as_slice(),
-            &(crate::durable_tail_store::FORMAT_VERSION + 1).to_le_bytes(),
+            &(crate::durable_tail_store::FORMAT_V3 + 1).to_le_bytes(),
             &[7_u8; 64],
         ]
         .concat();
         if held {
             fs::create_dir_all(&dir).unwrap();
             fs::write(&record, &bytes).unwrap();
+            if refused_members == 2 {
+                let peer = store::key_digest(
+                    store::DurableSource::Codex,
+                    &local_index_key(&root.join("sessions/b.jsonl")),
+                );
+                let peer = peer.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                fs::write(dir.join(format!("{peer}.rec")), &bytes).unwrap();
+            }
         }
         let (_, result) = sampled(&root, ScanIndex::default(), 10, &cache);
         let (durable, _) = cache.durable_counters(SnapshotSource::Codex).unwrap();
+        assert_eq!(durable.durable_held[6], 0, "no pending receipt");
         if held {
             assert!(result.snapshots.is_empty(), "held group emits nothing");
             assert_eq!(fs::read(&record).unwrap(), bytes);
-            assert!(durable.durable_held[store::Refusal::NewerFormat as usize] >= 1);
+            assert_eq!(
+                durable.durable_held[store::Refusal::NewerFormat as usize],
+                refused_members,
+                "C9: every refused group member counted, not only the first"
+            );
         } else {
-            assert_eq!(durable.durable_held, [0; 5]);
+            assert_eq!(durable.durable_held, [0; 9]);
         }
         scanned.push(result.scanned_file_count);
         fs::remove_dir_all(root).unwrap();
     }
     assert!(
-        scanned[1] + 2 <= scanned[0],
+        scanned[1] + 2 <= scanned[0] && scanned[2] + 2 <= scanned[0],
         "control acquires both members; the held group acquires neither: {scanned:?}"
     );
 }
 
 #[test]
 fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use codex_zst_refusal_tests::assert_refused;
     let (root, inventory) = fixture();
     let index = ScanIndex::default();
@@ -3227,6 +3253,7 @@ fn seed_member_debts<W: crate::durable_tail_store::SingleWriter>(
             .collect::<String>();
         seeded.push((path, dir.join(format!("{hex}.rec"))));
         pending.push(store::PendingRecord {
+            acquisition: None,
             binding: store::Binding {
                 source: ds,
                 key: digest,
@@ -3240,7 +3267,10 @@ fn seed_member_debts<W: crate::durable_tail_store::SingleWriter>(
         });
     }
     let mut disk = store::DurableTailStore::new(dir, ds);
-    let written = disk.write_after_save(writer, 1, pending).unwrap().written;
+    let written = disk
+        .write_after_save(writer, 1, 0, pending)
+        .unwrap()
+        .written;
     assert_eq!(written, debts.len());
     seeded
 }
@@ -3276,6 +3306,7 @@ fn group_pass(
 /// job-start capture and the one settlement; both are exercised.
 #[cfg(unix)]
 fn grouped_missing_carriers_mark_each_member_until_verified(paged: bool) {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let source = SnapshotSource::Codex;
     let root = if paged {
         paged_corpus("missing-carrier")
@@ -3330,7 +3361,7 @@ fn grouped_missing_carriers_mark_each_member_until_verified(paged: bool) {
         Some(&2)
     );
     assert_eq!(counts.restored, 0);
-    assert_eq!(counts.durable_held, [0; 5]);
+    assert_eq!(counts.durable_held, [0; 9]);
     // Actual save and post-save GC keep both predecessors while debt is owed.
     index.save(&index_path).unwrap();
     crate::snapshots::durable_after_save(&cache, &root, source, &index);
@@ -3408,10 +3439,9 @@ fn grouped_missing_carriers_mark_each_unpaged_member_until_verified() {
 
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn grouped_missing_carriers_mark_each_paged_member_until_verified() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
+    assert!(crate::heap_layout_bound::layout_supported());
     grouped_missing_carriers_mark_each_member_until_verified(true);
 }
 
@@ -3421,6 +3451,7 @@ fn grouped_missing_carriers_mark_each_paged_member_until_verified() {
 #[cfg(unix)]
 #[test]
 fn grouped_missing_carrier_requires_live_context_and_clamps_future_debt() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let source = SnapshotSource::Codex;
     let (root, _) = fixture();
     let lock = crate::locked_state_dir::test_locks::hold(&root);
@@ -3496,10 +3527,10 @@ fn grouped_missing_carrier_requires_live_context_and_clamps_future_debt() {
 /// guard), so this group fixture covers the shared path.
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    assert!(crate::heap_layout_bound::layout_supported());
     let source = SnapshotSource::Codex;
     let root = paged_corpus("missing-carrier-r1");
     fs::write(root.join("session_index.jsonl"), "{not valid json}\n").unwrap();
@@ -3566,6 +3597,61 @@ fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
     assert_eq!(
         durable.ineligible.get("audit_carrier_staged_unverified"),
         Some(&2)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+/// [format] protected group peer does not spend corruption rebuild before input.
+#[test]
+fn protected_group_peer_does_not_spend_corruption_rebuild_before_input() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    let (root, _) = fixture();
+    let writer = crate::locked_state_dir::test_locks::hold(&root);
+    let records = seed_member_debts(&root, writer, &[("a", 1, None), ("b", 1, None)]);
+    let newer = [
+        b"ottto-dt".as_slice(),
+        &(crate::durable_tail_store::FORMAT_V3 + 1).to_le_bytes(),
+        &[7_u8; 64],
+    ]
+    .concat();
+    fs::write(&records[0].1, &newer).unwrap();
+    let mut corrupt = fs::read(&records[1].1).unwrap();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fs::write(&records[1].1, &corrupt).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let source = SnapshotSource::Codex;
+    // The synthetic scanner helper does not install a durable store itself.
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &Scope("group-fixture".into()),
+        false,
+    );
+    let (index, held) = sampled(&root, ScanIndex::default(), 10, &cache);
+    assert!(held.snapshots.is_empty());
+    assert_eq!(
+        cache
+            .durable_counters(source)
+            .unwrap()
+            .1
+            .t14_rebuild_full_started,
+        0,
+        "a held peer must leave the corrupt member's native attempt unspent"
+    );
+    assert_eq!(fs::read(&records[0].1).unwrap(), newer);
+    assert_eq!(fs::read(&records[1].1).unwrap(), corrupt);
+    fs::remove_file(&records[0].1).unwrap();
+    let (_, recovered) = next_generation(&root, index, &cache, 1);
+    assert!(!recovered.snapshots.is_empty());
+    assert_eq!(
+        cache
+            .durable_counters(source)
+            .unwrap()
+            .1
+            .t14_rebuild_full_started,
+        1,
+        "same-process recovery retains the one native rebuild attempt"
     );
     fs::remove_dir_all(root).unwrap();
 }

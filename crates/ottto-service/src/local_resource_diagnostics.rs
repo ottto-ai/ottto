@@ -15,6 +15,28 @@ pub(crate) mod codex_side_lifecycle;
 mod footprint;
 pub(crate) mod rearm_cause;
 
+/// Native label losses only, never label text. Twelve fixed u64 cells (96 B),
+/// no per-key state. Invalid activity signals count inputs, since the existing
+/// detector deliberately does not expose the unnamed/dropped labels.
+#[inline(never)]
+pub(crate) fn skill_label_native_dropped(source: &str, set: &'static str, reason: &'static str) {
+    static COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+    let source_slot = match source {
+        "claude_code" => 0,
+        "codex" => 1,
+        "pi" => 2,
+        _ => return,
+    };
+    let slot = source_slot * 4
+        + usize::from(set == "activity") * 2
+        + usize::from(reason == "invalid_signal");
+    let total = COUNTS[slot].fetch_add(1, Relaxed).saturating_add(1);
+    durable_tail_alarm(
+        source,
+        &serde_json::json!({"skill_label_native_dropped": {(set): {(reason): total}}}),
+    );
+}
+
 #[cfg(not(test))]
 static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 #[cfg(test)]
@@ -1175,12 +1197,21 @@ impl crate::heap_layout_bound::HeapLayoutBound for NativeDecision {
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct FullCauses {
     pub(crate) restore_outcome: RestoreCounts,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) owed_full_after_lossy_shrink: u64,
+    /// Native Full read completed; does not imply verification or publication.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) owed_full_after_lossy_shrink_completed: u64,
 }
 impl FullCauses {
     fn is_empty(&self) -> bool {
         self.restore_outcome.restored == 0
             && self.restore_outcome.held == 0
+            && self.restore_outcome.pending == 0
             && self.restore_outcome.miss.is_empty()
+            && self.restore_outcome.stale.is_empty()
+            && self.owed_full_after_lossy_shrink == 0
+            && self.owed_full_after_lossy_shrink_completed == 0
     }
 }
 #[derive(Debug, Default, Serialize)]
@@ -1189,17 +1220,36 @@ pub(crate) struct RestoreCounts {
     restored: u64,
     #[serde(skip_serializing_if = "is_zero")]
     held: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pending: u64,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     miss: BTreeMap<&'static str, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    stale: BTreeMap<&'static str, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    stale_attribution: BTreeMap<&'static str, u64>,
 }
 impl RestoreCounts {
     #[cfg(unix)]
     pub(crate) fn record(&mut self, outcome: &crate::snapshots::sampled_scan::RestoreOutcome) {
         use crate::snapshots::sampled_scan::RestoreOutcome;
         let count = match outcome {
-            RestoreOutcome::Restored(_) => &mut self.restored,
-            RestoreOutcome::Held(_) => &mut self.held,
+            RestoreOutcome::Restored(..) => &mut self.restored,
+            RestoreOutcome::Held(_) | RestoreOutcome::FloorHeld => &mut self.held,
+            RestoreOutcome::Pending | RestoreOutcome::QuietPending => &mut self.pending,
             RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
+            RestoreOutcome::Stale(reason) => self.stale.entry(reason).or_default(),
+            RestoreOutcome::StaleUnregistered(reason, obligation) => {
+                let label =
+                    crate::snapshots::sampled_scan::MissClass::Unregistered(*obligation).label();
+                let attribution = self.stale_attribution.entry(label).or_default();
+                *attribution = attribution.saturating_add(1);
+                self.stale.entry(reason).or_default()
+            }
+            RestoreOutcome::Degraded => self
+                .miss
+                .entry("degraded_no_record.active_bound")
+                .or_default(),
         };
         *count = count.saturating_add(1);
     }
@@ -1684,9 +1734,33 @@ mod tests {
             crate::durable_tail_store::Refusal::Unknown,
         ));
         assert_eq!(counts.held, u64::MAX);
-        counts.restored = 1;
+        counts.held = 0;
+        counts.record(&RestoreOutcome::Pending);
+        assert!(
+            !probe.full_causes.is_empty(),
+            "pending-only pages remain visible"
+        );
+        probe.full_causes.restore_outcome.restored = 1;
         let json = serde_json::to_value(&probe.full_causes).unwrap();
         assert_eq!(json["restore_outcome"]["restored"], 1);
+        assert_eq!(json["restore_outcome"]["pending"], 1);
+        let causes = FullCauses {
+            owed_full_after_lossy_shrink: 1,
+            ..Default::default()
+        };
+        assert!(!causes.is_empty());
+        assert_eq!(
+            serde_json::to_value(causes).unwrap()["owed_full_after_lossy_shrink"],
+            1
+        );
+        let completed = FullCauses {
+            owed_full_after_lossy_shrink_completed: 1,
+            ..Default::default()
+        };
+        assert!(!completed.is_empty(), "completion may fall on a later page");
+        let json = serde_json::to_value(completed).unwrap();
+        assert_eq!(json["owed_full_after_lossy_shrink_completed"], 1);
+        assert!(json.get("owed_full_after_lossy_shrink").is_none());
     }
 
     #[test]

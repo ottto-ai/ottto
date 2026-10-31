@@ -1266,6 +1266,7 @@ impl ClaudeRequestCensus {
         &mut self,
         files: &BTreeMap<String, ScanIndexEntry>,
         cutoff: u64,
+        held: &dyn Fn(&str) -> bool,
         fits: &dyn Fn(usize, usize) -> bool,
         all_or_none: bool,
     ) -> (u64, u64) {
@@ -1280,7 +1281,7 @@ impl ClaudeRequestCensus {
                 )
                 && memo.suspects.iter().all(|key| {
                     self.records.get(key).map_or(true, |record| {
-                        transcript_retirement_age(files, cutoff, key, record).is_none()
+                        held(key) || transcript_retirement_age(files, cutoff, key, record).is_none()
                     })
                 })
             {
@@ -1299,7 +1300,10 @@ impl ClaudeRequestCensus {
             if !may_age(record, cutoff) {
                 continue;
             }
-            let Some(modified) = transcript_retirement_age(files, cutoff, key, record) else {
+            let Some(modified) = (!held(key))
+                .then(|| transcript_retirement_age(files, cutoff, key, record))
+                .flatten()
+            else {
                 suspects = suspects
                     .filter(|suspects: &Vec<String>| suspects.len() < MAX_RELEASE_MEMO_SUSPECTS)
                     .map(|mut suspects| {
@@ -1604,12 +1608,19 @@ pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<Sc
     CensusRead::new(reader).decode()
 }
 
-pub(super) fn normalized_bounded_bytes(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, bool, bool)> {
+pub(super) fn normalized_bounded_bytes(
+    bytes: &[u8],
+) -> anyhow::Result<(Vec<u8>, bool, bool, bool)> {
     use std::io::Read;
     let mut normalized = Vec::new();
     let mut reader = CensusRead::new(bytes);
     reader.read_to_end(&mut normalized)?;
-    Ok((normalized, reader.duplicate_census, reader.duplicate_shadow))
+    Ok((
+        normalized,
+        reader.duplicate_census,
+        reader.duplicate_shadow,
+        reader.duplicate_upgrade,
+    ))
 }
 
 pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
@@ -1682,12 +1693,14 @@ struct CensusRead<R> {
     root_array: bool,
     array_index: usize,
     sequence_fields: (usize, usize, usize),
-    retired_guard: bool,
+    upgrade_guard: bool,
     quoted: bool,
     escaped: bool,
     expect_key: bool,
     seen_census: bool,
     seen_shadow: bool,
+    seen_upgrade: bool,
+    duplicate_upgrade: bool,
     duplicate_census: bool,
     duplicate_shadow: bool,
     shadow_key: bool,
@@ -1710,12 +1723,14 @@ impl<R: std::io::Read> CensusRead<R> {
             root_array: false,
             array_index: 0,
             sequence_fields: sequence_fields(),
-            retired_guard: false,
+            upgrade_guard: false,
             quoted: false,
             escaped: false,
             expect_key: false,
             seen_census: false,
             seen_shadow: false,
+            seen_upgrade: false,
+            duplicate_upgrade: false,
             duplicate_census: false,
             duplicate_shadow: false,
             shadow_key: false,
@@ -1740,6 +1755,9 @@ impl<R: std::io::Read> CensusRead<R> {
     fn invalidate_duplicates(&self, index: &mut ScanIndex) {
         if self.duplicate_census {
             index.claude_request_census = ClaudeRequestCensus::default();
+        }
+        if super::restart_restore::enabled() && self.duplicate_upgrade {
+            index.o3_replay = super::upgrade_replay::State::refused();
         }
         if self.duplicate_shadow {
             index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
@@ -1767,7 +1785,7 @@ impl<R: std::io::Read> CensusRead<R> {
             }
         }
         self.shadow_key = false;
-        self.retired_guard = false;
+        self.upgrade_guard = false;
         if !self.quoted {
             if let Ok(name) = serde_json::from_slice::<String>(&key) {
                 let duplicate = match name.as_str() {
@@ -1789,8 +1807,11 @@ impl<R: std::io::Read> CensusRead<R> {
                     }
                     "reread_guard" => {
                         self.shadow_key = true;
-                        self.retired_guard = true;
-                        return Ok(b"\"_ignored_retired_reread_guard\"".to_vec());
+                        self.upgrade_guard = true;
+                        let duplicate = self.seen_upgrade;
+                        self.seen_upgrade = true;
+                        self.duplicate_upgrade |= duplicate;
+                        duplicate
                     }
                     _ => false,
                 };
@@ -1828,7 +1849,7 @@ impl<R: std::io::Read> CensusRead<R> {
         // Original admitted evidence was grammar-checked by the lexical
         // boundary. The syntax-only pass substitutes null without buffering
         // or interpreting census records, even before header controls run.
-        let mut overflow = self.syntax_only || self.retired_guard;
+        let mut overflow = self.syntax_only;
         while let Some(byte) = self.byte()? {
             if !quoted && depth == 0 && matches!(byte, b',' | b'}' | b']') {
                 self.replay = Some(byte);
@@ -1871,7 +1892,12 @@ impl<R: std::io::Read> CensusRead<R> {
         // Parsing is isolated from the enclosing index, including numeric
         // conversion and wrong-token errors. Only canonical, finite tokens
         // leave this reader. JSON syntax outside the optional field is intact.
-        Ok(if self.shadow_state {
+        Ok(if self.upgrade_guard {
+            let state = serde_json::from_slice::<super::upgrade_replay::State>(&bytes)
+                .unwrap_or_else(|_| super::upgrade_replay::State::refused());
+            drop(bytes);
+            serde_json::to_vec(&state).expect("O3 spend serialization")
+        } else if self.shadow_state {
             let state = serde_json::from_slice::<ClaudeRequestCensusShadowState>(&bytes)
                 .unwrap_or_default();
             drop(bytes);
@@ -1915,7 +1941,7 @@ impl<R: std::io::Read> CensusRead<R> {
                 || self.array_index == self.sequence_fields.2)
         {
             self.shadow_state = self.array_index == self.sequence_fields.1;
-            self.retired_guard = self.array_index == self.sequence_fields.2;
+            self.upgrade_guard = self.array_index == self.sequence_fields.2;
             self.replay = Some(byte);
             self.output = std::io::Cursor::new(self.evidence()?);
             return self.next();
@@ -2808,6 +2834,8 @@ pub(crate) struct ClaudeRequestCensusParse<'a> {
     pub(crate) index_key: &'a str,
     pub(crate) source_file_fingerprint: &'a str,
     pub(crate) census_window_end: &'a str,
+    /// This page's residue: unread growth its aged records still answer for.
+    pub(crate) held_index_keys: &'a BTreeSet<String>,
     pub(crate) complete: bool,
     pub(crate) lossy: bool,
     pub(crate) source_verified: bool,
@@ -2945,7 +2973,13 @@ pub(crate) fn record_claude_request_census(
             record.retire();
         }
     }
-    let _ = insert_transcript_record(index, parse.index_key, record, window);
+    let _ = insert_transcript_record(
+        index,
+        parse.index_key,
+        record,
+        window,
+        parse.held_index_keys,
+    );
     if let Some(stored) = index.claude_request_census.get(parse.index_key) {
         note_identity_incomplete_hold(
             !was_held && stored.identity_incomplete_hold(),
@@ -2964,6 +2998,31 @@ pub(crate) fn record_claude_request_census(
     }
 }
 
+/// A2 metadata proof for the currently opened object, independent of optional
+/// RAM/disk restore. A verified census must bind the exact committed fingerprint,
+/// mtime and physical object. Missing/stale/unknown evidence grants nothing.
+pub(super) fn proves_indexed_shrink(
+    index: &ScanIndex,
+    key: &str,
+    length: u64,
+    physical: Option<[u64; 2]>,
+) -> bool {
+    let (Some(record), Some(entry)) = (index.claude_request_census.get(key), index.files.get(key))
+    else {
+        return false;
+    };
+    length < entry.size_bytes
+        && !record.unverified
+        && !record.is_birth_stub()
+        && !entry.source_file_fingerprint.is_empty()
+        && decode_fingerprint(&entry.source_file_fingerprint)
+            == Some(record.source_file_fingerprint)
+        && record.modified == Some(entry.modified_unix_seconds)
+        && record
+            .birth
+            .is_some_and(|birth| physical == Some([birth.device, birth.inode]))
+}
+
 /// Stores a transcript parse's record. E7 stopgap (#920 round 3): a record
 /// that does not fit whole first releases what the retirement rule would
 /// retire at this window (`release_aged`), counted as admission overflow.
@@ -2979,6 +3038,7 @@ fn insert_transcript_record(
     key: &str,
     record: ClaudeRequestCensusRecord,
     window: u64,
+    page_held: &BTreeSet<String>,
 ) -> ClaudeRequestCensusInsert {
     let census = &index.claude_request_census;
     if census.records.len() >= MAX_CLAUDE_REQUEST_CENSUS_RECORDS
@@ -2991,6 +3051,22 @@ fn insert_transcript_record(
     }
     let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
     let files = &index.files;
+    // The terminal's residue exclusion, before the terminal: this page's holds,
+    // this traversal's, and the last terminal's not yet revisited.
+    let traversal = index
+        .traversal
+        .as_ref()
+        .map(|traversal| &traversal.residue.index_keys);
+    let witness = index
+        .scan_residue_witness
+        .as_ref()
+        .map(|witness| &witness.index_keys);
+    let held = |key: &str| {
+        super::restart_restore::enabled()
+            && (page_held.contains(key)
+                || traversal.is_some_and(|keys| keys.contains(key))
+                || witness.is_some_and(|keys| keys.contains(key)))
+    };
     let mut released = 0;
     let outcome =
         index
@@ -2998,7 +3074,7 @@ fn insert_transcript_record(
             .insert_releasing(key.to_owned(), record, |census, fits| {
                 // A release retires; it never marks the key lost or refused.
                 if window > 0 {
-                    released = census.release_aged(files, cutoff, fits, true).0;
+                    released = census.release_aged(files, cutoff, &held, fits, true).0;
                 }
             });
     note_kept_overlap_admission(released);
@@ -3072,7 +3148,7 @@ pub(crate) fn settle_claude_request_census_terminal(
         .claude_request_census
         .retain_keys(|key| files.contains_key(key) || observed_index_keys.contains(key));
     let window = rfc3339_unix_seconds(census_window_end).unwrap_or_default();
-    let retirement = retire_claude_transcript_records(index, window);
+    let retirement = retire_claude_transcript_records(index, window, residue_index_keys);
     note_transcript_retirements(retirement.aged, vanished);
     let join = ClaudeRequestCensusJoin::new(index, window, residue_index_keys);
     let mut counts = join.counts(true);
@@ -3230,7 +3306,11 @@ fn transcript_retirement_age(
 /// counts it, so a copy elsewhere owns those ids under the approved rule
 /// (telemetry owner first, else the copy). Retirement edits records in
 /// place: nothing is cloned.
-fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> TranscriptRetirement {
+fn retire_claude_transcript_records(
+    index: &mut ScanIndex,
+    window: u64,
+    held: &BTreeSet<String>,
+) -> TranscriptRetirement {
     // Every terminal starts the admission release memo afresh.
     index.claude_request_census.release_memo = None;
     let mut retirement = TranscriptRetirement::default();
@@ -3250,7 +3330,10 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> Trans
     let count = census
         .records
         .iter()
-        .filter(|(key, record)| transcript_retirement_age(files, cutoff, key, record).is_some())
+        .filter(|(key, record)| {
+            (!super::restart_restore::enabled() || !held.contains(key.as_str()))
+                && transcript_retirement_age(files, cutoff, key, record).is_some()
+        })
         .count();
     let mut aged = Vec::with_capacity(count);
     aged.extend(
@@ -3259,7 +3342,9 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> Trans
             .iter()
             .enumerate()
             .filter_map(|(position, (key, record))| {
-                transcript_retirement_age(files, cutoff, key, record)
+                (!super::restart_restore::enabled() || !held.contains(key.as_str()))
+                    .then(|| transcript_retirement_age(files, cutoff, key, record))
+                    .flatten()
                     .map(|modified| (modified, position, record.hash_count()))
             }),
     );
@@ -3287,7 +3372,9 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> Trans
     if retirement.kept_overlap_records > 0
         && !within_keep_occupancy(census.hash_total, census.serialized_total)
     {
-        let (records, hashes) = census.release_aged(files, cutoff, &within_keep_occupancy, false);
+        let held = |key: &str| held.contains(key);
+        let (records, hashes) =
+            census.release_aged(files, cutoff, &held, &within_keep_occupancy, false);
         retirement.overflow_occupancy = records;
         retirement.kept_overlap_records -= records;
         retirement.kept_overlap_hashes -= hashes;
@@ -3973,7 +4060,18 @@ impl ScanIndex {
         record: ClaudeRequestCensusRecord,
         window: u64,
     ) -> ClaudeRequestCensusInsert {
-        insert_transcript_record(self, key, record, window)
+        insert_transcript_record(self, key, record, window, &BTreeSet::new())
+    }
+
+    /// The same insert with this page's residue held.
+    pub(crate) fn insert_held_transcript_record_for_test(
+        &mut self,
+        key: &str,
+        record: ClaudeRequestCensusRecord,
+        window: u64,
+        page_held: &BTreeSet<String>,
+    ) -> ClaudeRequestCensusInsert {
+        insert_transcript_record(self, key, record, window, page_held)
     }
 
     /// The terminal's production retirement step alone: (aged, kept records,
@@ -3982,7 +4080,7 @@ impl ScanIndex {
         &mut self,
         window: u64,
     ) -> (u64, u64, u64, u64) {
-        let retirement = retire_claude_transcript_records(self, window);
+        let retirement = retire_claude_transcript_records(self, window, &BTreeSet::new());
         (
             retirement.aged,
             retirement.kept_overlap_records,

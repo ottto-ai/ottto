@@ -116,7 +116,7 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
         ))
         .unwrap();
     let source = durable::DurableSource::ClaudeCode;
-    let allowlist: [u8; 32] = "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c"
+    let allowlist: [u8; 32] = "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2"
         .as_bytes()
         .chunks_exact(2)
         .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
@@ -141,6 +141,7 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
         ),
     };
     let record = durable::PendingRecord {
+        acquisition: None,
         binding: binding.clone(),
         certificate,
         body: crate::snapshots::durable_store_fixture_body(
@@ -154,7 +155,12 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
     let mut store = durable::DurableTailStore::new(dir.clone(), source);
     assert_eq!(
         store
-            .write_after_save(&lock, generation, vec![record.clone()])
+            .write_after_save(
+                &lock,
+                generation,
+                fs::metadata(s.root()).unwrap().len(),
+                vec![record.clone()]
+            )
             .unwrap()
             .written,
         1
@@ -170,7 +176,8 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
     };
     assert_eq!(restored.index_generation, generation);
     assert_eq!(restored.record, record);
-    // The actual #865 admission seam checks entry/context/scope AND generation.
+    // The actual admission seam: a write-ahead record may lead its index, so
+    // only V1 Codex keeps the generation gate; context and scope always refuse.
     let expected = durable::Expected {
         binding: binding.clone(),
         committed_generation: root["generation"].as_u64().unwrap(),
@@ -180,6 +187,15 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
         .eligible(&durable::Expected {
             binding: binding.clone(),
             committed_generation: generation - 1
+        })
+        .is_ok());
+    assert!(restored
+        .eligible(&durable::Expected {
+            binding: durable::Binding {
+                scope: [9; 32],
+                ..binding.clone()
+            },
+            committed_generation: generation
         })
         .is_err());
     assert!(restored

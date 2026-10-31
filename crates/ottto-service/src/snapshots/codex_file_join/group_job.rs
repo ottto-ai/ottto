@@ -33,7 +33,7 @@ pub(in crate::snapshots) fn new_group_parser(
     artifacts: bool,
     context_curve: bool,
     evidence: codex_counting_version::AckEvidence,
-) -> Result<OwnedJsonlParser> {
+) -> Result<Box<OwnedJsonlParser>> {
     refuse_compressed_codex(
         Some(&member.path),
         None,
@@ -51,7 +51,7 @@ pub(in crate::snapshots) fn new_group_parser(
         context_curve,
     )?;
     codex_counting_version::configure_group_once(&mut parser.accumulator, evidence);
-    Ok(parser)
+    Ok(Box::new(parser))
 }
 
 #[cfg(test)]

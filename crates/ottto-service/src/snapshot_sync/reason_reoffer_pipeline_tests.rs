@@ -1449,6 +1449,15 @@ fn refused_then_conflicted_holding(
 ) -> (ReofferPipeline, String, u64, serde_json::Value) {
     let t0 = current_unix_seconds();
     let mut pipeline = ReofferPipeline::new(name, Answer::Refuse(ORIGINAL_PAIR), t0);
+    // Keep this physical-read fixture larger than its bounded certificate
+    // samples, so total guard + suffix bytes can distinguish restore from Full.
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(pipeline.transcript())
+        .unwrap()
+        .write_all((" ".repeat(32 * 1024) + "{}\n").as_bytes())
+        .unwrap();
     #[cfg(unix)]
     if locked {
         pipeline.hold_state_dir_lock();
@@ -1474,7 +1483,7 @@ fn refused_then_conflicted_holding(
     (pipeline, fingerprint, t1, deadline)
 }
 
-/// M1 through the real sync caller, both ways. Without the daemon's
+/// [regress] M1 through the real sync caller, both ways. Without the daemon's
 /// single-writer lock (#801) on the support directory the post-save write
 /// writes nothing, and the due-day restart reads the file cold. Holding it,
 /// the earlier cycles write the retained copy after their saves, and the
@@ -1486,6 +1495,7 @@ fn refused_then_conflicted_holding(
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn durable_store_is_written_only_under_the_state_dir_lock() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("durable_store_is_written_only_under_the_state_dir_lock") {
         return;
     }
@@ -1499,6 +1509,15 @@ fn durable_store_is_written_only_under_the_state_dir_lock() {
             refused_then_conflicted_holding(name, locked);
         let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
         let records = pipeline.durable_records();
+        // Scoped cold restore waits while quiet; inert growth exercises Tail
+        // without changing the offered body or the cooldown deadline.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(pipeline.transcript())
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
         let due = deadline.as_u64().unwrap() + 60;
         let (day2, _, bytes) = pipeline.measured_cycle(due, true);
         assert!(day2.result.is_ok(), "{name}: {:?}", day2.result);
@@ -1654,7 +1673,7 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
         .accepted_snapshot_fingerprint_recorded(&fingerprint));
 }
 
-/// SOURCE B1: the cooldown test's twin with the durable store present.
+/// [regress] SOURCE B1: the cooldown test's twin with the durable store present.
 /// Both arms hold the state-directory lock, so their earlier cycles write
 /// the retained copy; the cold arm then drops the store, the warm arm keeps
 /// it. Across restarts that could restore the file, the quiet cycles still
@@ -1667,6 +1686,7 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore") {
         return;
     }
@@ -1710,6 +1730,15 @@ fn cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore() {
         if !warm {
             pipeline.drop_durable_stores();
         }
+        // Scoped cold restore waits while quiet; inert growth exercises Tail
+        // without changing the offered body or the cooldown deadline.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(pipeline.transcript())
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
         let due = deadline.as_u64().unwrap() + 60;
         let (day2, _, bytes) = pipeline.measured_cycle(due, true);
         if warm {

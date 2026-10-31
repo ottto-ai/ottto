@@ -65,6 +65,7 @@ pub(super) fn candidate(path: &Path) -> CandidateFile {
 
 #[test]
 fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::private_dir("codex-zst-closure");
     let path = root.join("rollout-synthetic.jsonl.zst");
     // Valid JSON under the archive suffix catches accidental plain parsing too.

@@ -249,12 +249,14 @@ impl Drop for Hooks {
     }
 }
 
+/// [money] shared old writer tail receipt gc and two restarts.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_old_writer_tail_receipt_gc_and_two_restarts() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_transition") {
         return;
     }
@@ -299,12 +301,14 @@ fn shared_old_writer_tail_receipt_gc_and_two_restarts() {
     });
 }
 
+/// [format] shared quiet restart discloses m1 io gap instead of claiming zero.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_quiet_restart_discloses_m1_io_gap_instead_of_claiming_zero() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_quiet") {
         return;
     }
@@ -329,12 +333,14 @@ fn shared_quiet_restart_discloses_m1_io_gap_instead_of_claiming_zero() {
     });
 }
 
+/// [format] shared selection cleared is an explicit m1 gap for 859.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_selection_cleared_is_an_explicit_m1_gap_for_859() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_selection_clear") {
         return;
     }
@@ -371,12 +377,14 @@ fn shared_selection_cleared_is_an_explicit_m1_gap_for_859() {
     });
 }
 
+/// [money] shared unknown record holds last accepted body and survives gc.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_unknown_hold") {
         return;
     }
@@ -472,12 +480,14 @@ fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
     });
 }
 
+/// [money] shared failed rename preserves predecessor and retry money.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_failed_rename_preserves_predecessor_and_retry_money() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_rename_retry") {
         return;
     }
@@ -587,12 +597,14 @@ fn shared_failed_rename_preserves_predecessor_and_retry_money() {
     });
 }
 
+/// [format] shared failed rename unacked retry resends identical body once.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(supported("shared_unacked_rename_retry"));
     with_e2(|| {
         let mut f = M1::old_writer("transition-unacked-rename", WRITERS[0]);
@@ -857,8 +869,10 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
 }
 
 /// Runs ONLY as a new test process. Every edge is checked by the parent.
+/// [format] shared transition crash child.
 #[test]
 fn shared_transition_crash_child() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if std::env::var_os("OTTTO_TRANSITION_CRASH").is_none() {
         return;
     }
@@ -882,12 +896,14 @@ fn shared_transition_crash_child() {
     panic!("requested crash point was never reached");
 }
 
+/// [format] shared transition crash edges reach sigkill and keep a valid survivor.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_crash") {
         return;
     }
@@ -936,7 +952,7 @@ fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
                 births: BTreeMap::from([(path.clone(), nanos("2026-08-02T07:00:00Z"))]),
             };
             grow(&path, "recovery-append", 90);
-            let disk = Disk::new(&c);
+            let mut disk = Disk::new(&c);
             let mut cold = c.raw(&E2ScanFixture::default(), index.clone(), 100, true, &[]);
             let owner = disk.owner(SOURCE);
             let mut recovered = c.raw(&owner, index, 100, true, &[]);
@@ -960,12 +976,14 @@ fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
     }
 }
 
+/// [format] shared codex dated legacy and v2 receipts survive two restarts.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_codex") {
         return;
     }
@@ -975,7 +993,7 @@ fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
         } else {
             "transition-codex-v2"
         });
-        let disk = Disk::new(&c);
+        let mut disk = Disk::new(&c);
         let path = c.root.join("rollout.jsonl");
         let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
             "payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}})
@@ -1057,12 +1075,14 @@ fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
     }
 }
 
+/// [money] shared money oracle reports each field and rejects false holds.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_money_oracle_reports_each_field_and_rejects_false_holds() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_oracle_controls") {
         return;
     }
@@ -1244,7 +1264,7 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         + "\n";
     std::fs::write(&path, header + &codex_rows("initial", 10)).unwrap();
     input_clock(&path);
-    let disk = Disk::new(&c);
+    let mut disk = Disk::new(&c);
     let source = SnapshotSource::Codex;
     let _cutover = crate::snapshots::TestCutover::set(0);
     let writer = disk.owner(source);
@@ -1392,19 +1412,154 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
     }
 }
 
+/// [format] shared 24b old writer restored version tail and unchanged restart twice.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_24b_old_writer_restored_version_tail_and_unchanged_restart_twice() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(supported("shared_24b"));
     codex_24b_old_writer_row(false);
 }
 
+/// [format] shared 24b old writer zero old bytes target.
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "needs card-F retirement: main v1 restore re-derives SessionStartState prelude (DoD 6)"]
 fn shared_24b_old_writer_zero_old_bytes_target() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     codex_24b_old_writer_row(true);
+}
+
+/// M3 uses the shared native pipeline and its single money oracle. Each
+/// comparison arm starts from the same accepted index and exact predecessor,
+/// rather than letting an earlier arm's pre-ACK write seed a later arm.
+struct M3 {
+    inner: M1,
+    emitted: BTreeMap<Mode, RouteResult>,
+}
+impl M3 {
+    fn old_writer(name: &str) -> Self {
+        Self {
+            inner: M1::old_writer(name, WRITERS[0]),
+            emitted: BTreeMap::new(),
+        }
+    }
+}
+impl TransitionDriver for M3 {
+    fn emit_bodies(&mut self, mode: Mode) -> RouteResult {
+        for (path, bytes) in &self.inner.old_bytes {
+            std::fs::write(path, bytes).unwrap();
+        }
+        let reached = std::rc::Rc::new(std::cell::Cell::new(0_u64));
+        let _native_observer = if mode != Mode::ColdFull {
+            let paths: Vec<_> = self.inner.old_bytes.keys().cloned().collect();
+            let reached = reached.clone();
+            // Actual native settlement, before cursor/body/index effects and
+            // before the existing pipeline can construct a POST or ACK it.
+            Some(fixture::NativeEffectsObserver::new(move || {
+                for path in &paths {
+                    let bytes = std::fs::read(path).unwrap();
+                    assert_eq!(&bytes[..8], b"ottto-dt");
+                    assert_eq!(
+                        u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+                        crate::durable_tail_store::FORMAT_V3,
+                        "the native v3 successor already exists before effects/ACK"
+                    );
+                }
+                reached.set(reached.get() + 1);
+            }))
+        } else {
+            None
+        };
+        let result = self.inner.emit_bodies(mode);
+        if mode != Mode::ColdFull {
+            assert_eq!(reached.get(), 1, "one actual native pre-ACK settlement");
+            let page = &self.inner.pages[&mode];
+            let (_, store) = page.cache.durable_counters(SOURCE).unwrap();
+            assert!(store.records_written >= 1);
+            assert_eq!(store.receipt_pending_records, 0);
+        }
+        self.emitted.insert(mode, result.clone());
+        result
+    }
+
+    fn save_gc(&mut self, mode: Mode) {
+        let page = self.inner.pages.get_mut(&mode).expect("emit before save");
+        let emitted = &self.emitted[&mode];
+        page.index.save(&self.inner.disk.index).unwrap();
+        let writer = crate::locked_state_dir::held_for(&self.inner.disk.index).unwrap();
+        page.cache
+            .durable_write_after_save(writer, SOURCE, &page.index)
+            .expect("native store pass began");
+        page.cache.durable_gc(writer, SOURCE, &page.index).unwrap();
+        self.inner.prior = ScanIndex::load(&self.inner.disk.index).unwrap();
+        for item in &page.scan.snapshots {
+            self.inner.accepted.insert(
+                item.source_session_id.clone(),
+                Accepted {
+                    body: emitted.snapshots[&item.source_session_id].clone(),
+                    witness: snapshot_upload_body_witness(item),
+                },
+            );
+        }
+        self.inner.old_bytes = self.inner.disk.record_bytes();
+        assert_eq!(self.inner.old_bytes.len(), 1);
+        assert!(self
+            .inner
+            .old_bytes
+            .values()
+            .all(|bytes| u16::from_le_bytes(bytes[8..10].try_into().unwrap())
+                == crate::durable_tail_store::FORMAT_V3));
+    }
+
+    fn restart(&mut self) {
+        self.inner.restart();
+    }
+}
+
+/// [money] shared m3 native receipt precedes ack and five routes match money.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "M3 native retained transitions require qualified heap layout"
+)]
+fn shared_m3_native_receipt_precedes_ack_and_five_routes_match_money() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("shared_m3_native") {
+        return;
+    }
+    with_e2(|| {
+        let mut driver = M3::old_writer("shared-m3-native");
+        driver.inner.grow("r4", 40);
+        let cold = driver.emit_bodies(Mode::ColdFull);
+        assert!(!cold.batches.is_empty());
+        for mode in [
+            Mode::Ram,
+            Mode::DiskRestore,
+            Mode::EvictRetry,
+            Mode::Restart,
+        ] {
+            if mode == Mode::Restart {
+                driver.restart();
+            }
+            let actual = driver.emit_bodies(mode);
+            money_oracle::assert_equivalent(&cold, &actual);
+            assert_eq!(
+                actual.modes.0, 0,
+                "{mode:?}: no Full after a valid predecessor"
+            );
+        }
+        driver.save_gc(Mode::Restart);
+        driver.restart();
+        driver.inner.grow("r5", 50);
+        let cold = driver.emit_bodies(Mode::ColdFull);
+        let restarted = driver.emit_bodies(Mode::Restart);
+        money_oracle::assert_equivalent(&cold, &restarted);
+        assert_eq!(restarted.modes.0, 0);
+        assert_eq!(restarted.restored, 1);
+        driver.save_gc(Mode::Restart);
+    });
 }
