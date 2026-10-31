@@ -280,6 +280,7 @@ fn load_with_custody<M: Mapper>(
     if !route_needed(path, switched, custody)? {
         return Ok(None);
     }
+    let mut load_started = None;
     let result = held(with_state(path, |state| {
         state.inventory_ready = false;
         state.original = None;
@@ -288,6 +289,7 @@ fn load_with_custody<M: Mapper>(
             .then(telemetry::process_written_bytes)
             .flatten();
         if let Some((identity, db_path)) = pair {
+            load_started = Some(Instant::now());
             state.latched = true;
             if !switched {
                 telemetry::event("switch_off_ignored", &1);
@@ -390,6 +392,15 @@ fn load_with_custody<M: Mapper>(
         telemetry::event("route", &"v1");
         Ok(None)
     }));
+    if let Some(started) = load_started {
+        telemetry::event(
+            "load_span",
+            &serde_json::json!({
+                "duration_ms": started.elapsed().as_millis(),
+                "generation": result.as_ref().ok().and_then(|index| index.as_ref()).map(|index| index.generation)
+            }),
+        );
+    }
     if result.is_err() {
         with_state(path, |state| {
             if state.latched || state.current.as_ref().is_some_and(|runtime| runtime.active) {

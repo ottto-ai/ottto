@@ -131,6 +131,9 @@ pub(super) fn save_graph(
         committed.valid && !committed.ambiguous,
         "state_v2_context_invalid"
     );
+    let started = std::time::Instant::now();
+    let before = store.save_row_attempts();
+    let mut span_outcome = "error";
     let mut pending = std::mem::take(committed);
     let mut published = false;
     let result = (|| {
@@ -145,6 +148,11 @@ pub(super) fn save_graph(
         let mut tx = store.begin(TxnMode::Write)?;
         delta(prev, next, &mut tx, &mut pending, dirty)?;
         let outcome = tx.commit(prev.generation, next.generation);
+        span_outcome = match outcome {
+            DurableCommitOutcome::Committed(_) | DurableCommitOutcome::Published(_) => "committed",
+            DurableCommitOutcome::NotPublished => "not_published",
+            DurableCommitOutcome::Ambiguous => "ambiguous",
+        };
         published = !matches!(outcome, DurableCommitOutcome::NotPublished);
         match outcome {
             DurableCommitOutcome::Committed(generation) => {
@@ -198,6 +206,15 @@ pub(super) fn save_graph(
             next.generation = prev.generation;
         }
     }
+    let after = store.save_row_attempts();
+    telemetry::event(
+        "save_span",
+        &serde_json::json!({
+            "duration_ms": started.elapsed().as_millis(), "outcome": span_outcome,
+            "generation": next.generation, "rows_put": after.0.saturating_sub(before.0),
+            "rows_removed": after.1.saturating_sub(before.1)
+        }),
+    );
     result
 }
 

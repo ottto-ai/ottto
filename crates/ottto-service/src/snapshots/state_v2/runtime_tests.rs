@@ -428,11 +428,26 @@ fn generation_and_capability_are_checked_before_external_effects() {
 fn another_graph_save_cannot_advance_a_stale_external_guard() {
     let f = Fixture::new();
     f.published();
-    let mut first = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let (mut first, load_events) = crate::local_resource_diagnostics::capture(|| {
+        load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap()
+    });
+    let load = &load_events.last().unwrap()["counts"]["latest"]["load_span"];
+    assert!(load["duration_ms"].is_u64());
+    assert_eq!(load["generation"], G);
+    assert_eq!(load.as_object().unwrap().len(), 2);
     let second = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
     let stale = crate::snapshots::state_v2_side_effect_guard(&f.path, &second);
     stale().unwrap();
-    assert!(save_with(&f.path, &mut first).unwrap());
+    let (saved, save_events) =
+        crate::local_resource_diagnostics::capture(|| save_with(&f.path, &mut first).unwrap());
+    assert!(saved);
+    let save = &save_events.last().unwrap()["counts"]["latest"]["save_span"];
+    assert!(save["duration_ms"].is_u64());
+    assert_eq!(save["outcome"], "committed");
+    assert_eq!(save["generation"], G + 1);
+    assert!(save["rows_put"].as_u64().unwrap() > 0);
+    assert_eq!(save["rows_removed"], 0);
+    assert_eq!(save.as_object().unwrap().len(), 5);
     assert_eq!(second.generation, G);
     assert_eq!(first.generation, G + 1);
     assert!(stale().is_err());

@@ -1141,6 +1141,10 @@ impl Sqlite {
         );
         Ok(())
     }
+    pub(super) fn save_row_attempts(&self) -> (u64, u64) {
+        let stats = &self.stats;
+        (stats.row_write_attempts, stats.row_delete_attempts)
+    }
     pub(super) fn save_failure(&self) -> Option<Hold> {
         self.save_failure
     }
