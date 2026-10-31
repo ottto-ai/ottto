@@ -411,10 +411,7 @@ fn sticky_budget_sheds_curve_and_cache_before_stripping_any_tag() {
     let cache = padded.cache_observations.take().unwrap();
     assert_eq!(cache.coverage, "partial");
     assert!(cache.operations.len() < cache_observations::MAX_OPERATIONS);
-    assert_eq!(
-        cache.omitted_observation_count,
-        Some((cache_observations::MAX_OPERATIONS - cache.operations.len()) as u64)
-    );
+    assert_eq!(cache.omitted_observation_count, None);
     sticky_assert_reconciled(&padded);
     // Only the display leaves changed: tags, shares, refusals and totals match.
     padded.context_curve = None;

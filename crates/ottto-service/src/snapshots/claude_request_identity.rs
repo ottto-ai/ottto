@@ -2029,23 +2029,14 @@ fn shed_display_leaves(
         let Some(cache) = item.cache_observations.as_mut() else {
             break;
         };
-        let Some(dropped) = cache.operations.pop() else {
+        if cache.operations.pop().is_none() {
             break;
-        };
-        // The receiver keeps accepted rows on a partial patch; the omitted
-        // count stays exact when it was known.
-        let omitted = match cache.coverage.as_str() {
-            "complete" => Some(0),
-            "partial" => cache.omitted_observation_count,
-            _ => None,
-        };
-        let observed = matches!(
-            &dropped,
-            super::cache_observations::Operation::Upsert { observation }
-                if observation.status != "retracted"
-        );
+        }
+        // The receiver keeps accepted rows on a partial patch. The omitted
+        // count is unknown: an exact one could become null against an ACKed
+        // predecessor at upload and grow past the measured bytes.
         cache.coverage = "partial".into();
-        cache.omitted_observation_count = omitted.and_then(|n| n.checked_add(u64::from(observed)));
+        cache.omitted_observation_count = None;
     }
     crate::local_resource_diagnostics::ClaudeIdentityOverCapBytes {
         // SHA-256(session id)[:8], the investigation reports' entity digest.
