@@ -1,0 +1,217 @@
+{
+  "api_evidence": [],
+  "binding": {
+    "context": "1d43ea64364ef49c916c300341e35ec2b28a0c5498d9ba06e19f0f20a216c4fc",
+    "entry": "3af8bc0cbe5cfe08271f948aadec575c9d791329775244cdc9f65fca8a12f377",
+    "key": "ca98035cb8fc1318c7309b38efb6b92fd511abb4a4b5815a88e6db4245a0348f",
+    "scope": "897426f93a8c309d400257aae837ae6b67ea4312964a9bd6772f5f183533919c"
+  },
+  "case_id": "codex-legacy-acked",
+  "counting_receipts": {
+    "closed_filter_hit_unconfirmed": 0,
+    "closed_filter_hit_unconfirmed_native_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "legacy_to_v2_after_tombstone_eviction": 0,
+    "native_after_turn_closed": 0,
+    "native_after_turn_closed_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "native_after_ui_flush": 0,
+    "native_after_ui_flush_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "native_chain_gap": 0,
+    "native_chain_overlap": 0,
+    "native_chain_overlap_covered": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "native_conflict": 0,
+    "native_counted": 0,
+    "native_epoch_reset": 0,
+    "native_inside_holed_coverage": 0,
+    "native_inside_holed_coverage_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "native_not_authority": 0,
+    "native_outside_open_turn": 0,
+    "native_outside_open_turn_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "native_restated": 0,
+    "open_turn_ui_pending_events_this_scan": 0,
+    "open_turn_ui_pending_sessions_this_scan": 0,
+    "open_turn_ui_pending_unsummable_this_scan": 0,
+    "open_turn_ui_pending_usage_this_scan": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "pending_overflow_flushes": 0,
+    "tombstone_cap": 0,
+    "tombstone_count": 0,
+    "tombstone_evictions_not_provably_pre_cutover_legacy": 0,
+    "tombstone_evictions_pre_cutover_legacy": 0,
+    "tombstone_evictions_v2_only": 0,
+    "turn_closure_mismatch": 0,
+    "turn_reopened": 0,
+    "ui_equal_total_repeat": 0,
+    "ui_equal_total_repeat_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "ui_in_native_turn_not_counted": 0,
+    "ui_in_native_turn_not_counted_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "ui_in_unbound_span": 0,
+    "v2_cumulative_base_uncounted": 0,
+    "v2_cumulative_base_uncounted_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "v2_sessions": 0
+  },
+  "facts": {
+    "accepted_body_witness": true,
+    "cache_creation_1h_tokens": 0,
+    "cache_creation_5m_tokens": 0,
+    "cache_read_tokens": 0,
+    "cli_version": null,
+    "counting_version": "Legacy",
+    "input_tokens": 30,
+    "opening_output_tokens": null,
+    "opening_request_count": null,
+    "output_tokens": 4,
+    "protected_tier_receipt_present": false,
+    "request_2_context_tokens": null,
+    "request_3_context_tokens": null,
+    "request_count": 2,
+    "selector_context": {},
+    "selector_sources": {},
+    "source_session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+    "telemetry_cost_micros": null,
+    "tier_replay_finished": true,
+    "tier_replay_persisted": false
+  },
+  "post_save": {
+    "accepted": [
+      "f044911d78954a4d1528e2d3461b4e421f8fc60161cc1e9ddbbcaee4a211dccd"
+    ],
+    "entry": {
+      "codex_counting_owner": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+      "effective_upload_body_witness_revision": 1,
+      "last_snapshot_fingerprint": "343e827bd26f74de85262a3cc32e0bc6d903a1d160cc48e132c3f4b9bceb126b",
+      "last_upload_body_witness": "2d47bd723f46a11124a10219a077b8077ef04b8d80793e044ba7afbb572d2f12",
+      "modified_unix_nanos": 176006927,
+      "modified_unix_seconds": 1793420894,
+      "size_bytes": 2160,
+      "source_file_fingerprint": "sha256:4517f2265ee311b5e9a246ab2e81432ccbdf078233ee0eedcbe6e85bec256fe9"
+    },
+    "generation": 2
+  },
+  "pre_read": {
+    "ack_evidence": "legacy_acked",
+    "entry": {
+      "codex_counting_owner": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+      "effective_upload_body_witness_revision": 1,
+      "last_snapshot_fingerprint": "0dfa1416744f550e8a943bec5d2d5df682a7bc9c5d71dae61b984878644a1d96",
+      "last_upload_body_witness": "582aaa76e920090e87de6d8a9218e1f7eed7088861198783ddcc9af49d5de5f3",
+      "modified_unix_nanos": 173317336,
+      "modified_unix_seconds": 1793420894,
+      "size_bytes": 1155,
+      "source_file_fingerprint": "sha256:1d83d61339c03dc720bcd9c45170494b67e63e5dd5b520381ee69bb7a4379444"
+    },
+    "generation": 1
+  },
+  "pre_save": {
+    "accepted": [
+      "f044911d78954a4d1528e2d3461b4e421f8fc60161cc1e9ddbbcaee4a211dccd"
+    ],
+    "entry": {
+      "codex_counting_owner": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+      "effective_upload_body_witness_revision": 1,
+      "last_snapshot_fingerprint": "343e827bd26f74de85262a3cc32e0bc6d903a1d160cc48e132c3f4b9bceb126b",
+      "last_upload_body_witness": "2d47bd723f46a11124a10219a077b8077ef04b8d80793e044ba7afbb572d2f12",
+      "modified_unix_nanos": 176006927,
+      "modified_unix_seconds": 1793420894,
+      "size_bytes": 2160,
+      "source_file_fingerprint": "sha256:4517f2265ee311b5e9a246ab2e81432ccbdf078233ee0eedcbe6e85bec256fe9"
+    },
+    "generation": 1
+  },
+  "prior_legacy_ack": {
+    "accepted": [
+      "f3bb1db2c852134717f4f7187fcde6bd7555c8575642a2d7bf7971f18abc6507"
+    ],
+    "cutover_unix_ms": 9223372036854775807,
+    "entry": {
+      "codex_counting_owner": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+      "effective_upload_body_witness_revision": 1,
+      "last_snapshot_fingerprint": "0dfa1416744f550e8a943bec5d2d5df682a7bc9c5d71dae61b984878644a1d96",
+      "last_upload_body_witness": "582aaa76e920090e87de6d8a9218e1f7eed7088861198783ddcc9af49d5de5f3",
+      "modified_unix_nanos": 173317336,
+      "modified_unix_seconds": 1793420894,
+      "size_bytes": 1155,
+      "source_file_fingerprint": "sha256:1d83d61339c03dc720bcd9c45170494b67e63e5dd5b520381ee69bb7a4379444"
+    },
+    "generation": 1
+  },
+  "schema_version": 1,
+  "scope_inputs": {
+    "counting_view": "1793016000000:legacy_acked",
+    "file_scope": "durable-codec-test",
+    "fingerprint_recipe": "sha256 of inputs JSONL bytes",
+    "fixture_birth_unix_nanos": 1785654000000000000,
+    "identity_contract": "none|changed=false|capture=false",
+    "index_key_recipe": "local_index_key of the synthetic transcript in the CI scratch directory",
+    "namespace": "synthetic-v1-goldens"
+  },
+  "selector_span": null
+}
