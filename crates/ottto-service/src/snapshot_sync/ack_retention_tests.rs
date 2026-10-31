@@ -311,10 +311,10 @@ fn committed_ack_survives_unrelated_empty_and_failed_pages_after_reload() {
     }
 }
 
+/// [format] An exact ACK survives a crash before the due index debt is retired.
+/// Selection leaves the old deadline due; the ACK must suppress its transport.
 #[test]
-fn ack_saved_before_index_crash_survives_real_empty_and_unrelated_deltas() {
-    // Same persistence seam as the contract-retry repro, using main's existing
-    // paced RetryPending gate. No dependency on the separate contract-retry PR.
+fn ack_saved_before_index_crash_survives_due_and_unrelated_deltas() {
     for unrelated in [false, true] {
         let f = AckFixture::new(false);
         let (mut index, mut progress) = f.load();
@@ -332,7 +332,7 @@ fn ack_saved_before_index_crash_survives_real_empty_and_unrelated_deltas() {
             .active_quarantine_retries
             .contains(&f.item.snapshot_fingerprint));
         index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
-        index.save(&f.index_path).unwrap(); // claim/reserved future cooldown
+        index.save(&f.index_path).unwrap(); // selected, still due until transport
         progress.save(&f.progress_path).unwrap();
         assert!(!index.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
         f.upload(&mut progress, std::slice::from_ref(&f.item), exact_ack)
@@ -358,17 +358,39 @@ fn ack_saved_before_index_crash_survives_real_empty_and_unrelated_deltas() {
         }
         let committed = index.clone();
         let delta = AckFixture::scan(&f.sources, &mut index);
-        assert_eq!(delta.snapshots.len(), usize::from(unrelated));
-        assert!(delta
+        assert_eq!(delta.snapshots.len(), 1 + usize::from(unrelated));
+        assert_eq!(
+            delta
+                .snapshots
+                .iter()
+                .map(|item| item.source_session_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            if unrelated {
+                BTreeSet::from(["held", "unrelated"])
+            } else {
+                BTreeSet::from(["held"])
+            }
+        );
+        let retained = delta
             .snapshots
             .iter()
-            .all(|item| item.source_session_id == "unrelated"));
+            .find(|item| item.source_session_id == "held")
+            .unwrap();
+        assert_eq!(
+            snapshot_upload_body_witness(retained),
+            snapshot_upload_body_witness(&f.item)
+        );
+        let mut posts = 0;
         f.upload(&mut progress, &delta.snapshots, |batch| {
             f.assert_ack(&f.load().1);
             assert!(unrelated);
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch[0].source_session_id, "unrelated");
+            posts += 1;
             exact_ack(batch)
         })
         .unwrap();
+        assert_eq!(posts, usize::from(unrelated));
         f.assert_ack(&f.load().1);
         settle_index_after_upload(&mut index, &committed, &progress);
         index.save(&f.index_path).unwrap();
@@ -377,13 +399,16 @@ fn ack_saved_before_index_crash_survives_real_empty_and_unrelated_deltas() {
         assert!(index.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
         progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &BTreeSet::new());
         progress.finish_cycle(&f.progress_path).unwrap();
-        let (index, progress) = f.load();
+        let (mut index, progress) = f.load();
         f.assert_identity(&index);
         assert!(index.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
         assert!(
             progress.accepted_fingerprints.is_empty(),
             "adopted resume ACK is disposable"
         );
+        assert!(AckFixture::scan(&f.sources, &mut index)
+            .snapshots
+            .is_empty());
     }
 }
 
@@ -775,7 +800,9 @@ fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
             let f = AckFixture::new(true);
             let (index, mut progress) = f.load();
             progress.accepted_identity_buckets.bind_test_key(saved_key);
-            progress.accepted_identity_buckets.set_retained_enabled(true);
+            progress
+                .accepted_identity_buckets
+                .set_retained_enabled(true);
             if record {
                 progress.accepted_identity_buckets.record(&hint);
                 assert!(!progress.accepted_identity_buckets.is_empty(), "{case}");

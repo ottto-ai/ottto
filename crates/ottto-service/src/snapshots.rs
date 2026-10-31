@@ -55767,6 +55767,7 @@ mod tests {
         assert_eq!(index.manifest(SnapshotSource::Codex, 183).entity_count, 2);
     }
 
+    /// [regress] A release label keeps the deadline; a contract change retries.
     #[test]
     fn scan_index_retries_same_fingerprint_after_quarantine_contract_upgrade() {
         let path = PathBuf::from("/opaque/session.jsonl");
@@ -55840,6 +55841,18 @@ mod tests {
             ..ScanIndex::default()
         };
         index.activate_quarantine_witness(SnapshotSource::Codex);
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Skip
+        );
+        index
+            .quarantined_snapshot_fingerprints
+            .values_mut()
+            .next()
+            .unwrap()
+            .witness
+            .contract
+            .push_str("-old");
         assert_eq!(
             index.candidate_decision(&candidate),
             CandidateDecision::Parse
@@ -83410,9 +83423,9 @@ mod tests {
             .is_empty());
     }
 
-    /// O1: an exact-body cooldown defers only the ordinary retry of its own
+    /// [regress] O1: an exact-body cooldown defers only the ordinary retry of its own
     /// retained conflict on an unchanged file. A changed file, a lease, a
-    /// changed quarantine witness, another body or an unrelated due sibling
+    /// changed quarantine contract, another body or an unrelated due sibling
     /// in the same file still selects it. The conflict debt is untouched,
     /// the view is runtime only, and deferrals count distinct entities.
     #[test]
@@ -83554,10 +83567,18 @@ mod tests {
             reread
         );
 
-        // A changed quarantine witness (a new parser or contract) re-reads.
+        // A release label alone keeps the cooldown; a changed contract re-reads.
         index.activate_reason_reoffer_cooldowns(cooldown.clone());
         let mut older = conflict.clone();
         older.witness.parser_version.push_str("-older");
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("refused-entity".into(), older.clone());
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&candidate, 0),
+            (CandidateDecision::Skip, None)
+        );
+        older.witness.contract.push_str("-older");
         index
             .quarantined_snapshot_fingerprints
             .insert("refused-entity".into(), older);
