@@ -1,13 +1,14 @@
 # Re-listing pass: queue only files that need a read (all sources)
 
 A kept generation whose first walk has finished re-lists its roots, metadata
-only, at most every 30 minutes. A listed file is skipped only when it is
-settled: its stamp (size or certified Codex EOF fragment, mtime nanoseconds,
-file birth when known; never ctime) equals its index entry, nothing is owed on
-it (empty fingerprint, unverified sampled generation, account hold), and the
-ordinary candidate gate skips it at that stamp. The check is stat-only; no file
-is opened. Every other file is queued as fresh data, and acquisition still
-chooses Tail or Full.
+only, at most every 30 minutes. A listed file is queued when its stamp (size or
+certified Codex EOF fragment, mtime nanoseconds, file birth when known; never
+ctime) differs from its index entry, or when work is owed on it (empty
+fingerprint, unverified sampled generation). Other reasons to read an unchanged
+file were weighed by the generation's walk and keep their own schedulers and
+the next walk, as on main; re-offering them every pass would re-read the same
+files every 30 minutes. The check is stat-only; no file is opened. Acquisition
+still chooses Tail or Full.
 
 A queued file joins the census by the watcher-hint rule: always for Claude and
 Pi, and for Codex only if this generation has not observed it yet. A hint that
@@ -31,9 +32,10 @@ the switch (#1026).
 New files no longer wait for the oversized/unhealthy 6-hour floor: the pass
 finds them within about 30 minutes, without a hint or a restart.
 
-Watcher hints for existing files go through the same settled check, so a
-metadata-only event never queues a settled file. Owner re-enqueues (the
-sampled-audit retry) bypass it.
+A watcher hint is dropped only when its file is unchanged, not owed, not
+account-held, and the ordinary candidate gate skips it at that stamp, so a
+metadata-only event never queues a settled file and every other hint is queued
+as on main. Owner re-enqueues (the sampled-audit retry) bypass it.
 
 Counters: `listing_generations` and `listing_changes_without_hint` in the
 traversal counts. The 6-hour full sweep timer is removed: every successful

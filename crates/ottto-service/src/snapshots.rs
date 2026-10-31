@@ -43551,7 +43551,7 @@ fn codex_fresh_data_pending(
 
 /// Once a kept generation's latest walk has finished, re-list its roots
 /// every `LISTING_INTERVAL_SECONDS`, metadata only. The pass queues only
-/// files that need a read (`ScanIndex::listing_settled`) and never starts a
+/// changed or owed files (`ScanIndex::listing_unchanged`) and never starts a
 /// generation, so it re-arms nothing; it can only delay this generation's
 /// discovery, never complete it.
 fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at: &str) {
@@ -43584,18 +43584,17 @@ fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at:
         }));
 }
 
-/// Watcher hints go through the listing's check: a settled file (ctime-only
-/// events included) is dropped; a vanished one is kept for the exact removal
-/// path. Owner requests keep their unchanged files: a leased reason re-offer
+/// Watcher hints go through `ScanIndex::hint_settled`: a settled file
+/// (ctime-only events included) is dropped; a vanished one is kept for the
+/// exact removal path. Owner requests keep their unchanged files: a leased reason re-offer
 /// here, the audit retry by calling the queue directly.
 fn changed_watcher_hints(index: &ScanIndex, hinted_paths: &[PathBuf]) -> Vec<PathBuf> {
     hinted_paths
         .iter()
         .filter(|path| {
             index.reason_reoffer_leased(&local_index_key(path))
-                || !fs::symlink_metadata(path).is_ok_and(|metadata| {
-                    metadata.is_file() && index.listing_settled(path, &metadata)
-                })
+                || !fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.is_file() && index.hint_settled(path, &metadata))
         })
         .cloned()
         .collect()
@@ -44270,11 +44269,11 @@ fn advance_bounded_directory_traversal_with_budget(
             }
             if relisting {
                 let key = local_index_key(&path);
-                // Settled since its last read: seen, never queued. A file
-                // this generation already saw with no entry (held, oversized)
-                // has no stamp; its owner's floor re-offers it.
+                // Unchanged and not owed: seen, never queued. A file this
+                // generation already saw with no entry (held, oversized) has
+                // no stamp; its owner's floor re-offers it.
                 let seen = if index.files.contains_key(&key) {
-                    index.listing_settled(&path, &metadata)
+                    index.listing_unchanged(&path, &metadata)
                 } else {
                     traversal.observed_index_keys.contains(&key)
                 };
@@ -49143,18 +49142,29 @@ impl ScanIndex {
                 })
     }
 
-    /// A listed file needs no read: its stamp is unchanged since the last
-    /// read, nothing is owed on it (`DiscoveryRetention::owes`) and the
-    /// ordinary candidate gate skips it at that stamp. Stat-only: the file is
-    /// not opened. Any other answer queues it, as the first walk would.
-    fn listing_settled(&self, path: &Path, metadata: &fs::Metadata) -> bool {
-        let Some(entry) = self.files.get(&local_index_key(path)) else {
+    /// A re-listing pass leaves a file alone when its stamp is unchanged
+    /// since the last read and nothing is owed on it (empty fingerprint or an
+    /// unverified sampled generation). Other reasons to read an unchanged file
+    /// were weighed by this generation's walk; their owners and the next walk
+    /// re-offer them, as on main, rather than every pass. Stat-only.
+    fn listing_unchanged(&self, path: &Path, metadata: &fs::Metadata) -> bool {
+        self.files
+            .get(&local_index_key(path))
+            .is_some_and(|entry| entry.same_listing_stamp_as(metadata))
+            && !sampled_audit::path_requires_verification(&self.files, path)
+    }
+
+    /// A watcher hint needs no read: the file is unchanged and not owed, and
+    /// the ordinary candidate gate skips it at that stamp. An account-held
+    /// key keeps its hint: its gate needs the content stamp, so the gate is
+    /// never consulted (or its withheld memo cleared) here. Stat-only.
+    fn hint_settled(&self, path: &Path, metadata: &fs::Metadata) -> bool {
+        let key = local_index_key(path);
+        let Some(entry) = self.files.get(&key) else {
             return false;
         };
-        // `owes` first: it covers every account-held key, so the gate below
-        // never consults (or clears) a withheld content memo.
-        entry.same_listing_stamp_as(metadata)
-            && !discovery_retention!(self).owes(path)
+        self.listing_unchanged(path, metadata)
+            && !self.claude_account_deferred_holds.contains_key(&key)
             && self.candidate_decision(&CandidateFile {
                 physical_identity: None,
                 scan_root: PathBuf::new(),
