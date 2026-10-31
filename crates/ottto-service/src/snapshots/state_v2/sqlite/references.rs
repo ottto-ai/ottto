@@ -66,7 +66,6 @@ pub(super) fn adjust(tx: &mut Txn<'_>, key: &RowKey, delta: i64) -> Result<u64> 
                 bail!("state_v2_reference_kind")
             };
             ensure!(tx.store.conn()?.execute("UPDATE shared_values SET ref_count=?1,row_checksum=?2 WHERE class='request_hash_set' AND id=?3",params![next,h.row_checksum.as_slice(),id])?==1,"state_v2_reference_missing");
-            tx.changed.insert(key.clone(), Some(h));
         }
         Ok(next)
     })();

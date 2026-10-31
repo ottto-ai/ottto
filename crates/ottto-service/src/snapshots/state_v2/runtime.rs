@@ -370,7 +370,7 @@ fn load_with_custody<M: Mapper>(
             let stamp = db.stamp()?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             normalize_hydrated(&mut index)?;
-            db.prime_headers()?;
+            db.audit_headers()?;
             index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
                 active: true,
                 session: Mutex::new(Some(Session {
@@ -543,7 +543,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             .map_err(Hold::storage)?;
         db.path_extractor(M::private_paths);
         db.reference_extractor(M::references);
-        db.prime_headers()?;
+        db.audit_headers()?;
         let stamp = db.stamp()?;
         ensure!(
             stamp.0 == mapper.import_generation(index)?,

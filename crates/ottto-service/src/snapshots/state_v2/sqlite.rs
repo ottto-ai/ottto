@@ -313,7 +313,6 @@ pub(super) struct Sqlite {
     owner: File,
     _owner_lock: File,
     clean: bool,
-    headers: Option<BTreeMap<RowKey, Header>>,
     save_failure: Option<Hold>,
 }
 pub(super) struct Txn<'a> {
@@ -325,7 +324,8 @@ pub(super) struct Txn<'a> {
     path_bytes: usize,
     shared_erasure: bool,
     failed: bool,
-    changed: BTreeMap<RowKey, Option<Header>>,
+    record_delta: i64,
+    file_delta: i64,
     dirty_bytes: u64,
     estimated_pages: u64,
     dirty_rows: u64,
@@ -537,7 +537,6 @@ impl Sqlite {
             owner: file,
             _owner_lock: owner_lock,
             clean: false,
-            headers: None,
             save_failure: None,
         };
         store.control("limits", &StorageLimits::current())?;
@@ -575,11 +574,10 @@ impl Sqlite {
                 .query_row("PRAGMA data_version", [], |r| r.get(0))?,
         ))
     }
-    /// Header residency is built once after hydrate, never a second value pass.
-    /// Mapper delta emits dirty keys; unchanged put calls also avoid SQL writes.
-    pub(super) fn prime_headers(&mut self) -> Result<()> {
+    /// Stream the chunk-closure check and row census without retaining headers.
+    /// Normal reads and writes fetch only their touched keys from SQLite.
+    pub(super) fn audit_headers(&mut self) -> Result<()> {
         let mut total_parts = 0_u64;
-        let mut headers = BTreeMap::new();
         let mut rows = 0_u64;
         let mut files = 0_u64;
         for table in Table::ALL {
@@ -604,7 +602,6 @@ impl Sqlite {
                         matches!(&header.key,RowKey::Record{kind,..} if kind.name()=="file.progress"),
                     );
                     self.stats.max_value_bytes = self.stats.max_value_bytes.max(header.len);
-                    headers.insert(header.key.clone(), header);
                 }
             }
         }
@@ -617,7 +614,6 @@ impl Sqlite {
         self.stats.records_alarm = rows > 200_000;
         self.stats.files_alarm = files > 50_000;
         self.stats.value_size_alarm = self.stats.max_value_bytes > 4 * 1024 * 1024;
-        self.headers = Some(headers);
         Ok(())
     }
     /// This connection's state is unknown (failed open-transaction ROLLBACK,
@@ -740,7 +736,6 @@ impl Sqlite {
             owner: file,
             _owner_lock: owner_lock,
             clean: false,
-            headers: None,
             save_failure: None,
         };
         store.set_purge_policy(deadline, work)?;
@@ -782,7 +777,8 @@ impl Sqlite {
                 path_bytes: 0,
                 shared_erasure: false,
                 failed: false,
-                changed: BTreeMap::new(),
+                record_delta: 0,
+                file_delta: 0,
                 dirty_bytes: 0,
                 estimated_pages: 0,
                 dirty_rows: 0,
@@ -795,13 +791,6 @@ impl Sqlite {
             })?;
             tx.store.conn()?.execute_batch("COMMIT")?;
             tx.finished = true;
-            if let Some(headers) = &mut tx.store.headers {
-                for (key, header) in std::mem::take(&mut tx.changed) {
-                    if let Some(header) = header {
-                        headers.insert(key, header);
-                    }
-                }
-            }
             Ok(())
         })();
         result
@@ -878,7 +867,8 @@ impl Store for Sqlite {
             path_bytes: 0,
             shared_erasure: false,
             failed: false,
-            changed: BTreeMap::new(),
+            record_delta: 0,
+            file_delta: 0,
             dirty_bytes: 0,
             estimated_pages: 0,
             dirty_rows: 0,
@@ -1330,12 +1320,6 @@ fn pl(key: &RowKey) -> bool {
 impl Transaction for Txn<'_> {
     fn get(&mut self, key: &RowKey) -> Result<Option<Header>> {
         admit_key(key)?;
-        if let Some(header) = self.changed.get(key) {
-            return Ok(header.clone());
-        }
-        if let Some(headers) = &self.store.headers {
-            return Ok(headers.get(key).cloned());
-        }
         get(self.store.conn()?, key)
     }
     fn read_value(&mut self, h: &Header, out: &mut dyn Write) -> Result<()> {
@@ -1433,7 +1417,13 @@ impl Transaction for Txn<'_> {
             };
             conn.prepare_cached(sql)?
                 .execute(params_from_iter(values))?;
-            self.changed.insert(row.key.clone(), Some(h.clone()));
+            if previous.is_none() && table == Table::Records {
+                self.record_delta += 1;
+                if matches!(row.key, RowKey::Record { kind, .. } if kind.name() == "file.progress")
+                {
+                    self.file_delta += 1;
+                }
+            }
             self.store.stats.max_value_bytes = self.store.stats.max_value_bytes.max(h.len);
             self.store.stats.value_size_alarm |= h.len > 4 * 1024 * 1024;
             Ok(h)
@@ -1467,8 +1457,11 @@ impl Transaction for Txn<'_> {
             if count != 0 && self.original_paths.contains_key(key) {
                 self.removed_keys.insert(key.clone());
             }
-            if count != 0 {
-                self.changed.insert(key.clone(), None);
+            if count != 0 && table == Table::Records {
+                self.record_delta -= count as i64;
+                if matches!(key, RowKey::Record { kind, .. } if kind.name() == "file.progress") {
+                    self.file_delta -= count as i64;
+                }
             }
             Ok(count != 0)
         })();
@@ -1495,29 +1488,6 @@ impl Transaction for Txn<'_> {
         after: Option<&RowKey>,
         limit: usize,
     ) -> Result<Vec<Header>> {
-        if let Some(headers) = &self.store.headers {
-            ensure!(limit <= PAGE_HEADERS, "state_v2_header_page_admission");
-            let mut page = BTreeMap::new();
-            for (key, header) in headers.range((
-                after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
-                std::ops::Bound::Unbounded,
-            )) {
-                if key.table() == prefix.table && !self.changed.contains_key(key) {
-                    page.insert(key.clone(), header.clone());
-                    if page.len() >= limit {
-                        break;
-                    }
-                }
-            }
-            for (key, header) in &self.changed {
-                if key.table() == prefix.table && after.map_or(true, |a| key > a) {
-                    if let Some(header) = header {
-                        page.insert(key.clone(), header.clone());
-                    }
-                }
-            }
-            return Ok(page.into_values().take(limit).collect());
-        }
         scan(self.store.conn()?, prefix, after, limit)
     }
     fn scan_kind(
@@ -1619,24 +1589,16 @@ impl Txn<'_> {
                 telemetry::save_work(self.dirty_rows, self.dirty_bytes);
                 telemetry::event("save_estimated_pages", &self.estimated_pages);
             }
-            if let Some(headers) = &mut self.store.headers {
-                for (key, header) in std::mem::take(&mut self.changed) {
-                    let delta = i64::from(header.is_some()) - i64::from(headers.contains_key(&key));
-                    if key.table() == Table::Records {
-                        self.store.stats.record_rows =
-                            self.store.stats.record_rows.saturating_add_signed(delta);
-                    }
-                    if matches!(&key,RowKey::Record{kind,..} if kind.name()=="file.progress") {
-                        self.store.stats.file_rows =
-                            self.store.stats.file_rows.saturating_add_signed(delta);
-                    }
-                    if let Some(header) = header {
-                        headers.insert(key, header);
-                    } else {
-                        headers.remove(&key);
-                    }
-                }
-            }
+            self.store.stats.record_rows = self
+                .store
+                .stats
+                .record_rows
+                .saturating_add_signed(self.record_delta);
+            self.store.stats.file_rows = self
+                .store
+                .stats
+                .file_rows
+                .saturating_add_signed(self.file_delta);
             self.store.stats.records_alarm = self.store.stats.record_rows > 200_000;
             self.store.stats.files_alarm = self.store.stats.file_rows > 50_000;
             // Required checkpoint failure records debt; the completed data

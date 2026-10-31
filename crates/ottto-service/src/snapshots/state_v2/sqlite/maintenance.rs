@@ -325,13 +325,6 @@ impl Sqlite {
             bail!("current_index_requires_reload");
         }
         tx.finished = true;
-        if let Some(headers) = &mut tx.store.headers {
-            for (key, header) in std::mem::take(&mut tx.changed) {
-                if let Some(header) = header {
-                    headers.insert(key, header);
-                }
-            }
-        }
         Ok(())
     }
     pub(in super::super) fn maintenance(&mut self, idle: bool) -> Result<()> {

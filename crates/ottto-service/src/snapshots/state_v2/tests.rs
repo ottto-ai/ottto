@@ -998,7 +998,6 @@ fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
 fn one_save_commits_all_dirty_rows_above_soft_targets() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    db.prime_headers().unwrap();
     let mut tx = db.begin(TxnMode::Write).unwrap();
     for row in 0..5_001 {
         put(&mut tx, &traversal(format!("dirty-{row}")), b"evidence");
@@ -1017,7 +1016,6 @@ fn one_save_commits_all_dirty_rows_above_soft_targets() {
 fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    db.prime_headers().unwrap();
     let key = traversal("first".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"old");
@@ -1441,25 +1439,20 @@ fn oversized_control_refuses_before_parse_and_fails_the_save() {
     let mut tx = db.begin(TxnMode::Read).unwrap();
     assert!(tx.get(&key).unwrap().is_none());
 }
-/// [format] key admission matches for cached and cold reads.
+/// [format] key admission rejects invalid keys before SQLite reads.
 #[test]
-fn key_admission_matches_for_cached_and_cold_reads() {
+fn key_admission_rejects_invalid_keys_before_sqlite_reads() {
     let tmp = Scratch::new();
     let mut db = tmp.store();
-    for cached in [false, true] {
-        if cached {
-            db.prime_headers().unwrap();
-        }
-        let mut tx = db.begin(TxnMode::Read).unwrap();
-        let oversized = RowKey::record("file.entities", vec![b'x'; KEY_BYTES + 1], 0).unwrap();
-        assert_eq!(
-            tx.get(&oversized).unwrap_err().to_string(),
-            "state_v2_key_admission"
-        );
-        let exhausted = RowKey::record("file.entities", vec![], u64::MAX).unwrap();
-        assert!(tx.get(&exhausted).is_err());
-        assert!(tx.get(&RowKey::Meta("unregistered".into())).is_err());
-    }
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let oversized = RowKey::record("file.entities", vec![b'x'; KEY_BYTES + 1], 0).unwrap();
+    assert_eq!(
+        tx.get(&oversized).unwrap_err().to_string(),
+        "state_v2_key_admission"
+    );
+    let exhausted = RowKey::record("file.entities", vec![], u64::MAX).unwrap();
+    assert!(tx.get(&exhausted).is_err());
+    assert!(tx.get(&RowKey::Meta("unregistered".into())).is_err());
 }
 
 /// [format] overdue external reader is a breach and recovery precedes collection.

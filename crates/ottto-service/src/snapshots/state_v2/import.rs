@@ -142,7 +142,7 @@ impl Mapper for ClaudeMapper {
 impl ClaudeMapper {
     /// The one production save: merge current CAS custody, then run the
     /// semantic delta under the resident committed context. Emit the complete
-    /// dirty delta against the resident header map. Saves above 5k rows /
+    /// dirty delta with per-key SQLite header reads. Saves above 5k rows /
     /// 32 MiB reduce the next collection page; the whole save rolls back at its
     /// hard ceiling. More than 64 account windows is an alarm, never permission
     /// to drop unsettled custody. KEEP persisted shared refs: decode only each
