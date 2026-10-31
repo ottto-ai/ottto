@@ -2889,13 +2889,7 @@ pub(in crate::snapshots) enum SideVerdict {
         cause: u8,
     },
 }
-impl crate::heap_layout_bound::HeapLayoutBound for SideVerdict {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; SideVerdict);
 
 /// U1a-2a: the one side verdict of a parse of P, used by every side writer.
 /// Held iff the parse is not complete in PR-P's raw terms.
@@ -3001,13 +2995,7 @@ pub(in crate::snapshots) enum SideRequestState {
     /// A certified read ended on an unsealed row with a settled verdict.
     Unsealed,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for SideRequestState {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; SideRequestState);
 
 /// U1a-2a: one paced request that main also parses an unchanged parent P,
 /// so that P's side verdict can be recorded. Keyed by P's index key.
@@ -21979,13 +21967,7 @@ const _: () = assert!(
 const _: () = assert!(
     CodexParentUnresolvable::COUNT == crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES
 );
-impl crate::heap_layout_bound::HeapLayoutBound for CodexParentUnresolvable {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; CodexParentUnresolvable);
 
 /// L-5 probe value; `hlb` has no `Result` impl.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22684,13 +22666,7 @@ pub(in crate::snapshots) enum ChildResult {
     /// The child's reader failed.
     Unreadable,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for ChildResult {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ChildResult);
 
 /// U1a-2a (row 33, rev 2 §2.2, D6(d)): one reader of a proof job, frozen at
 /// its open extent with the existing extent limit (a straddling row is
@@ -23667,13 +23643,7 @@ pub(in crate::snapshots) enum OwedOrigin {
     Child,
     Lineage,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for OwedOrigin {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; OwedOrigin);
 
 /// U1a: proof work a held fork child (or a lineage parent) is owed.
 #[allow(dead_code)] // first production callers are the owe and finish
@@ -35742,13 +35712,7 @@ pub(in crate::snapshots) struct RetainRoom {
     pub(in crate::snapshots) salvage: usize,
     pub(in crate::snapshots) refused: bool,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for RetainRoom {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; RetainRoom);
 
 impl<R: BufRead> BoundedJsonlReader<R> {
     fn new(reader: R, max_line_bytes: usize, salvage_codex_envelope: bool) -> Self {

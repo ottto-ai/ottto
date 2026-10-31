@@ -155,13 +155,7 @@ impl std::fmt::Debug for FingerprintCheck {
     }
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for FingerprintCheck {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; FingerprintCheck);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeRequestIdentityEvidence {

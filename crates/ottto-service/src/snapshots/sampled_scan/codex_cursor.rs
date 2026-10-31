@@ -1060,38 +1060,20 @@ impl JobPace {
     }
 }
 
-impl HeapLayoutBound for JobPace {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        // A key, two `Instant`s, a `Duration` and a flag: nothing on the heap.
-        c.add(0)
-    }
-}
+// A key, two `Instant`s, a `Duration` and a flag: nothing on the heap.
+crate::heap_layout_bound::no_heap!(true; JobPace);
 
 /// A `Duration` held inline (no heap), for the page's ordinary equivalent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) struct InlineDuration(std::time::Duration);
 
-impl HeapLayoutBound for InlineDuration {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; InlineDuration);
 
 /// An `Instant` held inline (no heap), for a continuation page's deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) struct InlineInstant(std::time::Instant);
 
-impl HeapLayoutBound for InlineInstant {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; InlineInstant);
 
 /// The counting view of `candidate`'s index entries (K8): what a fresh
 /// singleton parser would be configured with now. Recorded at job start,
@@ -1909,14 +1891,8 @@ impl Default for PaceTable {
     }
 }
 
-impl HeapLayoutBound for PaceTable {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        // Fixed slots of keys, `Instant`s, `OpenStamp`s and offsets.
-        c.add(0)
-    }
-}
+// Fixed slots of keys, `Instant`s, `OpenStamp`s and offsets.
+crate::heap_layout_bound::no_heap!(true; PaceTable);
 
 /// The guard's start rule for one large ordinary start (§6 table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2162,13 +2138,7 @@ impl Default for ParentRestarts {
         Self([None; ROTATION_KEYS])
     }
 }
-impl HeapLayoutBound for ParentRestarts {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ParentRestarts);
 impl ParentRestarts {
     /// The slot of `key` (`parent_restart_key(namespace, scope)`), created as
     /// needed; refreshes `touched`. There is no reset branch: a new receipt
@@ -6413,13 +6383,7 @@ pub(in crate::snapshots) enum DebtReason {
     /// it is strict; parked until a member changes.
     ProbeBudgetOrder,
 }
-impl HeapLayoutBound for DebtReason {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; DebtReason);
 
 impl DebtReason {
     fn settleable(self) -> bool {

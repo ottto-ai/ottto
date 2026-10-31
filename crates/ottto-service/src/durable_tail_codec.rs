@@ -1373,14 +1373,8 @@ durable_struct!(DurableMarks {
     N title_line: Option<(u64, u64)>,
     N unknown: bool,
 });
-impl crate::heap_layout_bound::HeapLayoutBound for DurableMarks {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    // Plain integers: no heap, one walker visit for the whole struct.
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+// Plain integers: no heap, one walker visit for the whole struct.
+crate::heap_layout_bound::no_heap!(true; DurableMarks);
 
 impl DurableMarks {
     /// Records the current line's end as the latest assignment.
