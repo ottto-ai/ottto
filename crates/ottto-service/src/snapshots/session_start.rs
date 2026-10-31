@@ -3027,6 +3027,170 @@ mod tests {
             "iterations": [{"input_tokens": 1}, {"input_tokens": 2}]}}})));
     }
 
+    /// Cost receipt over local transcripts listed in
+    /// `OTTTO_SESSION_START_COST_FILES` (`claude|codex<TAB>path` per line).
+    /// A shadow state replays each file beside the real parser (its own state
+    /// pre-frozen) so the timer covers only session-start work. Prints
+    /// aggregates only; no transcript text leaves the test.
+    #[test]
+    #[ignore = "local cost receipt over real transcripts"]
+    fn session_start_cost_receipt() {
+        use super::super::{
+            apply_claude_code_line, apply_codex_line, codex_last_usage, CodexOwnershipBoundary,
+            SnapshotAccumulator,
+        };
+        use std::time::{Duration, Instant};
+        let Ok(list) = std::env::var("OTTTO_SESSION_START_COST_FILES") else {
+            return;
+        };
+        let list = String::from_utf8(std::fs::read(list).expect("file list")).expect("utf-8");
+        #[derive(Default)]
+        struct Totals {
+            files: usize,
+            lines: usize,
+            bytes: usize,
+            decode: Duration,
+            parse: Duration,
+            shadow: Duration,
+            measured: usize,
+            peak_held: Vec<usize>,
+            retained: Vec<usize>,
+            wire: Vec<usize>,
+        }
+        let mut totals = [Totals::default(), Totals::default()];
+        for entry in list.lines() {
+            let Some((kind, path)) = entry.split_once('\t') else {
+                continue;
+            };
+            let (source, slot) = match kind {
+                "claude" => (SnapshotSource::ClaudeCode, 0),
+                "codex" => (SnapshotSource::Codex, 1),
+                _ => continue,
+            };
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            let total = &mut totals[slot];
+            let started = Instant::now();
+            let values = bytes
+                .split(|byte| *byte == b'\n')
+                .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+                .collect::<Vec<_>>();
+            total.decode += started.elapsed();
+            total.files += 1;
+            total.lines += values.len();
+            total.bytes += bytes.len();
+            let mut parser = SnapshotAccumulator::new(source);
+            parser.session_start.frozen = true;
+            let mut shadow = SessionStartState::default();
+            let mut peak = 0usize;
+            for value in &values {
+                let started = Instant::now();
+                if source == SnapshotSource::ClaudeCode {
+                    apply_claude_code_line(value, &mut parser);
+                } else {
+                    apply_codex_line(value, &mut parser);
+                }
+                total.parse += started.elapsed();
+                let started = Instant::now();
+                if source == SnapshotSource::ClaudeCode {
+                    shadow.observe_claude_line(
+                        value,
+                        parser.claude_response_sequence,
+                        parser.workspace_path.as_deref(),
+                    );
+                } else {
+                    if str_at(value, "type") == Some("session_meta") {
+                        shadow.note_codex_session_meta(value);
+                    }
+                    if parser.codex_ownership_boundary == CodexOwnershipBoundary::AllLocal {
+                        shadow.observe_codex_line(value, parser.workspace_path.as_deref());
+                        if let Some(usage) = codex_last_usage(value) {
+                            shadow.note_codex_request(&usage);
+                        }
+                    }
+                }
+                total.shadow += started.elapsed();
+                if !shadow.frozen {
+                    peak =
+                        peak.max(crate::heap_layout_bound::bound(&shadow, usize::MAX).unwrap_or(0));
+                }
+            }
+            if source == SnapshotSource::ClaudeCode {
+                // The parser resolves responses at finish; replay them.
+                let mut responses = parser
+                    .claude_responses
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                responses.sort_by_key(|response| response.sequence);
+                for response in responses.into_iter().filter_map(|response| {
+                    response.resolve_with(&parser.claude_responses.selectors)
+                }) {
+                    shadow.note_claude_response(
+                        response.sequence,
+                        &response.usage,
+                        response
+                            .computed_effective_input_context
+                            .unwrap_or_else(|| response.usage.effective_input_context()),
+                        response.tool_uses.len(),
+                    );
+                }
+            }
+            let started = Instant::now();
+            let method = if slot == 0 {
+                CLAUDE_PARTS_METHOD
+            } else {
+                CODEX_PARTS_METHOD
+            };
+            // Upper bound on the wire: D6 is kept whenever request 1 reconciles.
+            let first_turn = shadow.requests[0].map(|request| request.context_tokens);
+            let finished = shadow.finish(true, first_turn, method, None, Some(&SALT));
+            total.shadow += started.elapsed();
+            total.peak_held.push(peak);
+            if let Some(mut start) = finished {
+                start.apply_upload_policy(true, false);
+                total.measured += 1;
+                total
+                    .retained
+                    .push(crate::heap_layout_bound::bound(&start, usize::MAX).unwrap_or(0));
+                total
+                    .wire
+                    .push(serde_json::to_vec(&start).expect("serialize").len());
+            }
+        }
+        let quantile = |values: &mut Vec<usize>, q: f64| -> usize {
+            values.sort_unstable();
+            values
+                .get((values.len().saturating_sub(1) as f64 * q).round() as usize)
+                .copied()
+                .unwrap_or(0)
+        };
+        for (name, total) in ["claude", "codex"].iter().zip(totals.iter_mut()) {
+            let per_file =
+                |duration: Duration| duration.as_secs_f64() * 1e6 / total.files.max(1) as f64;
+            println!(
+                "session_start_cost {name}: files={} lines={} bytes={} measured={} decode_us_per_file={:.1} parse_us_per_file={:.1} session_start_us_per_file={:.1} pct_of_parse={:.3} pct_of_decode_plus_parse={:.3} peak_held_p50={} peak_held_max={} retained_p50={} retained_max={} wire_p50={} wire_max={}",
+                total.files,
+                total.lines,
+                total.bytes,
+                total.measured,
+                per_file(total.decode),
+                per_file(total.parse),
+                per_file(total.shadow),
+                100.0 * total.shadow.as_secs_f64() / total.parse.as_secs_f64().max(1e-9),
+                100.0 * total.shadow.as_secs_f64()
+                    / (total.parse + total.decode).as_secs_f64().max(1e-9),
+                quantile(&mut total.peak_held, 0.5),
+                quantile(&mut total.peak_held, 1.0),
+                quantile(&mut total.retained, 0.5),
+                quantile(&mut total.retained, 1.0),
+                quantile(&mut total.wire, 0.5),
+                quantile(&mut total.wire, 1.0),
+            );
+        }
+    }
+
     /// M1, SOURCE P2-5: an opening call's `L` span is its id alone, apart
     /// from the tool name its `OpeningCall` holds (`U`); request-shape and
     /// blob keys are held only as their domain-separated digests, and an
