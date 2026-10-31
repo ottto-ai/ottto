@@ -431,13 +431,18 @@ impl AcceptedSession {
         shares.retain(|share| present.contains(&share.bucket));
         shares
     }
-    pub(super) fn exceeds_share_bound(&self, item: &SnapshotItem, item_cap: usize) -> bool {
-        self.shares_after(
-            &serde_json::to_value(item).expect("snapshot JSON"),
-            self.shares.iter().cloned(),
-        )
-        .len()
-            > max_shares(item_cap)
+    pub(super) fn exceeds_share_bound(
+        &self,
+        item: &SnapshotItem,
+        item_cap: usize,
+        new_shares: usize,
+    ) -> bool {
+        // The union cannot exceed prior + new shares; avoid building a wire
+        // Value on the ordinary path well below the negotiated bound.
+        self.shares.len().saturating_add(new_shares) > max_shares(item_cap)
+            && serde_json::to_value(item).map_or(true, |body| {
+                self.shares_after(&body, self.shares.iter().cloned()).len() > max_shares(item_cap)
+            })
     }
     pub(super) fn authority_hash(&self, authority: &AuthorityKey) -> [u8; 32] {
         authority_hash(self.key.as_ref().expect("bound accepted epoch"), authority)
@@ -962,9 +967,9 @@ impl AcceptedBuckets {
         self.record_with_diagnostics(body, false);
     }
     fn record_with_diagnostics(&mut self, body: &Value, report: bool) {
-        let Some(_) = self.1.as_ref() else {
+        if self.1.is_none() {
             return;
-        };
+        }
         if body["provenance"]["collector"].as_str() != Some(COLLECTOR) {
             return;
         }
@@ -979,14 +984,18 @@ impl AcceptedBuckets {
         }
         let item_cap = self.4;
         let limit = max_shares(item_cap);
-        let entry = self.session_entry(session, report).expect("bound fingerprint key");
-        let prior = std::mem::take(&mut entry.shares);
-        let preserved = (item_cap > MAX_ITEM_BYTES).then(|| prior.clone());
-        let mut shares = entry.shares_after(body, prior.into_iter());
+        let entry = self
+            .session_entry(session, report)
+            .expect("bound fingerprint key");
+        let mut shares = if item_cap > MAX_ITEM_BYTES {
+            entry.shares_after(body, entry.shares.iter().cloned())
+        } else {
+            let prior = std::mem::take(&mut entry.shares);
+            entry.shares_after(body, prior.into_iter())
+        };
         // An increased-cap upload is preflighted before POST. Preserve prior
         // proof defensively if an unexpected ACK would exceed its bound.
         if item_cap > MAX_ITEM_BYTES && shares.len() > limit {
-            entry.shares = preserved.expect("increased cap");
             entry.incomplete = true;
             return;
         }

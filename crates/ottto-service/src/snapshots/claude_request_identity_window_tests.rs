@@ -2683,6 +2683,44 @@ fn advertised_cap_retags_previously_stripped_accepted_body() {
         counts["identity_cap"]["accepted_state_unknown_cause"]["incomplete"],
         0
     );
+    // One more share must hold before POST and leave accepted proof untouched.
+    let mut over = large.clone();
+    let added = over.usage_buckets[0].model_usage[1].clone();
+    let last = over.usage_buckets.last_mut().unwrap();
+    last.model_usage.push(added.clone());
+    proof.push(Contribution {
+        bucket_start: last.bucket_start.clone(),
+        row_key: row_key_from_model_usage(&added),
+        usage: holder_usage(&added, None),
+        identity: RequestIdentity::Tagged(AuthorityKey {
+            login: None,
+            org: Some(D64.into()),
+            basis: identity::TRANSCRIPT_ORG,
+        }),
+    });
+    let top = over
+        .model_usage
+        .iter_mut()
+        .find(|row| row.model == "b")
+        .unwrap();
+    top.input_tokens += added.input_tokens;
+    top.request_count += added.request_count;
+    sticky_receiver_totals(&mut over);
+    let before = sticky_money(&over);
+    let accepted = serde_json::to_vec(&ledger).unwrap();
+    assert_eq!(
+        identity::apply_with_reserved_bytes_for_test(
+            &mut over,
+            &proof,
+            &ledger,
+            0,
+            Some(2_097_152)
+        )
+        .unwrap(),
+        Tagged::Held
+    );
+    assert_eq!(sticky_money(&over), before);
+    assert_eq!(serde_json::to_vec(&ledger).unwrap(), accepted);
 }
 
 /// [off=main] No hint, malformed values and smaller limits use main's exact

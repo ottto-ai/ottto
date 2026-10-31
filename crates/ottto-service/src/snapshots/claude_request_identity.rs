@@ -1117,29 +1117,28 @@ fn apply_grouped_with_accepted(
             );
         }
     }
-    if max_item_bytes > MAX_ITEM_BYTES
-        && known.map_or_else(
-            || {
-                grouping
-                    .groups
-                    .values()
-                    .flat_map(BTreeMap::values)
-                    .filter(|group| group.by_key.keys().any(Option::is_some))
-                    .map(|group| group.by_key.len())
-                    .sum::<usize>()
-                    > accepted::max_shares(max_item_bytes)
-            },
-            |state| state.exceeds_share_bound(item, max_item_bytes),
-        )
-    {
-        over_cap.insert(OverCap::PartsPerItem);
-        budget::record(&budget::Counts {
-            accepted_state_unknown: 1,
-            accepted_state_unknown_cause: budget::UnknownCauses::one(
-                accepted::UnknownCause::Incomplete,
-            ),
-            ..Default::default()
-        });
+    if max_item_bytes > MAX_ITEM_BYTES && over_cap.is_empty() {
+        let new_shares = grouping
+            .groups
+            .values()
+            .flat_map(BTreeMap::values)
+            .filter(|group| group.by_key.keys().any(Option::is_some))
+            .map(|group| group.by_key.len())
+            .sum::<usize>();
+        if item.usage_buckets.len() > accepted::MAX_BUCKETS
+            || known.map_or(new_shares > accepted::max_shares(max_item_bytes), |state| {
+                state.exceeds_share_bound(item, max_item_bytes, new_shares)
+            })
+        {
+            over_cap.insert(OverCap::PartsPerItem);
+            budget::record(&budget::Counts {
+                accepted_state_unknown: 1,
+                accepted_state_unknown_cause: budget::UnknownCauses::one(
+                    accepted::UnknownCause::Incomplete,
+                ),
+                ..Default::default()
+            });
+        }
     }
     let unpriced = over_cap
         .is_empty()
