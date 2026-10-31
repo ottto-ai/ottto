@@ -378,6 +378,188 @@ impl SnapshotUploadProgress {
         Ok(())
     }
 
+    /// Reserve the current ledger plus all possible additions from this page.
+    /// Keeping both predecessor and replacement values bounds mixed ACK and
+    /// refusal responses without evicting accepted shares or cache evidence.
+    ///
+    /// Over the bound, cache evidence of settled sessions is pruned first:
+    /// no pending head obligation and in neither the frozen logical page nor
+    /// the caller's `page` (every batch/probe of it). Such a session reopens
+    /// through the missing-head bootstrap. Returns true after a prune, which
+    /// the caller persists before its POST. If live custody alone still
+    /// exceeds the bound nothing changes and the route takes a paced hold.
+    pub(super) fn admit_ack_custody<'a, 'p, T: Serialize + 'a>(
+        &mut self,
+        items: impl IntoIterator<Item = &'a T>,
+        page: impl IntoIterator<Item = &'p str>,
+        fingerprint: &impl Fn(&T) -> &str,
+        body_witness: &impl Fn(&T) -> String,
+    ) -> Result<bool> {
+        let Some(recovery) = self.ack_recovery.clone() else {
+            return Ok(false);
+        };
+        let items = items.into_iter().collect::<Vec<_>>();
+        let refused = |progress: &Self| -> anyhow::Error {
+            AckSettlementRequired {
+                retained_ack_count: progress.accepted_fingerprints.len(),
+                retained_stale_ack_count: progress.retained_stale_ack_count,
+                capacity: progress.ack_capacity,
+                deferred_entity_count: items.len(),
+            }
+            .into()
+        };
+        if recovery.custody_held() {
+            return Err(refused(self));
+        }
+        if recovery
+            .admit_progress_bytes(self.custody_bytes(&items, fingerprint, body_witness)?)
+            .is_ok()
+        {
+            return Ok(false);
+        }
+        let mut live = recovery.custody_page().clone();
+        live.extend(page.into_iter().map(cache_session_key));
+        for item in &items {
+            if let Some(session) = serde_json::to_value(item)?
+                .get("source_session_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                live.insert(cache_session_key(session));
+            }
+        }
+        for file in self.pending_cache_heads.values() {
+            live.extend(file.entities.values().cloned());
+            live.extend(file.reselected_heads.keys().cloned());
+        }
+        let mut pruned = self.clone();
+        pruned
+            .accepted_cache_states
+            .retain(|key, _| live.contains(key));
+        let sessions = self.accepted_cache_states.len() - pruned.accepted_cache_states.len();
+        for key in self.accepted_cache_states.keys() {
+            if !live.contains(key) {
+                pruned.accepted_cache_heads.remove(key);
+            }
+        }
+        if sessions > 0
+            && recovery
+                .admit_progress_bytes(pruned.custody_bytes(&items, fingerprint, body_witness)?)
+                .is_ok()
+        {
+            recovery.custody_pruned(sessions);
+            *self = pruned;
+            return Ok(true);
+        }
+        recovery.hold_custody();
+        Err(refused(self))
+    }
+
+    /// Freeze the logical page's sessions before its bootstrap and batches.
+    /// OFF (no ACK custody) does no work.
+    pub(super) fn freeze_custody_page(&mut self, items: &[SnapshotItem]) {
+        if let Some(recovery) = self.ack_recovery.as_deref_mut() {
+            recovery.freeze_custody_page(
+                items
+                    .iter()
+                    .map(|item| cache_session_key(&item.source_session_id))
+                    .collect(),
+            );
+        }
+    }
+
+    /// Conservative serialized size of this ledger after any response to items.
+    fn custody_bytes<T: Serialize>(
+        &self,
+        items: &[&T],
+        fingerprint: &impl Fn(&T) -> &str,
+        body_witness: &impl Fn(&T) -> String,
+    ) -> Result<u64> {
+        let mut projected = Self::new(
+            self.destination_namespace_hash.clone(),
+            self.active_quarantine_witness
+                .clone()
+                .context("upload witness missing")?,
+        );
+        projected.accepted_identity_buckets = self.accepted_identity_buckets.clone();
+        let mut padding = 20_u64; // generation may grow to u64::MAX at save
+        for &item in items {
+            let fp = fingerprint(item);
+            let body = body_witness(item);
+            let value = serde_json::to_value(item)?;
+            if let Some(session) = value
+                .get("source_session_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                let key = cache_session_key(session);
+                if let Some(state) = self.accepted_cache_states.get(&key) {
+                    projected
+                        .accepted_cache_states
+                        .entry(key.clone())
+                        .or_insert_with(|| state.clone());
+                }
+                // Validated returned head tokens are exactly 64 hex bytes.
+                projected.accepted_cache_heads.insert(key, "f".repeat(64));
+            }
+            let before_identity = serde_json::to_value(&projected.accepted_identity_buckets)?;
+            projected.record_stored_state(item, false, None, true)?;
+            let after_identity = serde_json::to_value(&projected.accepted_identity_buckets)?;
+            if let Some(sessions) = after_identity.as_object() {
+                for (key, session) in sessions {
+                    if before_identity.get(key) != Some(session) {
+                        padding = padding.saturating_add(
+                            serde_json::to_vec_pretty(
+                                &serde_json::json!({"accepted_identity_buckets": {key: session}}),
+                            )?
+                            .len() as u64,
+                        );
+                    }
+                }
+            }
+            if let Some(session) = value
+                .get("source_session_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                if let Some(state) = projected
+                    .accepted_cache_states
+                    .get(&cache_session_key(session))
+                {
+                    padding =
+                        padding.saturating_add(serde_json::to_vec_pretty(&serde_json::json!({"accepted_cache_states": {cache_session_key(session): state}}))?.len() as u64);
+                }
+            }
+            if let Some(record) = self.quarantined_fingerprints.get(fp) {
+                projected
+                    .quarantined_fingerprints
+                    .insert(fp.into(), record.clone());
+            }
+            projected.quarantine_permanent_body(
+                fp,
+                &body,
+                reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
+            );
+            // Keep the refusal and ACK simultaneously in the projection; the
+            // response can select either, never more than this union.
+            projected.accepted_fingerprints.insert(fp.into());
+            projected.accepted_body_witnesses.insert(fp.into(), body);
+            if let Some(context) = &self.context_resend.active {
+                projected
+                    .accepted_body_contexts
+                    .insert(fp.into(), context.clone());
+            }
+            // Numeric widths, enum variants and map punctuation for all
+            // refusal outcomes are bounded independently of source data.
+            padding = padding.saturating_add(1024);
+        }
+        // self already reserves every retained identity session once. Changed
+        // session snapshots above reserve mixed-response/replacement space;
+        // unchanged cloned sessions must not consume the budget a second time.
+        projected.accepted_identity_buckets = Default::default();
+        let mut length = SnapshotPackingLength { bytes: 0 };
+        serde_json::to_writer_pretty(&mut length, self)?;
+        serde_json::to_writer_pretty(&mut length, &projected)?;
+        Ok((length.bytes as u64).saturating_add(padding))
+    }
+
     pub(super) fn admit_ack_batch(&self, new_acks: usize) -> Result<()> {
         if new_acks > 0
             && self.accepted_fingerprints.len().saturating_add(new_acks) > self.ack_capacity

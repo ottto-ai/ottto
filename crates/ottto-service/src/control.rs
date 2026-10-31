@@ -1650,6 +1650,11 @@ fn handle_command(
                 ));
             }
             let home = local_lifecycle_home()?;
+            #[cfg(target_os = "macos")]
+            crate::snapshots::invalidate_claude_state_v2_sessions(
+                &home.join("Library/Application Support/Ottto"),
+            )
+            .map_err(|_| LocalApiError::StatePoisoned)?;
             let mut result = execute_local_uninstall(&home, UninstallExecutionOptions::DAEMON);
             sweep_telemetry_keys_for_uninstall(&mut result);
             match &authorization {
@@ -7470,6 +7475,9 @@ fn forget_installation_state_locked() -> Result<(), LocalApiError> {
         .map_err(|_| LocalApiError::StatePoisoned)?;
     let support_dir = default_support_dir();
     crate::upload_receipts::clear(&support_dir).map_err(|_| LocalApiError::StatePoisoned)?;
+    // Closing registered native handles must not prevent the established
+    // whole-tree privacy cleanup, including unregistered/legacy namespaces.
+    let v2_erasure = crate::snapshots::erase_claude_state_v2_artifacts(&support_dir);
     let path = support_dir.join("snapshots");
     if path.is_dir() {
         fs::remove_dir_all(&path).map_err(|_| LocalApiError::StatePoisoned)?;
@@ -7478,7 +7486,7 @@ fn forget_installation_state_locked() -> Result<(), LocalApiError> {
     }
     crate::backfill::remove_backfill_state(&support_dir)
         .map_err(|_| LocalApiError::StatePoisoned)?;
-    Ok(())
+    v2_erasure.map_err(|_| LocalApiError::StatePoisoned)
 }
 
 #[cfg(test)]
@@ -25485,6 +25493,33 @@ for line in sys.stdin:
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
+    }
+
+    /// [regress] forget removes more than 64 legacy claude namespaces and progress files.
+    #[test]
+    #[serial]
+    fn forget_removes_more_than_64_legacy_claude_namespaces_and_progress_files() {
+        let _lock = lock_backend_test_env();
+        let env = history_choice_test_env();
+        let snapshots = env.root.join("snapshots");
+        for namespace in 0..70 {
+            let dir = snapshots
+                .join("destinations")
+                .join(format!("{namespace:064x}"));
+            fs::create_dir_all(&dir).unwrap();
+            for name in [
+                "claude_code-legacy-scan-index.json",
+                "claude_code-legacy-scan-index-upload-progress.json",
+                "claude_code-scan-index-v3.json.v2.sqlite",
+            ] {
+                fs::write(dir.join(name), b"synthetic-forget-canary").unwrap();
+            }
+        }
+        {
+            let _identity_lock = lock_setup_run_binding();
+            forget_installation_state_locked().unwrap();
+        }
+        assert!(!snapshots.exists());
     }
 
     #[test]
