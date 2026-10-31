@@ -2145,6 +2145,47 @@ impl SnapshotUploadProgress {
         changed
     }
 
+    /// Source-held retries use ordinary pacing without spending a failure.
+    /// Offered bodies keep their lease: transport/token failures still owe it.
+    fn defer_held_quarantine_retries(
+        &mut self,
+        offered: &[SnapshotItem],
+        source: SnapshotSource,
+    ) -> bool {
+        let mut deferred = 0;
+        self.active_quarantine_retries.retain(|fingerprint| {
+            if offered
+                .iter()
+                .any(|item| &item.snapshot_fingerprint == fingerprint)
+            {
+                return true;
+            }
+            let Some(record) = self.quarantined_fingerprints.get_mut(fingerprint) else {
+                return true;
+            };
+            if record.contract_retry_claims.is_some()
+                || record.disposition != SnapshotQuarantineDisposition::RetryPending
+            {
+                return true;
+            }
+            record.witness = self
+                .active_quarantine_witness
+                .clone()
+                .expect("upload progress always has an active quarantine witness");
+            record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+            deferred += 1;
+            false
+        });
+        if deferred > 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "quarantine_retry",
+                source.api_slug(),
+                &serde_json::json!({"action": "deferred_held", "count": deferred}),
+            );
+        }
+        deferred > 0
+    }
+
     /// The logical offer ends with the main upload call. Classify each
     /// attempted lease by its validated durable outcome; a lease still held
     /// had no validated response and keeps its reserved cooldown.
@@ -8005,6 +8046,9 @@ fn finish_sync_source(
     }
     // The same hook every resend path calls; nothing held is left by now.
     index.retain_claude_history_emission_permitted(&mut scan_result.snapshots);
+    if upload_progress.defer_held_quarantine_retries(&scan_result.snapshots, source) {
+        upload_progress.save(&upload_progress_path)?;
+    }
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
     let mut accepted = 0;
@@ -17893,7 +17937,7 @@ mod tests {
     /// yielded no upload item. A vacuous completed upload must not let the
     /// disposable ledger erase the index-owned retry obligation.
     #[test]
-    fn due_not_pending_quarantine_is_resent_once_without_burning_an_unsent_deadline() {
+    fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
         let root = test_dir("due-quarantine-terminal-unhealthy-empty-scan");
         let session_path = root.join("session.jsonl");
         std::fs::create_dir_all(&root).expect("create retry fixture root");
@@ -17945,15 +17989,23 @@ mod tests {
             snapshot_quarantine_witness(SnapshotSource::Pi),
         );
         progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
-        let scan = crate::snapshots::scan_source_roots(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            collected_at,
-            crate::snapshots::BACKFILL_WINDOW_DAYS,
-        )
-        .expect("independently backed-off terminal traversal returns a scan receipt");
+        let failures = progress.quarantined_fingerprints[&fingerprint].failed_reconstruction_count;
+        let (scan, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+            crate::snapshots::scan_source_roots(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                collected_at,
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+            )
+            .expect("independently backed-off terminal traversal returns a scan receipt")
+        });
+        assert!(
+            reads.is_empty(),
+            "source hold must not acquire the transcript"
+        );
         assert!(scan.snapshots.is_empty());
+        assert!(progress.defer_held_quarantine_retries(&scan.snapshots, SnapshotSource::Pi));
         assert!(!scan.census_complete);
         let mut accepted = 0;
         let mut upload_calls = 0;
@@ -17978,10 +18030,9 @@ mod tests {
             .quarantined_snapshot_fingerprints
             .get(&fingerprint)
             .expect("an empty scan must leave the retry armed");
-        assert_eq!(
-            retained.retry_after_unix_seconds, 0,
-            "claiming a retry without a send must keep its original due deadline"
-        );
+        assert!(retained.retry_after_unix_seconds > current_unix_seconds());
+        assert!(snapshot_quarantine_deadline_is_bounded(retained));
+        assert_eq!(retained.failed_reconstruction_count, failures);
         assert!(
             index
                 .legacy_settlement_reconciliation_pending_fingerprints()
@@ -18008,6 +18059,12 @@ mod tests {
             snapshot_quarantine_witness(SnapshotSource::Pi),
         )
         .unwrap();
+        assert!(!progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        progress
+            .quarantined_fingerprints
+            .get_mut(&fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
         assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
         let hints =
             save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
@@ -18030,6 +18087,7 @@ mod tests {
         assert_eq!(reads.values().sum::<usize>(), 1);
         assert_eq!(retry.snapshots.len(), 1);
         assert_eq!(retry.snapshots[0].snapshot_fingerprint, fingerprint);
+        assert!(!progress.defer_held_quarantine_retries(&retry.snapshots, SnapshotSource::Pi));
         // The existing DNS incident class fails before a batch can be sent.
         let unsent = upload_resumable_batches(
             &retry.snapshots,
