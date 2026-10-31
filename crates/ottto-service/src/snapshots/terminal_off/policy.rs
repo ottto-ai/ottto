@@ -1,82 +1,87 @@
 //! Machine-local opt-in, using the existing support-directory sentinel pattern.
 //! No ScanIndex field, upload field, remote setting or agent-writable API.
-use std::path::Path;
+
+/// Declares a module's `enabled()` and `enabled_at(support)`: one owner-set
+/// marker in the support directory, sampled once per process.
+macro_rules! local_switch {
+    ($marker:expr, marker_enables = $enables:literal, test_default = $default:literal) => {
+        pub(super) fn enabled() -> bool {
+            #[cfg(test)]
+            {
+                // A test must opt in on its own thread, never read the host setting.
+                ENABLED.with(std::cell::Cell::get)
+            }
+            #[cfg(not(test))]
+            {
+                // Pin policy for this process, including worker threads and yields.
+                // Ron changes the marker himself and restarts the daemon to apply it.
+                static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
+            }
+        }
+        fn enabled_at(support: &std::path::Path) -> bool {
+            // As with mcp_inventory/disabled and context_footprint/disabled, the
+            // owner's local marker is the setting. Refuse symlinks and non-files.
+            let marker = std::fs::symlink_metadata(support.join($marker))
+                .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink());
+            marker == $enables
+        }
+        #[cfg(test)]
+        thread_local! {
+            static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new($default) };
+        }
+    };
+}
+pub(super) use local_switch;
 
 pub(super) const NAME: &str = "claude_terminal_off_enabled";
-fn enabled_at(support: &Path) -> bool {
-    marker_at(support, NAME)
-}
-pub(in crate::snapshots) fn marker_at(support: &Path, name: &str) -> bool {
-    // As with mcp_inventory/disabled and context_footprint/disabled, the
-    // owner's local marker is the setting. Refuse symlinks and non-files.
-    std::fs::symlink_metadata(support.join(name))
-        .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
-}
+local_switch!(NAME, marker_enables = true, test_default = false);
 
-/// A process-pinned support-dir switch behind the caller's own lock-free
-/// cell. The owner changes the marker and restarts the daemon to apply it.
-pub(in crate::snapshots) fn pinned_marker(cell: &std::sync::OnceLock<bool>, name: &str) -> bool {
-    *cell.get_or_init(|| marker_at(&ottto_core::default_support_dir(), name))
-}
-
-pub(super) fn enabled() -> bool {
-    #[cfg(test)]
-    {
-        // A test must opt in on its own thread, never read the host setting.
-        ENABLED.with(std::cell::Cell::get)
-    }
-    #[cfg(not(test))]
-    {
-        // Pin policy for this process, including worker threads and yields.
-        // Ron changes the marker himself and restarts the daemon to apply it.
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
-    }
-}
-
-/// Q-W policy is pinned at first preparation, including absent/OFF markers.
-/// Fixtures read their scratch support directory, never the host policy.
-pub(in crate::snapshots) fn admission_reoffer_window(support: &Path) -> bool {
-    const NAME: &str = "claude_admission_reoffer_window_enabled";
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if cfg!(test) {
-        marker_at(support, NAME)
-    } else {
-        pinned_marker(&ENABLED, NAME)
-    }
-}
-
+/// Sets a test switch for this thread until dropped; unwind restores the
+/// previous value. Rc makes the guard !Send/!Sync, so moving it cannot
+/// silently change another fixture's policy.
 #[cfg(test)]
-thread_local! {
-    static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-#[cfg(test)]
-pub(crate) struct ClaudeTerminalOffForTest {
+pub(crate) struct ThreadSwitchForTest {
+    slot: &'static std::thread::LocalKey<std::cell::Cell<bool>>,
     previous: bool,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 #[cfg(test)]
+impl ThreadSwitchForTest {
+    pub(crate) fn set(
+        slot: &'static std::thread::LocalKey<std::cell::Cell<bool>>,
+        value: bool,
+    ) -> Self {
+        Self {
+            slot,
+            previous: slot.with(|switch| switch.replace(value)),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+#[cfg(test)]
+impl Drop for ThreadSwitchForTest {
+    fn drop(&mut self) {
+        self.slot.with(|switch| switch.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ClaudeTerminalOffForTest {
+    _switch: ThreadSwitchForTest,
+}
+#[cfg(test)]
 impl ClaudeTerminalOffForTest {
     pub(crate) fn enabled() -> Self {
-        Self::set(true)
+        Self {
+            _switch: ThreadSwitchForTest::set(&ENABLED, true),
+        }
     }
     /// The thread's test policy, ignoring any completion-path override.
     /// Retained feature fixtures use it to select their containment setup;
     /// main tests keep the original helper at the default OFF.
     pub(crate) fn active() -> bool {
         ENABLED.with(std::cell::Cell::get)
-    }
-    fn set(enabled: bool) -> Self {
-        Self {
-            previous: ENABLED.with(|slot| slot.replace(enabled)),
-            _thread: std::marker::PhantomData,
-        }
-    }
-}
-#[cfg(test)]
-impl Drop for ClaudeTerminalOffForTest {
-    fn drop(&mut self) {
-        ENABLED.with(|slot| slot.set(self.previous));
     }
 }
 

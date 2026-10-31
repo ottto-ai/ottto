@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -22,6 +22,7 @@ use ottto_protocol::{
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
+use crate::locked_state_dir::replace_json_cache;
 use crate::snapshots::{
     bounded_compaction_events, bounded_compaction_timestamps, LocalContextPoint,
     SnapshotCompactionEvent, SnapshotItem, SnapshotModelUsage, SnapshotSource,
@@ -1032,15 +1033,12 @@ fn write_cache(path: &Path, cache: &ActiveSessionCache) -> Result<()> {
         .with_context(|| format!("create active session cache dir {}", parent.display()))?;
     // Compact: the status path reads this whole file on every poll.
     let payload = serde_json::to_vec(cache).context("serialize active session cache")?;
-    let temp_path = path.with_extension("json.tmp");
-    let mut temp = File::create(&temp_path)
-        .with_context(|| format!("create active session cache temp {}", temp_path.display()))?;
-    temp.write_all(&payload)
-        .with_context(|| format!("write active session cache temp {}", temp_path.display()))?;
-    temp.sync_all().ok();
-    std::fs::rename(&temp_path, path)
-        .with_context(|| format!("rename active session cache into place {}", path.display()))?;
-    Ok(())
+    replace_json_cache(
+        path,
+        &payload,
+        "active session cache",
+        "active session cache",
+    )
 }
 
 #[cfg(test)]
@@ -2620,7 +2618,7 @@ mod tests {
     #[test]
     fn own_request_parts_gate_account_fallbacks() {
         // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         use crate::claude_local_otel::{
             ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipEvidence,
             ClaudeTraceOwnershipLoadReport,
@@ -2698,7 +2696,7 @@ mod tests {
                     .or_default()
                     .push(owner);
             }
-            let mut items = crate::snapshots::parse_claude_code_jsonl_file(
+            let mut items = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
                 &transcript,
                 "2026-08-02T07:01:00Z",
                 "child-fp".to_string(),
