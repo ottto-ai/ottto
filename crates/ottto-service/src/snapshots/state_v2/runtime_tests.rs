@@ -54,9 +54,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let support = crate::test_scratch::private_dir("ottto-v2-route")
-            .canonicalize()
-            .unwrap();
+        let support = crate::test_scratch::canonical_private_dir("ottto-v2-route");
         let parent = support.join("snapshots/destinations").join("b".repeat(64));
         fs::create_dir_all(&parent).unwrap();
         Self {

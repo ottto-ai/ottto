@@ -4456,7 +4456,7 @@ fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
     use std::os::unix::fs::MetadataExt;
     {
         for held in [false, true] {
-            let scratch = crate::test_scratch::ScratchDir::new("growth-identity-copy");
+            let scratch = crate::test_scratch::ScratchDir::canonical("growth-identity-copy");
             let root = scratch.join("sources");
             fs::create_dir_all(&root).unwrap();
             let path = root.join(format!("{ROOT}.jsonl"));

@@ -2491,7 +2491,7 @@ mod growth_tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let root = crate::test_scratch::private_dir("ottto-v2-growth");
+            let root = crate::test_scratch::canonical_private_dir("ottto-v2-growth");
             let path = root.join("session.jsonl");
             fs::write(&path, b"old\n").unwrap();
             let key = local_index_key(&path);
@@ -2580,7 +2580,7 @@ mod growth_tests {
     }
     fn restart_lenient(index: &ScanIndex) -> ScanIndex {
         if index.v2.is_some() || index.decode_holds.contains_field("growth_retention") {
-            let root = crate::test_scratch::private_dir("growth-row-restart");
+            let root = crate::test_scratch::canonical_private_dir("growth-row-restart");
             let mut restored = state_v2::money_test_support::roundtrip_rows(
                 index,
                 &root.join("state.v2.sqlite.import"),

@@ -7,11 +7,7 @@ use std::path::PathBuf;
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
-        Self(
-            crate::test_scratch::private_dir("ottto-state-v2")
-                .canonicalize()
-                .unwrap(),
-        )
+        Self(crate::test_scratch::canonical_private_dir("ottto-state-v2"))
     }
     fn path(&self) -> PathBuf {
         self.0.join("index.v2.sqlite.import")
@@ -1313,14 +1309,10 @@ fn format_one_physical_columns_match_the_four_table_contract() {
     assert!(RecordKind::parse("not.registered").is_err());
     assert!(RecordKind::parse("raw_hold.unknown").is_err());
 }
-/// [format] whole traversal fields have bounded caps and raw holds stay exact.
+/// [format] the two measured >1 MiB whole fields have bounded caps and raw holds stay exact.
 #[test]
 fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
-    for kind in [
-        "scan_state.traversal",
-        "scan_state.scan_residue_witness",
-        "scan_state.claude_stale_family_carry",
-    ] {
+    for kind in ["scan_state.traversal", "v1_field.birth_store"] {
         let key = RowKey::record(kind, b"family".to_vec(), 0).unwrap();
         for (size, ok) in [
             (MUTABLE_VALUE_BYTES + 1, true),

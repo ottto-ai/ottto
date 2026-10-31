@@ -114,7 +114,7 @@ fn import_sealing_is_idempotent_but_never_rebinds_a_different_db_or_progress() {
 /// [money] post commit cleanup receipt binds latest db generation and refuses rollback.
 #[test]
 fn post_commit_cleanup_receipt_binds_latest_db_generation_and_refuses_rollback() {
-    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-postcommit-generation");
+    let scratch = crate::test_scratch::ScratchDir::canonical("v2-ack-postcommit-generation");
     let path = scratch.join("progress");
     let db_path = scratch.join("db.v2.sqlite.import");
     let mut binding = ProgressRecovery::synthetic(&scratch.join("index"), &"a".repeat(64), 0);
@@ -177,7 +177,7 @@ fn v1_readable_progress_seals_without_rewriting_bytes() {
 /// [money] obsolete unpublished seal preserves custody then retries after v1 advances.
 #[test]
 fn obsolete_unpublished_seal_preserves_custody_then_retries_after_v1_advances() {
-    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-obsolete-import");
+    let scratch = crate::test_scratch::ScratchDir::canonical("v2-ack-obsolete-import");
     let parent = scratch.join("a".repeat(64));
     std::fs::create_dir(&parent).unwrap();
     let index = parent.join("claude_code-synthetic-scan-index.json");
@@ -226,7 +226,7 @@ fn obsolete_unpublished_seal_preserves_custody_then_retries_after_v1_advances() 
 /// [money] interrupted predecessor copy retries without losing exact companion.
 #[test]
 fn interrupted_predecessor_copy_retries_without_losing_exact_companion() {
-    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-import-copy-retry");
+    let scratch = crate::test_scratch::ScratchDir::canonical("v2-ack-import-copy-retry");
     let index = scratch.join("index");
     let companion = fence::sibling(&index, ".v2-ack-receipt");
     let original = b"exact-owned-companion";

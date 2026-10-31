@@ -353,25 +353,13 @@ fn value_cap(key: &RowKey) -> u64 {
     match key {
         RowKey::Meta(_) => CONTROL_BYTES,
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
-        // These whole v1 fields retain traversal queues/sets in memory already.
+        // Measured on a copy of real M4 state (245,006 values): only these two
+        // whole fields exceed 1 MiB (traversal 4.8 MB, birth_store 1.5 MB).
         // Bound logical JSON on both admission and decompression, before chunks.
         RowKey::Record { kind, .. }
-            if matches!(
-                kind.name(),
-                "scan_state.traversal"
-                    | "scan_state.scan_residue_witness"
-                    | "scan_state.claude_stale_family_carry"
-            ) =>
+            if matches!(kind.name(), "scan_state.traversal" | "v1_field.birth_store") =>
         {
             16 * 1024 * 1024
-        }
-        RowKey::Record { kind, .. }
-            if matches!(
-                kind.name(),
-                "account_window" | "usage.pending" | "file.entities" | "accepted.rebuild_incidence"
-            ) || kind.name().starts_with("v1_field.") =>
-        {
-            8 * 1024 * 1024
         }
         RowKey::RequestSet(_) => VALUE_BYTES,
         _ => MUTABLE_VALUE_BYTES,

@@ -81,7 +81,7 @@ fn assert_refs(db: &mut sqlite::Sqlite) -> BTreeMap<RowKey, u64> {
 /// [money] money presence empty null zero and tombstones survive all kind hydration.
 #[test]
 fn money_presence_empty_null_zero_and_tombstones_survive_all_kind_hydration() {
-    let scratch = crate::test_scratch::ScratchDir::new("money-presence");
+    let scratch = crate::test_scratch::ScratchDir::canonical("money-presence");
     for (n, value) in [None, Some(serde_json::Value::Null), Some(json!(0))]
         .into_iter()
         .enumerate()
@@ -136,7 +136,7 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
         "setting.upload_context_fingerprint",
         "accepted.entity",
     ] {
-        let scratch = crate::test_scratch::ScratchDir::new("money-missing-owner");
+        let scratch = crate::test_scratch::ScratchDir::canonical("money-missing-owner");
         let mut db = money_test_support::populate(
             &scratch.join("missing.v2.sqlite.import"),
             &fixture(),
@@ -163,7 +163,7 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
 /// [money] money ref diffs rollback and commit across accounts census and family membership.
 #[test]
 fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_membership() {
-    let scratch = crate::test_scratch::ScratchDir::new("money-ref-diff");
+    let scratch = crate::test_scratch::ScratchDir::canonical("money-ref-diff");
     let mut db = money_test_support::populate(
         &scratch.join("refs.v2.sqlite.import"),
         &fixture(),
@@ -218,7 +218,7 @@ fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_members
 /// [money] money missing shared value refuses instead of losing request membership.
 #[test]
 fn money_missing_shared_value_refuses_instead_of_losing_request_membership() {
-    let scratch = crate::test_scratch::ScratchDir::new("money-missing-ref");
+    let scratch = crate::test_scratch::ScratchDir::canonical("money-missing-ref");
     let mut db = money_test_support::populate(
         &scratch.join("missing-ref.v2.sqlite.import"),
         &fixture(),
@@ -244,7 +244,7 @@ fn money_missing_shared_value_refuses_instead_of_losing_request_membership() {
 /// [money] money 915 lost saturated and unknown copy classes pause before any baseline.
 #[test]
 fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline() {
-    let scratch = crate::test_scratch::ScratchDir::new("money-unmapped");
+    let scratch = crate::test_scratch::ScratchDir::canonical("money-unmapped");
     let path = scratch.join("claude_code-scan-index.json");
     std::fs::write(&path, br#"{"schema_version":2,"files":{}}"#).unwrap();
     assert!(
@@ -305,7 +305,7 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
 /// [money] money unknown registered marks refuse even with zero length payload.
 #[test]
 fn money_unknown_registered_marks_refuse_even_with_zero_length_payload() {
-    let scratch = crate::test_scratch::ScratchDir::new("money-unknown-kind");
+    let scratch = crate::test_scratch::ScratchDir::canonical("money-unknown-kind");
     let mut db = money_test_support::populate(
         &scratch.join("unknown.v2.sqlite.import"),
         &fixture(),
@@ -327,7 +327,7 @@ fn money_unknown_registered_marks_refuse_even_with_zero_length_payload() {
 #[test]
 fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
     use sha2::Digest;
-    let scratch = crate::test_scratch::ScratchDir::new("money-segmented");
+    let scratch = crate::test_scratch::ScratchDir::canonical("money-segmented");
     let mut raw = serde_json::to_value(fixture()).unwrap();
     let mut members = serde_json::Map::new();
     let hashes = (0_u64..12_000)
