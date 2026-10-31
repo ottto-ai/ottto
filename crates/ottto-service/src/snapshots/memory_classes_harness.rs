@@ -245,6 +245,8 @@ fn run() -> Result<()> {
                 && fs::metadata(&path)?.permissions().mode() & 0o777 == 0o600,
             "private index required"
         );
+        // This isolated worker also keeps production-created save/lock files owner-only.
+        unsafe { libc::umask(0o077) };
         return measure(source, &path, &support);
     }
     let support = std::env::var_os("OTTTO_MEMORY_SUPPORT_DIR")
