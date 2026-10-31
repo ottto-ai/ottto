@@ -6,6 +6,96 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// One lifecycle module's cumulative process totals: `Counts` (one `u64` per
+/// field), `Event`, saturating `add`/`record`, `Counts::totals` and the
+/// test-only `observe` seam. `sparse, on_add = hook;` also derives `Sparse`,
+/// `Counts::{add, merge, is_empty}` and calls `hook(event, amount)` first.
+macro_rules! lifetime_counters {
+    (sparse, on_add = $hook:path; $($field:ident: $event:ident),+ $(,)?) => {
+        lifetime_counters!(@core [$hook] $($field: $event),+);
+        pub(crate) struct Sparse(pub(crate) Counts);
+        impl ::serde::Serialize for Sparse {
+            fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use ::serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(None)?;
+                $(if self.0.$field != 0 { map.serialize_entry(stringify!($field), &self.0.$field)?; })+
+                map.end()
+            }
+        }
+        impl Counts {
+            pub(crate) fn add(&mut self, event: Event, amount: u64) {
+                match event { $(Event::$event => self.$field = self.$field.saturating_add(amount)),+ }
+            }
+            pub(crate) fn merge(&mut self, other: Self) {
+                $(self.$field = self.$field.saturating_add(other.$field);)+
+            }
+            pub(crate) fn is_empty(&self) -> bool { $(self.$field == 0)&&+ }
+        }
+    };
+    ($($field:ident: $event:ident),+ $(,)?) => {
+        lifetime_counters!(@core [] $($field: $event),+);
+    };
+    (@core [$($hook:path)?] $($field:ident: $event:ident),+) => {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ::serde::Serialize)]
+        pub(crate) struct Counts { $(pub(crate) $field: u64),+ }
+        #[derive(Clone, Copy)]
+        pub(crate) enum Event { $($event),+ }
+        const COUNT: usize = [$(stringify!($field)),+].len();
+        // Fixed static instrumentation only: no owner/cache graph fields,
+        // allocations, additional locks, identifiers or retained history.
+        static TOTALS: [::std::sync::atomic::AtomicU64; COUNT] =
+            [const { ::std::sync::atomic::AtomicU64::new(0) }; COUNT];
+        impl Counts {
+            fn from_array(values: [u64; COUNT]) -> Self {
+                Self { $($field: values[Event::$event as usize]),+ }
+            }
+            fn totals() -> Self {
+                use ::std::sync::atomic::Ordering::Relaxed;
+                Self::from_array(::std::array::from_fn(|i| TOTALS[i].load(Relaxed)))
+            }
+            #[cfg(test)]
+            pub(super) fn maximum() -> Self { Self { $($field: u64::MAX),+ } }
+        }
+        pub(crate) fn add(event: Event, amount: u64) {
+            use ::std::sync::atomic::Ordering::Relaxed;
+            $($hook(event, amount);)?
+            let _ = TOTALS[event as usize].fetch_update(Relaxed, Relaxed, |n| {
+                Some(n.saturating_add(amount))
+            });
+            #[cfg(test)]
+            TEST_EVENTS.with(|events| {
+                if let Some(mut values) = events.get() {
+                    values[event as usize] = values[event as usize].saturating_add(amount);
+                    events.set(Some(values));
+                }
+            });
+        }
+        pub(crate) fn record(event: Event) {
+            add(event, 1);
+        }
+        #[cfg(test)]
+        thread_local! {
+            static TEST_EVENTS: std::cell::Cell<Option<[u64; COUNT]>> = const { std::cell::Cell::new(None) };
+        }
+        /// Isolates assertions from concurrent fixtures without resetting or
+        /// changing the production process totals. No production observer or callback.
+        #[cfg(test)]
+        pub(crate) fn observe<T>(f: impl FnOnce() -> T) -> (T, Counts) {
+            struct Reset(Option<[u64; COUNT]>);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    TEST_EVENTS.with(|events| events.set(self.0));
+                }
+            }
+            let reset = Reset(TEST_EVENTS.with(|events| events.replace(Some([0; COUNT]))));
+            let value = f();
+            let counts = TEST_EVENTS.with(|events| Counts::from_array(events.get().unwrap()));
+            drop(reset);
+            (value, counts)
+        }
+    };
+}
+
 pub(crate) mod cache_lifecycle;
 pub(crate) mod claude_absence;
 pub(crate) mod claude_contract;
