@@ -3094,6 +3094,20 @@ pub(crate) fn settle_claude_request_census_terminal(
     counts
 }
 
+/// X3 (ON only): the terminal that runs #920's aged retirement is withheld.
+/// Run the same retirement (keep overlap, 90% occupancy release) at the
+/// service clock. No vanished prune, join or shadow counts: those stay
+/// terminal-only (Lead B Q-LB-4). Zero transcript reads.
+pub(crate) fn retire_aged_while_terminal_withheld(index: &mut ScanIndex, census_window_end: &str) {
+    if !super::claude_terminal_off() {
+        return;
+    }
+    let window = retirement_window(rfc3339_unix_seconds(census_window_end).unwrap_or_default());
+    let retirement = retire_claude_transcript_records(index, window);
+    note_transcript_retirements(retirement.aged, 0);
+    note_kept_overlap(retirement, 0);
+}
+
 /// A transcript is retired 35 days after its last modification.
 pub(crate) const CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS: u64 = 35 * 24 * 60 * 60;
 
