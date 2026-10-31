@@ -2281,3 +2281,109 @@ fn terminal_off_stale_clear_memo_is_bounded_and_eviction_fails_toward_another_cl
     reloaded.traversal = None;
     assert!(terminal_off_stale_clear_served(&reloaded, "context", &roots).is_empty());
 }
+
+const PRESERVED_ADMISSION_SIBLINGS: [&str; 2] = [
+    "b2222222-2222-4222-8222-222222222222",
+    "c3333333-3333-4333-8333-333333333333",
+];
+const PRESERVED_ADMISSION_PAGES: [&str; 3] =
+    [W2, "2026-08-20T10:13:00Z", "2026-08-20T10:14:00Z"];
+
+/// [regress] R7: like main's `stale_pending_roots`, neither the ON start's
+/// semantic clear nor its resumed retry admission takes a family whose
+/// quarantine is bound to its retained witness, so its unchanged root is never
+/// re-armed, offered or read. With its stale siblings re-armed (never
+/// storage-only), a platform without a native layout also carries and promotes
+/// no family, as main's start runs no streaming carry batch there.
+#[test]
+fn terminal_off_start_and_resumed_admission_never_rearm_a_witness_bound_family() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    for rearm_siblings in [false, true] {
+        let scratch =
+            crate::test_scratch::ScratchDir::new(&format!("terminal-off-r7-{rearm_siblings}"));
+        for root in std::iter::once(OFF_ROOT).chain(PRESERVED_ADMISSION_SIBLINGS) {
+            fs::write(
+                scratch.join(format!("{root}.jsonl")),
+                freshness_line(root, "X"),
+            )
+            .unwrap();
+        }
+        let mut index = off_index();
+        let baseline = off_scan(&mut index, &scratch, W1, 10);
+        off_accept(&mut index, &baseline);
+        let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+        let key = local_index_key(&path);
+        let revision = index.files[&key].source_file_fingerprint.clone();
+        index.insert_unproven_terminal_claude_authority_for_test(OFF_ROOT, &revision);
+        index.insert_claude_usage_family_pending_for_test(OFF_ROOT, W1);
+        for root in PRESERVED_ADMISSION_SIBLINGS {
+            index.claude_usage_family_pending.insert(
+                root.to_string(),
+                ClaudeUsageFamilyPending {
+                    census_window_end: W1.to_string(),
+                    member_request_id_hashes: BTreeMap::from([(
+                        root.to_string(),
+                        BTreeSet::new(),
+                    )]),
+                    member_occurrences: BTreeMap::new(),
+                    invalid: false,
+                    idless_revision: None,
+                },
+            );
+            if rearm_siblings {
+                let sibling = local_index_key(&scratch.join(format!("{root}.jsonl")));
+                index
+                    .files
+                    .get_mut(&sibling)
+                    .unwrap()
+                    .source_file_fingerprint
+                    .clear();
+            }
+        }
+        // The next page starts a traversal with all three families stale.
+        index.traversal = None;
+        let no_layout = rearm_siblings && !crate::heap_layout_bound::layout_supported();
+        for (page, at) in PRESERVED_ADMISSION_PAGES.into_iter().enumerate() {
+            let case = format!("rearm_siblings={rearm_siblings} page={page}");
+            let (_, reads) = terminal_contract_retry::source_acquisitions(|| {
+                sampled_scan::with_test_now(rfc3339_unix_seconds(at).unwrap(), || {
+                    scan_source_roots_with_test_limit_and_hints(
+                        SnapshotSource::ClaudeCode,
+                        &[scratch.to_path_buf()],
+                        &mut index,
+                        at,
+                        183,
+                        1,
+                        true,
+                        &[],
+                    )
+                    .unwrap()
+                })
+            });
+            assert_eq!(reads.get(&path).copied().unwrap_or(0), 0, "{case}: root read");
+            assert_eq!(
+                index.files[&key].source_file_fingerprint, revision,
+                "{case}: the witness-bound root is never offered or re-armed"
+            );
+            let carry = &index.claude_stale_family_carry;
+            assert!(!carry.contains(OFF_ROOT), "{case}");
+            let admission = carry.origin.as_ref().and_then(|o| o.admission.as_ref());
+            if page > 0 || no_layout {
+                let admission = admission.expect("the traversal keeps its retry admission");
+                assert_ne!(admission.oversized_root.as_deref(), Some(OFF_ROOT), "{case}");
+                if no_layout {
+                    assert!(carry.roots.is_empty(), "{case}: no family is carried");
+                    assert!(carry.capped_roots.is_empty(), "{case}");
+                    assert!(carry.replay.is_empty(), "{case}");
+                    assert_eq!(admission.oversized_root, None, "{case}: no promotion");
+                    assert_eq!(admission.after_root, None, "{case}: no root batch ran");
+                }
+            }
+        }
+        assert_eq!(
+            index.bound_terminal_claude_authority_revision_for_test(OFF_ROOT),
+            Some(revision)
+        );
+        assert!(index.claude_usage_family_pending.contains_key(OFF_ROOT));
+    }
+}

@@ -132,3 +132,18 @@ Existing per-class retention gauges/alarms remain ON-only. Ron accepted
 usage-proof retirement and the CAS peak are next-release top priorities.
 Ordinary held-history total remains a post-release gauge gap. F4 and #876 remain
 paired next-release work; no new absence shortcut is introduced here.
+
+## ON follow-up fixes (ON PR, all gated on `claude_terminal_off()`)
+
+These change only the ON path; with the switch OFF each gated site runs main's
+code. None adds a persisted field.
+
+- **R7 (witness-bound family re-read):** like main's `stale_pending_roots`,
+  neither the ON start's semantic clear nor its per-page retry admission takes
+  a family whose authority quarantine is bound to its retained witness; its
+  RetryPending deadline keeps the due arm. B-P2's unACKed heads and the B-P5
+  memo stay over the full stale set. On a platform without a supported native
+  layout (`heap_layout_bound::layout_supported()` is false, so anything but
+  pinned macOS), ON's resumed admission runs no carry batch and promotes no
+  stale family to the oversized retry root, the same as main's start there.
+  Pinned macOS is unchanged.

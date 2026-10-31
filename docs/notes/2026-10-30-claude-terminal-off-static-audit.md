@@ -234,3 +234,19 @@ never-quarantine suites. Linux green does not substitute for that evidence.
 | 190 | [snapshots/upload_context_receipt.rs:280](../../crates/ottto-service/src/snapshots/upload_context_receipt.rs#L280)<br>`@@ -110,0 +280,15 @@` | gated / neutral | OFF adoption runs main’s own body: the ON branch is an inserted claude_terminal_off() block (r31 removed the frozen main copy). Mixed context view is empty/false in OFF, including stale-view query protection; memo and retry-hold narrowing are ON-only. Main per-ACK receipt format/validation/context policies are untouched. |
 | 191 | [snapshots/upload_context_receipt.rs:310](../../crates/ottto-service/src/snapshots/upload_context_receipt.rs#L310)<br>`@@ -125,0 +310,6 @@` | gated / neutral | OFF adoption runs main’s own body: the ON branch is an inserted claude_terminal_off() block (r31 removed the frozen main copy). Mixed context view is empty/false in OFF, including stale-view query protection; memo and retry-hold narrowing are ON-only. Main per-ACK receipt format/validation/context policies are untouched. |
 | 192 | [snapshots/upload_context_receipt.rs:328](../../crates/ottto-service/src/snapshots/upload_context_receipt.rs#L328)<br>`@@ -138,3 +328,10 @@` | gated / neutral | OFF adoption runs main’s own body: the ON branch is an inserted claude_terminal_off() block (r31 removed the frozen main copy). Mixed context view is empty/false in OFF, including stale-view query protection; memo and retry-hold narrowing are ON-only. Main per-ACK receipt format/validation/context policies are untouched. |
+
+## ON follow-up hunks (ON PR, relative to main `562a40128`)
+
+Each row is one production-counted `git diff --unified=0 562a40128` hunk the
+ON PR adds on top of #899. Line numbers are at the ON branch head; the rows
+above keep their #899 numbering. OFF identity: every row is either inside an
+existing `claude_terminal_off()` branch, behind a new `claude_terminal_off()`
+guard, or a helper whose only callers are such branches. Stripping the ON arms
+(`r8-proof/strip_on.py`) gives main's function text.
+
+| # | File:new line / git hunk | Lane | Classification | Why OFF is main |
+| --- | --- | --- | --- | --- |
+| ON-1 | [snapshots.rs:42591](../../crates/ottto-service/src/snapshots.rs#L42591)<br>`@@ -42591 +42591,4 @@` | L2 R7 | gated | Inside `ensure_bounded_traversal`'s `source == ClaudeCode && claude_terminal_off()` start branch. The semantic clear drops witness-bound families (main's `stale_pending_roots` filter); `unacked`, the B-P5 memo and retry admission keep the full stale set. OFF never enters the branch. |
+| ON-2 | [snapshots/terminal_off.rs:336](../../crates/ottto-service/src/snapshots/terminal_off.rs#L336)<br>`@@ -335,0 +336,26 @@` | L2 R7 | gated helper | `claude_terminal_family_preserved` / `claude_terminal_semantic_stale_roots` reuse main's `claude_usage_authority_preserves_pending`. Callers: ON-1 and ON-3/ON-4 only. |
+| ON-3 | [snapshots/terminal_off.rs:752](../../crates/ottto-service/src/snapshots/terminal_off.rs#L752)<br>`@@ -725,0 +752,15 @@` | L2 R7 | gated | `resume_claude_retry_admission` returns at entry when OFF. Off a native layout the resume admits no root (main's start runs no streaming carry there); the due arm keeps its deadlines. |
+| ON-4 | [snapshots/terminal_off.rs:792](../../crates/ottto-service/src/snapshots/terminal_off.rs#L792)<br>`@@ -750,0 +792,2 @@`, `@@ -757 +800,3 @@` | L2 R7 | gated | Same function as ON-3: the resumed root range skips witness-bound families, as main's `stale_pending_roots`. |
