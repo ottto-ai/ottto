@@ -28,23 +28,17 @@ fn claude_completion_paths_for_test() -> bool {
 }
 #[cfg(test)]
 pub(crate) struct ClaudeCompletionPathsForTest {
-    previous: bool,
-    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    _switch: terminal_off_policy::ThreadSwitchForTest,
 }
 #[cfg(test)]
 impl ClaudeCompletionPathsForTest {
     pub(crate) fn enable() -> Self {
-        let previous = CLAUDE_COMPLETION_PATHS_FOR_TEST.with(|slot| slot.replace(true));
         Self {
-            previous,
-            _thread: std::marker::PhantomData,
+            _switch: terminal_off_policy::ThreadSwitchForTest::set(
+                &CLAUDE_COMPLETION_PATHS_FOR_TEST,
+                true,
+            ),
         }
-    }
-}
-#[cfg(test)]
-impl Drop for ClaudeCompletionPathsForTest {
-    fn drop(&mut self) {
-        CLAUDE_COMPLETION_PATHS_FOR_TEST.with(|slot| slot.set(self.previous));
     }
 }
 
@@ -199,6 +193,104 @@ fn claude_retain_unacked_reoffer(result: &mut ScanIndex, key: &str, working: &Sc
     }
 }
 
+// Bounded process memos. A `per_test_thread` memo is one per test thread, so
+// parallel fixtures never share it; every other memo is one per process.
+macro_rules! process_memo {
+    (fn $with:ident, static $memo:ident: $ty:ty) => {
+        static $memo: std::sync::Mutex<$ty> = std::sync::Mutex::new(<$ty>::new());
+        fn $with<T>(f: impl FnOnce(&mut $ty) -> T) -> T {
+            f(&mut $memo
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner))
+        }
+    };
+    (per_test_thread fn $with:ident, static $memo:ident: $ty:ty) => {
+        #[cfg(not(test))]
+        $crate::snapshots::process_memo!(fn $with, static $memo: $ty);
+        #[cfg(test)]
+        thread_local! {
+            static $memo: std::cell::RefCell<$ty> = const { std::cell::RefCell::new(<$ty>::new()) };
+        }
+        #[cfg(test)]
+        fn $with<T>(f: impl FnOnce(&mut $ty) -> T) -> T {
+            $memo.with(|memo| f(&mut memo.borrow_mut()))
+        }
+    };
+}
+pub(crate) use process_memo;
+
+/// At most `CAP` keys; a new key at capacity first forgets the oldest
+/// inserted one. Eviction or restart permits repeated work only, never proof,
+/// ACK or settlement.
+pub(crate) struct BoundedMemo<K, V, const CAP: usize> {
+    pub(crate) keys: BTreeMap<K, V>,
+    pub(crate) order: VecDeque<K>,
+    pub(crate) evictions: u64,
+}
+impl<K: Ord + Clone, V, const CAP: usize> Default for BoundedMemo<K, V, CAP> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl<K: Ord + Clone, V, const CAP: usize> BoundedMemo<K, V, CAP> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            keys: BTreeMap::new(),
+            order: VecDeque::new(),
+            evictions: 0,
+        }
+    }
+    /// `key`'s value, inserting `value()` (and evicting) only when absent.
+    pub(crate) fn get_or_insert_with<Q>(&mut self, key: &Q, value: impl FnOnce() -> V) -> &mut V
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Ord + ToOwned<Owned = K> + ?Sized,
+    {
+        if !self.keys.contains_key(key) {
+            if self.keys.len() == CAP {
+                let oldest = self.order.pop_front().expect("bounded memo has an owner");
+                self.keys.remove::<K>(&oldest);
+                self.evictions = self.evictions.saturating_add(1);
+            }
+            self.order.push_back(key.to_owned());
+            self.keys.insert(key.to_owned(), value());
+        }
+        self.keys.get_mut(key).expect("present after insert")
+    }
+    pub(crate) fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let value = self.keys.remove(key)?;
+        self.order.retain(|kept| kept.borrow() != key);
+        Some(value)
+    }
+}
+impl<K: Ord + Clone, const CAP: usize> BoundedMemo<K, (), CAP> {
+    /// True when remembering `key` evicted the oldest key.
+    pub(crate) fn remember(&mut self, key: K) -> bool {
+        let evictions = self.evictions;
+        self.get_or_insert_with(&key, || ());
+        self.evictions != evictions
+    }
+}
+/// Forgets the lowest-ranked entry (the first in key order on ties).
+pub(crate) fn forget_lowest<K: Ord + Clone, V, R: Ord>(
+    memo: &mut BTreeMap<K, V>,
+    rank: impl Fn(&V) -> R,
+) -> bool {
+    let Some(lowest) = memo
+        .iter()
+        .min_by_key(|(_, value)| rank(value))
+        .map(|(key, _)| key.clone())
+    else {
+        return false;
+    };
+    memo.remove(&lowest);
+    true
+}
+
 // B-P5: under containment neither the identity-contract latch nor
 // source-wide context adoption discharges, so an unsuppressed semantic stale
 // clear would re-arm every stale pending family at every red-retry or floor
@@ -211,44 +303,8 @@ fn claude_retain_unacked_reoffer(result: &mut ScanIndex, key: &str, working: &Sc
 // restart likewise fails toward one more re-read, never toward proof, ACK or
 // settlement.
 const TERMINAL_OFF_STALE_CLEAR_KEYS: usize = 16_384;
-#[derive(Default)]
-struct TerminalOffStaleClears {
-    keys: BTreeSet<[u8; 32]>,
-    order: VecDeque<[u8; 32]>,
-    evictions: u64,
-}
-impl TerminalOffStaleClears {
-    fn remember(&mut self, key: [u8; 32]) {
-        if !self.keys.insert(key) {
-            return;
-        }
-        self.order.push_back(key);
-        if self.keys.len() > TERMINAL_OFF_STALE_CLEAR_KEYS {
-            let oldest = self.order.pop_front().expect("bounded memo has an owner");
-            self.keys.remove(&oldest);
-            self.evictions = self.evictions.saturating_add(1);
-            eprintln!("claude_terminal_off stale_clear_memo_evicted evictions={} capacity={TERMINAL_OFF_STALE_CLEAR_KEYS}", self.evictions);
-        }
-    }
-}
-#[cfg(test)]
-thread_local! {
-    static TERMINAL_OFF_STALE_CLEARS: std::cell::RefCell<TerminalOffStaleClears> =
-        std::cell::RefCell::new(TerminalOffStaleClears::default());
-}
-fn with_terminal_off_stale_clears<T>(f: impl FnOnce(&mut TerminalOffStaleClears) -> T) -> T {
-    #[cfg(not(test))]
-    {
-        static MEMO: std::sync::OnceLock<std::sync::Mutex<TerminalOffStaleClears>> =
-            std::sync::OnceLock::new();
-        f(&mut MEMO
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
-    }
-    #[cfg(test)]
-    TERMINAL_OFF_STALE_CLEARS.with(|memo| f(&mut memo.borrow_mut()))
-}
+process_memo!(per_test_thread fn with_terminal_off_stale_clears,
+    static TERMINAL_OFF_STALE_CLEARS: BoundedMemo<[u8; 32], (), TERMINAL_OFF_STALE_CLEAR_KEYS>);
 fn terminal_off_stale_clear_key(
     index: &ScanIndex,
     context: &str,
@@ -294,7 +350,7 @@ fn terminal_off_stale_clear_served(
         roots
             .iter()
             .filter(|root| {
-                memo.keys.contains(&terminal_off_stale_clear_key(
+                memo.keys.contains_key(&terminal_off_stale_clear_key(
                     index,
                     context,
                     &prior.census_window_end,
@@ -317,7 +373,13 @@ fn note_terminal_off_stale_clears(
         .iter()
         .map(|root| terminal_off_stale_clear_key(index, context, window, root))
         .collect();
-    with_terminal_off_stale_clears(|memo| keys.into_iter().for_each(|key| memo.remember(key)));
+    with_terminal_off_stale_clears(|memo| {
+        for key in keys {
+            if memo.remember(key) {
+                eprintln!("claude_terminal_off stale_clear_memo_evicted evictions={} capacity={TERMINAL_OFF_STALE_CLEAR_KEYS}", memo.evictions);
+            }
+        }
+    });
 }
 #[cfg(test)]
 fn terminal_off_stale_clear_memo_len_for_test() -> (usize, u64) {
@@ -441,45 +503,12 @@ fn claude_terminal_rewind(traversal: &mut ScanTraversalCheckpoint) {
 // Hashes bind the exact path/context/source witness; eviction/restart permits
 // another ordinary read and grants no ACK, absence, settlement or proof credit.
 const TERMINAL_OFF_EMPTY_CONTEXT_KEYS: usize = 4096;
-#[derive(Default)]
-struct TerminalOffEmptyContexts {
-    keys: BTreeSet<[u8; 32]>,
-    order: VecDeque<[u8; 32]>,
-    evictions: u64,
-}
-impl TerminalOffEmptyContexts {
-    fn remember(&mut self, key: [u8; 32]) {
-        if self.keys.contains(&key) {
-            return;
-        }
-        if self.keys.len() == TERMINAL_OFF_EMPTY_CONTEXT_KEYS {
-            let oldest = self.order.pop_front().expect("bounded memo has an owner");
-            self.keys.remove(&oldest);
-            self.evictions = self.evictions.saturating_add(1);
-            eprintln!("upload_context_empty_memo_evicted evictions={} capacity={TERMINAL_OFF_EMPTY_CONTEXT_KEYS}", self.evictions);
-        }
-        self.keys.insert(key);
-        self.order.push_back(key);
-    }
-}
+type TerminalOffEmptyContexts = BoundedMemo<[u8; 32], (), TERMINAL_OFF_EMPTY_CONTEXT_KEYS>;
+process_memo!(per_test_thread fn with_terminal_off_empty_contexts,
+    static TERMINAL_OFF_EMPTY_CONTEXTS: TerminalOffEmptyContexts);
 #[cfg(test)]
 thread_local! {
-    static TERMINAL_OFF_EMPTY_CONTEXTS: std::cell::RefCell<TerminalOffEmptyContexts> =
-        std::cell::RefCell::new(TerminalOffEmptyContexts::default());
     static TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-fn with_terminal_off_empty_contexts<T>(f: impl FnOnce(&mut TerminalOffEmptyContexts) -> T) -> T {
-    #[cfg(not(test))]
-    {
-        static MEMO: std::sync::OnceLock<std::sync::Mutex<TerminalOffEmptyContexts>> =
-            std::sync::OnceLock::new();
-        f(&mut MEMO
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
-    }
-    #[cfg(test)]
-    TERMINAL_OFF_EMPTY_CONTEXTS.with(|memo| f(&mut memo.borrow_mut()))
 }
 fn terminal_off_empty_context_key(index: &ScanIndex, key: &str) -> Option<[u8; 32]> {
     if !claude_terminal_off() || !index.confirmed_empty_files.contains(key) {
@@ -507,7 +536,7 @@ fn terminal_off_empty_context_key(index: &ScanIndex, key: &str) -> Option<[u8; 3
 }
 fn terminal_off_empty_context_seen(index: &ScanIndex, key: &str) -> bool {
     terminal_off_empty_context_key(index, key)
-        .is_some_and(|key| with_terminal_off_empty_contexts(|memo| memo.keys.contains(&key)))
+        .is_some_and(|key| with_terminal_off_empty_contexts(|memo| memo.keys.contains_key(&key)))
 }
 fn note_terminal_off_empty_context(index: &ScanIndex, key: &str, parsed_fingerprint: &str) {
     if !index
@@ -518,7 +547,11 @@ fn note_terminal_off_empty_context(index: &ScanIndex, key: &str, parsed_fingerpr
         return;
     }
     if let Some(key) = terminal_off_empty_context_key(index, key) {
-        with_terminal_off_empty_contexts(|memo| memo.remember(key));
+        with_terminal_off_empty_contexts(|memo| {
+            if memo.remember(key) {
+                eprintln!("upload_context_empty_memo_evicted evictions={} capacity={TERMINAL_OFF_EMPTY_CONTEXT_KEYS}", memo.evictions);
+            }
+        });
     }
 }
 
@@ -526,63 +559,32 @@ fn note_terminal_off_empty_context(index: &ScanIndex, key: &str, parsed_fingerpr
 // Fixed-size hashed scopes retain no transcript/path strings. Eviction and a
 // process restart fail toward one metadata rewalk, never toward proof.
 const TERMINAL_OFF_REDISCOVERY_SCOPES: usize = 64;
-#[cfg(not(test))]
-static TERMINAL_OFF_REDISCOVERY: std::sync::Mutex<BTreeMap<String, u64>> =
-    std::sync::Mutex::new(BTreeMap::new());
-#[cfg(test)]
-thread_local! {
-    static TERMINAL_OFF_REDISCOVERY: std::cell::RefCell<BTreeMap<String, u64>> =
-        const { std::cell::RefCell::new(BTreeMap::new()) };
-}
+process_memo!(per_test_thread fn with_terminal_off_rediscovery,
+    static TERMINAL_OFF_REDISCOVERY: BTreeMap<String, u64>);
 fn terminal_off_cadence_requested(scope: &str, now: u64) -> bool {
-    #[cfg(test)]
-    {
-        TERMINAL_OFF_REDISCOVERY.with(|m| m.borrow().get(scope).map_or(true, |due| now >= *due))
-    }
-    #[cfg(not(test))]
-    {
-        TERMINAL_OFF_REDISCOVERY
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(scope)
-            .map_or(true, |due| now >= *due)
-    }
+    with_terminal_off_rediscovery(|memo| memo.get(scope).map_or(true, |due| now >= *due))
 }
 fn terminal_off_rediscovery_due(scope: String, now: u64, force: bool) -> bool {
-    let check = |memo: &mut BTreeMap<String, u64>| {
+    with_terminal_off_rediscovery(|memo| {
         if !force && memo.get(&scope).is_some_and(|due| now < *due) {
             return false;
         }
-        if !memo.contains_key(&scope) && memo.len() >= TERMINAL_OFF_REDISCOVERY_SCOPES {
-            if let Some(oldest) = memo
-                .iter()
-                .min_by_key(|(_, due)| **due)
-                .map(|(key, _)| key.clone())
-            {
-                memo.remove(&oldest);
-                eprintln!("claude_terminal_off rediscovery_memo_evicted=1 capacity=64");
-            }
+        if !memo.contains_key(&scope)
+            && memo.len() >= TERMINAL_OFF_REDISCOVERY_SCOPES
+            && forget_lowest(memo, |due| *due)
+        {
+            eprintln!("claude_terminal_off rediscovery_memo_evicted=1 capacity=64");
         }
         memo.insert(scope, now.saturating_add(300));
         true
-    };
-    #[cfg(not(test))]
-    {
-        check(
-            &mut TERMINAL_OFF_REDISCOVERY
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    }
-    #[cfg(test)]
-    TERMINAL_OFF_REDISCOVERY.with(|memo| check(&mut memo.borrow_mut()))
+    })
 }
 // Reader/identity fixture drivers model an explicitly due discovery walk,
 // rather than an idle daemon tick at the same fixed fixture timestamp.
 #[cfg(test)]
 pub(crate) fn expire_terminal_off_discovery_for_test(index: &ScanIndex) {
     if let Some(scope) = terminal_off_rediscovery_scope(index) {
-        TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow_mut().remove(&scope));
+        with_terminal_off_rediscovery(|memo| memo.remove(&scope));
     }
 }
 
@@ -609,7 +611,6 @@ fn refresh_terminal_off_discovery(
     roots: &[PathBuf],
     now: u64,
     overflow: bool,
-    at: &str,
     file_limit: usize,
 ) {
     if !claude_terminal_off() {
@@ -648,7 +649,7 @@ fn refresh_terminal_off_discovery(
     }
     let scope = terminal_off_rediscovery_scope(index).expect("retained traversal");
     let requested = changed || overflow || terminal_off_cadence_requested(&scope, now);
-    let start = terminal_off_discovery::prepare(index, now, at, requested);
+    let start = terminal_off_discovery::prepare(index, now, requested);
     if start {
         terminal_off_rediscovery_due(scope, now, true);
     }
@@ -1113,25 +1114,15 @@ impl RetentionAlarmWindow {
         true
     }
 }
+// Bounded runtime throttle only. Old inactive destinations can be evicted;
+// returning to one can repeat an alarm, never suppress its retained debt.
+process_memo!(fn with_retention_alarms,
+    static RETENTION_ALARMS: BoundedMemo<String, RetentionAlarmWindow, 64>);
 fn retention_alarm(context: &str, window: &str, class: u8, exceeded: bool) -> bool {
-    // Bounded runtime throttle only. Old inactive destinations can be evicted;
-    // returning to one can repeat an alarm, never suppress its retained debt.
-    static MEMO: OnceLock<Mutex<std::collections::VecDeque<(String, RetentionAlarmWindow)>>> =
-        OnceLock::new();
-    let Ok(mut memo) = MEMO.get_or_init(Default::default).lock() else {
-        return exceeded;
-    };
-    let at = match memo.iter().position(|(key, _)| key == context) {
-        Some(at) => at,
-        None => {
-            if memo.len() == 64 {
-                memo.pop_front();
-            }
-            memo.push_back((context.into(), RetentionAlarmWindow::default()));
-            memo.len() - 1
-        }
-    };
-    memo[at].1.observe(window, class, exceeded)
+    with_retention_alarms(|memo| {
+        memo.get_or_insert_with(context, RetentionAlarmWindow::default)
+            .observe(window, class, exceeded)
+    })
 }
 impl ScanIndex {
     fn terminal_retention_alarms(&self, debt: &TerminalRetention) -> serde_json::Value {

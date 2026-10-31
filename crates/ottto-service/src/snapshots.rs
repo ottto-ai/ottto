@@ -26793,7 +26793,6 @@ impl OwnedSourceScan {
                 roots,
                 audit_now,
                 watcher_overflowed,
-                collected_at,
                 file_limit,
             );
         }

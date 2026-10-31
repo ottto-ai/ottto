@@ -88,7 +88,6 @@ fn refresh_terminal_off_discovery_at_test(
         roots,
         rfc3339_unix_seconds(at).unwrap(),
         overflow,
-        at,
         MAX_BACKFILL_FILES_PER_SOURCE,
     );
 }
@@ -1443,11 +1442,11 @@ fn terminal_off_empty_context_memo_is_bounded_counts_eviction_and_never_grants_c
     assert_eq!(memo.order.len(), TERMINAL_OFF_EMPTY_CONTEXT_KEYS);
     assert_eq!(memo.evictions, 1);
     assert!(
-        !memo.keys.contains(&first),
+        !memo.keys.contains_key(&first),
         "eviction permits another ordinary context read"
     );
     memo.remember(first);
-    assert!(memo.keys.contains(&first));
+    assert!(memo.keys.contains_key(&first));
     assert_eq!(memo.evictions, 2);
     assert_eq!(memo.keys.len(), TERMINAL_OFF_EMPTY_CONTEXT_KEYS);
 }
@@ -1676,7 +1675,7 @@ fn terminal_off_targeted_adoption_is_page_bounded_deduplicated_and_never_census(
         SnapshotSource::ClaudeCode,
     );
     uploader.prepare_for_scan(SnapshotSource::ClaudeCode, "d".repeat(64), &mut index);
-    terminal_off_discovery::prepare(&mut index, now, W1, false);
+    terminal_off_discovery::prepare(&mut index, now, false);
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
         terminal_off_discovery::targeted(&mut index, now, 3)
     });
