@@ -65,6 +65,34 @@ pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
     restored
 }
 
+/// Compare each selected page with the graph the full-clone saver received.
+/// Keep returned commitments across pages, including a freshly rebuilt subset.
+pub(crate) fn assert_selected_saves(initial: &ScanIndex, pages: &[ScanIndex]) {
+    let scratch = crate::test_scratch::ScratchDir::canonical("selected-row-saves");
+    let mut db = populate(&scratch.join("state.sqlite"), initial, BTreeMap::new());
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let (previous, mut cx) = kinds::hydrate(&mut db, binding()).unwrap();
+    let mut digests = kinds::baseline(&previous, &mut cx).unwrap();
+    for page in pages {
+        let mut expected = page.clone();
+        digests = kinds::save_graph(&mut db, &identity, digests, &mut expected, &mut cx).unwrap();
+        let restored = kinds::hydrate(&mut db, binding()).unwrap().0;
+        assert_eq!(
+            serde_json::to_vec(&restored).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        assert!(restored.decode_holds.same_as(&expected.decode_holds));
+        assert_eq!(
+            restored.decode_holds.v2_provenance(),
+            expected.decode_holds.v2_provenance()
+        );
+        assert_eq!(
+            restored.v2().growth_retention,
+            expected.v2().growth_retention
+        );
+    }
+}
+
 /// Preserve v2-only debt and raw holds through the composed store as well.
 pub(in super::super) fn roundtrip_rows(index: &ScanIndex, path: &Path) -> ScanIndex {
     let mut db = populate(path, index, BTreeMap::new());
