@@ -45063,7 +45063,6 @@ fn census_count_fields(names: &[&str], counts: &[usize]) -> String {
         .join(" ")
 }
 
-
 struct CheckpointLock {
     file: File,
 }

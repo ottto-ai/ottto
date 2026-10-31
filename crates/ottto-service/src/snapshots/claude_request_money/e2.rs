@@ -250,7 +250,6 @@ fn diag_max(key: &'static str, value: u64) {
     let _ = (key, value);
 }
 
-
 /// The parse-time view of the durable birth table (T1's `BirthStore`).
 pub(in crate::snapshots) struct ReadContext<'a> {
     pub(in crate::snapshots) index: &'a ScanIndex,

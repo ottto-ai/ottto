@@ -724,7 +724,6 @@ fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
     }
 }
 
-
 /// [regress] Containment regression: real hold renews floor and three pages do not requeue it.
 /// Real demotion classification and selected-save custody, without oversized
 /// debt restarting the frozen window: each served hold must renew its floor.
