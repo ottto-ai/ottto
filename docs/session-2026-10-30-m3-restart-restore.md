@@ -5,12 +5,16 @@ store, then feeds only the appended suffix to the native parser. It preserves
 account attribution, complete-body money semantics and exact upload ACK rules.
 Quiet files consume no transcript input. An unavailable or incompatible record
 uses the existing growth recovery and Full pacing paths; unknown formats remain
-protected. Parser versions, pins and wire contracts are unchanged by this cut.
+protected. Parser versions and upload wire contracts are unchanged. The retained
+private-label schema uses new allowlist pins; retired pre-label pins are not read.
 
 The `restart_restore_enabled` sentinel requests the feature. The discovery
 readiness gate must also be open; otherwise `restart_restore_on_refused` reports
-the refusal and the native M1 route remains active. M3 is intended to land with
-its discovery dependencies. This simplification does not change those gates.
+the refusal. OFF fully disables ordinary store reads, writes, repair and GC;
+files use main's no-record acquisition path. Consent/source erasure remains
+bounded, counted and fail-closed. Owned sibling recognition and counted deletion
+of outgrown v1 records also remain active while OFF. A failed deletion retries at
+the next publication; a downgrade during that window may re-count that file.
 
 Claude native completions use write-ahead preparation on the existing source
 owner and active lease. Commit fences check the held object, scope, generation
@@ -33,11 +37,18 @@ rederive input and fences, `restored_behind_accepted`, exact retirement outcomes
 and the existing process proxies. See [diagnostics.md](diagnostics.md) for units
 and reset semantics. Counters never contain transcript content or file paths.
 
-Known limits: native layout proofs require macOS; Linux does not execute those
-fixtures. RAM-only six-hour pacing resets at process restart. Exact retired-pin
-records now follow missing-record recovery: a quiet file reads zero bytes,
+Known limits: Linux exercises supported heap-layout paths; macOS APIs and
+macOS-only fixtures still require macOS evidence. RAM-only six-hour pacing resets at process restart. With ON, exact retired-pin
+records follow missing-record recovery: a quiet file reads zero bytes,
 and growth takes a counted repin Full through the shared six-hour pace and
 history-upgrade page (2,000 files / 1 GiB, 512 MiB per file). Replacements use
 the normal write-ahead/receipt path; only an exact upload ACK settles the body.
 No post-ACK GC gate or second-generation store is introduced. The per-key state
 consolidation and switch decision remain separate follow-ups.
+
+M3 off: files that older builds could warm-restore are read once in full on their
+next growth (paced, cost only). Main's normal per-page Full read-mode counters
+are the cost signal. M3 custody debt is not yet covered by the 6 h freshness alarm.
+
+Cargo-invoked process default thread stack becomes 8 MiB; installed runtime
+stack configuration unchanged.

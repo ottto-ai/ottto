@@ -37,6 +37,7 @@ pub(crate) struct Properties {
     pub(crate) representations: &'static [Representation],
     #[cfg(test)]
     pub(super) encode: fn(&CachedJsonlReduction, usize, u64) -> Result<Vec<u8>, Refuse>,
+    #[cfg(test)]
     pub(super) decode: fn(&[u8], SnapshotSource) -> Result<durable::Decoded, Corrupt>,
     #[cfg(unix)]
     pub(super) decode_bounded:
@@ -64,6 +65,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         ),
         #[cfg(test)]
         encode: durable::encode_body,
+        #[cfg(test)]
         decode: durable::decode_body,
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
@@ -81,6 +83,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         ),
         #[cfg(test)]
         encode: durable::encode_body,
+        #[cfg(test)]
         decode: durable::decode_body,
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,

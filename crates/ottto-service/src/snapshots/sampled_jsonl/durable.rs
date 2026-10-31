@@ -299,12 +299,14 @@ pub(crate) struct Decoded {
     rederive: Rederive,
 }
 
+#[cfg(test)]
 pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Corrupt> {
     let source = crate::durable_tail_store::DurableSource::from_snapshot(source).ok_or(Corrupt)?;
     let row = source.properties();
     (row.decode)(body, row.snapshot)
 }
 
+#[cfg(test)]
 pub(in crate::snapshots) fn decode_body(
     body: &[u8],
     source: SnapshotSource,
@@ -430,6 +432,7 @@ impl Decoded {
 
     /// Move the already-paid graph only when no content needs native input.
     /// Even a zero head mark cannot excuse a nonempty digest obligation.
+    #[cfg(test)]
     pub(crate) fn without_rederive(
         self,
     ) -> Result<(CachedJsonlReduction, RederiveReceipt), RederiveUnfunded> {
@@ -597,6 +600,7 @@ fn pread_line(file: &mut File, offset: u64, len: u64) -> std::io::Result<Vec<u8>
 /// A fresh parser for re-derivation: the same source and options as the
 /// record's, no title metadata and no live inputs (no re-derived field reads
 /// them), and no reread binding (a bounded head read, not a Full).
+#[cfg(test)]
 pub(crate) fn rederive_parser(
     mut file: File,
     path: &Path,
