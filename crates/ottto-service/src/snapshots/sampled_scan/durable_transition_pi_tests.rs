@@ -1096,9 +1096,9 @@ fn pi_active_bound_is_one_paced_no_record_full_and_keeps_the_record() {
 // keeping the durable record and the accepted state. Growth inside the pace
 // window is then a counted delay with 0 Full that holds the accepted body.
 // Once admission fits, the kept record restores and Tails; a quiet restart
-// POSTs nothing. No new Full cause and no new pace key; the pace key, 6 h
-// window, map overflow and alarm are asserted on the shared owner in
-// `durable_tail_pi_bound_tests.rs` (`pi_cache_copy`).
+// POSTs nothing. No new Full cause and no new pace key; the pace window and
+// map overflow are the shared owner's (`durable_tail_pi_bound_tests.rs`,
+// `m3_owed_tests`).
 // Revisit trigger: if the Pi cache_transit count is ever > 0 on M4 or the
 // fleet, a cache-less restore -> Tail path becomes next-release work.
 /// [format] Pi native accounting and restore contract.

@@ -1169,40 +1169,6 @@ fn pi_lines(first_prompt: bool) -> Vec<String> {
     lines
 }
 
-/// The retained copy of a real Pi parse and its decoded body, before any
-/// re-derivation. `decode` needs no native layout, unlike `decode_bounded`.
-fn pi_decoded(path: &Path) -> (CachedJsonlReduction, Decoded) {
-    let (reduction, _) = full_read(path, SnapshotSource::Pi);
-    let body = encode(
-        &reduction,
-        crate::durable_tail_store::RECORD_BYTES,
-        line_cap(),
-    )
-    .unwrap();
-    let decoded = decode(&body, SnapshotSource::Pi).expect("decode");
-    (reduction, decoded)
-}
-
-/// [format] Pi native accounting and restore contract.
-/// Bounded replay restores Pi workspace, first prompt and fallback title.
-/// These content steps are portable; durable bounded decode is layout-gated.
-#[test]
-fn pi_cwd_and_first_prompt_body_is_admitted_for_restore() {
-    let scratch = Scratch::new("pi-admitted");
-    let path = scratch.write("pi.jsonl", &pi_lines(true));
-    let (reduction, decoded) = pi_decoded(&path);
-    let cold = &reduction.accumulator;
-    assert!(cold.workspace_path.is_some() && cold.first_prompt_material.is_some());
-    let plan = decoded.rederive_plan().expect("no RederiveUnfunded");
-    let (restored, _, _) = decoded
-        .rederive_content_planned(&File::open(&path).unwrap(), &plan)
-        .expect("restore admitted");
-    let restored = restored.accumulator;
-    assert_eq!(restored.workspace_path, cold.workspace_path);
-    assert_eq!(restored.first_prompt_material, cold.first_prompt_material);
-    assert_eq!(restored.first_prompt_title, cold.first_prompt_title);
-}
-
 /// [format] Pi native accounting and restore contract.
 /// A physical first prompt after 1 MiB cannot obtain a bounded durable proof.
 #[test]
@@ -1356,34 +1322,29 @@ fn pi_restored_tail(path: &Path, grow: &[String]) -> OwnedJsonlParser {
     continued
 }
 
+/// [format] Pi native accounting and restore contract.
 /// restore→Tail equals a cold Full: money and every uploaded field, byte-equal,
 /// including the first-prompt and title fields, with no re-assignment from the
-/// Tail's prompt.
-fn pi_restore_tail_case(cwd: bool) {
-    let scratch = Scratch::new("pi-marked-tail");
-    let path = scratch.write("t.jsonl", &pi_marked_lines(cwd));
-    let context = pi_attribution(&scratch.0);
-    let parser = pi_restored_tail(&path, &pi_tail_lines());
-    let tailed = pi_uploaded(parser, &path, &context);
-    assert_eq!(tailed, pi_cold_uploaded(&path, &context));
-    let text = tailed.to_string();
-    for field in ["template_group_id", "skill_id", "session_display_name\":\""] {
-        assert!(text.contains(field), "{field}");
-    }
-    assert!(text.contains(PI_MARKER), "the title and the label carry it");
-}
-
-/// [format] Pi native accounting and restore contract.
+/// Tail's prompt. With and without a header `cwd`, rederived from its marked
+/// header row.
 #[test]
 fn pi_restored_tail_publishes_the_cold_first_prompt_and_title() {
-    pi_restore_tail_case(false);
-}
-
-/// [format] Pi native accounting and restore contract.
-/// The same with a header `cwd`, rederived from its marked header row.
-#[test]
-fn pi_restored_tail_with_header_cwd_publishes_the_cold_body() {
-    pi_restore_tail_case(true);
+    for cwd in [false, true] {
+        let scratch = Scratch::new("pi-marked-tail");
+        let path = scratch.write("t.jsonl", &pi_marked_lines(cwd));
+        let context = pi_attribution(&scratch.0);
+        let parser = pi_restored_tail(&path, &pi_tail_lines());
+        let tailed = pi_uploaded(parser, &path, &context);
+        assert_eq!(tailed, pi_cold_uploaded(&path, &context), "cwd={cwd}");
+        let text = tailed.to_string();
+        for field in ["template_group_id", "skill_id", "session_display_name\":\""] {
+            assert!(text.contains(field), "cwd={cwd}: {field}");
+        }
+        assert!(
+            text.contains(PI_MARKER),
+            "cwd={cwd}: the title and the label carry it"
+        );
+    }
 }
 
 /// [format] Pi native accounting and restore contract.
