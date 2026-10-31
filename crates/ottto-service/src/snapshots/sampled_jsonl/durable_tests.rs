@@ -1623,7 +1623,7 @@ fn generate_53d05a43_v1_goldens() {
             }
             let before = json!({"generation":index.generation,
                 "entry":index.files.get(&key),"ack_evidence":ack});
-            let (mut reduction, checkpoint, mut parsed) =
+            let (mut reduction, checkpoint, mut parsed, tier_receipt) =
                 claude_history_upgrade::with_staged_births_for_test(
                     BTreeMap::from([(key.clone(), 1_785_654_000_000_000_000)]),
                     || {
@@ -1648,6 +1648,22 @@ fn generate_53d05a43_v1_goldens() {
                             ReadMode::Full(_)
                         ));
                         while !p.step().unwrap() {}
+                        // Match the scan's EOF settlement: TierReplay is live
+                        // class E state, finished and removed before retention.
+                        let tier_receipt = if claude {
+                            None
+                        } else {
+                            p.accumulator
+                                .codex_tier_replay
+                                .take()
+                                .expect("Codex input must run the live tier replay")
+                                .finish()
+                                .unwrap()
+                        };
+                        assert!(
+                            tier_receipt.is_none(),
+                            "these inputs contain no protected priority tiers"
+                        );
                         let reduction = p.reduction_copy();
                         let checkpoint = match p.certify_without_retention(&scope(), NOW).unwrap() {
                             SideCertificate::Certified { completed, .. } => completed.checkpoint,
@@ -1669,25 +1685,34 @@ fn generate_53d05a43_v1_goldens() {
                                 None,
                             )
                             .unwrap();
-                        (reduction, checkpoint, parsed)
+                        (reduction, checkpoint, parsed, tier_receipt)
                     },
                 );
             assert_eq!(parsed.snapshots.len(), 1);
             assert_eq!(parsed.recognized_usage_drop_count, 0);
+            assert!(
+                reduction.positive_usage_evidence,
+                "{case}: native usage must be populated"
+            );
             let v2 = !claude && !legacy;
             assert_eq!(reduction.accumulator.codex_counting_v2(), v2);
             let mut counting_receipts =
                 crate::codex_scan_diagnostics::CountingV2Receipts::default();
-            if let Some(counting) = &reduction.accumulator.codex_counting {
+            if !claude {
+                let counting = reduction
+                    .accumulator
+                    .codex_counting
+                    .as_ref()
+                    .expect("both Codex cases require real counting selection state");
                 counting.fold_receipts(&mut counting_receipts);
                 if v2 {
+                    assert_eq!(counting_receipts.v2_sessions, 1);
                     assert_eq!(counting_receipts.native_counted, 1);
                 } else {
                     assert_eq!(counting_receipts.v2_sessions, 0);
                 }
             }
             if claude {
-                let mut read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
                 evidence_rows = [10, 20, 30]
                     .into_iter()
                     .enumerate()
@@ -1720,7 +1745,37 @@ fn generate_53d05a43_v1_goldens() {
                         row
                     })
                     .collect();
-                read.evidence.insert(ROOT.into(), evidence_rows.clone());
+                // Mirror e2_tests::sidecar: load both rows AND their read/health
+                // witness. Filling the public evidence map alone is not a read.
+                let sidecar_dir = crate::claude_local_otel::STORE_DIR;
+                fs::create_dir_all(scratch.0.join(sidecar_dir)).unwrap();
+                scratch.write(
+                    &format!("{sidecar_dir}/{}.jsonl", sha(ROOT.as_bytes())),
+                    &evidence_rows
+                        .iter()
+                        .map(|row| serde_json::to_string(row).unwrap())
+                        .collect::<Vec<_>>(),
+                );
+                let read = crate::claude_local_otel::ClaudeApiEvidenceRead::load(
+                    &scratch.0,
+                    [ROOT.to_owned()],
+                )
+                .unwrap();
+                let report = read
+                    .session_report(ROOT)
+                    .expect("synthetic sidecar read witness");
+                assert!(report.complete);
+                assert!(report.duplicate_keys.is_empty());
+                assert_eq!(report.rows.len(), 3);
+                assert_eq!(parsed.snapshots[0].claude_usage_occurrences.len(), 3);
+                for row in report.rows {
+                    assert!(validate_claude_api_row(row, ROOT));
+                    let occurrence = parsed.snapshots[0]
+                        .claude_usage_occurrences
+                        .get(&row.request_id)
+                        .expect("every API row has a parsed request holder");
+                    assert!(claude_api_matches_transcript_occurrence(row, occurrence));
+                }
                 claude_request_money::e2::decide_page_copies(&mut parsed.snapshots, &index);
                 claude_request_money::e2::attach_page(&mut parsed.snapshots, &read);
                 let fold = parsed.snapshots[0]
@@ -1772,11 +1827,7 @@ fn generate_53d05a43_v1_goldens() {
             let members = BTreeSet::from([item.snapshot_fingerprint.clone()]);
             let witnesses = BTreeSet::from([snapshot_upload_body_witness(item)]);
             let metadata = fs::metadata(&path).unwrap();
-            let tier_receipt = reduction
-                .accumulator
-                .codex_tier_replay
-                .clone()
-                .and_then(|replay| replay.finish().unwrap());
+            assert!(reduction.accumulator.codex_tier_replay.is_none());
             let entry: ScanIndexEntry = serde_json::from_value(json!({
                 "size_bytes":metadata.len(),"modified_unix_seconds":metadata.mtime().max(0) as u64,
                 "modified_unix_nanos":metadata.mtime_nsec(),"source_file_fingerprint":fingerprint,
@@ -1810,6 +1861,10 @@ fn generate_53d05a43_v1_goldens() {
             let body = encode(&reduction, store::RECORD_BYTES, line_cap()).unwrap();
             verify(&body).unwrap();
             let decoded = decode(&body, source).unwrap();
+            assert_eq!(decoded.reduction.accumulator.codex_counting_v2(), v2);
+            if !claude {
+                assert!(decoded.reduction.accumulator.codex_counting.is_some());
+            }
             let selector_span = if selector {
                 let capture = &reduction.accumulator.current_selector;
                 assert_eq!(decoded.reduction.accumulator.current_selector, *capture);
@@ -1862,6 +1917,11 @@ fn generate_53d05a43_v1_goldens() {
             index.save(&index_path).unwrap();
             let entry = &index.files[&key];
             assert!(entry.last_upload_body_witness.is_some());
+            assert!(index.accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint));
+            if !claude {
+                assert_eq!(entry.codex_counting_v2, v2);
+                assert_eq!(entry.codex_counting_owner.as_deref(), Some(ROOT));
+            }
             let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
             let ds = if claude {
                 DurableSource::ClaudeCode
@@ -1955,13 +2015,12 @@ fn generate_53d05a43_v1_goldens() {
                 "cli_version":if !claude && !legacy { Some("0.148.9") } else { None },
                 "selector_context":if selector { json!({"service_tier":"priority"}) } else { json!({}) },
                 "selector_sources":if selector { json!({"service_tier":"derived_from_logs_2"}) } else { json!({}) },
-                "accepted_body_witness":true,"tier_replay_present":!claude});
+                "accepted_body_witness":true,"tier_replay_finished":!claude,
+                "tier_replay_persisted":false,"protected_tier_receipt_present":false});
             assert_eq!(item.cache_read_tokens, if claude { 9 } else { 0 });
             assert_eq!(item.cache_creation_5m_tokens, if claude { 15 } else { 0 });
             assert_eq!(item.cache_creation_1h_tokens, if claude { 6 } else { 0 });
-            if !claude {
-                assert!(decoded.reduction.accumulator.codex_tier_replay.is_some());
-            }
+            assert!(decoded.reduction.accumulator.codex_tier_replay.is_none());
             let expected = json!({"schema_version":1,"case_id":case,"facts":facts,
                 "scope_inputs":{"file_scope":scope().0,"namespace":namespace.0,
                     "identity_contract":interpretation.identity_contract,"counting_view":interpretation.counting_view,
