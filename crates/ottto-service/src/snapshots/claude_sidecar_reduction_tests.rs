@@ -1400,6 +1400,20 @@ mod durable_restart {
                 u64::from(crate::heap_layout_bound::layout_supported())
             );
             assert_eq!(exact_bodies(&warm), exact_bodies(&cold));
+            let item = &warm.result.snapshots[0];
+            assert!(item
+                .model_usage
+                .iter()
+                .any(|row| row.identity_parts.is_some()));
+            assert_eq!(
+                uniform_session_account_hash(item),
+                f.api[0].account_identifier_hash
+            );
+            assert_eq!(
+                exact_session_account_hash(item),
+                None,
+                "placement is never login proof"
+            );
             assert_eq!(
                 warm.result.snapshots[0]
                     .request_evidence

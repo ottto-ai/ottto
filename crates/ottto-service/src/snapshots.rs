@@ -14280,13 +14280,31 @@ fn exact_session_account_hash(item: &SnapshotItem) -> Option<String> {
 /// Uniform placement only, including carried rows. Never use for creator,
 /// retained, sole-login or own-request proof.
 fn uniform_session_account_hash(item: &SnapshotItem) -> Option<String> {
-    let mut rows = item.model_usage.iter().chain(
+    let rows = item.model_usage.iter().chain(
         item.usage_buckets
             .iter()
             .flat_map(|bucket| bucket.model_usage.iter()),
     );
-    let first = rows.next()?.account_identifier_hash.as_deref()?;
-    rows.all(|row| row.account_identifier_hash.as_deref() == Some(first))
+    // Only the new provenance split admits same-login identity parts here.
+    // With no carried evidence preserve the old row-only comparison exactly.
+    let carried = item
+        .request_evidence
+        .iter()
+        .any(|entry| entry.account_source.is_some());
+    let mut accounts = rows.flat_map(|row| {
+        let parts = row.identity_parts.as_deref().filter(|_| carried);
+        std::iter::once(row.account_identifier_hash.as_deref())
+            .take(usize::from(parts.is_none()))
+            .chain(
+                parts
+                    .into_iter()
+                    .flatten()
+                    .map(|part| part.account_identifier_hash.as_deref()),
+            )
+    });
+    let first = accounts.next()??;
+    accounts
+        .all(|account| account == Some(first))
         .then(|| first.to_string())
 }
 
