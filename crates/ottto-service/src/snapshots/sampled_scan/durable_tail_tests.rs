@@ -248,8 +248,13 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
                 }
                 match scan.step(None) {
                     OwnedSourceScanStep::Pending(next) => scan = next,
-                    OwnedSourceScanStep::Complete { index, scan, .. } => {
-                        return (index, scan, modes)
+                    OwnedSourceScanStep::Complete {
+                        mut index,
+                        mut scan,
+                        ..
+                    } => {
+                        finalize_scan_after_policy(source, &mut scan, &mut index);
+                        return (index, scan, modes);
                     }
                 }
             }
@@ -5921,6 +5926,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                                 SnapshotUploadPolicy::default(),
                             );
                             finalize_scan_after_policy(source, &mut projected, &mut index);
+                            projected.finish_codex_capture_boundary(&mut index);
                             let accepted = projected
                                 .snapshots
                                 .iter()
@@ -11455,8 +11461,13 @@ fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
                 }
                 match scan.step(None) {
                     OwnedSourceScanStep::Pending(next) => scan = next,
-                    OwnedSourceScanStep::Complete { index, scan, .. } => {
-                        return (index, scan, modes)
+                    OwnedSourceScanStep::Complete {
+                        mut index,
+                        mut scan,
+                        ..
+                    } => {
+                        finalize_scan_after_policy(source, &mut scan, &mut index);
+                        return (index, scan, modes);
                     }
                 }
             }
