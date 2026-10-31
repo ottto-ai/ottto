@@ -26726,7 +26726,7 @@ impl OwnedSourceScan {
         let codex_title_metadata = if source == SnapshotSource::Codex {
             let mut metadata = CodexTitleMetadata::load_from_roots(roots);
             metadata.count_prior_state_only_conflicts(index);
-            metadata.scope_created_thread_census(index);
+            metadata.scope_created_thread_census(index, roots);
             metadata
         } else {
             CodexTitleMetadata::default()
@@ -40888,22 +40888,27 @@ impl CodexTitleMetadata {
 
     /// E2 B3b: after a home's created-thread census failed, scope a rollout to
     /// its own home only when the file -> home map is exact. Its one identity
-    /// has a state row in exactly one loaded home, that home is complete and
-    /// is the only loaded home containing the row's rollout path, and
-    /// discovery has walked every failing home without finding a rollout of
+    /// has a state row in exactly one loaded home, whose created-thread census
+    /// succeeded and which is the only loaded home containing the row's
+    /// rollout path, and discovery has walked every failing root (in its scan
+    /// roots, none pending, no namespace loss) without finding a rollout of
     /// that identity there (a copy whose unread row could disagree). Anything
     /// else stays held. Counted in `created_thread_scoped_rollouts`.
-    fn scope_created_thread_census(&mut self, index: &ScanIndex) {
+    fn scope_created_thread_census(&mut self, index: &ScanIndex, roots: &[PathBuf]) {
         let failed = &self.created_thread_census_failed_homes;
         let under_failed = |path: &Path| failed.iter().any(|home| path.starts_with(home));
         let Some(traversal) = index.traversal.as_ref() else {
             return;
         };
         if failed.is_empty()
+            || roots
+                .iter()
+                .any(|root| under_failed(root) && !traversal.scan_roots.contains(root))
             || traversal
                 .pending_directories
                 .iter()
                 .any(|directory| under_failed(&directory.path))
+            || claude_family_census_shadow::Vetoes::current(index, traversal).namespace_loss
         {
             return;
         }
@@ -78389,10 +78394,11 @@ mod tests {
     }
 
     /// [money] E2 B3b (Lead B, 2026-10-31): one home's created-thread census
-    /// fails. A rollout whose proof comes only from another, complete home is
-    /// not held; a rollout that might depend on two homes, one with no own row
-    /// and one inside the failing home stay held, and nothing is scoped until
-    /// discovery has walked the failing home.
+    /// fails. A rollout whose proof comes only from another, healthy home is
+    /// not held. A rollout that might depend on two homes (a copy of its id in
+    /// the failing home), one with no own-home row and one inside the failing
+    /// home stay held, and nothing is scoped until discovery has walked the
+    /// failing home's roots without loss.
     #[test]
     fn codex_created_thread_census_failure_holds_only_files_of_the_failing_home() {
         let base = temp_dir("codex-created-thread-scoped-failure");
@@ -78438,28 +78444,27 @@ mod tests {
         }
         drop(state);
         let roots = [failing.join("sessions"), healthy.join("sessions")];
-        let walked = |pending_directories: Value| {
+        let walked = json!({
+            "context_fingerprint": "context",
+            "census_window_end": "2026-10-31T10:00:00Z",
+            "scan_roots": roots,
+            "pending_directories": [],
+            "pending_candidates": [],
+            "observed_index_keys": [],
+            "codex_rollout_paths": [local_index_key(&copy_in_failing)],
+            "reconciliation_upper_bound": null,
+            "reconciliation_after": null,
+            "reconciliation_started": false,
+            "counts": {}
+        });
+        let scoped = |traversal: Option<&Value>| {
             let index = ScanIndex {
-                traversal: Some(
-                    serde_json::from_value(json!({
-                        "context_fingerprint": "context",
-                        "census_window_end": "2026-10-31T10:00:00Z",
-                        "scan_roots": roots,
-                        "pending_directories": pending_directories,
-                        "pending_candidates": [],
-                        "observed_index_keys": [],
-                        "codex_rollout_paths": [local_index_key(&copy_in_failing)],
-                        "reconciliation_upper_bound": null,
-                        "reconciliation_after": null,
-                        "reconciliation_started": false,
-                        "counts": {}
-                    }))
-                    .expect("traversal fixture"),
-                ),
+                traversal: traversal
+                    .map(|traversal| serde_json::from_value(traversal.clone()).unwrap()),
                 ..ScanIndex::default()
             };
             let mut metadata = CodexTitleMetadata::load_from_roots(&roots);
-            metadata.scope_created_thread_census(&index);
+            metadata.scope_created_thread_census(&index, &roots);
             metadata
         };
         let ambiguous = |metadata: &CodexTitleMetadata, path: &Path| {
@@ -78472,7 +78477,7 @@ mod tests {
             accumulator.codex_sidecar_identity_ambiguous
         };
 
-        let metadata = walked(json!([]));
+        let metadata = scoped(Some(&walked));
         assert_eq!(
             metadata.created_thread_census_failed_homes,
             BTreeSet::from([failing.clone()])
@@ -78492,12 +78497,27 @@ mod tests {
         );
         assert_eq!(metadata.local_diagnostics.created_thread_scoped_rollouts, 1);
 
-        let walking = walked(json!([{"scan_root": roots[0], "path": failing.join("sessions")}]));
-        assert!(
-            ambiguous(&walking, &own_path),
-            "failing home not yet walked"
-        );
-        assert_eq!(walking.local_diagnostics.created_thread_scoped_rollouts, 0);
+        // Until discovery has fully walked the failing home, nothing is scoped.
+        let mut pending = walked.clone();
+        pending["pending_directories"] =
+            json!([{"scan_root": roots[0], "path": failing.join("sessions")}]);
+        let mut lossy = walked.clone();
+        lossy["counts"] = json!({"symlink_rejected_count": 1});
+        let mut unwalked_root = walked.clone();
+        unwalked_root["scan_roots"] = json!([roots[1]]);
+        for (name, traversal) in [
+            ("pending directory", Some(&pending)),
+            ("namespace loss", Some(&lossy)),
+            ("root not walked", Some(&unwalked_root)),
+            ("no traversal", None),
+        ] {
+            let metadata = scoped(traversal);
+            assert!(ambiguous(&metadata, &own_path), "{name}");
+            assert_eq!(
+                metadata.local_diagnostics.created_thread_scoped_rollouts, 0,
+                "{name}"
+            );
+        }
     }
 
     #[test]
