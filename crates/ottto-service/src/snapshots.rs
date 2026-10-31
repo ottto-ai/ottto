@@ -8913,7 +8913,7 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
         .iter()
         .filter(|(_, pending)| {
             pending.invalid
-                || !pending.previous_windows.is_empty()
+                || pending.has_history()
                 || pending
                     .member_requests
                     .values()

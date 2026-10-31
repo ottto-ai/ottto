@@ -80,6 +80,10 @@ impl ClaudeAccountFamilyPendingWindow {
 }
 
 impl ClaudeAccountFamilyPending {
+    pub(super) fn has_history(&self) -> bool {
+        !self.previous_windows.is_empty()
+    }
+
     pub(super) fn history_summary(&self) -> HistorySummary {
         HistorySummary::fold(&self.previous_windows)
     }
