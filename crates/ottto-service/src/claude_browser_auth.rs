@@ -156,10 +156,19 @@ pub(crate) fn release_ceremony(operation_id: &str) {
     });
 }
 
-// Fields drop in order: the flock is released before the process mutex.
 struct StateGuard {
-    _file: FileLock,
     _process: std::sync::MutexGuard<'static, ()>,
+    file: File,
+}
+
+impl Drop for StateGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
 }
 
 pub(crate) struct OperationGuard {
@@ -309,10 +318,19 @@ fn cancel_provider_before_terminal(child: &mut SupervisedChild, operation_id: &s
     }
 }
 
-// Fields drop in order: the flock is released before the process mutex.
 struct AdmissionGuard {
-    _file: FileLock,
     _process: std::sync::MutexGuard<'static, ()>,
+    file: File,
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
 }
 
 pub(crate) fn annotate_status(mut status: ClaudeAccountsStatusV1) -> ClaudeAccountsStatusV1 {
@@ -3723,15 +3741,19 @@ fn transact<T>(mutation: impl FnOnce(&mut PersistedState) -> T) -> Result<T, std
 }
 
 fn state_guard() -> std::io::Result<StateGuard> {
+    use std::os::fd::AsRawFd;
     let process = STATE_TRANSACTION
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     fs::create_dir_all(default_support_dir())?;
     let file = open_private_lock_file(&default_support_dir().join(STATE_LOCK_FILE))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(StateGuard {
-        _file: FileLock::exclusive(file)?,
         _process: process,
+        file,
     })
 }
 
@@ -3798,15 +3820,19 @@ fn provider_process_active(operation_id: &str) -> std::io::Result<bool> {
 }
 
 fn admission_guard() -> std::io::Result<AdmissionGuard> {
+    use std::os::fd::AsRawFd;
     let process = ADMISSION_TRANSACTION
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     fs::create_dir_all(default_support_dir())?;
     let file = open_private_lock_file(&default_support_dir().join(ADMISSION_LOCK_FILE))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(AdmissionGuard {
-        _file: FileLock::exclusive(file)?,
         _process: process,
+        file,
     })
 }
 

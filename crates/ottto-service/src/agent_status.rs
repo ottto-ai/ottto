@@ -1,5 +1,5 @@
 use crate::claude_status_coverage::Observation as CoverageObservation;
-use crate::locked_state_dir::{open_private_lock_file, FileLock};
+use crate::locked_state_dir::open_private_lock_file;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
 use ottto_core::claude_account_identifier_hash;
@@ -39,6 +39,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1137,15 +1138,36 @@ struct PersistedClaudeSlotCollectionStateV1 {
     anchor_transitions: Vec<ottto_protocol::ClaudeAccountAnchorTransitionV1>,
 }
 
-// Fields drop in order: the flock is released before the process mutex.
 struct ClaudeSlotCollectionStateGuard {
-    _file: FileLock,
     _process: std::sync::MutexGuard<'static, ()>,
+    file: Option<File>,
 }
 
 struct ClaudeOAuthCollectionAttemptGuard {
-    _file: FileLock,
     _process: std::sync::MutexGuard<'static, ()>,
+    file: File,
+}
+
+impl Drop for ClaudeOAuthCollectionAttemptGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+impl Drop for ClaudeSlotCollectionStateGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if let Some(file) = &self.file {
+                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            }
+        }
+    }
 }
 
 /// The failure classes that count toward opening the breaker. Everything else
@@ -9252,6 +9274,7 @@ fn merge_claude_slot_collection_state_at(
 }
 
 fn claude_slot_collection_state_guard() -> std::io::Result<ClaudeSlotCollectionStateGuard> {
+    use std::os::fd::AsRawFd;
     let process = CLAUDE_SLOT_COLLECTION_STATE_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -9260,9 +9283,12 @@ fn claude_slot_collection_state_guard() -> std::io::Result<ClaudeSlotCollectionS
     let file = open_private_lock_file(
         &default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE),
     )?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(ClaudeSlotCollectionStateGuard {
-        _file: FileLock::exclusive(file)?,
         _process: process,
+        file: Some(file),
     })
 }
 
@@ -12750,6 +12776,7 @@ fn try_claude_oauth_collection_attempt(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
 ) -> Option<ClaudeOAuthCollectionAttemptGuard> {
+    use std::os::fd::AsRawFd;
     let process_lock = {
         let mut locks = CLAUDE_OAUTH_COLLECTION_ATTEMPT_LOCKS
             .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -12773,9 +12800,12 @@ fn try_claude_oauth_collection_attempt(
         return None;
     }
     let file = open_private_lock_file(&account_root.join(".collection-attempt.lock")).ok()?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
     Some(ClaudeOAuthCollectionAttemptGuard {
-        _file: FileLock::try_exclusive(file).ok()?,
         _process: process,
+        file,
     })
 }
 
