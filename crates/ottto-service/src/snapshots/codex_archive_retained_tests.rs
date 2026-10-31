@@ -26,6 +26,7 @@ fn archive_event_count(rows: &[Value], event: &str) -> u64 {
         .sum()
 }
 
+/// [money] An unsettled retained archive resends without decoding; only the exact ACK settles it.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -90,6 +91,7 @@ fn unsettled_retained_archive_resends_zero_decoded_bytes_and_exact_ack_settles()
     ));
 }
 
+/// [money] Read bound: an evicted archive retries once with a counted bounded decode.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -132,6 +134,7 @@ fn evicted_archive_retries_once_with_counted_bounded_decode() {
     );
 }
 
+/// [money] RAM-only cache fence: a changed archive object never takes the prior retained copy.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -175,6 +178,8 @@ fn changed_archive_object_never_takes_prior_retained_copy() {
     );
 }
 
+/// [money] A twin without content equivalence holds the archive; the plain sibling body is
+/// unchanged.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -229,6 +234,7 @@ fn twin_without_content_equivalence_holds_archive_and_preserves_plain_body() {
     }
 }
 
+/// [behaviour] A prior plain carrier or tombstone holds a moved archive before any content read.
 #[test]
 fn prior_plain_carrier_or_tombstone_holds_move_before_any_content_read() {
     let f = ArchiveFixture::new(b"not even a valid zstd frame: no header read allowed");
@@ -284,6 +290,8 @@ fn prior_plain_carrier_or_tombstone_holds_move_before_any_content_read() {
     }
 }
 
+/// [behaviour] Resolving the only pending sibling restores one first-read eligibility, not a sticky
+/// hold.
 #[test]
 fn only_pending_sibling_resolution_restores_one_a1_eligibility() {
     let f = ArchiveFixture::new(b"metadata only");
@@ -308,6 +316,7 @@ fn only_pending_sibling_resolution_restores_one_a1_eligibility() {
     );
 }
 
+/// [money] Plain retained output and charge are unchanged beside archive pressure.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -376,6 +385,7 @@ fn plain_retained_output_and_charge_are_unchanged_beside_archive_pressure() {
     assert_eq!(observations[0], observations[1]);
 }
 
+/// [behaviour] Newest-archive order survives small pages; plain FIFO work goes first.
 #[test]
 fn global_newest_archive_order_survives_small_pages_and_plain_fifo_is_first() {
     let f = ArchiveFixture::new(b"no content read");
@@ -442,6 +452,8 @@ fn global_newest_archive_order_survives_small_pages_and_plain_fifo_is_first() {
     assert!(pending.is_empty());
 }
 
+/// [behaviour] An only pending sibling that resolves to another owner leaves exactly one first
+/// read.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -522,6 +534,7 @@ fn only_pending_sibling_resolves_to_another_owner_then_exactly_one_a1() {
     ));
 }
 
+/// [behaviour] A retained-archive scope mismatch is quiet correction residue, not eviction credit.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -567,6 +580,7 @@ fn retained_archive_scope_mismatch_is_quiet_correction_residue_not_eviction_cred
     );
 }
 
+/// [behaviour] An unavailable retained scope keeps the copy and defers without decode credit.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -604,6 +618,7 @@ fn unavailable_retained_archive_scope_keeps_copy_and_defers_without_decode_credi
 }
 
 #[cfg(unix)]
+/// [money] RAM-only cache fence: a compressed retained save never writes a durable record.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -645,6 +660,8 @@ fn compressed_retained_save_never_writes_a_durable_record() {
     assert!(checkpoint.durable_certificate(0).is_none());
 }
 
+/// [money] RAM-only cache fence: plain preparation cannot take or reuse a compressed retained
+/// entry.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -705,6 +722,7 @@ fn plain_prepare_cannot_take_or_reuse_a_compressed_retained_entry() {
     assert!(cache.retained_checkpoint(&key).is_some());
 }
 
+/// [money] Claude retained reuse is unchanged beside archive pressure.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -821,6 +839,7 @@ fn claude_retained_reuse_is_unchanged_beside_archive_pressure() {
     assert_eq!(observations[0], observations[1]);
 }
 
+/// [money] Custody precedes the retained take; a growing archive keeps its copy.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -870,6 +889,7 @@ fn custody_precedes_retained_take_and_growing_archive_keeps_its_copy() {
     }
 }
 
+/// [behaviour] A new archive first read with exact accepted history counts as a re-upgrade Full.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -920,6 +940,7 @@ fn new_archive_a1_with_exact_accepted_history_counts_reupgrade_full() {
     assert_eq!(archive_event_count(&rows, "archive_reupgrade_full"), 0);
 }
 
+/// [behaviour] The activated funded decoder admits 1 GiB and refuses an unknown-size probe.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),

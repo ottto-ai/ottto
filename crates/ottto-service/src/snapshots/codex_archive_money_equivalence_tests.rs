@@ -31,6 +31,7 @@ fn discovered_scan(f: &ArchiveFixture, mut index: ScanIndex, limit: usize) -> Ow
     )
 }
 
+/// [money] Read bound: thread CPU and clock pacing stop archive decodes at the boundary.
 #[test]
 fn fake_thread_cpu_and_clock_enforce_archive_boundary_pacing() {
     use crate::snapshots::sampled_scan::ArchivePass as Pass;
@@ -53,6 +54,8 @@ fn fake_thread_cpu_and_clock_enforce_archive_boundary_pacing() {
     assert!(!pass.ready(1));
 }
 
+/// [money] Read bound: the archive CPU budget is not reset by completion, partial commit or
+/// continuation.
 #[test]
 fn cpu_budget_survives_scan_completion_partial_commit_and_continuation_pages() {
     let f = ArchiveFixture::new(b"no decoder permission");
@@ -104,6 +107,7 @@ fn cpu_budget_survives_scan_completion_partial_commit_and_continuation_pages() {
     );
 }
 
+/// [money] Read bound: no per-pass inventory re-read storm; live work precedes the paced backlog.
 #[test]
 fn no_inventory_storm_and_live_work_precedes_paced_backlog() {
     let f = ArchiveFixture::new(b"never decode denied backlog");
@@ -159,6 +163,7 @@ fn no_inventory_storm_and_live_work_precedes_paced_backlog() {
     }
 }
 
+/// [behaviour] Archive hints queue as backlog and the newest archive is selected first.
 #[test]
 fn archive_hints_are_backlog_and_newest_archive_is_selected_first() {
     let f = ArchiveFixture::new(b"constructor does not decode");
@@ -190,6 +195,7 @@ fn archive_hints_are_backlog_and_newest_archive_is_selected_first() {
     assert_eq!(scan.identified_candidates.front().unwrap().path, f.0);
 }
 
+/// [money] Read bound: an unchanged archive stamp never re-decodes during inventory.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -243,6 +249,7 @@ fn stamp_matching_header_inventory_never_decodes_archives() {
     assert!(inventory.headers.is_empty());
 }
 
+/// [money] Plain reads unchanged: unseen archives do not spend the plain header cap.
 #[test]
 fn unseen_archives_do_not_spend_the_plain_header_population_cap() {
     let f = ArchiveFixture::new(b"not read");
@@ -268,6 +275,7 @@ fn unseen_archives_do_not_spend_the_plain_header_population_cap() {
     assert!(inventory.headers.is_empty());
 }
 
+/// [behaviour] Watcher, retained refresh and bounded walk admit exact Codex archive names.
 #[test]
 fn watcher_retained_refresh_and_bounded_walk_admit_exact_codex_archives() {
     let f = ArchiveFixture::new(b"discovery must not decode");
@@ -331,6 +339,7 @@ fn watcher_retained_refresh_and_bounded_walk_admit_exact_codex_archives() {
     }
 }
 
+/// [money] Read bound: repeated short steps under contention decode no archive.
 #[test]
 fn many_short_steps_over_contention_work_decode_no_archive() {
     let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
@@ -351,6 +360,7 @@ fn many_short_steps_over_contention_work_decode_no_archive() {
     assert_eq!(result.unreadable_path_count, 0);
 }
 
+/// [behaviour] Bounded preparation skips rejected archives and still admits a late eligible entry.
 #[test]
 fn rejected_archives_then_late_eligible_entry_bounded_prep() {
     let f = ArchiveFixture::new(b"never read rejected archives");
@@ -406,6 +416,7 @@ fn rejected_archives_then_late_eligible_entry_bounded_prep() {
     assert_eq!(inventory.headers[0].candidate.path, plain);
 }
 
+/// [behaviour] Source-aware events reject non-exact archive suffixes.
 #[test]
 fn source_aware_events_reject_nonexact_archive_suffixes() {
     let paths = [
@@ -427,6 +438,7 @@ fn source_aware_events_reject_nonexact_archive_suffixes() {
     }
 }
 
+/// [money] An archive-only root is read once, settles on exact ACK, and restarts quietly.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -478,6 +490,7 @@ fn compressed_only_root_read_once_and_acked_then_quiet_restart() {
     }
 }
 
+/// [money] Read bound: a declared >1 GiB archive is held without a decoder and restart stays quiet.
 #[test]
 fn declared_over_1gib_held_without_decoder_and_restart_is_quiet() {
     let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();

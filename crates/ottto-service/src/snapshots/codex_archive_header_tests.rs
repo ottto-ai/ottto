@@ -111,6 +111,7 @@ fn header_inventory(
     rows
 }
 
+/// [money] Read bound: one header read then one Full read, with physical-byte accounting.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -248,6 +249,7 @@ fn inventory_header_once_then_full_once_with_physical_accounting() {
     assert_eq!(decodes(&header_inventory(&f, &mut quiet, &cache)), 0);
 }
 
+/// [behaviour] A header read never checks archive completion; a failed Full keeps the projection.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -281,6 +283,7 @@ fn header_read_never_checks_archive_completion_and_failed_full_keeps_projection(
     assert!(state.codex_parent_ownership_ledgers.is_empty());
 }
 
+/// [money] Read bound: header limits and failures do not re-decode the same stamp.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -331,6 +334,7 @@ fn header_limits_and_failures_do_not_redecode_same_stamp() {
     }
 }
 
+/// [behaviour] Refused header admission does not spend a decode attempt.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -406,6 +410,7 @@ fn refused_header_admission_does_not_spend_a_decode_attempt() {
     );
 }
 
+/// [money] Plain sibling output: an invalid archive does not hold live plain work on the next pass.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -488,6 +493,7 @@ fn invalid_archive_does_not_hold_live_plain_on_next_pass() {
     ));
 }
 
+/// [behaviour] A Full read accepts a 70 KiB header and settles once.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -561,6 +567,7 @@ fn full_read_accepts_seventy_kib_header_and_settles_once() {
     }
 }
 
+/// [money] Read bound: a Full admission refusal keeps the header without re-decoding it.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -606,6 +613,7 @@ fn real_full_admission_refusal_preserves_header_without_redecode() {
     assert_eq!(decodes(&header_inventory(&f, &mut state, &cache)), 0);
 }
 
+/// [behaviour] Header permission and CPU gates spend no transcript bytes or attempt.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -668,6 +676,7 @@ fn header_permission_and_cpu_gate_spend_no_transcript_bytes_or_attempt() {
     assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_input"));
 }
 
+/// [behaviour] A double-UUID archive gets a named-owner hold with no replacement or re-decode.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -737,6 +746,7 @@ fn double_uuid_archive_has_named_owner_hold_no_replacement_or_redecode() {
     assert!(result.snapshots.is_empty());
 }
 
+/// [behaviour] An inventory step charges decoded bytes to the page and keeps physical accounting.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -798,6 +808,8 @@ fn inventory_step_charges_decoded_bytes_to_page_and_keeps_physical_inventory_acc
     panic!("inventory budget test did not reach its step");
 }
 
+/// [money] Plain sibling output: an unreadable segment holds its filename owner, not unrelated
+/// plain.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -893,6 +905,8 @@ fn unreadable_segment_holds_its_filename_owner_but_not_unrelated_plain() {
     );
 }
 
+/// [off=main] With discovery off after restart, the retained archive queue and roster stay as on
+/// main.
 #[test]
 fn retained_archive_queue_and_roster_obey_discovery_off_after_restart() {
     let _discovery = archive_discovery_scope(false);
@@ -1194,6 +1208,7 @@ fn retained_archive_queue_and_roster_obey_discovery_off_after_restart() {
     }
 }
 
+/// [behaviour] A cached archive header does not bypass the permission gate.
 #[test]
 fn cached_archive_header_does_not_bypass_permission_gate() {
     let bytes = synthetic_rollout();
@@ -1223,6 +1238,7 @@ fn cached_archive_header_does_not_bypass_permission_gate() {
     );
 }
 
+/// [format] An excluded-archive inventory hold survives restart without a plain header re-read.
 #[test]
 fn excluded_archive_inventory_hold_survives_restart_without_plain_header_reread() {
     let _discovery = archive_discovery_scope(false);
@@ -1446,6 +1462,8 @@ fn excluded_archive_inventory_hold_survives_restart_without_plain_header_reread(
     }
 }
 
+/// [behaviour] A denied-only inventory hold re-offers owed plain work at a bounded retry
+/// generation.
 #[test]
 fn denied_only_inventory_hold_reoffers_owed_plain_at_bounded_retry_generation() {
     let _discovery = archive_discovery_scope(false);
@@ -1737,6 +1755,7 @@ fn denied_only_inventory_hold_reoffers_owed_plain_at_bounded_retry_generation() 
     fs::remove_dir_all(state_root).unwrap();
 }
 
+/// [format] Every persisted pre-composition archive disposition label still decodes.
 #[test]
 fn merged_causes_decode_every_precomposition_archive_disposition_label() {
     use CodexZstCause::*;
@@ -1788,6 +1807,7 @@ fn merged_causes_decode_every_precomposition_archive_disposition_label() {
     assert_eq!(DecoderRefusedHeaderOccupancy as usize, 24);
 }
 
+/// [behaviour] A changed stamp keeps the historical logical identity and resets acquisition state.
 #[test]
 fn changed_stamp_preserves_historical_logical_identity_but_resets_acquisition_state() {
     let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -2033,6 +2053,7 @@ fn selector_archive_pass(
     (index, result, rows, observer)
 }
 
+/// [behaviour] Production inventory denial holds only its scope; the sibling progresses.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -2142,6 +2163,7 @@ fn production_inventory_denial_holds_scoped_and_sibling_progresses() {
     }
 }
 
+/// [format] The persisted header-bound marker survives restart without an inventory re-decode.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -2210,6 +2232,8 @@ fn large_header_rollout() -> Vec<u8> {
     bytes
 }
 
+/// [money] Plain sibling output: mixed-owner plain publishes identical bytes while the hold stays
+/// quiet.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -2286,6 +2310,8 @@ fn bound_archive_mixed_owner_plain_publishes_identical_and_hold_stays_quiet() {
     }
 }
 
+/// [format] Crash safety: the header bound survives a saved reservation and a crash before the
+/// first line.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -2374,6 +2400,7 @@ fn bound_header_survives_saved_reservation_before_first_line_crash() {
     assert!(result.snapshots.is_empty());
 }
 
+/// [format] The inventory bound marker survives a normal save before the Full reservation.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -2454,6 +2481,7 @@ fn inventory_bound_marker_survives_normal_save_before_full_reservation() {
     assert_eq!(cache.cursor_reserved(), 0);
 }
 
+/// [behaviour] Sibling inventory at the population cap counts shared physical keys once.
 #[test]
 fn sibling_inventory_at_population_cap_counts_shared_physical_keys_once() {
     let paths = (0..codex_file_join::MAX_HEADER_FILES - 2)
@@ -2494,6 +2522,7 @@ fn sibling_inventory_at_population_cap_counts_shared_physical_keys_once() {
     );
 }
 
+/// [behaviour] A changed archive stamp resets the header bound and decodes one bounded prefix.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -2544,6 +2573,7 @@ fn changed_archive_stamp_resets_header_bound_and_decodes_one_bounded_prefix() {
     }
 }
 
+/// [format] A missing or malformed persisted header bound loads false and reads at most one prefix.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -2601,6 +2631,7 @@ fn missing_or_malformed_header_bound_loads_false_and_reads_at_most_one_prefix() 
     }
 }
 
+/// [behaviour] Warm evidence with a changed stamp defers without reading an unselected header.
 #[test]
 fn warm_archive_evidence_changed_stamp_defers_without_unselected_header_read() {
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
@@ -2642,6 +2673,7 @@ fn warm_archive_evidence_changed_stamp_defers_without_unselected_header_read() {
     assert_eq!(serde_json::to_value(&index.files[&key]).unwrap(), before);
 }
 
+/// [money] Read bound: denied inventory debt releases once and paces without a plain body re-read.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -2895,6 +2927,7 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
     }
 }
 
+/// [behaviour] Activation does not release an unchanged non-regular archive inventory witness.
 #[test]
 fn activation_does_not_release_unchanged_nonregular_archive_inventory_witness() {
     let f = ArchiveFixture::new(b"metadata-only fixture");
@@ -2938,6 +2971,7 @@ fn activation_does_not_release_unchanged_nonregular_archive_inventory_witness() 
     }
 }
 
+/// [behaviour] An incomplete archive inventory defers before frame or header I/O.
 #[test]
 fn incomplete_archive_inventory_defers_before_frame_or_header_io() {
     let f = ArchiveFixture::new(b"no read permission from incomplete membership");
@@ -2966,6 +3000,7 @@ fn incomplete_archive_inventory_defers_before_frame_or_header_io() {
         .any(|row| row["stage"] == "codex_zst_frame_header"));
 }
 
+/// [behaviour] Deferred header gates and an absent cache do not increment the admission streak.
 #[test]
 fn header_deferred_gates_and_absent_cache_do_not_increment_admission_streak() {
     let _lock = ARCHIVE_TEST_LOCK
@@ -3060,6 +3095,7 @@ fn activated_selector_scan(
     scan
 }
 
+/// [behaviour] Power loss after construction defers without a read or attempt; plain progresses.
 #[test]
 fn archive_power_loss_after_construction_defers_without_read_or_attempt_and_plain_progresses() {
     for denied in [Some(false), None] {
@@ -3117,6 +3153,7 @@ fn archive_power_loss_after_construction_defers_without_read_or_attempt_and_plai
     }
 }
 
+/// [behaviour] Power loss between header and body keeps the paid header; plain progresses.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -3187,6 +3224,7 @@ fn archive_power_loss_between_header_and_body_preserves_paid_header_and_plain_pr
     }
 }
 
+/// [behaviour] The activated selector reaches header-claim starvation and resets on progress.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),

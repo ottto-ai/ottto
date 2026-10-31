@@ -9,14 +9,14 @@ entry definition contains archive evidence or a compressed hold enum position.
 They ignore the entire unknown archive object, including its new cause labels,
 and retain the file/body/counting evidence they understand, as today.
 
-Linux-running synthetic fixtures vendor that exact entry decode path with both
-commit pins and source-span hashes. They serialize the branch's actual index,
-decode every entry with the released types, retain all known entry fields and
-incidence, then load the downgraded serialization through the current loader.
-The compatibility harness preserves unrelated top-level fields opaquely; it does
-not reproduce the entire historical runtime or its unrelated repair/GC paths.
-No index reset or quarantine is expected. These fixtures require no native
-funded decoder; execution is deferred to the authorized CI lane.
+Two kinds of evidence cover this boundary. The CI-only
+`scripts/test_codex_zst_downgrade.py` compiles the 0.1.201 and R1 loaders from
+their pinned source and runs them on branch-written bytes. Linux unit tests in
+`codex_archive_downgrade_tests.rs` use a checked released-format index: the
+branch writer keeps those bytes and adds custody only under each entry's
+`archive` key, for every disposition and correction state, and released-format
+bytes re-import without reset, hold or stranded correction. The unit tests run
+no released code and do not reproduce its unrelated repair/GC paths.
 
 Downgrade keeps custody; new budget/correction state is lost; at most today's
 behavior; re-upgrading grants nothing new (user_change_spent absent = MAX).
