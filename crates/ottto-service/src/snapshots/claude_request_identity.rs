@@ -3709,12 +3709,7 @@ impl<'a> ScanEvidence<'a> {
                 evidence.invalid_logins.insert(key);
                 continue;
             };
-            if let Some(org) = row
-                .request_identity
-                .as_ref()
-                .filter(|identity| identity.disposition == ClaudeIdentityDisposition::Complete)
-                .and_then(|identity| organization_hash(identity).ok().flatten())
-            {
+            if let Some(org) = complete_org(row) {
                 evidence
                     .memberships
                     .entry(login.to_string())
@@ -3864,6 +3859,27 @@ fn organization_hash(identity: &ClaudeRequestIdentityEvidence) -> Result<Option<
             .map(Some)
             .ok_or(()),
     }
+}
+
+/// The org of a row whose request identity is complete, as memberships use.
+fn complete_org(row: &ClaudeLocalOtelEvidence) -> Option<&str> {
+    row.request_identity
+        .as_ref()
+        .filter(|identity| identity.disposition == ClaudeIdentityDisposition::Complete)
+        .and_then(|identity| organization_hash(identity).ok().flatten())
+}
+
+/// A telemetry-only side call's own account: an intact row login with a
+/// complete org (the same checks that establish memberships). `None` when
+/// either is missing or incomplete: the caller keeps the session fallback.
+pub(crate) fn side_call_account(row: &ClaudeLocalOtelEvidence, root: &str) -> AccountPartition {
+    let login = valid_login(row, root)?;
+    let org = complete_org(row)?;
+    Some(Arc::new(AuthorityKey {
+        login: Some(login.to_owned()),
+        org: Some(org.to_owned()),
+        basis: TELEMETRY,
+    }))
 }
 
 /// The row's login when the row itself is intact: D1's capture, count,
