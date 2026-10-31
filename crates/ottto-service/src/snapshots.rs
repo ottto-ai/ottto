@@ -29169,7 +29169,12 @@ impl OwnedSourceScan {
                             );
                         }
                         if codex_archive_path(&active.candidate.path) {
-                            index.archive_hold(&active.candidate.path, CodexZstCause::DecodeFailed);
+                            let cause = if codex_compressed_input::structural_read_error(&error) {
+                                CodexZstCause::DecodeFailed
+                            } else {
+                                CodexZstCause::AdmissionRefused
+                            };
+                            index.archive_hold(&active.candidate.path, cause);
                             active.parser.reader.reader.close();
                             pending!();
                         }
@@ -29798,7 +29803,7 @@ impl OwnedSourceScan {
                         > codex_file_join::MAX_RECEIPT_BYTES
                 {
                     if codex_archive_path(&candidate.path) {
-                        index.archive_hold(&candidate.path, CodexZstCause::OutputHeld);
+                        index.archive_hold(&candidate.path, CodexZstCause::AdmissionRefused);
                         parser.reader.reader.close();
                         pending!();
                     }
@@ -30290,7 +30295,12 @@ impl OwnedSourceScan {
                             );
                         }
                         if codex_archive_path(&candidate.path) {
-                            index.archive_hold(&candidate.path, CodexZstCause::DecodeFailed);
+                            let cause = if codex_compressed_input::structural_read_error(&error) {
+                                CodexZstCause::DecodeFailed
+                            } else {
+                                CodexZstCause::AdmissionRefused
+                            };
+                            index.archive_hold(&candidate.path, cause);
                             pending!();
                         }
                         census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
@@ -79382,6 +79392,9 @@ mod tests {
                 fs::write(&archive, b"invalid archive header").unwrap();
             }
             let checkpoint = root.join("scan-index.json");
+            if checkpoint.exists() {
+                fs::remove_file(&checkpoint).unwrap();
+            }
             let mut index = ScanIndex::default();
             let mut child_snapshot = None;
             for cycle in 0..8 {

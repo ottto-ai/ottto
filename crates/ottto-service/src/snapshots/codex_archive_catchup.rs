@@ -30,6 +30,12 @@ impl ScanIndex {
             a.transient();
         }
     }
+    fn archive_fence_hold(&mut self, path: &Path, cause: CodexZstCause) {
+        if let Some(a) = self.archives.get_mut(&local_index_key(path)) {
+            a.cancel_reservation();
+            a.disposition = ArchiveDisposition::Held { cause };
+        }
+    }
     pub(super) fn archive_owed_count(&self) -> usize {
         self.archives
             .values()
@@ -85,9 +91,7 @@ impl ScanIndex {
         i: &codex_file_join::HeaderInventory,
         boundary: usize,
     ) -> Result<(), CodexZstCause> {
-        if !i.archive_scope_valid(self, boundary) {
-            return Err(CodexZstCause::AdmissionRefused);
-        }
+        i.archive_scope(self, boundary)?;
         let h = i
             .archive_headers
             .iter()
@@ -156,7 +160,7 @@ impl ScanIndex {
                 continue;
             }
             match self.archive_fence(&key, inventory, 0) {
-                Err(cause) => self.archive_hold(&c.path, cause),
+                Err(cause) => self.archive_fence_hold(&c.path, cause),
                 Ok(()) => {
                     let a = self.archives.get_mut(&key).unwrap();
                     if a.work
@@ -192,7 +196,7 @@ impl ScanIndex {
         }
         if !budget.archive_ready(&self.archive_pass) {
             // No Full bytes spent: cancel the unconsumed reservation.
-            self.archives.get_mut(&key).unwrap().cancel_reservation();
+            self.archives.get_mut(&key).unwrap().transient();
             return Admission::Held;
         }
         if !self.archive_parent_ready(&key, validated) {
@@ -203,7 +207,7 @@ impl ScanIndex {
             .ok_or(CodexZstCause::OwnerUnproven)
             .and_then(|i| self.archive_fence(&key, i, 1))
         {
-            self.archive_hold(&c.path, cause);
+            self.archive_fence_hold(&c.path, cause);
             return Admission::Held;
         }
         Admission::Read
@@ -220,7 +224,7 @@ impl ScanIndex {
             .ok_or(CodexZstCause::OwnerUnproven)
             .and_then(|i| self.archive_fence(&key, i, 2))
         {
-            self.archive_hold(path, cause);
+            self.archive_fence_hold(path, cause);
             return false;
         }
         if !self

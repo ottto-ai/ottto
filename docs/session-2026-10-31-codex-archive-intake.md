@@ -16,12 +16,13 @@ Archive debt blocks only archive-dependent decisions. It is counted and alarmed
 separately from ordinary unreadable-file errors. Unaccepted reservations remain
 owed after a crash. The existing disclosed-loss receipt channel reports money
 as incomplete without lowering the source census flag: ordinary backfill/replay,
-plain re-offers, manifest and acknowledgement retirement keep their native gates. No unknown usage becomes a zero total.
+plain re-offers, manifest and acknowledgement retirement keep their native gates.
+No unknown usage becomes a zero total.
 
 The bounded header prefix is inventory work, separate from a Full read. Header
 attempt markers are saved as a batch before decoding; incomplete attempts after
-a restart wait for their saved six-hour retry. One batch saves all admitted Full reservations for the
-page before any Full body bytes. Decoder allocation is prepaid through the
+a restart wait for their saved six-hour retry. One batch saves all admitted Full
+reservations for the page before any Full body bytes. Decoder allocation is prepaid through the
 existing shared cache. The same native parser continues in RAM across decoded
 pages to EOF; a process restart loses that checkpoint.
 
@@ -38,8 +39,8 @@ Settled archive markers keep only object stamp and disposition; acquisition
 headers and body scratch are discarded. Settled files use listing stamps rather
 than repeated opens or one scan step per archive. Scope checks are shared at
 reservation, read and publication boundaries, validating each directory home
-once. Archive work restores the native continuation QoS when it finishes. Archive state uses the existing index save and state-store
-owners, with no slot added to ordinary file entries.
+once. Archive work restores the native continuation QoS when it finishes.
+Archive state uses the existing index save and state-store owners, with no slot added to ordinary file entries.
 
 Release note: context or replay changes retain accepted archive money and mark
 `CorrectionUnapplied` once per transition. No automatic archive reread is granted;

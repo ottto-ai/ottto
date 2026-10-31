@@ -75,6 +75,15 @@ pub(super) fn compressed_input_credit() -> io::Result<usize> {
         .ok_or_else(|| invalid("compressed rollout credit overflow"))
 }
 
+pub(super) fn structural_read_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<io::Error>().map_or(true, |error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+        )
+    })
+}
+
 pub(super) fn archive_alarm(count: usize) {
     if count > 0 {
         crate::local_resource_diagnostics::durable_tail_alarm(
@@ -102,6 +111,7 @@ pub(super) struct ArchiveWork {
     pub(super) header_retry_after: u64,
     pub(super) retry_after: u64,
     pub(super) decoded: bool,
+    pub(super) structural: bool,
     pub(super) alarmed: Option<CodexZstCause>,
     #[serde(skip)]
     pub(super) save_pending: bool,
@@ -172,6 +182,17 @@ impl ArchiveEvidence {
             work: Some(Box::default()),
         }
     }
+    pub(super) fn checked(self) -> Self {
+        if matches!(
+            self.disposition,
+            ArchiveDisposition::Acquired | ArchiveDisposition::Empty
+        ) && (self.stamp.is_none() || self.work.is_some())
+        {
+            Self::unknown()
+        } else {
+            self
+        }
+    }
     pub(super) fn from_metadata(meta: std::fs::Metadata) -> io::Result<Self> {
         Ok(Self {
             stamp: Some(crate::transcript_acquisition::FileStamp::capture(meta)?.content_only()),
@@ -185,6 +206,7 @@ impl ArchiveEvidence {
         work.reservation_saved = false;
         work.save_pending = true;
         work.decoded = false;
+        work.structural = false;
         work.retry_after = super::sampled_scan::now_seconds().saturating_add(21600);
         self.disposition = ArchiveDisposition::Pending {
             attempts: work.attempts,
@@ -234,15 +256,7 @@ impl ArchiveEvidence {
             ArchiveDisposition::Held { cause } => {
                 cause == CodexZstCause::CorrectionUnapplied
                     || cause == CodexZstCause::HeaderInvalid
-                    || self.work.as_ref().is_some_and(|w| {
-                        w.decoded
-                            && matches!(
-                                cause,
-                                CodexZstCause::OwnerUnproven
-                                    | CodexZstCause::OutputHeld
-                                    | CodexZstCause::DecodeFailed
-                            )
-                    })
+                    || self.work.as_ref().is_some_and(|w| w.structural)
             }
             ArchiveDisposition::HeaderValidated => false,
         }
@@ -253,14 +267,22 @@ impl ArchiveEvidence {
             .is_ok_and(|s| self.stamp.as_ref().is_some_and(|old| old.same_content(&s)))
     }
     pub(super) fn hold(&mut self, cause: CodexZstCause) {
-        if matches!(cause, CodexZstCause::AdmissionRefused) {
-            self.transient();
-        } else {
-            self.disposition = ArchiveDisposition::Held { cause };
+        if cause == CodexZstCause::AdmissionRefused {
+            self.cancel_reservation();
         }
+        if let Some(w) = self.work.as_mut() {
+            w.structural = w.decoded
+                && matches!(
+                    cause,
+                    CodexZstCause::OwnerUnproven
+                        | CodexZstCause::OutputHeld
+                        | CodexZstCause::DecodeFailed
+                );
+        }
+        self.disposition = ArchiveDisposition::Held { cause };
     }
     pub(super) fn transient(&mut self) {
-        self.cancel_reservation();
+        self.hold(CodexZstCause::AdmissionRefused);
     }
     pub(super) fn finish(&mut self, owner: Option<&str>, parsed: &super::ParsedJsonlFile) -> bool {
         if owner.is_none() || self.header().map(|h| h.owner.as_str()) != owner {
@@ -289,7 +311,7 @@ impl ArchiveEvidence {
     }
 }
 crate::heap_layout_bound::fields!(ValidatedHeader;owner,created_unix_ms,parent);
-crate::heap_layout_bound::fields!(ArchiveWork;header,body_witness,attempts,header_attempts,header_retry_after,retry_after,decoded,alarmed,save_pending,reservation_saved,reserved);
+crate::heap_layout_bound::fields!(ArchiveWork;header,body_witness,attempts,header_attempts,header_retry_after,retry_after,decoded,structural,alarmed,save_pending,reservation_saved,reserved);
 crate::heap_layout_bound::fields!(ArchiveEvidence;stamp,disposition,work);
 impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -636,12 +658,21 @@ impl super::ScanIndex {
             return Ok(HeaderRead::Deferred);
         }
         if !self.archive_pass.ready(1) {
+            if let Some(w) = self.archives.get_mut(&key).and_then(|a| a.work.as_mut()) {
+                if w.reservation_saved {
+                    w.header_retry_after = 0;
+                    w.header_attempts = w.header_attempts.saturating_sub(1);
+                    w.reservation_saved = false;
+                    w.save_pending = false;
+                }
+            }
             return Ok(HeaderRead::Deferred);
         }
         let w = self.archives.get_mut(&key).unwrap().work.as_mut().unwrap();
         if !w.reservation_saved {
             return Ok(HeaderRead::Deferred);
         }
+        w.reservation_saved = false;
         self.archive_pass.started = true;
         let file = match open_candidate_beneath_root(candidate) {
             Ok(file) => file,
@@ -669,10 +700,13 @@ impl super::ScanIndex {
         let result = (|| -> Result<ValidatedHeader> {
             let bytes =
                 codex_file_join::read_header_line(&mut input)?.context("archive header bound")?;
-            anyhow::ensure!(
-                self.archives[&key].matches(input.get_ref()),
-                "archive changed during header read"
-            );
+            if !self.archives[&key].matches(input.get_ref()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "archive changed during header read",
+                )
+                .into());
+            }
             ValidatedHeader::from_bytes(&bytes).context("archive header invalid")
         })();
         if let OpenedInput::Compressed(reader, _) = &input {
@@ -695,8 +729,11 @@ impl super::ScanIndex {
                     .header = Some(Box::new(header.clone()));
                 Ok(HeaderRead::Validated(header))
             }
-            Err(_) => {
-                self.archive_hold(&candidate.path, CodexZstCause::HeaderInvalid);
+            Err(error) => {
+                if structural_read_error(&error) {
+                    self.archive_hold(&candidate.path, CodexZstCause::HeaderInvalid);
+                }
+
                 Ok(HeaderRead::Deferred)
             }
         }
@@ -754,6 +791,13 @@ impl super::OwnedSourceScan {
                     w.reservation_saved = true;
                     w.save_pending = false;
                 }
+            }
+        }
+        for a in committed.archives.values_mut() {
+            if let Some(w) = a.work.as_mut() {
+                w.save_pending = false;
+                w.reservation_saved = false;
+                w.reserved = false;
             }
         }
         self.index.archive_pass.dirty = false;
@@ -1460,16 +1504,26 @@ pub(in crate::snapshots) mod tests {
         traversal.pending_directories.clear();
         scan
     }
-    fn finish_selector(
+    fn finish_selector(scan: OwnedSourceScan, checkpoint: &Path) -> (ScanIndex, SourceScanResult) {
+        finish_selector_with(scan, checkpoint, |_| {})
+    }
+    fn finish_selector_with(
         mut scan: OwnedSourceScan,
         checkpoint: &Path,
+        mut observe: impl FnMut(&mut OwnedSourceScan),
     ) -> (ScanIndex, SourceScanResult) {
         let mut committed = scan.index.clone();
+        // Restart fixtures retain the exact CAS generation, as real loaded
+        // indexes do; a new empty pathname cannot stand in for that database.
+        if committed.generation > 0 && !checkpoint.exists() {
+            fs::write(checkpoint, serde_json::to_vec(&committed).unwrap()).unwrap();
+        }
         for _ in 0..100000 {
             match scan.step(None) {
                 OwnedSourceScanStep::Pending(mut next) => {
                     next.persist_archive_reservation(&mut committed, checkpoint)
                         .unwrap();
+                    observe(&mut next);
                     scan = next;
                 }
                 OwnedSourceScanStep::Complete {
@@ -1803,7 +1857,7 @@ pub(in crate::snapshots) mod tests {
             index.archives[&local_index_key(&f.0)].disposition,
             ArchiveDisposition::Pending { .. }
         ));
-        let (_, result, logs) = run_archive(
+        let (spent_index, result, logs) = run_archive(
             &f,
             saved(&index),
             Arc::new(sampled_scan::SharedCache::default()),
@@ -1817,13 +1871,17 @@ pub(in crate::snapshots) mod tests {
         // A cancelled reservation has spent no Full and must not buy a retry
         // penalty or a retry counter. A structural post-Full failure is quiet.
         for spent in [false, true] {
-            let mut held = saved(&index);
+            let mut held = if spent {
+                saved(&spent_index)
+            } else {
+                saved(&index)
+            };
             let a = held.archives.get_mut(&local_index_key(&f.0)).unwrap();
-            a.reserve();
-            a.work.as_mut().unwrap().reserved = true;
             if spent {
                 a.hold(CodexZstCause::OwnerUnproven);
             } else {
+                a.reserve();
+                a.work.as_mut().unwrap().reserved = true;
                 a.cancel_reservation();
                 assert_eq!(a.work.as_ref().unwrap().attempts, 0);
             }
@@ -1874,7 +1932,7 @@ pub(in crate::snapshots) mod tests {
             Arc::new(sampled_scan::SharedCache::default()),
         );
         assert_eq!(scan.archive_owed_count, 2);
-        crate::snapshot_sync::tests::assert_archive_debt_preserves_replay_progress(index, &scan);
+        crate::snapshot_sync::assert_archive_debt_preserves_replay_progress(index, &scan);
     }
     /// [regress] A plain append between reservation and admission cancels only
     /// the unspent archive attempt; the next pass can read its native body.
@@ -1895,7 +1953,7 @@ pub(in crate::snapshots) mod tests {
         .unwrap();
         let mut c = codex_zst_refusal_tests::candidate(&plain);
         c.size_bytes = fs::metadata(&plain).unwrap().len();
-        let mut scan = selector_scan(
+        let scan = selector_scan(
             &f,
             ScanIndex::default(),
             Arc::new(sampled_scan::SharedCache::default()),
@@ -1904,18 +1962,14 @@ pub(in crate::snapshots) mod tests {
         );
         let checkpoint = fixture(b"", ".json");
         fs::remove_file(&checkpoint.0).unwrap();
-        let mut committed = scan.index.clone();
-        loop {
-            let OwnedSourceScanStep::Pending(mut next) = scan.step(None) else {
-                panic!("reservation missing")
-            };
-            next.persist_archive_reservation(&mut committed, &checkpoint.0)
-                .unwrap();
-            if next
-                .index
-                .archives
-                .get(&local_index_key(&f.0))
-                .is_some_and(ArchiveEvidence::ready_full)
+        let mut appended = false;
+        let (index, first) = finish_selector_with(scan, &checkpoint.0, |next| {
+            if !appended
+                && next
+                    .index
+                    .archives
+                    .get(&local_index_key(&f.0))
+                    .is_some_and(ArchiveEvidence::ready_full)
             {
                 fs::OpenOptions::new()
                     .append(true)
@@ -1923,12 +1977,10 @@ pub(in crate::snapshots) mod tests {
                     .unwrap()
                     .write_all(b"{}\n")
                     .unwrap();
-                scan = next;
-                break;
+                appended = true;
             }
-            scan = next;
-        }
-        let (index, first) = finish_selector(scan, &checkpoint.0);
+        });
+        assert!(appended);
         assert_eq!(first.unreadable_path_count, 0);
         assert!(first
             .snapshots
@@ -2049,47 +2101,32 @@ pub(in crate::snapshots) mod tests {
                     fs::set_permissions(&f.0, fs::Permissions::from_mode(0o0)).unwrap();
                 }
             }
-            let mut scan = selector_scan(
+            let scan = selector_scan(
                 &f,
                 ScanIndex::default(),
                 Arc::new(sampled_scan::SharedCache::default()),
                 VecDeque::from([c, f.candidate()]),
                 true,
             );
-            let mut committed = scan.index.clone();
             let mut injected = false;
-            let (mut index, mut result) = loop {
-                match scan.step(None) {
-                    OwnedSourceScanStep::Pending(mut next) => {
-                        next.persist_archive_reservation(&mut committed, &checkpoint.0)
-                            .unwrap();
-                        if refusal == "receipt" && !injected {
-                            if let Some(active) = next
-                                .active_file
-                                .as_mut()
-                                .filter(|a| codex_archive_path(&a.candidate.path))
-                            {
-                                active
-                                    .parser
-                                    .accumulator
-                                    .codex_tier_replay
-                                    .as_mut()
-                                    .unwrap()
-                                    .admitted(Some(("synthetic-tier".into(), "x".repeat(65))));
-                                injected = true;
-                            }
-                        }
-                        scan = next;
+            let (index, result) = finish_selector_with(scan, &checkpoint.0, |next| {
+                if refusal == "receipt" && !injected {
+                    if let Some(active) = next
+                        .active_file
+                        .as_mut()
+                        .filter(|a| codex_archive_path(&a.candidate.path))
+                    {
+                        active
+                            .parser
+                            .accumulator
+                            .codex_tier_replay
+                            .as_mut()
+                            .unwrap()
+                            .admitted(Some(("synthetic-tier".into(), "x".repeat(65))));
+                        injected = true;
                     }
-                    OwnedSourceScanStep::Complete { index, scan, .. } => break (index, scan),
                 }
-            };
-            apply_upload_policy(
-                SnapshotSource::Codex,
-                &mut result.snapshots,
-                SnapshotUploadPolicy::default(),
-            );
-            finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+            });
             if refusal == "receipt" {
                 assert!(injected);
                 assert_eq!(
@@ -2129,6 +2166,7 @@ pub(in crate::snapshots) mod tests {
             json!("future"),
             json!({"disposition":"new-version"}),
             json!(false),
+            json!({"stamp":null,"disposition":"Acquired"}),
         ] {
             let mut wire = serde_json::to_value(&index).unwrap();
             wire["archives"][&key] = value;
@@ -2138,6 +2176,17 @@ pub(in crate::snapshots) mod tests {
             assert!(held.decode_holds.is_empty());
             assert!(held.accepted_snapshot_fingerprints.is_empty());
         }
+        let mut wire = serde_json::to_value(&index).unwrap();
+        wire["archives"] = json!(false);
+        let checkpoint = fixture(&serde_json::to_vec(&wire).unwrap(), ".json");
+        let mut held = ScanIndex::load(&checkpoint.0).unwrap();
+        assert_eq!(held.archive_owed_count(), 1);
+        assert!(held.decode_holds.is_empty());
+        held.save(&checkpoint.0).unwrap();
+        assert_eq!(
+            ScanIndex::load(&checkpoint.0).unwrap().archive_owed_count(),
+            1
+        );
         index.archives.clear();
         assert_eq!(before, serde_json::to_value(index).unwrap());
     }

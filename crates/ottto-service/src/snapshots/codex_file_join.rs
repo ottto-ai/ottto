@@ -375,7 +375,7 @@ pub(super) struct HeaderInventory {
     cache_pruned: bool,
     pub(super) archive_complete: bool,
     plain_finished: bool,
-    archive_checks: [std::cell::OnceCell<bool>; 3],
+    archive_checks: [std::cell::OnceCell<Option<CodexZstCause>>; 3],
     pub(super) archive_headers: Vec<HeaderWitness>,
     archive_pending: VecDeque<PathBuf>,
     /// Roster files whose first record was refused, each with the metadata
@@ -450,10 +450,16 @@ impl HeaderInventory {
     }
     /// One scope check per reservation/read/publication boundary, shared by
     /// every archive. Directory homes are validated once within that check.
-    pub(super) fn archive_scope_valid(&self, index: &ScanIndex, boundary: usize) -> bool {
-        *self.archive_checks[boundary].get_or_init(|| {
-            self.archive_complete
-                && codex_counting_version::absence_coverage_complete(index, self)
+    pub(super) fn archive_scope(
+        &self,
+        index: &ScanIndex,
+        boundary: usize,
+    ) -> Result<(), CodexZstCause> {
+        let cause = *self.archive_checks[boundary].get_or_init(|| {
+            if !codex_counting_version::absence_coverage_complete(index, self) {
+                return Some(CodexZstCause::OwnerUnproven);
+            }
+            let valid = self.archive_complete
                 && self.content_unchanged()
                 && self.archives_unchanged()
                 && self
@@ -463,8 +469,10 @@ impl HeaderInventory {
                     .map(|h| &h.home)
                     .collect::<BTreeSet<_>>()
                     .into_iter()
-                    .all(|home| self.directories.validate(home).is_ok())
-        })
+                    .all(|home| self.directories.validate(home).is_ok());
+            (!valid).then_some(CodexZstCause::AdmissionRefused)
+        });
+        cause.map_or(Ok(()), Err)
     }
     pub(super) fn archives_unchanged(&self) -> bool {
         self.archive_headers.iter().all(|h| {
@@ -507,7 +515,13 @@ impl HeaderInventory {
                     let key = local_index_key(path);
                     if index.archives.get(&key).is_some_and(|a| {
                         a.stamp.is_none()
-                            && !matches!(a.disposition, ArchiveDisposition::HeaderValidated)
+                            && !matches!(
+                                a.disposition,
+                                ArchiveDisposition::HeaderValidated
+                                    | ArchiveDisposition::Held {
+                                        cause: CodexZstCause::AdmissionRefused
+                                    }
+                            )
                     }) {
                         continue;
                     }

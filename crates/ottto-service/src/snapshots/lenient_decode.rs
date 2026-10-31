@@ -1834,6 +1834,9 @@ impl<R: BufRead + Seek> Decoder<R> {
     ) -> std::result::Result<BTreeMap<String, T>, Error> {
         self.reader.seek(SeekFrom::Start(span.start))?;
         if self.ws()? != Some(b'{') {
+            if let Some(unknown) = unknown {
+                return Ok(BTreeMap::from([(String::new(), unknown())]));
+            }
             if debt {
                 return Err(Error::Refused("unkeyed negative collection"));
             }
@@ -1864,7 +1867,11 @@ impl<R: BufRead + Seek> Decoder<R> {
                     return Err(Error::HoldBudget);
                 }
             }
-            let key = self.record_key(key_span)?;
+            let key = if field == "archives" && key_span.len == 2 {
+                String::new()
+            } else {
+                self.record_key(key_span)?
+            };
             if values.contains_key(&key) || self.holds.contains(field, &key) {
                 return Err(Error::Refused("duplicate record key"));
             }
@@ -2099,13 +2106,17 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "files" => index.files = self.records("files", value, true)?,
                         "archives" => {
-                            index.archives = self.records_checked(
-                                "archives",
-                                value,
-                                false,
-                                |_| false,
-                                Some(codex_compressed_input::ArchiveEvidence::unknown),
-                            )?
+                            index.archives = self
+                                .records_checked(
+                                    "archives",
+                                    value,
+                                    false,
+                                    |_| false,
+                                    Some(codex_compressed_input::ArchiveEvidence::unknown),
+                                )?
+                                .into_iter()
+                                .map(|(key, a)| (key, a.checked()))
+                                .collect()
                         }
                         "session_account_bindings" => {
                             index.session_account_bindings = self.typed(value)?

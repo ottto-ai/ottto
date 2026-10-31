@@ -12890,7 +12890,10 @@ pub(crate) fn terminal_off_traversal_ended_for_test(index: &ScanIndex) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub(crate) use tests::assert_archive_debt_preserves_replay_progress;
+
+#[cfg(test)]
+mod tests {
     use super::*;
     mod terminal_contract_retry_tests {
         include!("snapshot_sync/terminal_contract_retry_tests.rs");
@@ -12916,10 +12919,9 @@ pub(crate) mod tests {
                 destination,
             );
         }
-        assert!(
-            !pending_backfill_sources_for_destination(&backfill, destination)
-                .contains(&SnapshotSource::Codex)
-        );
+        let pending = pending_backfill_sources_for_destination(&backfill, destination)
+            .contains(&SnapshotSource::Codex);
+        assert!(!pending);
         let fp = "a".repeat(64);
         let mut progress = SnapshotUploadProgress::new("c".repeat(64), test_quarantine_witness());
         for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
@@ -12935,7 +12937,7 @@ pub(crate) mod tests {
             &mut progress,
             &index,
             "replay",
-            false,
+            pending,
             None,
         );
         assert!(progress.active_quarantine_retries.contains(&fp));
