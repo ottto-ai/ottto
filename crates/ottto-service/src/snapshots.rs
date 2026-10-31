@@ -36241,7 +36241,6 @@ crate::heap_layout_bound::fields!(ParserPending; owed_full_after_lossy_shrink,
     pending_taken, pending_returns, #[cfg(unix)] pending_funding);
 
 struct OwnedJsonlParser {
-    pending: Option<Box<ParserPending>>,
     #[cfg(test)]
     source_read_probe: Option<PathBuf>,
     reader: BoundedJsonlReader<OpenedInput>,
@@ -36253,6 +36252,8 @@ struct OwnedJsonlParser {
     positive_usage_evidence: bool,
     /// P1 ledger birth from the same open-time read as `claude_file_birth`.
     claude_opened_birth: Option<claude_request_census::ClaudeRequestBirth>,
+    // Last: parser-owned graphs are gone before the return funding releases.
+    pending: Option<Box<ParserPending>>,
 }
 impl OwnedJsonlParser {
     fn pending_mut(&mut self) -> &mut ParserPending {
@@ -37162,7 +37163,7 @@ fn bind_native_chain(
         custody.take_owed();
         custody.take_chain();
     }
-    if let Some(mut owed) = custody.take_owed() {
+    if let Some(mut owed) = custody.state.as_mut().and_then(|state| state.owed.take()) {
         if custody.ensure_active(cache, request.source, 0).is_ok() {
             let _ = cache.advance_owed(
                 &mut owed,
@@ -37179,9 +37180,7 @@ fn bind_native_chain(
                 counting,
             );
         }
-        custody
-            .put_owed(owed)
-            .unwrap_or_else(|_| unreachable!("owed owner was taken"));
+        custody.state_mut().owed = Some(owed);
         return;
     }
     if !custody.has_active() {
