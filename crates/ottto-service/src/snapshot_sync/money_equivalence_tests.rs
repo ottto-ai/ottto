@@ -1075,6 +1075,7 @@ pending!(
 /// real scanner output against explicit additive totals, without a frozen parser.
 #[test]
 fn codex_admission_branches_preserve_emitted_totals() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("codex_admission_branches") {
         return;
     }
@@ -1127,8 +1128,58 @@ fn codex_admission_branches_preserve_emitted_totals() {
         let c = corpus(&format!("codex-admission-{name}"));
         let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
             "payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}});
+        let prefix = header.to_string()+"\n";
         let text = std::iter::once(header).chain(lines).map(|v| v.to_string()+"\n").collect::<String>();
         let path = c.root.join("rollout.jsonl");
+        if name == "dropped-staging" {
+            // Lead B: main quarantines the whole entity, including its valid
+            // sibling usage. Exercise that policy after a genuine disk restore
+            // and Tail, as well as from RAM and a cold byte-zero read.
+            let source = SnapshotSource::Codex;
+            let _cutover = crate::snapshots::TestCutover::set(0);
+            let mut disk = Disk::new(&c);
+            let scanner = E2ScanFixture::default();
+            disk.begin(&scanner, source);
+            std::fs::write(&path, prefix + &codex_rows("seed", 1)).unwrap();
+            input_clock(&path);
+            let (mut prior, seed, modes) = other_page(&c, &scanner, source, ScanIndex::default());
+            assert_eq!(modes, (1, 0, 0));
+            assert!(!seed.snapshots.is_empty());
+            prior.record_accepted_snapshot_fingerprints(&seed.snapshots.iter()
+                .map(|s| s.snapshot_fingerprint.clone()).collect());
+            let prior = disk.commit(&scanner.cache, source, &mut prior);
+            append(&path, text.split_once('\n').unwrap().1);
+            input_clock(&path);
+            let restart = disk.owner(source);
+            let arms = [
+                other_page(&c, &scanner, source, prior.clone()),
+                other_page(&c, &E2ScanFixture::default(), source, prior.clone()),
+                other_page(&c, &restart, source, prior.clone()),
+            ];
+            assert_eq!(arms[0].2, (0, 1, 0));
+            assert_eq!(arms[1].2, (1, 0, 0));
+            assert_eq!(arms[2].2, (0, 1, 0));
+            assert_eq!(durable_restores(&restart.cache, source).1, 1);
+            for (index, scan, _) in &arms {
+                assert_eq!(scan.dropped_usage_record_count, 1);
+                assert_eq!(scan.recognized_usage_drop_count, 1);
+                assert!(scan.snapshots.is_empty(), "quarantine emits neither money nor a $0 body");
+                let key = prior.files.keys().next().unwrap();
+                assert!(index.files.get(key).map_or(true, |entry|
+                    entry.source_file_fingerprint.is_empty()
+                        || entry.size_bytes < std::fs::metadata(&path).unwrap().len()),
+                    "the lossy extent never settles");
+                // An ordinary next generation still discovers the held file
+                // and counts its dropped usage; no manual re-arm is needed.
+                let (_, retry, _) = other_page(&c, &E2ScanFixture::default(), source, index.clone());
+                assert!(retry.snapshots.is_empty());
+                assert_eq!(retry.dropped_usage_record_count, 1);
+            }
+            let emitted = |scan: &SourceScanResult| serde_json::to_vec(&scan.snapshots).unwrap();
+            assert_eq!(emitted(&arms[0].1), emitted(&arms[1].1));
+            assert_eq!(emitted(&arms[2].1), emitted(&arms[1].1));
+            continue;
+        }
         std::fs::write(&path, text).unwrap();
         input_clock(&path);
         let _cutover = crate::snapshots::TestCutover::set(if legacy { i64::MAX } else { 0 });

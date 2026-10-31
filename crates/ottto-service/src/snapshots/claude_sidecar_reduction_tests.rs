@@ -1040,17 +1040,12 @@ mod durable_restart {
 
     /// A native write-ahead acquisition may be ahead of the saved selection.
     /// It restores Unchanged and still emits the cold Full's exact body.
-    /// A cleared selection continues to require its ordinary Full reparse.
-    fn assert_fresh_restart_matches_full(
-        f: &Fixture,
-        state: &State,
-        settled: ScanIndex,
-        selection_cleared: bool,
-    ) {
+    /// A cleared selection also permits an independently proved acquisition (#865).
+    fn assert_fresh_restart_matches_full(f: &Fixture, state: &State, settled: ScanIndex) {
         let fresh = Arc::new(SharedCache::default());
         state.begin(&fresh);
         let cached = enriched(f, raw_scan(f, settled.clone(), Some(fresh.clone()), |_| {}));
-        let native = crate::heap_layout_bound::layout_supported() && !selection_cleared;
+        let native = crate::heap_layout_bound::layout_supported();
         assert_eq!(restored(&fresh), u64::from(native));
         assert_eq!(cached.modes, if native { (0, 0, 1) } else { (1, 0, 0) });
         assert_oracle(f, &cached, settled);
@@ -1087,14 +1082,14 @@ mod durable_restart {
         );
         settled.save(&state.index_path).unwrap();
         assert_selection_refused(&second, &state, &settled);
-        assert_fresh_restart_matches_full(&f, &state, settled, false);
+        assert_fresh_restart_matches_full(&f, &state, settled);
     }
 
-    /// F2, the cleared-fingerprint reparse case: settlement clears the held
-    /// entry's fingerprint (reparse debt). A restore refuses it before any
-    /// record is read, the post-save write refuses, and a restart reads Full.
+    /// [format] F2, the cleared-fingerprint reparse case: settlement clears the held
+    /// entry's fingerprint (reparse debt). Post-save refuses that selection;
+    /// #865 still permits acquisition proof independent of the cleared entry.
     #[test]
-    fn a_cleared_fingerprint_never_restores_or_writes() {
+    fn a_cleared_fingerprint_reuses_only_a_proved_native_acquisition() {
         let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
         let f = Fixture::new(1);
         let state = State::new(&f);
@@ -1111,8 +1106,9 @@ mod durable_restart {
         let (scanned, held) = finalized_with_holds(run, &key);
         let mut settled = scanned.into_locally_held_keys_reverted(&prior, &held, &held);
         assert!(settled.files[&key].source_file_fingerprint.is_empty());
-        // The record of the committed selection is still on disk here; the
-        // cleared selection refuses before it is read.
+        // The independently acquired record remains on disk. A direct restore
+        // under a different file scope refuses it; the production restart below
+        // must prove the actual file scope before reusing it.
         let fresh = SharedCache::default();
         state.begin(&fresh);
         let namespace = Scope("sidecar-fixture".into());
@@ -1146,7 +1142,7 @@ mod durable_restart {
         );
         settled.save(&state.index_path).unwrap();
         assert_selection_refused(&second, &state, &settled);
-        assert_fresh_restart_matches_full(&f, &state, settled, true);
+        assert_fresh_restart_matches_full(&f, &state, settled);
     }
 
     /// F2, a RAM reduction ahead of the saved selection: two passes in one
@@ -1182,7 +1178,7 @@ mod durable_restart {
         let mut saved = settle(first_pass);
         saved.save(&state.index_path).unwrap();
         assert_selection_refused(&second, &state, &saved);
-        assert_fresh_restart_matches_full(&f, &state, saved, false);
+        assert_fresh_restart_matches_full(&f, &state, saved);
     }
 
     /// E1 S2: a restart under the same (constant) capture restores the

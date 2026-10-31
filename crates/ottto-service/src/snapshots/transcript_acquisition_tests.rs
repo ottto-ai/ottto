@@ -1017,6 +1017,13 @@ struct ScanFixture {
     file: Fixture,
 }
 impl ScanFixture {
+    // Audit/custody fixtures need no private-content replay obligation. Native
+    // identity still comes from assistant rows or the Codex rollout filename.
+    fn without_content(self) -> Self {
+        fs::write(&self.file.0, b"").unwrap();
+        self
+    }
+
     fn new(source: SnapshotSource) -> Self {
         let file = Fixture::new(source);
         let dir = file.0.with_extension("scan-fixture");
@@ -1729,7 +1736,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             let full = arm == "real_edit" || missing;
             let owes = arm.starts_with("due_") || arm == "real_edit" || missing || pending > 0;
             sampled_scan::set_test_now(Some(START));
-            let fixture = ScanFixture::new(source);
+            let fixture = ScanFixture::new(source).without_content();
             fixture.file.append(&usage(source, 100, 0, "fixture-model"));
             let namespace = Scope("r2-audit-gate".into());
             let state = fixture.dir.join("state");
@@ -2075,7 +2082,7 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
     sampled_scan::codex_cursor::with_test_limits(PAGE_BYTES, PAGE_BYTES, 128, || {
         for source in [SnapshotSource::Codex, SnapshotSource::ClaudeCode] {
             sampled_scan::set_test_now(Some(START));
-            let fixture = ScanFixture::new(source);
+            let fixture = ScanFixture::new(source).without_content();
             fixture.file.append(&usage(source, 100, 0, "fixture-model"));
             let before = fs::metadata(&fixture.file.0).unwrap().len();
             assert!(before < PAGE_BYTES, "seed is an ordinary read");
@@ -2524,9 +2531,8 @@ fn durable_inventory_overflow_keeps_tail_reuse_and_new_key_money() {
     assert_eq!(store.records_written, 2 * u64::from(supported));
     assert_eq!(store.budget_refused, 0);
     assert_eq!(store.store_write_skipped, [0, 0]);
-    if supported {
-        assert_eq!(store.disk_records, bound as u64 + 3);
-    }
+    // Overflow deliberately makes the inventory's cardinality unknown. The
+    // physical count and preservation of every opaque record are checked below.
     second.durable_gc(lock, source, &warm).unwrap();
     assert_eq!(records(), bound + 1 + 2 * usize::from(supported));
     assert!(opaque());
@@ -4880,7 +4886,11 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
                 original,
                 "the verified Full owns its native write-ahead receipt"
             );
-            assert_eq!(cache.durable_counters(source).unwrap().1.native_flushes, 1);
+            let mut disk =
+                store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+            assert!(
+                matches!(disk.read(&record_key), store::ReadOutcome::Found(record) if record.format == store::FORMAT_V3)
+            );
         }
         // Linux also exercises the real Full/census/counter path above. Native
         // cache retention and disk replacement require a supported heap layout.

@@ -3533,6 +3533,8 @@ impl SharedCache {
         );
         if full {
             RestoreOutcome::Miss(MissClass::Resource(phase))
+        } else if phase == "rederive_quiet" {
+            RestoreOutcome::QuietPending
         } else {
             RestoreOutcome::Pending
         }
@@ -3546,7 +3548,12 @@ impl SharedCache {
         accepted_end: u64,
         phase: &'static str,
     ) -> bool {
-        let granted = if phase.starts_with("rederive_") || phase == "decode" {
+        let granted = if phase == "rederive_quiet" {
+            // Restore itself read no input. The scanner already selected this
+            // key for an ordinary reparse and checked its history-upgrade gate.
+            // Spend the existing cross-cause pace only at native Full start.
+            self.paced_admission(source, key, SystemTime::now(), false, false, true)
+        } else if phase.starts_with("rederive_") || phase == "decode" {
             self.rederive_full(source, key, file, accepted_end, true)
         } else {
             self.paced_growth_full(source, key, file, accepted_end, SystemTime::now(), phase)
@@ -4182,6 +4189,29 @@ impl SharedCache {
                     );
                 }
                 return Err(MissClass::AcceptedFloor.into());
+            }
+            if source == DurableSource::ClaudeCode
+                && record.format == store::FORMAT_V3
+                && a.strict
+                && a.verified_extent
+                && record.record.binding.context == original_expected.binding.context
+                && record.record.certificate.sealed_offset < a.end
+            {
+                // A binary without the store may have accepted a newer Full.
+                // An older record cannot stand in for that accepted prefix;
+                // reacquire from byte zero before replacing its exact stamp.
+                Counters::bump(
+                    &mut self
+                        .durable()
+                        .ok_or(MissClass::Unavailable)?
+                        .counters
+                        .ineligible,
+                    "entry_changed",
+                );
+                return Err(MissClass::Failure(Failure::Ineligible(
+                    store::Ineligible::EntryChanged,
+                ))
+                .into());
             }
         }
         if record.record.binding.context
@@ -6350,6 +6380,9 @@ pub(crate) enum RestoreOutcome {
     Restored(Box<Taken<CachedJsonlReduction>>, store::ActiveLease),
     M1Restored(Box<Taken<CachedJsonlReduction>>),
     Pending,
+    /// Restore read zero input; an already-selected native reparse may take
+    /// its ordinary Full after history admission and the shared pace check.
+    QuietPending,
     Miss(MissClass),
     /// Known correctness hold, census-neutral; never a Full fallback.
     FloorHeld,
@@ -6458,7 +6491,7 @@ mod restore_test {
                 | Self::StaleUnregistered(_, _)
                 | Self::Degraded
                 | Self::Held(store::Refusal::BehindAccepted) => None,
-                Self::FloorHeld => None,
+                Self::FloorHeld | Self::QuietPending => None,
                 Self::Pending if !crate::heap_layout_bound::layout_supported() => None,
                 Self::Pending => panic!("ordinary restore unexpectedly Pending"),
                 Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),

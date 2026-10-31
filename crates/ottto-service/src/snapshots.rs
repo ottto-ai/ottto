@@ -34040,7 +34040,17 @@ impl OwnedSourceScan {
                                         );
                                         pending!();
                                     }
-                                    sampled_scan::durable_tail::RestoreOutcome::Pending => {
+                                    sampled_scan::durable_tail::RestoreOutcome::QuietPending
+                                        if parse_reason.is_some_and(|reason| reason != CandidateParseReason::Audit) =>
+                                    {
+                                        // Restore grants no input. This existing explicit
+                                        // selection may take its ordinary Full after the
+                                        // history gate and shared six-hour pace below.
+                                        resource_full_pending = Some("rederive_quiet");
+                                        (None, taken_admission, debt)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Pending
+                                    | sampled_scan::durable_tail::RestoreOutcome::QuietPending => {
                                         residue_index_keys.insert(key.clone());
                                         context.cache.durable_custody_hold(
                                             source,
@@ -36548,6 +36558,20 @@ where
     let chain = chain
         .as_ref()
         .or_else(|| owed.as_ref().map(|owed| owed.chain()))?;
+    if certified.is_none()
+        && owed.is_none()
+        && !sampled_jsonl::loss_free_source_report(
+            live.report,
+            live.recognized_usage_drop_count,
+            live.accumulator.dropped_usage_record_count,
+        )
+    {
+        // A lossy Tail has no certified candidate to receipt. Preserve its
+        // predecessor and let native settlement disclose the loss and keep
+        // main's entity quarantine. Treating it as a failed commit would hide
+        // the dropped-usage counts behind a synthetic receipt hold.
+        return None;
+    }
     let Some((checkpoint, reduction, unsealed)) = certified else {
         return Some(PrepareOutcome::NotPersisted(NotPersisted::Certificate));
     };

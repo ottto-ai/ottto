@@ -1221,7 +1221,7 @@ impl RestoreCounts {
         let count = match outcome {
             RestoreOutcome::Restored(..) | RestoreOutcome::M1Restored(..) => &mut self.restored,
             RestoreOutcome::Held(_) | RestoreOutcome::FloorHeld => &mut self.held,
-            RestoreOutcome::Pending => &mut self.pending,
+            RestoreOutcome::Pending | RestoreOutcome::QuietPending => &mut self.pending,
             RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
             RestoreOutcome::Stale(reason) => self.stale.entry(reason).or_default(),
             RestoreOutcome::StaleUnregistered(reason, obligation) => {

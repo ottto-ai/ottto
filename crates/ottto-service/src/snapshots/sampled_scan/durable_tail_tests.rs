@@ -144,7 +144,7 @@ fn assert_rederive_pending(
     source: SnapshotSource,
     key: &str,
 ) {
-    assert!(matches!(outcome, RestoreOutcome::Pending));
+    assert!(matches!(outcome, RestoreOutcome::QuietPending));
     assert!(cache.retained().unwrap().peek(key).is_none());
     let resource_full = cache.durable_counters(source).unwrap().0.resource_full;
     assert!(resource_full.is_empty(), "idle: no growth Full");
@@ -3005,7 +3005,15 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                 if path == denied && op == "open" {
                     calls.set(calls.get() + 1);
                 }
-                if path == denied && op == if fault == "permission" { "open" } else { fault } {
+                if path == denied
+                    && op
+                        == if matches!(fault, "permission" | "restore_open") {
+                            "open"
+                        } else {
+                            fault
+                        }
+                    && (fault != "restore_open" || calls.get() >= 2)
+                {
                     Err(if fault == "permission" {
                         std::io::ErrorKind::PermissionDenied.into()
                     } else {
@@ -3214,6 +3222,13 @@ pub(super) fn known_corrupt_scan(
     namespace: &Scope,
     at: &str,
 ) -> (ScanIndex, SourceScanResult, [u64; 3]) {
+    let support = sessions.parent().unwrap();
+    std::fs::create_dir_all(support.join("snapshots")).unwrap();
+    std::fs::write(
+        support.join("snapshots/claude_code-reemission-exclusions.txt"),
+        b"# synthetic corruption fixture\n",
+    )
+    .unwrap();
     let capture = claude_request_identity::captures(source);
     let mut scan = OwnedSourceScan::new_with_identity_capture(
         source,
@@ -3223,7 +3238,7 @@ pub(super) fn known_corrupt_scan(
         365,
         100,
         false,
-        None,
+        Some(support),
         &[],
         false,
         true,

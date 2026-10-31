@@ -44,7 +44,10 @@ impl Restarted {
                 lease.release();
                 "restored"
             }
-            RestoreOutcome::Pending | RestoreOutcome::FloorHeld | RestoreOutcome::Degraded => {
+            RestoreOutcome::Pending
+            | RestoreOutcome::QuietPending
+            | RestoreOutcome::FloorHeld
+            | RestoreOutcome::Degraded => {
                 panic!("unexpected resource/floor deferral")
             }
             RestoreOutcome::Stale(reason) => reason,

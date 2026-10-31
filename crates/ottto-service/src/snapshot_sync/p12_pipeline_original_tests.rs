@@ -1924,7 +1924,10 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     writeln!(std::io::stderr().lock(),"native_comparison_real_copy_hit: hit_body_ran=true quiet0_before_hit=true deliberate_policy_defer=true eligible_family3_page_cap4=true copy_withheld_until_samewindow_native=true selected_restore_debt3=true copy_not_fake_empty=true exact_pair_saved=true no_positive_copied_posture_or_tags=true bounded_copy_liveness=true").unwrap();
 }
 
+#[inline(never)]
 fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool) {
+    run_on_scan_worker_stack(move || {
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} supported_positive=UNEXECUTED").unwrap();
         return;
@@ -2097,6 +2100,7 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
         "partial selected debt/restart must recover within ordinary bounded generations"
     );
     writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} body_ran=true N_defer_Nplus1_BASE_offer=true restart_between_N_Nplus1_checked={restart} exact_BASE_owner_outcome_checked={restart} actual_copy_offer=true actual_terminal_native_fold=true partial_CAS_save=true unACKed_copy_not_committed=true prior_bindings_preserved=true no_borrowed_posture=true eventual_exact_ACK=true").unwrap();
+    });
 }
 
 #[test]

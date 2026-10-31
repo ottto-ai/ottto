@@ -510,11 +510,14 @@ impl SharedCache {
                             .record
                             .acquisition
                             .is_some_and(|a| a.acquired_revision == effective_revision(source));
-                    let missing_carrier = !index.files.contains_key(key)
+                    let recovered_carrier = index
+                        .files
+                        .get(key)
+                        .map_or(true, ScanIndexEntry::has_unverified_source)
                         && record.format == store::FORMAT_V1
                         && record.envelope_audit_debt.is_some();
                     if same_context
-                        && (native || missing_carrier)
+                        && (native || recovered_carrier)
                         && record.record.allowlist == ds.properties().allowlist()
                     {
                         // A completed byte-zero read replaces a verified current

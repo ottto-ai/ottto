@@ -1539,7 +1539,7 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         for &fault in faults {
             sampled_scan::set_test_now(Some(START));
-            let fixture = ScanFixture::new(source);
+            let fixture = ScanFixture::new(source).without_content();
             fixture.file.append(&usage(source, 100, 0, "fixture-model"));
             let scope = Scope(format!("quiet-writer-{fault}"));
             let state = fixture.dir.join("state");
@@ -1571,8 +1571,13 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 1
             );
             fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-            let (mut index, _, modes) =
-                production_scan(&fixture, source, index, Some(cache.clone()), &scope.0);
+            let (mut index, _, modes) = {
+                // Only this compatibility arm reproduces a V1 writer's lost
+                // index marker. V3's verified envelope carries its own debt.
+                let _legacy_writer = (fault == "legacy_index_clear")
+                    .then(crate::snapshots::RestartRestoreForTest::disabled);
+                production_scan(&fixture, source, index, Some(cache.clone()), &scope.0)
+            };
             assert_eq!(modes, (0, 1, 0));
             assert!(index.files[&key].has_unverified_source());
             index.save(&index_path).unwrap();
@@ -1596,6 +1601,15 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
             let store::ReadOutcome::Found(record) = disk.read(&store::key_digest(ds, &key)) else {
                 panic!("the native predecessor is verified");
             };
+            assert_eq!(
+                record.format,
+                if fault == "legacy_index_clear" {
+                    store::FORMAT_V1
+                } else {
+                    store::FORMAT_V3
+                },
+                "the legacy fault requires a real V1 predecessor"
+            );
             assert!(
                 record.envelope_audit_debt.is_some(),
                 "#865's envelope carries the debt"
@@ -1675,7 +1689,9 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                             .written,
                         1
                     );
-                    assert_eq!(fs::read(&record_path).unwrap()[311], 0);
+                    assert!(
+                        matches!(disk.read(&store::key_digest(ds, &key)), store::ReadOutcome::Found(record) if record.envelope_audit_debt.is_none())
+                    );
                     if fault == "index_save_error" {
                         assert!(index.files[&key].audit_requires_full(START + 2 * 60 * 60));
                         // Advance the real index CAS without changing its owed
@@ -1801,10 +1817,12 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 usize::from(fault != "legacy_index_clear")
             );
             assert!(!loaded.files[&key].has_unverified_source());
-            assert_eq!(
-                fs::read(&record_path).unwrap()[311],
-                0,
-                "same writer rewrote #865's debt carrier"
+            assert!(
+                matches!(
+                    disk.read(&store::key_digest(ds, &key)),
+                    store::ReadOutcome::Found(record) if record.envelope_audit_debt.is_none()
+                ),
+                "same writer rewrote the verified debt carrier"
             );
             drop(restart);
             let (final_index, _, modes) = production_scan(
