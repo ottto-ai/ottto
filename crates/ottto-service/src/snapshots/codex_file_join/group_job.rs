@@ -408,16 +408,20 @@ impl GroupBoot {
             }
         }
         let mut census = ScanCensus::default();
-        let Some((opened, file)) = open_and_identify_scan_candidate_with_rescue(
+        let Some((opened, file)) = open_and_identify_scan_candidate_with_rescue_at(
             SnapshotSource::Codex,
             candidate,
             &mut census,
-            None,
-            0,
-            // The entry's stored ctime lets a ctime-only change keep the
-            // stored fingerprint (fresh samples hashed, no re-read).
-            discovery_retention!(index),
+            CandidateWindow {
+                census_unix_seconds: None,
+                backfill_window_days: 0,
+                // The entry's stored ctime lets a ctime-only change keep the
+                // stored fingerprint (fresh samples hashed, no re-read).
+                retention: discovery_retention!(index),
+                growth: None,
+            },
             false,
+            sampled_scan::now_seconds(),
             cache,
         ) else {
             return Boot::Strict;
@@ -673,6 +677,7 @@ impl GroupBoot {
             source_file_fingerprint: last.source_file_fingerprint.clone(),
             candidate: first,
             decision: CandidateDecision::Parse,
+            parse_reason: None,
             parser,
             aliases: members.clone(),
             applied_receipts: BTreeMap::new(),

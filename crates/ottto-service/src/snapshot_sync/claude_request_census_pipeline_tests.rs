@@ -142,6 +142,17 @@ fn census_pre_hold_bodies(
     collected_at: &str,
     cycle: &PipelineCycle<'_>,
 ) -> CensusPreHoldBodies {
+    // The same file birth as `PipelineFixture::page`.
+    crate::snapshots::claude_request_money::e2::with_fixture_birth(PIPELINE_FILE_BIRTH, || {
+        census_pre_hold_bodies_born(fixture, collected_at, cycle)
+    })
+}
+
+fn census_pre_hold_bodies_born(
+    fixture: &PipelineFixture,
+    collected_at: &str,
+    cycle: &PipelineCycle<'_>,
+) -> CensusPreHoldBodies {
     let mut index = ScanIndex::load(&fixture.index_path).expect("preview index");
     index.activate_upload_context(cycle.upload_context.to_owned());
     let mut reset_owed_members = 0;
@@ -173,14 +184,18 @@ fn census_pre_hold_bodies(
     index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
         SnapshotSource::ClaudeCode,
     ));
-    let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
-        SnapshotSource::ClaudeCode,
+    // Production order (`finish_sync_source`), as the actual page: the real
+    // exclusion list is runtime state, loaded again after every reload.
+    index.adopt_effective_upload_body_witness_revision_monotonically();
+    index.load_claude_reemission_exclusions(&fixture.support);
+    crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
+    let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
         std::slice::from_ref(&fixture.root),
         &mut index,
         collected_at,
         183,
         PIPELINE_PAGE_FILES,
-        true,
+        &fixture.support,
     )
     .expect("preview bounded page");
     let (mut disposition, _, _) =
@@ -259,6 +274,17 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
         crate::snapshots::claude_request_census::disable_records_under_for_test(&fixture.root);
     }
     fixture.baseline();
+    // The parity is pre-E2 (E2 reads census records as copy-holder evidence),
+    // so every family whose body is compared reads ordinary money: list them
+    // after the unlisted baseline. Each page loads the real list.
+    let listed = [
+        PIPELINE_SESSIONS[0],
+        PIPELINE_SESSIONS[1],
+        PIPELINE_SESSIONS[2],
+        CENSUS_PARITY_COPY,
+        CENSUS_PARITY_ID_LESS,
+    ];
+    fixture.list_held(&listed);
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
     std::fs::write(
         fixture.root.join(format!("{CENSUS_PARITY_COPY}.jsonl")),
@@ -271,6 +297,7 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
     let mut facts = Vec::new();
     let mut held_bodies = 0;
     let mut reset_owed_members = 0;
+    let mut ordinary_held_reads = 0;
     for hour in [9, 10, 11] {
         if hour == 10 {
             let mut index = ScanIndex::load(&fixture.index_path).expect("index before replay");
@@ -307,6 +334,12 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
             let at = format!("2026-08-02T{hour:02}:{number:02}:00Z");
             let before = census_pre_hold_bodies(&fixture, &at, &cycle);
             let page = fixture.page(&at, &cycle, PipelineUpload::Accept);
+            for session in listed {
+                assert_listed_fold_absent([&page], session);
+            }
+            if page.parsed.contains(PIPELINE_HELD_SESSION) {
+                ordinary_held_reads += 1;
+            }
             assert_eq!(before.discovered, page.scan.discovered_file_count);
             assert_eq!(before.scanned, page.scan.scanned_file_count);
             assert_eq!(before.complete, page.scan.census_complete);
@@ -333,6 +366,9 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
             }
         }
     }
+    // Positive control for the fold-absent checks: the changed listed
+    // session is actually read on ordinary money.
+    assert!(ordinary_held_reads > 0, "the listed held session is read");
     (facts, held_bodies, reset_owed_members)
 }
 
@@ -342,7 +378,7 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
 #[serial(source_manifests)]
 fn census_every_offered_and_held_body_matches_control() {
     // Pre-E2 invariant: E2 reads census records as copy-holder evidence.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let (records, records_held, records_reset_owed) =
         census_pre_hold_parity_arm("census-all-bodies-records", true);
     let (control, control_held, control_reset_owed) =

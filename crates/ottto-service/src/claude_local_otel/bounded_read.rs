@@ -50,14 +50,6 @@ impl Input {
             return None;
         }
         let before = api_file_generation(&fs::metadata(path).ok()?)?;
-        #[cfg(test)]
-        if matches!(kind, Some(ReadKind::Api)) {
-            API_BEFORE_OPEN.with(|hook| {
-                if let Some(hook) = hook.borrow_mut().take() {
-                    hook(path);
-                }
-            });
-        }
         let mut file = open_strict(path).ok()?;
         #[cfg(test)]
         match kind {
@@ -109,11 +101,6 @@ impl Input {
             API_READ_RECEIPT.with(|receipt| {
                 let (opens, bytes, force) = receipt.get();
                 receipt.set((opens, bytes + extra, force));
-            });
-            API_AFTER_READ.with(|hook| {
-                if let Some(hook) = hook.borrow_mut().take() {
-                    hook(path);
-                }
             });
         }
         if extra != 0 || !generation_unchanged(&file, path, Some(&opened)) {

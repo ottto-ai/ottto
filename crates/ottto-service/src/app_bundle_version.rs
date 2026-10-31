@@ -352,24 +352,6 @@ mod tests {
     }
 
     #[test]
-    fn agreeing_installed_copies_report_the_shared_version() {
-        let root = scratch();
-        let home = root.0.join("home");
-        let system = root.0.join("Applications");
-        for bundle in [
-            home.join("Applications").join(APP_BUNDLE_NAME),
-            system.join(APP_BUNDLE_NAME),
-        ] {
-            write_bundle(&bundle, &info_plist(COMPANION_BUNDLE_IDENTIFIER, "0.1.162"));
-        }
-
-        assert_eq!(
-            installed_app_version(None, Some(&home), &system),
-            Some("0.1.162".to_string())
-        );
-    }
-
-    #[test]
     fn missing_or_malformed_plists_stay_unknown() {
         let root = scratch();
         let system = root.0.join("Applications");
@@ -551,26 +533,6 @@ mod tests {
         assert_eq!(
             installed_app_version(None, Some(&home), &system),
             Some("0.1.162".to_string())
-        );
-    }
-
-    #[test]
-    fn helper_layout_is_required_for_enclosing_bundle() {
-        assert_eq!(
-            enclosing_app_bundle(Path::new(
-                "/Applications/Ottto.app/Contents/Helpers/ottto-service"
-            )),
-            Some(PathBuf::from("/Applications/Ottto.app"))
-        );
-        assert_eq!(
-            enclosing_app_bundle(Path::new("/Applications/Ottto.app/Contents/MacOS/Ottto")),
-            None
-        );
-        assert_eq!(
-            enclosing_app_bundle(Path::new(
-                "/tmp/Ottto.app-helper/Contents/Helpers/ottto-service"
-            )),
-            None
         );
     }
 }

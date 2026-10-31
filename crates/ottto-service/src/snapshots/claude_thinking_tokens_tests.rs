@@ -30,9 +30,13 @@ fn write_family(dir: &Path, root_thinking: Option<u64>) -> (PathBuf, PathBuf) {
 }
 
 fn parse_member(path: &Path, fingerprint: &str) -> SnapshotItem {
-    parse_claude_code_jsonl_file(path, "2026-08-02T07:01:00Z", fingerprint.to_string())
-        .expect("parse member")
-        .remove(0)
+    crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+        path,
+        "2026-08-02T07:01:00Z",
+        fingerprint.to_string(),
+    )
+    .expect("parse member")
+    .remove(0)
 }
 
 /// [regress] Reader-upgrade recovery: a family proven before the thinking reader hashed reasoning 0 into its
@@ -42,7 +46,7 @@ fn parse_member(path: &Path, fingerprint: &str) -> SnapshotItem {
 #[test]
 fn family_proven_before_thinking_reader_reproves_after_upgrade() {
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use super::tests::{complete_api_row, complete_trace_row, manifest_index_entry};
     let dir = std::env::temp_dir().join(format!(
         "ottto-claude-thinking-family-{}-{}",
@@ -85,7 +89,8 @@ fn family_proven_before_thinking_reader_reproves_after_upgrade() {
 
     // Before the upgrade: the old reader saw no thinking count.
     let (root_path, child_path) = write_family(&dir, None);
-    let mut index = ScanIndex::default();
+    let mut index =
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
     index
         .files
         .insert(local_index_key(&root_path), manifest_index_entry(None));
