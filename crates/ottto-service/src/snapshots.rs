@@ -45926,17 +45926,18 @@ fn refresh_retained_codex_roster(
                 modified_unix_seconds,
                 codex_fragment::Stamp::metadata(&metadata),
             );
-            if !recovery.requires(source, &path, metadata.len())
-                && census_unix_seconds.is_some_and(|now| {
-                    !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
-                })
-                && !retention.owes_stamped(
+            let aged = census_unix_seconds.is_some_and(|now| {
+                !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
+            });
+            let owes_stamped = aged
+                && retention.owes_stamped(
                     source,
                     &path,
                     metadata.len(),
                     codex_fragment::Stamp::metadata(&metadata),
-                )
-            {
+                );
+            let requires_recovery = recovery.requires(source, &path, metadata.len());
+            if !requires_recovery && aged && !owes_stamped {
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
@@ -46348,17 +46349,18 @@ fn advance_bounded_directory_traversal_with_budget(
                 modified_unix_seconds,
                 codex_fragment::Stamp::metadata(&metadata),
             );
-            if !recovery.requires(source, &path, metadata.len())
-                && census_unix_seconds.is_some_and(|now| {
-                    !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
-                })
-                && !retention.owes_stamped(
+            let aged = census_unix_seconds.is_some_and(|now| {
+                !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
+            });
+            let owes_stamped = aged
+                && retention.owes_stamped(
                     source,
                     &path,
                     metadata.len(),
                     codex_fragment::Stamp::metadata(&metadata),
-                )
-            {
+                );
+            let requires_recovery = recovery.requires(source, &path, metadata.len());
+            if !requires_recovery && aged && !owes_stamped {
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
@@ -46592,17 +46594,17 @@ fn candidate_from_traversal_path_at(
         .ok()
         .and_then(unix_seconds)
         .unwrap_or_default();
-    if !recovery.requires(source, &pending.path, metadata.len())
-        && census_unix_seconds.is_some_and(|now| {
-            !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
-        })
-        && !retention.owes_stamped(
+    let aged = census_unix_seconds
+        .is_some_and(|now| !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days));
+    let owes_stamped = aged
+        && retention.owes_stamped(
             source,
             &pending.path,
             metadata.len(),
             codex_fragment::Stamp::metadata(&metadata),
-        )
-    {
+        );
+    let requires_recovery = recovery.requires(source, &pending.path, metadata.len());
+    if !requires_recovery && aged && !owes_stamped {
         // Watcher hints must not widen the configured activity window. The
         // same revalidation also handles an ordinary candidate whose mtime was
         // restored behind the cutoff after directory discovery.
@@ -47064,18 +47066,21 @@ fn codex_parent_outside_window(
         modified,
         metadata.as_ref().and_then(codex_fragment::Stamp::metadata),
     );
-    !recovery.requires(
-        SnapshotSource::Codex,
-        path,
-        metadata.as_ref().map_or(u64::MAX, std::fs::Metadata::len),
-    ) && census_unix_seconds
-        .is_some_and(|now| !is_recent_enough_at(modified, now, backfill_window_days))
-        && !retention.owes_stamped(
+    let aged = census_unix_seconds
+        .is_some_and(|now| !is_recent_enough_at(modified, now, backfill_window_days));
+    let owes_stamped = aged
+        && retention.owes_stamped(
             SnapshotSource::Codex,
             path,
             metadata.as_ref().map_or(0, |m| m.len()),
             metadata.as_ref().and_then(codex_fragment::Stamp::metadata),
-        )
+        );
+    let requires_recovery = recovery.requires(
+        SnapshotSource::Codex,
+        path,
+        metadata.as_ref().map_or(u64::MAX, std::fs::Metadata::len),
+    );
+    !requires_recovery && aged && !owes_stamped
 }
 
 fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
@@ -47399,6 +47404,20 @@ fn open_and_identify_scan_candidate_with_rescue_at(
         candidate.modified_unix_seconds,
         codex_fragment::Stamp::candidate(&candidate),
     );
+    let aged = !opened_candidate_is_within_frozen_window(
+        &candidate,
+        census_unix_seconds,
+        backfill_window_days,
+    );
+    // Count aged retention before cache rescue, keeping the caller's rescue boundary.
+    let owes_stamped = !verification_rescue
+        && aged
+        && retention.owes_stamped(
+            source,
+            &candidate.path,
+            candidate.size_bytes,
+            codex_fragment::Stamp::candidate(&candidate),
+        );
     #[cfg(unix)]
     let verification_rescue = verification_rescue
         || cache
@@ -47407,20 +47426,9 @@ fn open_and_identify_scan_candidate_with_rescue_at(
         files: retention.files,
         cache,
     };
-    if !verification_rescue
-        && !recovery.requires(source, &candidate.path, candidate.size_bytes)
-        && !opened_candidate_is_within_frozen_window(
-            &candidate,
-            census_unix_seconds,
-            backfill_window_days,
-        )
-        && !retention.owes_stamped(
-            source,
-            &candidate.path,
-            candidate.size_bytes,
-            codex_fragment::Stamp::candidate(&candidate),
-        )
-    {
+    let requires_recovery =
+        !verification_rescue && recovery.requires(source, &candidate.path, candidate.size_bytes);
+    if !verification_rescue && !requires_recovery && aged && !owes_stamped {
         // The path can be atomically replaced after directory/candidate stat
         // but before the no-follow open. Eligibility follows the exact opened
         // object, not stale discovery metadata.

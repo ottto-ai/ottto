@@ -1325,9 +1325,15 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
 /// [behaviour] Sleep/restart retention is source-neutral: only real positive growth
 /// gains an exemption, including growth beyond the size cap (observed only).
 /// Gate counters are decisions, and overlapping owed arms count only once.
+/// F1: an unverified marker must not suppress the aged growth event.
 #[test]
 fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    for (source, recovery_overlap) in [
+        (SnapshotSource::ClaudeCode, false),
+        (SnapshotSource::Codex, false),
+        (SnapshotSource::ClaudeCode, true),
+        (SnapshotSource::Codex, true),
+    ] {
         let root = Root::new("ld-grown-gates");
         let directory = root.projects().join("2026/10/01");
         fs::create_dir_all(&directory).unwrap();
@@ -1339,6 +1345,10 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
             let mut entry = super::tests::manifest_index_entry(None);
             entry.size_bytes = committed;
             assert!(!entry.has_unverified_source());
+            if recovery_overlap && name == "grown" {
+                entry.set_unverified_deadline(0);
+                assert!(entry.has_unverified_source());
+            }
             index.files.insert(local_index_key(&path(name)), entry);
         }
         // Both arms apply to the same reverted committed entry.
@@ -1427,6 +1437,13 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                     .contains(&local_index_key(&path(name))),
                 retained
             );
+            if recovery_overlap && name == "grown" {
+                assert_eq!(
+                    discovery_page(source.api_slug())["discovery_retained"],
+                    json!({"grown": 1}),
+                    "candidate counts growth once despite recovery"
+                );
+            }
             // Obtain a recent-window candidate independently so even the
             // rejected controls exercise the opened-object age gate.
             let candidate = candidate_from_traversal_path(
@@ -1443,6 +1460,31 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
             )
             .unwrap();
+            if recovery_overlap && name == "grown" {
+                assert!(
+                    discovery_page(source.api_slug())
+                        .get("discovery_retained")
+                        .is_none(),
+                    "recent candidate does not count growth"
+                );
+                assert!(open_and_identify_scan_candidate_with_rescue(
+                    source,
+                    candidate.clone(),
+                    &mut ScanCensus::default(),
+                    rfc3339_unix_seconds(NOW),
+                    7,
+                    discovery_retention!(index),
+                    true,
+                    None,
+                )
+                .is_some());
+                assert!(
+                    discovery_page(source.api_slug())
+                        .get("discovery_retained")
+                        .is_none(),
+                    "caller verification rescue keeps its counter boundary"
+                );
+            }
             assert_eq!(
                 open_and_identify_scan_candidate(
                     source,
@@ -1456,6 +1498,13 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 retained,
                 "open {name}"
             );
+            if recovery_overlap && name == "grown" {
+                assert_eq!(
+                    discovery_page(source.api_slug())["discovery_retained"],
+                    json!({"grown": 1}),
+                    "open counts growth once despite recovery"
+                );
+            }
             if source == SnapshotSource::Codex {
                 assert_eq!(
                     codex_parent_outside_window(
@@ -1469,12 +1518,26 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                     !retained,
                     "Codex parent {name}"
                 );
+                if recovery_overlap && name == "grown" {
+                    assert_eq!(
+                        discovery_page(source.api_slug())["discovery_retained"],
+                        json!({"grown": 1}),
+                        "parent counts growth once despite recovery"
+                    );
+                }
             }
         }
         let expected = if source == SnapshotSource::Codex {
             6
         } else {
             4
+        };
+        // In the overlap case the grown key's per-gate events were drained above;
+        // the held key still contributes once at each of the same gates.
+        let expected = if recovery_overlap {
+            expected / 2
+        } else {
+            expected
         };
         assert_eq!(
             discovery_page(source.api_slug())["discovery_retained"],
@@ -1487,6 +1550,33 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 .is_none(),
             "page deltas drain to zero"
         );
+
+        if recovery_overlap && source == SnapshotSource::Codex {
+            // Make the indexed grown key newly visible to the retained roster.
+            index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .codex_rollout_paths
+                .remove(&local_index_key(&path("grown")));
+            File::open(&directory)
+                .unwrap()
+                .set_modified(UNIX_EPOCH)
+                .unwrap();
+            refresh_retained_codex_roster(
+                source,
+                index.traversal.as_mut().unwrap(),
+                7,
+                discovery_retention!(index),
+                (&index.files).into(),
+            );
+            assert!(candidates(&index).contains(&path("grown")));
+            assert_eq!(
+                discovery_page(source.api_slug())["discovery_retained"],
+                json!({"grown": 1}),
+                "roster counts growth once despite recovery"
+            );
+        }
     }
 }
 
