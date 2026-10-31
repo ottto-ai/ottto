@@ -39,10 +39,12 @@ struct Entry {
     seen: Option<Box<Seen>>,
     tokens: Option<u64>,
     first_seen: u64,
-    absence: Option<(std::time::Instant, u64, Box<sampled_audit::AbsenceParent>)>,
+    absence: Option<Absence>,
 }
 crate::heap_layout_bound::fields!(Entry; seen, tokens, first_seen, absence);
 type Entries = BTreeMap<[u8; 32], Entry>;
+/// First rooted absence: when, in which walk window, under which pinned parent.
+type Absence = (std::time::Instant, u64, Box<sampled_audit::AbsenceParent>);
 #[derive(Debug)]
 struct State {
     entries: Entries,
@@ -358,47 +360,58 @@ impl Memo {
                 }
                 return false;
             };
-            if state.entry(memo_key(key)).is_none() {
-                return false;
-            }
-            let now = (state.clock)(state.origin);
-            let Some(entry) = state.entries.get_mut(&memo_key(key)) else {
+            let Some(entry) = state.entry(memo_key(key)) else {
                 return false;
             };
-            if let Some((first, first_window, before)) = &entry.absence {
-                if let Some(elapsed) = now.checked_duration_since(*first) {
-                    if before.same_parent(&parent) {
-                        // A later completed walk must have started after the first
-                        // observation's traversal. A resumed/restarted generation
-                        // cannot prove a destination was discovered after that probe.
-                        return walk_window > *first_window
-                            && elapsed >= std::time::Duration::from_secs(600);
-                    }
+            let before = entry.absence.take();
+            let (eligible, after) = state.absence_step(before, parent, walk_window);
+            state
+                .entries
+                .get_mut(&memo_key(key))
+                .expect("admitted memo entry")
+                .absence = after;
+            eligible
+        })
+        .unwrap_or(false)
+    }
+}
+impl State {
+    /// One rooted observation. A same-parent witness is kept and is eligible
+    /// only in a later completed walk; anything else re-pins within budget.
+    fn absence_step(
+        &self,
+        before: Option<Absence>,
+        parent: sampled_audit::AbsenceParent,
+        walk_window: u64,
+    ) -> (bool, Option<Absence>) {
+        let now = (self.clock)(self.origin);
+        if let Some(witness) = before {
+            let (first, first_window, pinned) = &witness;
+            if let Some(elapsed) = now.checked_duration_since(*first) {
+                if pinned.same_parent(&parent) {
+                    // A later completed walk must have started after the first
+                    // observation's traversal. A resumed/restarted generation
+                    // cannot prove a destination was discovered after that probe.
+                    let eligible = walk_window > *first_window
+                        && elapsed >= std::time::Duration::from_secs(600);
+                    return (eligible, Some(witness));
                 }
             }
             // Replacing an invalidated witness releases its old descriptor first.
-            entry.absence = None;
-            // Heap admission does not reserve descriptors. Keep at least seven
-            // eighths of the soft limit for ordinary daemon I/O, and never retain
-            // more than 32 pins. The existing memo owns the population accounting.
-            let limit = crate::fd_guard::descriptor_limit().map_or(0, |n| (n / 8).min(32));
-            if state
-                .entries
-                .values()
-                .filter(|entry| entry.absence.is_some())
-                .count()
-                >= limit
-            {
-                return false;
-            }
-            let entry = state
-                .entries
-                .get_mut(&memo_key(key))
-                .expect("admitted memo entry");
-            entry.absence = Some((now, walk_window, Box::new(parent)));
-            false
-        })
-        .unwrap_or(false)
+        }
+        // Heap admission does not reserve descriptors. Keep at least seven
+        // eighths of the soft limit for ordinary daemon I/O, and never retain
+        // more than 32 pins. The existing memo owns the population accounting.
+        let limit = crate::fd_guard::descriptor_limit().map_or(0, |n| (n / 8).min(32));
+        let pinned = self
+            .entries
+            .values()
+            .filter(|entry| entry.absence.is_some())
+            .count();
+        if pinned >= limit {
+            return (false, None);
+        }
+        (false, Some((now, walk_window, Box::new(parent))))
     }
 }
 
