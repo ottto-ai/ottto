@@ -498,8 +498,9 @@ whether or not an observer is registered.
 
 `counts.source_rotation_serial_fallback` counts failed parking decisions while
 sibling sources wait, drained by that source's next completed page. Closed
-causes are `unsupported_layout`, `bound_none` (opaque/unaccountable ownership)
-and `budget_exhausted` (no queue allowance or a returned bound over available).
+causes are `unsupported_layout` and `bound_refused`. A refused bound (`None`)
+covers both opaque ownership and over-limit frames; it does not distinguish
+their causes. Unavailable shared allowance also uses `bound_refused`.
 Each decision continues the same owned frame serially and counts once; ordinary
 serial turns with no waiting sibling do not count.
 
