@@ -671,7 +671,12 @@ mod tests {
             if interruption == "backward" {
                 for (now, held) in [(999, 1), (1_598, 1), (1_599, 0)] {
                     sampled_scan::set_test_now(Some(now));
-                    crate::snapshots::line_delivery_tests::next_walk(&mut index, 7);
+                    crate::snapshots::line_delivery_tests::next_walk(
+                        &mut index,
+                        std::slice::from_ref(&root),
+                        "2026-10-07T12:00:00Z",
+                        7,
+                    );
                     index.probe_absent_claude_account_deferred_holds();
                     assert_eq!(index.claude_account_deferred_hold_count(), held);
                 }
@@ -725,7 +730,12 @@ mod tests {
                 1,
                 "{interruption}"
             );
-            crate::snapshots::line_delivery_tests::next_walk(&mut index, 7);
+            crate::snapshots::line_delivery_tests::next_walk(
+                &mut index,
+                std::slice::from_ref(&root),
+                "2026-10-07T12:00:00Z",
+                7,
+            );
             sampled_scan::set_test_now(Some(2_201));
             index.probe_absent_claude_account_deferred_holds();
             assert_eq!(
@@ -819,7 +829,12 @@ mod tests {
         index.probe_absent_claude_account_deferred_holds();
         assert_eq!(index.claude_account_deferred_hold_count(), 1);
         super::sampled_scan::set_test_now(Some(191 * DAY + 600));
-        crate::snapshots::line_delivery_tests::next_walk(&mut index, 7);
+        crate::snapshots::line_delivery_tests::next_walk(
+            &mut index,
+            std::slice::from_ref(&dir),
+            "2026-10-07T12:00:00Z",
+            7,
+        );
         index.probe_absent_claude_account_deferred_holds();
         fs::remove_dir_all(dir).unwrap();
         assert!(index.claude_account_deferred_holds.is_empty());

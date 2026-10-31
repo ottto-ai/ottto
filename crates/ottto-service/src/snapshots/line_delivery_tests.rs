@@ -1146,20 +1146,25 @@ pub(in crate::snapshots) fn walk_all(index: &mut ScanIndex, days: u64) {
     }
 }
 
-/// Start and finish the next real bounded walk; elapsed probe time alone is not coverage.
-pub(in crate::snapshots) fn next_walk(index: &mut ScanIndex, days: u64) {
-    let previous = index.traversal.take().expect("first walk");
-    let at = (OffsetDateTime::parse(&previous.census_window_end, &Rfc3339).unwrap()
-        + time::Duration::seconds(1))
-    .format(&Rfc3339)
-    .unwrap();
-    ensure_bounded_traversal(
-        SnapshotSource::ClaudeCode,
-        &previous.scan_roots,
-        index,
-        &at,
-        days,
-    );
+/// Complete a later real bounded walk, even if a healthy page retired its checkpoint.
+/// The caller owns the configured roots and prior observed window; a retained
+/// checkpoint can advance that window, but is not required to recover the scope.
+pub(in crate::snapshots) fn next_walk(
+    index: &mut ScanIndex,
+    roots: &[PathBuf],
+    after: &str,
+    days: u64,
+) {
+    let after = OffsetDateTime::parse(after, &Rfc3339).unwrap();
+    let prior = index.traversal.take().map_or(after, |previous| {
+        OffsetDateTime::parse(&previous.census_window_end, &Rfc3339)
+            .unwrap()
+            .max(after)
+    });
+    let at = (prior + time::Duration::seconds(1))
+        .format(&Rfc3339)
+        .unwrap();
+    ensure_bounded_traversal(SnapshotSource::ClaudeCode, roots, index, &at, days);
     walk_all(index, days);
 }
 
@@ -1913,7 +1918,7 @@ fn reconciliation_keeps_present_withheld_keys_and_retires_absent_ones() {
     sampled_scan::set_test_now(Some(1_000));
     index.probe_absent_claude_account_deferred_holds();
     assert_eq!(index.claude_account_deferred_hold_count(), 2);
-    next_walk(&mut index, 7);
+    next_walk(&mut index, &[root.projects()], NOW, 7);
     sampled_scan::set_test_now(Some(1_599));
     index.probe_absent_claude_account_deferred_holds();
     assert_eq!(index.claude_account_deferred_hold_count(), 2);
@@ -2272,7 +2277,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
             );
             active.probe_absent_claude_account_deferred_holds();
             assert!(active.claude_account_deferred_holds.contains_key(&old_key));
-            next_walk(&mut active, 1_000);
+            next_walk(&mut active, &[root.projects()], &at, 1_000);
         }
         let scan = make(active, &at, 1_000);
         assert!(

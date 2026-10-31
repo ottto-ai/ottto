@@ -1889,6 +1889,8 @@ fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() 
                 sampled_scan::set_test_now(Some(sampled_scan::now_seconds() + 600));
                 crate::snapshots::line_delivery_tests::next_walk(
                     &mut retired,
+                    std::slice::from_ref(&fixture.root),
+                    NOW,
                     BACKFILL_WINDOW_DAYS,
                 );
                 let ((next, _, modes), next_diagnostics) =
@@ -2152,7 +2154,12 @@ fn hold_only_inventory_requires_two_secure_absence_observations() {
             index.claude_account_deferred_holds.contains_key(&key),
             "one observation keeps custody"
         );
-        crate::snapshots::line_delivery_tests::next_walk(&mut index, BACKFILL_WINDOW_DAYS);
+        crate::snapshots::line_delivery_tests::next_walk(
+            &mut index,
+            std::slice::from_ref(&fixture.root),
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+        );
         sampled_scan::set_test_now(Some(1_600));
         crate::local_resource_diagnostics::withheld_support::take_withheld();
         withheld_account::support::clock(&index.withheld_memo);
@@ -2225,7 +2232,12 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
     withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
     assert_eq!(index.claude_account_deferred_hold_count(), 1);
-    crate::snapshots::line_delivery_tests::next_walk(&mut index, BACKFILL_WINDOW_DAYS);
+    crate::snapshots::line_delivery_tests::next_walk(
+        &mut index,
+        std::slice::from_ref(&fixture.root),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
     sampled_scan::set_test_now(Some(sampled_scan::now_seconds() + 600));
     withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
@@ -2245,7 +2257,12 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
     sampled_scan::set_test_now(Some(1_000));
     withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
-    crate::snapshots::line_delivery_tests::next_walk(&mut index, BACKFILL_WINDOW_DAYS);
+    crate::snapshots::line_delivery_tests::next_walk(
+        &mut index,
+        std::slice::from_ref(&fixture.root),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
     sampled_scan::set_test_now(Some(1_600));
     withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
@@ -2255,7 +2272,12 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
         "descriptor admission keeps debt and makes progress"
     );
     for step in 2..=80 {
-        crate::snapshots::line_delivery_tests::next_walk(&mut index, BACKFILL_WINDOW_DAYS);
+        crate::snapshots::line_delivery_tests::next_walk(
+            &mut index,
+            std::slice::from_ref(&fixture.root),
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+        );
         sampled_scan::set_test_now(Some(1_000 + step * 600));
         withheld_account::support::clock(&index.withheld_memo);
         index.probe_absent_claude_account_deferred_holds();

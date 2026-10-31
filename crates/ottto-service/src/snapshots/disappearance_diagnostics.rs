@@ -1026,8 +1026,12 @@ mod tests {
                             .get(&second_key)
                             .is_some());
                         super::super::sampled_scan::set_test_now(Some(1_600));
+                        // A healthy first generation may have retired its
+                        // checkpoint while the account hold still needs F4.
                         super::super::line_delivery_tests::next_walk(
                             &mut index,
+                            &[dir.to_path_buf()],
+                            LATER,
                             BACKFILL_WINDOW_DAYS,
                         );
                         pages.extend(claude_generation(&mut index, &dir, RETRY, 1, &[]));
