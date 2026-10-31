@@ -178,6 +178,31 @@ fn cleanup(paths: &[&Path]) {
     }
 }
 
+/// [behaviour] DS1: the copy-prefix switch is the owner's support-dir marker,
+/// not process environment. Present (a regular file) is ON; absent, a
+/// directory or the old environment key is OFF; tests never read the host.
+#[test]
+fn copy_prefix_switch_is_the_support_marker_and_defaults_off() {
+    let scratch = crate::test_scratch::ScratchDir::new("e2-copy-prefix-marker");
+    assert!(!resumed_prefix_enabled_at(&scratch), "absent marker is OFF");
+    fs::write(scratch.join(RESUMED_PREFIX_MARKER), b"").unwrap();
+    assert!(resumed_prefix_enabled_at(&scratch), "marker present is ON");
+    fs::remove_file(scratch.join(RESUMED_PREFIX_MARKER)).unwrap();
+    fs::create_dir(scratch.join(RESUMED_PREFIX_MARKER)).unwrap();
+    assert!(
+        !resumed_prefix_enabled_at(&scratch),
+        "a directory is not the marker"
+    );
+    assert!(
+        !resumed_prefix_enabled(),
+        "fixtures never consult the host marker"
+    );
+    let on = ResumedPrefixForTest::set(true);
+    assert!(resumed_prefix_enabled());
+    drop(on);
+    assert!(!resumed_prefix_enabled());
+}
+
 #[test]
 fn e2_thinking_300_matches_an_otel_zero_and_rejects_a_different_count() {
     // Grain detail exists only with the gate on: dark keeps no grain map.

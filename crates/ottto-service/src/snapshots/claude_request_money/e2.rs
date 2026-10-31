@@ -49,20 +49,27 @@ const HOUR_NANOS: i128 = 3_600_000_000_000;
 /// decide: the affected sessions or families are held, never counted.
 const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
-/// Local release switch. Only the exact value `1` opts in; unset, `0`,
-/// unknown and non-Unicode values preserve released money behavior. This is
-/// process configuration, independent of the server's wire capability.
+/// Local release switch: the owner's support-dir marker (a regular file,
+/// never a symlink), as `claude_terminal_off_enabled`. Absent preserves
+/// released money behavior. Read once per process, so the daemon and the
+/// re-read CLI apply it from their next start. Independent of the server's
+/// wire capability.
+pub(crate) const RESUMED_PREFIX_MARKER: &str = "claude_resumed_prefix_dedupe_enabled";
 pub(crate) fn resumed_prefix_enabled() -> bool {
     #[cfg(test)]
     {
-        if PRE_CHANGE_BUILDER.with(std::cell::Cell::get) {
-            return false;
-        }
-        if let Some(on) = RESUMED_PREFIX.with(std::cell::Cell::get) {
-            return on;
-        }
+        // A test opts in on its own thread, never reading the host marker.
+        !PRE_CHANGE_BUILDER.with(std::cell::Cell::get)
+            && RESUMED_PREFIX.with(std::cell::Cell::get).unwrap_or(false)
     }
-    std::env::var("OTTTO_CLAUDE_RESUMED_PREFIX_DEDUPE").as_deref() == Ok("1")
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| resumed_prefix_enabled_at(&ottto_core::default_support_dir()))
+    }
+}
+pub(crate) fn resumed_prefix_enabled_at(support: &std::path::Path) -> bool {
+    super::super::terminal_off_policy::marker_at(support, RESUMED_PREFIX_MARKER)
 }
 #[cfg(test)]
 thread_local! {

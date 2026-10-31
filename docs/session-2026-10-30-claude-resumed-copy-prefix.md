@@ -88,9 +88,12 @@ review before release.
 
 ## Default-off release switch
 
-The complete resumed-prefix behavior above ships OFF. The one local process
-setting is `OTTTO_CLAUDE_RESUMED_PREFIX_DEDUPE=1`; only the exact value `1`
-enables it. Unset, `0`, invalid or non-Unicode values keep released behavior.
+The complete resumed-prefix behavior above ships OFF. The one local setting is
+the owner's support-dir marker `claude_resumed_prefix_dedupe_enabled` (a
+regular file, never a symlink or directory), checked like
+`claude_terminal_off_enabled`. Absent keeps released behavior. (It replaced the
+original `OTTTO_CLAUDE_RESUMED_PREFIX_DEDUPE` environment key, which the
+Companion-owned LaunchAgent could never carry.)
 This controls resumed dedupe, saved-removal use/writes, prefix retry selection
 and expiry, metadata recovery, marker re-derivation and prefix flags/counters.
 Existing all-copy and certified-writer decisions retain their released path
@@ -98,12 +101,11 @@ when OFF. A frozen pre-change native builder from main `d0dcfbc72` pins actual
 upload bytes, hashes and ACK witnesses for a six-file old-writer demo family
 in full and sampled scans. Existing resumed-prefix fixtures explicitly opt in.
 
-For a later authorized local enable, set that environment key in the daemon's
-launch environment (for a manual launch, prefix the existing daemon command
-with `OTTTO_CLAUDE_RESUMED_PREFIX_DEDUPE=1`). Exporting it in another shell does
-not change an already-running daemon; the operator must arrange the next
-launch using the existing service management procedure. This task does not
-set the environment, restart the daemon or inspect private source data.
+For a later authorized local enable, create that marker in the support
+directory. The daemon and the re-read CLI read it once per process, so a
+running daemon applies it from its next start; deleting the marker and
+restarting turns it OFF. This task does not create the marker, restart the
+daemon or inspect private source data.
 Enabling first requires the operator's typed authorization and a money PLAN
 with expected removed requests/dollars and expected own-turn requests for the
 same measurement cohort. Default-ON needs a later release and money review.

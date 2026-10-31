@@ -3701,6 +3701,52 @@ fn e2_pipeline_certified_resume_keeps_its_timestamp_skip() {
     });
 }
 
+/// [money] #964 proof target (Lead B audit 2026-10-31: five accepted,
+/// unchanged main files on M4 hold 857 copied requests / 315.6M tokens).
+/// The shape: a resumed main file with an uncertified writer, own turns in
+/// later hours and its holder in an earlier accepted member. Its switch-ON
+/// re-read of the same bytes removes exactly the copied requests; every
+/// token counter is conserved (kept + removed = the OFF body), the own turns
+/// keep their money, and an unrelated session's body is unchanged. Scheduling
+/// the paced re-read is the `claude_copy_prefix_reread` tests' concern.
+#[test]
+fn e2_pipeline_audit_shaped_resume_reread_removes_exactly_its_copies() {
+    with_e2(|| {
+        const OTHER: &str = "8338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let mut c = Corpus::new("e2-pipeline-audit-shape");
+        c.root(ROOT, &resumed(ROOT, &[A, B]));
+        let old = ScanIndex::default();
+        let page = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
+        let prior = settle(&c, &old, page, &mut e2_progress());
+        let late = ("d-late", "2026-08-02T08:10:00Z", RESUME_WRITER);
+        c.write_at(&file(COPY), &resumed(COPY, &[A, B, C, late]), "2026-08-02T07:03:00Z");
+        c.write_at(&file(OTHER), &resumed(OTHER, &[("u1", "2026-08-02T07:30:10Z", RESUME_WRITER)]),
+            "2026-08-02T07:30:00Z");
+        let off = {
+            let _off = e2::ResumedPrefixForTest::set(false);
+            ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false)
+        };
+        let accepted = body(&off, COPY).unwrap().clone();
+        assert_eq!((accepted.request_count, accepted.removed_request_count.unwrap_or(0)), (4, 0),
+            "OFF accepted the copied prefix");
+        let unrelated = canonical(body(&off, OTHER).unwrap());
+        let on = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        let copy = body(&on, COPY).unwrap();
+        assert_eq!((copy.request_count, copy.removed_request_count), (2, Some(2)),
+            "only the copied requests are removed");
+        let removed = copy.removed_usage.expect("removed usage is counted");
+        let tokens = |item: &SnapshotItem| [item.input_tokens, item.output_tokens,
+            item.cache_read_tokens, item.cache_creation_5m_tokens, item.cache_creation_1h_tokens];
+        let kept = tokens(copy);
+        let gone = [removed.input_tokens, removed.output_tokens, removed.cache_read_tokens,
+            removed.cache_creation_5m_tokens, removed.cache_creation_1h_tokens];
+        assert_eq!(std::array::from_fn::<u64, 5, _>(|n| kept[n] + gone[n]), tokens(&accepted),
+            "kept + removed tokens = the accepted OFF body, per counter");
+        assert_eq!(copy.output_tokens, 20, "the two own turns keep their tokens");
+        assert_eq!(canonical(body(&on, OTHER).unwrap()), unrelated, "unrelated body unchanged");
+    });
+}
+
 #[test]
 fn e2_pipeline_file_without_copied_prefix_stores_and_flags_nothing() {
     with_e2(|| {
