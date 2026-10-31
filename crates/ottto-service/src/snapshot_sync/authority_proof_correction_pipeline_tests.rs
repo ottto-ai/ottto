@@ -150,6 +150,8 @@ struct ApcPage {
     /// The index reloaded from disk after the page's durable save.
     index: ScanIndex,
     fully_settled: bool,
+    /// Members the finish's drain restore re-owed (0 on a crash or shed page).
+    reowed_members: usize,
     held: BTreeSet<String>,
     held_sessions: BTreeSet<String>,
     /// Bodies handed to the upload, whatever the server answered.
@@ -704,6 +706,7 @@ impl ApcFixture {
                 before,
                 index: ScanIndex::load(&self.index_path).expect("reload scan index"),
                 fully_settled: false,
+                reowed_members: 0,
                 held: holds.held_fingerprints,
                 held_sessions,
                 offered: BTreeSet::new(),
@@ -861,6 +864,7 @@ impl ApcFixture {
                 before,
                 index: ScanIndex::load(&self.index_path).expect("reload scan index"),
                 fully_settled: false,
+                reowed_members: 0,
                 held: holds.held_fingerprints,
                 held_sessions,
                 offered,
@@ -889,7 +893,7 @@ impl ApcFixture {
         // an empty cache, so no retained custody: a released hold's entry is
         // cleared and queued for retry.
         let no_custody = crate::snapshots::sampled_scan::SharedCache::default();
-        let fully_settled = finish_selected_settlement(
+        let (fully_settled, reowed_members) = finish_selected_settlement(
             &mut index,
             &scan,
             &committed_index,
@@ -934,6 +938,7 @@ impl ApcFixture {
             before,
             index: ScanIndex::load(&self.index_path).expect("reload scan index"),
             fully_settled,
+            reowed_members,
             held: holds.held_fingerprints,
             held_sessions,
             offered,
@@ -1122,6 +1127,7 @@ impl ApcFixture {
                 before,
                 index: ScanIndex::load(&self.index_path).expect("reload scan index"),
                 fully_settled: false,
+                reowed_members: 0,
                 held: holds.held_fingerprints,
                 held_sessions,
                 offered: BTreeSet::new(),
@@ -1280,6 +1286,7 @@ impl ApcFixture {
                 before,
                 index: ScanIndex::load(&self.index_path).expect("reload scan index"),
                 fully_settled: false,
+                reowed_members: 0,
                 held: holds.held_fingerprints,
                 held_sessions,
                 offered,
@@ -1308,7 +1315,7 @@ impl ApcFixture {
         // an empty cache, so no retained custody: a released hold's entry is
         // cleared and queued for retry.
         let no_custody = crate::snapshots::sampled_scan::SharedCache::default();
-        let fully_settled = finish_selected_settlement(
+        let (fully_settled, reowed_members) = finish_selected_settlement(
             &mut index,
             &scan,
             &committed_index,
@@ -1357,6 +1364,7 @@ impl ApcFixture {
             before,
             index: ScanIndex::load(&self.index_path).expect("reload scan index"),
             fully_settled,
+            reowed_members,
             held: holds.held_fingerprints,
             held_sessions,
             offered,
@@ -4251,6 +4259,7 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
         .expect("owed before the release");
     assert_eq!(owed_before, held, "the released member is the last owed");
     apc_f1_released_members_stay_owed(page, &grant, &held, "last owed");
+    assert_eq!(page.reowed_members, held.len(), "the restore counts the re-owed member");
     assert_eq!(
         page.record().and_then(|record| record.correction),
         Some((grant.proof.clone(), held.clone())),

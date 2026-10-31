@@ -453,11 +453,11 @@ impl ScanIndex {
     // only the revision and entity set the selected save keeps. Any other
     // selected entry leaves the member owed under the same proof with its
     // pre-drain pair. A record its last drain removed is re-bound with its
-    // pending proof. Returns whether any member owes again.
+    // pending proof. Returns how many members owe again.
     pub(crate) fn restore_unselected_claude_proof_body_drains(
         &mut self,
         drains: ClaudeProofBodyDrains,
-    ) -> bool {
+    ) -> usize {
         let ClaudeProofBodyDrains {
             drains,
             mut families,
@@ -513,7 +513,7 @@ impl ScanIndex {
                     .or_insert(pending);
             }
         }
-        let mut owed_again = false;
+        let mut owed_again = 0;
         for drain in reverted {
             let Some(record) = self.claude_usage_authority_quarantine.get_mut(&drain.root) else {
                 continue;
@@ -526,7 +526,7 @@ impl ScanIndex {
             {
                 continue;
             }
-            owed_again = true;
+            owed_again += 1;
             let previous = drain.previous.unwrap_or_else(|| {
                 // A valid record pairs every owed member; keep the debt with a
                 // domain-separated nonmatching revision, as A2 does.
@@ -538,6 +538,9 @@ impl ScanIndex {
             record
                 .member_source_file_fingerprints
                 .insert(drain.member, previous);
+        }
+        if owed_again > 0 {
+            eprintln!("local snapshot sync: claude proof correction reason=drain_reverted reowed_members={owed_again}");
         }
         owed_again
     }
