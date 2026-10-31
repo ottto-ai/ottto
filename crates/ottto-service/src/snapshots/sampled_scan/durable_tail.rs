@@ -994,7 +994,9 @@ impl<'a> Interpretation<'a> {
             identity_contract.push_str(&format!("|attr={}", claude_attribution_capture_enabled()));
         }
         Self {
-            accepted: (restart_restore::enabled() && source == SnapshotSource::ClaudeCode)
+            accepted: (restart_restore::enabled()
+                && crate::snapshots::durable_sources::below_accepted(source)
+                    == crate::snapshots::durable_sources::BelowAccepted::Held)
                 .then(|| AcceptedFloor::of(index, key))
                 .flatten(),
             identity_contract,

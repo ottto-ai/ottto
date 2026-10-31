@@ -33178,7 +33178,7 @@ impl OwnedSourceScan {
             // S2: preserve accepted facts before candidate/working-entry changes.
             #[cfg(unix)]
             let accepted_floor = (restart_restore::enabled()
-                && source == SnapshotSource::ClaudeCode)
+                && durable_sources::below_accepted(source) == durable_sources::BelowAccepted::Held)
                 .then(|| {
                     sampled_scan::durable_tail::AcceptedFloor::of(
                         index,
