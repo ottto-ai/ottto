@@ -277,11 +277,6 @@ impl SideLedger {
         self.entries.len()
     }
 
-    #[cfg(test)]
-    pub(in crate::snapshots) fn pass_seq(&self) -> u32 {
-        self.pass_seq
-    }
-
     fn slot(&self, ns: u128) -> Option<&GateSlot> {
         self.gate.iter().flatten().find(|slot| slot.ns == ns)
     }
@@ -829,7 +824,7 @@ impl SideLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap_layout_bound::layout_supported;
+    use crate::heap_layout_bound::{bound, layout_supported, Counter};
     use crate::snapshots::{SideRequest, SideRequestState};
 
     fn entry() -> LedgerEntry {
@@ -856,6 +851,49 @@ mod tests {
             dev: 1,
             ino: u64::try_from(p).unwrap(),
         }
+    }
+
+    /// [behaviour] U-T64(f): the charge is constant, lock-free and inside the state bound.
+    #[test]
+    fn shared_cache_charges_the_constant_without_locking_the_ledger() {
+        let empty = SharedCache::default();
+        let full = SharedCache::default();
+        {
+            let mut ledger = full.side_ledger();
+            ledger.begin_pass(7, 1000);
+            for p in 0..MAX_SIDE_LEDGER as u128 {
+                if layout_supported() {
+                    assert_eq!(ledger.charge(key(7, p + 1), entry(), 1000), Ok(true));
+                } else {
+                    ledger.entries.insert(key(7, p + 1), entry());
+                }
+            }
+            assert_eq!(ledger.len(), MAX_SIDE_LEDGER);
+        }
+        assert_eq!(bound(&full, usize::MAX), bound(&empty, usize::MAX));
+        assert_eq!(bound(&empty, usize::MAX).is_some(), layout_supported());
+        if layout_supported() {
+            // The term is exactly the constant: one visit, no walk.
+            let mut with = Counter::new(usize::MAX);
+            crate::heap_layout_bound::HeapLayoutBound::heap_bound(&empty, &mut with).unwrap();
+            let mut without = Counter::new(usize::MAX);
+            crate::heap_layout_bound::HeapLayoutBound::heap_bound(&empty.inner, &mut without)
+                .unwrap();
+            crate::heap_layout_bound::HeapLayoutBound::heap_bound(&empty.cursor, &mut without)
+                .unwrap();
+            // The separately allocated memo header is another cache-owned
+            // component; include it once to isolate the ledger's fixed term.
+            crate::heap_layout_bound::HeapLayoutBound::heap_bound(
+                &empty.withheld_memo,
+                &mut without,
+            )
+            .unwrap();
+            assert_eq!(with.bytes, without.bytes + SIDE_LEDGER_BYTES);
+        }
+        // Held lock: heap_bound still answers.
+        let held = full.side_ledger();
+        assert_eq!(bound(&full, usize::MAX), bound(&empty, usize::MAX));
+        drop(held);
     }
 
     #[test]
@@ -1645,6 +1683,39 @@ mod tests {
             BTreeMap::from([(old, (LedgerTag::Gone, 1)), (new, (LedgerTag::Live, 2))])
         );
         assert_eq!(loaded.codex_parent_side_requests.get(P), Some(&charged));
+    }
+
+    /// [behaviour] D5′ sizes: the entry and slot keep their cleared sizes. The
+    /// ledger's inline growth is inside `size_of::<SharedCache>()`; its fixed
+    /// heap reservation and the memo's separate allocation header are each
+    /// charged once beside that payload.
+    #[test]
+    fn d5_inline_ledger_is_in_the_cache_size_and_the_heap_formula_holds() {
+        use crate::heap_layout_bound::HeapLayoutBound;
+        assert_eq!(size_of::<LedgerEntry>(), 96);
+        assert_eq!(size_of::<GateSlot>(), 48);
+        assert_eq!(size_of::<Option<GateSlot>>(), 48);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(size_of::<SideLedger>(), 560);
+        assert!(size_of::<SharedCache>() >= size_of::<std::sync::Mutex<SideLedger>>());
+        if !layout_supported() {
+            return;
+        }
+        let cache = std::sync::Arc::new(SharedCache::default());
+        let mut whole = Counter::new(usize::MAX);
+        cache.heap_bound(&mut whole).unwrap();
+        let mut parts = Counter::new(usize::MAX);
+        cache.inner.heap_bound(&mut parts).unwrap();
+        cache.cursor.heap_bound(&mut parts).unwrap();
+        cache.withheld_memo.heap_bound(&mut parts).unwrap();
+        assert_eq!(
+            whole.bytes,
+            size_of::<SharedCache>()
+                + std::mem::align_of::<SharedCache>()
+                + 2 * size_of::<usize>()
+                + parts.bytes
+                + SIDE_LEDGER_BYTES
+        );
     }
 
     #[test]
