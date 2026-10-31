@@ -31421,6 +31421,40 @@ impl OwnedSourceScan {
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
                 context_read_budget.flush(index, &codex_selected_flags);
+                // A failed/held ordinary owner cannot strand a readable copy.
+                // At this boundary every selected candidate has ended; queued
+                // work still owns its lease. Reuse the existing hint queue for
+                // the next incidence, leaving the unsent deadline due.
+                let retry_copies = index
+                    .terminal_contract_retries
+                    .iter()
+                    .filter(|(fp, _)| {
+                        index
+                            .quarantined_snapshot_fingerprints
+                            .get(*fp)
+                            .is_some_and(|r| r.contract_retry_claims.is_none())
+                            && !snapshots
+                                .iter()
+                                .any(|item| &item.snapshot_fingerprint == *fp)
+                            && !index.quarantine_retry_is_queued(fp)
+                    })
+                    .filter_map(|(fp, owner)| {
+                        index
+                            .file_snapshot_fingerprints
+                            .range((
+                                std::ops::Bound::Excluded(owner.clone()),
+                                std::ops::Bound::Unbounded,
+                            ))
+                            .find(|(_, fingerprints)| fingerprints.contains(fp))
+                            .map(|(key, _)| (fp.clone(), key.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (fp, key) in retry_copies {
+                    index.terminal_contract_retries.insert(fp, key.clone());
+                    if let Some(traversal) = index.traversal.as_mut() {
+                        enqueue_watcher_hints(source, traversal, &[PathBuf::from(key)], false);
+                    }
+                }
                 if codex_page.continuation() {
                     let continuation_evidence = codex_join_inventory.map(|inventory| {
                         Arc::new(Mutex::new(Some(CodexContinuationEvidence {
@@ -48564,6 +48598,29 @@ impl ScanIndex {
                 self.terminal_contract_retries
                     .entry(fingerprint.clone())
                     .or_insert_with(|| key.clone());
+            }
+        }
+        // A prior page's failed owner queued its next copy. That durable queue
+        // keeps the fallback ahead of the first incidence after save/reload.
+        for (fingerprint, owner) in &mut self.terminal_contract_retries {
+            if self
+                .quarantined_snapshot_fingerprints
+                .get(fingerprint)
+                .is_some_and(|r| r.contract_retry_claims.is_none())
+            {
+                if let Some(pending) = self
+                    .traversal
+                    .iter()
+                    .flat_map(|walk| walk.pending_candidates.iter())
+                    .chain(self.claude_stale_family_carry.replay.iter())
+                    .find(|pending| {
+                        self.file_snapshot_fingerprints
+                            .get(&local_index_key(&pending.path))
+                            .is_some_and(|fingerprints| fingerprints.contains(fingerprint))
+                    })
+                {
+                    *owner = local_index_key(&pending.path);
+                }
             }
         }
         // Use the same revalidated candidate admission as exact refusal re-offers.

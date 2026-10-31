@@ -10301,16 +10301,16 @@ fn require_normal_write_ack_for_legacy_reconciliation(
         return Ok(());
     }
     if response.disabled {
-        return Err(anyhow!(
-            "disabled snapshot response cannot settle legacy reconciliation"
-        ));
+        return Err(anyhow::Error::new(SnapshotAckRejected {
+            reason: "disabled snapshot response cannot settle legacy reconciliation",
+        }));
     }
     if response.entity_ack_contract.as_deref()
         != Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT)
     {
-        return Err(anyhow!(
-            "legacy snapshot reconciliation requires the exact entity ACK contract"
-        ));
+        return Err(anyhow::Error::new(SnapshotAckRejected {
+            reason: "legacy snapshot reconciliation requires the exact entity ACK contract",
+        }));
     }
     Ok(())
 }
@@ -17951,6 +17951,8 @@ mod tests {
             ),
         )
         .expect("write manifest-present source revision");
+        let duplicate_path = root.join("z-copy.jsonl");
+        std::fs::copy(&session_path, &duplicate_path).unwrap();
         let mut index = ScanIndex::default();
         let mut first_scan = crate::snapshots::scan_source_roots(
             SnapshotSource::Pi,
@@ -17966,6 +17968,11 @@ mod tests {
             &mut index,
         );
         let fingerprint = first_scan.snapshots[0].snapshot_fingerprint.clone();
+        assert_eq!(index.file_snapshot_fingerprints.len(), 2);
+        assert!(index
+            .file_snapshot_fingerprints
+            .values()
+            .all(|fingerprints| { fingerprints == &BTreeSet::from([fingerprint.clone()]) }));
         let mut quarantine = crate::snapshots::snapshot_quarantine_record(SnapshotSource::Pi);
         quarantine.retry_after_unix_seconds = 0;
         quarantine.upload_body_witness = Some(fingerprint.clone());
@@ -18049,7 +18056,8 @@ mod tests {
         // absent from its candidate queue, just like the four M4 quarantines.
         let mut state = serde_json::to_value(&index).unwrap();
         state["traversal"]["scan_roots"] = serde_json::json!([root]);
-        state["traversal"]["observed_index_keys"] = serde_json::json!([session_path]);
+        state["traversal"]["observed_index_keys"] =
+            serde_json::json!([session_path, duplicate_path]);
         assert_eq!(
             state["traversal"]["pending_candidates"],
             serde_json::json!([])
@@ -18101,6 +18109,59 @@ mod tests {
             progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
             0
         );
+        // Round 4 P2b (theoretical): a retained unreadable first incidence
+        // releases ownership to the next copy through the same pending queue.
+        #[cfg(unix)]
+        let hints = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            let (held, reads) =
+                crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+                    crate::snapshots::scan_source_roots_with_test_limit_and_hints(
+                        SnapshotSource::Pi,
+                        std::slice::from_ref(&root),
+                        &mut index,
+                        collected_at,
+                        crate::snapshots::BACKFILL_WINDOW_DAYS,
+                        1,
+                        true,
+                        &hints,
+                    )
+                    .unwrap()
+                });
+            assert!(held.snapshots.is_empty());
+            assert!(reads.is_empty());
+            assert!(held.unreadable_path_count > 0);
+            assert!(index.quarantine_retry_is_queued(&fingerprint));
+            assert!(!progress.defer_held_quarantine_retries(
+                &held.snapshots,
+                &index,
+                SnapshotSource::Pi
+            ));
+            assert_eq!(
+                progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
+                0
+            );
+            assert_eq!(
+                progress.quarantined_fingerprints[&fingerprint].failed_reconstruction_count,
+                failures
+            );
+            index.save(&index_path).unwrap();
+            progress.save(&progress_path).unwrap();
+            index = ScanIndex::load(&index_path).unwrap();
+            progress = SnapshotUploadProgress::load(
+                &progress_path,
+                &progress.destination_namespace_hash,
+                snapshot_quarantine_witness(SnapshotSource::Pi),
+            )
+            .unwrap();
+            assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+            let hints =
+                save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
+            assert_eq!(hints, vec![duplicate_path.clone()]);
+            hints
+        };
         let (mut retry, reads) =
             crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
                 crate::snapshots::scan_source_roots_with_test_limit_and_hints(
@@ -18117,6 +18178,8 @@ mod tests {
             });
         crate::snapshots::finalize_scan_after_policy(SnapshotSource::Pi, &mut retry, &mut index);
         assert_eq!(reads.values().sum::<usize>(), 1);
+        #[cfg(unix)]
+        assert_eq!(reads.get(&duplicate_path), Some(&1));
         assert_eq!(retry.snapshots.len(), 1);
         assert_eq!(retry.snapshots[0].snapshot_fingerprint, fingerprint);
         assert!(!progress.defer_held_quarantine_retries(
@@ -18147,6 +18210,46 @@ mod tests {
             progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
             0
         );
+        // Round 4 P2a (theoretical): a count-only HTTP reply remains a real
+        // send even though it cannot settle legacy reconciliation.
+        let replied = upload_resumable_batches(
+            &retry.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            |_| {
+                let response = accepted_batch(1);
+                let pending = BTreeSet::from([fingerprint.clone()]);
+                require_normal_write_ack_for_legacy_reconciliation(&response, &pending, &pending)?;
+                Ok(response)
+            },
+            |state| state.save(&progress_path),
+        );
+        assert!(replied
+            .unwrap_err()
+            .downcast_ref::<SnapshotAckRejected>()
+            .is_some());
+        let paced = &progress.quarantined_fingerprints[&fingerprint];
+        assert!(paced.retry_after_unix_seconds > current_unix_seconds());
+        assert!(snapshot_quarantine_deadline_is_bounded(paced));
+        assert_eq!(paced.failed_reconstruction_count, failures);
+        assert_eq!(accepted, 0);
+        assert!(!progress.accepted_fingerprints.contains(&fingerprint));
+        progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &progress.destination_namespace_hash,
+            snapshot_quarantine_witness(SnapshotSource::Pi),
+        )
+        .unwrap();
+        assert!(!progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        // The next ordinary deadline becomes due; the retained body sends once.
+        progress
+            .quarantined_fingerprints
+            .get_mut(&fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
         upload_resumable_batches(
             &retry.snapshots,
             &unique_poison_scope(),
@@ -18183,6 +18286,12 @@ mod tests {
         assert!(reads.is_empty());
         assert!(quiet.snapshots.is_empty());
         assert_eq!((upload_calls, accepted), (1, 1));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
