@@ -6177,17 +6177,21 @@ fn q8_strict_v1_bridge_keeps_unknown_same_and_inode_reuse_conservative() {
 
 // Movable native transition rows; no replacement money reducer/comparator.
 // Compare the exact production SnapshotBatchRequest serialization on the same physical file.
-fn a1a_wire(support: &Path, index: &mut ScanIndex, scan: &mut SourceScanResult) -> Vec<u8> {
+fn a1a_finalize(support: &Path, index: &mut ScanIndex, scan: &mut SourceScanResult) {
     let source = SnapshotSource::ClaudeCode;
     crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, scan, index);
     index.veto_claude_history_emission(source, &mut scan.snapshots);
     index.bind_session_accounts(source, "a1a-fixture-machine", &mut scan.snapshots, &[]);
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
     finalize_scan_after_policy(source, scan, index);
+}
+
+fn a1a_wire(support: &Path, index: &mut ScanIndex, scan: &mut SourceScanResult) -> Vec<u8> {
+    a1a_finalize(support, index, scan);
     assert!(!scan.snapshots.is_empty(), "nonempty emitted money premise");
     let request = SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
-        source: source.api_slug().into(),
+        source: SnapshotSource::ClaudeCode.api_slug().into(),
         machine_id: "a".repeat(64),
         collector_version: Some("fixture".into()),
         snapshots: scan.snapshots.clone(),
@@ -13299,14 +13303,33 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
         (1, 0, 0),
         "first native pass after cold import is one Full"
     );
-    a1a_wire(&root, &mut cold, &mut scan);
+    // This Full rebuilds native state for an unchanged imported body. Run the
+    // production finalization chain, which must suppress its repeat upload;
+    // a1a_wire is reserved for a nonempty money emission.
+    assert_eq!(scan.snapshots.len(), 1);
+    assert_eq!(scan.snapshots[0].input_tokens, 100);
+    assert_eq!(scan.snapshots[0].output_tokens, 10);
+    a1a_finalize(&root, &mut cold, &mut scan);
+    assert!(
+        scan.snapshots.is_empty(),
+        "unchanged cold Full has no upload"
+    );
+    assert_eq!(scan.semantic_noop_count, 1);
+    let key = local_index_key(&path);
+    assert_eq!(
+        cold.files[&key].last_snapshot_fingerprint,
+        imported.files[&key].last_snapshot_fingerprint
+    );
+    assert_eq!(
+        cold.files[&key].last_upload_body_witness,
+        imported.files[&key].last_upload_body_witness
+    );
     next = cold;
     next.generation = imported.generation + 1;
     let binding = scan_index_persistence::Binding {
         source: scan_index_persistence::Source::Claude,
         namespace_hash: "a".repeat(64),
     };
-    let key = local_index_key(&path);
     let current = BTreeMap::new();
     let mut adapter = Adapter::new(owner.cache.clone(), &index_path, binding.clone()).unwrap();
     store::test_hooks::set_before_access(Some(Box::new(|_, _| {
