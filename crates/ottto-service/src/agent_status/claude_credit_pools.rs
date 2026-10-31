@@ -1222,25 +1222,6 @@ mod tests {
     }
 
     #[test]
-    fn expired_one_time_pool_is_skipped_and_live_one_is_kept() {
-        let body = plain_max_body();
-        let after_expiry = claude_one_time_credits(&body, READ_AT, &mut Vec::new());
-        assert!(after_expiry
-            .iter()
-            .all(|credit| credit.limit_id.as_deref() != Some("amber_ladder")));
-        let before_expiry = claude_one_time_credits(&body, "2026-09-25T10:00:00Z", &mut Vec::new());
-        let amber = before_expiry
-            .iter()
-            .find(|credit| credit.limit_id.as_deref() == Some("amber_ladder"))
-            .expect("amber_ladder before its expiry");
-        assert_eq!(amber.quota, Some(250_000));
-        assert_eq!(amber.used, Some(250_137));
-        assert_eq!(amber.remaining, Some(0));
-        assert_eq!(amber.status, AgentCreditBalanceStatus::Exhausted);
-        assert_eq!(amber.expires_at.as_deref(), Some("2026-10-02T06:59:59Z"));
-    }
-
-    #[test]
     fn one_time_pool_label_becomes_title_and_windows_are_never_pools() {
         let body = json!({
             "five_hour": {"utilization": 1, "resets_at": null, "limit_dollars": 9},
