@@ -697,6 +697,40 @@ impl HistoryPage {
             self.family_closure_root_absent_excluded.saturating_add(1);
     }
 
+    // ON-only count of history files actually admitted to a parser, including
+    // local work that bypasses the upgrade-only budget. No proof authority;
+    // kept in the static diagnostics array so OFF's layout equals main.
+    pub(super) fn note_history_read(&self) {
+        if super::claude_terminal_off() {
+            crate::local_resource_diagnostics::terminal_off_count(
+                crate::local_resource_diagnostics::TerminalOffCount::HistoryRead,
+                1,
+            );
+        }
+    }
+
+    pub(super) fn emit_page_diagnostics(&self) {
+        if !super::claude_terminal_off() {
+            return;
+        }
+        let budget = super::body_witness_adoption_page_budget() as u64;
+        let read_files = crate::local_resource_diagnostics::take_terminal_off_count(
+            crate::local_resource_diagnostics::TerminalOffCount::HistoryRead,
+        );
+        crate::local_resource_diagnostics::traversal_point(
+            "history_upgrade_page",
+            "claude_code",
+            &std::collections::BTreeMap::from([(
+                "history_upgrade_page",
+                std::collections::BTreeMap::from([
+                    ("admitted_files", read_files),
+                    ("budget", budget),
+                    ("extra_files", read_files.saturating_sub(budget)),
+                ]),
+            )]),
+        );
+    }
+
     /// This page admitted at least one history file to its budget.
     pub(super) fn admitted_any(&self) -> bool {
         self.files > 0

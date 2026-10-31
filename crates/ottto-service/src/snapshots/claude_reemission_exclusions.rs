@@ -247,6 +247,25 @@ impl ReemissionExclusions {
         self
     }
 
+    /// ON-only RAM scheduling scope of the listed digests: a commutative
+    /// SHA-256 set fold over `digests`, computed on demand (no stored field,
+    /// so OFF's layout and heap walk equal main). OFF returns zeros.
+    pub(super) fn held_context_digest(&self) -> [u8; 32] {
+        use sha2::Digest;
+        let mut scope = [0; 32];
+        if super::claude_terminal_off() {
+            for digest in &self.digests {
+                for (byte, part) in scope
+                    .iter_mut()
+                    .zip(sha2::Sha256::digest(digest.as_bytes()))
+                {
+                    *byte ^= part;
+                }
+            }
+        }
+        scope
+    }
+
     pub(crate) fn state(&self) -> ListState {
         self.state
     }

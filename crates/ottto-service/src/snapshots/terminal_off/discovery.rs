@@ -40,6 +40,11 @@ struct Observation {
     served: Option<(Option<Stat>, [u8; 32])>,
     served_root: Option<[u8; 32]>,
     served_at: Option<u64>,
+    // Explicit per-key hold custody, independent of sweep/proof family roots.
+    held_retry: bool,
+    // This serve re-read a key the previous settlement held. Only a held
+    // re-read starts the floor: a fresh hold keeps its one immediate retry.
+    held_reread: bool,
 }
 #[derive(Clone, Default)]
 struct Walk {
@@ -188,7 +193,10 @@ fn cause(index: &ScanIndex, key: &str, now: u64) -> Option<&'static str> {
         "identity_version"
     } else if mintable && index.effective_upload_body_witness_revision_requires_adoption(key) {
         "body_witness_revision"
-    } else if mintable && index.file_upload_context_requires_adoption(key) {
+    } else if mintable
+        && index.file_upload_context_requires_adoption(key)
+        && !terminal_off_held_context_seen(index, key)
+    {
         "upload_context"
     } else if debt.is_some_and(|d| now >= d.due_unix_seconds) {
         "audit_due"
@@ -429,7 +437,24 @@ pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile, now: u64) {
     });
     let debt = sampled_audit::debt_for_key(index, &key, now);
     let cause = cause(index, &key, now).unwrap_or("watcher_stat_change");
-    with_walks(|memo| {
+    let id = digest(&key);
+    let initial_retry = with_walks(|memo| {
+        let walk_now = memo.get(&scope).map(|walk| walk.now);
+        // Hold custody from any retained walk scope is consumed by this read.
+        // Re-reading a fresh hold before its six hours is the one extra
+        // early read Lead B allows; a floored re-read is never early.
+        let (held_reread, initial_retry) =
+            memo.values_mut().fold((false, false), |(held, early), walk| {
+                walk.observations.get_mut(&id).map_or((held, early), |o| {
+                    let custody = std::mem::take(&mut o.held_retry);
+                    let soon = custody
+                        && !o.held_reread
+                        && o.served_at.zip(walk_now).is_some_and(|(at, now)| {
+                            now < at.saturating_add(6 * 3600)
+                        });
+                    (held || custody, early || soon)
+                })
+            });
         if let Some(walk) = memo.get_mut(&scope) {
             let round = walk.round;
             let now = walk.now;
@@ -441,10 +466,26 @@ pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile, now: u64) {
             o.round = round;
             o.served = Some((stat, token));
             o.served_at = Some(now);
+            o.held_retry = false; // Classification belongs to this parse's settlement.
+            o.held_reread = held_reread;
             o.served_root = Some(digest(&local_index_key(&candidate.scan_root)));
             o.targeted = Some(service_token(token, debt, stat, cause));
         }
+        initial_retry
     });
+    if initial_retry {
+        // Lead B (NBF): a fresh non-blocking hold may be read twice in its
+        // first six hours; process total of those extra early reads.
+        let total = crate::local_resource_diagnostics::terminal_off_count(
+            crate::local_resource_diagnostics::TerminalOffCount::NbfInitialRetryRead,
+            1,
+        );
+        crate::local_resource_diagnostics::traversal_point(
+            "terminal_off_nbf_initial_retry_read",
+            "claude_code",
+            &json!({"nbf_initial_retry_reads":total,"keys":1,"bytes":0}),
+        );
+    }
 }
 
 pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
@@ -493,45 +534,86 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
             }
         });
     }
+    // NBF custody: a settlement-held key whose six-hour floor has expired is
+    // offered again. Otherwise a suppressing walk skips its unchanged stat
+    // (walk_path), its unchanged service token stays deduplicated below, and
+    // the floored re-queue never returns: the hold would sit unread. RAM only.
+    let due = with_walks(|memo| {
+        memo.values()
+            .flat_map(|walk| walk.observations.iter())
+            .filter(|(_, o)| {
+                o.held_retry
+                    && o.served_at
+                        .is_some_and(|at| now >= at.saturating_add(6 * 3600))
+            })
+            .map(|(id, _)| *id)
+            .collect::<BTreeSet<_>>()
+    });
+    let held_due = if due.is_empty() {
+        BTreeSet::new()
+    } else {
+        index
+            .files
+            .keys()
+            .cloned()
+            .chain(
+                index
+                    .claude_full_rearm_progress
+                    .terminal_off_admitted
+                    .iter()
+                    .map(|p| local_index_key(&p.path)),
+            )
+            .filter(|key| due.contains(&digest(key)) && !pending.contains(key))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(limit)
+            .collect::<BTreeSet<_>>()
+    };
     let mut selected = Vec::new();
-    for key in &keys {
+    for key in held_due.iter().chain(keys.iter().filter(|key| !held_due.contains(*key))) {
+        let floor_expired = held_due.contains(key);
         if pending.contains(key)
             || sampled_audit::candidate_open_blocked(key, now)
-            || index.file_upload_context_waits_for_retry(key)
+            || (!floor_expired && index.file_upload_context_waits_for_retry(key))
         {
             continue;
         }
-        let debt = sampled_audit::debt_for_key(index, key, now);
-        if debt.is_some_and(|d| now < d.due_unix_seconds) {
-            continue;
-        }
-        let Some(cause) = cause(index, key, now) else {
-            continue;
-        };
-        let token = revision(index, key);
-        stats += 1;
-        let stat = fs::symlink_metadata(key)
-            .ok()
-            .and_then(|m| Stat::capture(&m));
-        let retry_ready = sampled_audit::failed_open_retry_ready(key, now);
-        let admitted = with_walks(|memo| {
-            let Some(walk) = memo.get_mut(&scope) else {
-                return false;
+        let cause = if floor_expired {
+            "held_retry_due"
+        } else {
+            let debt = sampled_audit::debt_for_key(index, key, now);
+            if debt.is_some_and(|d| now < d.due_unix_seconds) {
+                continue;
+            }
+            let Some(cause) = cause(index, key, now) else {
+                continue;
             };
-            if blocked(walk, key, stat, Some(token)) {
-                return false;
+            let token = revision(index, key);
+            stats += 1;
+            let stat = fs::symlink_metadata(key)
+                .ok()
+                .and_then(|m| Stat::capture(&m));
+            let retry_ready = sampled_audit::failed_open_retry_ready(key, now);
+            let admitted = with_walks(|memo| {
+                let Some(walk) = memo.get_mut(&scope) else {
+                    return false;
+                };
+                if blocked(walk, key, stat, Some(token)) {
+                    return false;
+                }
+                let token = service_token(token, debt, stat, cause);
+                let o = observation(walk, key);
+                if o.targeted == Some(token) && !retry_ready {
+                    return false;
+                }
+                o.targeted = Some(token);
+                true
+            });
+            if !admitted {
+                continue;
             }
-            let token = service_token(token, debt, stat, cause);
-            let o = observation(walk, key);
-            if o.targeted == Some(token) && !retry_ready {
-                return false;
-            }
-            o.targeted = Some(token);
-            true
-        });
-        if !admitted {
-            continue;
-        }
+            cause
+        };
         let traversal = index.traversal.as_ref().unwrap();
         let served_root = with_walks(|m| {
             m.get(&scope)
@@ -590,7 +672,7 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
 }
 
 crate::heap_layout_bound::fields!(Stat; length, modified, identity, birth);
-crate::heap_layout_bound::fields!(Observation; stat, round, first_seen, targeted, served, served_root, served_at);
+crate::heap_layout_bound::fields!(Observation; stat, round, first_seen, targeted, served, served_root, served_at, held_retry, held_reread);
 crate::heap_layout_bound::fields!(Walk; now, last_walk, coalesced_since, round, suppressing, target_cursor, held_roots, oversized, observations);
 
 pub(super) fn retry_blocked(index: &ScanIndex, key: &str) -> bool {
@@ -605,8 +687,71 @@ pub(super) fn retry_blocked(index: &ScanIndex, key: &str) -> bool {
         .and_then(|m| Stat::capture(&m));
     let token = revision(index, key);
     with_walks(|m| {
-        m.get(&scope).is_some_and(|w| {
-            blocked(w, key, stat, Some(token)) || sampled_audit::candidate_open_blocked(key, w.now)
+        let Some(walk) = m.get(&scope) else {
+            return false;
+        };
+        // Explicit non-blocking custody survives traversal starts in the same
+        // bounded RAM observation map. It never borrows held_family_roots,
+        // which owns distinct sweep/proof semantics. Real object/context
+        // changes and unknown identity fail toward another read. Only a held
+        // re-read is floored, so a fresh hold keeps its one immediate retry.
+        let held_key_blocked = stat
+            .is_some_and(|s| s.identity.is_some() && s.modified.is_some() && s.birth > 0)
+            && m.values().any(|prior| {
+                prior.observations.get(&digest(key)).is_some_and(|o| {
+                    o.held_retry
+                        && o.held_reread
+                        && o.served_at
+                            .is_some_and(|at| walk.now < at.saturating_add(6 * 3600))
+                        && o.served == Some((stat, token))
+                })
+            });
+        held_key_blocked
+            || blocked(walk, key, stat, Some(token))
+            || sampled_audit::candidate_open_blocked(key, walk.now)
+    })
+}
+
+/// A settlement-held key whose six-hour floor has expired: its custody is
+/// still unread, so it owes exactly one read (targeted re-offer, forced parse).
+pub(super) fn held_retry_due(index: &ScanIndex, key: &str) -> bool {
+    if !claude_terminal_off() {
+        return false;
+    }
+    let Some(scope) = terminal_off_rediscovery_scope(index) else {
+        return false;
+    };
+    let id = digest(key);
+    with_walks(|memo| {
+        let Some(now) = memo.get(&scope).map(|walk| walk.now) else {
+            return false;
+        };
+        memo.values().any(|walk| {
+            walk.observations.get(&id).is_some_and(|o| {
+                o.held_retry
+                    && o.served_at
+                        .is_some_and(|at| now >= at.saturating_add(6 * 3600))
+            })
         })
     })
+}
+
+/// Register the keys actually returned by local hold settlement. Querying or
+/// re-enqueueing never renews served_at; only an actual parse can do that.
+/// A fresh hold is still retried once; its held re-read starts the floor.
+pub(super) fn held_retry_blocked(index: &ScanIndex, key: &str) -> bool {
+    if !claude_terminal_off() {
+        return false;
+    }
+    if let Some(scope) = terminal_off_rediscovery_scope(index) {
+        with_walks(|memo| {
+            if let Some(o) = memo
+                .get_mut(&scope)
+                .and_then(|walk| walk.observations.get_mut(&digest(key)))
+            {
+                o.held_retry = true;
+            }
+        });
+    }
+    retry_blocked(index, key)
 }

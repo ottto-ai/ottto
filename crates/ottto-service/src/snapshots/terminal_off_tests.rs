@@ -593,13 +593,65 @@ fn terminal_off_context_change_and_contract_debt_still_select() {
         "2026-08-20T10:22:00Z",
         BACKFILL_WINDOW_DAYS,
     );
-    assert!(index.files[&local_index_key(&path)]
-        .source_file_fingerprint
-        .is_empty());
+    // Lead B Ask 1 (R11): exact ACK settles the money, so the contract clear
+    // keeps this file's body; the new context stays owed and still selects it
+    // through the paced UploadContext path.
+    let key = local_index_key(&path);
+    assert!(!index.files[&key].source_file_fingerprint.is_empty());
+    assert!(index.file_upload_context_requires_adoption(&key));
     assert!(
         index.claude_request_identity_contract_changed,
         "suppressed full replay never spends the latch"
     );
+    // The paced pass, with the per-file context production activates every
+    // cycle: the body is re-emitted and ACKed under the NEW context, money
+    // unchanged.
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "new-destination".into());
+    let paced = off_scan(&mut index, &scratch, "2026-08-20T10:23:00Z", 10);
+    assert_eq!(paced.scanned_file_count, 1);
+    let candidates = index.file_upload_context_ack_candidates(&paced.snapshots);
+    let acks = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(
+        SnapshotSource::ClaudeCode,
+        &paced.snapshots,
+    );
+    index.accept_file_upload_context_acks(&candidates, &acks);
+    assert_eq!(
+        index.files[&key]
+            .upload_context_receipt
+            .as_ref()
+            .map(|receipt| receipt.context_fingerprint.as_str()),
+        Some("new-destination"),
+        "the context change reaches the wire"
+    );
+    assert!(!index.file_upload_context_requires_adoption(&key));
+    // Main's money comparison (`usage_totals_equal`), per emitted item in
+    // session order, plus each item's row costs.
+    let money = |result: &SourceScanResult| {
+        let mut items = result
+            .snapshots
+            .iter()
+            .map(|item| {
+                let mut costs = item
+                    .model_usage
+                    .iter()
+                    .map(|row| row.cost_usd.clone())
+                    .collect::<Vec<_>>();
+                costs.sort();
+                (item.source_session_id.clone(), usage_totals_from_item(item), costs)
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.0.cmp(&right.0));
+        items
+    };
+    let (before, after) = (money(&first), money(&paced));
+    assert_eq!(before.len(), after.len());
+    for ((session, totals, costs), (paced_session, paced_totals, paced_costs)) in
+        before.iter().zip(&after)
+    {
+        assert_eq!(session, paced_session);
+        assert!(usage_totals_equal(totals, paced_totals), "{session} tokens");
+        assert_eq!(costs, paced_costs, "{session} costs");
+    }
 }
 
 /// [format] Process-local containment state preserves persisted bytes and recovery safety.
@@ -2280,4 +2332,267 @@ fn terminal_off_stale_clear_memo_is_bounded_and_eviction_fails_toward_another_cl
     );
     reloaded.traversal = None;
     assert!(terminal_off_stale_clear_served(&reloaded, "context", &roots).is_empty());
+}
+
+const PRESERVED_ADMISSION_SIBLINGS: [&str; 2] = [
+    "b2222222-2222-4222-8222-222222222222",
+    "c3333333-3333-4333-8333-333333333333",
+];
+const PRESERVED_ADMISSION_PAGES: [&str; 3] =
+    [W2, "2026-08-20T10:13:00Z", "2026-08-20T10:14:00Z"];
+
+/// [regress] R7: like main's `stale_pending_roots`, neither the ON start's
+/// semantic clear nor its resumed retry admission takes a family whose
+/// quarantine is bound to its retained witness, so its unchanged root is never
+/// re-armed, offered or read. With its stale siblings re-armed (never
+/// storage-only), a platform without a native layout also carries and promotes
+/// no family, as main's start runs no streaming carry batch there.
+#[test]
+fn terminal_off_start_and_resumed_admission_never_rearm_a_witness_bound_family() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    for rearm_siblings in [false, true] {
+        let scratch =
+            crate::test_scratch::ScratchDir::new(&format!("terminal-off-r7-{rearm_siblings}"));
+        for root in std::iter::once(OFF_ROOT).chain(PRESERVED_ADMISSION_SIBLINGS) {
+            fs::write(
+                scratch.join(format!("{root}.jsonl")),
+                freshness_line(root, "X"),
+            )
+            .unwrap();
+        }
+        let mut index = off_index();
+        let baseline = off_scan(&mut index, &scratch, W1, 10);
+        off_accept(&mut index, &baseline);
+        let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+        let key = local_index_key(&path);
+        let revision = index.files[&key].source_file_fingerprint.clone();
+        index.insert_unproven_terminal_claude_authority_for_test(OFF_ROOT, &revision);
+        index.insert_claude_usage_family_pending_for_test(OFF_ROOT, W1);
+        for root in PRESERVED_ADMISSION_SIBLINGS {
+            index.claude_usage_family_pending.insert(
+                root.to_string(),
+                ClaudeUsageFamilyPending {
+                    census_window_end: W1.to_string(),
+                    member_request_id_hashes: BTreeMap::from([(
+                        root.to_string(),
+                        BTreeSet::new(),
+                    )]),
+                    member_occurrences: BTreeMap::new(),
+                    invalid: false,
+                    idless_revision: None,
+                },
+            );
+            if rearm_siblings {
+                let sibling = local_index_key(&scratch.join(format!("{root}.jsonl")));
+                index
+                    .files
+                    .get_mut(&sibling)
+                    .unwrap()
+                    .source_file_fingerprint
+                    .clear();
+            }
+        }
+        // The next page starts a traversal with all three families stale.
+        index.traversal = None;
+        let no_layout = rearm_siblings && !crate::heap_layout_bound::layout_supported();
+        for (page, at) in PRESERVED_ADMISSION_PAGES.into_iter().enumerate() {
+            let case = format!("rearm_siblings={rearm_siblings} page={page}");
+            let (_, reads) = terminal_contract_retry::source_acquisitions(|| {
+                sampled_scan::with_test_now(rfc3339_unix_seconds(at).unwrap(), || {
+                    scan_source_roots_with_test_limit_and_hints(
+                        SnapshotSource::ClaudeCode,
+                        &[scratch.to_path_buf()],
+                        &mut index,
+                        at,
+                        183,
+                        1,
+                        true,
+                        &[],
+                    )
+                    .unwrap()
+                })
+            });
+            assert_eq!(reads.get(&path).copied().unwrap_or(0), 0, "{case}: root read");
+            assert_eq!(
+                index.files[&key].source_file_fingerprint, revision,
+                "{case}: the witness-bound root is never offered or re-armed"
+            );
+            let carry = &index.claude_stale_family_carry;
+            assert!(!carry.contains(OFF_ROOT), "{case}");
+            let admission = carry.origin.as_ref().and_then(|o| o.admission.as_ref());
+            if page > 0 || no_layout {
+                let admission = admission.expect("the traversal keeps its retry admission");
+                assert_ne!(admission.oversized_root.as_deref(), Some(OFF_ROOT), "{case}");
+                if no_layout {
+                    assert!(carry.roots.is_empty(), "{case}: no family is carried");
+                    assert!(carry.capped_roots.is_empty(), "{case}");
+                    assert!(carry.replay.is_empty(), "{case}");
+                    assert_eq!(admission.oversized_root, None, "{case}: no promotion");
+                    assert_eq!(admission.after_root, None, "{case}: no root batch ran");
+                }
+            }
+        }
+        assert_eq!(
+            index.bound_terminal_claude_authority_revision_for_test(OFF_ROOT),
+            Some(revision)
+        );
+        assert!(index.claude_usage_family_pending.contains_key(OFF_ROOT));
+    }
+}
+
+/// [regress] R5: a complete held parse suppresses only this exact context's
+/// UploadContext re-read. A context or fingerprint change, a non-held parse
+/// and OFF all fail toward another read; the memo persists no proof, receipt
+/// or ACK.
+#[test]
+fn terminal_off_held_context_memo_forgets_changes_and_nonheld_parse_without_credit() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    let scratch = crate::test_scratch::ScratchDir::new("held-context-key");
+    let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+    fs::write(&path, freshness_line(OFF_ROOT, "held-context-key")).unwrap();
+    let mut index = off_index();
+    off_scan(&mut index, &scratch, W1, 10);
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "memo-context".into());
+    let key = local_index_key(&path);
+    let fp = index.files[&key].source_file_fingerprint.clone();
+    let before = serde_json::to_value(&index).unwrap();
+    note_terminal_off_held_context(&index, &key, &fp);
+    assert!(terminal_off_held_context_seen(&index, &key));
+    assert_eq!(
+        serde_json::to_value(&index).unwrap(),
+        before,
+        "no persisted proof, receipt or ACK"
+    );
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "other-context".into());
+    assert!(!terminal_off_held_context_seen(&index, &key));
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "memo-context".into());
+    assert!(
+        !terminal_off_held_context_seen(&index, &key),
+        "old context forgotten"
+    );
+    note_terminal_off_held_context(&index, &key, &fp);
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    assert!(!terminal_off_held_context_seen(&index, &key));
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = fp.clone();
+    assert!(
+        !terminal_off_held_context_seen(&index, &key),
+        "old fingerprint forgotten"
+    );
+    note_terminal_off_held_context(&index, &key, &fp);
+    forget_terminal_off_held_context(&key);
+    assert!(
+        !terminal_off_held_context_seen(&index, &key),
+        "non-held parse forgets"
+    );
+    {
+        let _off = ClaudeCompletionPathsForTest::enable();
+        assert!(!claude_terminal_off());
+        note_terminal_off_held_context(&index, &key, &fp);
+        assert!(!terminal_off_held_context_seen(&index, &key));
+    }
+    assert!(
+        !terminal_off_held_context_seen(&index, &key),
+        "OFF writes no memo"
+    );
+}
+
+/// [regress] NBF: a non-blocking hold (the real `into_locally_held_keys_reverted`
+/// settlement) keeps its one immediate retry; its held re-read floors the key
+/// for six hours, and at floor expiry the key is re-offered and read exactly
+/// once even when nothing else selects it, so a floored hold is never idle.
+/// Cases: a never-committed key, and a key whose hold reverts to its
+/// committed, unchanged entry (only the floor-expiry read serves it).
+#[test]
+fn terminal_off_nonblocking_hold_reads_once_per_six_hours_and_never_idles() {
+    use crate::local_resource_diagnostics::TerminalOffCount;
+    let _on = ClaudeTerminalOffForTest::enabled();
+    let t0 = rfc3339_unix_seconds(W1).unwrap();
+    let at = |offset: u64| {
+        OffsetDateTime::from_unix_timestamp((t0 + offset) as i64)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap()
+    };
+    // Offsets from W1: retry window, inside the floor, floor expiry, +300 s, +12 h.
+    let schedule = [600, 4_200, 22_200, 22_500, 43_800];
+    for (committed, expected) in [(false, [1, 0, 1, 0, 1]), (true, [0, 0, 1, 0, 1])] {
+        let scratch = crate::test_scratch::ScratchDir::new(&format!("terminal-off-nbf-{committed}"));
+        let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+        fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
+        let key = local_index_key(&path);
+        let mut index = off_index();
+        let mut previous = index.clone();
+        if committed {
+            let baseline = off_scan(&mut index, &scratch, "2026-08-20T10:01:00Z", 1);
+            off_accept(&mut index, &baseline);
+            index.traversal = None;
+            previous = index.clone();
+            // The first held read: a re-armed member whose hold reverts to
+            // its committed entry.
+            index.files.get_mut(&key).unwrap().source_file_fingerprint.clear();
+        }
+        // Process totals in the static diagnostics array (adding 0 reads them).
+        let total = |count| crate::local_resource_diagnostics::terminal_off_count(count, 0);
+        let early_before = total(TerminalOffCount::NbfInitialRetryRead);
+        let forced_before = total(TerminalOffCount::NbfFloorExpiryForcedRead);
+        // The never-committed key reverts as main's held-retry control does
+        // (reparse); the committed key reverts to its unchanged entry.
+        let reparse = !committed;
+        let page = |index: &mut ScanIndex, previous: ScanIndex, when: &str| {
+            let (_, reads) =
+                terminal_contract_retry::source_acquisitions(|| off_scan(index, &scratch, when, 1));
+            let read = reads.get(&path).copied().unwrap_or(0);
+            if read > 0 {
+                // Settlement holds the key again (non-progressing, non-blocking).
+                let held = index
+                    .file_snapshot_fingerprints
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
+                let reparse_held = if reparse { held.clone() } else { BTreeSet::new() };
+                *index = std::mem::take(index).into_locally_held_keys_reverted(
+                    &previous,
+                    &held,
+                    &reparse_held,
+                );
+            }
+            assert!(
+                index
+                    .accepted_snapshot_fingerprints
+                    .iter()
+                    .all(|fp| previous.accepted_snapshot_fingerprints.contains(fp)),
+                "a held read is never an ACK"
+            );
+            read
+        };
+        assert_eq!(page(&mut index, previous, W1), 1, "committed={committed}: first held read");
+        for (offset, expected) in schedule.into_iter().zip(expected) {
+            let previous = index.clone();
+            assert_eq!(
+                page(&mut index, previous, &at(offset)),
+                expected,
+                "committed={committed} +{offset}s"
+            );
+        }
+        // Lead B: at most one early read per new hold; floor-expiry reads are
+        // never early.
+        assert_eq!(
+            total(TerminalOffCount::NbfInitialRetryRead) - early_before,
+            u64::from(!committed),
+            "committed={committed}"
+        );
+        if committed {
+            // Lead B Ask 2c: both floor-expiry reads (+22,200 s, +43,800 s) of
+            // the committed, unchanged key are forced and counted.
+            assert_eq!(
+                total(TerminalOffCount::NbfFloorExpiryForcedRead) - forced_before,
+                2
+            );
+        }
+    }
 }

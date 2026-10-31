@@ -243,16 +243,32 @@ pub(crate) enum UnselectedReason {
     /// ON page pair or first rotating off-page pair gets a protected read.
     StrictBudgetProtected,
 }
-/// Three reasons, seven withheld events, growth, deleted tokens and audit retirement.
-const UNSELECTED_REASONS: usize = 21;
-/// Claude, Codex, Pi x reason, drained by that source's page line.
+/// Claude ON-only (`claude_terminal_off()`) counts, in the per-source slots
+/// after main's slots 0-18 and the strict-budget slots 19-20.
+/// Recorded after the decision; never
+/// a gate input, never carried in a scan/frame graph.
+#[derive(Clone, Copy)]
+pub(crate) enum TerminalOffCount {
+    /// History files admitted to a parser on this page (R4); page drained.
+    HistoryRead = 21,
+    /// NBF: never-committed held keys given their one immediate retry.
+    NbfInitialRetryRead,
+    /// NBF: held keys read because their six-hour floor expired.
+    NbfFloorExpiryForcedRead,
+    /// R11: semantic-clear members carried on exact ACK without a receipt.
+    CarriedExactAckWithoutReceipt,
+}
+const SOURCE_SLOTS: usize = 25;
+/// Claude, Codex, Pi x (age, size, serial fallback causes, ON counts),
+/// drained by that source's page line or the ON line that owns the slot.
+/// Diagnostics only; never carried in a scan/frame graph.
 #[cfg(not(test))]
-static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
-    [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS];
+static SOURCE_COUNTS: [AtomicU64; 3 * SOURCE_SLOTS] =
+    [const { AtomicU64::new(0) }; 3 * SOURCE_SLOTS];
 #[cfg(test)]
 thread_local! {
-    static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
-        const { [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS] };
+    static SOURCE_COUNTS: [AtomicU64; 3 * SOURCE_SLOTS] =
+        const { [const { AtomicU64::new(0) }; 3 * SOURCE_SLOTS] };
 }
 fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
     let sources = ["claude_code", "codex", "pi"];
@@ -261,11 +277,11 @@ fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) 
     };
     #[cfg(test)]
     {
-        LINE_UNSELECTED.with(|slots| f(&slots[UNSELECTED_REASONS * slot + reason]))
+        SOURCE_COUNTS.with(|slots| f(&slots[SOURCE_SLOTS * slot + reason]))
     }
     #[cfg(not(test))]
     {
-        f(&LINE_UNSELECTED[UNSELECTED_REASONS * slot + reason])
+        f(&SOURCE_COUNTS[SOURCE_SLOTS * slot + reason])
     }
 }
 /// One skip decision, recorded after the gate decided; never a gate input.
@@ -280,6 +296,18 @@ pub(crate) fn take_strict_budget_counts() -> (u64, u64) {
         take(UnselectedReason::StrictBudgetDeferred as usize),
         take(UnselectedReason::StrictBudgetProtected as usize),
     )
+}
+/// Adds `amount` to a Claude ON count; returns the new process total.
+pub(crate) fn terminal_off_count(count: TerminalOffCount, amount: u64) -> u64 {
+    source_count("claude_code", count as usize, |slot| {
+        slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+            .unwrap_or_else(|n| n)
+            .saturating_add(amount)
+    })
+}
+/// Drains a Claude ON count for the line that owns it.
+pub(crate) fn take_terminal_off_count(count: TerminalOffCount) -> u64 {
+    source_count("claude_code", count as usize, |slot| slot.swap(0, Relaxed))
 }
 /// One failed parking decision; no logging, resource probes or scan ownership.
 pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bool) {

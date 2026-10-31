@@ -8298,7 +8298,17 @@ pub fn finalize_scan_after_policy_with_body_witness(
         }
         if index.finalize_claude_held_history(&pending.index_key, &pending.source_file_fingerprint)
         {
+            if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                note_terminal_off_held_context(
+                    index,
+                    &pending.index_key,
+                    &pending.source_file_fingerprint,
+                );
+            }
             continue;
+        }
+        if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+            forget_terminal_off_held_context(&pending.index_key);
         }
         let final_fingerprints = by_source_file
             .get(&pending.source_file_fingerprint)
@@ -27155,20 +27165,36 @@ impl OwnedSourceScan {
         let pending_finalization = Vec::new();
         let claude_authority_preflight = source == SnapshotSource::ClaudeCode
             && !index.claude_usage_authority_quarantine.is_empty();
-        let mut identified_candidates = if claude_authority_preflight {
+        // Fix P (R10): before opening, the fingerprint slot holds only the
+        // sidecar digest. ON's gate-free context classification needs the full
+        // opened identity on both sides, including healthy families with
+        // context debt.
+        let context_preflight = source == SnapshotSource::ClaudeCode
+            && claude_terminal_off()
+            && index.file_upload_context_enabled;
+        let mut identified_candidates = if claude_authority_preflight || context_preflight {
             files
                 .into_iter()
                 .filter_map(|candidate| {
-                    open_and_identify_scan_candidate_at(
-                        source,
-                        candidate,
-                        &mut census,
-                        census_unix_seconds,
-                        backfill_window_days,
-                        discovery_retention!(index, &resource_probe.discovery_growth),
-                        audit_now,
-                    )
-                    .map(|(candidate, _)| candidate)
+                    if claude_authority_preflight
+                        || index
+                            .candidate_decision_with_reason_at(&candidate, audit_now)
+                            .1
+                            == Some(CandidateParseReason::UploadContext)
+                    {
+                        open_and_identify_scan_candidate_at(
+                            source,
+                            candidate,
+                            &mut census,
+                            census_unix_seconds,
+                            backfill_window_days,
+                            discovery_retention!(index, &resource_probe.discovery_growth),
+                            audit_now,
+                        )
+                        .map(|(candidate, _)| candidate)
+                    } else {
+                        Some(candidate)
+                    }
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -31571,6 +31597,9 @@ impl OwnedSourceScan {
                         .terminal_dropped_usage_record_count
                         .saturating_add(census.terminal_dropped_usage_record_count);
                 }
+                if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                    history_upgrade.emit_page_diagnostics();
+                }
                 if source == SnapshotSource::Codex {
                     // Count-only attribution of why Codex files were selected
                     // on this page. No path, session, or identifier is named.
@@ -32562,9 +32591,10 @@ impl OwnedSourceScan {
                         CandidateDecision::Parse,
                         Some(CandidateParseReason::ForcedFamily),
                     ),
-                    // Use the same audit clock as slot preparation and the
-                    // rescue above; a future virtual slot must stay future.
-                    None => index.candidate_decision_in_window(
+                    // Use main's window/audit decision before the ON-only retry override.
+                    None => terminal_off_held_retry_decision(
+                        source,
+                        index,
                         &candidate,
                         audit_now,
                         census_unix_seconds,
@@ -32589,6 +32619,7 @@ impl OwnedSourceScan {
             if comparison_target {
                 decision = CandidateDecision::Parse;
             }
+            let mut history_read = false;
             // History-upgrade gate (SOURCE P1), whatever selected the file:
             // unchanged Claude history that would carry a new body-witness
             // revision passes the list, the no-list birth hold, the family
@@ -32686,6 +32717,10 @@ impl OwnedSourceScan {
                     }
                     HistoryDecision::NotOwed => {}
                 }
+                history_read = source == SnapshotSource::ClaudeCode
+                    && claude_terminal_off()
+                    && decision == CandidateDecision::Parse
+                    && matches!(history, HistoryDecision::Owed | HistoryDecision::Held(_));
             }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
@@ -33206,6 +33241,9 @@ impl OwnedSourceScan {
             if side_plan.is_none() {
                 scanned_file_count += 1;
                 if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                    if history_read {
+                        history_upgrade.note_history_read();
+                    }
                     terminal_off_discovery::served(index, &candidate, audit_now);
                 }
             }
@@ -42634,15 +42672,39 @@ fn ensure_bounded_traversal(
             BTreeSet::new()
         } else {
             let served = terminal_off_stale_clear_served(index, &context_fingerprint, &stale);
-            stale.difference(&served).cloned().collect()
+            claude_terminal_semantic_stale_roots(index, &stale)
+                .difference(&served)
+                .cloned()
+                .collect()
         };
-        if !semantic.is_empty() || !unacked.is_empty() {
+        // R11: an unchanged exact-ACK member keeps its body (context debt
+        // stays owed); B-P2's unACKed heads are still re-armed.
+        let semantic_members: BTreeSet<_> = index
+            .files
+            .iter()
+            .filter(|(key, entry)| {
+                if !claude_index_path_member_ref(Path::new(key))
+                    .is_some_and(|m| semantic.contains(m.root))
+                {
+                    return false;
+                }
+                if !terminal_off_stale_member_can_skip_clear(index, key, entry) {
+                    return true;
+                }
+                if !index.receipt_matches(key, entry) {
+                    crate::local_resource_diagnostics::terminal_off_count(
+                        crate::local_resource_diagnostics::TerminalOffCount::CarriedExactAckWithoutReceipt,
+                        1,
+                    );
+                }
+                false
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if !semantic_members.is_empty() || !unacked.is_empty() {
             // Actual destination/identity-contract invalidation remains owed.
             for (key, entry) in &mut index.files {
-                if unacked.contains(key)
-                    || claude_index_path_member_ref(Path::new(key))
-                        .is_some_and(|m| semantic.contains(m.root))
-                {
+                if unacked.contains(key) || semantic_members.contains(key) {
                     transition.rearmed_index_files +=
                         usize::from(!entry.source_file_fingerprint.is_empty());
                     rearm_cause::clear(key, entry, transition.rearm_cause());
@@ -42657,8 +42719,11 @@ fn ensure_bounded_traversal(
         }
         if !semantic.is_empty() {
             eprintln!(
-                "claude_terminal_off semantic_context_reselection files={}",
-                index.files.len()
+                "claude_terminal_off semantic_context_reselection files={} carried_exact_ack_without_receipt={}",
+                index.files.len(),
+                crate::local_resource_diagnostics::take_terminal_off_count(
+                    crate::local_resource_diagnostics::TerminalOffCount::CarriedExactAckWithoutReceipt,
+                ),
             );
         }
         claude_terminal_unproven(index, collected_at);
@@ -51699,6 +51764,7 @@ impl ScanIndex {
             && !withheld_unchanged
             && self.file_upload_context_requires_adoption(&key)
             && !self.file_upload_context_backoff_holds(candidate)
+            && (!claude_terminal_off() || !terminal_off_held_context_seen(self, &key))
         {
             return (
                 CandidateDecision::Parse,

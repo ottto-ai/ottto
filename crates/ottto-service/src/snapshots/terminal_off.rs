@@ -136,6 +136,33 @@ pub(crate) fn claude_terminal_authority(_index: &ScanIndex, offered: bool, _wind
     offered && !claude_terminal_off()
 }
 
+// R11 (Lead B Ask 1, 2026-10-31): the contract (money) re-arm carries a member
+// main independently accepted (every snapshot fingerprint ACKed, committed head
+// current) whose request census is current for its fingerprint, as main's C1b
+// retry carry checks it. No upload-context receipt is required: that debt stays
+// owed on its own paced UploadContext path. Any member change re-arms. This
+// grants no source/census authority and cannot protect held or listed debt;
+// the BASE control keeps main's re-arm.
+fn terminal_off_stale_member_can_skip_clear(
+    index: &ScanIndex,
+    key: &str,
+    entry: &ScanIndexEntry,
+) -> bool {
+    if !claude_terminal_off() {
+        return false;
+    }
+    #[cfg(test)]
+    if KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(std::cell::Cell::get) {
+        return false;
+    }
+    claude_stale_member_independently_accepted(index, key, entry)
+        && !entry.source_file_fingerprint.is_empty()
+        && index
+            .claude_request_census
+            .retry_carry_record(key)
+            .map_or(true, |record| record.current_for(&entry.source_file_fingerprint))
+}
+
 fn claude_redundant_stale_clear_suppressed(index: &ScanIndex) -> bool {
     // Only redundant stale-window debt; independent semantic/context clears
     // and every already-empty fingerprint remain owned by their usual gates.
@@ -333,6 +360,32 @@ fn claude_terminal_stale_roots(index: &ScanIndex, window: &str) -> BTreeSet<Stri
         .collect()
 }
 
+// Main parity (`stale_pending_roots`): a family whose authority quarantine is
+// bound to its retained witness keeps its own retry gate, so a start never
+// re-arms it and retry admission never takes it as a root.
+fn claude_terminal_family_preserved(index: &ScanIndex, root: &str) -> bool {
+    index
+        .claude_usage_authority_quarantine
+        .get(root)
+        .zip(index.claude_usage_family_witnesses.get(root))
+        .is_some_and(|(quarantine, witness)| {
+            claude_usage_authority_preserves_pending(quarantine, witness)
+        })
+}
+
+// Only the semantic clear uses this; B-P2's unACKed heads and the B-P5 memo
+// stay over the full stale set.
+fn claude_terminal_semantic_stale_roots(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    stale
+        .iter()
+        .filter(|root| !claude_terminal_family_preserved(index, root))
+        .cloned()
+        .collect()
+}
+
 fn claude_terminal_unproven(index: &ScanIndex, window: &str) {
     if !claude_terminal_off() {
         return;
@@ -523,6 +576,182 @@ fn note_terminal_off_empty_context(index: &ScanIndex, key: &str, parsed_fingerpr
     if let Some(key) = terminal_off_empty_context_key(index, key) {
         with_terminal_off_empty_contexts(|memo| memo.remember(key));
     }
+}
+
+// R5: the last complete parse was history-held in exactly this context. RAM
+// only: it suppresses UploadContext selection and wakes, never ACKs, receipts
+// or other read causes. Eviction or restart permits one more held re-read.
+const TERMINAL_OFF_HELD_CONTEXT_KEYS: usize = MAX_BACKFILL_FILES_PER_SOURCE;
+#[derive(Default)]
+struct TerminalOffHeldContexts {
+    // One context per path: changing a context/fingerprint forgets its old hit.
+    keys: BTreeMap<[u8; 32], [u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+    evictions: u64,
+}
+impl TerminalOffHeldContexts {
+    fn forget(&mut self, path: &[u8; 32]) {
+        if self.keys.remove(path).is_some() {
+            self.order.retain(|key| key != path);
+        }
+    }
+    fn seen(&mut self, path: [u8; 32], context: Option<[u8; 32]>) -> bool {
+        if context.is_some() && self.keys.get(&path).copied() == context {
+            return true;
+        }
+        self.forget(&path);
+        false
+    }
+    fn remember(&mut self, path: [u8; 32], context: [u8; 32]) {
+        if self.seen(path, Some(context)) {
+            return;
+        }
+        if self.keys.len() == TERMINAL_OFF_HELD_CONTEXT_KEYS {
+            let oldest = self
+                .order
+                .pop_front()
+                .expect("bounded held memo has an owner");
+            self.keys.remove(&oldest);
+            self.evictions = self.evictions.saturating_add(1);
+            crate::local_resource_diagnostics::traversal_point(
+                "upload_context_held_memo_evicted",
+                SnapshotSource::ClaudeCode.api_slug(),
+                &BTreeMap::from([
+                    ("evictions", self.evictions),
+                    ("capacity", TERMINAL_OFF_HELD_CONTEXT_KEYS as u64),
+                ]),
+            );
+        }
+        self.keys.insert(path, context);
+        self.order.push_back(path);
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static TERMINAL_OFF_HELD_CONTEXTS: std::cell::RefCell<TerminalOffHeldContexts> =
+        std::cell::RefCell::new(TerminalOffHeldContexts::default());
+}
+fn with_terminal_off_held_contexts<T>(f: impl FnOnce(&mut TerminalOffHeldContexts) -> T) -> T {
+    #[cfg(not(test))]
+    {
+        static MEMO: std::sync::OnceLock<std::sync::Mutex<TerminalOffHeldContexts>> =
+            std::sync::OnceLock::new();
+        f(&mut MEMO
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    TERMINAL_OFF_HELD_CONTEXTS.with(|memo| f(&mut memo.borrow_mut()))
+}
+fn terminal_off_held_path(key: &str) -> [u8; 32] {
+    Sha256::digest(key.as_bytes()).into()
+}
+fn terminal_off_held_context_key(index: &ScanIndex, key: &str) -> Option<[u8; 32]> {
+    if !claude_terminal_off() {
+        return None;
+    }
+    let entry = index.files.get(key)?;
+    if entry.source_file_fingerprint.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    for value in [
+        "terminal-off-held-context:v1",
+        key,
+        index.active_upload_context_fingerprint.as_deref()?,
+        &entry.source_file_fingerprint,
+        index
+            .historical_replay_generation
+            .as_deref()
+            .unwrap_or("none"),
+        index.claude_reemission_exclusions.status(),
+    ] {
+        update_length_prefixed(&mut digest, value.as_bytes());
+    }
+    digest.update(index.context_curve_replay_epoch.to_be_bytes());
+    digest.update(index.active_effective_upload_body_witness_revision.to_be_bytes());
+    digest.update([match index.claude_no_list_policy {
+        NoListPolicy::Pace => 0,
+        NoListPolicy::HoldUnverified => 1,
+        NoListPolicy::HoldMoveNotFull => 2,
+    }]);
+    digest.update(index.claude_reemission_exclusions.held_context_digest());
+    digest.update(
+        index
+            .claude_history_cutoff_unix_seconds
+            .unwrap_or_default()
+            .to_be_bytes(),
+    );
+    digest.update([
+        u8::from(index.claude_history_move_not_full),
+        u8::from(index.claude_history_move_released),
+    ]);
+    Some(digest.finalize().into())
+}
+fn terminal_off_held_context_seen(index: &ScanIndex, key: &str) -> bool {
+    if !claude_terminal_off() {
+        return false;
+    }
+    let context = terminal_off_held_context_key(index, key);
+    with_terminal_off_held_contexts(|memo| memo.seen(terminal_off_held_path(key), context))
+}
+fn note_terminal_off_held_context(index: &ScanIndex, key: &str, parsed_fingerprint: &str) {
+    if !claude_terminal_off()
+        || !index
+            .files
+            .get(key)
+            .is_some_and(|entry| entry.source_file_fingerprint == parsed_fingerprint)
+    {
+        return;
+    }
+    if let Some(context) = terminal_off_held_context_key(index, key) {
+        with_terminal_off_held_contexts(|memo| memo.remember(terminal_off_held_path(key), context));
+    }
+}
+fn forget_terminal_off_held_context(key: &str) {
+    if claude_terminal_off() {
+        with_terminal_off_held_contexts(|memo| memo.forget(&terminal_off_held_path(key)));
+    }
+}
+
+// NBF custody: a settlement-held key whose six-hour floor expired is read once
+// even when nothing else selects it (unchanged, context settled); its own
+// settlement then holds or settles it. A floored held key is never left idle.
+fn terminal_off_held_retry_decision(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    candidate: &CandidateFile,
+    audit_now: u64,
+    census_now: Option<u64>,
+    window: u64,
+) -> (CandidateDecision, Option<CandidateParseReason>) {
+    let decided = index.candidate_decision_in_window(candidate, audit_now, census_now, window);
+    if source != SnapshotSource::ClaudeCode
+        || decided.0 != CandidateDecision::Skip
+        || !claude_terminal_off()
+        || !terminal_off_discovery::held_retry_due(index, &local_index_key(&candidate.path))
+    {
+        return decided;
+    }
+    // Lead B Ask 2c: process total of floor-expiry forced reads.
+    let forced = crate::local_resource_diagnostics::terminal_off_count(
+        crate::local_resource_diagnostics::TerminalOffCount::NbfFloorExpiryForcedRead,
+        1,
+    );
+    crate::local_resource_diagnostics::traversal_point(
+        "terminal_off_held_retry_due_read",
+        SnapshotSource::ClaudeCode.api_slug(),
+        &BTreeMap::from([
+            ("keys", 1u64),
+            ("bytes", 0),
+            ("nbf_floor_expiry_forced_reads", forced),
+        ]),
+    );
+    (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::ActivityOrQuarantineRetry),
+    )
 }
 
 // Scheduling only: ordinary ScanIndex reloads must not reset the cadence.
@@ -726,6 +955,21 @@ fn resume_claude_retry_admission(index: &mut ScanIndex, at: &str) {
         previous.due_upper_path = index.files.keys().next_back().cloned();
         previous.due_complete = false;
     }
+    // Platform parity: main's start runs the streaming carry batch only on a
+    // supported native layout. Elsewhere every batch is a structural refusal
+    // that promoted each uncarried stale family, in turn, to the oversized
+    // retry root ahead of the page queue. Like main, admit no root here: no
+    // carry and no oversized promotion. The due arm keeps its deadlines.
+    if !crate::heap_layout_bound::layout_supported() {
+        previous.roots_complete = true;
+        previous.complete = previous.oversized_root.is_none()
+            && previous.due_complete
+            && !previous.storage_deferred;
+        if let Some(origin) = index.claude_stale_family_carry.origin.as_mut() {
+            origin.admission = Some(previous);
+        }
+        return;
+    }
     if previous.complete {
         carry_admission_stall(index, at);
         return;
@@ -751,13 +995,17 @@ fn resume_claude_retry_admission(index: &mut ScanIndex, at: &str) {
         .after_root
         .clone()
         .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+    // R7: main admits only `stale_pending_roots`, never a witness-bound
+    // family. Its RetryPending deadline still owns the due arm.
     let stale = index
         .claude_usage_family_pending
         .range((
             lower,
             std::ops::Bound::Included(previous.upper_root.clone()),
         ))
-        .filter(|(_, p)| p.census_window_end != window)
+        .filter(|(root, p)| {
+            p.census_window_end != window && !claude_terminal_family_preserved(index, root)
+        })
         .take(CLAUDE_RETRY_ADMISSION_ROOTS + 1)
         .map(|(root, _)| root.clone())
         .collect();
@@ -884,7 +1132,7 @@ impl ScanIndex {
         }
         let runnable = keys
             .iter()
-            .filter(|key| !terminal_off_discovery::retry_blocked(self, key))
+            .filter(|key| !terminal_off_discovery::held_retry_blocked(self, key))
             .cloned()
             .collect::<Vec<_>>();
         if let Some(traversal) = self.traversal.as_mut() {

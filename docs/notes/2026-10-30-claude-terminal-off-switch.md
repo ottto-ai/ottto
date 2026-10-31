@@ -154,3 +154,82 @@ Existing per-class retention gauges/alarms remain ON-only. Ron accepted
 usage-proof retirement and the CAS peak are next-release top priorities.
 Ordinary held-history total remains a post-release gauge gap. F4 and #876 remain
 paired next-release work; no new absence shortcut is introduced here.
+
+## ON follow-up fixes (ON PR, all gated on `claude_terminal_off()`)
+
+These change only the ON path; with the switch OFF each gated site runs main's
+code. None adds a persisted field, and none adds a field to an OFF-reachable
+struct: ON-only counts live in the `local_resource_diagnostics` per-source
+static array (Claude slots 6-9), so OFF struct sizes and the heap-bound walk
+equal main (Lead B Q2, 2026-10-31).
+
+- **R7 (witness-bound family re-read):** like main's `stale_pending_roots`,
+  neither the ON start's semantic clear nor its per-page retry admission takes
+  a family whose authority quarantine is bound to its retained witness; its
+  RetryPending deadline keeps the due arm. B-P2's unACKed heads and the B-P5
+  memo stay over the full stale set. On a platform without a supported native
+  layout (`heap_layout_bound::layout_supported()` is false, so anything but
+  pinned macOS), ON's resumed admission runs no carry batch and promotes no
+  stale family to the oversized retry root, the same as main's start there.
+  Pinned macOS is unchanged. Lead B kept R7 (2026-10-31, 18 witness-bound
+  families SEEN on M4); #899's four-batch resume test now expects each batch
+  to end one root later and asserts the skipped family's debt stays owed.
+- **R11 (exact-ACK re-read under contract debt):** the ON start's semantic
+  (contract) clear keeps a member's body when main independently accepted it
+  (every snapshot fingerprint ACKed, committed head current) and its request
+  census is current for its fingerprint, the same check main's C1b carry uses
+  (`terminal_off_stale_member_can_skip_clear`). No upload-context receipt is
+  required (Lead B Ask 1, 2026-10-31): exact ACK settles the money, and the
+  context debt stays owed on its own paced UploadContext path, so the two do
+  not stack into about 12.3k Full reads at ON start (M4: 12,783 exact-ACK
+  files, 461 with a receipt). Any member change re-arms. B-P2's unACKed heads,
+  held, listed and no-list-held members and the BASE control keep the clear.
+  `claude_terminal_off semantic_context_reselection` reports
+  `carried_exact_ack_without_receipt`.
+- **R5 (held history re-read every walk round):** a bounded RAM memo
+  (10,000 path digests, FIFO, `upload_context_held_memo_evicted` diagnostic)
+  records that a file's last complete parse was history-held in exactly this
+  context (path, context, fingerprint, replay generation and epoch, body
+  revision, list state and digest, no-list policy, cutoff and move policy).
+  The list digest is folded on demand from the installed list (at most 2,048
+  digests), never stored.
+  Only the UploadContext selection gate and the targeted `upload_context`
+  wake consult it; `file_upload_context_requires_adoption` itself is
+  unchanged. A non-held parse, a context or fingerprint change, eviction or a
+  restart forgets it. Disclosure: one extra held re-read (no upload) after a
+  restart or eviction, and about 1.3 MB extra RAM at capacity.
+- **NBF (non-blocking held keys):** a key that non-blocking settlement holds
+  keeps one immediate retry; its held re-read floors it for six hours (same
+  object, context and revision), and when the floor expires it is re-offered
+  (`held_retry_due`) and read once even if nothing else selects it, so a held
+  key is never left idle. Disclosure: at most two reads in a new hold's first
+  six hours, then at most one per six hours, counted by
+  `terminal_off_nbf_initial_retry_read` (`nbf_initial_retry_reads`) and
+  `terminal_off_held_retry_due_read` (`nbf_floor_expiry_forced_reads`, Lead B
+  Ask 2c: about 7.1k account-held families on M4, so up to about 7.1k forced
+  reads per six hours); up to six hours of added held
+  release latency, a gate before fleet default-ON. Blocking holds (B1) are
+  unchanged.
+- **R4 disclosure counter:** each ON page emits `history_upgrade_page`
+  (`admitted_files`, `budget`, `extra_files`): history files actually admitted
+  to a parser, including local work beyond the upgrade budget, drained from
+  the static diagnostics array at page end.
+- **R10 fix P (context pacing):** under ON, Claude never adopts the
+  source-wide context, so UploadContext stays a file's first selecting gate.
+  `context_only_read` now also requires that the decision without the
+  UploadContext gate is not Parse, so a real sidecar or retry read uses
+  ordinary read budgets while pure context catch-up keeps its one-file
+  pacing. ON preflight opens UploadContext candidates before sorting, so both
+  sides of that comparison use the full opened identity. OFF and Codex keep
+  main's classification.
+- **R10 money harness:** `terminal_off_on_money_receipts` includes the
+  unchanged money-equivalence harness under the scoped ON guard.
+  `scripts/money_equivalence.py` runs base-OFF, head-OFF and head-ON (the same
+  head binary, a separate process and output directory), each requiring all
+  ten native money receipts and three disk receipts, and compares both head
+  arms with base-OFF through the existing decoded-body comparison
+  (`MONEY_EQUIVALENCE_DIFF`, `MONEY_EQUIVALENCE_ON_DIFF`). No ON-specific
+  exclusion is allowed; the manifest records `terminal_off_on`. Linux reports
+  the native harness UNEXECUTED. The three arms share one test thread's
+  containment RAM memos, so a green result does not claim cold-process memo
+  fidelity.

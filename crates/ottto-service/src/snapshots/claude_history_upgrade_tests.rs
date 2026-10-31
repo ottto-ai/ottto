@@ -2002,3 +2002,123 @@ fn copies_read_under_a_closed_duplicate_fence_settle_after_one_walk() {
     assert_eq!(accepted_total() / APPENDED_INPUT, 1);
     let _ = fs::remove_dir_all(root);
 }
+
+/// [regress] R11 (Lead B Ask 1): the ON semantic stale clear carries a member
+/// main independently accepted (every snapshot fingerprint ACKed) whose
+/// request census is current, with no upload-context receipt; its context
+/// stays owed. Every other case keeps the clear: the BASE control, an ACK-less
+/// or changed member, a stale census, held or listed history and the no-list
+/// hold.
+#[test]
+fn terminal_off_semantic_stale_clear_carries_only_an_unchanged_exact_ack() {
+    // Main's OFF builder accepts both members; ON then owes a new per-file
+    // context (the source stays adopted at `ctx-1`) and mints no receipt.
+    let (home, _root, mut index) = families("r11-skip-clear", 1);
+    let _on = ClaudeTerminalOffForTest::enabled();
+    index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-on".into());
+    let skips = |index: &ScanIndex| {
+        with_no_list_cutoff(u64::MAX, || {
+            index
+                .files
+                .iter()
+                .map(|(key, entry)| terminal_off_stale_member_can_skip_clear(index, key, entry))
+                .collect::<Vec<_>>()
+        })
+    };
+    assert!(
+        index.files.keys().all(|key| index
+            .claude_request_census
+            .retry_carry_record(key)
+            .is_some()),
+        "fixture parses record a census"
+    );
+    assert_eq!(
+        skips(&index),
+        [true, true],
+        "exact ACKs carry without a receipt"
+    );
+    assert!(
+        index
+            .files
+            .iter()
+            .all(|(key, entry)| !index.receipt_matches(key, entry)
+                && index.file_upload_context_requires_adoption(key)),
+        "the upload context stays owed"
+    );
+    {
+        let _base = KeepStaleClaudeFamilyRearmForTest::new();
+        assert_eq!(skips(&index), [false, false], "BASE keeps main's re-arm");
+    }
+    type Change = fn(&mut ScanIndex);
+    let cases: [(&str, Change); 6] = [
+        ("ACK-less", |index| {
+            index.accepted_snapshot_fingerprints.clear()
+        }),
+        ("member changed", |index| {
+            // A new, even ACKed, entity: the committed head no longer matches.
+            let added = "0".repeat(64);
+            for fingerprints in index.file_snapshot_fingerprints.values_mut() {
+                fingerprints.insert(added.clone());
+            }
+            index.accepted_snapshot_fingerprints.insert(added);
+        }),
+        ("census stale", |index| {
+            // Each member's fingerprint moves off its census record.
+            let fingerprints = index
+                .files
+                .values()
+                .map(|entry| entry.source_file_fingerprint.clone())
+                .collect::<Vec<_>>();
+            for (entry, fingerprint) in index.files.values_mut().zip(fingerprints.into_iter().rev())
+            {
+                entry.source_file_fingerprint = fingerprint;
+            }
+        }),
+        ("held", |index| {
+            index.claude_reemission_exclusions =
+                ReemissionExclusions::with_state(ListState::Unreadable)
+        }),
+        ("listed", |index| {
+            index.claude_reemission_exclusions =
+                ReemissionExclusions::parse(format!("{}\n", digest(&session(0))).as_bytes())
+        }),
+        ("no-list held", |index| {
+            index.claude_reemission_exclusions =
+                ReemissionExclusions::with_state(ListState::NotInstalled)
+        }),
+    ];
+    for (case, change) in cases {
+        let mut changed = index.clone();
+        change(&mut changed);
+        assert_eq!(skips(&changed), [false, false], "{case} keeps the clear");
+    }
+    let _ = fs::remove_dir_all(home);
+}
+
+/// [behaviour] R4 disclosure: ON counts the history files actually admitted
+/// to a parser and discloses those beyond the page budget; OFF emits nothing.
+#[test]
+fn terminal_off_history_page_discloses_reads_beyond_its_budget() {
+    let budget = body_witness_adoption_page_budget();
+    for on in [false, true] {
+        let _on = on.then(ClaudeTerminalOffForTest::enabled);
+        let page = HistoryPage::default();
+        for _ in 0..budget + 2 {
+            page.note_history_read();
+        }
+        let ((), records) =
+            crate::local_resource_diagnostics::capture(|| page.emit_page_diagnostics());
+        let counts = records
+            .iter()
+            .filter(|record| record["stage"] == "history_upgrade_page")
+            .map(|record| record["counts"]["history_upgrade_page"].clone())
+            .collect::<Vec<_>>();
+        let expected = if on {
+            vec![json!({"admitted_files": budget + 2, "budget": budget, "extra_files": 2})]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(counts, expected, "on={on}");
+    }
+}

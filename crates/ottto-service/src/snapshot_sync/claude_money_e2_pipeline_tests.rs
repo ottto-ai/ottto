@@ -3071,6 +3071,21 @@ mod money_equivalence_tests {
     }
 }
 
+// R10: the money harness's ON arm. `scripts/money_equivalence.py` runs this
+// module from the head binary in its own process ("head-on") and compares
+// its receipts with base OFF. The included harness is byte-identical; only
+// the scoped policy differs. The name stays outside the OFF arm's
+// `money_equivalence_tests::` filter. The durable-transition suite is not
+// included: its crash child is addressed by the OFF module path.
+mod terminal_off_on_money_receipts {
+    fn with_e2<T>(f: impl FnOnce() -> T) -> T {
+        let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+        assert!(crate::snapshots::claude_terminal_off());
+        crate::snapshots::with_max_gated_claude_revision(3, f)
+    }
+    include!("money_equivalence_tests.rs");
+}
+
 #[test]
 fn e2_page_never_creates_p1_ledger_or_diagnostics() {
     with_e2(|| {
@@ -4168,5 +4183,92 @@ fn terminal_off_two_member_new_copy_cohort_emits_shared_request_once() {
                 .all(|s| s.source_session_id != COPY),
             "copied prefix is held or excluded instead of minted as new money"
         );
+    });
+}
+
+/// [regress] R10 (fix P): the warm page has neither an upload nor an ACK, so
+/// both members owe UploadContext first. A real sidecar change (late side
+/// call owned by the agent) still reads both members in one page, with exact
+/// money, instead of being paced as context-only catch-up; pure context debt
+/// on two unchanged roots stays paced at one file per page, with no ACK or
+/// receipt shortcut.
+#[test]
+fn terminal_off_context_pacing_excludes_real_sidecar_work() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    crate::snapshots::with_max_gated_claude_revision(3, || {
+        for sidecar_change in [true, false] {
+            let mut c = Corpus::new(&format!("r10-fix-p-{sidecar_change}"));
+            let root = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+            let other = if sidecar_change {
+                c.agent(0, &line(ROOT, "agent", AT, 20))
+            } else {
+                c.root(COPY, &line(COPY, "r2", AT, 20))
+            };
+            let scanner = E2ScanFixture::default();
+            let mut warm = c.raw(&scanner, ScanIndex::default(), 100, sidecar_change, &[]);
+            warm.enrich(&c);
+            warm.finish();
+            let prior = c.reload(&mut warm.index);
+            if !sidecar_change {
+                let mut first = c.raw(&scanner, prior, 100, false, &[]);
+                assert_eq!(first.index.context_read_counts.files, 1);
+                let first_paths = scanner.paths();
+                assert_eq!(first_paths.len(), 1);
+                first.enrich(&c);
+                first.finish();
+                let next = c.reload(&mut first.index);
+                // The retained traversal drains the deferred member next page.
+                let second = c.raw(&scanner, next, 100, false, &[]);
+                assert_eq!(second.index.context_read_counts.files, 1);
+                let second_paths = scanner.paths();
+                assert_eq!(second_paths.len(), 1);
+                assert_ne!(first_paths, second_paths);
+                assert_eq!(
+                    first_paths
+                        .into_iter()
+                        .chain(second_paths)
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from([root, other])
+                );
+                continue;
+            }
+            c.evidence(
+                &[api("r1", 10, 100), api("agent", 20, 200), api("side", 5, 50)],
+                &[trace("side", "000")],
+            );
+            let mut after = c.raw(&scanner, prior.clone(), 100, true, &[]);
+            assert_eq!(
+                scanner.paths().into_iter().collect::<BTreeSet<_>>(),
+                BTreeSet::from([root, other]),
+                "real sidecar work must not be paced as context-only catch-up"
+            );
+            assert_mode(after.modes, (0, 0, 2));
+            assert_eq!(after.index.context_read_counts.files, 0);
+            after.enrich(&c);
+            after.finish();
+            literal(&after);
+            assert_eq!(after.scan.snapshots.len(), 2);
+            let root_body = body(&after, ROOT).unwrap();
+            let agent_body = body(&after, &format!("{ROOT}_agent-000")).unwrap();
+            assert_eq!((root_body.request_count, root_body.input_tokens), (1, 10));
+            assert_eq!((agent_body.request_count, agent_body.input_tokens), (2, 25));
+            assert_eq!(
+                root_body.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                Some("0.0001")
+            );
+            assert_eq!(
+                agent_body.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                Some("0.00025")
+            );
+            assert_eq!(total(&after), 3, "the side call is published exactly once");
+            let mut full = c.raw(&E2ScanFixture::default(), prior, 100, true, &[]);
+            assert_mode(full.modes, (2, 0, 0));
+            full.enrich(&c);
+            full.finish();
+            assert_eq!(
+                canonical(&after.scan.snapshots),
+                canonical(&full.scan.snapshots)
+            );
+        }
     });
 }
