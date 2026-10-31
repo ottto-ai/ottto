@@ -2340,6 +2340,75 @@ fn e2_identity_attach_unpriced_and_side_calls_keep_account_partition() {
     });
 }
 
+/// One ORG_A request plus one telemetry-only side call; returns the item and
+/// the (org, basis) of the side call's row.
+fn side_call_page(side: ClaudeLocalOtelEvidence) -> (SnapshotItem, Option<(String, String)>) {
+    let path = root_file("identity-side-own");
+    let index = ScanIndex::default();
+    let mut items = vec![parse(
+        &path,
+        Some(t0()),
+        &index,
+        &[org_marker(ORG_A), line("a", &at(1), 10)],
+    )];
+    let read = sidecar(&[identity_api_row("a", 1, 10, ORG_A), side]);
+    attach_page(&mut items, &read);
+    side_calls_page(
+        &mut items,
+        &api_report(&read),
+        &ClaudeTraceOwnershipLoadReport::default(),
+        &index,
+    );
+    let item = tag_owned(items, &index).remove(0);
+    let side = item
+        .model_usage
+        .iter()
+        .find(|row| {
+            row.selector_context
+                .get("request_usage_origin")
+                .map(String::as_str)
+                == Some("telemetry_reported")
+        })
+        .unwrap()
+        .evidence_ref
+        .map(|at| &item.request_evidence[usize::from(at)])
+        .map(|evidence| {
+            (
+                evidence.provider_workspace_hash.clone().unwrap_or_default(),
+                evidence.identity_basis.clone(),
+            )
+        });
+    assert_evidence_referenced(&item);
+    cleanup(&[&path]);
+    (item, side)
+}
+
+/// [money] [regress] MA1 B3: a telemetry-only side call (Desktop
+/// `prompt_suggestion`/`compact`) with its own complete account was added
+/// under the session fallback instead (2,817 requests per cycle uploaded
+/// account-less). It now carries its own account; totals are unchanged.
+#[test]
+fn e2_side_call_with_own_complete_account_keeps_it_and_money() {
+    let (own, side) = side_call_page(identity_api_row("side", 2, 40, ORG_B));
+    assert_eq!(side, Some((org_hash(ORG_B), "telemetry".to_owned())));
+    let (login_only, _) = side_call_page(row("side", 2, 40));
+    for item in [&own, &login_only] {
+        assert_eq!((item.request_count, item.input_tokens), (2, 50));
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0002")
+        );
+    }
+}
+
+/// [behaviour] A side call whose own account is incomplete (login, no org)
+/// keeps the session fallback: the target's starting account.
+#[test]
+fn e2_side_call_with_incomplete_account_falls_back_to_the_session() {
+    let (_, side) = side_call_page(row("side", 2, 40));
+    assert_eq!(side.map(|(org, _)| org), Some(org_hash(ORG_A)));
+}
+
 #[test]
 fn e2_identity_telemetry_contradiction_preserves_own_orgs() {
     with_enabled(|| {

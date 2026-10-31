@@ -58,6 +58,7 @@ What stays the same:
   (`BadClock`). With an invalid or missing login of its own, it is refused
   `InvalidEvidence`. Its usage stays on its row, untagged and counted as
   refused. The transcript requests keep their telemetry tags.
+  2026-10-31 ID1: telemetry-only side calls take their own row's complete account (B3, #1018); BadClock refusal no longer applies to them; money bucket unchanged.
 - **Unsettled census.** `withdraw_transcript_tags` still removes only
   marker-derived tags. Telemetry tags stay, so the item stays contract 5.
 - No collection, reads, retained state, wire fields, hashes or fences change.
