@@ -2566,6 +2566,83 @@ fn advertised_cap_retags_previously_stripped_accepted_body() {
     );
     ledger.record(&serde_json::to_value(&third).unwrap());
     assert_eq!(serde_json::to_value(&ledger).unwrap(), expected_ledger);
+
+    // Extend this ACK/re-tag fixture to the receiver-derived ledger boundary.
+    // Two single-authority rows per hour keep 6,553 shares below MAX_BUCKETS.
+    let (mut large, _) = sticky_session(3_277);
+    let mut rows = Vec::new();
+    let mut proof = Vec::new();
+    for (index, bucket) in large.usage_buckets.iter_mut().enumerate() {
+        let mut row = bucket.model_usage[0].clone();
+        row.model = "a".into();
+        let mut other = row.clone();
+        other.model = "b".into();
+        bucket.model_usage = if index == 3_276 {
+            vec![row]
+        } else {
+            vec![row, other]
+        };
+        for row in &bucket.model_usage {
+            proof.push(Contribution {
+                bucket_start: bucket.bucket_start.clone(),
+                row_key: row_key_from_model_usage(row),
+                usage: holder_usage(row, None),
+                identity: login_key(A64),
+            });
+        }
+    }
+    for (name, hours) in [("a", 3_277), ("b", 3_276)] {
+        let mut row = large.usage_buckets[0].model_usage[0].clone();
+        row.model = name.into();
+        row.input_tokens *= hours;
+        row.request_count *= hours;
+        rows.push(row);
+    }
+    large.model_usage = rows;
+    sticky_receiver_totals(&mut large);
+    let mut ledger = identity::AcceptedBuckets::for_test();
+    ledger.set_item_cap(2_097_152);
+    identity::take_identity_counts();
+    assert_eq!(
+        identity::apply_with_reserved_bytes_for_test(
+            &mut large,
+            &proof,
+            &ledger,
+            0,
+            Some(2_097_152)
+        )
+        .unwrap(),
+        Tagged::Sent { refusals: 0 }
+    );
+    assert!(identity::item_bytes(&large) <= 2_097_152);
+    ledger.record(&serde_json::to_value(&large).unwrap());
+    let bytes = serde_json::to_vec(&ledger).unwrap();
+    ledger = identity::AcceptedBuckets::restore_for_test(&bytes);
+    ledger.set_item_cap(2_097_152);
+    let before = sticky_money(&large);
+    assert_eq!(
+        identity::apply_with_reserved_bytes_for_test(
+            &mut large,
+            &proof,
+            &ledger,
+            0,
+            Some(2_097_152)
+        )
+        .unwrap(),
+        Tagged::Sent { refusals: 0 }
+    );
+    assert_eq!(sticky_money(&large), before);
+    assert!(large
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+        .all(sticky_tagged));
+    let counts = serde_json::to_value(identity::take_identity_counts()).unwrap();
+    assert_eq!(counts["identity_cap"]["accepted_share_changed"], 0);
+    assert_eq!(
+        counts["identity_cap"]["accepted_state_unknown_cause"]["incomplete"],
+        0
+    );
 }
 
 /// [off=main] No hint, malformed values and smaller limits use main's exact

@@ -7526,6 +7526,9 @@ fn finish_sync_source(
         .bind_context(attribution_context.as_ref());
     upload_progress
         .accepted_identity_buckets
+        .set_item_cap(identity_item_cap);
+    upload_progress
+        .accepted_identity_buckets
         .set_retained_enabled(
             source == SnapshotSource::ClaudeCode
                 && activity_hint
