@@ -86,6 +86,10 @@ pub(crate) struct AcceptedSession {
     /// live body's cut retires them. Live entries never carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     of: Option<String>,
+    /// Segment entries only: the fingerprint of the ACKed segment body, so a
+    /// complete census that no longer references the session retires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<String>,
 }
 /// Truncated keyed digests: the (bucket, row) grain and its exact proof.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -572,6 +576,7 @@ impl AcceptedBuckets {
                             shares,
                             incomplete: true,
                             of: None,
+                            fingerprint: None,
                         },
                     )
                 })
@@ -914,6 +919,39 @@ impl AcceptedBuckets {
                     .is_some_and(|through| entry.starts.last().map_or(true, |last| *last < through))
         });
     }
+    /// Segment ledger: retire a session's entries once a complete census
+    /// references none of their ACKed bodies (the session is gone). A
+    /// session that still has one referenced segment keeps all of them.
+    pub(crate) fn retire_absent(&mut self, absent: &BTreeSet<String>) {
+        if !self.4 || absent.is_empty() {
+            return;
+        }
+        let mut present = BTreeSet::new();
+        for entry in self.0.values() {
+            if !entry
+                .fingerprint
+                .as_ref()
+                .is_some_and(|fingerprint| absent.contains(fingerprint))
+            {
+                present.extend(entry.of.clone());
+            }
+        }
+        self.0
+            .retain(|_, entry| entry.of.as_ref().map_or(true, |of| present.contains(of)));
+    }
+    /// Segment ledger: the other entries of `live`'s cut, for a window that
+    /// replaced (halved or re-cut) an earlier one.
+    pub(crate) fn siblings(&self, live: &str, except: &str) -> Vec<&AcceptedSession> {
+        let Some(key) = self.1.as_ref() else {
+            return Vec::new();
+        };
+        let (of, own) = (session_key(key, live), session_key(key, except));
+        self.0
+            .iter()
+            .filter(|(entry_key, entry)| **entry_key != own && entry.of.as_deref() == Some(&of))
+            .map(|(_, entry)| entry)
+            .collect()
+    }
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
@@ -959,6 +997,7 @@ impl AcceptedBuckets {
             entry.of = body["history_segment"]["of"]
                 .as_str()
                 .map(|live| session_key(fingerprint_key, live));
+            entry.fingerprint = body["snapshot_fingerprint"].as_str().map(str::to_owned);
         }
         let mut shares = std::mem::take(&mut entry.shares)
             .into_iter()
@@ -1049,15 +1088,17 @@ impl AcceptedBuckets {
     }
 }
 /// A segment's accepted hints for its `buckets`: per bucket its own entry
-/// when that holds the bucket, else the live entry's shares.
+/// when that holds the bucket, else an earlier window of the same cut that
+/// held it (a window halved or re-cut since), else the live entry's shares.
 /// Retained proof comes from its own entry only: until the segment entity
 /// has its own accepted proof it sends full identity rows.
 pub(crate) fn segment_view(
     own: Option<&AcceptedSession>,
+    prior: &[&AcceptedSession],
     live: Option<&AcceptedSession>,
     buckets: &[i64],
 ) -> Option<AcceptedSession> {
-    let base = own.or(live)?;
+    let base = own.or(prior.first().copied()).or(live)?;
     let mut view = AcceptedSession {
         key_epoch: base.key_epoch,
         key: base.key.clone(),
@@ -1068,9 +1109,10 @@ pub(crate) fn segment_view(
     buckets.sort_unstable();
     buckets.dedup();
     for bucket in buckets {
-        let holder = [own, live]
+        let holder = own
             .into_iter()
-            .flatten()
+            .chain(prior.iter().copied())
+            .chain(live)
             .find(|entry| entry.starts.binary_search(&bucket).is_ok());
         if let Some(holder) = holder {
             view.starts.push(bucket);
@@ -1121,7 +1163,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for AcceptedSession {
                 .capacity()
                 .checked_mul(std::mem::size_of::<i64>())?,
         )?;
-        c.add(self.of.as_ref().map_or(0, String::capacity))
+        c.add(self.of.as_ref().map_or(0, String::capacity))?;
+        c.add(self.fingerprint.as_ref().map_or(0, String::capacity))
     }
 }
 impl crate::heap_layout_bound::HeapLayoutBound for AcceptedBuckets {
@@ -1212,6 +1255,7 @@ mod heap_tests {
                             ],
                             incomplete: false,
                             of: None,
+                            fingerprint: None,
                             proved: Vec::new(),
                             missing: Vec::new(),
                         },
@@ -1651,6 +1695,7 @@ mod retained_heap_tests {
                             ],
                             incomplete: false,
                             of: None,
+                            fingerprint: None,
                             proved: vec![
                                 ProvedRow {
                                     bucket: 1,
@@ -1721,7 +1766,7 @@ mod segment_tests {
         segments.record(&body(SEGMENT, &[OLD], 'a', of()));
         let (old, late) = (bucket_key(OLD).unwrap(), bucket_key(LATE).unwrap());
         let own = segments.get(SEGMENT);
-        let view = segment_view(own, proving.get(LIVE), &[late, old]).unwrap();
+        let view = segment_view(own, &[], proving.get(LIVE), &[late, old]).unwrap();
         assert_eq!(&*view, &[old, late]);
         assert_eq!(
             view.row_shares(old, &row()),
@@ -1734,7 +1779,7 @@ mod segment_tests {
         assert_ne!(view.row_shares(old, &row()), view.row_shares(late, &row()));
         assert!(proving.get(LIVE).unwrap().proved_row(old, &row()).is_some());
         assert!(view.proved_row(old, &row()).is_none() && view.proved_row(late, &row()).is_none());
-        assert!(segment_view(None, None, &[old]).is_none());
+        assert!(segment_view(None, &[], None, &[old]).is_none());
     }
 
     /// [money] Segment entries are never evicted by count (only an
@@ -1795,13 +1840,66 @@ mod segment_tests {
         let capped = AcceptedBuckets::restore_for_test(&bytes);
         assert_eq!(capped.len(), MAX_SESSIONS);
     }
+
+    /// [money] A window halved (or re-cut) into a new entity has no own entry
+    /// yet: per bucket it takes the earlier window of the same cut that held
+    /// the bucket before the live entry, never the live entry's newer shares.
+    #[test]
+    fn halved_window_keeps_the_earlier_window_shares() {
+        let mut live = AcceptedBuckets::for_test();
+        live.record(&body(LIVE, &[OLD], 'b', json!({})));
+        let mut segments = AcceptedBuckets::segments_for_test();
+        segments.record(&body(SEGMENT, &[OLD], 'a', of()));
+        let halved = "synthetic#w20260828";
+        let old = bucket_key(OLD).unwrap();
+        let prior = segments.siblings(LIVE, halved);
+        assert_eq!(prior.len(), 1);
+        let view = segment_view(segments.get(halved), &prior, live.get(LIVE), &[old]).unwrap();
+        assert_eq!(
+            view.row_shares(old, &row()),
+            segments.get(SEGMENT).unwrap().row_shares(old, &row())
+        );
+        assert_ne!(
+            view.row_shares(old, &row()),
+            live.get(LIVE).unwrap().row_shares(old, &row())
+        );
+        assert!(segments.siblings(LIVE, SEGMENT).is_empty());
+    }
+
+    /// [money] Segment entries leave with their session: a complete census
+    /// that references none of a session's ACKed segment bodies retires all
+    /// of them; one still referenced keeps the whole session's entries.
+    #[test]
+    fn segment_entries_retire_when_a_complete_census_lost_their_session() {
+        let mut segments = AcceptedBuckets::segments_for_test();
+        let fingerprint = |n: u8| {
+            json!({"history_segment": {"of": LIVE},
+            "snapshot_fingerprint": format!("{n:064x}")})
+        };
+        segments.record(&body(SEGMENT, &[OLD], 'a', fingerprint(1)));
+        segments.record(&body("synthetic#w20260903", &[NEW], 'a', fingerprint(2)));
+        segments.record(&body(
+            "other#w20260827",
+            &[OLD],
+            'a',
+            json!({"history_segment": {"of": "other"}, "snapshot_fingerprint": format!("{:064x}", 3)}),
+        ));
+        segments.retire_absent(&BTreeSet::from([format!("{:064x}", 1)]));
+        assert_eq!(segments.len(), 3);
+        segments.retire_absent(&BTreeSet::from([
+            format!("{:064x}", 1),
+            format!("{:064x}", 2),
+        ]));
+        assert_eq!(segments.len(), 1);
+        assert!(segments.get(SEGMENT).is_none() && segments.get("other#w20260827").is_some());
+    }
 }
 
 #[cfg(all(test, target_pointer_width = "64"))]
 mod segment_heap_tests {
     use super::*;
     use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-    /// [format] Rule 9 heap bound of the sibling segment ledger at its stated
+    /// [format] Heap bound of the sibling segment ledger at its stated
     /// design maximum: 64 entries, each at MAX_SHARES with full proof. A real
     /// entry spans one 7-day window (at most 168 hourly buckets).
     #[test]
@@ -1836,6 +1934,7 @@ mod segment_heap_tests {
                     starts,
                     incomplete: true,
                     of: Some(session_key(&key, &format!("max-{n}"))),
+                    fingerprint: Some("f".repeat(64)),
                 },
             );
         }

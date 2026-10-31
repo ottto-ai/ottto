@@ -24,8 +24,6 @@ pub(crate) const TRIGGER_BYTES: usize = 512 * 1024;
 const DAY_SECONDS: i64 = 86_400;
 const WINDOW_SECONDS: i64 = 7 * DAY_SECONDS;
 const SETTLED_SECONDS: i64 = 72 * 3_600;
-/// Non-bucket framing charged per piece when sizing the group's one batch.
-const PIECE_FRAMING_BYTES: usize = 4 * 1024;
 const SEPARATOR: &str = "#w";
 
 /// Wire: this body is the window `[window_start, window_end)` of `of`.
@@ -65,10 +63,11 @@ pub(crate) struct Plan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Skipped {
-    /// The group would not fit one upload batch: today's body is kept.
-    GroupOverBatch,
     /// Top rows, scalars or money did not re-sum exactly: today's body is kept.
     Unbalanced,
+    /// A one-day window still could not keep its identity within the item
+    /// limit: the session is held (delayed, never stripped).
+    PieceHeld,
 }
 
 #[derive(Serialize)]
@@ -110,16 +109,24 @@ pub(crate) fn segment_id(live: &str, start: i64) -> Option<String> {
 }
 
 /// Upload packing unit: a cut session's group, else its request-owned
-/// family. A group fits one batch by construction (`plan`).
+/// family. A group larger than one batch is packed oldest segment first and
+/// its live body last, so each batch advances the stored history.
 pub(crate) fn packing_unit(item: &SnapshotItem) -> Option<&str> {
     group_of(item).or_else(|| super::claude_request_money::request_owned_family_root(item))
 }
 
 /// Whether `id` names a segment entity: `<live>#w<YYYYMMDD>`.
 pub(crate) fn is_segment_id(id: &str) -> bool {
-    id.rsplit_once(SEPARATOR).is_some_and(|(live, date)| {
-        !live.is_empty() && date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit())
-    })
+    segment_of(id).is_some()
+}
+
+/// The live session id a segment entity id belongs to.
+pub(crate) fn segment_of(id: &str) -> Option<&str> {
+    id.rsplit_once(SEPARATOR)
+        .filter(|(live, date)| {
+            !live.is_empty() && date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .map(|(live, _)| live)
 }
 
 /// The live session id of a cut session's group: a segment's `of`, or the
@@ -136,10 +143,8 @@ pub(crate) fn group_of(item: &SnapshotItem) -> Option<&str> {
 
 /// Plan the cut of a full body measuring `full_bytes`, or `None` when it
 /// stays one body. `item_limit` is the per-item wire limit: a window over
-/// half of it halves at whole days (never seen at today's sizes). The whole
-/// group (segments first, then live) must fit one upload batch.
+/// half of it halves at whole days (never seen at today's sizes).
 pub(crate) fn plan(
-    source: SnapshotSource,
     item: &SnapshotItem,
     full_bytes: usize,
     now: i64,
@@ -163,59 +168,61 @@ pub(crate) fn plan(
     let through = windows.keys().next_back()? + WINDOW_SECONDS;
     let mut segments = Vec::new();
     for (window, buckets) in windows {
-        halve(
-            item,
-            window,
-            window + WINDOW_SECONDS,
+        let piece = Piece {
+            start: window,
+            end: window + WINDOW_SECONDS,
             buckets,
-            item_limit / 2,
-            &mut segments,
-        );
-    }
-    let pieces = segments.len() + 1;
-    if pieces > crate::snapshot_sync::SNAPSHOT_BATCH_LIMIT
-        || full_bytes.saturating_add(pieces.saturating_mul(PIECE_FRAMING_BYTES))
-            > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES
-    {
-        alarm(source, Skipped::GroupOverBatch);
-        return None;
+        };
+        halve(item, piece, item_limit / 2, &mut segments);
     }
     Some(Plan { segments, through })
 }
 
-fn halve(
-    item: &SnapshotItem,
-    start: i64,
-    end: i64,
-    buckets: Vec<usize>,
-    half_limit: usize,
-    out: &mut Vec<Piece>,
-) {
-    let bytes = buckets
+fn halve(item: &SnapshotItem, piece: Piece, half_limit: usize, out: &mut Vec<Piece>) {
+    let bytes = piece
+        .buckets
         .iter()
         .map(|index| {
             serde_json::to_vec(&item.usage_buckets[*index])
                 .map_or(usize::MAX, |bytes| bytes.len() + 1)
         })
         .fold(0usize, usize::saturating_add);
-    let days = (end - start) / DAY_SECONDS;
-    if bytes <= half_limit || days < 2 {
-        out.push(Piece {
-            start,
-            end,
-            buckets,
-        });
-        return;
-    }
-    let middle = start + (days / 2) * DAY_SECONDS;
-    let (older, newer): (Vec<_>, Vec<_>) = buckets
-        .into_iter()
-        .partition(|index| bucket_unix(&item.usage_buckets[*index]).is_some_and(|at| at < middle));
-    for (start, end, buckets) in [(start, middle, older), (middle, end, newer)] {
-        if !buckets.is_empty() {
-            halve(item, start, end, buckets, half_limit, out);
+    match (bytes > half_limit)
+        .then(|| halve_piece(item, &piece))
+        .flatten()
+    {
+        Some(halves) => {
+            for half in halves {
+                halve(item, half, half_limit, out);
+            }
         }
+        None => out.push(piece),
     }
+}
+
+/// `piece` split at its middle whole day, without empty halves; `None` for
+/// a piece under two days.
+pub(crate) fn halve_piece(item: &SnapshotItem, piece: &Piece) -> Option<Vec<Piece>> {
+    let days = (piece.end - piece.start) / DAY_SECONDS;
+    if days < 2 {
+        return None;
+    }
+    let middle = piece.start + (days / 2) * DAY_SECONDS;
+    let (older, newer): (Vec<_>, Vec<_>) =
+        piece.buckets.iter().copied().partition(|index| {
+            bucket_unix(&item.usage_buckets[*index]).is_some_and(|at| at < middle)
+        });
+    Some(
+        [(piece.start, middle, older), (middle, piece.end, newer)]
+            .into_iter()
+            .filter(|(_, _, buckets)| !buckets.is_empty())
+            .map(|(start, end, buckets)| Piece {
+                start,
+                end,
+                buckets,
+            })
+            .collect(),
+    )
 }
 
 /// Exact wire money: digits with at most 12 decimals, as picodollars.
@@ -689,14 +696,8 @@ pub(crate) fn expand_page(
         let mut segments = std::mem::take(&mut item.history_cut);
         if segments.is_empty() && rows_self_contained(&item) {
             let bytes = super::snapshot_item_wire_size(source, &item, policy);
-            if let Some((cut, live)) = plan(
-                source,
-                &item,
-                bytes,
-                now,
-                super::MAX_SNAPSHOT_ITEM_WIRE_BYTES,
-            )
-            .and_then(|plan| split(source, &item, &plan))
+            if let Some((cut, live)) = plan(&item, bytes, now, super::MAX_SNAPSHOT_ITEM_WIRE_BYTES)
+                .and_then(|plan| split(source, &item, &plan))
             {
                 segments = cut;
                 item = live;

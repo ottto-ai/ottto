@@ -2470,8 +2470,18 @@ fn segment_placement(pieces: &[&SnapshotItem]) -> BTreeMap<(String, RowKey), Val
 /// window's last account (the whole-session carry, decided before any cut).
 /// Grown until its untagged body crosses the cut trigger.
 fn segment_session() -> (SnapshotItem, Vec<Contribution>, i64) {
+    segment_session_until(24 * 21, |item, _| {
+        identity::item_bytes(item) > crate::snapshots::history_segments::TRIGGER_BYTES
+    })
+}
+
+/// `segment_session` from `hours`, grown a day at a time until `done`.
+fn segment_session_until(
+    hours: usize,
+    done: impl Fn(&SnapshotItem, &[Contribution]) -> bool,
+) -> (SnapshotItem, Vec<Contribution>, i64) {
     let week = 7 * 86_400;
-    for hours in (24 * 21..).step_by(24) {
+    for hours in (hours..).step_by(24) {
         let (mut item, mut proof) = sticky_session(hours);
         for contribution in &mut proof {
             let at = OffsetDateTime::parse(&contribution.bucket_start, &Rfc3339)
@@ -2487,7 +2497,7 @@ fn segment_session() -> (SnapshotItem, Vec<Contribution>, i64) {
             });
         }
         sticky_receiver_totals(&mut item);
-        if identity::item_bytes(&item) > crate::snapshots::history_segments::TRIGGER_BYTES {
+        if done(&item, &proof) {
             let last = OffsetDateTime::parse(&item.collected_at, &Rfc3339)
                 .unwrap()
                 .unix_timestamp();
@@ -2495,6 +2505,72 @@ fn segment_session() -> (SnapshotItem, Vec<Contribution>, i64) {
         }
     }
     unreachable!()
+}
+
+/// `segment_session` whose first `days` days from 2026-09-03 (a window
+/// start) run `models` models per hour, each on 16 accounts: that window is
+/// over the per-item parts cap once tagged, the rest of the session is not.
+fn hot_session(days: i64, models: usize) -> (SnapshotItem, Vec<Contribution>, i64) {
+    let (mut item, mut proof, now) = segment_session();
+    let first = OffsetDateTime::parse("2026-09-03T00:00:00Z", &Rfc3339)
+        .unwrap()
+        .unix_timestamp();
+    let hot = |start: &str| {
+        let at = OffsetDateTime::parse(start, &Rfc3339)
+            .unwrap()
+            .unix_timestamp();
+        (first..first + days * 86_400).contains(&at)
+    };
+    let base = item.model_usage[0].clone();
+    let rows = (0..models)
+        .map(|model| {
+            let mut row = base.clone();
+            if model > 0 {
+                row.model = format!("{}-{model}", base.model);
+            }
+            row.input_tokens = 16;
+            row.request_count = 16;
+            row
+        })
+        .collect::<Vec<_>>();
+    proof.retain(|contribution| !hot(&contribution.bucket_start));
+    for bucket in &mut item.usage_buckets {
+        if !hot(&bucket.bucket_start) {
+            continue;
+        }
+        bucket.model_usage = rows.clone();
+        for row in &rows {
+            let mut one = row.clone();
+            one.input_tokens = 1;
+            one.request_count = 1;
+            for key in 0..16u64 {
+                proof.push(Contribution {
+                    bucket_start: bucket.bucket_start.clone(),
+                    row_key: row_key_from_model_usage(row),
+                    usage: holder_usage(&one, None),
+                    identity: RequestIdentity::Tagged(AuthorityKey {
+                        login: Some(format!("{key:064x}")),
+                        org: Some(format!("{:064x}", key + 32)),
+                        basis: identity::TELEMETRY,
+                    }),
+                });
+            }
+        }
+    }
+    let mut top = BTreeMap::<String, SnapshotModelUsage>::new();
+    for row in item.usage_buckets.iter().flat_map(|bucket| &bucket.model_usage) {
+        let total = top.entry(row.model.clone()).or_insert_with(|| {
+            let mut total = row.clone();
+            total.input_tokens = 0;
+            total.request_count = 0;
+            total
+        });
+        total.input_tokens += row.input_tokens;
+        total.request_count += row.request_count;
+    }
+    item.model_usage = top.into_values().collect();
+    sticky_receiver_totals(&mut item);
+    (item, proof, now)
 }
 
 fn segment_pieces(live: &SnapshotItem) -> Vec<&SnapshotItem> {
@@ -2553,9 +2629,10 @@ fn segment_identities(pieces: &[&SnapshotItem]) -> SegmentTruth {
 
 /// [money] Valid big history finishes: whole, this session is over the item
 /// limit once tagged, so today it loses identity; cut, every bucket row keeps
-/// its exact account and workspace (the scan's own requests, carry
-/// included) in exactly one entity, each piece reconciles on its own
-/// evidence table, and totals conserve.
+/// its exact account and workspace (the requests' own identities) in exactly
+/// one entity, each piece reconciles on its own evidence table, and totals
+/// conserve. The scan's boundary carry is proven end to end by the
+/// segmented pipeline oracle.
 #[test]
 fn settled_history_cut_keeps_whole_session_placement() {
     let (full, proof, now) = segment_session();
@@ -2610,15 +2687,6 @@ fn settled_history_cut_keeps_whole_session_placement() {
         totals,
         [full.input_tokens, full.request_count, full.model_usage[0].input_tokens]
     );
-    // The first rows of a later window kept the previous window's account.
-    let first = &live.history_cut[1].usage_buckets[0].model_usage[0];
-    let previous = live.history_cut[0].usage_buckets.last().unwrap();
-    let (first_account, previous_account) = (
-        first.account_identifier_hash.as_ref(),
-        previous.model_usage[0].account_identifier_hash.as_ref(),
-    );
-    assert!(first_account.is_some());
-    assert_eq!(first_account, previous_account);
 }
 
 /// [money] #909 ledger across the cut: after the group ACK each segment entry
@@ -2654,6 +2722,80 @@ fn settled_history_cut_tags_from_own_entry_then_live() {
         segment_placement(&segment_pieces(&again)),
         segment_placement(&segment_pieces(&live))
     );
+}
+
+/// [money] The trigger is the body as it would be sent: a session under the
+/// trigger untagged but over it once tagged is cut, with every row's
+/// identity kept.
+#[test]
+fn settled_history_cut_measures_the_tagged_body() {
+    let accepted = identity::AcceptedBuckets::for_test();
+    let segments = identity::AcceptedBuckets::segments_for_test();
+    let trigger = crate::snapshots::history_segments::TRIGGER_BYTES;
+    let tagged_bytes = |item: &SnapshotItem, proof: &[Contribution]| {
+        let mut whole = item.clone();
+        identity::apply_cut_for_test(&mut whole, proof, &accepted, &segments, None).unwrap();
+        identity::item_bytes(&whole)
+    };
+    let (full, proof, now) =
+        segment_session_until(24 * 14, |item, proof| tagged_bytes(item, proof) > trigger);
+    assert!(identity::item_bytes(&full) <= trigger, "untagged it is under");
+    let mut live = full.clone();
+    identity::apply_cut_for_test(&mut live, &proof, &accepted, &segments, Some(now)).unwrap();
+    assert!(live.history_segments.is_some() && !live.history_cut.is_empty());
+    assert_eq!(segment_identities(&segment_pieces(&live)), segment_truth(&proof));
+}
+
+/// [money] A window over a size cap once tagged halves at whole days until
+/// each piece keeps its identity: never stripped, placement exact.
+#[test]
+fn settled_history_window_over_a_size_cap_halves() {
+    let (full, proof, now) = hot_session(3, 2);
+    let accepted = identity::AcceptedBuckets::for_test();
+    let segments = identity::AcceptedBuckets::segments_for_test();
+    let mut whole = full.clone();
+    let uncut = identity::apply_cut_for_test(&mut whole, &proof, &accepted, &segments, None);
+    assert!(matches!(uncut, Ok(Tagged::Fallback { .. })), "whole it strips");
+    let mut live = full.clone();
+    let (tagged, held) =
+        identity::apply_cut_held_for_test(&mut live, &proof, &accepted, &segments, Some(now));
+    assert!(matches!(tagged, Ok(Tagged::Sent { .. })));
+    assert!(held.is_empty());
+    let windows = live
+        .history_cut
+        .iter()
+        .map(|segment| {
+            let window = segment.history_segment.as_ref().unwrap();
+            (window.window_start.as_str(), window.window_end.as_str())
+        })
+        .collect::<Vec<_>>();
+    for halved in [
+        ("2026-09-03T00:00:00Z", "2026-09-04T00:00:00Z"),
+        ("2026-09-04T00:00:00Z", "2026-09-06T00:00:00Z"),
+        ("2026-09-06T00:00:00Z", "2026-09-10T00:00:00Z"),
+    ] {
+        assert!(windows.contains(&halved), "{halved:?} in {windows:?}");
+    }
+    assert_eq!(segment_identities(&segment_pieces(&live)), segment_truth(&proof));
+    for piece in segment_pieces(&live) {
+        sticky_assert_reconciled(piece);
+    }
+}
+
+/// [money] A window still over a size cap at one day holds the session for
+/// this pass (counted, delayed): nothing of it is cut or sent stripped as
+/// segments, and the caller's hold keeps the whole body off the wire.
+#[test]
+fn settled_history_day_over_a_size_cap_holds_the_session() {
+    let (full, proof, now) = hot_session(1, 6);
+    let accepted = identity::AcceptedBuckets::for_test();
+    let segments = identity::AcceptedBuckets::segments_for_test();
+    let mut item = full.clone();
+    let (tagged, held) =
+        identity::apply_cut_held_for_test(&mut item, &proof, &accepted, &segments, Some(now));
+    assert!(matches!(tagged, Ok(Tagged::Fallback { .. })));
+    assert_eq!(held, BTreeSet::from([full.source_session_id.clone()]));
+    assert!(item.history_cut.is_empty() && item.history_segments.is_none());
 }
 
 /// [off=main] Without the capability nothing is cut: the same bytes as an

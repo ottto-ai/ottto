@@ -6,7 +6,7 @@ use super::money_equivalence_tests::{
 use super::*;
 use serde_json::Value;
 
-fn tagged_api(
+pub(super) fn tagged_api(
     request: &str,
     tokens: u64,
     account: Option<&str>,

@@ -896,6 +896,18 @@ pub(crate) fn apply_cut_for_test(
     segments: &AcceptedBuckets,
     now: Option<i64>,
 ) -> Result<Tagged, Ineligible> {
+    apply_cut_held_for_test(item, contributions, accepted, segments, now).0
+}
+
+/// `apply_cut_for_test`, with the sessions the cut held this pass.
+#[cfg(test)]
+pub(crate) fn apply_cut_held_for_test(
+    item: &mut SnapshotItem,
+    contributions: &[Contribution],
+    accepted: &AcceptedBuckets,
+    segments: &AcceptedBuckets,
+    now: Option<i64>,
+) -> (Result<Tagged, Ineligible>, BTreeSet<String>) {
     let mut grouping = Grouping::new(bucket_row_count(item));
     for c in contributions {
         grouping.add_at(
@@ -910,13 +922,14 @@ pub(crate) fn apply_cut_for_test(
     let evidence = ScanEvidence::default()
         .with_accepted_buckets(Some(accepted))
         .with_history_segments(Some(segments), now);
-    apply_cut(
+    let tagged = apply_cut(
         item,
         grouping,
         &evidence,
         accepted.get(&item.source_session_id),
         accepted.retained_enabled(),
-    )
+    );
+    (tagged, evidence.history_held.take())
 }
 
 /// `apply` with each request's own transcript time (`None`: auxiliary),
@@ -3828,6 +3841,9 @@ pub(crate) struct ScanEvidence<'a> {
     accepted_segments: Option<&'a AcceptedBuckets>,
     /// `session_history_segments:v1` on: this pass's clock (unix seconds).
     history_segments_now: Option<i64>,
+    /// Sessions whose settled history cannot keep its identity even in
+    /// one-day windows: held by the caller this pass.
+    pub(crate) history_held: std::cell::RefCell<BTreeSet<String>>,
     wire_size_reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
 }
 
@@ -5130,12 +5146,16 @@ fn keeps_markerless_account(item: &SnapshotItem) -> bool {
             })
 }
 
-/// Tag `item`; with `session_history_segments:v1` on and an oversized body,
-/// first cut its settled history and tag every piece from the whole-session
-/// grouping (carry already ran over the whole session). Each segment's
-/// accepted hints are its own entry per bucket, else the live entry's;
-/// retained proof is its own entry's only. Any piece failing keeps the
-/// whole body on today's path. Segments wait on the live body for the page.
+/// Tag `item`; with `session_history_segments:v1` on, a body over the trigger
+/// as sent (tagged), or one that could keep its identity only by stripping,
+/// is cut into its settled windows first. Every piece is tagged from the
+/// whole-session grouping (carry already ran over the whole session). Each
+/// segment's accepted hints are its own entry per bucket, else an earlier
+/// window of the same cut, else the live entry's; retained proof is its own
+/// entry's only. A window over a size cap once tagged halves at whole days;
+/// one still over at one day holds the session (delayed, never stripped).
+/// Any other failed piece keeps the whole body on today's path. Segments
+/// wait on the live body.
 fn apply_cut(
     item: &mut SnapshotItem,
     grouping: Grouping,
@@ -5143,19 +5163,12 @@ fn apply_cut(
     accepted: Option<&accepted::AcceptedSession>,
     retained: bool,
 ) -> Result<Tagged, Ineligible> {
-    let cut = evidence.history_segments_now.and_then(|now| {
-        let plan = history_segments::plan(
-            SnapshotSource::ClaudeCode,
-            item,
-            grouping.item_bytes(item),
-            now,
-            MAX_ITEM_BYTES,
-        )?;
-        history_segments::split(SnapshotSource::ClaudeCode, item, &plan)
-    });
-    let Some((mut segments, mut live)) = cut else {
-        return apply_grouped_with_accepted(item, grouping, accepted, retained);
+    let now = match evidence.history_segments_now {
+        // Tagging cannot grow a body this small past the trigger.
+        Some(now) if grouping.item_bytes(item) > history_segments::TRIGGER_BYTES / 4 => now,
+        _ => return apply_grouped_with_accepted(item, grouping, accepted, retained),
     };
+    let original = item.clone();
     let starts = |piece: &SnapshotItem| {
         piece
             .usage_buckets
@@ -5163,35 +5176,91 @@ fn apply_cut(
             .map(|bucket| bucket.bucket_start.clone())
             .collect::<Vec<_>>()
     };
-    let mut tagged_segments = true;
-    for segment in &mut segments {
-        let owned = starts(segment);
-        let keys = owned
-            .iter()
-            .filter_map(|start| accepted::bucket_key(start))
-            .collect::<Vec<_>>();
-        let own = evidence
-            .accepted_segments
-            .and_then(|ledger| ledger.get(&segment.source_session_id));
-        let view = accepted::segment_view(own, accepted, &keys);
-        let piece = grouping.piece(&owned.iter().map(String::as_str).collect(), false);
-        if apply_grouped_with_accepted(segment, piece, view.as_ref(), retained).is_err() {
-            tagged_segments = false;
-            break;
-        }
+    let everything = starts(&*item);
+    let whole = grouping.piece(&everything.iter().map(String::as_str).collect(), true);
+    let tagged = apply_grouped_with_accepted(item, whole, accepted, retained);
+    let sent = matches!(tagged, Ok(Tagged::Sent { .. }));
+    if tagged.is_err() || (sent && grouping.item_bytes(item) <= history_segments::TRIGGER_BYTES) {
+        return tagged;
     }
-    let owned = starts(&live);
-    let piece = grouping.piece(&owned.iter().map(String::as_str).collect(), true);
-    let tagged = tagged_segments
-        .then(|| apply_grouped_with_accepted(&mut live, piece, accepted, retained))
-        .and_then(Result::ok);
-    match tagged {
-        Some(tagged) => {
-            live.history_cut = segments;
-            *item = live;
-            Ok(tagged)
+    let Some(mut plan) = history_segments::plan(
+        &original,
+        history_segments::TRIGGER_BYTES + 1,
+        now,
+        MAX_ITEM_BYTES,
+    ) else {
+        return tagged;
+    };
+    loop {
+        let Some((mut segments, mut live)) =
+            history_segments::split(SnapshotSource::ClaudeCode, &original, &plan)
+        else {
+            return tagged;
+        };
+        let mut failed = BTreeSet::new();
+        for (index, segment) in segments.iter_mut().enumerate() {
+            let owned = starts(&*segment);
+            let keys = owned
+                .iter()
+                .filter_map(|start| accepted::bucket_key(start))
+                .collect::<Vec<_>>();
+            let (own, prior) = evidence
+                .accepted_segments
+                .map_or((None, Vec::new()), |ledger| {
+                    (
+                        ledger.get(&segment.source_session_id),
+                        ledger.siblings(&original.source_session_id, &segment.source_session_id),
+                    )
+                });
+            let view = accepted::segment_view(own, &prior, accepted, &keys);
+            let piece = grouping.piece(&owned.iter().map(String::as_str).collect(), false);
+            match apply_grouped_with_accepted(segment, piece, view.as_ref(), retained) {
+                Ok(Tagged::Sent { .. }) => {}
+                // Only a size cap is a window's to fix by halving.
+                Ok(Tagged::Fallback { over_cap, .. })
+                    if !over_cap.is_empty()
+                        && over_cap
+                            .iter()
+                            .all(|cap| matches!(cap, OverCap::Bytes | OverCap::PartsPerItem)) =>
+                {
+                    failed.insert(index);
+                }
+                // Any other cause is the whole session's too: today's path.
+                _ => return tagged,
+            }
         }
-        None => apply_grouped_with_accepted(item, grouping, accepted, retained),
+        if failed.is_empty() {
+            let owned = starts(&live);
+            let piece = grouping.piece(&owned.iter().map(String::as_str).collect(), true);
+            return match apply_grouped_with_accepted(&mut live, piece, accepted, retained) {
+                Ok(result) => {
+                    live.history_cut = segments;
+                    *item = live;
+                    Ok(result)
+                }
+                Err(_) => tagged,
+            };
+        }
+        let mut pieces = Vec::with_capacity(plan.segments.len() + failed.len());
+        for (index, piece) in std::mem::take(&mut plan.segments).into_iter().enumerate() {
+            if !failed.contains(&index) {
+                pieces.push(piece);
+                continue;
+            }
+            let Some(halves) = history_segments::halve_piece(&original, &piece) else {
+                history_segments::alarm(
+                    SnapshotSource::ClaudeCode,
+                    history_segments::Skipped::PieceHeld,
+                );
+                evidence
+                    .history_held
+                    .borrow_mut()
+                    .insert(original.source_session_id.clone());
+                return tagged;
+            };
+            pieces.extend(halves);
+        }
+        plan.segments = pieces;
     }
 }
 

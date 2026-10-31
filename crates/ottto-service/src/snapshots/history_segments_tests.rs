@@ -186,7 +186,7 @@ fn assert_conserved(full: &SnapshotItem, segments: &[SnapshotItem], live: &Snaps
 fn shared_cut_conserves_money_and_placement_for_every_source() {
     for source in SOURCES {
         let full = session(source, 30);
-        let cut = plan(source, &full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
+        let cut = plan(&full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
         let (segments, live) = split(source, &full, &cut).unwrap();
         assert_eq!(segments.len(), 4, "{source:?}");
         assert_conserved(&full, &segments, &live);
@@ -238,14 +238,7 @@ fn shared_cut_conserves_money_and_placement_for_every_source() {
 fn shared_cut_halves_oversized_windows_and_skips_small_or_recent_bodies() {
     let full = session(SnapshotSource::Codex, 30);
     let day_bytes = serde_json::to_vec(&full.usage_buckets[..24]).unwrap().len();
-    let cut = plan(
-        SnapshotSource::Codex,
-        &full,
-        TRIGGER_BYTES + 1,
-        now(&full),
-        4 * day_bytes,
-    )
-    .unwrap();
+    let cut = plan(&full, TRIGGER_BYTES + 1, now(&full), 4 * day_bytes).unwrap();
     assert!(cut.segments.len() > 4);
     for piece in &cut.segments {
         assert_eq!(piece.start.rem_euclid(DAY_SECONDS), 0);
@@ -258,23 +251,9 @@ fn shared_cut_halves_oversized_windows_and_skips_small_or_recent_bodies() {
         .collect::<BTreeSet<_>>();
     assert_eq!(ids.len(), segments.len());
     assert_conserved(&full, &segments, &live);
-    assert!(plan(
-        SnapshotSource::Codex,
-        &full,
-        TRIGGER_BYTES,
-        now(&full),
-        usize::MAX
-    )
-    .is_none());
+    assert!(plan(&full, TRIGGER_BYTES, now(&full), usize::MAX).is_none());
     let recent = session(SnapshotSource::Codex, 3);
-    assert!(plan(
-        SnapshotSource::Codex,
-        &recent,
-        TRIGGER_BYTES + 1,
-        now(&recent),
-        usize::MAX
-    )
-    .is_none());
+    assert!(plan(&recent, TRIGGER_BYTES + 1, now(&recent), usize::MAX).is_none());
     // Top rows that do not re-sum exactly keep today's whole body.
     let mut unbalanced = full.clone();
     unbalanced.model_usage[1].input_tokens += 1;
@@ -290,7 +269,7 @@ fn shared_cut_keeps_partially_priced_rows() {
         let mut full = session(source, 30);
         full.usage_buckets[5].model_usage[1].cost_usd = None;
         full.model_usage[1].cost_usd = None;
-        let cut = plan(source, &full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
+        let cut = plan(&full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
         let (segments, live) = split(source, &full, &cut).unwrap();
         assert_eq!(segments.len(), 4, "{source:?}");
         assert_conserved(&full, &segments, &live);

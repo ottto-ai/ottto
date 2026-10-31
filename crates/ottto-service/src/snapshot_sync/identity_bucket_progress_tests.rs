@@ -508,10 +508,26 @@ fn history_group() -> [Value; 2] {
 }
 
 fn group_page(progress: &mut SnapshotUploadProgress, items: &[Value], conflicted: &[usize]) {
+    group_page_at(
+        progress,
+        items,
+        &(0..items.len()).collect::<Vec<_>>(),
+        conflicted,
+    );
+}
+
+/// One page of `indices` out of `items`; every page entity ACKs except
+/// `conflicted`, which conflict.
+fn group_page_at(
+    progress: &mut SnapshotUploadProgress,
+    items: &[Value],
+    indices: &[usize],
+    conflicted: &[usize],
+) {
     let mut accepted = 0;
     attempt_snapshot_page(
         items,
-        &(0..items.len()).collect::<Vec<_>>(),
+        indices,
         "synthetic-history-group",
         progress,
         &mut accepted,
@@ -533,8 +549,10 @@ fn group_page(progress: &mut SnapshotUploadProgress, items: &[Value], conflicted
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),
             };
-            let (conflict, accepted): (Vec<_>, Vec<_>) =
-                (0..items.len()).partition(|index| conflicted.contains(index));
+            let (conflict, accepted): (Vec<_>, Vec<_>) = indices
+                .iter()
+                .copied()
+                .partition(|index| conflicted.contains(index));
             Ok(crate::snapshot_client::SnapshotBatchResponse {
                 accepted: accepted.len() as u64,
                 sessions_reconciled: 0,
@@ -615,6 +633,163 @@ fn history_group_settles_whole_segments_before_live() {
             .len(),
         1
     );
+}
+
+/// [money] A live body sent alone waits for its segment outside the page:
+/// its ACK is not recorded until the segment's exact bytes are ACKed, so its
+/// `through` never settles over history the receiver may not hold.
+#[test]
+fn history_live_waits_on_a_segment_outside_its_page() {
+    let mut progress = progress();
+    let items = history_group();
+    group_page_at(&mut progress, &items, &[1], &[]);
+    assert!(!progress.accepted_fingerprints.contains(&"e".repeat(64)));
+    group_page_at(&mut progress, &items, &[0], &[]);
+    assert!(progress.accepted_fingerprints.contains(&"d".repeat(64)));
+    group_page_at(&mut progress, &items, &[1], &[]);
+    assert!(progress.accepted_fingerprints.contains(&"e".repeat(64)));
+}
+
+/// [money] A live body whose `count` names a segment missing from the input
+/// (held, quarantined or deferred) settles nothing of its group.
+#[test]
+fn history_live_waits_for_every_counted_segment() {
+    let mut progress = progress();
+    let [segment, mut live] = history_group();
+    live["history_segments"]["count"] = json!(2);
+    group_page(&mut progress, &[segment, live], &[]);
+    for fingerprint in ['d', 'e'] {
+        assert!(!progress
+            .accepted_fingerprints
+            .contains(&fingerprint.to_string().repeat(64)));
+    }
+}
+
+/// [money][regress] Re-offer after a whole upload: a later whole (or lower)
+/// body retires the receiver's segment, so the next cut live body conflicts.
+/// That conflict forgets the group's earlier segment ACKs, so the next pass
+/// offers the byte-identical segment again instead of skipping it.
+#[test]
+fn history_live_conflict_forgets_its_earlier_segment_acks() {
+    let mut progress = progress();
+    let items = history_group();
+    group_page(&mut progress, &items, &[]);
+    assert!(progress.accepted_fingerprints.contains(&"d".repeat(64)));
+    let mut changed = items.clone();
+    changed[1]["snapshot_fingerprint"] = json!("f".repeat(64));
+    group_page_at(&mut progress, &changed, &[1], &[1]);
+    assert!(!progress.accepted_fingerprints.contains(&"d".repeat(64)));
+    assert!(!progress
+        .accepted_body_witnesses
+        .contains_key(&"d".repeat(64)));
+}
+
+/// [behaviour] A group over one batch never falls back to the whole body:
+/// the packer sends its segments oldest first in batch-sized groups and the
+/// live body last, and the live body settles once every segment ACKed. A
+/// restart after the first batch resends only the rest of the group; a later
+/// pass sizes only what changed.
+#[test]
+fn history_group_over_one_batch_advances_oldest_first() {
+    let live = "synthetic-long";
+    let mut items = (0..60u64)
+        .map(|n| {
+            json!({"source_session_id": format!("{live}#w{}", 20_250_101 + n),
+                "snapshot_fingerprint": format!("{:064x}", 0x1000 - n),
+                "history_segment": {"of": live}})
+        })
+        .collect::<Vec<_>>();
+    items.push(
+        json!({"source_session_id": live, "snapshot_fingerprint": "f".repeat(64),
+        "history_segments": {"count": 60}}),
+    );
+    let upload = |progress: &mut SnapshotUploadProgress, items: &[Value], crash_at: usize| {
+        let mut batches = Vec::<Vec<String>>::new();
+        let mut accepted = 0;
+        let result = upload_resumable_batches_with_literal_families(
+            items,
+            "synthetic-history-over-batch",
+            progress,
+            &mut accepted,
+            |value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
+            |value: &Value| value["snapshot_fingerprint"].as_str().unwrap().to_owned(),
+            |value: &Value| value["source_session_id"].as_str(),
+            |_: &Value| false,
+            |_: &Value| Some(live),
+            &mut InplaceRetryBudget::default(),
+            |batch: Vec<Value>| {
+                let entity = |value: &Value| crate::snapshot_client::SnapshotEntityRef {
+                    source_session_id: value["source_session_id"].as_str().unwrap().into(),
+                    snapshot_fingerprint: value["snapshot_fingerprint"].as_str().unwrap().into(),
+                    occurrence_count: 1,
+                    body_witness_version: None,
+                    body_witness_digest: None,
+                    head_etag: None,
+                    head_challenge: None,
+                    unchanged_basis: None,
+                    retained_proof_missing: Vec::new(),
+                };
+                batches.push(
+                    batch
+                        .iter()
+                        .map(|value| value["source_session_id"].as_str().unwrap().into())
+                        .collect(),
+                );
+                if crash_at > 0 && batches.len() >= crash_at {
+                    anyhow::bail!("synthetic crash before this batch's ACK");
+                }
+                Ok(crate::snapshot_client::SnapshotBatchResponse {
+                    accepted: batch.len() as u64,
+                    sessions_reconciled: 0,
+                    session_ids: vec![],
+                    disabled: false,
+                    disabled_reason: None,
+                    entity_ack_contract: Some(
+                        crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into(),
+                    ),
+                    accepted_entities: batch.iter().map(entity).collect(),
+                    unchanged_entities: vec![],
+                    rejected_entities: vec![],
+                    conflict_entities: vec![],
+                })
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(result.is_ok(), crash_at == 0);
+        batches
+    };
+    let mut progress = progress();
+    let crashed = upload(&mut progress, &items, 2);
+    assert_eq!(
+        crashed.iter().take(2).map(Vec::len).collect::<Vec<_>>(),
+        vec![50, 11]
+    );
+    assert!(!progress.accepted_fingerprints.contains(&"f".repeat(64)));
+    // Restart: the saved progress keeps the first batch's segment ACKs.
+    let mut progress: SnapshotUploadProgress =
+        serde_json::from_slice(&serde_json::to_vec(&progress).unwrap()).unwrap();
+    let batches = upload(&mut progress, &items, 0);
+    assert_eq!(batches, vec![crashed[1].clone()]);
+    let batches = [crashed[0].clone(), batches[0].clone()];
+    let flat = batches.concat();
+    assert_eq!(flat.last().map(String::as_str), Some(live));
+    let segments = &flat[..60];
+    assert!(segments.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(segments
+        .iter()
+        .all(|id| crate::snapshots::history_segments::is_segment_id(id)));
+    for item in &items {
+        assert!(progress
+            .accepted_fingerprints
+            .contains(item["snapshot_fingerprint"].as_str().unwrap()));
+    }
+    // Next pass: only the changed live body is sized and sent.
+    items[60]["snapshot_fingerprint"] = json!("e".repeat(64));
+    assert_eq!(
+        upload(&mut progress, &items, 0),
+        vec![vec![live.to_owned()]]
+    );
+    assert!(progress.accepted_fingerprints.contains(&"e".repeat(64)));
 }
 
 /// [format] Segment hints persist in their own sibling field, beside the

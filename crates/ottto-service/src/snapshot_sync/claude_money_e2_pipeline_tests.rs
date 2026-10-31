@@ -240,6 +240,19 @@ impl Page {
         corpus: &Corpus,
         accepted: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
     ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
+        self.enrich_with(corpus, accepted, None)
+    }
+    /// `segments`: `session_history_segments:v1` on, with its sibling
+    /// ledger and clock; the shared cut then runs where the driver runs it.
+    fn enrich_with(
+        &mut self,
+        corpus: &Corpus,
+        accepted: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
+        segments: Option<(
+            &crate::snapshots::claude_request_identity::AcceptedBuckets,
+            i64,
+        )>,
+    ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
         let ((mut disposition, _, _), released) =
             e2::pipeline_test_observer::capture_released(|| {
                 try_apply_claude_local_evidence_to_scan_with_comparison(
@@ -251,7 +264,7 @@ impl Page {
                     None,
                     Some((&self.cache, &self.committed)),
                     accepted,
-                    None,
+                    segments,
                     None,
                 )
                 .unwrap()
@@ -279,6 +292,13 @@ impl Page {
             &disposition,
             &backfill,
         );
+        crate::snapshots::history_segments::expand_page(
+            SnapshotSource::ClaudeCode,
+            &mut self.scan.snapshots,
+            segments.map(|(_, now)| now),
+            SnapshotUploadPolicy::default(),
+        );
+        disposition.hold_segments_with_live(&self.scan.snapshots);
         self.disposition = disposition.clone();
         disposition
     }
@@ -3017,6 +3037,10 @@ mod money_equivalence_tests {
 // V2-only fixtures must not enter the cross-build harness transplanted to v1.
 mod state_v2_money_tests {
     include!("state_v2_money_tests.rs");
+}
+
+mod history_segments_oracle_tests {
+    include!("history_segments_oracle_tests.rs");
 }
 
 #[test]

@@ -8095,6 +8095,10 @@ fn finish_sync_source(
     // page stops through partial settlement only after those bodies can finish.
     let census_absent_upload_acks =
         upload_progress.complete_census_ack_retirements(&index, scan_result.census_complete);
+    // Segment entries leave with their session (complete census only).
+    upload_progress
+        .accepted_identity_segments
+        .retire_absent(&census_absent_upload_acks);
     // Current scanner incidence grants live slots on a first install, too.
     // No absent ACK or unrelated entity borrows those slots.
     upload_progress.prepare_context_receipt_candidates(
@@ -8120,6 +8124,17 @@ fn finish_sync_source(
         .context_resend
         .retain_candidates(&upload_progress.context_receipt_candidates);
     upload_progress.freeze_custody_page(&scan_result.snapshots);
+    // A cut live body never bootstraps its cache head alone: its `through`
+    // needs its segments. It travels with its group without the additive
+    // cache patch (the probe's shape); that ACK carries the head.
+    for item in &mut scan_result.snapshots {
+        if item.history_segments.is_some()
+            && item.cache_observations.is_some()
+            && item.cache_base_head_etag.is_none()
+        {
+            *item = cache_head_probe(item);
+        }
+    }
     let probes = scan_result
         .snapshots
         .iter()
@@ -10310,6 +10325,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 std::mem::take(&mut disposition.request_groupings),
                 &ownership,
             );
+        // A settled-history window that cannot keep its identity even at one
+        // day holds its session: delayed, never stripped.
+        disposition.hold_request_owned(evidence.history_held.take());
         if let Some(activity) = request_owned_activity {
             crate::snapshots::claude_request_identity::publish_request_owned_activity(
                 &scan_result.snapshots,
@@ -10915,6 +10933,8 @@ where
         // store this body (its head already covers the usage). Nothing
         // body-scoped is recorded as stored: the exact body is held instead,
         // so it is offered once per change and never marked emitted.
+        let groups = history_groups(items, indices)?;
+        let group_segments = history_group_segments(items, &groups, session_id);
         let not_stored = response
             .unchanged_entities
             .iter()
@@ -10938,14 +10958,30 @@ where
         // Settled-history groups settle whole: a member stays
         // unsettled, and is offered again with its group, unless every
         // member on this page settled. Segments record before their live body.
-        let groups = history_groups(items, indices)?;
-        let unsettled_groups = groups
+        let mut unsettled_groups = groups
             .iter()
             .filter(|(index, _)| !settled.contains(fingerprint(&items[*index])))
             .filter_map(|(_, group)| group.as_ref().map(|(live, _)| live.clone()))
             .collect::<BTreeSet<_>>();
+        // A live body also needs every segment of its group outside this
+        // page (an earlier batch, or one held, quarantined or deferred) ACKed
+        // with its exact bytes, and all `count` of them present.
+        for (live, segments) in &group_segments {
+            let count = groups.iter().find_map(|(_, group)| match group {
+                Some((id, Some(count))) if id == live => Some(*count),
+                _ => None,
+            });
+            let ready = segments.iter().all(|index| {
+                indices.contains(index)
+                    || progress
+                        .contains_body(fingerprint(&items[*index]), &body_witness(&items[*index]))
+            });
+            if !ready || count != Some(segments.len() as u64) {
+                unsettled_groups.insert(live.clone());
+            }
+        }
         let mut ordered = groups;
-        ordered.sort_by_key(|(_, group)| group.as_ref().is_some_and(|(_, segment)| !segment));
+        ordered.sort_by_key(|(_, group)| group.as_ref().is_some_and(|(_, count)| count.is_some()));
         for (index, group) in &ordered {
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
@@ -11022,6 +11058,22 @@ where
                 }
             } else if conflicted.contains(item_fingerprint) {
                 progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
+                // A cut live body conflicts when the receiver no longer holds
+                // a segment under its `through` (a whole or lower body retired
+                // it since): forget the group's segment ACKs from earlier
+                // passes so the next pass offers them again.
+                let live = session_id(item);
+                for segment in group_segments
+                    .iter()
+                    .filter(|(id, _)| Some(id.as_str()) == live)
+                    .flat_map(|(_, segments)| segments)
+                {
+                    let segment_fingerprint = fingerprint(&items[*segment]);
+                    if !settled.contains(segment_fingerprint) {
+                        progress.accepted_fingerprints.remove(segment_fingerprint);
+                        progress.accepted_body_witnesses.remove(segment_fingerprint);
+                    }
+                }
             }
         }
         // A conflict is not a settlement, but it IS retryable: the
@@ -11138,9 +11190,10 @@ fn literal_family_groups(members: Vec<(usize, usize, bool)>) -> Vec<Vec<(usize, 
     groups
 }
 
-/// A page item's settled-history group: the live session id and whether the
-/// item is a segment (`None` outside any cut session).
-type HistoryGroup = Option<(String, bool)>;
+/// A page item's settled-history group: the live session id and, for the
+/// live body, its segment count (`None` for a segment). `None` outside any
+/// cut session.
+type HistoryGroup = Option<(String, Option<u64>)>;
 
 /// Each page index with its settled-history group.
 fn history_groups<T: Serialize>(
@@ -11152,15 +11205,44 @@ fn history_groups<T: Serialize>(
         .map(|index| {
             let value = serde_json::to_value(&items[*index])?;
             let group = match value["history_segment"]["of"].as_str() {
-                Some(live) => Some((live.to_owned(), true)),
-                None => value
-                    .get("history_segments")
-                    .and_then(|_| value["source_session_id"].as_str())
-                    .map(|live| (live.to_owned(), false)),
+                Some(live) => Some((live.to_owned(), None)),
+                None => value["history_segments"]["count"]
+                    .as_u64()
+                    .zip(value["source_session_id"].as_str())
+                    .map(|(count, live)| (live.to_owned(), Some(count))),
             };
             Ok((*index, group))
         })
         .collect()
+}
+
+/// For each cut live body on this page: the indices of every segment of its
+/// group in the whole input, on this page or not (by entity id: no body is
+/// serialized off the page).
+fn history_group_segments<T>(
+    items: &[T],
+    groups: &[(usize, HistoryGroup)],
+    session_id: &impl Fn(&T) -> Option<&str>,
+) -> BTreeMap<String, Vec<usize>> {
+    let mut lives = groups
+        .iter()
+        .filter_map(|(_, group)| match group {
+            Some((live, Some(_))) => Some((live.clone(), Vec::new())),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    if lives.is_empty() {
+        return lives;
+    }
+    for (index, item) in items.iter().enumerate() {
+        if let Some(segments) = session_id(item)
+            .and_then(crate::snapshots::history_segments::segment_of)
+            .and_then(|live| lives.get_mut(live))
+        {
+            segments.push(index);
+        }
+    }
+    lives
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11401,10 +11483,16 @@ where
     let mut ordinary_units = Vec::new();
     let mut catchup_units = Vec::new();
     for unit in units {
+        // A settled-history group stays one ordinary unit, in order.
+        let history = unit.iter().any(|(index, _, _)| {
+            session_id(&items[*index])
+                .is_some_and(crate::snapshots::history_segments::is_segment_id)
+        });
         let (catchup, ordinary): (Vec<_>, Vec<_>) = unit.into_iter().partition(|(index, _, _)| {
-            progress
-                .context_resend
-                .is_catchup(fingerprint(&items[*index]))
+            !history
+                && progress
+                    .context_resend
+                    .is_catchup(fingerprint(&items[*index]))
         });
         if !ordinary.is_empty() {
             ordinary_units.push(ordinary);

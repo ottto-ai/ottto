@@ -215,12 +215,12 @@ pub(super) fn receipt_with_output(
 /// (#801). Every arm loads the SAME committed index from here. It is not an
 /// ancestor of the corpus support dir, so the RAM and cold arms hold no
 /// state-directory writer, exactly as before.
-struct Disk {
+pub(super) struct Disk {
     dir: PathBuf,
     index: PathBuf,
 }
 impl Disk {
-    fn new(c: &Corpus) -> Self {
+    pub(super) fn new(c: &Corpus) -> Self {
         let dir = c.base.join("durable-state");
         std::fs::create_dir_all(&dir).unwrap();
         crate::locked_state_dir::test_locks::hold(&dir);
@@ -229,12 +229,12 @@ impl Disk {
             dir,
         }
     }
-    fn begin(&self, owner: &E2ScanFixture, source: SnapshotSource) {
+    pub(super) fn begin(&self, owner: &E2ScanFixture, source: SnapshotSource) {
         owner.begin_durable(source, &self.dir, &self.index);
     }
     /// A new owner: a restarted process with an empty RAM cache, whose pass
     /// begins on the store as the daemon's does.
-    fn owner(&self, source: SnapshotSource) -> E2ScanFixture {
+    pub(super) fn owner(&self, source: SnapshotSource) -> E2ScanFixture {
         let owner = E2ScanFixture::default();
         self.begin(&owner, source);
         owner
@@ -242,7 +242,7 @@ impl Disk {
     /// The daemon's commit: save the index, then the production post-save
     /// record write and GC for this owner. Returns the index as the next
     /// process loads it.
-    fn commit(
+    pub(super) fn commit(
         &self,
         cache: &crate::snapshots::sampled_scan::SharedCache,
         source: SnapshotSource,
@@ -258,7 +258,7 @@ impl Disk {
         );
         ScanIndex::load(&self.index).unwrap()
     }
-    fn records(&self) -> usize {
+    pub(super) fn records(&self) -> usize {
         std::fs::read_dir(crate::durable_tail_store::store_dir_for_index(&self.index))
             .map_or(0, |entries| entries.count())
     }
@@ -327,7 +327,7 @@ fn compare_claude(
     )
 }
 
-fn claude_pages(
+pub(super) fn claude_pages(
     c: &Corpus,
     retained: &E2ScanFixture,
     restart: &E2ScanFixture,
