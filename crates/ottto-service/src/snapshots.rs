@@ -50932,7 +50932,7 @@ impl ScanIndex {
             active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),
             file_upload_context_enabled: self.file_upload_context_enabled,
             mixed_context_view: self.mixed_context_view.clone(),
-            context_read_counts: self.context_read_counts,
+            context_read_counts: self.context_read_counts.clone(),
             active_effective_upload_body_witness_revision: self
                 .active_effective_upload_body_witness_revision,
             active_effective_upload_body_witness_revision_monotone: self
