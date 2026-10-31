@@ -453,36 +453,24 @@ fn the_always_on_sampled_scope_keeps_the_permit_era_bytes() {
     use crate::snapshots::claude_request_identity::captures;
     let witness = [3u8; 32];
     let index_path = Path::new("/tmp/ottto-continuation-scope-index.json");
-    for (source, curve, golden) in [
+    // The retired curve flag stays in the scope as a literal `false`.
+    for (source, golden) in [
         (
             SnapshotSource::ClaudeCode,
-            false,
             "c58cf74dc52ebcdb56cce301dde881fac71e0045ddf127d0137ed7d16b80ae55",
         ),
         (
-            SnapshotSource::ClaudeCode,
-            true,
-            "2d63534231ce46641c37958033fe49bdfb683d2592f1648ddd715ac412022292",
-        ),
-        (
             SnapshotSource::Codex,
-            false,
             "26648c9996bbbd2102f21bab2bd0a6c2fc6a522bb3b159ba6869d5c645d9df04",
-        ),
-        (
-            SnapshotSource::Codex,
-            true,
-            "a9cd90d380262e8c616ed6ff63cb6bbc1b568a8b375526a90b32a94f6537103d",
         ),
     ] {
         let scope = cycle_sampled_scope(
             &witness,
             CONTINUATION_NAMESPACE,
             index_path,
-            curve,
             captures(source),
         );
-        assert_eq!(scope.0, golden, "{source:?} curve={curve}");
+        assert_eq!(scope.0, golden, "{source:?}");
     }
 }
 
