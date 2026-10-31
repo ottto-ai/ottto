@@ -238,9 +238,6 @@ fn read_control<T: serde::de::DeserializeOwned + Serialize>(
     Ok(value)
 }
 
-pub(super) fn merge_cas(tx: &mut dyn Transaction, working: &mut ScanIndex) -> Result<()> {
-    merge_cas_at(tx, working, working.generation)
-}
 pub(super) fn merge_cas_at(
     tx: &mut dyn Transaction,
     working: &mut ScanIndex,

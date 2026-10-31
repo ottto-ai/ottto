@@ -576,19 +576,11 @@ pub(in super::super) fn save_locked(
     progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
     custody: bool,
 ) -> Result<bool> {
-    save_with_custody(
-        path,
-        index,
-        &ClaudeMapper,
-        claim_only,
-        progress_owner,
-        custody,
-    )
+    save_with_custody(path, index, claim_only, progress_owner, custody)
 }
-fn save_with_custody<M: Mapper>(
+fn save_with_custody(
     path: &Path,
     index: &mut ScanIndex,
-    mapper: &M,
     claim_only: bool,
     progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
     custody: bool,
@@ -639,51 +631,26 @@ fn save_with_custody<M: Mapper>(
                     path,
                     owner,
                 )?;
-                let save = if claim_only {
-                    M::save_claim_delta
-                } else {
-                    M::save_delta
-                };
-                let save_result = save(
-                    mapper,
+                ClaudeMapper.save(
                     &mut session.db,
                     &identity,
                     &previous,
                     index,
                     &mut session.cx,
-                );
-                if save_result? {
-                    session.stamp = session.db.stamp()?;
-                    // Only a freshly committed replacement/finish resolves the
-                    // failed key. Unrelated saves and elapsed backoff never do.
-                    state.resume_excluded.retain(|key, excluded| {
-                        session
-                            .cx
-                            .committed
-                            .get(key)
-                            .map_or(!excluded.had_ref, |checkpoint| {
-                                checkpoint.file_generation <= excluded.failed_generation
-                            })
-                    });
-                    state.cached = Some(index.clone());
-                    state.saved_page(session.db.save_over_target(), claim_only);
-                    return Ok(true);
-                }
-                mapper.preflight(index).map_err(|_| Hold::DbUnavailable)?;
-                state.cached = None;
-                let mut tx = session.db.begin(TxnMode::Write)?;
-                // Identity is independently authenticated; generation is atomically
-                // compared again by commit. Hold comparisons remain mapper-owned.
-                mapper.merge_cas(&mut tx, index)?;
-                if !claim_only {
-                    index.retire_committed_claude_account_pending_windows();
-                }
-                lenient_check(index)?;
-                let previous = index.generation;
-                let next = previous.checked_add(1).ok_or(Hold::DbUnavailable)?;
-                mapper.delta(&mut tx, index)?;
-                apply_outcome(index, &mut session.reload, tx.commit(previous, next))?;
+                    claim_only,
+                )?;
                 session.stamp = session.db.stamp()?;
+                // Only a freshly committed replacement/finish resolves the
+                // failed key. Unrelated saves and elapsed backoff never do.
+                state.resume_excluded.retain(|key, excluded| {
+                    session
+                        .cx
+                        .committed
+                        .get(key)
+                        .map_or(!excluded.had_ref, |checkpoint| {
+                            checkpoint.file_generation <= excluded.failed_generation
+                        })
+                });
                 // Publish only the complete, unambiguously committed graph.
                 state.cached = Some(index.clone());
                 state.saved_page(session.db.save_over_target(), claim_only);
@@ -759,32 +726,6 @@ fn save_with_custody<M: Mapper>(
     }
     result
 }
-fn lenient_check(index: &ScanIndex) -> Result<()> {
-    super::super::lenient_decode::check_held_output(index)
-}
-fn apply_outcome(
-    index: &mut ScanIndex,
-    reload: &mut bool,
-    outcome: DurableCommitOutcome,
-) -> Result<()> {
-    match outcome {
-        DurableCommitOutcome::Committed(g) => {
-            index.generation = g;
-            Ok(())
-        }
-        DurableCommitOutcome::NotPublished => bail!("state_v2_not_published"),
-        DurableCommitOutcome::Published(g) => {
-            index.generation = g;
-            *reload = true;
-            bail!("current_index_requires_reload");
-        }
-        DurableCommitOutcome::Ambiguous => {
-            *reload = true;
-            bail!("current_index_requires_reload");
-        }
-    }
-}
-
 pub(in super::super) fn guard_containment_locked(path: &Path) -> Result<()> {
     if binding(path).is_none() || !route_needed(path, false, published(path)?)? {
         return Ok(());

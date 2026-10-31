@@ -95,11 +95,7 @@ pub(super) trait Mapper {
         value: &dyn Value,
         refs: &mut dyn FnMut(&RowKey) -> Result<()>,
     ) -> Result<()>;
-    fn inventory(&self, path: &Path) -> std::result::Result<(), Pause>;
-    fn inventory_context(&self, path: &Path) -> std::result::Result<Option<Original>, Pause> {
-        self.inventory(path)?;
-        Ok(None)
-    }
+    fn inventory_context(&self, path: &Path) -> std::result::Result<Option<Original>, Pause>;
     fn preflight(&self, index: &ScanIndex) -> std::result::Result<(), Pause>;
     fn import_generation(&self, index: &ScanIndex) -> Result<u64> {
         Ok(index.generation)
@@ -113,41 +109,7 @@ pub(super) trait Mapper {
     /// Read every semantic row through Transaction::read_value, verifying
     /// value digests while decoding. Never return
     /// a partially hydrated graph or normalize unknown raw holds away.
-    fn hydrate<S: Store>(&self, store: &mut S) -> Result<ScanIndex>;
-    fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
-        Ok((self.hydrate(store)?, KindCx::default()))
-    }
-    /// Uses the SAME claim maxima/hold and repair comparisons as v1; the
-    /// adapter streams current custody through txn, without a second graph.
-    fn merge_cas<T: Transaction>(&self, txn: &mut T, index: &mut ScanIndex) -> Result<()>;
-    /// Emit the complete dirty delta against the resident header map. Saves
-    /// above 5k rows / 32 MiB reduce the next collection page; the whole save
-    /// rolls back at its hard ceiling. More than 64 account windows is an alarm, never
-    /// permission to drop unsettled custody. KEEP persisted shared refs: decode
-    /// only each changed row's old refs, diff against new refs, adjust/reclaim
-    /// in this transaction. Never perform whole-history GC during a save.
-    fn delta<T: Transaction>(&self, txn: &mut T, index: &ScanIndex) -> Result<()>;
-    fn save_delta(
-        &self,
-        db: &mut sqlite::Sqlite,
-        identity: &Identity,
-        prev: &ScanIndex,
-        index: &mut ScanIndex,
-        cx: &mut KindCx,
-    ) -> Result<bool> {
-        let _ = (db, identity, prev, index, cx);
-        Ok(false)
-    }
-    fn save_claim_delta(
-        &self,
-        db: &mut sqlite::Sqlite,
-        identity: &Identity,
-        prev: &ScanIndex,
-        index: &mut ScanIndex,
-        cx: &mut KindCx,
-    ) -> Result<bool> {
-        self.save_delta(db, identity, prev, index, cx)
-    }
+    fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)>;
 }
 /// Composed semantic mapper. The default NoResumeHooks refuses conversion
 /// until M3 installs the source owner's immutable-record staging adapter.
@@ -166,9 +128,6 @@ impl Mapper for ClaudeMapper {
         paths: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<()> {
         kinds::private_paths(header, value, paths)
-    }
-    fn inventory(&self, path: &Path) -> std::result::Result<(), Pause> {
-        Original::read(path).map(|_| ())
     }
     fn inventory_context(&self, path: &Path) -> std::result::Result<Option<Original>, Pause> {
         Original::read(path).map(Some)
@@ -214,9 +173,6 @@ impl Mapper for ClaudeMapper {
         let mut tx = store.begin(TxnMode::Read)?;
         verify_normalized_at(&mut tx, index, original, identity.binding, generation)
     }
-    fn hydrate<S: Store>(&self, store: &mut S) -> Result<ScanIndex> {
-        self.hydrate_context(store).map(|(index, _)| index)
-    }
     fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
         let mut tx = store.begin(TxnMode::Read)?;
         let header = tx
@@ -232,71 +188,24 @@ impl Mapper for ClaudeMapper {
         );
         kinds::hydrate_txn(&mut tx, identity.binding)
     }
-    fn merge_cas<T: Transaction>(&self, tx: &mut T, index: &mut ScanIndex) -> Result<()> {
-        kinds_misc::merge_cas(tx, index)?;
-        kinds_files::merge_growth_cas(tx, index)
-    }
-    fn delta<T: Transaction>(&self, _: &mut T, _: &ScanIndex) -> Result<()> {
-        // Production saves use save_delta with their resident committed context.
-        // The generic fallback is for mappers without semantic row ownership.
-        bail!(Hold::ReloadRequired)
-    }
-    fn save_delta(
-        &self,
-        db: &mut sqlite::Sqlite,
-        identity: &Identity,
-        prev: &ScanIndex,
-        index: &mut ScanIndex,
-        cx: &mut KindCx,
-    ) -> Result<bool> {
-        self.save_admitted(
-            db,
-            identity,
-            prev,
-            index,
-            cx,
-            SaveOptions {
-                hooks: &mut kinds_files::NoResumeHooks,
-                claim_only: false,
-            },
-        )?;
-        Ok(true)
-    }
-    fn save_claim_delta(
-        &self,
-        db: &mut sqlite::Sqlite,
-        identity: &Identity,
-        prev: &ScanIndex,
-        index: &mut ScanIndex,
-        cx: &mut KindCx,
-    ) -> Result<bool> {
-        self.save_admitted(
-            db,
-            identity,
-            prev,
-            index,
-            cx,
-            SaveOptions {
-                hooks: &mut kinds_files::NoResumeHooks,
-                claim_only: true,
-            },
-        )?;
-        Ok(true)
-    }
-}
-struct SaveOptions<'a> {
-    hooks: &'a mut dyn kinds_files::ResumeHooks,
-    claim_only: bool,
 }
 impl ClaudeMapper {
-    fn save_admitted(
+    /// The one production save: merge current CAS custody, then run the
+    /// semantic delta under the resident committed context. Emit the complete
+    /// dirty delta against the resident header map. Saves above 5k rows /
+    /// 32 MiB reduce the next collection page; the whole save rolls back at its
+    /// hard ceiling. More than 64 account windows is an alarm, never permission
+    /// to drop unsettled custody. KEEP persisted shared refs: decode only each
+    /// changed row's old refs, diff against new refs, adjust/reclaim in this
+    /// transaction. Never perform whole-history GC during a save.
+    pub(super) fn save(
         &self,
         db: &mut sqlite::Sqlite,
         identity: &Identity,
         prev: &ScanIndex,
         next: &mut ScanIndex,
         cx: &mut KindCx,
-        options: SaveOptions<'_>,
+        claim_only: bool,
     ) -> Result<()> {
         {
             let mut tx = db.begin(TxnMode::Read)?;
@@ -307,11 +216,18 @@ impl ClaudeMapper {
             next,
             super::super::sampled_scan::now_seconds(),
         );
-        if !options.claim_only {
+        if !claim_only {
             next.retire_committed_claude_account_pending_windows();
         }
         super::super::lenient_decode::check_held_output(next)?;
-        kinds::save_graph(db, identity, prev, next, cx, options.hooks)
+        kinds::save_graph(
+            db,
+            identity,
+            prev,
+            next,
+            cx,
+            &mut kinds_files::NoResumeHooks,
+        )
     }
 }
 
@@ -1253,7 +1169,7 @@ mod application_cases {
             let stored = mapper::bytes(&mut tx, &header).unwrap();
             assert_eq!(codec::expand(&stored, value_cap(&key)).unwrap(), expected);
             drop(tx);
-            let restored = ClaudeMapper.hydrate(&mut db).unwrap();
+            let restored = ClaudeMapper.hydrate_context(&mut db).unwrap().0;
             assert_eq!(serde_json::to_vec(&restored.traversal).unwrap(), expected);
             original.capture_progress(&c.path).unwrap();
             original.preserve(&c.path).unwrap();

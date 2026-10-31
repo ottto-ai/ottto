@@ -360,7 +360,8 @@ fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quar
         .remove(&"b".repeat(64));
     working.v2_mut().growth_retention.clear();
     let mut tx = db.begin(TxnMode::Read).unwrap();
-    kinds_misc::merge_cas(&mut tx, &mut working).unwrap();
+    let generation = working.generation;
+    kinds_misc::merge_cas_at(&mut tx, &mut working, generation).unwrap();
     kinds_files::merge_growth_cas(&mut tx, &mut working).unwrap();
     assert_eq!(
         working.quarantined_snapshot_fingerprints[&key].contract_retry_claims,
@@ -374,8 +375,7 @@ fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quar
             ["last_growth_full_unix"],
         20
     );
-    working.generation += 1;
-    assert!(kinds_misc::merge_cas(&mut tx, &mut working).is_err());
+    assert!(kinds_misc::merge_cas_at(&mut tx, &mut working, generation + 1).is_err());
 }
 /// [money] growth raw hold survives composed hydration and cas cannot release it.
 #[test]
@@ -409,9 +409,10 @@ fn growth_raw_hold_survives_composed_hydration_and_cas_cannot_release_it() {
         assert!(working.decode_holds.same_as(&index.decode_holds));
         assert_eq!(working.decode_holds.v2_provenance(), (19, 3));
         let mut tx = db.begin(TxnMode::Read).unwrap();
-        kinds_misc::merge_cas(&mut tx, &mut working).unwrap();
+        let generation = working.generation;
+        kinds_misc::merge_cas_at(&mut tx, &mut working, generation).unwrap();
         working.decode_holds = Default::default();
-        assert!(kinds_misc::merge_cas(&mut tx, &mut working).is_err());
+        assert!(kinds_misc::merge_cas_at(&mut tx, &mut working, generation).is_err());
     }
 }
 

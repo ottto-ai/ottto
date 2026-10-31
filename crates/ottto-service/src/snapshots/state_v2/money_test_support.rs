@@ -68,7 +68,7 @@ pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
 /// Preserve v2-only debt and raw holds through the composed store as well.
 pub(in super::super) fn roundtrip_rows(index: &ScanIndex, path: &Path) -> ScanIndex {
     let mut db = populate(path, index, BTreeMap::new());
-    import::ClaudeMapper.hydrate(&mut db).unwrap()
+    import::ClaudeMapper.hydrate_context(&mut db).unwrap().0
 }
 
 use import::Mapper;
