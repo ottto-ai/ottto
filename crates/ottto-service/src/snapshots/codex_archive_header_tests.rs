@@ -1114,17 +1114,29 @@ fn finish_selector(scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
     finish_selector_with(scan, |_| {})
 }
 
+fn finish_selector_at(scan: OwnedSourceScan, checkpoint: &Path) -> (ScanIndex, SourceScanResult) {
+    finish_selector_checkpoint(scan, |_| {}, Some(checkpoint))
+}
 fn finish_selector_with(
+    scan: OwnedSourceScan,
+    observe: impl FnMut(&OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult) {
+    finish_selector_checkpoint(scan, observe, None)
+}
+fn finish_selector_checkpoint(
     mut scan: OwnedSourceScan,
     mut observe: impl FnMut(&OwnedSourceScan),
+    checkpoint: Option<&Path>,
 ) -> (ScanIndex, SourceScanResult) {
     let mut committed = scan.index.clone();
     // A valid committed index: the strict decoder refuses a bare `{}`.
     let reservation = fixture(&serde_json::to_vec(&committed).unwrap(), ".json");
-    for _ in 0..1000 {
+    let checkpoint = checkpoint.unwrap_or(&reservation.0);
+    // The large-line paging driver must reach EOF through all native yields.
+    for _ in 0..10000 {
         match scan.step(None) {
             OwnedSourceScanStep::Pending(mut next) => {
-                next.persist_archive_reservation(&mut committed, &reservation.0)
+                next.persist_archive_reservation(&mut committed, checkpoint)
                     .unwrap();
                 observe(&next);
                 scan = next;
@@ -1970,7 +1982,7 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
                 );
                 scan.index.archive_pass.power = false;
                 scan.index.archive_pass.cpu = 30_000_000;
-                finish_selector(scan)
+                finish_selector_at(scan, &saved)
             })
         });
     assert_eq!(
@@ -2004,7 +2016,7 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
                     )
                     .with_sampled_acquisition(cache.clone(), Scope("activation-held-debt".into()));
                     archive_power(&mut scan.index.archive_pass, true);
-                    finish_selector(scan)
+                    finish_selector_at(scan, &saved)
                 })
             });
         assert_eq!(

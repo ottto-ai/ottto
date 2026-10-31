@@ -1746,22 +1746,24 @@ pub(in crate::snapshots) mod tests {
         let reservation_path = f.0.parent().unwrap().join("reservation.json");
         fs::write(&reservation_path, serde_json::to_vec(&committed).unwrap()).unwrap();
         let ((index, result), diagnostics) = crate::local_resource_diagnostics::capture(|| {
-            let mut scan = OwnedSourceScan::new(
-                SnapshotSource::Codex,
-                roots,
+            // Exercise the existing native inventory/classification prelude;
+            // setting codex_join_prepared without it now correctly denies Full.
+            let mut scan = selector_scan(
+                f,
                 index,
-                NOW,
-                BACKFILL_WINDOW_DAYS,
-                10,
-                false,
-                None,
-                &[],
-                false,
+                cache
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(sampled_scan::SharedCache::default())),
+                VecDeque::from([f.candidate()]),
                 true,
             )
             .with_line_observer("archive", Box::new(ends.clone()));
+            scan.roots = roots.to_vec();
             if let Some(cache) = cache {
                 scan = scan.with_sampled_acquisition(cache, Scope("archive-test".into()));
+            } else {
+                scan.sampling = None;
+                scan.durable_guard = None;
             }
             // Deterministic A1 permission; corrections need the explicit A3
             // permission fixture, independently of the host's actual power.
@@ -1776,7 +1778,6 @@ pub(in crate::snapshots) mod tests {
             scan.census
                 .observed_index_keys
                 .insert(local_index_key(&f.0));
-            scan.codex_join_prepared = true;
             scan.census_unix_seconds = None;
             setup(&mut scan);
             for _ in 0..1000 {
@@ -2830,27 +2831,8 @@ pub(in crate::snapshots) mod tests {
         cache: Arc<sampled_scan::SharedCache>,
         setup: impl FnOnce(&mut OwnedSourceScan),
     ) -> OwnedSourceScan {
-        let mut scan = OwnedSourceScan::new(
-            SnapshotSource::Codex,
-            &[],
-            index,
-            NOW,
-            BACKFILL_WINDOW_DAYS,
-            10,
-            false,
-            None,
-            &[],
-            false,
-            true,
-        )
-        .with_sampled_acquisition(cache, Scope("archive-test".into()));
-        archive_power(&mut scan.index.archive_pass, true); // synthetic pacing permission
-        scan.identified_candidates = VecDeque::from([f.candidate()]);
-        scan.census
-            .observed_index_keys
-            .insert(local_index_key(&f.0));
-        scan.codex_join_prepared = true;
-        scan.census_unix_seconds = None;
+        let mut scan = selector_scan(f, index, cache, VecDeque::from([f.candidate()]), true);
+        // Keep the actual inventory and reserved first-read boundary intact.
         setup(&mut scan);
         for _ in 0..1000 {
             scan = match scan.step(None) {

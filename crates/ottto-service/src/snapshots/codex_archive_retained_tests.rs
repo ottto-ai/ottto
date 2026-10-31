@@ -656,11 +656,12 @@ fn compressed_retained_save_never_writes_a_durable_record() {
     let writer = crate::locked_state_dir::test_locks::hold(f.0.parent().unwrap());
     let namespace = Scope("archive-ram-only".into());
     cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, false);
-    let (mut index, result) = finish_selector(retained_archive_scan(
-        &f,
-        ScanIndex::default(),
-        cache.clone(),
-    ));
+    let mut committed = ScanIndex::default();
+    committed.save(&index_path).unwrap();
+    let (mut index, result) = finish_selector_at(
+        retained_archive_scan(&f, committed, cache.clone()),
+        &index_path,
+    );
     assert_eq!(result.snapshots.len(), 1);
     let key = local_index_key(&f.0);
     assert!(cache.retained_checkpoint(&key).unwrap().is_compressed());

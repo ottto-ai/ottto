@@ -101,7 +101,8 @@ fn archive_replacement_requires_equal_session_and_accepted_identity_superset() {
             )
             .unwrap();
         // Same bytes through the ordinary native reader are the cold money
-        // oracle; this also compares complete emitted placement fields.
+        // oracle. Placement absence is compared too; this is reader parity,
+        // not a tagged-account or selector-level Replace positive control.
         fs::write(&plain, &extended).unwrap();
         let mut cold_parser = codex_parser(OpenedInput::plain(File::open(&plain).unwrap()), &plain);
         let cold_identity =
@@ -261,19 +262,24 @@ fn accepted_plain_superset_settles_archive_dominated_without_upload() {
     use super::super::sampled_scan::transition_fixture::{money_oracle, scan_money, Accepted};
     for divergent in [false, true] {
         let bytes = synthetic_rollout();
-        let subset = String::from_utf8(bytes.clone())
+        let mut archive_rows: Vec<Value> = String::from_utf8(bytes.clone())
             .unwrap()
             .lines()
             .take(3)
-            .map(|line| line.to_owned() + "\n")
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        if divergent {
+            for (row, n) in archive_rows[1..].iter_mut().zip([50_u64, 70]) {
+                let usage =
+                    json!({"input_tokens":n,"cached_input_tokens":n/2,"output_tokens":n/10});
+                row["payload"]["info"]["total_token_usage"] = usage.clone();
+                row["payload"]["info"]["last_token_usage"] = usage;
+            }
+        }
+        let subset = archive_rows
+            .iter()
+            .map(|row| row.to_string() + "\n")
             .collect::<String>();
-        let subset = if divergent {
-            // Observed resumed shape: larger later cumulative counters cannot
-            // cover the earlier responses when last_token_usage excludes the base.
-            subset.replace(":100", ":50").replace(":250", ":70")
-        } else {
-            subset
-        };
         let f = ArchiveFixture::new(&zstd::stream::encode_all(subset.as_bytes(), 1).unwrap());
         let plain = f.0.with_extension("");
         let mut plain_rows: Vec<Value> = String::from_utf8(bytes)
@@ -283,6 +289,30 @@ fn accepted_plain_superset_settles_archive_dominated_without_upload() {
             .collect();
         if divergent {
             plain_rows[0]["payload"]["history_base"] = json!({"thread_id":"compressed-fixture"});
+            // Nonzero inherited base + local running usage, on every component.
+            // Last-response counters stay unchanged, so emitted input stays750.
+            for (field, base) in [
+                ("input_tokens", 1000_u64),
+                ("cached_input_tokens", 500),
+                ("output_tokens", 100),
+            ] {
+                let mut cumulative = base;
+                for row in &mut plain_rows[1..] {
+                    cumulative += row["payload"]["info"]["last_token_usage"][field]
+                        .as_u64()
+                        .unwrap();
+                    row["payload"]["info"]["total_token_usage"][field] = json!(cumulative);
+                }
+                assert!(
+                    plain_rows[1]["payload"]["info"]["total_token_usage"][field]
+                        .as_u64()
+                        .unwrap()
+                        >= archive_rows.last().unwrap()["payload"]["info"]["total_token_usage"]
+                            [field]
+                            .as_u64()
+                            .unwrap()
+                );
+            }
         }
         fs::write(
             &plain,
@@ -320,6 +350,33 @@ fn accepted_plain_superset_settles_archive_dominated_without_upload() {
         prior
             .accepted
             .insert("compressed-fixture".into(), accepted_body.clone());
+        // An independent ordinary Full supplies the emitted sibling oracle.
+        // It must keep flowing beside held/terminal archive custody.
+        let sibling = plain.parent().unwrap().join("rollout-healthy.jsonl");
+        fs::write(
+            &sibling,
+            String::from_utf8(synthetic_rollout())
+                .unwrap()
+                .replace("compressed-fixture", "healthy"),
+        )
+        .unwrap();
+        let sibling_key = local_index_key(&sibling);
+        let mut healthy = super::super::codex_zst_refusal_tests::candidate(&sibling);
+        healthy.size_bytes = fs::metadata(&sibling).unwrap().len();
+        let mut cold_scan = selector_scan(
+            &f,
+            ScanIndex::default(),
+            Arc::new(sampled_scan::SharedCache::default()),
+            VecDeque::from([healthy.clone()]),
+            true,
+        );
+        cold_scan.state_census_complete = true;
+        cold_scan.sidecar_census_complete = true;
+        let (cold_index, cold_output) = finish_selector(cold_scan);
+        assert_eq!(cold_output.snapshots.len(), 1);
+        assert_eq!(cold_output.snapshots[0].input_tokens, 750);
+        let cold_sibling = scan_money(SnapshotSource::Codex, &cold_index, &cold_output);
+        let committed = index.clone();
         let key = local_index_key(&f.0);
         let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
         evidence.header_validated =
@@ -337,17 +394,15 @@ fn accepted_plain_superset_settles_archive_dominated_without_upload() {
                 &f,
                 index,
                 cache,
-                VecDeque::from([member, f.candidate()]),
+                VecDeque::from([member, healthy, f.candidate()]),
                 true,
             );
             scan.state_census_complete = true;
             scan.sidecar_census_complete = true;
             finish_selector(scan)
         });
-        assert!(
-            result.snapshots.is_empty(),
-            "subset cannot replace or add usage"
-        );
+        assert_eq!(result.snapshots.len(), 1, "only the healthy sibling emits");
+        assert_eq!(result.snapshots[0].source_session_id, "healthy");
         let mut held = scan_money(SnapshotSource::Codex, &index, &result);
         held.accepted.insert(
             "compressed-fixture".into(),
@@ -359,8 +414,27 @@ fn accepted_plain_superset_settles_archive_dominated_without_upload() {
                     .unwrap(),
             },
         );
-        money_oracle::assert_held("compressed-fixture", &prior, &held, &prior);
-        money_oracle::assert_no_smaller_reemit("compressed-fixture", &prior, &held, &prior, true);
+        // Scope the global per-file diagnostic inventory to the independently
+        // scanned sibling; held-owner head/body evidence is checked below.
+        held.codex_evidence["TierReplay"]
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| key == &sibling_key);
+        assert_eq!(
+            held.codex_evidence["TierReplay"].as_object().unwrap().len(),
+            1
+        );
+        if divergent {
+            money_oracle::assert_held("compressed-fixture", &prior, &held, &cold_sibling);
+        } else {
+            money_oracle::assert_no_smaller_reemit(
+                "compressed-fixture",
+                &prior,
+                &held,
+                &cold_sibling,
+                true,
+            );
+        }
         let archive = index.files[&key].archive.as_ref().unwrap();
         if divergent {
             assert_eq!(
@@ -398,7 +472,16 @@ fn accepted_plain_superset_settles_archive_dominated_without_upload() {
         let ((saved, quiet), rows) = crate::local_resource_diagnostics::capture(|| {
             finish_selector(retained_archive_scan(
                 &f,
-                checkpoint(&index),
+                serde_json::from_slice(
+                    &serde_json::to_vec(&index.committable_subset_with_local_holds(
+                        &committed,
+                        &BTreeSet::new(),
+                        &BTreeMap::new(),
+                        &BTreeSet::new(),
+                    ))
+                    .unwrap(),
+                )
+                .unwrap(),
                 Arc::new(sampled_scan::SharedCache::default()),
             ))
         });
@@ -424,7 +507,16 @@ fn accepted_plain_superset_settles_archive_dominated_without_upload() {
         money_oracle::assert_held("compressed-fixture", &prior, &quiet_route, &prior);
         assert_eq!(decoded_archive_bytes(&rows), 0);
         assert!(saved.accepted_snapshot_fingerprints.contains(&ack));
-        if !divergent {
+        if divergent {
+            assert_eq!(
+                saved.files[&key].codex_compressed_hold,
+                Some(CodexZstCause::ArchiveEquivalenceUnproven)
+            );
+            assert!(matches!(
+                saved.files[&key].archive.as_ref().unwrap().disposition,
+                ArchiveDisposition::Pending { .. }
+            ));
+        } else {
             assert!(matches!(
                 saved.files[&key].archive.as_ref().unwrap().disposition,
                 ArchiveDisposition::Refused {
