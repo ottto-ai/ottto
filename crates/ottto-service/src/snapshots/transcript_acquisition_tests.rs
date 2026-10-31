@@ -4387,6 +4387,8 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
+    use crate::durable_tail_store as store;
+
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(crate::heap_layout_bound::layout_supported());
     // Match OwnedSourceScan::new capture mode for both sources.
