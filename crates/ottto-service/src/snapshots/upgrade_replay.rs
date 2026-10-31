@@ -46,22 +46,90 @@ impl crate::heap_layout_bound::HeapLayoutBound for KeyHash {
     }
 }
 #[derive(Debug, Default, Serialize)]
-pub(super) struct State {
+pub(super) struct Ledger {
     replayed: BTreeMap<String, BTreeSet<KeyHash>>,
     closed: bool,
     // A ticket is usable only in the process that saved the negative spend.
     #[serde(skip)]
     reservations: BTreeMap<KeyHash, (bool, bool)>, // saved, claimed
 }
-crate::heap_layout_bound::fields!(State; replayed, closed, reservations);
+crate::heap_layout_bound::fields!(Ledger; replayed, closed, reservations);
 // An index copy carries only negative evidence, never a live permission.
-impl Clone for State {
+impl Clone for Ledger {
     fn clone(&self) -> Self {
         Self {
             replayed: self.replayed.clone(),
             closed: self.closed,
             reservations: BTreeMap::new(),
         }
+    }
+}
+
+/// OFF owns no replay map roots or allocation. The optional pointer is the
+/// only inline representation; all live authority belongs to an ON ledger.
+#[derive(Clone, Debug, Default)]
+pub(super) struct State(Option<Box<Ledger>>);
+impl crate::heap_layout_bound::HeapLayoutBound for State {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        self.0.heap_bound(c)
+    }
+}
+impl State {
+    pub(super) fn refused() -> Self {
+        Self(Some(Box::new(Ledger {
+            closed: true,
+            ..Ledger::default()
+        })))
+    }
+    pub(super) fn is_empty(&self) -> bool {
+        !restart_restore::enabled()
+            || self
+                .0
+                .as_ref()
+                .map_or(true, |ledger| !ledger.closed && ledger.replayed.is_empty())
+    }
+    pub(super) fn preserve_spends_from(&mut self, other: &Self) {
+        if restart_restore::enabled() {
+            if let Some(other) = &other.0 {
+                std::ops::DerefMut::deref_mut(self).preserve_spends_from(other);
+            }
+        }
+    }
+}
+impl std::ops::Deref for State {
+    type Target = Ledger;
+    fn deref(&self) -> &Ledger {
+        static EMPTY: Ledger = Ledger {
+            replayed: BTreeMap::new(),
+            closed: false,
+            reservations: BTreeMap::new(),
+        };
+        self.0.as_deref().unwrap_or(&EMPTY)
+    }
+}
+impl std::ops::DerefMut for State {
+    fn deref_mut(&mut self) -> &mut Ledger {
+        assert!(restart_restore::enabled(), "O3 ledger requires ON");
+        self.0.get_or_insert_with(Default::default)
+    }
+}
+impl Serialize for State {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        std::ops::Deref::deref(self).serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for State {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        if !restart_restore::enabled() {
+            serde::de::IgnoredAny::deserialize(deserializer)?;
+            return Ok(Self::default());
+        }
+        Ledger::deserialize(deserializer).map(|ledger| Self(Some(Box::new(ledger))))
     }
 }
 
@@ -90,7 +158,7 @@ fn unique_spends<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_map(Unique)
 }
 
-impl<'de> Deserialize<'de> for State {
+impl<'de> Deserialize<'de> for Ledger {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
@@ -131,18 +199,12 @@ impl<'de> Deserialize<'de> for State {
         })
     }
 }
-impl State {
+impl Ledger {
     fn release() -> String {
         format!(
             "upgrade_state_missing:{}",
             ottto_core::compiled_release_version()
         )
-    }
-    pub(super) fn refused() -> Self {
-        Self {
-            closed: true,
-            ..Self::default()
-        }
     }
     /// Copies carry only negative evidence. Union both checkpoint lineages so
     /// a partial/error settlement cannot mint a previously spent A5 grant.
@@ -161,9 +223,6 @@ impl State {
                 spent.insert(*key);
             }
         }
-    }
-    pub(super) fn is_empty(&self) -> bool {
-        !restart_restore::enabled() || (!self.closed && self.replayed.is_empty())
     }
     pub(super) fn upgrade_missing(&mut self, key: &str, consume: bool) -> bool {
         if self.closed {

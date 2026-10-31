@@ -684,6 +684,9 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
             sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
                 let guard = taken
                     .durable
+                    .state
+                    .as_ref()
+                    .expect("custody state")
                     .retail
                     .as_ref()
                     .expect("next-pass cold Tail requires Q11");
@@ -745,6 +748,9 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
         sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
             let guard = taken
                 .durable
+                .state
+                .as_ref()
+                .expect("custody state")
                 .retail
                 .as_ref()
                 .expect("guard BEFORE owned prepare");
@@ -799,13 +805,25 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
             let active = scan.active_file.as_ref().expect("funded persistent hold");
             assert!(active
                 .parser
+                .pending
+                .as_ref()
+                .expect("M3 parser state")
                 .pending_taken
                 .as_ref()
                 .unwrap()
                 .durable
+                .state
+                .as_ref()
+                .expect("custody state")
                 .retail
                 .is_some());
-            assert!(active.parser.pending_funding.is_some());
+            assert!(active
+                .parser
+                .pending
+                .as_ref()
+                .expect("M3 parser state")
+                .pending_funding
+                .is_some());
             assert_eq!(
                 cache.lock_poisoned_for_test(super::super::TestLock::Retained),
                 return_mode == "poison"
@@ -868,8 +886,21 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
                 .active_file
                 .as_deref_mut()
                 .expect("funded actual native owner");
-            let taken = active.parser.pending_taken.as_mut().expect("original held");
-            assert!(active.parser.pending_funding.is_some());
+            assert!(active
+                .parser
+                .pending
+                .as_ref()
+                .expect("M3 parser state")
+                .pending_funding
+                .is_some());
+            let taken = active
+                .parser
+                .pending
+                .as_mut()
+                .expect("M3 parser state")
+                .pending_taken
+                .as_mut()
+                .expect("original held");
             assert_eq!(
                 &**taken as *const _ as usize, facts.7,
                 "same original through refused return"
@@ -5945,6 +5976,9 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                 sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
                     let guard = taken
                         .durable
+                        .state
+                        .as_ref()
+                        .expect("custody state")
                         .retail
                         .as_ref()
                         .expect("custody before real ReadPlan Full");
@@ -10137,7 +10171,14 @@ fn o3_same_owner_shorter_growth_expires_pace_without_lowering_original_floor() {
     );
     assert!(custody.upgrade_started.is_none());
     assert_eq!(stores.counters.migration[2], 1);
-    assert_eq!(stores.upgrade_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        stores
+            .upgrade_reads
+            .as_ref()
+            .unwrap()
+            .load(Ordering::Relaxed),
+        1
+    );
     assert_eq!(
         stores.slots[DurableSource::ClaudeCode.slot()]
             .as_ref()
@@ -13146,80 +13187,124 @@ fn retired_missing_native_rebuild_then_successor_tails_without_double_count() {
     assert_eq!(tail.snapshots[0].input_tokens, 600);
 }
 
-/// [off=main] No-record growth follows the ordinary Full path with zero store I/O.
+/// [off=main] Empty or ON-written v3 records take ordinary Full then Tail OFF;
+/// only the approved off_v1 header dispatch can inspect the surviving record.
 #[test]
 fn off_no_record_growth_uses_ordinary_full_without_store_io() {
     // The fold is initialized before the scan driver's per-file birth setter.
     // Give that existing constructor seam the same synthetic physical birth.
     claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
-        let _off = crate::snapshots::RestartRestoreForTest::disabled();
-        let root = crate::test_scratch::ScratchDir::new("off-no-record");
-        let projects = root.join("projects");
-        std::fs::create_dir(&projects).unwrap();
-        let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
-        std::fs::write(&path, a1a_row("accepted", 100)).unwrap();
-        let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
-        let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
-        let index_path = root.join("index.json");
-        owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
-        store::test_hooks::set_before_access(Some(Box::new(|_, _| panic!("OFF store I/O"))));
-        let scan = |index| {
-            owner.scan(
-                std::slice::from_ref(&projects),
-                &root,
-                index,
-                100,
-                true,
-                &births,
-                &[],
+        for stored in [false, true] {
+            let _off = crate::snapshots::RestartRestoreForTest::disabled();
+            let root = crate::test_scratch::ScratchDir::new("off-no-record");
+            let projects = root.join("projects");
+            std::fs::create_dir(&projects).unwrap();
+            let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+            std::fs::write(&path, a1a_row("accepted", 100)).unwrap();
+            let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
+            let startup_on = stored.then(RestartRestoreForTest::enabled);
+            let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
+            let index_path = root.join("index.json");
+            owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
+            let scan = |owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
+                        index| {
+                owner.scan(
+                    std::slice::from_ref(&projects),
+                    &root,
+                    index,
+                    100,
+                    true,
+                    &births,
+                    &[],
+                )
+            };
+            let mut initial = ScanIndex::default();
+            // The real sync caller activates the current row before scanning.
+            // Revision zero would correctly veto the request-owned literal.
+            initial.activate_effective_upload_body_witness_revision(
+                crate::snapshot_sync::effective_upload_body_witness_revision(
+                    SnapshotSource::ClaudeCode,
+                ),
+            );
+            let (mut prior, mut first, modes) = scan(&owner, initial);
+            assert_eq!(modes.0, 1);
+            a1a_wire(&root, &mut prior, &mut first);
+            assert_eq!(first.snapshots[0].input_tokens, 100);
+            prior.record_accepted_snapshot_fingerprints(
+                &first
+                    .snapshots
+                    .iter()
+                    .map(|s| s.snapshot_fingerprint.clone())
+                    .collect(),
+            );
+            let dir = store::store_dir_for_index(&index_path);
+            let digest = store::key_digest(DurableSource::ClaudeCode, &local_index_key(&path));
+            let record_path = dir.join(format!(
+                "{}.rec",
+                digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ));
+            let written = fs::read(&record_path).ok();
+            if stored {
+                let bytes = written.as_ref().expect("ON wrote the native record");
+                assert_eq!(&bytes[8..10], &3u16.to_le_bytes());
+            } else {
+                assert!(written.is_none());
+            }
+            drop(startup_on);
+            let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
+            owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
+            store::test_hooks::set_before_access(Some(Box::new(move |_, phase| {
+                if !stored {
+                    panic!("OFF store I/O");
+                }
+                // The separately approved off_v1 exception may inspect headers,
+                // but it cannot restore or decode this ON-written v3 body.
+                assert_ne!(phase, "body", "OFF never reads a restart body");
+                Ok(())
+            })));
+            let (prior, quiet, modes) = scan(&owner, prior);
+            assert!(quiet.snapshots.is_empty());
+            assert_eq!(modes.0 + modes.1, 0);
+            // A present ON record supplies no acquisition/hold authority OFF.
+            // Cold growth is ordinary paced Full, then the RAM copy takes Tail.
+            owner.evict();
+            std::io::Write::write_all(
+                &mut std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+                a1a_row("growth", 200).as_bytes(),
             )
-        };
-        let mut initial = ScanIndex::default();
-        // The real sync caller activates the current row before scanning.
-        // Revision zero would correctly veto the request-owned literal.
-        initial.activate_effective_upload_body_witness_revision(
-            crate::snapshot_sync::effective_upload_body_witness_revision(
-                SnapshotSource::ClaudeCode,
-            ),
-        );
-        let (mut prior, mut first, modes) = scan(initial);
-        assert_eq!(modes.0, 1);
-        a1a_wire(&root, &mut prior, &mut first);
-        assert_eq!(first.snapshots[0].input_tokens, 100);
-        prior.record_accepted_snapshot_fingerprints(
-            &first
-                .snapshots
-                .iter()
-                .map(|s| s.snapshot_fingerprint.clone())
-                .collect(),
-        );
-        let (prior, quiet, modes) = scan(prior);
-        assert!(quiet.snapshots.is_empty());
-        assert_eq!(modes.0 + modes.1, 0);
-        // The binding OFF proof is cold growth without a durable record.
-        // Discard the initial scan's ordinary RAM reduction, as on restart.
-        owner.evict();
-        std::io::Write::write_all(
-            &mut std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap(),
-            a1a_row("growth", 200).as_bytes(),
-        )
-        .unwrap();
-        let (mut prior, mut grown, modes) = scan(prior);
-        store::test_hooks::set_before_access(None);
-        assert_eq!(modes.0, 1);
-        assert_eq!(modes.1, 0);
-        a1a_wire(&root, &mut prior, &mut grown);
-        assert_eq!(grown.snapshots[0].input_tokens, 300);
-        let (_, disk) = owner
-            .cache
-            .durable_counters(SnapshotSource::ClaudeCode)
-            .expect("begin_durable configures an inert OFF slot");
-        // Includes reads, writes, GC, guards, repairs and resource probes.
-        assert_eq!(disk, store::StoreCounters::default());
-        assert!(!store::store_dir_for_index(&index_path).exists());
+            .unwrap();
+            let (mut prior, mut grown, modes) = scan(&owner, prior);
+            assert_eq!(modes.0, 1);
+            assert_eq!(modes.1, 0);
+            a1a_wire(&root, &mut prior, &mut grown);
+            assert_eq!(grown.snapshots[0].input_tokens, 300);
+            if let Some((counts, disk)) = owner.cache.durable_counters(SnapshotSource::ClaudeCode) {
+                assert_eq!(counts.restore_attempts, 0);
+                assert_eq!(disk.records_read, 0);
+                assert_eq!(disk.bytes_read, 0);
+                assert_eq!(disk.off_v1_invalidated, 0);
+                assert_eq!(disk.mode_repaired, 0);
+            }
+            std::io::Write::write_all(
+                &mut fs::OpenOptions::new().append(true).open(&path).unwrap(),
+                a1a_row("tail", 300).as_bytes(),
+            )
+            .unwrap();
+            let (_, tail, modes) = scan(&owner, prior);
+            assert_eq!((modes.0, modes.1), (0, 1));
+            assert_eq!(tail.snapshots[0].input_tokens, 600);
+            store::test_hooks::set_before_access(None);
+            assert_eq!(fs::read(&record_path).ok(), written);
+            if !stored {
+                assert!(!dir.exists());
+            }
+        }
     });
 }
 

@@ -192,7 +192,9 @@ pub(crate) struct SharedCache {
     /// held while taking another. Not part of the state budget: bounded by
     /// `durable_tail::STORES_RESIDENT_BOUND` and never walked.
     #[cfg(unix)]
-    durable: Mutex<durable_tail::Stores>,
+    durable: Mutex<durable_tail::StoreRoot>,
+    #[cfg(unix)]
+    durable_bytes: std::sync::atomic::AtomicUsize,
 }
 impl Default for SharedCache {
     fn default() -> Self {
@@ -202,7 +204,9 @@ impl Default for SharedCache {
             cursor: Mutex::new(codex_cursor::CursorState::default()),
             side: Mutex::new(side_ledger::SideLedger::default()),
             #[cfg(unix)]
-            durable: Mutex::new(durable_tail::Stores::default()),
+            durable: Mutex::new(durable_tail::StoreRoot::default()),
+            #[cfg(unix)]
+            durable_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -229,7 +233,7 @@ impl HeapLayoutBound for SharedCache {
         // every copy budget. The ledger's whole heap is this proved constant;
         // its inline tables are inside `size_of::<SharedCache>()`, which the
         // caller's `bound` (or `Arc`) charges once (D5′ size test).
-        c.add(side_ledger::SIDE_LEDGER_BYTES)
+        c.add(side_ledger::SIDE_LEDGER_BYTES.checked_add(self.durable_root_charge())?)
     }
 }
 #[cfg(test)]
@@ -241,6 +245,30 @@ impl SharedCache {
     }
 }
 
+// Qualified 64-bit main root: Stores 18,272 B, complete SharedCache 40,784 B.
+// Keep its reservation while OFF, even though optional M3 owners now allocate
+// only for ON or the approved erasure/invalidation actions.
+const OFF_MAIN_SHARED_BYTES: usize = 40_784;
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<SharedCache>() <= OFF_MAIN_SHARED_BYTES);
+impl SharedCache {
+    // Main's Stores root reservation on the qualified 64-bit toolchains.
+    // This is conservative when OFF's optional owner is absent; every real
+    // ON/exception allocation is added as well, without taking a leaf lock.
+    fn durable_root_charge(&self) -> usize {
+        #[cfg(unix)]
+        {
+            OFF_MAIN_SHARED_BYTES.saturating_sub(size_of::<SharedCache>())
+                + self
+                    .durable_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    }
+}
 impl SharedCache {
     /// The retained-copy lock. Lock order: retained, then cursor, never the
     /// reverse; never twice on one thread (both checked in debug builds).
@@ -776,7 +804,7 @@ impl OwnedSourceScan {
 /// where another implies it today.
 fn owns_no_optimization_state(active: &OwnedActiveFile) -> bool {
     active.sampling.is_none()
-        && active.parser.pending_taken.is_none()
+        && !active.parser.return_pending()
         && active.cursor.is_none()
         && active.group.is_none()
         && active.aliases.is_empty()
@@ -1089,7 +1117,8 @@ fn context_overhead(context: &Context) -> Option<usize> {
         .checked_sub(size_of::<codex_cursor::PaceTable>())?
         .checked_add(align_of::<SharedCache>())?
         .checked_add(2 * size_of::<usize>())?
-        .checked_add(side_ledger::SIDE_LEDGER_BYTES)?;
+        .checked_add(side_ledger::SIDE_LEDGER_BYTES)?
+        .checked_add(context.cache.durable_root_charge())?;
     size_of::<Context>()
         .checked_add(shared)?
         .checked_add(bound(namespace, state_bytes())?)?

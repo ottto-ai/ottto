@@ -728,6 +728,7 @@ mod tests {
     #[cfg(unix)]
     #[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]
     fn attached_retail_guard_survives_virtual_self_eviction_and_real_admission() {
+        let _on = crate::snapshots::RestartRestoreForTest::enabled();
         use crate::snapshots::{sampled_scan::SharedCache, SnapshotSource};
         use crate::transcript_acquisition::{ReadPlan, Scope};
         assert!(heap_layout_bound::layout_supported());

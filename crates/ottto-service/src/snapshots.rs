@@ -35,6 +35,10 @@ use toml_edit::{DocumentMut, Item};
 /// The chain lives in `owed` while debt exists, never also in `chain`.
 #[derive(Default)]
 pub(crate) struct DurableCustody {
+    state: Option<Box<DurableState>>,
+}
+#[derive(Default)]
+struct DurableState {
     #[cfg(unix)]
     active: Option<crate::durable_tail_store::ActiveLease>,
     #[cfg(unix)]
@@ -47,10 +51,15 @@ pub(crate) struct DurableCustody {
     #[cfg(unix)]
     upgrade: Option<sampled_scan::durable_tail::UpgradeRead>,
 }
-crate::heap_layout_bound::fields!(DurableCustody; #[cfg(unix)] active, #[cfg(unix)] chain,
+crate::heap_layout_bound::fields!(DurableCustody; state);
+crate::heap_layout_bound::fields!(DurableState; #[cfg(unix)] active, #[cfg(unix)] chain,
     #[cfg(unix)] owed, #[cfg(unix)] retail, #[cfg(unix)] upgrade);
 impl DurableCustody {
-    /// Heap owned by the optional cache box, including its allocation layout.
+    #[cfg(unix)]
+    fn state_mut(&mut self) -> &mut DurableState {
+        assert!(restart_restore::enabled(), "M3 custody requires ON");
+        self.state.get_or_insert_with(Default::default)
+    }
     pub(crate) fn retained_bytes(&self, limit: usize) -> Option<usize> {
         use crate::heap_layout_bound::{Counter, HeapLayoutBound};
         if self.is_empty() {
@@ -64,11 +73,13 @@ impl DurableCustody {
     pub(crate) fn is_empty(&self) -> bool {
         #[cfg(unix)]
         {
-            self.active.is_none()
-                && self.chain.is_none()
-                && self.owed.is_none()
-                && self.retail.is_none()
-                && self.upgrade.is_none()
+            self.state.as_ref().map_or(true, |state| {
+                state.active.is_none()
+                    && state.chain.is_none()
+                    && state.owed.is_none()
+                    && state.retail.is_none()
+                    && state.upgrade.is_none()
+            })
         }
         #[cfg(not(unix))]
         {
@@ -19435,7 +19446,9 @@ impl SnapshotAccumulator {
                 && !skills.iter().any(|seen| seen.eq_ignore_ascii_case(&name))
             {
                 skills.insert(name);
-            } else if restart_restore::enabled() && !skills.iter().any(|seen| seen.eq_ignore_ascii_case(&name)) {
+            } else if restart_restore::enabled()
+                && !skills.iter().any(|seen| seen.eq_ignore_ascii_case(&name))
+            {
                 crate::local_resource_diagnostics::skill_label_native_dropped(
                     self.source.api_slug(),
                     "activity",
@@ -29188,7 +29201,12 @@ impl OwnedSourceScan {
                 }
             }
             if let Some(mut active) = active_file.take() {
-                if let Some(taken) = active.parser.pending_taken.take() {
+                if let Some(taken) = active
+                    .parser
+                    .pending
+                    .as_mut()
+                    .and_then(|p| p.pending_taken.take())
+                {
                     let context = sampling.as_ref().expect("sampled custody owner");
                     match context
                         .cache
@@ -29196,20 +29214,25 @@ impl OwnedSourceScan {
                     {
                         Ok(()) => {
                             #[cfg(unix)]
-                            if let Some(lease) = active.parser.pending_funding.take() {
+                            if let Some(lease) = active.parser.pending_mut().pending_funding.take()
+                            {
                                 lease.release();
                             }
                             identified_candidates.push_front(active.candidate);
                         }
                         Err(taken) => {
-                            active.parser.pending_returns += 1;
-                            if active.parser.pending_returns < RETURN_ADMISSION_ATTEMPTS {
-                                active.parser.pending_taken = Some(taken);
+                            active.parser.pending_mut().pending_returns += 1;
+                            if active.parser.pending_mut().pending_returns
+                                < RETURN_ADMISSION_ATTEMPTS
+                            {
+                                active.parser.pending_mut().pending_taken = Some(taken);
                                 active_file = Some(active);
                             } else {
                                 drop(taken); // Optional graph goes before its funding.
                                 #[cfg(unix)]
-                                if let Some(lease) = active.parser.pending_funding.take() {
+                                if let Some(lease) =
+                                    active.parser.pending_mut().pending_funding.take()
+                                {
                                     lease.release();
                                 }
                                 crate::local_resource_diagnostics::durable_tail_alarm(
@@ -29546,7 +29569,11 @@ impl OwnedSourceScan {
                 if let Some(context) = sampling.as_mut().filter(|_| active.side_origin.is_none()) {
                     if let Some(plan) = active.parser.reader.acquisition.as_ref() {
                         context.record_input(plan.metrics());
-                        if std::mem::take(&mut active.parser.owed_full_after_lossy_shrink)
+                        if active
+                            .parser
+                            .pending
+                            .as_mut()
+                            .is_some_and(|p| std::mem::take(&mut p.owed_full_after_lossy_shrink))
                             && matches!(
                                 plan.mode(),
                                 crate::transcript_acquisition::ReadMode::Full(_)
@@ -34166,11 +34193,12 @@ impl OwnedSourceScan {
                                     }
                                 }
                                 Err(taken) => {
-                                    parser.pending_taken = Some(taken);
-                                    parser.pending_returns = 1;
+                                    parser.pending_mut().pending_taken = Some(taken);
+                                    parser.pending_mut().pending_returns = 1;
                                     #[cfg(unix)]
                                     {
-                                        parser.pending_funding = preparation_lease.take();
+                                        parser.pending_mut().pending_funding =
+                                            preparation_lease.take();
                                     }
                                     active_file = Some(Box::new(OwnedActiveFile {
                                         comparison_target,
@@ -34574,7 +34602,7 @@ impl OwnedSourceScan {
                                         // A marked lossy extent is not a verified prefix.
                                         // Re-read the due body; S2 and the Full-start
                                         // store guard still fence preparation/publication.
-                                        parser.owed_full_after_lossy_shrink = true;
+                                        parser.pending_mut().owed_full_after_lossy_shrink = true;
                                         resource_probe.full_causes.owed_full_after_lossy_shrink =
                                             resource_probe.full_causes.owed_full_after_lossy_shrink.saturating_add(1);
                                         (None, taken_admission, debt)
@@ -36200,12 +36228,20 @@ type LineSink<'a> = &'a mut dyn FnMut(&Value);
 // Includes the first failed return: at most two retries may park the owner.
 const RETURN_ADMISSION_ATTEMPTS: u8 = 3;
 
-struct OwnedJsonlParser {
-    // Diagnostic origin only; follows this acquisition across step/page boundaries.
+#[derive(Default)]
+struct ParserPending {
     owed_full_after_lossy_shrink: bool,
-    // Drop the optional original before its funding, including cancellation.
     pending_taken: Option<Box<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>>,
     pending_returns: u8,
+    // Drop the original graph before releasing its funding.
+    #[cfg(unix)]
+    pending_funding: Option<crate::durable_tail_store::ActiveLease>,
+}
+crate::heap_layout_bound::fields!(ParserPending; owed_full_after_lossy_shrink,
+    pending_taken, pending_returns, #[cfg(unix)] pending_funding);
+
+struct OwnedJsonlParser {
+    pending: Option<Box<ParserPending>>,
     #[cfg(test)]
     source_read_probe: Option<PathBuf>,
     reader: BoundedJsonlReader<OpenedInput>,
@@ -36217,11 +36253,17 @@ struct OwnedJsonlParser {
     positive_usage_evidence: bool,
     /// P1 ledger birth from the same open-time read as `claude_file_birth`.
     claude_opened_birth: Option<claude_request_census::ClaudeRequestBirth>,
-    // Last: cancel frees the transferred graph before releasing its credit.
-    #[cfg(unix)]
-    pending_funding: Option<crate::durable_tail_store::ActiveLease>,
 }
 impl OwnedJsonlParser {
+    fn pending_mut(&mut self) -> &mut ParserPending {
+        assert!(restart_restore::enabled(), "M3 parser state requires ON");
+        self.pending.get_or_insert_with(Default::default)
+    }
+    fn return_pending(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|p| p.pending_taken.is_some())
+    }
     #[allow(clippy::too_many_arguments)]
     fn new(
         file: File,
@@ -36297,11 +36339,7 @@ impl OwnedJsonlParser {
         }
 
         Ok(Self {
-            pending_taken: None,
-            owed_full_after_lossy_shrink: false,
-            pending_returns: 0,
-            #[cfg(unix)]
-            pending_funding: None,
+            pending: None,
             #[cfg(test)]
             source_read_probe: Some(path.to_owned()),
             reader: BoundedJsonlReader::new(
@@ -36322,7 +36360,7 @@ impl OwnedJsonlParser {
         self.step_delivering(None)
     }
     fn step_delivering(&mut self, on_line: Option<line_delivery::LineTap<'_>>) -> Result<bool> {
-        anyhow::ensure!(self.pending_taken.is_none(), "acquisition return pending");
+        anyhow::ensure!(!self.return_pending(), "acquisition return pending");
         #[cfg(test)]
         transcript_io_allowed()?;
         #[cfg(test)]
@@ -36339,12 +36377,14 @@ impl OwnedJsonlParser {
         observe: impl FnMut(&Value),
         on_line: Option<line_delivery::LineTap<'_>>,
     ) -> Result<bool> {
-        anyhow::ensure!(self.pending_taken.is_none(), "acquisition return pending");
+        anyhow::ensure!(!self.return_pending(), "acquisition return pending");
         #[cfg(unix)]
-        let observation = restart_restore::enabled().then(|| (
-            self.reader.consumed_bytes(),
-            self.reader.acquisition.as_ref().map(|plan| plan.mode()),
-        ));
+        let observation = restart_restore::enabled().then(|| {
+            (
+                self.reader.consumed_bytes(),
+                self.reader.acquisition.as_ref().map(|plan| plan.mode()),
+            )
+        });
         let step = self.with_line_sink(observe, |reader, sink| reader.step_lines(sink, on_line));
         #[cfg(unix)]
         if let Some((before, Some(mode))) = observation {
@@ -36984,12 +37024,12 @@ where
         ),
         FinishAcquisition::Uncertified(custody) => (custody, None),
     };
-    let DurableCustody {
+    let DurableState {
         active,
         chain,
         owed,
         ..
-    } = custody;
+    } = custody.state.as_deref_mut()?;
     // While debt exists the chain lives only in it.
     let chain = chain
         .as_deref()
@@ -37046,9 +37086,8 @@ where
 #[cfg(unix)]
 fn custody_chain(custody: &DurableCustody) -> Option<&sampled_scan::durable_tail::AcquiredChain> {
     custody
-        .chain
-        .as_deref()
-        .or_else(|| custody.owed.as_ref().map(|owed| owed.chain()))
+        .chain()
+        .or_else(|| custody.owed().map(|owed| owed.chain()))
 }
 
 /// Descriptor acquisition for the already admitted M3 finish route. Use the
@@ -37123,15 +37162,15 @@ fn bind_native_chain(
         custody.take_owed();
         custody.take_chain();
     }
-    if let Some(mut owed) = custody.owed.take() {
+    if let Some(mut owed) = custody.take_owed() {
         if custody.ensure_active(cache, request.source, 0).is_ok() {
             let _ = cache.advance_owed(
                 &mut owed,
                 &completed.checkpoint,
-                custody.active.as_mut().expect("lease"),
+                custody.active_mut().expect("lease"),
             );
             let _ = cache.durable_rebind_chain(
-                custody.active.as_mut().expect("lease"),
+                custody.active_mut().expect("lease"),
                 owed.chain_mut(),
                 request.opened_object_identity,
                 request.held,
@@ -37140,7 +37179,9 @@ fn bind_native_chain(
                 counting,
             );
         }
-        custody.owed = Some(owed);
+        custody
+            .put_owed(owed)
+            .unwrap_or_else(|_| unreachable!("owed owner was taken"));
         return;
     }
     if !custody.has_active() {
@@ -37152,10 +37193,11 @@ fn bind_native_chain(
             | crate::durable_tail_store::LeaseWait::OverBudget => return,
         }
     }
-    if let Some(chain) = custody.chain.as_mut() {
+    let state = custody.state_mut();
+    if let Some(chain) = state.chain.as_mut() {
         if cache
             .durable_rebind_chain(
-                custody.active.as_mut().expect("ensured active lease"),
+                state.active.as_mut().expect("ensured active lease"),
                 chain,
                 request.opened_object_identity,
                 request.held,
@@ -37166,12 +37208,12 @@ fn bind_native_chain(
             .is_err()
         {
             // Never restamp a carried chain into a new binding.
-            custody.chain = None;
+            state.chain = None;
         }
         return;
     }
     let first_read = matches!(request.mode, ReadMode::Full(_));
-    let Some(lease) = custody.active.as_mut() else {
+    let Some(lease) = state.active.as_mut() else {
         return;
     };
     if let Ok(chain) = cache.durable_capture_chain(
@@ -37185,7 +37227,7 @@ fn bind_native_chain(
         first_read || real_edit,
         counting,
     ) {
-        custody.chain = Some(Box::new(chain));
+        state.chain = Some(Box::new(chain));
     }
 }
 
@@ -37259,7 +37301,7 @@ fn settle_native_attempt(
         if let Some(staged) = preparation {
             discard_staging(cache, staged);
         }
-        if acquisition.custody().owed.is_some() {
+        if acquisition.custody().owed().is_some() {
             cache.retain_owed_discovery(fence.source, fence.key);
         }
         None
@@ -37384,7 +37426,7 @@ fn settle_native_attempt(
         FinishAcquisition::Certified(completed) => Some(completed),
         FinishAcquisition::Uncertified(custody) => {
             if publication.is_some_and(|completion| !completion.publishes())
-                && custody.owed.is_some()
+                && custody.owed().is_some()
             {
                 cache.retain_owed_discovery(fence.source, fence.key);
             }
@@ -95825,7 +95867,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
-crate::heap_layout_bound::fields!(OwnedJsonlParser; owed_full_after_lossy_shrink, pending_taken, pending_returns, #[cfg(unix)] pending_funding, #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
+crate::heap_layout_bound::fields!(OwnedJsonlParser; pending, #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_publication, native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; restored_behind_accepted, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
@@ -96166,6 +96208,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
             retain_room,
         } = self;
         c.add(reader.capacity())?;
+        reader.custody_heap_bound(c)?;
         buf.heap_bound(c)?;
         report.heap_bound(c)?;
         max_line_bytes.heap_bound(c)?;
@@ -96540,3 +96583,15 @@ impl ScanIndex {
 pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
     sampled_jsonl::durable::test_replay_privacy_artifacts(root)
 }
+
+// Static receipts from the qualified 64-bit production layout. These keep
+// the listed OFF parser-box allocation delta honest; no runtime test executes.
+#[cfg(all(unix, target_pointer_width = "64", not(test)))]
+const _: () = {
+    assert!(size_of::<OwnedJsonlParser>() == 5312);
+    assert!(std::mem::align_of::<OwnedJsonlParser>() == 16);
+    assert!(size_of::<OwnedActiveFile>() == 856);
+    assert!(
+        size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() == 4880
+    );
+};

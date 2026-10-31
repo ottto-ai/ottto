@@ -601,6 +601,8 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
                 side: Default::default(),
                 #[cfg(unix)]
                 durable: Default::default(),
+                #[cfg(unix)]
+                durable_bytes: Default::default(),
             })
         } else {
             cache.clear();
