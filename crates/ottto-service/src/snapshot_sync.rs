@@ -4151,8 +4151,7 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
             // shortens a wait. A machine that cannot watch its transcripts (no
             // permission, exhausted descriptors, a root that does not exist yet)
             // collects on exactly the schedule it does today.
-            let mut codex_homes = crate::snapshot_roots::WatchedCodexHomes::default();
-            let mut watcher = watch_snapshot_source_roots(&home, &mut codex_homes);
+            let mut watcher = watch_snapshot_source_roots(&home);
             if watcher.is_none() {
                 eprintln!(
                     "local snapshot sync: filesystem watch unavailable; cadence follows the scan tiers only"
@@ -4161,7 +4160,8 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
             let mut account_switch = ClaudeAccountSwitchProbe::default();
             let mut retry = live_snapshot_retry::LiveRetryOwner::production();
             loop {
-                if let Ok(roots) = crate::snapshot_roots::watcher_roots(&home, &mut codex_homes) {
+                let prior = watcher.as_ref().map_or(&[][..], |current| current.roots());
+                if let Ok(roots) = crate::snapshot_roots::watcher_roots(&home, prior) {
                     if watcher.as_ref().map_or(true, |current| !current.matches_roots(&roots)) {
                         watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).ok();
                     }
@@ -4250,11 +4250,8 @@ impl continuation::LoopHost for ContinuationLoop<'_> {
 }
 
 /// Watch every enabled source's transcript roots, if the platform allows it.
-fn watch_snapshot_source_roots(
-    home: &Path,
-    codex_homes: &mut crate::snapshot_roots::WatchedCodexHomes,
-) -> Option<crate::snapshot_watcher::SnapshotWatcher> {
-    let roots = crate::snapshot_roots::watcher_roots(home, codex_homes).ok()?;
+fn watch_snapshot_source_roots(home: &Path) -> Option<crate::snapshot_watcher::SnapshotWatcher> {
+    let roots = crate::snapshot_roots::watcher_roots(home, &[]).ok()?;
     crate::snapshot_watcher::watch_snapshot_roots(roots).ok()
 }
 

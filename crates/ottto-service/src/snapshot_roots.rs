@@ -89,73 +89,49 @@ fn compose_roots(
     roots
 }
 
-/// The Codex slot homes the watcher last read from the slot registry.
-#[derive(Debug, Default)]
-pub(crate) struct WatchedCodexHomes {
-    homes: Vec<PathBuf>,
-    registry_unreadable: bool,
-}
-
 /// The watcher covers the Codex slot homes discovery scans; without them
 /// growth in a slot home waits for the next census walk. A slot home that
 /// cannot be resolved is skipped, as the status collection skips it. Sorted
 /// so a reordered registry does not replace the watcher.
 pub(crate) fn watcher_roots(
     home: &Path,
-    codex: &mut WatchedCodexHomes,
+    prior: &[(SnapshotSource, PathBuf)],
 ) -> Result<Vec<(SnapshotSource, PathBuf)>> {
     let read = registered_codex_homes(&FileCodexAccountSlotSettingsStore::default())
         .map(|homes| homes.filter_map(Result::ok).collect());
-    watcher_roots_with(home, read, codex)
+    watcher_roots_with(home, read, prior)
 }
 
-/// An unreadable slot registry never costs the other roots: the last slot
-/// homes read (none at start) stay watched, the failure is counted once in
-/// the local diagnostics, and the next successful read replaces them.
+/// An unreadable slot registry keeps the homes of the `prior` watcher's Codex
+/// roots (none at start); every source's roots are composed fresh.
 fn watcher_roots_with(
     home: &Path,
     read: Result<Vec<PathBuf>>,
-    codex: &mut WatchedCodexHomes,
+    prior: &[(SnapshotSource, PathBuf)],
 ) -> Result<Vec<(SnapshotSource, PathBuf)>> {
-    let homes = match &read {
-        Ok(homes) => {
-            let mut homes = homes.clone();
-            homes.sort();
-            homes
-        }
-        Err(_) => codex.homes.clone(),
-    };
-    let roots = [
+    let mut codex_homes = read.unwrap_or_else(|_| {
+        prior
+            .iter()
+            .filter(|(source, _)| *source == SnapshotSource::Codex)
+            .filter_map(|(_, root)| root.parent().map(Path::to_path_buf))
+            .collect()
+    });
+    codex_homes.sort();
+    codex_homes.dedup();
+    [
         SnapshotSource::Codex,
         SnapshotSource::ClaudeCode,
         SnapshotSource::Pi,
     ]
     .into_iter()
     .map(|source| {
-        Ok(scan_roots(source, home, &homes)?
+        Ok(scan_roots(source, home, &codex_homes)?
             .into_iter()
             .map(|root| (source, root))
             .collect::<Vec<_>>())
     })
-    .collect::<Result<Vec<_>>>()?
-    .into_iter()
-    .flatten()
-    .collect();
-    // Only roots the caller receives update the state.
-    if read.is_ok() {
-        *codex = WatchedCodexHomes {
-            homes,
-            registry_unreadable: false,
-        };
-    } else if !codex.registry_unreadable {
-        codex.registry_unreadable = true;
-        crate::local_resource_diagnostics::traversal_point(
-            "watcher_roots",
-            "codex",
-            &serde_json::json!({"codex_slot_registry_unreadable": 1}),
-        );
-    }
-    Ok(roots)
+    .collect::<Result<Vec<_>>>()
+    .map(|roots| roots.into_iter().flatten().collect())
 }
 
 pub(crate) fn validate_claude_roots(home: &Path, expected: &[PathBuf]) -> Result<()> {
@@ -438,41 +414,6 @@ mod tests {
         assert_eq!(scanned.snapshots[0].source_session_id, "healthy");
     }
 
-    /// Watches `roots` until a Codex batch names `session`; no Codex batch may
-    /// name `unrelated`. Native watcher startup is asynchronous, so it keeps
-    /// writing. Drains the process-wide Codex hint queue it wrote to.
-    fn assert_codex_write_queued(
-        roots: Vec<(SnapshotSource, PathBuf)>,
-        session: &Path,
-        unrelated: &Path,
-    ) {
-        let watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-        loop {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "no Codex session event"
-            );
-            fs::write(unrelated, "{}\n").unwrap();
-            fs::write(session, "{}\n").unwrap();
-            match watcher
-                .events
-                .recv_timeout(std::time::Duration::from_millis(250))
-            {
-                Ok(event) if event.source == SnapshotSource::Codex => {
-                    assert!(!event.paths.iter().any(|path| path == unrelated));
-                    if event.paths.iter().any(|path| path == session) {
-                        break;
-                    }
-                }
-                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(error) => panic!("watch event channel: {error}"),
-            }
-        }
-        drop(watcher);
-        let _ = crate::snapshot_watcher::take_pending_snapshot_paths(SnapshotSource::Codex);
-    }
-
     /// [behaviour] A write under a registered Codex slot home's `sessions/`
     /// reaches the watcher queue; a transcript-shaped file elsewhere in that
     /// home does not.
@@ -484,72 +425,48 @@ mod tests {
         let slot_home = base.join("codex-accounts/slot/home");
         let day = slot_home.join("sessions/2026/10/31");
         fs::create_dir_all(&day).unwrap();
-        let roots = watcher_roots_with(
-            &base.join("user"),
-            Ok(vec![slot_home.clone()]),
-            &mut WatchedCodexHomes::default(),
-        )
-        .unwrap();
+        let user = base.join("user");
+        let roots = watcher_roots_with(&user, Ok(vec![slot_home.clone()]), &[]).unwrap();
         assert!(roots.contains(&(SnapshotSource::Codex, slot_home.join("sessions"))));
-        assert_codex_write_queued(
-            roots,
-            &day.join("rollout-2026-10-31T10-00-00-slot.jsonl"),
-            &slot_home.join("history.jsonl"),
-        );
-    }
-
-    /// [behaviour] An unreadable Codex slot registry at start still watches
-    /// the other roots and is counted once; later, it keeps the slot homes
-    /// last read until a successful read replaces them.
-    #[test]
-    fn unreadable_codex_slot_registry_still_watches_other_roots() {
-        let scratch = ScratchDir::new("codex-slot-registry-unreadable");
-        let base = fs::canonicalize(&scratch).unwrap();
-        let home = base.join("user");
-        let day = home.join(".codex/sessions/2026/10/31");
-        fs::create_dir_all(&day).unwrap();
-        let slot_sessions = base.join("slot/home/sessions");
-        fs::create_dir_all(&slot_sessions).unwrap();
-        let unreadable =
-            || -> Result<Vec<PathBuf>> { Err(anyhow::anyhow!("synthetic unreadable registry")) };
-        let mut codex = WatchedCodexHomes::default();
-        let (roots, lines) = crate::local_resource_diagnostics::capture(|| {
-            let roots = watcher_roots_with(&home, unreadable(), &mut codex).unwrap();
-            assert_eq!(
-                watcher_roots_with(&home, unreadable(), &mut codex).unwrap(),
-                roots
-            );
+        // An unreadable registry keeps the prior watcher's slot roots, and
+        // at start (no prior watcher) the default ones.
+        let unreadable = || -> Result<Vec<PathBuf>> { Err(anyhow::anyhow!("unreadable")) };
+        assert_eq!(
+            watcher_roots_with(&user, unreadable(), &roots).unwrap(),
             roots
-        });
-        let counted = |lines: &[serde_json::Value]| {
-            lines
-                .iter()
-                .filter(|line| {
-                    line["stage"] == "watcher_roots"
-                        && line["counts"]["codex_slot_registry_unreadable"] == 1
-                })
-                .count()
-        };
-        assert_eq!(counted(&lines), 1);
-        let codex_roots = roots
-            .iter()
-            .filter(|(source, _)| *source == SnapshotSource::Codex)
-            .map(|(_, root)| root.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(codex_roots, SnapshotSource::Codex.default_roots(&home));
-        assert_codex_write_queued(
-            roots,
-            &day.join("rollout-2026-10-31T10-00-00-default.jsonl"),
-            &home.join(".codex/history.jsonl"),
         );
-        let slot = (SnapshotSource::Codex, slot_sessions.clone());
-        let read = watcher_roots_with(&home, Ok(vec![base.join("slot/home")]), &mut codex);
-        assert!(read.unwrap().contains(&slot));
-        let (kept, lines) = crate::local_resource_diagnostics::capture(|| {
-            watcher_roots_with(&home, unreadable(), &mut codex).unwrap()
-        });
-        assert!(kept.contains(&slot));
-        assert_eq!(counted(&lines), 1);
+        let start = watcher_roots_with(&user, unreadable(), &[]).unwrap();
+        assert_eq!(start, watcher_roots_with(&user, Ok(vec![]), &[]).unwrap());
+        let watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).unwrap();
+        let session = day.join("rollout-2026-10-31T10-00-00-slot.jsonl");
+        let unrelated = slot_home.join("history.jsonl");
+        // Native watcher startup is asynchronous, so keep writing until the
+        // session write is seen; every queued batch must exclude `unrelated`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no slot session event"
+            );
+            fs::write(&unrelated, "{}\n").unwrap();
+            fs::write(&session, "{}\n").unwrap();
+            match watcher
+                .events
+                .recv_timeout(std::time::Duration::from_millis(250))
+            {
+                Ok(event) if event.source == SnapshotSource::Codex => {
+                    assert!(!event.paths.contains(&unrelated));
+                    if event.paths.contains(&session) {
+                        break;
+                    }
+                }
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("watch event channel: {error}"),
+            }
+        }
+        // The queue is process-wide; leave no scratch hints for other tests.
+        drop(watcher);
+        let _ = crate::snapshot_watcher::take_pending_snapshot_paths(SnapshotSource::Codex);
     }
 
     #[test]
