@@ -687,8 +687,6 @@ pub(crate) struct DurableTailStore {
     disabled: Option<&'static str>,
     /// This pass: directory checked and [records loaded, T14 rebuilds].
     checked: bool,
-    /// M1's reader ceiling, selected by the source owner before a pass.
-    read_v1_only: bool,
     pass: [u64; 2],
     /// Process-lifetime attempts, removed only after a successful replacement.
     rebuilt: BTreeMap<Digest32, Rebuild>,
@@ -744,7 +742,6 @@ impl DurableTailStore {
             cleanup: Arc::new(TempCleanupCounts::default()),
             disabled: None,
             checked: false,
-            read_v1_only: false,
             pass: [0; 2],
             rebuilt: BTreeMap::new(),
             startup_synced: false,
@@ -758,12 +755,6 @@ impl DurableTailStore {
             resource_checked: false,
             resource_granted: false,
         }
-    }
-
-    /// Preserve main's envelope admission while restart restore is OFF.
-    /// Only explicit consent erasure may inspect newer known records.
-    pub(crate) fn restrict_reads_to_v1(&mut self) {
-        self.read_v1_only = true;
     }
 
     /// A new pass: the directory is checked again and the T14 breaker resets.
@@ -980,14 +971,6 @@ impl DurableTailStore {
                 self.counters.guard_header_bytes += n as u64;
             }
             first.map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
-            if self.read_v1_only
-                && work != "privacy_restore"
-                && header.len() >= 10
-                && header[..8] == MAGIC
-                && u16::from_le_bytes([header[8], header[9]]) > FORMAT_V1
-            {
-                return Err(Refusal::NewerFormat);
-            }
             let (_, _, _, size) = dispatch(&header)?;
             let rest = Read::by_ref(&mut file)
                 .take((size - n) as u64)
@@ -1151,11 +1134,7 @@ impl DurableTailStore {
         live_context: &Digest32,
     ) -> Result<Option<u64>, Refusal> {
         let held = self.guard_with_carrier(key, has_index, live_context);
-        // The OFF/M1 reader has no successor writer. Its optional corrupt
-        // cache may recover in RAM, but cannot consume an attempt whose only
-        // discharge would be a new durable record.
         if start
-            && !self.read_v1_only
             && held.is_ok()
             && self.disabled.is_none()
             && self.rebuilt.get(key) == Some(&Rebuild::Authorized)

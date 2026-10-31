@@ -54,7 +54,6 @@ impl Restarted {
             RestoreOutcome::StaleUnregistered(reason, _) => {
                 panic!("unexpected unregistered obligation: {reason}")
             }
-            RestoreOutcome::M1Restored(_) => panic!("M3 fixture must enable its switch"),
             RestoreOutcome::Held(_) => "held",
         }
     }

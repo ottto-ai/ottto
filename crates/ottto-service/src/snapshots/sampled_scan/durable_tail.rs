@@ -29,7 +29,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) mod acquired;
-mod m1;
 pub(crate) use acquired::{AcquiredChain, AcquisitionProtocol, ImmutableCounting};
 mod owed;
 pub(in crate::snapshots) use owed::OwedCompletionAdmission;
@@ -2258,6 +2257,9 @@ impl SharedCache {
         namespace: &Scope,
         identity_capture: bool,
     ) {
+        if !restart_restore::enabled() {
+            return;
+        }
         let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) else {
             return;
         };
@@ -2316,9 +2318,6 @@ impl SharedCache {
             });
         }
         if let Some(slot) = slot.as_mut() {
-            if !restart_restore::enabled() {
-                slot.store.restrict_reads_to_v1();
-            }
             slot.store.begin_pass();
             // At most one resource probe per pass; the store owns its back-off.
             // Held keys retry through their own next native write.
@@ -2359,6 +2358,9 @@ impl SharedCache {
         index: &ScanIndex,
         recovered_audit_due: &mut Option<u64>,
     ) -> Option<store::Refusal> {
+        if !restart_restore::enabled() {
+            return None;
+        }
         let ram = !restore_recheck && self.retained().is_ok_and(|ram| ram.peek(key).is_some());
         let source = durable_source(snapshot_source)?;
         let mut stores = self.durable()?;
@@ -2421,6 +2423,9 @@ impl SharedCache {
         index: &ScanIndex,
         recovered_audit_due: &mut Option<u64>,
     ) -> Option<store::Refusal> {
+        if !restart_restore::enabled() {
+            return None;
+        }
         let source = durable_source(snapshot_source)?;
         let mut stores = self.durable()?;
         let slot = stores.slot(source).as_mut()?;
@@ -2452,7 +2457,7 @@ impl SharedCache {
         index: &ScanIndex,
     ) -> Result<Option<u64>, store::ActiveOverBudget> {
         if !restart_restore::enabled() {
-            return Ok(self.durable_carrier_reprobe_active(source, key, index));
+            return Ok(None);
         }
         if !self.durable_classifier_enabled(source)? {
             return Ok(None);
@@ -2494,6 +2499,9 @@ impl SharedCache {
         snapshot_source: SnapshotSource,
         key: &str,
     ) -> Option<store::Refusal> {
+        if !restart_restore::enabled() {
+            return None;
+        }
         let source = durable_source(snapshot_source)?;
         let digest = store::key_digest(source, key);
         {
@@ -2549,7 +2557,7 @@ impl SharedCache {
         guard: impl FnOnce(&Self) -> Option<store::Refusal>,
     ) -> Result<Option<store::Refusal>, store::ActiveOverBudget> {
         if !restart_restore::enabled() {
-            return Ok(guard(self));
+            return Ok(None);
         }
         if !self.durable_classifier_enabled(source)? {
             return Ok(None); // D-DISABLED/absent: no input allocation is needed.
@@ -2564,6 +2572,9 @@ impl SharedCache {
         &self,
         source: SnapshotSource,
     ) -> Result<bool, store::ActiveOverBudget> {
+        if !restart_restore::enabled() {
+            return Ok(false);
+        }
         let Some(ds) = durable_source(source) else {
             return Ok(false);
         };
@@ -2582,7 +2593,7 @@ impl SharedCache {
         members: impl FnOnce(&Self) -> bool,
     ) -> Result<bool, store::ActiveOverBudget> {
         if !restart_restore::enabled() {
-            return Ok(members(self));
+            return Ok(false);
         }
         if !self.durable_classifier_enabled(source)? {
             return Ok(false); // No classifier/no T14 grant; native group proceeds.
@@ -2627,6 +2638,9 @@ impl SharedCache {
         key: &str,
         start: bool,
     ) -> Option<store::Refusal> {
+        if !restart_restore::enabled() {
+            return None;
+        }
         let source = durable_source(source)?;
         let mut stores = self.durable()?;
         stores
@@ -2641,6 +2655,9 @@ impl SharedCache {
         source: SnapshotSource,
         key: &str,
     ) -> Result<Option<&'static str>, store::ActiveOverBudget> {
+        if !restart_restore::enabled() {
+            return Ok(None);
+        }
         let Some(ds) = durable_source(source) else {
             return Ok(None);
         };
@@ -3217,15 +3234,7 @@ impl SharedCache {
         interpretation: &Interpretation<'_>,
     ) -> RestoreOutcome {
         if !restart_restore::enabled() {
-            return self.m1_restore(
-                snapshot_source,
-                key,
-                path,
-                scope,
-                held,
-                index,
-                interpretation,
-            );
+            return RestoreOutcome::Miss(MissClass::Missing);
         }
         let floor_behind = interpretation
             .accepted
@@ -5301,19 +5310,7 @@ impl SharedCache {
         index: &ScanIndex,
     ) -> Option<store::BatchReceipt> {
         durable_source(snapshot_source)?;
-        // The index save has already committed. Consent erasure neither
-        // advances an ACK nor clears custody/owed metadata. A missing record
-        // subsequently follows the native recovery path on natural growth.
-        let purge_needed = self
-            .durable()
-            .and_then(|mut stores| {
-                stores
-                    .slot(durable_source(snapshot_source)?)
-                    .as_ref()
-                    .map(|slot| !slot.skill_labels_enabled && !slot.skill_label_purge_complete)
-            })
-            .unwrap_or(false);
-        if !restart_restore::enabled() && !purge_needed {
+        if !restart_restore::enabled() {
             return None;
         }
         let store::LeaseWait::Granted(lease) = self.acquire_active(
@@ -5322,35 +5319,6 @@ impl SharedCache {
         ) else {
             return None;
         };
-        if purge_needed {
-            let mut stores = self.durable()?;
-            let slot = stores.slot(durable_source(snapshot_source)?).as_mut()?;
-            match slot.store.purge_private_labels(writer, |body| {
-                codec::body_has_skill_labels(body).unwrap_or(false)
-            }) {
-                Ok(report) => {
-                    slot.skill_label_purge_complete = report.refused == 0;
-                    for (class, count) in [
-                        ("skill_label_purged", report.erased),
-                        ("skill_label_purge_failed", report.refused),
-                    ] {
-                        if count > 0 {
-                            *stores.counters.not_persisted.entry(class).or_default() += count;
-                        }
-                    }
-                }
-                Err(_) => {
-                    Counters::bump(
-                        &mut stores.counters.not_persisted,
-                        "skill_label_purge_failed",
-                    );
-                }
-            }
-        }
-        if !restart_restore::enabled() {
-            lease.release();
-            return None;
-        }
         let service = std::time::Instant::now();
         let result = self.write_after_save_active(writer, snapshot_source, index);
         let micros = service.elapsed().as_micros().min(u64::MAX as u128) as u64;
@@ -5894,6 +5862,9 @@ impl SharedCache {
         writer: &W,
         snapshot_source: SnapshotSource,
     ) -> std::io::Result<()> {
+        if !restart_restore::enabled() {
+            return Ok(());
+        }
         let Some(source) = durable_source(snapshot_source) else {
             return Ok(());
         };
@@ -6385,7 +6356,6 @@ impl MissClass {
 
 pub(crate) enum RestoreOutcome {
     Restored(Box<Taken<CachedJsonlReduction>>, store::ActiveLease),
-    M1Restored(Box<Taken<CachedJsonlReduction>>),
     Pending,
     /// Restore read zero input; an already-selected native reparse may take
     /// its ordinary Full after history admission and the shared pace check.
@@ -6485,10 +6455,6 @@ mod restore_test {
     impl RestoreOutcome {
         pub(in crate::snapshots) fn into_test_option(self) -> Option<RestoredForTest> {
             match self {
-                Self::M1Restored(taken) => Some(RestoredForTest {
-                    taken: Some(taken),
-                    lease: None,
-                }),
                 Self::Restored(taken, lease) => Some(RestoredForTest {
                     taken: Some(taken),
                     lease: Some(lease),

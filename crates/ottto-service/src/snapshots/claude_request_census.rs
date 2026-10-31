@@ -1751,7 +1751,7 @@ impl<R: std::io::Read> CensusRead<R> {
         if self.duplicate_census {
             index.claude_request_census = ClaudeRequestCensus::default();
         }
-        if self.duplicate_upgrade {
+        if super::restart_restore::enabled() && self.duplicate_upgrade {
             index.o3_replay = super::upgrade_replay::State::refused();
         }
         if self.duplicate_shadow {
@@ -3057,9 +3057,10 @@ fn insert_transcript_record(
         .as_ref()
         .map(|witness| &witness.index_keys);
     let held = |key: &str| {
-        page_held.contains(key)
-            || traversal.is_some_and(|keys| keys.contains(key))
-            || witness.is_some_and(|keys| keys.contains(key))
+        super::restart_restore::enabled()
+            && (page_held.contains(key)
+                || traversal.is_some_and(|keys| keys.contains(key))
+                || witness.is_some_and(|keys| keys.contains(key)))
     };
     let mut released = 0;
     let outcome =

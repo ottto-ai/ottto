@@ -12909,8 +12909,8 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
         writable.set_len(6).unwrap();
         {
             let _off = RestartRestoreForTest::disabled();
-            assert!(cache.missing_reduction_growth(source, &key, &index.files, 6));
-            assert!(DiscoveryRecovery {
+            assert!(!cache.missing_reduction_growth(source, &key, &index.files, 6));
+            assert!(!DiscoveryRecovery {
                 files: &index.files,
                 cache: Some(&cache)
             }

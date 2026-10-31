@@ -104,6 +104,9 @@ impl<'de> Deserialize<'de> for State {
         // Preserve duplicate members until the typed decoder can reject them;
         // a Value would silently keep the last member and erase negative proof.
         let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        if !restart_restore::enabled() {
+            return Ok(Self::default());
+        }
         // Old malformed diagnostic state must not poison the whole index.
         // It may only refuse O3 authority; the paced fallback remains usable.
         let Ok(mut wire) = serde_json::from_str::<Wire>(raw.get()) else {
@@ -159,7 +162,7 @@ impl State {
         }
     }
     pub(super) fn is_empty(&self) -> bool {
-        !self.closed && self.replayed.is_empty()
+        !restart_restore::enabled() || (!self.closed && self.replayed.is_empty())
     }
     pub(super) fn upgrade_missing(&mut self, key: &str, consume: bool) -> bool {
         if self.closed {

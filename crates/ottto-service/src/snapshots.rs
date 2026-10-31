@@ -34008,11 +34008,6 @@ impl OwnedSourceScan {
                                         );
                                         (Some(taken), Some(admission), debt)
                                     }
-                                    sampled_scan::durable_tail::RestoreOutcome::M1Restored(taken) => {
-                                        retained_offset = Some(taken.retained.checkpoint.sealed_offset());
-                                        let admission = (taken.modified_hint, taken.finalization_charge, taken.retained.state.usage_witness());
-                                        (Some(taken), Some(admission), debt)
-                                    }
                                     sampled_scan::durable_tail::RestoreOutcome::FloorHeld => {
                                         context.cache.durable_custody_hold(
                                             source,
@@ -34286,7 +34281,7 @@ impl OwnedSourceScan {
                                     }
                                     return_original!(taken, refusal);
                                 }
-                                if refusal.is_some() {
+                                if restart_restore::enabled() && refusal.is_some() {
                                     match parser.prepare_acquisition_owned(
                                         None,
                                         &scope,

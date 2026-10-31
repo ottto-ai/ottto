@@ -323,7 +323,7 @@ impl Serialize for ScanIndex {
         field!(accepted_rebuild_pending_since_unix_seconds, Option::is_none);
         field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
         field!(codex_counting_tombstones, BTreeMap::is_empty);
-        if !self.o3_replay.is_empty() {
+        if restart_restore::enabled() && !self.o3_replay.is_empty() {
             map.serialize_entry("reread_guard", &self.o3_replay)?;
         }
         field!(
@@ -1624,9 +1624,9 @@ impl<R: BufRead + Seek> Decoder<R> {
                     } else if name == "claude_request_census_shadow" {
                         index.claude_request_census_shadow =
                             ClaudeRequestCensusShadowState::default();
-                    } else if name == "reread_guard" {
+                    } else if name == "reread_guard" && restart_restore::enabled() {
                         index.o3_replay = upgrade_replay::State::refused();
-                    } else if name != "claude_desktop_store_inventory" {
+                    } else if name != "claude_desktop_store_inventory" && name != "reread_guard" {
                         return Err(Error::Refused("duplicate index field"));
                     }
                 } else {
@@ -1640,7 +1640,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         } => {}
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
-                        "reread_guard" => {
+                        "reread_guard" if restart_restore::enabled() => {
                             index.o3_replay =
                                 if value.len > claude_request_census::MAX_RAW_BYTES as u64 {
                                     upgrade_replay::State::refused()
@@ -2457,7 +2457,7 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     if duplicate_shadow {
         index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
     }
-    if duplicate_upgrade {
+    if restart_restore::enabled() && duplicate_upgrade {
         index.o3_replay = upgrade_replay::State::refused();
     }
     Ok(index)
