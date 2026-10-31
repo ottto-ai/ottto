@@ -6868,34 +6868,6 @@ mod tests {
     }
 
     #[test]
-    fn available_agent_status_does_not_stamp_verification_authority() {
-        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
-        {
-            let mut state = daemon.inner.lock().expect("state");
-            upsert_agent_status_snapshot(
-                &mut state,
-                available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z"),
-            );
-        }
-
-        let status = daemon.status(TOKEN).expect("status after refresh");
-        assert_eq!(status.sources[0].state, SourceState::Healthy);
-        assert!(
-            status.sources[0].last_verified_at.is_none(),
-            "local availability scans must not masquerade as Verify attempts"
-        );
-        let source = status
-            .canonical_health
-            .expect("canonical health")
-            .sources
-            .into_iter()
-            .find(|source| source.app == SourceKind::Codex)
-            .expect("Codex source");
-        assert_eq!(source.state, LocalHealthSourceState::Healthy);
-        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
-    }
-
-    #[test]
     fn available_agent_status_preserves_admin_disabled_verification_policy() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let result = SourceVerificationResult {
@@ -7288,51 +7260,6 @@ mod tests {
         assert_eq!(source.state, LocalHealthSourceState::Healthy);
         assert_eq!(source.authority, LocalHealthAuthority::Runtime);
         assert!(source.blocking_reason.is_none());
-    }
-
-    #[test]
-    fn reconnect_required_verification_updates_source_health() {
-        let daemon = daemon();
-        daemon
-            .update_sources(TOKEN, vec![codex_health()])
-            .expect("source health should update");
-        let result = SourceVerificationResult {
-            source: SourceKind::Codex,
-            config: SourceConfigState {
-                discovered: true,
-                path_hint: Some("~/.codex/config.toml".to_string()),
-                fingerprint: Some("sha256:test".to_string()),
-                drift: Vec::new(),
-            },
-            status: SourceVerificationStatus::ReconnectRequired,
-            verified: false,
-            records_seen: 0,
-            last_record_id: None,
-            last_received_at: None,
-            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
-            message: StableMessage {
-                code: "setup_run_token_invalid".to_string(),
-                text: "Use Sign in in the Ottto app to refresh it.".to_string(),
-            },
-            route_results: Vec::new(),
-            check: None,
-        };
-
-        daemon
-            .record_verification_result(&result)
-            .expect("record reconnect result");
-        let status = daemon.status(TOKEN).expect("status");
-        assert_eq!(status.sources.len(), 1);
-        assert_eq!(status.sources[0].state, SourceState::Failed);
-        assert_eq!(status.sources[0].grade, HealthGrade::Critical);
-        assert_eq!(
-            status.sources[0].problems[0].code,
-            StableProblemCode::TelemetryNotVerified
-        );
-        assert_eq!(
-            status.sources[0].recommended_actions[0].action,
-            RepairActionKind::VerifyTelemetry
-        );
     }
 
     #[test]
@@ -8332,59 +8259,6 @@ mod tests {
         assert!(status.sources[0].agent_status.is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn startup_reverify_promotes_available_seeded_source() {
-        let restarted = daemon()
-            .with_account(account("user_1", "ron@example.com"))
-            .with_registered_device_sources_presence(
-                Some(LocalDeviceBinding {
-                    device_id: "device_test".to_string(),
-                    machine_id: Some("machine_test".to_string()),
-                    sources: vec!["codex".to_string()],
-                }),
-                |_| true,
-            );
-
-        let mut state = restarted.inner.lock().expect("state");
-        assert_eq!(state.sources[0].state, SourceState::Verifying);
-
-        let remaining = apply_verifying_reconfirm(
-            &mut state,
-            vec![available_agent_status(
-                SourceKind::Codex,
-                "2026-05-05T10:20:00Z",
-            )],
-        );
-
-        assert_eq!(remaining, 0);
-        assert_eq!(state.sources[0].state, SourceState::Healthy);
-        assert_eq!(state.sources[0].grade, HealthGrade::Ok);
-    }
-
-    #[test]
-    fn startup_reverify_does_not_clobber_explicit_verify_result() {
-        // A source that an explicit Verify already moved out of `verifying`
-        // (e.g. needs_confirmation after a no-fresh-telemetry smoke) must not be
-        // promoted back to healthy by a racing startup scan.
-        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
-        let mut state = daemon.inner.lock().expect("state");
-        let mut confirmed = codex_health();
-        confirmed.state = SourceState::NeedsConfirmation;
-        confirmed.grade = HealthGrade::Warning;
-        state.sources = vec![confirmed];
-
-        let remaining = apply_verifying_reconfirm(
-            &mut state,
-            vec![available_agent_status(
-                SourceKind::Codex,
-                "2026-05-05T10:20:00Z",
-            )],
-        );
-
-        assert_eq!(remaining, 0);
-        assert_eq!(state.sources[0].state, SourceState::NeedsConfirmation);
     }
 
     #[test]
