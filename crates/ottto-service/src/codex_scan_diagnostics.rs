@@ -881,38 +881,13 @@ crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
 crate::heap_layout_bound::fields!(IdentityConflictTaxonomy; state_alias_keys, state_intra_root_row_keys, state_cross_root_keys, state_cross_root_progress_only_keys, state_cross_root_identity_field_keys, state_cross_root_field_differs, conflict_keys_total, conflict_keys_state_created, conflict_keys_prior_state_only, conflict_parent_child_edges);
 crate::heap_layout_bound::fields!(StateRowFieldDiffs; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
-impl crate::heap_layout_bound::HeapLayoutBound for LoaderReason {
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        match self {
-            Self::Complete
-            | Self::Io
-            | Self::SqliteBusy
-            | Self::SqliteOpenOrQuery
-            | Self::SqliteRowDecode
-            | Self::IncompleteShape
-            | Self::OtherFailure => c.add(0),
-        }
-    }
-}
-impl crate::heap_layout_bound::HeapLayoutBound for LoaderStage {
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        match self {
-            Self::Open | Self::Prepare | Self::Query | Self::Row => c.add(0),
-        }
-    }
-}
-impl crate::heap_layout_bound::HeapLayoutBound for FileReason {
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        match self {
-            Self::NotParsedThisCycle
-            | Self::Complete
-            | Self::ParentPending
-            | Self::OwnershipIncomplete
-            | Self::RecognizedUsageDropped
-            | Self::ReadOrLineLoss => c.add(0),
-        }
-    }
-}
+crate::heap_layout_bound::unit_enum!(false;
+    LoaderReason: Complete | Io | SqliteBusy | SqliteOpenOrQuery | SqliteRowDecode
+        | IncompleteShape | OtherFailure;
+    LoaderStage: Open | Prepare | Query | Row;
+    FileReason: NotParsedThisCycle | Complete | ParentPending | OwnershipIncomplete
+        | RecognizedUsageDropped | ReadOrLineLoss;
+);
 
 #[cfg(test)]
 mod tests {

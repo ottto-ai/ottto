@@ -36,6 +36,7 @@ use crate::context_footprint::{
     workspace_label, ContextFootprintCategoryInput, ContextFootprintIngestRequest,
     ContextFootprintItemInput, RepositoryIdentity,
 };
+use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{
     load_snapshot_device_credentials, workspace_labels_allowed, SnapshotApiClient,
 };
@@ -1046,22 +1047,6 @@ pub(crate) fn build_request(inputs: RequestInputs<'_>) -> Option<ContextFootprin
 
 mod feed;
 pub(crate) use feed::CodexPreludeFeed;
-
-fn write_json_atomic(path: &Path, value: &impl Serialize) {
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let Ok(payload) = serde_json::to_vec(value) else {
-        return;
-    };
-    let temp = path.with_extension("json.tmp");
-    if fs::write(&temp, &payload).is_ok() {
-        let _ = fs::rename(&temp, path);
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UploadCacheEntry {
