@@ -4663,3 +4663,5 @@ fn terminal_off_suppressed_start_still_rearms_an_unacked_head() {
     let again = terminal_off_red_retry_start(&mut index, CARRY_SECOND_RETRY);
     assert_eq!(again["rearmed_index_files"], 1);
 }
+
+include!("settled_contract_carry_tests.rs");

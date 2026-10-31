@@ -190,6 +190,7 @@ pub(crate) fn durable_store_fixture_body(source: SnapshotSource, count: u64, sum
 }
 
 pub(crate) mod sampled_scan;
+mod settled_contract_carry;
 mod stale_carry_diagnostics;
 #[cfg(test)]
 mod transcript_acquisition_tests;
@@ -5913,20 +5914,14 @@ fn claude_stream_accepted_retry_carry_observed(
     result
 }
 
-fn claude_stream_accepted_retry_carry_inner(
+/// The whole streaming carry's structural price: its member paths, their
+/// doubled key bytes and the scratch bytes charged against `limit`.
+fn claude_stream_carry_price(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
-    diagnostics: &mut StaleCarryRejectionCounts,
-    debt_scope: Option<&BTreeSet<String>>,
-) -> Result<ClaudeStaleFamilyCarry, ClaudeRetryAdmissionRefusal> {
-    if !index.persistence_available() {
-        return Err(ClaudeRetryAdmissionRefusal::Structure);
-    }
-
+    limit: usize,
+) -> Result<(usize, usize, usize), ClaudeRetryAdmissionRefusal> {
     use crate::heap_layout_bound::{tree_nodes, Counter};
-    if !crate::heap_layout_bound::layout_supported() {
-        return Err(ClaudeRetryAdmissionRefusal::Structure);
-    }
     let mut paths = 0usize;
     let mut path_bytes = 0usize;
     for key in index.files.keys() {
@@ -5947,7 +5942,7 @@ fn claude_stream_accepted_retry_carry_inner(
         .iter()
         .try_fold(0usize, |sum, root| sum.checked_add(root.len()))
         .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
-    let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+    let mut cost = Counter::new(limit);
     tree_nodes::<String, ()>(stale.len(), &mut cost)
         .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
     cost.add(root_bytes)
@@ -5966,6 +5961,24 @@ fn claude_stream_accepted_retry_carry_inner(
     .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
     cost.add(path_bytes)
         .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
+    Ok((paths, path_bytes, cost.bytes))
+}
+
+fn claude_stream_accepted_retry_carry_inner(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+    diagnostics: &mut StaleCarryRejectionCounts,
+    debt_scope: Option<&BTreeSet<String>>,
+) -> Result<ClaudeStaleFamilyCarry, ClaudeRetryAdmissionRefusal> {
+    if !index.persistence_available() {
+        return Err(ClaudeRetryAdmissionRefusal::Structure);
+    }
+
+    if !crate::heap_layout_bound::layout_supported() {
+        return Err(ClaudeRetryAdmissionRefusal::Structure);
+    }
+    let (paths, path_bytes, _) =
+        claude_stream_carry_price(index, stale, crate::source_rotation::PARKED_BUDGET)?;
     // Tests may refuse an otherwise priced multi-root start; the actual
     // structural math above still runs unchanged before this scheduling seam.
     #[cfg(test)]
@@ -10339,6 +10352,20 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         let contract = claude_request_identity::cycle_contract(identity.is_some());
         let cutover_terminal = cutover == CLAUDE_CONTRACT_CUTOVER_OWED
             && index.claude_request_identity_contract.as_deref() == Some(contract);
+        // RF1 B1 Q5 (default OFF): a mid-walk contract change records a
+        // placeholder, so a recorded current contract means this window's
+        // evidence was parsed under it. With no older evidence left there is
+        // nothing to mix; the latch clears before its full re-arm. Counted.
+        if settled_contract_carry::enabled()
+            && !claude_terminal_off()
+            && index.claude_request_identity_contract_changed
+            && index.claude_request_identity_contract.as_deref() == Some(contract)
+            && settled_contract_carry::evidence_from_window(index, census_window_end)
+        {
+            claude_contract::note(|counts| counts.identity_contract_latch.cleared += 1);
+            index.claude_request_identity_contract_changed = false;
+            eprintln!("local snapshot census settled-contract carry: latch_cleared=1");
+        }
         let latch_rearms = index.claude_request_identity_contract_changed
             && cutover != CLAUDE_CONTRACT_CUTOVER_SPENT;
         if let Some(record) = (index.claude_full_rearm_progress.structural_record.as_mut())
@@ -10698,13 +10725,32 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             diagnostic.update(|d| d.terminal_rearm = Some(rearm));
         }
 
+        // RF1 B1 GUARD (default OFF): completion retires only families with a
+        // completed family proof; every other indexed family stays owed.
+        let settled_guard = settled_contract_carry::enabled() && !claude_terminal_off();
+        let mut settled_owed = 0_usize;
         index
             .claude_usage_family_pending
-            .retain(|root_session_id, _| {
-                index
+            .retain(|root_session_id, pending| {
+                let owed = settled_guard
+                    && settled_contract_carry::owed_at_completion(
+                        root_session_id,
+                        pending,
+                        proven.contains_key(root_session_id),
+                        &indexed_claude_family_ids,
+                    );
+                settled_owed += usize::from(owed);
+                owed || index
                     .claude_usage_authority_quarantine
                     .contains_key(root_session_id)
             });
+        if settled_guard {
+            eprintln!(
+                "local snapshot census settled-contract carry: completion_kept_owed_families={settled_owed} \
+                 retained_pending_families={}",
+                index.claude_usage_family_pending.len()
+            );
+        }
         let progress = &mut index.claude_full_rearm_progress;
         progress.observed_window = None;
         progress.ignored_vetoes = 0;
@@ -42665,6 +42711,30 @@ fn ensure_bounded_traversal(
             })
             .map(|(root, _)| root.clone())
             .collect::<BTreeSet<_>>();
+        // RF1 B1 Q3 (default OFF): invalid families a re-read cannot change stay
+        // pending beside the carry, unread and uncredited; see the module.
+        let settled_contract = settled_contract_carry::enabled();
+        let (settled_kept, settled_kept_files) = if settled_contract {
+            settled_contract_carry::kept_invalid_roots(index, &stale_pending_roots)
+        } else {
+            (BTreeSet::new(), 0)
+        };
+        let stale_pending_roots = if settled_kept.is_empty() {
+            stale_pending_roots
+        } else {
+            stale_pending_roots
+                .difference(&settled_kept)
+                .cloned()
+                .collect()
+        };
+        // Lead B Q2: counts-only alarm at >=80% of the whole carry's priced
+        // headroom, from the carry's own price (roots scale with bytes).
+        let settled_price = settled_contract
+            .then(|| claude_stream_carry_price(index, &stale_pending_roots, usize::MAX).ok())
+            .flatten()
+            .map(|(_, _, bytes)| bytes);
+        let mut settled_admission_dropped = false;
+        let mut settled_due_retained = false;
         // Fix 2: when the traversal after a full re-arm needed a clean
         // follow-up, its own window's families are carried under C1b's
         // family checks instead of being re-read whole again, and the
@@ -42732,9 +42802,12 @@ fn ensure_bounded_traversal(
         let carry = if streaming_carry {
             // Existing scheduling debt survives even if the whole set now fits.
             // Re-price its batch, but do not discard unoffered service cursors.
+            // RF1 B1 (default OFF): an unfinished admission no longer forces
+            // the batch path; a whole carry that fits replaces it.
             let whole = if prior_admission
                 .as_ref()
                 .is_some_and(|state| !state.complete)
+                && !settled_contract
             {
                 Err(ClaudeRetryAdmissionRefusal::Structure)
             } else {
@@ -42746,7 +42819,19 @@ fn ensure_bounded_traversal(
                 )
             };
             match whole {
-                Ok(carry) => carry,
+                Ok(carry) => {
+                    // RF1 B1 (rev F2): unoffered due service stays with its
+                    // existing owner; only the covered root walk is settled.
+                    if let Some(state) = prior_admission.as_ref().filter(|state| !state.complete) {
+                        if settled_contract_carry::due_unoffered(index, state, collected_at) {
+                            admission = Some(settled_contract_carry::due_only(state));
+                            settled_due_retained = true;
+                        } else {
+                            settled_admission_dropped = true;
+                        }
+                    }
+                    carry
+                }
                 Err(refusal) => {
                     let due = claude_retry_due_family_exists(index, collected_at);
                     if matches!(refusal, ClaudeRetryAdmissionRefusal::Structure)
@@ -42914,6 +42999,26 @@ fn ensure_bounded_traversal(
                 }
             }
         }
+        // Lead B Q1 (rev F3): a kept-invalid family whose recorded requests
+        // fit the pending occurrence cap after this start's clears re-arms.
+        let settled_cap_rearmed = if settled_kept.is_empty() {
+            BTreeSet::new()
+        } else {
+            settled_contract_carry::cap_room_roots(index, &settled_kept)
+        };
+        let mut settled_cap_rearmed_files = 0_usize;
+        if !settled_cap_rearmed.is_empty() {
+            for (index_key, entry) in &mut index.files {
+                if !entry.source_file_fingerprint.is_empty()
+                    && claude_index_path_member_ref(Path::new(index_key))
+                        .is_some_and(|member| settled_cap_rearmed.contains(member.root))
+                {
+                    rearm_cause::clear(index_key, entry, transition.rearm_cause());
+                    settled_cap_rearmed_files += 1;
+                }
+            }
+            rearmed_file_count += settled_cap_rearmed_files;
+        }
         if window_rearmed_file_count > 0 {
             claude_full_rearm_window_note_stale_rearm(index, collected_at, window_member_digests);
         }
@@ -42967,6 +43072,26 @@ fn ensure_bounded_traversal(
         transition.rearmed_index_files = rearmed_file_count;
         transition.carried_pending_families = carried_roots.len();
         transition.carried_index_files = carried_file_count;
+        if settled_contract {
+            let budget = crate::source_rotation::PARKED_BUDGET;
+            eprintln!(
+                "local snapshot census settled-contract carry: kept_invalid_families={} \
+                 kept_invalid_files={} kept_invalid_cap_room_rearmed_families={} \
+                 prior_admission_dropped={} prior_admission_due_retained={} admission={} \
+                 latched={} priced_roots={} priced_bytes={} headroom_alarm={}",
+                settled_kept.len() - settled_cap_rearmed.len(),
+                settled_kept_files.saturating_sub(settled_cap_rearmed_files),
+                settled_cap_rearmed.len(),
+                settled_admission_dropped,
+                settled_due_retained,
+                admission.is_some(),
+                index.claude_request_identity_contract_changed,
+                stale_pending_roots.len(),
+                settled_price.map_or(-1, |bytes| bytes as i128),
+                settled_price.map_or(true, |bytes| bytes.saturating_mul(5)
+                    >= budget.saturating_mul(4)),
+            );
+        }
         index.claude_stale_family_carry = ClaudeStaleFamilyCarry {
             origin: Some(ClaudeStaleFamilyCarryOrigin {
                 context_fingerprint: context_fingerprint.clone(),

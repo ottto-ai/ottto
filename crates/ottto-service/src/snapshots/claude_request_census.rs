@@ -646,6 +646,19 @@ impl ClaudeRequestCensusRecord {
                 .is_some_and(|fp| fp == self.source_file_fingerprint)
     }
 
+    /// Settled-contract keep (switch ON only): this exact revision was parsed
+    /// in `window` under the current derivation, whatever its shape, so a
+    /// re-read reproduces it. Never proof, coverage or an ACK.
+    pub(super) fn reproduces(&self, entry_fingerprint: &str, window: u64) -> bool {
+        self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
+            && self.window == window
+            && !self.unverified
+            && !self.twin
+            && self.retired.is_none()
+            && decode_fingerprint(entry_fingerprint)
+                .is_some_and(|fingerprint| fingerprint == self.source_file_fingerprint)
+    }
+
     /// Freshness of a ledger holder: `current_for`, or a loss-free
     /// identity-incomplete record (it has message-only, id-less or displaced
     /// responses) whose message-only ids are known (`message_known`, the
