@@ -736,6 +736,7 @@ pub(crate) struct DurableTailStore {
     /// Process-lifetime attempts, removed only after a successful replacement.
     rebuilt: BTreeMap<Digest32, Rebuild>,
     startup_synced: bool,
+    off_v1_sync_due: bool,
     gc_after: Option<Digest32>,
     private_purge_entries: Option<fs::ReadDir>,
     private_purge_page: Option<PrivateLabelPage>,
@@ -804,6 +805,7 @@ impl DurableTailStore {
             pass: [0; 2],
             rebuilt: BTreeMap::new(),
             startup_synced: false,
+            off_v1_sync_due: false,
             gc_after: None,
             private_purge_entries: None,
             private_purge_page: None,
@@ -958,6 +960,19 @@ impl DurableTailStore {
         self.dir.join(format!("{}{RECORD_SUFFIX}", hex(key)))
     }
 
+    /// Existing owned directory, without permission repair or startup sync.
+    fn read_only_directory(&self) -> io::Result<bool> {
+        let metadata = match inspect_path(&self.dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_dir() || metadata.uid() != our_uid() || metadata.mode() & 0o777 != 0o700 {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        Ok(true)
+    }
+
     /// Owner/mode (store-level) precede header dispatch, which precedes the
     /// size check. Only a verified known record licenses mutation. `Ok(None)`
     /// also when the store is disabled.
@@ -977,14 +992,8 @@ impl DurableTailStore {
         if read_only {
             // Privacy dispatch is not startup/restore: never repair metadata
             // or run the startup barrier merely to identify unrelated bytes.
-            let metadata = match inspect_path(&self.dir) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(_) => return Err(Refusal::Undecodable),
-            };
-            if !metadata.is_dir() || metadata.uid() != our_uid() || metadata.mode() & 0o777 != 0o700
-            {
-                return Err(Refusal::Undecodable);
+            if !self.read_only_directory().map_err(|_| Refusal::Undecodable)? {
+                return Ok(None);
             }
         } else if !self.usable(writer) {
             return Ok(None);
@@ -2560,6 +2569,8 @@ impl DurableTailStore {
     ) -> io::Result<bool> {
         let result = (|| -> io::Result<bool> {
             self.check_writer(writer)?;
+            // Retry only our own unlink barrier, never the startup restore sync.
+            self.sync_off_v1_unlink()?;
             if self.pending.contains_key(key) {
                 return Ok(false);
             }
@@ -2579,9 +2590,8 @@ impl DurableTailStore {
             // If the barrier fails, the next classification retries it even
             // though the pathname is now absent. No deletion is reported early.
             self.startup_synced = false;
-            self.sync_store()?;
-            self.startup_synced = true;
-            self.counters.off_v1_invalidated += 1;
+            self.off_v1_sync_due = true;
+            self.sync_off_v1_unlink()?;
             Ok(true)
         })();
         if result.is_err() {
@@ -2590,9 +2600,25 @@ impl DurableTailStore {
         result
     }
 
-    /// Physical absence only: a retired reduction still has a record on disk.
+    /// Physical absence after any outstanding OFF unlink barrier. A missing
+    /// name alone cannot settle a deletion whose directory sync failed.
     pub(crate) fn record_missing(&self, key: &Digest32) -> bool {
-        matches!(stamp_at(&self.record_path(key)), Ok(None))
+        !self.off_v1_sync_due && matches!(stamp_at(&self.record_path(key)), Ok(None))
+    }
+
+    fn sync_off_v1_unlink(&mut self) -> io::Result<()> {
+        if self.off_v1_sync_due {
+            if self.read_only_directory()? {
+                self.sync_store()?;
+            } else {
+                // A removed whole store is settled by its parent's barrier.
+                sync_dir(self.dir.parent().ok_or_else(|| io::Error::other("store parent"))?)?;
+            }
+            self.off_v1_sync_due = false;
+            self.startup_synced = true;
+            self.counters.off_v1_invalidated += 1;
+        }
+        Ok(())
     }
 
     /// Retire exactly the verified predecessor. `sync_due` belongs to writer

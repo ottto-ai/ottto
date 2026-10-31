@@ -2558,11 +2558,10 @@ impl SharedCache {
         let Some(slot) = stores.slot(source).as_mut() else {
             return;
         };
-        let outcome = if !slot.dir.try_exists().unwrap_or(true) {
-            Ok(true) // The record's whole directory was removed.
-        } else if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
-            slot.store
-                .invalidate_outgrown_v1(writer, &digest, published_end)
+        let outcome = if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
+            slot.store.invalidate_outgrown_v1(writer, &digest, published_end)
+        } else if !slot.dir.try_exists().unwrap_or(true) && slot.store.record_missing(&digest) {
+            Ok(true) // No record or outstanding unlink barrier remains.
         } else {
             return;
         };
