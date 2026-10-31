@@ -25952,12 +25952,32 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     }
 }
 
+mod child_evidence_digest;
+
 fn prepare_owned_scan_candidate(
+    source: SnapshotSource,
+    candidate: &mut CandidateFile,
+    codex: &CodexTitleMetadata,
+    claude: &ClaudeTitleMetadata,
+    support: Option<&Path>,
+) {
+    prepare_owned_scan_candidate_with_child_evidence(
+        source,
+        candidate,
+        codex,
+        claude,
+        support,
+        &mut child_evidence_digest::Page::default(),
+    );
+}
+
+fn prepare_owned_scan_candidate_with_child_evidence(
     source: SnapshotSource,
     candidate: &mut CandidateFile,
     codex_title_metadata: &CodexTitleMetadata,
     claude_title_metadata: &ClaudeTitleMetadata,
     claude_effort_support_dir: Option<&Path>,
+    child_evidence: &mut child_evidence_digest::Page,
 ) {
     // Sidecar contribution is path-derived and can be computed before the
     // transcript opens. Transcript identity itself is filled from the
@@ -25993,6 +26013,9 @@ fn prepare_owned_scan_candidate(
                     &candidate.path,
                     &identity,
                     claude_effort_support_dir,
+                    child_evidence
+                        .digest(claude_effort_support_dir, &identity)
+                        .as_deref(),
                 )
             } else {
                 candidate
@@ -26057,6 +26080,7 @@ pub(crate) struct OwnedSourceScan {
     claude_effort_support_dir: Option<PathBuf>,
     codex_title_metadata: CodexTitleMetadata,
     claude_title_metadata: ClaudeTitleMetadata,
+    child_evidence: child_evidence_digest::Page,
     state_census_complete: bool,
     sidecar_census_complete: bool,
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
@@ -26611,6 +26635,7 @@ impl OwnedSourceScan {
             claude_request_identity_capture: false,
             claude_effort_support_dir: None,
             claude_title_metadata: Default::default(),
+            child_evidence: Default::default(),
             state_census_complete: !codex_title_metadata.state_census_incomplete,
             sidecar_census_complete: !codex_title_metadata.sidecar_census_incomplete,
             codex_title_metadata,
@@ -27131,13 +27156,17 @@ impl OwnedSourceScan {
             })
             .collect::<Vec<_>>();
 
-        let prepare_candidate_context = |candidate: &mut CandidateFile| {
-            prepare_owned_scan_candidate(
+        let mut child_evidence = child_evidence_digest::Page::new(
+            source == SnapshotSource::ClaudeCode && terminal_off_policy::child_evidence_digest(),
+        );
+        let mut prepare_candidate_context = |candidate: &mut CandidateFile| {
+            prepare_owned_scan_candidate_with_child_evidence(
                 source,
                 candidate,
                 &codex_title_metadata,
                 &claude_title_metadata,
                 claude_effort_support_dir,
+                &mut child_evidence,
             );
         };
         for candidate in &mut files {
@@ -27416,6 +27445,7 @@ impl OwnedSourceScan {
             claude_effort_support_dir: claude_effort_support_dir.map(Path::to_path_buf),
             codex_title_metadata,
             claude_title_metadata,
+            child_evidence,
             state_census_complete,
             sidecar_census_complete,
             codex_turn_traces,
@@ -27614,6 +27644,7 @@ impl OwnedSourceScan {
             claude_effort_support_dir,
             codex_title_metadata,
             claude_title_metadata,
+            mut child_evidence,
             state_census_complete,
             sidecar_census_complete,
             codex_turn_traces,
@@ -32444,12 +32475,13 @@ impl OwnedSourceScan {
             }
             // Keep the prepass physical identity intact while lookup yields. Only
             // replace it with sidecar inputs immediately before the second open.
-            prepare_owned_scan_candidate(
+            prepare_owned_scan_candidate_with_child_evidence(
                 source,
                 &mut candidate,
                 &codex_title_metadata,
                 &claude_title_metadata,
                 claude_effort_support_dir_ref,
+                &mut child_evidence,
             );
             let rescue_key = local_index_key(&candidate.path);
             let open_parked = source == SnapshotSource::ClaudeCode
@@ -33936,6 +33968,7 @@ impl OwnedSourceScan {
             claude_effort_support_dir,
             codex_title_metadata,
             claude_title_metadata,
+            child_evidence,
             state_census_complete,
             sidecar_census_complete,
             codex_turn_traces,
@@ -52959,6 +52992,7 @@ fn claude_subagent_sidecar_fingerprint(
     transcript_path: &Path,
     identity: &ClaudeSubagentIdentity,
     claude_effort_support_dir: Option<&Path>,
+    consumed_evidence: Option<&str>,
 ) -> String {
     let meta_stat = file_stat_token(&transcript_path.with_extension("meta.json"));
     let manifest_stat = identity
@@ -52971,11 +53005,13 @@ fn claude_subagent_sidecar_fingerprint(
     // id. Make every explicit child depend on that same sidecar so late account
     // evidence re-selects the complete family, even if the child transcript was
     // indexed before the final provider event arrived.
-    let effort_fingerprint = claude_effort_support_dir
-        .map(|support_dir| {
-            claude_usage_sidecars_fingerprint(support_dir, &identity.root_session_id)
-        })
-        .unwrap_or_default();
+    let effort_fingerprint = consumed_evidence.map(str::to_owned).unwrap_or_else(|| {
+        claude_effort_support_dir
+            .map(|support_dir| {
+                claude_usage_sidecars_fingerprint(support_dir, &identity.root_session_id)
+            })
+            .unwrap_or_default()
+    });
     sha256_hex(&[
         "claude_subagent_sidecar:v2",
         &meta_stat,
@@ -68450,10 +68486,10 @@ mod tests {
 
         let support_dir = root.join("support");
         let baseline =
-            claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir));
+            claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir), None);
         assert_eq!(
             baseline,
-            claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir)),
+            claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir), None),
             "fingerprint must be deterministic"
         );
 
@@ -68465,7 +68501,7 @@ mod tests {
         )
         .expect("write manifest");
         let with_manifest =
-            claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir));
+            claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir), None);
         assert_ne!(baseline, with_manifest);
 
         // So does a meta sidecar appearing...
@@ -68475,7 +68511,7 @@ mod tests {
         )
         .expect("write sidecar");
         let with_meta =
-            claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir));
+            claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir), None);
         assert_ne!(with_manifest, with_meta);
 
         // Root-scoped OTLP identity arriving later must also re-select the
@@ -68494,7 +68530,7 @@ mod tests {
             1
         );
         let with_effort =
-            claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir));
+            claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir), None);
         assert_ne!(with_meta, with_effort);
 
         let _ = fs::remove_dir_all(root);
@@ -84759,7 +84795,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, child_evidence, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);

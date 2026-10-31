@@ -28,6 +28,19 @@ pub(super) fn enabled() -> bool {
     }
 }
 
+/// Q-D3: hash the child's consumed root evidence instead of sidecar stats.
+pub(in crate::snapshots) fn child_evidence_digest() -> bool {
+    #[cfg(test)]
+    { false }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| marker_at(
+            &ottto_core::default_support_dir(), "claude_child_evidence_digest_enabled",
+        ))
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
