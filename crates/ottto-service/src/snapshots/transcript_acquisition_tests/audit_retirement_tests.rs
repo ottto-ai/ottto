@@ -2027,8 +2027,15 @@ fn protected_codex_absence_retires_only_the_audit_obligation() {
     traversal.reconciliation_upper_bound = Some(key.clone());
     let (done, diagnostics) = crate::local_resource_diagnostics::capture(|| {
         let done = reconcile_missing_index_entries_with_side(&mut index, 10, None, source);
-        crate::local_resource_diagnostics::Probe::start()
-            .collection(source.api_slug(), Default::default());
+        crate::local_resource_diagnostics::Probe::start().collection(
+            source.api_slug(),
+            crate::local_resource_diagnostics::CollectionCounts {
+                scanned_files: 0,
+                semantic_noops: 0,
+                sampled_acquisition: None,
+                full_causes: Default::default(),
+            },
+        );
         done
     });
     assert!(done);

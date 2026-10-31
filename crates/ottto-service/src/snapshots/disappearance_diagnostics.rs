@@ -743,7 +743,7 @@ mod tests {
         }
     }
 
-    /// N-T3: main records the forced member's NotFound as loss in every such
+    /// [behaviour] N-T3: main records the forced member's NotFound as loss in every such
     /// generation. With the parent present the first one is a removal that
     /// retires the entry together with its unverified audit marker (SOURCE N2,
     /// counted), so the next generation no longer enumerates the member and
@@ -763,7 +763,14 @@ mod tests {
         index
             .claude_account_deferred_holds
             .insert(member_key.clone(), "held-member-revision".to_string());
-        for at in [NOW, RETRY] {
+        super::super::sampled_scan::set_test_now(Some(1_000));
+        claude_generation(&mut index, &fixture.dir, NOW, 10, &[]);
+        assert!(index
+            .claude_account_deferred_holds
+            .contains_key(&member_key));
+        assert!(index.files[&member_key].has_unverified_source());
+        for (at, now) in [(NOW, 1_600), (RETRY, 2_200)] {
+            super::super::sampled_scan::set_test_now(Some(now));
             let (result, rows) = crate::local_resource_diagnostics::capture(|| {
                 observe_vanished(|| {
                     observe_sites(|| {
@@ -834,6 +841,7 @@ mod tests {
                 "positively absent account hold is released"
             );
         }
+        super::super::sampled_scan::set_test_now(None);
     }
 
     /// Control for N-T3: the same member with its parent directory missing is
@@ -953,7 +961,7 @@ mod tests {
         assert_eq!(vanished, [[0; VANISHED], [0, 1], [0; VANISHED]]);
     }
 
-    /// The audit-debt path (SOURCE N2) also drops the member's request-census
+    /// [behaviour] The audit-debt path (SOURCE N2) also drops the member's request-census
     /// (D1) record with its entry and counts both retirements, while the
     /// member's snapshot fingerprints stay (N3).
     #[test]
@@ -1003,9 +1011,26 @@ mod tests {
             }
             let fingerprints_before = index.file_snapshot_fingerprints.get(&second_key).cloned();
             fs::remove_file(&second_path).unwrap();
+            super::super::sampled_scan::set_test_now(Some(1_000));
             let ((pages, sites), vanished) = observe_vanished(|| {
-                observe_sites(|| claude_generation(&mut index, &dir, LATER, 1, &[]))
+                observe_sites(|| {
+                    let mut pages = claude_generation(&mut index, &dir, LATER, 1, &[]);
+                    if account_held {
+                        assert!(index
+                            .claude_account_deferred_holds
+                            .contains_key(&second_key));
+                        assert!(index.files[&second_key].has_unverified_source());
+                        assert!(index
+                            .claude_request_census_for_test()
+                            .get(&second_key)
+                            .is_some());
+                        super::super::sampled_scan::set_test_now(Some(1_600));
+                        pages.extend(claude_generation(&mut index, &dir, LATER, 1, &[]));
+                    }
+                    pages
+                })
             });
+            super::super::sampled_scan::set_test_now(None);
             let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
             expected_sites[1][Site::CandidateWalk.index()] = [0, 1];
             assert_eq!(sites, expected_sites);
