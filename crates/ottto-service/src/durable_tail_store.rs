@@ -2460,8 +2460,8 @@ impl DurableTailStore {
         let mut report = PrivateLabelPurge {
             visited: self
                 .private_purge_page
-                .as_ref()
-                .map_or(0, |page| page.visited),
+                .as_mut()
+                .map_or(0, |page| std::mem::take(&mut page.visited)),
             scanned: 0,
             verified: 0,
             erased: 0,
@@ -2513,8 +2513,8 @@ impl DurableTailStore {
             erased += 1;
         }
         // No erase count until unlink AND its directory barrier have succeeded.
-        if self.sync_store().is_err() {
-            report.refused += erased.max(1);
+        if erased > 0 && self.sync_store().is_err() {
+            report.refused += erased;
             return Ok(report); // Previous inventory still says PL may exist.
         }
         report.erased = erased;
