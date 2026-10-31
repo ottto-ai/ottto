@@ -601,7 +601,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         false,
         true,
     );
-    let cold = loop {
+    let (cold_index, cold) = loop {
         match cold_scan.step(None) {
             OwnedSourceScanStep::Pending(next) => cold_scan = next,
             OwnedSourceScanStep::Complete {
@@ -611,7 +611,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
             } => {
                 apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
                 finalize_scan_after_policy(source, &mut scan, &mut index);
-                break scan;
+                break (index, scan);
             }
         }
     };
@@ -621,8 +621,8 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         "catch-up body == cold Full"
     );
     sampled_scan::transition_fixture::money_oracle::assert_equivalent(
-        &sampled_scan::transition_fixture::scan_money(source, &cold),
-        &sampled_scan::transition_fixture::scan_money(source, &scan),
+        &sampled_scan::transition_fixture::scan_money(source, &cold_index, &cold),
+        &sampled_scan::transition_fixture::scan_money(source, &caught, &scan),
     );
     let (_, idle, reads, _) = f.page(source, caught);
     assert!(idle.snapshots.is_empty(), "emitted once");

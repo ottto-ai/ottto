@@ -1711,7 +1711,7 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
         "new committed size catches up"
     );
     // Keep the raw full-body comparison and the shared emitted-money oracle.
-    let (_, cold, _) = finish(OwnedSourceScan::new(
+    let (cold_index, cold, _) = finish(OwnedSourceScan::new(
         SnapshotSource::ClaudeCode,
         &[root.projects()],
         ScanIndex::default(),
@@ -1730,8 +1730,16 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
         "aged growth == cold Full body"
     );
     sampled_scan::transition_fixture::money_oracle::assert_equivalent(
-        &sampled_scan::transition_fixture::scan_money(SnapshotSource::ClaudeCode, &cold),
-        &sampled_scan::transition_fixture::scan_money(SnapshotSource::ClaudeCode, &result),
+        &sampled_scan::transition_fixture::scan_money(
+            SnapshotSource::ClaudeCode,
+            &cold_index,
+            &cold,
+        ),
+        &sampled_scan::transition_fixture::scan_money(
+            SnapshotSource::ClaudeCode,
+            &caught_up,
+            &result,
+        ),
     );
     let fingerprint = caught_up.files[&key].source_file_fingerprint.clone();
     assert_eq!(
@@ -2124,7 +2132,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
         sampled_scan::set_test_now(Some(now.unix_timestamp() as u64));
         append(&original, &assistant_line("rename-accepted"));
         let (baseline, first, _) = finish(make(ScanIndex::default(), &today, 7));
-        let mut prior = scan_money(source, &first);
+        let mut prior = scan_money(source, &baseline, &first);
         prior.accepted = first
             .snapshots
             .iter()
@@ -2153,7 +2161,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
         // Growth is unread when the pathname changes; rename preserves mtime.
         append(&original, &assistant_line("rename-unread"));
         let modified = fs::metadata(&original).unwrap().modified().unwrap();
-        let (_, cold_scan, _) = finish(OwnedSourceScan::new(
+        let (cold_index, cold_scan, _) = finish(OwnedSourceScan::new(
             source,
             &[root.projects()],
             ScanIndex::default(),
@@ -2166,7 +2174,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
             false,
             true,
         ));
-        let cold = scan_money(source, &cold_scan);
+        let cold = scan_money(source, &cold_index, &cold_scan);
         if !known_generation {
             // Real legacy/unknown owner state, using its existing observation API.
             let birth = claude_context_file_birth::ClaudeOpenedBirth::from_metadata(
@@ -2366,7 +2374,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
                 resolved.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
             assert_eq!(partial.files[&new_key].size_bytes, committed_size);
             assert!(!partial.files.contains_key(&old_key));
-            money_oracle::assert_equivalent(&cold, &scan_money(source, &result));
+            money_oracle::assert_equivalent(&cold, &scan_money(source, &resolved, &result));
             assert_eq!(
                 result
                     .snapshots
@@ -2398,7 +2406,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
                     kept = next;
                     assert!(quiet.snapshots.is_empty());
                 }
-                let mut route = scan_money(source, &result);
+                let mut route = scan_money(source, &kept, &result);
                 route.accepted = prior.accepted.clone();
                 money_oracle::assert_held(SESSION, &prior, &route, &cold);
                 assert!(kept.claude_account_deferred_holds.contains_key(&old_key));

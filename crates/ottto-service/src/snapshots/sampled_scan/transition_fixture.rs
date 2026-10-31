@@ -27,6 +27,7 @@ use std::path::Path;
 /// Emitted-body comparison for native scan fixtures without a transport driver.
 pub(crate) fn scan_money(
     source: SnapshotSource,
+    index: &super::super::ScanIndex,
     scan: &super::super::SourceScanResult,
 ) -> RouteResult {
     let batches = if scan.snapshots.is_empty() {
@@ -37,7 +38,32 @@ pub(crate) fn scan_money(
         request.snapshots = scan.snapshots.clone();
         vec![serde_json::to_vec(&request).unwrap()]
     };
-    RouteResult::emitted(Mode::Ram, source, batches, &scan.snapshots)
+    let mut route = RouteResult::emitted(Mode::Ram, source, batches, &scan.snapshots);
+    if source == SnapshotSource::Codex {
+        route.codex_evidence = codex_evidence(index, scan);
+    }
+    route
+}
+
+/// The actual post-scan tier/ownership state and emitted token counts. Shared
+/// by ordinary scan and durable-transition adapters; absence is collected too.
+pub(crate) fn codex_evidence(
+    index: &super::super::ScanIndex,
+    scan: &super::super::SourceScanResult,
+) -> Value {
+    json!({
+        "TierReplay": index.files.iter().map(|(key, entry)| (key.clone(), json!({
+            "applied": entry.codex_applied_tier_receipt,
+            "required": entry.codex_applied_tier_receipt_required,
+            "captured": entry.codex_captured_tier_receipt,
+            "owner": entry.codex_protected_owner,
+            "v2": entry.codex_counting_v2,
+        }))).collect::<BTreeMap<_, _>>(),
+        "token_count": scan.snapshots.iter().map(|item| (item.source_session_id.clone(), json!([
+            item.input_tokens, item.output_tokens, item.cache_read_tokens,
+            item.reasoning_output_tokens, item.request_count,
+        ]))).collect::<BTreeMap<_, _>>(),
+    })
 }
 
 /// Keep private acquisition internals private; sibling test adapters enter here.
