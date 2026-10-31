@@ -1338,10 +1338,11 @@ impl<R: BufRead + Seek> Decoder<R> {
         record: Span,
         custody: bool,
     ) -> std::result::Result<Option<Span>, Error> {
-        // Custody is a closed optional scalar at ScanIndexEntry position21.
-        //512 wire bytes includes escaped supported labels without buffering damage.
+        // Custody is a closed optional scalar at ScanIndexEntry position 22,
+        // after main's upload_context_receipt (21). 512 wire bytes includes
+        // escaped supported labels without buffering damage.
         let (name, slot, limit) = if custody {
-            ("codex_compressed_hold", 21, 512)
+            ("codex_compressed_hold", 22, 512)
         } else {
             ("idless_revision", 4, 4096)
         };

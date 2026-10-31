@@ -724,6 +724,7 @@ fn custody_lexical_mask_precedes_reader_allocation_and_keeps_entry_evidence() {
         "opened_changed_nanos",
         "archive",
         "opened_birth_nanos",
+        "upload_context_receipt",
         "codex_compressed_hold",
     ];
     for positional in [false, true] {
@@ -732,7 +733,7 @@ fn custody_lexical_mask_precedes_reader_allocation_and_keeps_entry_evidence() {
         if positional {
             let mut fields = json!([
                 0, 0, null, "", null, null, 0, null, null, null, null, null, false, null, false,
-                false, false, null, 0, null, 0, null
+                false, false, null, 0, null, 0, null, null
             ]);
             for (at, name) in names.iter().enumerate() {
                 if let Some(v) = value["files"][&key].get(*name) {
