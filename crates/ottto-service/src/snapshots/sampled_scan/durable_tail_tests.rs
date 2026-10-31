@@ -11993,7 +11993,7 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
         ),
         RestoreOutcome::QuietPending
     ));
-    assert_eq!(fresh.durable_counters(source).unwrap().1.body_bytes_read, 0);
+    assert_eq!(fresh.durable_counters(source).unwrap().1.guard_verify_bytes, 0);
     std::io::Write::write_all(
         &mut std::fs::OpenOptions::new().append(true).open(&path).unwrap(),
         b"{}\n",
