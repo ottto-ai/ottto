@@ -95,10 +95,6 @@ fn serve_listener(
     // before it on every return path, before the descriptor can be closed and
     // reused.
     let published = PublishedListener::publish(listener.as_raw_fd());
-    // Declared after `published`, so it drops (and unguards) first, and both
-    // drop before the `listener` parameter closes the descriptor.
-    let fd_guard =
-        crate::fd_guard::ListenerFdGuard::arm_if_enabled(listener.as_raw_fd(), "unix control");
 
     let mut served = 0_usize;
     let mut workers = Vec::new();
@@ -134,10 +130,9 @@ fn serve_listener(
                 eprintln!(
                     "socket listener {} lost its descriptor: {error}; {}; {}; stopping",
                     path.display(),
-                    crate::fd_guard::describe_descriptor(fd),
-                    crate::fd_guard::descriptor_census()
+                    control_plane_health::describe_descriptor(fd),
+                    control_plane_health::descriptor_census()
                 );
-                drop(fd_guard);
                 drop(published);
                 let _ = listener.into_raw_fd();
                 return Err(error)
@@ -167,7 +162,6 @@ fn serve_listener(
             eprintln!("socket listener {} worker panicked", path.display());
         }
     }
-    drop(fd_guard);
     drop(published);
     Ok(())
 }

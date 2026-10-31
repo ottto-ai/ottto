@@ -112,7 +112,6 @@ crates/ottto-service/src/control.rs	29355	targeted reading	partially read: 285-4
 crates/ottto-service/src/control_plane_health.rs	358	structural scan	structural scan	not reviewed in this pass
 crates/ottto-service/src/detected_uses.rs	759	structural scan	structural scan	not reviewed in this pass
 crates/ottto-service/src/external_scheduler_attribution.rs	1240	structural scan	structural scan	not reviewed in this pass
-crates/ottto-service/src/fd_guard.rs	323	structural scan	structural scan	not reviewed in this pass
 crates/ottto-service/src/heap_layout_bound.rs	437	structural scan	structural scan	not reviewed in this pass
 crates/ottto-service/src/keychain.rs	906	targeted reading	partially read: 1-230,590-669	partially read: 1-521,555-700
 crates/ottto-service/src/launch_events.rs	943	structural scan	structural scan	not reviewed in this pass

@@ -38,8 +38,6 @@ mod durable_tail_codec;
 #[cfg(unix)]
 mod durable_tail_store;
 mod external_scheduler_attribution;
-#[cfg(unix)]
-pub(crate) mod fd_guard;
 mod instruction_inventory;
 pub mod keychain;
 mod launch_events;
