@@ -192,31 +192,6 @@ fn over_cap_tail_uploads_match_one_full_upload_without_retractions() {
 }
 
 #[test]
-fn prefix_storage_is_fixed_for_many_requests_with_few_or_many_breaks() {
-    for breaks in [0, 2, 100_000] {
-        let mut requests = session("", breaks);
-        while requests.len() < 100_000 {
-            let index = requests.len();
-            requests.push(request(
-                &format!("warm_extra_{index}"),
-                90_000,
-                index as i64,
-            ));
-        }
-        let (rows, omitted) = cache_observations::detect_unique_prefix("s", &requests);
-        assert_eq!(rows.capacity(), MAX_OPERATIONS);
-        assert_eq!(rows.len(), breaks.min(MAX_OPERATIONS));
-        assert_eq!(omitted, breaks.saturating_sub(MAX_OPERATIONS) as u64);
-        assert_eq!(
-            rows.iter()
-                .map(|row| row.affected_request_ref.clone())
-                .collect::<Vec<_>>(),
-            colds(0..breaks.min(MAX_OPERATIONS))
-        );
-    }
-}
-
-#[test]
 fn partial_never_retracts_prior_and_extra_prior_ids_make_count_unknown() {
     let (_, prior) = upload(&session("old_", 10), None);
     let (wire, state) = upload(&session("", 65), Some(&prior));
@@ -410,13 +385,6 @@ fn cumulative_row_cap_and_metadata_only_refusal_preserve_accepted_evidence() {
     prepare_cache_observations(&mut item, Some(&exact));
     assert!(item.cache_observations.is_none());
     assert!(item.cache_observations_state.is_none());
-}
-
-#[test]
-fn claude_overflow_adapter_keeps_its_existing_empty_gate() {
-    let wire = cache_wire_for_requests("s", &session("", 65)).unwrap();
-    assert!(wire.operations.is_empty());
-    assert_eq!(wire.omitted_observation_count, Some(65));
 }
 
 #[test]

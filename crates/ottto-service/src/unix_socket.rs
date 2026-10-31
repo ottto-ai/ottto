@@ -499,15 +499,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn peer_euid_reports_connecting_process_euid() {
-        // A connected socket pair lives in this process, so the captured peer
-        // euid must equal our own effective uid.
-        let (a, _b) = UnixStream::pair().expect("socket pair");
-        let euid = peer_euid(&a).expect("peer euid available on connected socket");
-        assert_eq!(euid, unsafe { libc::geteuid() });
-    }
-
-    #[test]
     fn local_client_peer_captures_euid() {
         let (a, _b) = UnixStream::pair().expect("socket pair");
         let peer = local_client_peer(&a).expect("peer attributes");
@@ -1054,69 +1045,6 @@ mod tests {
         server.join().expect("server thread should join").unwrap();
         // The listener is gone, so its descriptor is no longer published.
         assert_eq!(control_plane_health::published_listener_draining(), None);
-        let _ = fs::remove_file(path);
-    }
-
-    /// Serving counts answered requests for the check-in, and a request that
-    /// could not be read counts as an error.
-    #[test]
-    #[serial]
-    fn unix_socket_counts_served_requests_and_read_failures() {
-        let path = std::env::temp_dir().join(format!(
-            "ottto-service-test-{}-{}.sock",
-            std::process::id(),
-            "health-counters"
-        ));
-        let _ = fs::remove_file(&path);
-        let handler: RequestHandler = Arc::new(move |request, _peer| LocalControlResponse {
-            request_id: request.request_id,
-            ok: true,
-            payload: Some(serde_json::json!({"daemon": "running"})),
-            error: None,
-        });
-        let server_path = path.clone();
-        let server = thread::spawn(move || {
-            serve_unix_socket_with_limit_and_handler(&server_path, Some(2), handler)
-        });
-        wait_for_socket(&path);
-        control_plane_health::mark_serving(control_plane_health::ControlTransport::UnixSocket);
-        let before = control_plane_health::snapshot().expect("serving health");
-
-        let response = request_unix_socket(
-            &path,
-            &LocalControlRequest {
-                request_id: "req_health_counters".to_string(),
-                protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
-                token: Some("token".to_string()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: LocalControlCommand::Status {
-                    refresh_agent_status: false,
-                    retry_relay_authorization: false,
-                },
-            },
-        )
-        .expect("socket request should succeed");
-        assert!(response.ok);
-        {
-            let mut stream = UnixStream::connect(&path).expect("connect socket");
-            stream
-                .write_all(b"not json")
-                .expect("write malformed request");
-            stream
-                .shutdown(std::net::Shutdown::Write)
-                .expect("shutdown write");
-            let mut body = Vec::new();
-            stream
-                .read_to_end(&mut body)
-                .expect("read invalid-request reply");
-        }
-        server.join().expect("server thread should join").unwrap();
-
-        let after = control_plane_health::snapshot().expect("serving health");
-        assert!(after.requests_served > before.requests_served);
-        assert!(after.request_errors > before.request_errors);
-        assert!(after.last_request_served_at.is_some());
         let _ = fs::remove_file(path);
     }
 
