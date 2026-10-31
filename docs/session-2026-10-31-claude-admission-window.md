@@ -2,23 +2,28 @@
 
 The optional support-directory marker `claude_admission_reoffer_window_enabled`
 limits admission-triggered widening of the Claude scan window. It defaults OFF.
-Only a regular file enables it; symlinks and directories do not. The marker is
-read at source-cycle preparation, independently of the terminal-off setting.
+Only a regular file enables it; symlinks and directories do not. Its marker is
+statted once per Claude preparation, including OFF; no incidence files are
+statted OFF.
 
-When enabled, an ordinary current-limit RetryPending hold inside the negotiated
-window leaves that window unchanged. The one-shot admission re-offer still
-widens the scan: its existing zero failure count and zero retry deadline mark
-an unspent re-entry. Legacy settlement reconciliation uses that same shape and
-keeps its recovery opportunity. No persisted field or upload format is added.
+When enabled, every current-limit RetryPending record follows one rule, whether
+ordinary, legacy or armed by admission re-offer: widen only if some incidence
+file is outside the current window or unknown. All known incidences inside the
+window leave it unchanged; the narrow walk already visits those files. Failure
+counts and retry deadlines are not provenance and do not affect this decision.
+Below-limit records retain the existing admission-reoffer behavior.
 
-A pending retry outside the discovery window also keeps widening, including one
-that aged out after refusal. This uses committed file/entity incidence and the
-scanner's existing mtime cutoff, using current file metadata. Missing metadata,
-non-files and unknown incidence conservatively keep the broad scan. This avoids
-relying on a committed mtime that could be stale after a restore or copy.
-No ACK or quarantine is settled by this window decision.
+The rule uses committed file/entity incidence and the scanner's existing mtime
+cutoff on current file metadata. Missing incidence, stat/mtime errors and
+non-files conservatively widen. No ACK or quarantine is settled by this decision.
 
-The enabled path logs only counts: `armed`, `outside_or_unknown`, and
-`ordinary_inside`. Explicit historical and context-curve replays retain their
-existing window decisions. With the marker absent, the original pending query
-is used. Codex and Pi retain that original query under either setting.
+Metadata work is incidence-proportional: up to the sum of matching incidences
+across qualifying records, with early exit per record on outside/unknown. A file
+shared by multiple entities may be statted repeatedly. The retry lease budget
+does not cap this query. A hold aging out can still widen the scan and change
+its traversal context; settlement can narrow it again. These residual flips
+preserve discovery of owed retries.
+
+The enabled path logs only `outside_or_unknown` and `inside` record counts.
+Explicit historical and context-curve replay decisions stay unchanged. OFF,
+Codex and Pi retain the original pending query. No persisted format is added.

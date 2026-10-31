@@ -64,53 +64,76 @@ fn admission_window_off_matches_main() {
     }
 }
 
-/// [regress] M4's one ordinary current-limit hold must not flip the context twice.
+/// [regress] Any in-window current-limit hold must not flip the context twice.
 #[test]
-fn admission_window_ordinary_retry_keeps_window_and_context() {
+fn admission_window_in_window_holds_keep_window_and_context() {
     let (support, mut index) = fixture();
     fs::write(support.join(MARKER), b"").unwrap();
-    let retry = index
+    let ordinary = index
         .quarantined_snapshot_fingerprints
         .remove("entity")
         .unwrap();
     let before = window_and_context(&index, &support);
     assert_eq!(before.0, 183);
-    index
-        .quarantined_snapshot_fingerprints
-        .insert("entity".into(), retry);
-    assert!(!index.prepare_snapshot_admission_reoffer(50));
-    assert_eq!(window_and_context(&index, &support), before);
-    index
-        .quarantined_snapshot_fingerprints
-        .get_mut("entity")
-        .unwrap()
-        .disposition = SnapshotQuarantineDisposition::SupersededTerminal;
-    assert_eq!(window_and_context(&index, &support), before);
+    for origin in ["ordinary", "legacy", "admission"] {
+        let mut record = ordinary.clone();
+        match origin {
+            "legacy" => {
+                record.failed_reconstruction_count = 0;
+                record.retry_after_unix_seconds = 0;
+                record.witness.contract = SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION.into();
+            }
+            "admission" => record.witness.item_wire_byte_limit = 128 * 1024,
+            _ => {}
+        }
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("entity".into(), record);
+        assert_eq!(
+            index.prepare_snapshot_admission_reoffer(50),
+            origin == "admission"
+        );
+        assert_eq!(window_and_context(&index, &support), before, "{origin}");
+        index
+            .quarantined_snapshot_fingerprints
+            .get_mut("entity")
+            .unwrap()
+            .disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+        assert_eq!(
+            window_and_context(&index, &support),
+            before,
+            "{origin} settled"
+        );
+    }
 }
 
-/// [money] Unspent lower-limit admission and a retry aged out of discovery stay wide.
+/// [money] Outside or unknown current-limit retry incidences always stay wide.
 #[test]
-fn admission_window_armed_and_aged_out_retries_stay_wide() {
+fn admission_window_outside_or_unknown_holds_stay_wide() {
     let (support, mut index) = fixture();
     fs::write(support.join(MARKER), b"").unwrap();
-    index
-        .quarantined_snapshot_fingerprints
-        .get_mut("entity")
-        .unwrap()
-        .witness
-        .item_wire_byte_limit = 128 * 1024;
-    assert!(index.prepare_snapshot_admission_reoffer(50));
-    let resumed: ScanIndex = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
-    assert_eq!(window_and_context(&resumed, &support).0, u64::MAX);
-    index.quarantined_snapshot_fingerprints.insert(
-        "entity".into(),
-        snapshot_quarantine_record(SnapshotSource::ClaudeCode),
-    );
+    let member = support.join("member.jsonl");
     assert_eq!(window_and_context(&index, &support).0, 183);
-    fs::File::open(support.join("member.jsonl"))
+    fs::File::open(&member)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH))
         .unwrap();
-    // Keep the recent committed mtime: only current file metadata shows age.
+    // A recent committed mtime cannot conceal an aged-out current file.
     assert_eq!(window_and_context(&index, &support).0, u64::MAX);
+    fs::remove_file(&member).unwrap();
+    assert_eq!(
+        window_and_context(&index, &support).0,
+        u64::MAX,
+        "stat error"
+    );
+    fs::create_dir(&member).unwrap();
+    assert_eq!(window_and_context(&index, &support).0, u64::MAX, "non-file");
+    fs::remove_dir(&member).unwrap();
+    fs::write(&member, b"").unwrap();
+    index.file_snapshot_fingerprints.clear();
+    assert_eq!(
+        window_and_context(&index, &support).0,
+        u64::MAX,
+        "missing incidence"
+    );
 }

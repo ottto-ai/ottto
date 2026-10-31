@@ -48501,9 +48501,8 @@ impl ScanIndex {
             })
     }
 
-    /// Narrow only Claude's admission-triggered scan widening. The existing
-    /// zero-failures/zero-deadline shape is an unspent admission re-entry (also
-    /// used by legacy settlement reconciliation); ordinary refusals start at 1.
+    /// Q-W: every current-limit pending retry uses the same outside/unknown
+    /// incidence rule, regardless of which operation created or armed it.
     pub(crate) fn snapshot_admission_reoffer_pending_for_scan(
         &self,
         source: SnapshotSource,
@@ -48518,15 +48517,11 @@ impl ScanIndex {
         let Some(now) = unix_seconds(SystemTime::now()) else {
             return self.snapshot_admission_reoffer_pending();
         };
-        let (mut armed, mut outside, mut ordinary) = (0, 0, 0);
+        let (mut outside, mut inside) = (0, 0);
         for (fingerprint, record) in &self.quarantined_snapshot_fingerprints {
             if record.witness.item_wire_byte_limit != MAX_SNAPSHOT_ITEM_WIRE_BYTES
                 || record.disposition != SnapshotQuarantineDisposition::RetryPending
             {
-                continue;
-            }
-            if record.failed_reconstruction_count == 0 && record.retry_after_unix_seconds == 0 {
-                armed += 1;
                 continue;
             }
             // A retry can age out after its refusal. Use the scanner's mtime
@@ -48553,15 +48548,15 @@ impl ScanIndex {
             if outside_window || !found {
                 outside += 1;
             } else {
-                ordinary += 1;
+                inside += 1;
             }
         }
-        if armed + outside + ordinary > 0 {
+        if outside + inside > 0 {
             eprintln!(
-                "ottto-service: Claude admission scan window: armed={armed} outside_or_unknown={outside} ordinary_inside={ordinary}"
+                "ottto-service: Claude admission scan window: outside_or_unknown={outside} inside={inside}"
             );
         }
-        armed + outside > 0
+        outside > 0
     }
 
     fn activate_quarantine_witness(&mut self, source: SnapshotSource) {
