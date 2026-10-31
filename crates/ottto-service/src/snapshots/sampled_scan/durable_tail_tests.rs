@@ -1318,7 +1318,14 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
             for _ in 0..10_000 {
                 match scan.step(None) {
                     OwnedSourceScanStep::Pending(next) => scan = next,
-                    OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+                    OwnedSourceScanStep::Complete {
+                        mut index,
+                        mut scan,
+                        ..
+                    } => {
+                        finalize_scan_after_policy(source, &mut scan, &mut index);
+                        return (index, scan);
+                    }
                 }
             }
             panic!("production scan did not complete");
