@@ -1473,7 +1473,9 @@ With restart restore enabled, content re-derivation runs only after growth
 past the committed extent. Quiet files return Pending before certificate samples
 or content input. Grown files validate the existing certificate samples before
 any decode, support, pacing or allocation refusal, so those refusals cannot hide
-prefix edits. The native M1 route remains active when the switch is OFF.
+prefix edits. This includes valid records with no content obligations: quiet
+restores return counted `QuietPending` before decode or sample reads. With the
+switch OFF, the durable-tail store is disabled; ordinary no-record pacing applies.
 
 The replay reads at most a 1 MiB head and one title line of at most 1 MiB.
 An enforced seeded JSON builder admits at most 8,388,608 bytes of Value-owned

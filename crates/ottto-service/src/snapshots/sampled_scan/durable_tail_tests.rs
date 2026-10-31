@@ -12340,7 +12340,11 @@ fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
                     acquisition: None,
                     binding: b,
                     certificate: certificate(&path, &scope),
-                    body: Vec::new(),
+                    body: if source == SnapshotSource::Pi {
+                        Vec::new()
+                    } else {
+                        codec::store_fixture_body(source, 0, 0)
+                    },
                     allowlist: codec::allowlist_digest(source),
                 },
             };

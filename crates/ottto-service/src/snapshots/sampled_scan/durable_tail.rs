@@ -4732,9 +4732,8 @@ impl SharedCache {
             .len()
             <= committed
             && v3.is_some();
-        // An empty body cannot restore anything; preserve the no-input quiet
-        // refusal before allocating a decoder for it.
-        if quiet && record.record.body.is_empty() {
+        // Every metadata-quiet scoped restore defers before decode or samples.
+        if quiet {
             if let Some(mut stores) = self.durable() {
                 stores.counters.restore_pending_quiet[diagnostic_source_slot(source)] += 1;
             }
@@ -4754,16 +4753,10 @@ impl SharedCache {
             // between a write-ahead replacement and its index save.
             certificate.audit_debt_unix_seconds = record.envelope_audit_debt;
         }
-        let checkpoint = if quiet {
-            None
-        } else {
-            Some(
-                certificate
-                    .restore_grown(held, scope.clone())
-                    .map_err(Failure::Certificate)?
-                    .0,
-            )
-        };
+        let checkpoint = certificate
+            .restore_grown(held, scope.clone())
+            .map_err(Failure::Certificate)?
+            .0;
         let decoded = codec::decode_bounded(&record.record.body, source, lease).map_err(
             |reason| match reason {
                 crate::durable_tail_codec::DecodeFailure::Budget => Failure::Resource("decode"),
@@ -4805,23 +4798,6 @@ impl SharedCache {
         let digest = record.record.binding.key;
         let extent = record.record.certificate.length;
         let content = decoded.has_content();
-        // Quiet input may restore the content-free reduction. Only replay of
-        // private content needs a growth grant and must precede sample reads.
-        if quiet && content {
-            if let Some(mut stores) = self.durable() {
-                stores.counters.restore_pending_quiet[diagnostic_source_slot(source)] += 1;
-            }
-            return Err(Failure::Resource("rederive_quiet"));
-        }
-        let checkpoint = match checkpoint {
-            Some(checkpoint) => checkpoint,
-            None => {
-                certificate
-                    .restore_grown(held, scope.clone())
-                    .map_err(Failure::Certificate)?
-                    .0
-            }
-        };
         if content {
             self.rederive_gate(source, digest, extent, false, false)?;
         }
