@@ -1251,7 +1251,7 @@ impl SharedCache {
                 match index.files.get(&key) {
                     None => continue,
                     Some(entry)
-                        if !entry.rearmed()
+                        if !entry.source_file_fingerprint.is_empty()
                             && acquired_for.as_deref()
                                 == Some(entry.source_file_fingerprint.as_str()) => {}
                     Some(_) => {
