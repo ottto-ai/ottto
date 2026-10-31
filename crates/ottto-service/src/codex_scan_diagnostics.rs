@@ -1100,10 +1100,18 @@ mod tests {
         let old: UnreadableCauses =
             serde_json::from_str(r#"{"counts":[0,0,2,0,1,0,0,0]}"#).unwrap();
         assert!(old.samples.is_empty());
-        let other_build: UnreadableCauses =
-            serde_json::from_str(r#"{"counts":[0,0,2,0,1,0,0,0],"samples":[["7:moon"]]}"#).unwrap();
-        assert!(other_build.samples.is_empty());
-        assert_eq!(other_build.counts, old.counts);
+        // A wrong shape, and a well-sized sample of another form (the
+        // unreleased `line:root:kind:hex` string), both load as empty.
+        let mut string_form = vec![serde_json::json!([null, null, null, null]); 8];
+        string_form[2][0] = "7:dot_codex:jsonl:00000000000000ff".into();
+        for samples in [serde_json::json!([["7:moon"]]), string_form.into()] {
+            let other_build: UnreadableCauses = serde_json::from_value(
+                serde_json::json!({"counts": [0, 0, 2, 0, 1, 0, 0, 0], "samples": samples}),
+            )
+            .unwrap();
+            assert!(other_build.samples.is_empty());
+            assert_eq!(other_build.counts, old.counts);
+        }
 
         let private = std::path::Path::new("/Users/private credential/.codex/sessions");
         let mut causes = UnreadableCauses::default();

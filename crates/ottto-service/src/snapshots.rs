@@ -16477,7 +16477,8 @@ struct CodexTitleMetadata {
     /// see `created_thread_census_incomplete_for`.
     created_thread_census_failed_homes: BTreeSet<PathBuf>,
     /// While a home failed: identity -> rollout path whose created-thread
-    /// proof comes from exactly one other, complete home
+    /// proof comes from exactly one other, complete home that locates it
+    /// exactly, with every spawn ancestor scoped too
     /// (`scope_created_thread_census`).
     created_thread_scoped: BTreeMap<String, PathBuf>,
     legacy_sidecar_fingerprint: String,
@@ -78419,7 +78420,7 @@ mod tests {
     /// [money] E2 B3b (Lead B, 2026-10-31): one home's created-thread census
     /// fails. A rollout whose proof comes only from another, healthy home is
     /// not held, nor is its spawned child. A rollout that might depend on two
-    /// homes (a copy of its id in the failing home), its spawned child, one
+    /// homes (a copy of its id in the failing home), its spawned descendants, one
     /// with no own-home row and one inside the failing home stay held, and
     /// nothing is scoped until discovery has walked the failing home's roots
     /// without loss.
@@ -78428,13 +78429,14 @@ mod tests {
         let base = temp_dir("codex-created-thread-scoped-failure");
         let failing = base.join(".codex");
         let healthy = base.join("slot").join("home");
-        let [own, copied, rowless, inside, own_child, copied_child] = [
+        let [own, copied, rowless, inside, own_child, copied_child, grandchild] = [
             "01a03e99-49cf-7460-9fd7-f7dbfd2f0a01",
             "01a03e99-49cf-7460-9fd7-f7dbfd2f0a02",
             "01a03e99-49cf-7460-9fd7-f7dbfd2f0a03",
             "01a03e99-49cf-7460-9fd7-f7dbfd2f0a04",
             "01a03e99-49cf-7460-9fd7-f7dbfd2f0a05",
             "01a03e99-49cf-7460-9fd7-f7dbfd2f0a06",
+            "01a03e99-49cf-7460-9fd7-f7dbfd2f0a07",
         ];
         let rollout = |home: &Path, id: &str| {
             let path = home
@@ -78444,8 +78446,10 @@ mod tests {
             fs::write(&path, b"{}\n").expect("write scoped fixture rollout");
             path
         };
-        let [own_path, copied_path, rowless_path, own_child_path, copied_child_path] =
-            [own, copied, rowless, own_child, copied_child].map(|id| rollout(&healthy, id));
+        let [own_path, copied_path, rowless_path] =
+            [own, copied, rowless].map(|id| rollout(&healthy, id));
+        let [own_child_path, copied_child_path, grandchild_path] =
+            [own_child, copied_child, grandchild].map(|id| rollout(&healthy, id));
         let [inside_path, copy_in_failing] = [inside, copied].map(|id| rollout(&failing, id));
         fs::write(failing.join("state_5.sqlite"), b"not a sqlite database")
             .expect("write failing classification census");
@@ -78457,7 +78461,11 @@ mod tests {
                  CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT);",
             )
             .expect("create healthy state schema");
-        for (parent, child) in [(own, own_child), (copied, copied_child)] {
+        for (parent, child) in [
+            (own, own_child),
+            (copied, copied_child),
+            (copied_child, grandchild),
+        ] {
             state
                 .execute(
                     "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
@@ -78470,6 +78478,7 @@ mod tests {
             (copied, &copied_path),
             (own_child, &own_child_path),
             (copied_child, &copied_child_path),
+            (grandchild, &grandchild_path),
         ] {
             state
                 .execute(
@@ -78533,6 +78542,10 @@ mod tests {
         assert!(
             ambiguous(&metadata, &copied_child_path),
             "child of a held parent"
+        );
+        assert!(
+            ambiguous(&metadata, &grandchild_path),
+            "grandchild of a held parent"
         );
         assert!(ambiguous(&metadata, &rowless_path), "no own-home row");
         assert!(
