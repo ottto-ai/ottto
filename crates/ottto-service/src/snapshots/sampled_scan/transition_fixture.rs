@@ -1305,6 +1305,21 @@ pub(crate) mod native_cold {
         (reduction, checkpoint)
     }
 
+    /// Reset existing counterfactual-route records without manufacturing a
+    /// receipt or changing their per-route save/ACK order.
+    pub(crate) fn restore_records(
+        index: &Path,
+        records: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        let dir = store::store_dir_for_index(index);
+        for (path, bytes) in records {
+            let target = dir.join(path.file_name().unwrap());
+            if fs::read(&target).unwrap() != *bytes {
+                fs::write(target, bytes).unwrap();
+            }
+        }
+    }
+
     /// Real v3 streaming; no receipt is synthesized and flush stays explicit.
     pub(crate) fn commit(
         disk: &mut store::DurableTailStore,

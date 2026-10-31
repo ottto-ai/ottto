@@ -142,13 +142,7 @@ impl M1 {
     // Counterfactual routes fork the same committed native predecessor. A
     // prior route's pre-ACK native write must not seed the next route.
     fn restore_predecessor(&self) {
-        let dir = crate::durable_tail_store::store_dir_for_index(&self.disk.index);
-        for (path, bytes) in &self.old_bytes {
-            let target = dir.join(path.file_name().unwrap());
-            if std::fs::read(&target).unwrap() != *bytes {
-                std::fs::write(target, bytes).unwrap();
-            }
-        }
+        fixture::native_cold::restore_records(&self.disk.index, &self.old_bytes);
     }
 
     fn grow(&self, request: &str, tokens: u64) {
