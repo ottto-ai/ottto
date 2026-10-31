@@ -100,3 +100,37 @@ impl AsRef<Path> for ScratchDir {
         &self.path
     }
 }
+
+/// Writes `contents` to `path` as a script a test will execute, with `mode`.
+///
+/// Linux refuses to execute a file that any process still holds open for
+/// writing (`ETXTBSY`, "Text file busy"). A plain `fs::write` here opens such a
+/// descriptor; it is close-on-exec, but tests run on parallel threads, and a
+/// sibling test that forks a child (`git`, a fake CLI) while it is open copies
+/// it into that child, which keeps it until its own `exec`. Executing this file
+/// inside that window fails at spawn. So a separate `/bin/sh` process writes
+/// the bytes: this process never holds a write descriptor for the file, and the
+/// writer has exited before this returns.
+pub(crate) fn write_executable(path: &Path, contents: &[u8], mode: u32) {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", "exec /bin/cat > \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn executable writer");
+    let mut stdin = writer.stdin.take().expect("executable writer input");
+    stdin.write_all(contents).expect("write executable");
+    drop(stdin);
+    let status = writer.wait().expect("wait for executable writer");
+    assert!(
+        status.success(),
+        "write executable {}: {status}",
+        path.display()
+    );
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .expect("chmod executable");
+}

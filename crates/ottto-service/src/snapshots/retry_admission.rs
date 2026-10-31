@@ -18,6 +18,10 @@ fn claude_retry_record_due(
 }
 
 fn claude_retry_due_family_exists(index: &ScanIndex, collected_at: &str) -> bool {
+    if !index.persistence_available() {
+        return false;
+    }
+
     let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
     let served = index
         .traversal
@@ -73,27 +77,14 @@ fn claude_retry_admit_batch_observed(
                     && state.due_complete))
         })
         .cloned()
-        .unwrap_or_else(|| ClaudeRetryAdmission {
-            after_root: None,
-            upper_root: stale.last().cloned().unwrap_or_default(),
-            complete: false,
-            roots_complete: false,
-            progressed: false,
-            served_before: previous.map(|state| state.due_through).unwrap_or_else(|| {
-                index
-                    .traversal
-                    .as_ref()
-                    .and_then(|t| rfc3339_unix_seconds(&t.census_window_end))
-                    .unwrap_or_default()
-            }),
-            due_through: rfc3339_unix_seconds(collected_at).unwrap_or_default(),
-            due_after_path: None,
-            due_upper_path: index.files.keys().next_back().cloned(),
-            due_complete: false,
-            oversized_root: None,
-            oversized_after_path: None,
-            storage_deferred: false,
-        });
+        .unwrap_or_else(|| claude_retry_admission_start(index, stale, collected_at, previous));
+    if !index.persistence_available() {
+        state.complete = false;
+        state.roots_complete = false;
+        state.storage_deferred = true;
+        state.progressed = false;
+        return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
+    }
     state.progressed = false;
     let lower = state
         .after_root
@@ -323,6 +314,10 @@ fn claude_retry_path_owed(
 }
 
 fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
+    if !index.persistence_available() {
+        return;
+    }
+
     let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
     let became_storage_only = index
         .claude_stale_family_carry
@@ -558,4 +553,33 @@ thread_local! {
 #[cfg(test)]
 fn retry_admission_tests_refuse_multi() -> bool {
     RETRY_ADMISSION_REFUSE_MULTI.with(std::cell::Cell::get)
+}
+
+fn claude_retry_admission_start(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+    collected_at: &str,
+    previous: Option<&ClaudeRetryAdmission>,
+) -> ClaudeRetryAdmission {
+    ClaudeRetryAdmission {
+        after_root: None,
+        upper_root: stale.last().cloned().unwrap_or_default(),
+        complete: false,
+        roots_complete: false,
+        progressed: false,
+        served_before: previous.map(|state| state.due_through).unwrap_or_else(|| {
+            index
+                .traversal
+                .as_ref()
+                .and_then(|t| rfc3339_unix_seconds(&t.census_window_end))
+                .unwrap_or_default()
+        }),
+        due_through: rfc3339_unix_seconds(collected_at).unwrap_or_default(),
+        due_after_path: None,
+        due_upper_path: index.files.keys().next_back().cloned(),
+        due_complete: false,
+        oversized_root: None,
+        oversized_after_path: None,
+        storage_deferred: false,
+    }
 }

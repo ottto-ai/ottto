@@ -80,6 +80,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for HeldRaw {
     }
 }
 impl Holds {
+    pub(super) fn contains_field(&self, field: &str) -> bool {
+        self.0.get(field).is_some_and(|slots| !slots.is_empty())
+    }
     pub(super) fn file_keys(&self) -> impl Iterator<Item = &str> {
         self.0
             .get("files")
@@ -124,10 +127,6 @@ impl Holds {
             self.1.count,
             self.1.sum,
         )
-    }
-    #[cfg(test)]
-    pub(super) fn clone_provenance_for_test(&self) -> impl Sized {
-        self.1
     }
     pub(super) fn contains(&self, field: &str, key: &str) -> bool {
         self.0.get(field).is_some_and(|map| map.contains_key(key))
@@ -199,6 +198,9 @@ impl<T: Serialize> Serialize for WireMap<'_, T> {
 
 impl Serialize for ScanIndex {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        if !self.persistence_available() {
+            return Err(serde::ser::Error::custom("scan_index_map_unavailable"));
+        }
         let mut map = serializer.serialize_map(None)?;
         macro_rules! field {
             ($name:ident) => {
@@ -327,7 +329,10 @@ impl Serialize for ScanIndex {
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
         );
-        field!(claude_desktop_store_inventory, Option::is_none);
+        field!(
+            claude_copy_removals,
+            claude_request_money::copy_removals::CopyRemovals::is_empty
+        );
         map.end()
     }
 }
@@ -419,7 +424,8 @@ pub(super) const FIELDS: &[&str] = &[
     "upload_ack_retirement_handoff",
     "held_audit_progress",
     "claude_money_birth_store",
-    "claude_desktop_store_inventory",
+    "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
+    "claude_copy_removals",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -521,6 +527,7 @@ struct Decoder<R> {
     counts: Counts,
     family_spans: BTreeMap<&'static str, Span>,
     census_resources: [bool; 2],
+    persistence_map: bool,
 }
 #[derive(Clone, Copy)]
 struct Span {
@@ -813,7 +820,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
                 reader.consume(1);
                 name
             };
-            let optional = optional_census(name) || name == Some("claude_money_birth_store");
+            let optional = optional_census(name) || optional_money_hint(name);
             // CensusRead streams positional-array separator whitespace before
             // capture; object-field evidence starts immediately after ':'.
             if array {
@@ -860,6 +867,14 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
     reader.seek(SeekFrom::Start(0))?;
     Ok(resources)
 }
+/// Local money hints: damage drops the hint, never the index.
+fn optional_money_hint(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some("claude_money_birth_store" | "claude_copy_removals")
+    )
+}
+
 fn optional_census(name: Option<&str>) -> bool {
     matches!(
         name,
@@ -901,15 +916,32 @@ pub(super) fn read<R: BufRead + Seek>(
 }
 
 fn read_inner<R: BufRead + Seek>(
+    reader: R,
+    stage: &str,
+    source: &'static str,
+) -> std::result::Result<ScanIndex, Error> {
+    read_persistence_mode(reader, stage, source, false, None)
+}
+fn read_persistence_mode<R: BufRead + Seek>(
     mut reader: R,
     stage: &str,
     source: &'static str,
+    map_only: bool,
+    partial: Option<[Option<scan_index_persistence::MapUnavailable>; 3]>,
 ) -> std::result::Result<ScanIndex, Error> {
     take_dropped_codex_side_requests();
     let _side_request_counts = SideRequestCountGuard;
     let input_len = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
     let census_resources = validate_original(&mut reader)?;
+    // Missing maps cannot defund already-held negative metadata. A Partial
+    // index has no publication/acquisition authority. Keep the existing absolute
+    // hold/count ceilings, then charge its retained custody in the adapter.
+    let input_len = if partial.is_some() {
+        input_len.max(HOLD_BYTES_MAX * 8)
+    } else {
+        input_len
+    };
     let mut decoder = Decoder {
         reader,
         input_len,
@@ -919,11 +951,18 @@ fn read_inner<R: BufRead + Seek>(
         counts: Counts::default(),
         family_spans: BTreeMap::new(),
         census_resources,
+        persistence_map: map_only,
     };
     // Controls are checked before any record can exhaust hold admission.
     // Otherwise a future ledger placed after damaged records could be renamed
     // as corruption before this build learns it cannot interpret the file.
-    let headers = decoder.index(Pass::Headers)?;
+    let mut headers = decoder.index(Pass::Headers)?;
+    if partial.is_some() {
+        if headers.schema_version != scan_index_persistence::OUTER_SCHEMA {
+            return Err(Error::Refused("partial storage schema"));
+        }
+        headers.schema_version = SCAN_INDEX_SCHEMA_VERSION;
+    }
     controls(&headers, source)?;
     drop(headers);
     decoder.reader.seek(SeekFrom::Start(0))?;
@@ -941,13 +980,23 @@ fn read_inner<R: BufRead + Seek>(
         ));
     }
     let mut index = result?;
+    if let Some(unavailable) = partial {
+        index.persistence_unavailable = unavailable;
+    }
+    if partial.is_some() {
+        index.schema_version = SCAN_INDEX_SCHEMA_VERSION;
+    }
     controls(&index, source)?;
     // Normalize on every successful read, including both CAS readers. A bad
     // cutoff clears the loaded marker so prior-history signals re-derive it.
     index.drop_malformed_claude_history_cutoff();
     index.decode_holds = decoder.holds;
     index.decode_holds.rebuild_scopes();
-    let semantic = index.drop_invalid_index_records();
+    let semantic = if !map_only && index.persistence_available() {
+        index.drop_invalid_index_records()
+    } else {
+        ScanIndexLoadDrops::default()
+    };
     decoder.counts.drops.activity += semantic.activity;
     decoder.counts.drops.accepted += semantic.accepted;
     decoder.counts.drops.cursor += semantic.cursor;
@@ -963,9 +1012,22 @@ fn read_inner<R: BufRead + Seek>(
             decoder.counts.authority_repairs,
         ],
     );
-    index.retain_decodable_codex_parent_state();
-    index.drop_unbound_claude_authority_records(stage);
-    settle_retired_family_decode(&mut index);
+    if !map_only && index.persistence_available() {
+        index.retain_decodable_codex_parent_state();
+        index.drop_unbound_claude_authority_records(stage);
+        settle_retired_family_decode(&mut index);
+    }
+    if map_only
+        && (!index.decode_holds.is_empty()
+            || index.decode_holds.1.count != 0
+            || decoder.counts.drops.activity
+                + decoder.counts.drops.accepted
+                + decoder.counts.drops.cursor
+                + decoder.counts.drops.quarantine
+                != 0)
+    {
+        return Err(Error::Refused("incomplete persistence map"));
+    }
     Ok(index)
 }
 
@@ -1009,6 +1071,7 @@ pub(super) fn read_identity_carry(
         counts: Counts::default(),
         family_spans: BTreeMap::new(),
         census_resources,
+        persistence_map: false,
     };
     let mut carry = decoder.index(Pass::IdentityCarry)?;
     controls(&carry, source)?;
@@ -1317,6 +1380,9 @@ impl<R: BufRead + Seek> Decoder<R> {
         let Some(marker) = self.damaged_idless_marker(record)? else {
             return self.typed(record);
         };
+        if self.persistence_map {
+            return Err(Error::Refused("incomplete persistence marker"));
+        }
         self.reader.seek(SeekFrom::Start(record.start))?;
         let masked = AbsentMarkerReader {
             reader: &mut self.reader,
@@ -1539,8 +1605,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                 self.eat(b':')?;
                 name
             };
-            let value = self
-                .span_optional(optional_census(name) || name == Some("claude_money_birth_store"))?;
+            let value = self.span_optional(optional_census(name) || optional_money_hint(name))?;
             if let Some(name) = name {
                 if matches!(
                     name,
@@ -1553,12 +1618,18 @@ impl<R: BufRead + Seek> Decoder<R> {
                     self.family_spans.insert(name, value);
                 }
                 if !seen.insert(name) {
+                    if name == "claude_desktop_store_inventory" && pass == Pass::Full {
+                        with_claude_absence_counters(|counts| {
+                            counts.tombstone_decode_drops =
+                                counts.tombstone_decode_drops.saturating_add(1);
+                        });
+                    }
                     if name == "claude_request_census" {
                         index.claude_request_census = ClaudeRequestCensus::default();
                     } else if name == "claude_request_census_shadow" {
                         index.claude_request_census_shadow =
                             ClaudeRequestCensusShadowState::default();
-                    } else if name != "reread_guard" {
+                    } else if !matches!(name, "reread_guard" | "claude_desktop_store_inventory") {
                         return Err(Error::Refused("duplicate index field"));
                     }
                 } else {
@@ -1573,6 +1644,24 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
                         "reread_guard" => {} // TOMBSTONE: decode-and-drop.
+                        "claude_desktop_store_inventory" => {
+                            // No new refusal: this key was unknown to the last
+                            // release. A digest is 64 bytes plus its quotes, so
+                            // nothing wider is buffered; a bad value is dropped.
+                            let inventory: Option<String> = if value.len > 66 {
+                                Some(String::new())
+                            } else {
+                                self.history_scalar(value, Some(String::new()))?
+                            };
+                            if inventory.as_ref().is_some_and(|digest| digest.len() != 64) {
+                                with_claude_absence_counters(|counts| {
+                                    counts.tombstone_decode_drops =
+                                        counts.tombstone_decode_drops.saturating_add(1);
+                                });
+                            } else {
+                                index.claude_desktop_store_inventory = inventory;
+                            }
+                        }
                         "upload_ack_retirement_handoff" => {
                             // Damaged cleanup authority delays retirement; it must
                             // never discard identity custody or pause ingestion.
@@ -1768,9 +1857,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_desktop_store_cursor" => {
                             index.claude_desktop_store_cursor = self.typed(value)?
                         }
-                        "claude_desktop_store_inventory" => {
-                            index.claude_desktop_store_inventory = self.typed(value)?
-                        }
                         "claude_desktop_store_upper_bound" => {
                             index.claude_desktop_store_upper_bound = self.typed(value)?
                         }
@@ -1932,6 +2018,29 @@ impl<R: BufRead + Seek> Decoder<R> {
                             }
                             index.claude_money_birth_store = decoded.unwrap_or_default();
                         }
+                        "claude_copy_removals" => {
+                            // Like the birth table: a damaged or over-budget
+                            // value decodes as none (copies decide afresh).
+                            let decoded = if !value.resource
+                                && value.len
+                                    <= (claude_request_money::copy_removals::MAX_BYTES as u64) / 3
+                                        * 4
+                                        + 64
+                            {
+                                self.typed::<claude_request_money::copy_removals::CopyRemovals>(
+                                    value,
+                                )
+                                .ok()
+                            } else {
+                                None
+                            };
+                            if decoded.is_none() {
+                                self.counts.drops.activity += 1;
+                            }
+                            index.claude_copy_removals = decoded.unwrap_or_else(
+                                claude_request_money::copy_removals::CopyRemovals::missing,
+                            );
+                        }
                         "accepted_rebuild_incidence" => {
                             if value.len > CARRIED_ACK_BYTES_MAX as u64 {
                                 return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
@@ -1951,11 +2060,15 @@ impl<R: BufRead + Seek> Decoder<R> {
             }
         }
         self.eat(if array { b']' } else { b'}' })?;
-        if !seen.contains("files") {
+        if !self.persistence_map && !seen.contains("files") {
             return Err(Error::Refused("missing files"));
         }
 
         if pass == Pass::Full {
+            if !seen.contains("claude_copy_removals") {
+                index.claude_copy_removals =
+                    claude_request_money::copy_removals::CopyRemovals::missing();
+            }
             // Migrate the old marker without granting later ACKs blanket retention.
             if index.accepted_incidence_pending_census
                 && index.accepted_rebuild_incidence.is_empty()
@@ -2154,6 +2267,19 @@ impl<R: BufRead + Seek> Decoder<R> {
         Ok(())
     }
     fn census(&mut self, span: Span, field: &str) -> std::result::Result<ScanIndex, Error> {
+        if self.persistence_map && field == "claude_request_census" {
+            if span.resource || self.census_resources[0] {
+                return Err(Error::Refused("census admission"));
+            }
+            self.reader.seek(SeekFrom::Start(span.start))?;
+            let census =
+                claude_request_census::decode_persistence_census((&mut self.reader).take(span.len))
+                    .map_err(|_| Error::Refused("incomplete persistence census"))?;
+            return Ok(ScanIndex {
+                claude_request_census: census,
+                ..ScanIndex::default()
+            });
+        }
         if span.resource
             || (optional_census(Some(field))
                 && self.census_resources[usize::from(field == "claude_request_census_shadow")])
@@ -2179,9 +2305,8 @@ impl ScanIndex {
         self.decode_holds.1.count == 0 || self.decode_holds.1 == working.decode_holds.1
     }
     pub(super) fn decode_holds_family(&self, root: &str) -> bool {
-        #[cfg(test)]
-        SCOPE_VISITS.with(|count| count.set(count.get() + 1));
-        self.decode_holds.2.contains(&repair_key(root))
+        !self.persistence_available()
+            || self.decode_holds.2.contains(&repair_key(root))
             || [
                 "claude_usage_authority_quarantine",
                 "claude_account_family_witnesses",
@@ -2193,8 +2318,6 @@ impl ScanIndex {
             .any(|field| self.decode_holds.contains(field, root))
     }
     pub(crate) fn decode_holds_file(&self, key: &str) -> bool {
-        #[cfg(test)]
-        SCOPE_VISITS.with(|count| count.set(count.get() + 1));
         self.decode_holds.contains("files", key)
             || claude_index_path_member_ref(Path::new(key))
                 .is_some_and(|member| self.decode_holds_family(member.root))
@@ -2212,8 +2335,10 @@ impl ScanIndex {
     // Consumers with a file key must retain that context rather than reverse
     // scanning every incidence set for each fingerprint.
     pub(crate) fn decode_holds_entity(&self, fingerprint: &str) -> bool {
-        self.decode_holds
-            .contains("quarantined_snapshot_fingerprints", fingerprint)
+        !self.persistence_available()
+            || self
+                .decode_holds
+                .contains("quarantined_snapshot_fingerprints", fingerprint)
     }
     pub(crate) fn eligible_snapshot_fingerprint_refs(&self) -> impl Iterator<Item = &str> {
         let exact = self
@@ -2583,13 +2708,6 @@ fn repair_key(value: &str) -> [u8; 32] {
 }
 
 #[cfg(test)]
-thread_local! { static SCOPE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-#[cfg(test)]
-pub(super) fn scope_visits_for_test(reset: bool) -> usize {
-    SCOPE_VISITS.with(|count| if reset { count.replace(0) } else { count.get() })
-}
-
-#[cfg(test)]
 #[test]
 fn repair_commitment_is_order_independent_and_removes_frozen_records() {
     let mut left = RepairProvenance::default();
@@ -2603,4 +2721,104 @@ fn repair_commitment_is_order_independent_and_removes_frozen_records() {
     let mut only_native = RepairProvenance::default();
     only_native.add("quarantined_snapshot_fingerprints", "a", [1; 32]);
     assert_eq!(right, only_native);
+}
+
+pub(super) fn validate_persistence_map(
+    field: scan_index_persistence::Field,
+    reader: &mut scan_index_persistence::LogicalReader,
+) -> anyhow::Result<()> {
+    reader.seek(SeekFrom::Start(0))?;
+    let index = read_persistence_mode(
+        BufReader::new(reader),
+        "shard_validation",
+        "unattributed",
+        true,
+        None,
+    )?;
+    anyhow::ensure!(
+        !index.decode_holds.0.contains_key(field.name()),
+        "incomplete persistence map"
+    );
+    Ok(())
+}
+pub(super) fn read_partial_persistence(
+    partial: scan_index_persistence::PartialIndex,
+    stage: &str,
+    source: &'static str,
+    cap: Option<usize>,
+) -> anyhow::Result<ScanIndex> {
+    let (mut reader, unavailable) = partial.into_reader()?;
+    if let Some(cap) = cap {
+        anyhow::ensure!(
+            reader.seek(SeekFrom::End(0))? <= cap as u64,
+            "scan_index_read_limit"
+        );
+        reader.seek(SeekFrom::Start(0))?;
+    }
+    let mut index = read_persistence_mode(
+        BufReader::new(reader),
+        stage,
+        source,
+        false,
+        Some(unavailable),
+    )
+    .map_err(|error| scan_index_integration::storage_decode_error(error.into()))?;
+    index.persistence_unavailable = unavailable;
+    Ok(index)
+}
+
+/// Immutable semantic custody. Never a receipt and never replaces full CAS decode.
+#[derive(Debug, Clone)]
+pub(super) struct PersistenceControls {
+    holds: Holds,
+    claims: BTreeMap<String, SnapshotQuarantineRecord>,
+}
+crate::heap_layout_bound::fields!(PersistenceControls; holds, claims);
+pub(super) fn persistence_controls(
+    index: &ScanIndex,
+    budget: usize,
+) -> anyhow::Result<Arc<PersistenceControls>> {
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    let claims = index
+        .quarantined_snapshot_fingerprints
+        .iter()
+        .filter(|(_, r)| r.contract_retry_claims.is_some());
+    let mut c = Counter::new(budget);
+    let admitted = (|| {
+        c.add(
+            std::mem::size_of::<PersistenceControls>()
+                + std::mem::align_of::<PersistenceControls>()
+                + 2 * std::mem::size_of::<usize>(),
+        )?;
+        index.decode_holds.completed_heap_bound(&mut c)?;
+        crate::heap_layout_bound::tree_nodes::<String, SnapshotQuarantineRecord>(
+            claims.clone().count(),
+            &mut c,
+        )?;
+        // Completion boundary: each claim gets its ordinary recursive visit
+        // budget, while every child spends the SAME diminishing byte budget.
+        let mut claim_bytes = 0usize;
+        for (key, record) in claims.clone() {
+            let remaining = budget.checked_sub(c.bytes)?.checked_sub(claim_bytes)?;
+            let mut child = Counter::new(remaining);
+            key.completed_heap_bound(&mut child)?;
+            record.completed_heap_bound(&mut child)?;
+            claim_bytes = claim_bytes.checked_add(child.bytes)?;
+        }
+        c.add(claim_bytes)?;
+        Some(())
+    })();
+    anyhow::ensure!(admitted.is_some(), "scan_index_storage_admission");
+    Ok(Arc::new(PersistenceControls {
+        holds: index.decode_holds.clone(),
+        claims: claims.map(|(k, r)| (k.clone(), r.clone())).collect(),
+    }))
+}
+pub(super) fn retain_persistence_claims(index: &mut ScanIndex) {
+    if let Some(controls) = &index.persistence_controls {
+        terminal_contract_retry::merge_maps(
+            &mut index.quarantined_snapshot_fingerprints,
+            &controls.claims,
+        );
+    }
 }

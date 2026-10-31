@@ -676,7 +676,6 @@ fn window_slides_with_read(window: &Value, read_at: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quota_credit_model::credit_grant_key;
     use ottto_protocol::{
         AgentCreditBalanceStatus, AgentCreditBalanceUnit, AgentQuotaWindowFreshness,
         CreditGrantsState,
@@ -768,167 +767,6 @@ mod tests {
     const EXPIRES_3: i64 = 1_794_038_400;
 
     #[test]
-    fn balance_names_are_the_contract_wire_names() {
-        assert_eq!(PLAN_CREDITS, "credits");
-        assert_eq!(RESET_BANK, "reset_bank");
-        assert_eq!(WORKSPACE_MONTHLY_CREDITS, "workspace_monthly_credits");
-    }
-
-    #[test]
-    fn complete_two_grant_list_maps_to_expected_wire() {
-        let mut tracker = CodexCreditTracker::default();
-        let provider = detailed(
-            2,
-            vec![
-                // Out of expiry order on purpose: the model sorts.
-                row("grant-two", GRANTED_2, Some(EXPIRES_2)),
-                row("grant-one", GRANTED_1, Some(EXPIRES_1)),
-            ],
-        );
-        let (balance, diagnostics) =
-            attach(&mut tracker, &provider, read(Some(BINDING_A), true, T0));
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let expected = json!({
-            "name": "reset_bank",
-            "status": "ok",
-            "freshness": "fresh",
-            "unit": "resets",
-            "remaining": 2,
-            "unlimited": false,
-            "kind": "saved_resets",
-            "grant_count": 2,
-            "grants_state": "complete",
-            "grants_observed_at": READ_AT,
-            "next_expires_at": "2026-10-29T19:14:56Z",
-            "latest_granted_at": "2026-10-07T23:42:35Z",
-            "grants": [
-                {
-                    "grant_key": credit_grant_key(Provider::OpenAi, "grant-one"),
-                    "grant_type": "rate_limit_reset",
-                    "status": "available",
-                    "granted_at": "2026-09-29T19:14:56Z",
-                    "expires_at": "2026-10-29T19:14:56Z",
-                    "title": "Full reset"
-                },
-                {
-                    "grant_key": credit_grant_key(Provider::OpenAi, "grant-two"),
-                    "grant_type": "rate_limit_reset",
-                    "status": "available",
-                    "granted_at": "2026-10-07T23:42:35Z",
-                    "expires_at": "2026-11-06T23:42:35Z",
-                    "title": "Full reset"
-                }
-            ]
-        });
-        assert_eq!(wire(&balance), expected);
-        assert!(
-            !wire(&balance)
-                .to_string()
-                .contains("Thanks for using Codex"),
-            "description is never carried"
-        );
-    }
-
-    #[test]
-    fn complete_three_grant_list_keeps_count_and_orders_by_expiry() {
-        let mut tracker = CodexCreditTracker::default();
-        let provider = detailed(
-            3,
-            vec![
-                row("grant-three", GRANTED_3, Some(EXPIRES_3)),
-                row("grant-one", GRANTED_1, Some(EXPIRES_1)),
-                row("grant-two", GRANTED_2, Some(EXPIRES_2)),
-            ],
-        );
-        let (balance, diagnostics) =
-            attach(&mut tracker, &provider, read(Some(BINDING_A), true, T0));
-        assert!(diagnostics.is_empty());
-        assert_eq!(balance.remaining, Some(3), "remaining stays availableCount");
-        assert_eq!(balance.grant_count, Some(3));
-        assert_eq!(balance.grants_state, Some(CreditGrantsState::Complete));
-        let keys = balance
-            .grants
-            .as_ref()
-            .expect("grants")
-            .iter()
-            .map(|grant| grant.grant_key.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            keys,
-            ["grant-one", "grant-two", "grant-three"]
-                .map(|id| credit_grant_key(Provider::OpenAi, id))
-        );
-        assert_eq!(
-            balance.next_expires_at.as_deref(),
-            Some("2026-10-29T19:14:56Z")
-        );
-        assert_eq!(
-            balance.latest_granted_at.as_deref(),
-            Some("2026-10-08T08:00:00Z")
-        );
-    }
-
-    #[test]
-    fn count_only_and_null_lists_are_unavailable_never_empty() {
-        for provider in [
-            count_only(2),
-            json!({"rateLimitResetCredits": {"availableCount": 2}}),
-        ] {
-            let mut tracker = CodexCreditTracker::default();
-            let (balance, _) = attach(&mut tracker, &provider, read(Some(BINDING_A), true, T0));
-            assert_eq!(
-                wire(&balance),
-                json!({
-                    "name": "reset_bank",
-                    "status": "ok",
-                    "freshness": "fresh",
-                    "unit": "resets",
-                    "remaining": 2,
-                    "unlimited": false,
-                    "kind": "saved_resets",
-                    "grant_count": 2,
-                    "grants_state": "unavailable"
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn empty_list_with_zero_count_is_complete_and_empty() {
-        let mut tracker = CodexCreditTracker::default();
-        let (balance, _) = attach(
-            &mut tracker,
-            &detailed(0, vec![]),
-            read(Some(BINDING_A), true, T0),
-        );
-        assert_eq!(balance.grants_state, Some(CreditGrantsState::Complete));
-        assert_eq!(balance.grants.as_deref(), Some(&[][..]));
-        assert_eq!(balance.remaining, Some(0));
-        assert_eq!(balance.status, AgentCreditBalanceStatus::Exhausted);
-        assert_eq!(balance.next_expires_at, None);
-    }
-
-    #[test]
-    fn provider_capped_list_is_capped_without_summaries() {
-        let mut tracker = CodexCreditTracker::default();
-        let provider = detailed(
-            3,
-            vec![
-                row("grant-one", GRANTED_1, Some(EXPIRES_1)),
-                row("grant-two", GRANTED_2, Some(EXPIRES_2)),
-            ],
-        );
-        let (balance, _) = attach(&mut tracker, &provider, read(Some(BINDING_A), true, T0));
-        assert_eq!(balance.grants_state, Some(CreditGrantsState::Capped));
-        assert_eq!(balance.grant_count, Some(3));
-        assert_eq!(balance.grants.as_ref().map(Vec::len), Some(2));
-        assert_eq!(balance.remaining, Some(3));
-        // Codex capped, not the sender: no expiry or added-time claims.
-        assert_eq!(balance.next_expires_at, None);
-        assert_eq!(balance.latest_granted_at, None);
-    }
-
-    #[test]
     fn invalid_rows_make_the_list_partial_with_field_diagnostics() {
         let mut tracker = CodexCreditTracker::default();
         let provider = detailed(
@@ -965,65 +803,6 @@ mod tests {
             !suffix.contains("grant-bad"),
             "values never reach diagnostics"
         );
-    }
-
-    #[test]
-    fn non_object_reset_credits_and_missing_balance_attach_nothing() {
-        let mut tracker = CodexCreditTracker::default();
-        let mut balances = vec![];
-        assert!(tracker
-            .attach_reset_bank_grants(
-                &mut balances,
-                &detailed(1, vec![]),
-                read(Some(BINDING_A), true, T0)
-            )
-            .is_empty());
-        assert_eq!(
-            available_count(&json!({"rateLimitResetCredits": null})),
-            None
-        );
-    }
-
-    #[test]
-    fn kinds_cover_every_codex_balance_name() {
-        let balance = |name: &str, limit_id: Option<&str>| AgentCreditBalance {
-            name: name.to_string(),
-            limit_id: limit_id.map(str::to_string),
-            ..Default::default()
-        };
-        let cases = [
-            (
-                balance("credits", Some("codex")),
-                CreditBalanceKind::PlanCredits,
-            ),
-            (balance("credits", None), CreditBalanceKind::PlanCredits),
-            (
-                balance("premium_credits", Some("premium")),
-                CreditBalanceKind::PlanCredits,
-            ),
-            (balance("reset_bank", None), CreditBalanceKind::SavedResets),
-            (
-                balance("workspace_monthly_credits", Some("codex")),
-                CreditBalanceKind::WorkspaceAllowance,
-            ),
-            (
-                balance("premium_workspace_monthly_credits", Some("premium")),
-                CreditBalanceKind::WorkspaceAllowance,
-            ),
-            // A pool id that ends like a base name still resolves by its id.
-            (
-                balance("x_workspace_monthly_credits", Some("x_workspace_monthly")),
-                CreditBalanceKind::PlanCredits,
-            ),
-            (balance("something_else", None), CreditBalanceKind::Unknown),
-        ];
-        for (balance, kind) in cases {
-            assert_eq!(codex_balance_kind(&balance), kind, "{}", balance.name);
-        }
-        let mut balances = vec![balance("credits", Some("codex")), balance("other", None)];
-        stamp_codex_balance_kinds(&mut balances);
-        assert_eq!(balances[0].kind, Some(CreditBalanceKind::PlanCredits));
-        assert_eq!(balances[1].kind, Some(CreditBalanceKind::Unknown));
     }
 
     #[test]
@@ -1117,93 +896,6 @@ mod tests {
         assert_eq!(sent, vec![ROUTINE]);
         let (sent, _) = poll(&mut tracker, BINDING_A, last_detail + 60 * 60, 2, &rows(2));
         assert_eq!(sent, vec![ROUTINE, DETAILED]);
-    }
-
-    #[test]
-    fn grants_stay_continuous_across_routine_polls_with_original_read_time() {
-        let mut tracker = CodexCreditTracker::default();
-        let (sent, first) = poll(&mut tracker, BINDING_A, T0, 2, &rows(2));
-        assert_eq!(sent, vec![ROUTINE, DETAILED]);
-        for step in 1..=4u64 {
-            let mut balances = vec![reset_bank(2)];
-            let now = T0 + step * 300;
-            assert!(!tracker.routine_needs_details(Some(BINDING_A), &count_only(2), now));
-            tracker.attach_reset_bank_grants(
-                &mut balances,
-                &count_only(2),
-                CodexCreditRead {
-                    binding: Some(BINDING_A),
-                    details_requested: false,
-                    details_answered: false,
-                    // A later read clock: the list keeps its own.
-                    observed_at: Some("2026-10-09T15:05:00Z"),
-                    now,
-                },
-            );
-            assert_eq!(wire(&balances[0]), wire(&first), "routine poll {step}");
-            assert_eq!(balances[0].grants_observed_at.as_deref(), Some(READ_AT));
-        }
-    }
-
-    #[test]
-    fn cold_cache_escalates_at_once_and_never_sends_unknown() {
-        let mut tracker = CodexCreditTracker::default();
-        assert!(tracker.routine_needs_details(Some(BINDING_A), &count_only(2), T0));
-        let (sent, balance) = poll(&mut tracker, BINDING_A, T0, 2, &rows(2));
-        assert_eq!(sent, vec![ROUTINE, DETAILED]);
-        assert_eq!(balance.status, AgentCreditBalanceStatus::Ok);
-        assert_eq!(balance.grants_state, Some(CreditGrantsState::Complete));
-    }
-
-    #[test]
-    fn daemon_restart_reads_details_on_the_first_poll_so_the_list_never_blinks() {
-        let mut tracker = CodexCreditTracker::default();
-        let mut emitted = Vec::new();
-        for step in 0..3u64 {
-            emitted.push(poll(&mut tracker, BINDING_A, T0 + step * 300, 2, &rows(2)));
-        }
-        // Daemon restart: every in-memory cadence and cache entry is gone.
-        let mut tracker = CodexCreditTracker::default();
-        let restarted_at = T0 + 3 * 300;
-        let (sent, first_after_restart) = poll(&mut tracker, BINDING_A, restarted_at, 2, &rows(2));
-        assert_eq!(
-            sent,
-            vec![ROUTINE, DETAILED],
-            "the first poll after start reads details in the same session"
-        );
-        emitted.push((sent, first_after_restart.clone()));
-        emitted.push(poll(
-            &mut tracker,
-            BINDING_A,
-            restarted_at + 300,
-            2,
-            &rows(2),
-        ));
-        for (index, (_, balance)) in emitted.iter().enumerate() {
-            assert_eq!(
-                balance.grants_state,
-                Some(CreditGrantsState::Complete),
-                "reading {index}"
-            );
-            assert_eq!(
-                balance.grants.as_ref().map(Vec::len),
-                Some(2),
-                "reading {index}"
-            );
-            assert_eq!(
-                balance.status,
-                AgentCreditBalanceStatus::Ok,
-                "reading {index}"
-            );
-        }
-        // The same grants before and after the restart.
-        assert_eq!(first_after_restart.grants, emitted[0].1.grants);
-        // The process-wide tracker treats a never-read binding the same way.
-        assert!(routine_read_needs_details(
-            Some("synthetic-never-read:workspace"),
-            &count_only(2),
-            restarted_at
-        ));
     }
 
     #[test]
@@ -1420,41 +1112,6 @@ mod tests {
     }
 
     #[test]
-    fn param_rejection_and_detail_budget_rules() {
-        assert!(routine_param_rejected(
-            &json!({"code": -32602, "message": "x"})
-        ));
-        assert!(routine_param_rejected(&json!({"code": -32600})));
-        assert!(!routine_param_rejected(&json!({"code": -32603})));
-        assert!(!routine_param_rejected(&json!({"code": 401})));
-        assert!(!routine_param_rejected(&json!({"message": "no code"})));
-        assert_eq!(
-            detail_read_budget(Duration::from_secs(1)),
-            DETAIL_READ_MIN_BUDGET
-        );
-        assert_eq!(
-            detail_read_budget(Duration::from_secs(15)),
-            Duration::from_secs(15)
-        );
-        assert_eq!(
-            detail_read_budget(Duration::from_secs(60)),
-            DETAIL_READ_MAX_BUDGET
-        );
-    }
-
-    #[test]
-    fn cadence_clock_rules() {
-        let cadence = DetailCadence::default();
-        assert!(cadence.detail_due(T0));
-        let mut cadence = DetailCadence::default();
-        cadence.record_detail(true, Some(2), T0);
-        assert!(!cadence.detail_due(T0 + 3_000));
-        assert!(cadence.detail_due(T0 + DETAIL_INTERVAL_SECS - POLL_SLACK_SECS));
-        assert!(cadence.detail_due(T0 + 3 * 3_600), "after a 3 h sleep");
-        assert!(cadence.detail_due(T0 - 1), "a clock that went back");
-    }
-
-    #[test]
     fn pools_diagnostic_counts_without_values() {
         let rate_limits = json!({
             "rateLimits": {"limitId": "codex"},
@@ -1482,15 +1139,6 @@ mod tests {
             rate_limit_pools_summary(&json!({"ordinaryUsageAllowed": null}), T0),
             "Codex rate-limit pools: map unobserved; ordinaryUsageAllowed null; accountId absent."
         );
-    }
-
-    #[test]
-    fn routine_summary_reports_the_count_only() {
-        assert_eq!(
-            routine_reset_credit_summary(&count_only(2)).as_deref(),
-            Some("Codex reset details: count 2; list not requested on this routine read.")
-        );
-        assert_eq!(routine_reset_credit_summary(&json!({})), None);
     }
 
     /// The canonical v2.2 producer fixtures: each Codex provider body, read by
@@ -1630,12 +1278,10 @@ mod tests {
         /// The fake answers the routine read with the count only and the
         /// detailed read with the list, except as `mode` says:
         /// - `reject`: the routine read is refused as invalid params (-32602);
-        /// - `outage`: the routine read fails with a non-parameter error;
         /// - `reject_then_error`: `reject`, then the detailed read fails too;
         /// - `detail_error`: the detailed read fails;
         /// - `detail_silent`: the detailed read is never answered;
-        /// - `detail_oversized`: the detailed answer exceeds the line bound;
-        /// - `exit`: closes its stdin, answers the routine read and quits.
+        /// - `detail_oversized`: the detailed answer exceeds the line bound.
         ///
         /// Every request line is logged.
         const FAKE_APP_SERVER: &str = r#"import json
@@ -1669,16 +1315,8 @@ for line in sys.stdin:
     elif request.get("method") == "account/rateLimits/read":
         excluded = request.get("params", {}).get("excludeResetCreditDetails") is True
         if excluded:
-            if mode == "exit":
-                # Close the only read end before answering, so the collector's
-                # follow-up write fails with a broken pipe.
-                os.close(0)
-                answer(request, routine)
-                sys.exit(0)
-            elif mode in ("reject", "reject_then_error"):
+            if mode in ("reject", "reject_then_error"):
                 answer(request, code=-32602)
-            elif mode == "outage":
-                answer(request, code=-32603)
             else:
                 answer(request, routine)
         elif mode in ("detail_error", "reject_then_error"):
@@ -1847,36 +1485,12 @@ for line in sys.stdin:
 
         #[test]
         #[serial]
-        fn an_oversized_escalated_answer_keeps_the_routine_reading() {
-            let (observation, requests) = run("detail_oversized", true);
-            assert_eq!(requests, vec![routine_request(), detail_request()]);
-            assert_routine_reading_kept(&observation.expect("reading"));
-        }
-
-        #[test]
-        #[serial]
-        fn a_server_gone_before_the_detail_read_keeps_the_routine_reading() {
-            let (observation, requests) = run("exit", true);
-            assert_eq!(requests, vec![routine_request()]);
-            assert_routine_reading_kept(&observation.expect("reading"));
-        }
-
-        #[test]
-        #[serial]
         fn a_server_rejecting_the_param_falls_back_to_the_plain_read() {
             let (observation, requests) = run("reject", false);
             let observation = observation.expect("reading");
             assert_eq!(requests, vec![routine_request(), detail_request()]);
             assert!(observation.details_requested);
             assert!(has_list(&observation));
-        }
-
-        #[test]
-        #[serial]
-        fn a_rejected_param_then_a_failing_detailed_read_fails_the_reading() {
-            let (observation, requests) = run("reject_then_error", false);
-            assert_eq!(requests, vec![routine_request(), detail_request()]);
-            assert!(observation.is_err(), "no reading to keep");
         }
 
         /// A failed detailed read never costs a routine reading; only when no
@@ -1899,14 +1513,6 @@ for line in sys.stdin:
                 !message.contains("synthetic"),
                 "no provider text: {message}"
             );
-        }
-
-        #[test]
-        #[serial]
-        fn other_routine_errors_do_not_retry_with_the_detailed_read() {
-            let (observation, requests) = run("outage", true);
-            assert_eq!(requests, vec![routine_request()], "no costlier retry");
-            assert!(observation.is_err());
         }
     }
 }

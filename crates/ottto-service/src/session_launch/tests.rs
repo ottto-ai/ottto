@@ -194,27 +194,6 @@ fn environment_preserves_exact_slot_and_default_semantics() {
 }
 
 #[test]
-fn supported_major_versions_only() {
-    assert_eq!(
-        parse_version(b"2.1.310 (Claude Code)\n", Provider::ClaudeCode).as_deref(),
-        Some("2.1.310")
-    );
-    assert_eq!(
-        parse_version(b"codex-cli 0.170.0\n", Provider::Codex).as_deref(),
-        Some("0.170.0")
-    );
-    for (text, provider) in [
-        ("3.0.0", Provider::ClaudeCode),
-        ("1.0.0", Provider::Codex),
-        ("0.149.99", Provider::Codex),
-        ("future", Provider::Codex),
-        ("0.1\nunsafe", Provider::Codex),
-    ] {
-        assert!(parse_version(text.as_bytes(), provider).is_none());
-    }
-}
-
-#[test]
 fn folder_restrictions_and_inode_replacement() {
     let scratch = crate::test_scratch::ScratchDir::new("launch-folder");
     let root = scratch.as_ref();

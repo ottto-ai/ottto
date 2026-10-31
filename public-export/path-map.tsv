@@ -1,11 +1,12 @@
 # source_prefix	destination_prefix	reason
 .cargo/audit.toml	.cargo	Public repository root file is already in export shape.
+.cargo/config.toml	.cargo	Public repository root file is already in export shape.
+.github/actions/rust-setup/action.yml	.github/actions/rust-setup	Public repository root file is already in export shape.
 .github/dependabot.yml	.github	Public repository root file is already in export shape.
 .github/workflows/ci.yml	.github/workflows	Public repository root file is already in export shape.
 .github/workflows/linux-tests.yml	.github/workflows	Public repository root file is already in export shape.
 .github/workflows/macos-stable-release.yml	.github/workflows	Public repository root file is already in export shape.
 .github/workflows/merge-queue-cleanup.yml	.github/workflows	Public repository root file is already in export shape.
-.github/workflows/replay-harness.yml	.github/workflows	Public repository root file is already in export shape.
 AGENTS.md	.	Public repository root file is already in export shape.
 CLAUDE.md	.	Public repository root file is already in export shape.
 CODE_OF_CONDUCT.md	.	Public repository root file is already in export shape.

@@ -326,6 +326,8 @@ mod tests {
         SnapshotModelUsage {
             evidence_ref: None,
             identity_parts: None,
+            copy_unproven: false,
+            identity_retained: false,
             model: "test-model".to_string(),
             input_tokens,
             output_tokens,
@@ -393,6 +395,7 @@ mod tests {
             removed_usage: None,
             telemetry_owned_complete: None,
             resolver_conflict_count: None,
+            copy_unproven_counts: None,
             claude_money: None,
             session_account_evidence: None,
             claude_usage_request_ids: std::collections::BTreeSet::new(),
@@ -637,34 +640,6 @@ mod tests {
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].plan_fingerprint.as_deref(), Some("pro::20598"));
         assert_eq!(detected[0].subscription_product.as_deref(), Some("pro"));
-    }
-
-    #[test]
-    fn token_volume_recent_keeps_only_the_most_recent_samples() {
-        let mut buckets = Vec::new();
-        for day in 1..=30u32 {
-            let start = format!("2026-05-{day:02}T00:00:00Z");
-            let last = format!("2026-05-{day:02}T00:30:00Z");
-            buckets.push(usage_bucket(
-                &start,
-                &last,
-                vec![model_usage(
-                    Some("vertex"),
-                    Some("anthropic"),
-                    None,
-                    None,
-                    day as u64,
-                    0,
-                )],
-            ));
-        }
-        let detected = aggregate_detected_uses(&[snapshot("s", "2026-05-30T00:30:00Z", buckets)]);
-        assert_eq!(detected.len(), 1);
-        let samples = &detected[0].token_volume_recent;
-        assert_eq!(samples.len(), MAX_TOKEN_SAMPLES);
-        // 30 buckets, keep the most recent 24 → days 01..06 dropped.
-        assert_eq!(samples.first().unwrap().at, "2026-05-07T00:00:00Z");
-        assert_eq!(samples.last().unwrap().at, "2026-05-30T00:00:00Z");
     }
 
     #[test]

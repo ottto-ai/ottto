@@ -1,0 +1,263 @@
+{
+  "api_evidence": [
+    {
+      "account_identity_checked": false,
+      "app_version": "2.1.309",
+      "cache_creation_1h_tokens": 2,
+      "cache_creation_5m_tokens": 5,
+      "cache_creation_tokens": 7,
+      "cache_read_tokens": 3,
+      "capture_revision": "claude_api_request:v2",
+      "client_request_id": "client-r1",
+      "cost_usd_micros": 100,
+      "effort": "high",
+      "event_sequence": 101,
+      "fingerprint": "sha256:8fd6bcfd4d7dbc689782df494bcbeb2c12a26bc7f3e5afe86d6c343fd5341305",
+      "input_tokens": 10,
+      "model": "claude-haiku-4-5",
+      "observed_at": "2026-08-02T07:00:10Z",
+      "output_tokens": 10,
+      "query_source": "user",
+      "reasoning_output_tokens": 0,
+      "request_count": 1,
+      "request_id": "r1",
+      "session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+      "speed": ""
+    },
+    {
+      "account_identity_checked": false,
+      "app_version": "2.1.309",
+      "cache_creation_1h_tokens": 2,
+      "cache_creation_5m_tokens": 5,
+      "cache_creation_tokens": 7,
+      "cache_read_tokens": 3,
+      "capture_revision": "claude_api_request:v2",
+      "client_request_id": "client-r2",
+      "cost_usd_micros": 200,
+      "effort": "high",
+      "event_sequence": 201,
+      "fingerprint": "sha256:da1476f8b3ca96e1a1b040adb9879c1ef9ce097079a9378d2056ae4d649d3f7d",
+      "input_tokens": 20,
+      "model": "claude-haiku-4-5",
+      "observed_at": "2026-08-02T07:00:10Z",
+      "output_tokens": 20,
+      "query_source": "user",
+      "reasoning_output_tokens": 0,
+      "request_count": 1,
+      "request_id": "r2",
+      "session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+      "speed": ""
+    },
+    {
+      "account_identity_checked": false,
+      "app_version": "2.1.309",
+      "cache_creation_1h_tokens": 2,
+      "cache_creation_5m_tokens": 5,
+      "cache_creation_tokens": 7,
+      "cache_read_tokens": 3,
+      "capture_revision": "claude_api_request:v2",
+      "client_request_id": "client-r3",
+      "cost_usd_micros": 300,
+      "effort": "high",
+      "event_sequence": 301,
+      "fingerprint": "sha256:68e675ad7611e189670d5fea7b503333fdcfae5a6a64b4395e690f480886d7ec",
+      "input_tokens": 30,
+      "model": "claude-haiku-4-5",
+      "observed_at": "2026-08-02T07:00:10Z",
+      "output_tokens": 30,
+      "query_source": "user",
+      "reasoning_output_tokens": 0,
+      "request_count": 1,
+      "request_id": "r3",
+      "session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+      "speed": ""
+    }
+  ],
+  "binding": {
+    "context": "1d43ea64364ef49c916c300341e35ec2b28a0c5498d9ba06e19f0f20a216c4fc",
+    "entry": "900764dfed8375bc8fd1597971747f28c730fdeea1b0b3bfb31fa0bce52383d8",
+    "key": "ad14b3bbf537cc96695e477dc1bdd27fea0fe3ec72c79b367be4fe289c6fc203",
+    "scope": "a5b5793986c9772d0a1b1ce0969614dccd2ce243b17a5422006ea733068feb7a"
+  },
+  "case_id": "claude-three-request",
+  "counting_receipts": {
+    "closed_filter_hit_unconfirmed": 0,
+    "closed_filter_hit_unconfirmed_native_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "legacy_to_v2_after_tombstone_eviction": 0,
+    "native_after_turn_closed": 0,
+    "native_after_turn_closed_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "native_after_ui_flush": 0,
+    "native_after_ui_flush_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "native_chain_gap": 0,
+    "native_chain_overlap": 0,
+    "native_chain_overlap_covered": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "native_conflict": 0,
+    "native_counted": 0,
+    "native_epoch_reset": 0,
+    "native_inside_holed_coverage": 0,
+    "native_inside_holed_coverage_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "native_not_authority": 0,
+    "native_outside_open_turn": 0,
+    "native_outside_open_turn_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "native_restated": 0,
+    "open_turn_ui_pending_events_this_scan": 0,
+    "open_turn_ui_pending_sessions_this_scan": 0,
+    "open_turn_ui_pending_unsummable_this_scan": 0,
+    "open_turn_ui_pending_usage_this_scan": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "pending_overflow_flushes": 0,
+    "tombstone_cap": 0,
+    "tombstone_count": 0,
+    "tombstone_evictions_not_provably_pre_cutover_legacy": 0,
+    "tombstone_evictions_pre_cutover_legacy": 0,
+    "tombstone_evictions_v2_only": 0,
+    "turn_closure_mismatch": 0,
+    "turn_reopened": 0,
+    "ui_equal_total_repeat": 0,
+    "ui_equal_total_repeat_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "ui_in_native_turn_not_counted": 0,
+    "ui_in_native_turn_not_counted_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "ui_in_unbound_span": 0,
+    "v2_cumulative_base_uncounted": 0,
+    "v2_cumulative_base_uncounted_usage": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "v2_sessions": 0
+  },
+  "facts": {
+    "accepted_body_witness": true,
+    "cache_creation_1h_tokens": 6,
+    "cache_creation_5m_tokens": 15,
+    "cache_read_tokens": 9,
+    "cli_version": null,
+    "counting_version": "not_applicable",
+    "input_tokens": 60,
+    "opening_output_tokens": 30,
+    "opening_request_count": 3,
+    "output_tokens": 60,
+    "protected_tier_receipt_present": false,
+    "request_2_context_tokens": 30,
+    "request_3_context_tokens": 40,
+    "request_count": 3,
+    "selector_context": {},
+    "selector_sources": {},
+    "source_session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+    "telemetry_cost_micros": 600,
+    "tier_replay_finished": false,
+    "tier_replay_persisted": false
+  },
+  "post_save": {
+    "accepted": [
+      "2284dc4abf4c69a238b1026b6a813eaa6d8aa3700cd667d946c7771f5aafc933"
+    ],
+    "entry": {
+      "effective_upload_body_witness_revision": 3,
+      "last_snapshot_fingerprint": "0aec9698e76e734bb7960d504fee5b232f8bca750c24734e26a6f02a655531d4",
+      "last_upload_body_witness": "8ba40211992a9bc415ac118c157a16ceddac95ca9e2de38a32f7cff4d5e0e35d",
+      "modified_unix_nanos": 53772981,
+      "modified_unix_seconds": 1793423802,
+      "size_bytes": 1149,
+      "source_file_fingerprint": "sha256:da726a6b2be20a8de719e0302ab5d5bfa7c076d8b117a54e6000eac892282184"
+    },
+    "generation": 1
+  },
+  "pre_read": {
+    "ack_evidence": "none",
+    "entry": null,
+    "generation": 0
+  },
+  "pre_save": {
+    "accepted": [
+      "2284dc4abf4c69a238b1026b6a813eaa6d8aa3700cd667d946c7771f5aafc933"
+    ],
+    "entry": {
+      "effective_upload_body_witness_revision": 3,
+      "last_snapshot_fingerprint": "0aec9698e76e734bb7960d504fee5b232f8bca750c24734e26a6f02a655531d4",
+      "last_upload_body_witness": "8ba40211992a9bc415ac118c157a16ceddac95ca9e2de38a32f7cff4d5e0e35d",
+      "modified_unix_nanos": 53772981,
+      "modified_unix_seconds": 1793423802,
+      "size_bytes": 1149,
+      "source_file_fingerprint": "sha256:da726a6b2be20a8de719e0302ab5d5bfa7c076d8b117a54e6000eac892282184"
+    },
+    "generation": 0
+  },
+  "prior_legacy_ack": null,
+  "schema_version": 1,
+  "scope_inputs": {
+    "counting_view": "none",
+    "file_scope": "durable-codec-test",
+    "fingerprint_recipe": "sha256 of inputs JSONL bytes",
+    "fixture_birth_unix_nanos": 1785654000000000000,
+    "identity_contract": "none|changed=false|capture=false|attr=false",
+    "index_key_recipe": "local_index_key of the synthetic transcript in the CI scratch directory",
+    "namespace": "synthetic-v1-goldens"
+  },
+  "selector_span": null
+}

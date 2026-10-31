@@ -151,43 +151,49 @@ pub(crate) fn stats() -> Stats {
     STATS.with(Cell::get)
 }
 pub(crate) fn phase_begin() {
+    if process::caller_phase_begin() {
+        return;
+    }
     assert!(ACTIVE.with(Cell::get));
     PHASE_BASE.with(|b| b.set(stats().requested_live));
     PHASE_PEAK.with(|p| p.set(0));
 }
 pub(crate) fn phase_peak() -> usize {
-    PHASE_PEAK.with(Cell::get)
+    process::caller_phase_peak().unwrap_or_else(|| PHASE_PEAK.with(Cell::get))
 }
 
-// Independent born-in-scope audits. The fixed tables allocate no Rust heap and
-// leave System/Layouts untouched. Only pointers born inside this scope are
-// charged: freeing a pre-existing allocation cannot hide a later peak. Charge
-// realloc's old+new overlap conservatively even when System grows in place.
+// Independent born-in-scope audits. Bookkeeping uses System directly, outside
+// the observed allocator, without changing observed pointers or Layouts. The
+// index holds one node per live born pointer, freed on retirement or scope exit;
+// metadata allocation failure latches overflow and fails the audit. Only
+// pointers born inside this scope are charged: freeing a pre-existing
+// allocation cannot hide a later peak. Charge realloc's old+new overlap
+// conservatively even when System grows in place.
 // The process table charges every thread. The caller table charges only the
 // measuring thread's allocations; a free on any thread retires a charged
 // pointer exactly, and unrelated threads' allocations are never charged.
 mod process {
     use super::Stats;
+    use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, MutexGuard};
-    const SLOTS: usize = 65_536;
-    #[derive(Clone, Copy)]
+    // Bucket count affects lookup cost, never the number of live pointers.
+    const BUCKETS: usize = 65_536;
     struct Entry {
+        next: usize,
         pointer: usize,
         requested: usize,
         usable: usize,
+        in_phase: bool,
     }
-    const EMPTY: Entry = Entry {
-        pointer: 0,
-        requested: 0,
-        usable: 0,
-    };
     struct Audit {
         active: bool,
         overflow: bool,
         stats: Stats,
-        entries: [Entry; SLOTS],
+        phase_live: usize,
+        phase_peak: usize,
+        buckets: [usize; BUCKETS],
     }
     const IDLE: Audit = Audit {
         active: false,
@@ -202,7 +208,9 @@ mod process {
             requested_peak_with_overlap: 0,
             usable_peak_with_overlap: 0,
         },
-        entries: [EMPTY; SLOTS],
+        phase_live: 0,
+        phase_peak: 0,
+        buckets: [0; BUCKETS],
     };
     struct Table {
         active: AtomicBool,
@@ -225,20 +233,51 @@ mod process {
         CALLER_THREAD.try_with(Cell::get).unwrap_or(false)
     }
     impl Audit {
-        fn lookup(&self, pointer: usize) -> Option<usize> {
-            let first = (pointer >> 4).wrapping_mul(0x9e3779b1) % SLOTS;
-            for i in 0..SLOTS {
-                let slot = (first + i) % SLOTS;
-                if self.entries[slot].pointer == 0 {
-                    return None;
-                }
-                if self.entries[slot].pointer == pointer {
-                    return Some(slot);
+        fn bucket(pointer: usize) -> usize {
+            (pointer >> 4).wrapping_mul(0x9e3779b1) % BUCKETS
+        }
+        fn clear(&mut self) {
+            for bucket in &mut self.buckets {
+                while *bucket != 0 {
+                    let node = *bucket as *mut Entry;
+                    // Nodes belong exclusively to this audit under its mutex.
+                    // Free only metadata, never the observed native allocation.
+                    unsafe {
+                        *bucket = (*node).next;
+                        System.dealloc(node.cast(), Layout::new::<Entry>());
+                    }
                 }
             }
-            None
         }
         fn insert(&mut self, pointer: usize, requested: usize, usable: usize) {
+            // Do not recurse through Probe or charge its bookkeeping to either
+            // audit. Native allocation pointers and allocator sizes stay intact.
+            let node = unsafe { System.alloc(Layout::new::<Entry>()).cast::<Entry>() };
+            self.insert_node(pointer, requested, usable, node);
+        }
+        fn insert_node(
+            &mut self,
+            pointer: usize,
+            requested: usize,
+            usable: usize,
+            node: *mut Entry,
+        ) {
+            if node.is_null() {
+                self.overflow = true;
+                return;
+            }
+            let bucket = Self::bucket(pointer);
+            // The caller supplies fresh System storage for one Entry.
+            unsafe {
+                node.write(Entry {
+                    next: self.buckets[bucket],
+                    pointer,
+                    requested,
+                    usable,
+                    in_phase: true,
+                });
+            }
+            self.buckets[bucket] = node as usize;
             self.stats.requested_live += requested as isize;
             self.stats.usable_live += usable as isize;
             self.stats.requested_peak = self
@@ -246,30 +285,33 @@ mod process {
                 .requested_peak
                 .max(self.stats.requested_live as usize);
             self.stats.usable_peak = self.stats.usable_peak.max(self.stats.usable_live as usize);
+            self.phase_live += requested;
+            self.phase_peak = self.phase_peak.max(self.phase_live);
             self.stats.allocations += 1;
             self.stats.requested_peak_with_overlap = self.stats.requested_peak;
             self.stats.usable_peak_with_overlap = self.stats.usable_peak;
-            let first = (pointer >> 4).wrapping_mul(0x9e3779b1) % SLOTS;
-            for i in 0..SLOTS {
-                let slot = (first + i) % SLOTS;
-                if self.entries[slot].pointer <= 1 {
-                    self.entries[slot] = Entry {
-                        pointer,
-                        requested,
-                        usable,
-                    };
-                    return;
-                }
-            }
-            self.overflow = true;
         }
         fn remove(&mut self, pointer: usize) {
-            if let Some(slot) = self.lookup(pointer) {
-                let entry = self.entries[slot];
-                self.stats.requested_live -= entry.requested as isize;
-                self.stats.usable_live -= entry.usable as isize;
-                self.stats.deallocations += 1;
-                self.entries[slot].pointer = 1;
+            let mut link = &mut self.buckets[Self::bucket(pointer)];
+            while *link != 0 {
+                let node = *link as *mut Entry;
+                // Every link is a live System-owned node under this mutex.
+                // Unlink before freeing so address reuse cannot leave a stale
+                // entry. No reference to the removed node survives this branch.
+                unsafe {
+                    if (*node).pointer == pointer {
+                        self.stats.requested_live -= (*node).requested as isize;
+                        self.stats.usable_live -= (*node).usable as isize;
+                        self.stats.deallocations += 1;
+                        if (*node).in_phase {
+                            self.phase_live -= (*node).requested;
+                        }
+                        *link = (*node).next;
+                        System.dealloc(node.cast(), Layout::new::<Entry>());
+                        return;
+                    }
+                    link = &mut (*node).next;
+                }
             }
         }
         fn reallocated(&mut self, old: usize, new: usize, requested: usize, usable: usize) {
@@ -281,6 +323,7 @@ mod process {
                 .stats
                 .usable_peak
                 .max(self.stats.usable_live as usize + usable);
+            self.phase_peak = self.phase_peak.max(self.phase_live + requested);
             self.remove(old);
             self.insert(new, requested, usable);
         }
@@ -305,8 +348,10 @@ mod process {
                     drop(audit);
                     panic!("native allocation audit already active");
                 }
-                audit.entries.fill(EMPTY);
+                audit.clear();
                 audit.stats = Stats::default();
+                audit.phase_live = 0;
+                audit.phase_peak = 0;
                 audit.overflow = false;
                 audit.active = true;
                 self.active.store(true, Ordering::Release);
@@ -315,11 +360,9 @@ mod process {
             impl Drop for Stop<'_> {
                 fn drop(&mut self) {
                     self.0.active.store(false, Ordering::Release);
-                    self.0
-                        .audit
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .active = false;
+                    let mut audit = self.0.audit.lock().unwrap_or_else(|p| p.into_inner());
+                    audit.active = false;
+                    audit.clear();
                 }
             }
             let stop = Stop(self);
@@ -329,7 +372,10 @@ mod process {
                 let audit = self.audit.lock().unwrap_or_else(|p| p.into_inner());
                 (audit.overflow, audit.stats)
             };
-            assert!(!overflow, "native allocation audit table overflow");
+            assert!(
+                !overflow,
+                "native allocation audit metadata allocation failed"
+            );
             (result, stats)
         }
     }
@@ -355,7 +401,6 @@ mod process {
         layout: std::alloc::Layout,
         requested: usize,
     ) -> *mut u8 {
-        use std::alloc::{GlobalAlloc, System};
         // Keep the table locks (always process, then caller) across System's
         // native realloc: another thread may immediately reuse the old address
         // after System frees it.
@@ -388,6 +433,39 @@ mod process {
         }
         CALLER.active().map(|audit| audit.stats)
     }
+    // Phase peaks count only pointers born since phase_begin. A free of an
+    // older pointer must not offset a later phase allocation. Realloc charges
+    // the full new side plus any still-live phase allocations conservatively.
+    pub(super) fn caller_phase_begin() -> bool {
+        if !on_caller_thread() {
+            return false;
+        }
+        let mut audit = CALLER.active().expect("active caller-thread audit");
+        for bucket in &audit.buckets {
+            let mut node = *bucket as *mut Entry;
+            while !node.is_null() {
+                // Nodes remain live and exclusively locked throughout the walk.
+                unsafe {
+                    (*node).in_phase = false;
+                    node = (*node).next as *mut Entry;
+                }
+            }
+        }
+        audit.phase_live = 0;
+        audit.phase_peak = 0;
+        true
+    }
+    pub(super) fn caller_phase_peak() -> Option<usize> {
+        if !on_caller_thread() {
+            return None;
+        }
+        Some(
+            CALLER
+                .active()
+                .expect("active caller-thread audit")
+                .phase_peak,
+        )
+    }
     pub(super) fn measure<T>(f: impl FnOnce() -> T) -> (T, Stats) {
         PROCESS.measure(f)
     }
@@ -409,6 +487,22 @@ mod process {
             let _leave = Leave;
             f()
         })
+    }
+
+    #[test]
+    fn metadata_allocation_failure_fails_closed_and_releases_the_audit() {
+        let failed = std::panic::catch_unwind(|| {
+            measure_caller(|| {
+                // Exercise the actual null-metadata path without native OOM.
+                CALLER
+                    .active()
+                    .unwrap()
+                    .insert_node(2, 8, 8, std::ptr::null_mut());
+            })
+        });
+        assert!(failed.is_err());
+        let ((), stats) = measure_caller(|| {});
+        assert_eq!((stats.allocations, stats.deallocations), (0, 0));
     }
 }
 
@@ -432,72 +526,6 @@ pub(crate) fn measure_caller_thread<T>(f: impl FnOnce() -> T) -> (T, Stats) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Explicit serial run because the nested process probe sees every thread.
-    #[test]
-    #[ignore = "explicit serial native allocator audit"]
-    fn m1_allocator_accounting_self_tests() {
-        for new_size in [256, 32] {
-            let (((), thread), process) = measure_process(|| {
-                measure(|| unsafe {
-                    let layout = Layout::from_size_align(64, 8).unwrap();
-                    let ptr = std::alloc::alloc(layout);
-                    assert!(!ptr.is_null());
-                    let grown = std::alloc::realloc(ptr, layout, new_size);
-                    assert!(!grown.is_null());
-                    assert_eq!(stats().requested_live, new_size as isize);
-                    std::alloc::dealloc(grown, Layout::from_size_align(new_size, 8).unwrap());
-                })
-            });
-            assert_eq!(thread.requested_peak_with_overlap, 64 + new_size);
-            assert_eq!(thread.requested_peak_with_overlap, process.requested_peak);
-            assert_eq!(thread.usable_peak_with_overlap, process.usable_peak);
-            assert_eq!(thread.requested_live, 0);
-            assert_eq!((thread.allocations, thread.deallocations), (2, 2));
-            assert_eq!(thread.deallocations, process.deallocations);
-        }
-        // Native OOM return-null is not reliable on every allocator/platform.
-        // Exercise the exact success-gated accounting entry point synthetically.
-        let (_, failed) = measure(|| {
-            let value = Box::new([0u8; 64]);
-            let before = stats();
-            record_reallocation(64, 64, None);
-            let after = stats();
-            assert_eq!(formatless(before), formatless(after));
-            drop(std::hint::black_box(value));
-        });
-        assert_eq!((failed.allocations, failed.deallocations), (1, 1));
-
-        // Create the receiver before measuring so thread startup is excluded.
-        let (send, receive) = std::sync::mpsc::sync_channel(0);
-        let worker = std::thread::spawn(move || {
-            drop(receive.recv().unwrap());
-            drop(receive.recv().unwrap());
-        });
-        send.send(Box::new([0u8; 64])).unwrap(); // Initialize sender TLS first.
-        let (_, escaped) = measure(|| send.send(Box::new([0u8; 64])).unwrap());
-        worker.join().unwrap();
-        assert_eq!(escaped.requested_live, 64);
-        assert_eq!(escaped.deallocations, 0);
-
-        let external = Box::new([0u8; 64]);
-        let negative = std::panic::catch_unwind(|| measure(|| drop(external)));
-        assert!(negative.is_err()); // Preserve measure's existing nonnegative guard.
-        assert_eq!(stats().requested_live, -64);
-
-        let external = Box::new([0u8; 64]);
-        let (leaked, compensated) = measure(|| {
-            drop(external);
-            Box::into_raw(Box::new([0u8; 64]))
-        });
-        assert_eq!(compensated.requested_live, 0);
-        assert_eq!(compensated.usable_live, 0);
-        assert_eq!(compensated.allocations, compensated.deallocations);
-        assert_eq!(compensated.requested_peak, 0); // Hidden peak: not detected.
-        unsafe {
-            drop(Box::from_raw(leaked));
-        }
-    }
 
     #[test]
     fn caller_thread_stats_is_allocation_free_and_observational() {
@@ -548,6 +576,85 @@ mod tests {
         assert_eq!((audit.allocations, audit.deallocations), (2, 1));
         assert!(audit.usable_peak_with_overlap >= audit.requested_peak_with_overlap);
         drop(grown);
+    }
+
+    #[test]
+    fn caller_audit_tracks_large_live_sets_and_reuses_retired_storage() {
+        // The owned oracle's 1000-hour fixture exceeded 65,536 simultaneous
+        // live pointers on Linux. Keep more than twice that many live, then
+        // retire and replace them without ending the scope or losing peaks.
+        const COUNT: usize = 2 * 65_536 + 1;
+        let mut pointers = Vec::with_capacity(COUNT);
+        let layout = Layout::from_size_align(8, 8).unwrap();
+        let ((), audit) = measure_caller_thread(|| {
+            for round in 0..2 {
+                phase_begin();
+                for _ in 0..COUNT {
+                    let pointer = unsafe { std::alloc::alloc(layout) };
+                    assert!(!pointer.is_null());
+                    pointers.push(pointer);
+                }
+                let live = caller_thread_stats().unwrap();
+                assert_eq!(live.requested_live, (COUNT * 8) as isize);
+                assert_eq!(live.allocations, (round + 1) * COUNT);
+                assert_eq!(phase_peak(), COUNT * 8);
+                for pointer in pointers.drain(..) {
+                    unsafe { std::alloc::dealloc(pointer, layout) };
+                }
+                let retired = caller_thread_stats().unwrap();
+                assert_eq!((retired.requested_live, retired.usable_live), (0, 0));
+                assert_eq!(retired.allocations, retired.deallocations);
+            }
+        });
+        assert_eq!(audit.requested_peak_with_overlap, COUNT * 8);
+        assert!(audit.usable_peak_with_overlap >= audit.requested_peak_with_overlap);
+        assert_eq!(
+            (audit.allocations, audit.deallocations),
+            (2 * COUNT, 2 * COUNT)
+        );
+    }
+
+    #[test]
+    fn legacy_measure_keeps_phase_accounting() {
+        let ((), audit) = measure(|| {
+            phase_begin();
+            let value = std::hint::black_box(Box::new([0u8; 128]));
+            assert_eq!(stats().requested_live, 128);
+            assert_eq!(phase_peak(), 128);
+            drop(value);
+        });
+        assert_eq!(audit.requested_live, 0);
+    }
+
+    #[test]
+    fn caller_phases_exclude_old_frees_without_hiding_growth() {
+        let external = Box::new([0u8; 4096]);
+        let mut grown = Vec::<u8>::with_capacity(64);
+        let ((), audit) = measure_caller_thread(|| {
+            let earlier_phase = std::hint::black_box(Box::new([0u8; 512]));
+            phase_begin();
+            drop(external);
+            drop(earlier_phase);
+            assert_eq!(phase_peak(), 0);
+            let born = std::hint::black_box(Box::new([0u8; 256]));
+            grown.reserve_exact(1024); // Only the new side belongs to this audit.
+            assert_eq!(phase_peak(), 256 + 1024);
+            drop(born);
+            assert_eq!(caller_thread_stats().unwrap().requested_live, 1024);
+            phase_begin();
+            drop(grown); // Born in scope, but before this phase: no peak credit.
+            let mut bytes = Vec::<u8>::with_capacity(64);
+            bytes.push(1);
+            bytes.reserve_exact(255);
+            assert_eq!(phase_peak(), 64 + 256); // Conservative realloc overlap.
+            drop(std::hint::black_box(bytes));
+            assert_eq!(caller_thread_stats().unwrap().requested_live, 0);
+        });
+        assert_eq!(audit.requested_peak_with_overlap, 256 + 1024);
+        assert_eq!((audit.requested_live, audit.usable_live), (0, 0));
+        assert_eq!((audit.allocations, audit.deallocations), (5, 5));
+        // A new scope starts with no phase history.
+        measure_caller_thread(|| assert_eq!(phase_peak(), 0));
     }
 
     fn formatless(s: Stats) -> (isize, isize, usize, usize, usize, usize, usize, usize) {

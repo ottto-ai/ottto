@@ -4,13 +4,12 @@
 // the source-pinned pre-change decoder, partial-checkpoint carriage, M1
 // complete-healthy absence retirement, M2 no-body completion, the A1 empty map
 // advance with its A2/A3 restoration seams, the accepted-body no-op, and
-// count/byte-only allocation receipts. All fixtures are synthetic and
+// correction custody. All fixtures are synthetic and
 // content-free. The M1/M2/A1-A3 section is CONTROLLED: it seeds a granted
 // index, then runs the production seams in production order. The lifecycle
 // through real pages, uploads and reloads lives in
 // `snapshot_sync/authority_proof_correction_pipeline_tests.rs`.
 use super::*;
-use crate::retry_allocation_probe as probe;
 
 const APC_ROOT: &str = "e1111111-1111-4111-8111-111111111111";
 const APC_WINDOW: &str = "2026-08-02T07:10:00Z";
@@ -853,6 +852,7 @@ fn apc_pending(
     parsed_snapshot_count: usize,
 ) -> PendingIndexFinalization {
     PendingIndexFinalization {
+        withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: apc_keys()[slot].clone(),
@@ -1914,355 +1914,11 @@ fn a_correction_persists_no_diagnostic_metadata() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// R8 measurement on the small M2 synthetic family shape (32 and 64 roots, two
-// members each). Every input graph is born inside `probe::measure`, so no
-// pre-existing allocation is freed inside the scope. Receipts are count/byte
-// only and written directly to stderr; they are allocation-request
-// accounting, not RSS claims. Normal index/read/allocation limits are not
-// changed or exercised beyond their existing use.
-
-const APC_M2_MEMBERS: usize = 2;
-
-fn apc_m2_root(root: usize) -> String {
-    format!("{:08x}-5a5a-4000-8000-0000000000a8", 0x6e00_0000 + root)
-}
-
-fn apc_m2_digest(tag: u64, value: usize) -> String {
-    format!("{tag:016x}{value:048x}")
-}
-
-/// One terminal record per family; `owed` > 0 grants a correction owing that
-/// many members (contract v2), 0 keeps the old-contract record.
-fn apc_m2_index(roots: usize, owed: usize) -> ScanIndex {
-    let mut index = ScanIndex {
-        accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_VERSION,
-        ..ScanIndex::default()
-    };
-    for root in 0..roots {
-        let session = apc_m2_root(root);
-        let members = [
-            (
-                session.clone(),
-                format!("/synthetic/m2/projects/{session}.jsonl"),
-            ),
-            (
-                format!("{session}_agent-m2{root:04x}"),
-                format!("/synthetic/m2/projects/{session}/subagents/agent-m2{root:04x}.jsonl"),
-            ),
-        ];
-        let mut witness = ClaudeUsageFamilyWitness {
-            evidence_fingerprint: apc_m2_digest(1, root),
-            member_request_id_fingerprints: BTreeMap::new(),
-            member_occurrence_fingerprints: BTreeMap::new(),
-            assigned_request_id_fingerprints: BTreeMap::new(),
-            legacy_excluded_request_id_hashes: BTreeMap::new(),
-            legacy_exclusion_evidence_fingerprint: None,
-            legacy_owner_roots: BTreeSet::new(),
-        };
-        let mut revisions = BTreeMap::new();
-        for (slot, (member, key)) in members.iter().enumerate() {
-            let file = root * APC_M2_MEMBERS + slot;
-            let body = apc_m2_digest(3, file);
-            index
-                .files
-                .insert(key.clone(), apc_entry(&apc_m2_digest(2, file), &body));
-            index
-                .file_snapshot_fingerprints
-                .insert(key.clone(), BTreeSet::from([body.clone()]));
-            index
-                .snapshot_activity_at
-                .insert(body.clone(), Some(APC_WINDOW.to_string()));
-            index.accepted_snapshot_fingerprints.insert(body);
-            revisions.insert(member.clone(), apc_m2_digest(2, file));
-            witness
-                .member_request_id_fingerprints
-                .insert(member.clone(), apc_m2_digest(5, file));
-            witness
-                .member_occurrence_fingerprints
-                .insert(member.clone(), apc_m2_digest(6, file));
-        }
-        let digest = claude_usage_family_witness_fingerprint(&witness);
-        let correction = (owed > 0).then(|| ClaudeAuthorityProofCorrection {
-            proof_witness_fingerprint: digest.clone(),
-            owed_member_ids: members
-                .iter()
-                .take(owed)
-                .map(|(member, _)| member.clone())
-                .collect(),
-        });
-        index.claude_usage_authority_quarantine.insert(
-            session.clone(),
-            ClaudeUsageAuthorityQuarantineRecord {
-                contract: if correction.is_some() {
-                    CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION
-                } else {
-                    CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION
-                }
-                .to_string(),
-                proven_witness_fingerprint: digest,
-                member_source_file_fingerprints: revisions,
-                failed_reconstruction_count: MAX_CLAUDE_USAGE_AUTHORITY_FAILURES,
-                disposition: ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
-                retry_after_unix_seconds: 0,
-                proof_correction: correction,
-            },
-        );
-        index.claude_usage_family_witnesses.insert(session, witness);
-    }
-    index
-}
-
-/// One captured candidate per owed member, as a page would hold them.
-fn apc_m2_candidates(index: &ScanIndex) -> Vec<ClaudeProofCorrectionCandidate> {
-    let mut candidates = Vec::new();
-    for (root, record) in &index.claude_usage_authority_quarantine {
-        let Some(correction) = &record.proof_correction else {
-            continue;
-        };
-        for member in &correction.owed_member_ids {
-            let key = index
-                .files
-                .keys()
-                .find(|key| {
-                    claude_index_path_family_member(Path::new(key.as_str()))
-                        .is_some_and(|(_, found)| found == *member)
-                })
-                .cloned()
-                .expect("indexed member");
-            candidates.push(ClaudeProofCorrectionCandidate {
-                revision: record.member_source_file_fingerprints[member].clone(),
-                fingerprint: index.files[&key]
-                    .last_snapshot_fingerprint
-                    .clone()
-                    .unwrap_or_default(),
-                body_witness: apc_m2_digest(9, candidates.len()),
-                index_key: key,
-                root: root.clone(),
-                member: member.clone(),
-                proof: correction.proof_witness_fingerprint.clone(),
-            });
-        }
-    }
-    candidates
-}
-
 fn apc_emit(line: Value) {
     use std::io::Write as _;
     std::io::stderr()
         .write_all(format!("{line}\n").as_bytes())
         .expect("allocation receipt");
-}
-
-fn apc_live() -> usize {
-    usize::try_from(probe::stats().requested_live).expect("live requested bytes")
-}
-
-#[derive(Debug, Default)]
-struct ApcM2Measure {
-    encoded_v1: usize,
-    encoded_v2: usize,
-    clone_v1: usize,
-    clone_v2: usize,
-    subset_peak_v1: usize,
-    subset_peak_v2: usize,
-    subset_live_v2: usize,
-    candidates_live: usize,
-    candidate_count: usize,
-    layout_bound_v1: Option<usize>,
-    layout_bound_v2: Option<usize>,
-    advance_count: usize,
-    advance_live: usize,
-    subset_peak_rollback: usize,
-    subset_peak_carry: usize,
-}
-
-/// The agent member's file key in M2 family `root`.
-fn apc_m2_agent(root: usize) -> (String, String) {
-    let session = apc_m2_root(root);
-    (
-        format!("{session}_agent-m2{root:04x}"),
-        format!("/synthetic/m2/projects/{session}/subagents/agent-m2{root:04x}.jsonl"),
-    )
-}
-
-/// Drop every agent member's prior entity: delivery-free entries.
-fn apc_m2_without_agent_entities(index: &mut ScanIndex, roots: usize) {
-    for root in 0..roots {
-        let (_, key) = apc_m2_agent(root);
-        let entry = index.files.get_mut(&key).unwrap();
-        entry.last_snapshot_fingerprint = None;
-        entry.last_upload_body_witness = None;
-        index.file_snapshot_fingerprints.remove(&key);
-    }
-}
-
-/// A1 on every family: the owed agent parsed complete and empty at a new
-/// revision, with the paired map advance.
-fn apc_m2_advance(index: &mut ScanIndex, roots: usize) {
-    for root in 0..roots {
-        let (member, key) = apc_m2_agent(root);
-        let revision = apc_m2_digest(7, root * APC_M2_MEMBERS + 1);
-        let entry = index.files.get_mut(&key).unwrap();
-        entry.source_file_fingerprint = revision.clone();
-        entry.last_snapshot_fingerprint = None;
-        entry.last_upload_body_witness = None;
-        index.file_snapshot_fingerprints.remove(&key);
-        index.confirmed_empty_files.insert(key);
-        index
-            .claude_usage_authority_quarantine
-            .get_mut(&apc_m2_root(root))
-            .unwrap()
-            .member_source_file_fingerprints
-            .insert(member, revision);
-    }
-}
-
-/// R8: the added encoded bytes per record and per index, and the owned bytes
-/// of a ScanIndex clone, a partial-checkpoint committable subset (pre-grant
-/// previous, granted current) and the page-scoped captured candidates; for
-/// A2, the ephemeral empty-map advance copy and the checkpoint selection that
-/// rolls it back (prior entities) or carries it (none). The per-record encoded
-/// delta is asserted exactly: it is the serialized correction alone, since v1
-/// and v2 contract names have equal length. The locked checkpoint itself is
-/// measured in the pipeline tests.
-#[test]
-fn proof_correction_encoded_and_owned_bytes_receipt() {
-    for roots in [32, 64] {
-        for owed in 1..=APC_M2_MEMBERS {
-            let (measured, scope) = probe::measure(|| {
-                let v1 = apc_m2_index(roots, 0);
-                let v2 = apc_m2_index(roots, owed);
-                let mut measured = ApcM2Measure {
-                    encoded_v1: serde_json::to_vec(&v1).unwrap().len(),
-                    encoded_v2: serde_json::to_vec(&v2).unwrap().len(),
-                    ..ApcM2Measure::default()
-                };
-                if crate::heap_layout_bound::layout_supported() {
-                    measured.layout_bound_v1 = crate::heap_layout_bound::bound(&v1, usize::MAX);
-                    measured.layout_bound_v2 = crate::heap_layout_bound::bound(&v2, usize::MAX);
-                }
-                let before = apc_live();
-                let clone = v1.clone();
-                measured.clone_v1 = apc_live() - before;
-                drop(clone);
-                let before = apc_live();
-                let clone = v2.clone();
-                measured.clone_v2 = apc_live() - before;
-                drop(clone);
-                let accepted = BTreeSet::new();
-                let quarantined = BTreeMap::new();
-                probe::phase_begin();
-                let subset = v1.committable_subset(&v1, &accepted, &quarantined);
-                measured.subset_peak_v1 = probe::phase_peak();
-                drop(subset);
-                let before = apc_live();
-                probe::phase_begin();
-                let subset = v2.committable_subset(&v1, &accepted, &quarantined);
-                measured.subset_peak_v2 = probe::phase_peak();
-                measured.subset_live_v2 = apc_live() - before;
-                assert_eq!(
-                    serde_json::to_vec(&subset.claude_usage_authority_quarantine).unwrap(),
-                    serde_json::to_vec(&v2.claude_usage_authority_quarantine).unwrap(),
-                    "the checkpoint subset carries every owed member"
-                );
-                drop(subset);
-                let before = apc_live();
-                let candidates = apc_m2_candidates(&v2);
-                measured.candidates_live = apc_live() - before;
-                measured.candidate_count = candidates.len();
-                drop(candidates);
-                // A2: the ephemeral advance copy every restoration seam takes,
-                // then checkpoint selection that rolls the map back (prior
-                // entities) or carries it (no prior entity).
-                let rollback_previous = apc_m2_index(roots, APC_M2_MEMBERS);
-                let mut rollback = rollback_previous.clone();
-                apc_m2_advance(&mut rollback, roots);
-                let before = apc_live();
-                let advances = rollback.claude_empty_map_advances(&rollback_previous);
-                measured.advance_live = apc_live() - before;
-                measured.advance_count = advances.len();
-                drop(advances);
-                probe::phase_begin();
-                let subset =
-                    rollback.committable_subset(&rollback_previous, &accepted, &quarantined);
-                measured.subset_peak_rollback = probe::phase_peak();
-                assert_eq!(
-                    apc_quarantine_bytes(&subset),
-                    apc_quarantine_bytes(&rollback_previous),
-                    "every restored prior entity rolls its map revision back"
-                );
-                drop(subset);
-                let mut carry_previous = apc_m2_index(roots, APC_M2_MEMBERS);
-                apc_m2_without_agent_entities(&mut carry_previous, roots);
-                let mut carry = carry_previous.clone();
-                apc_m2_advance(&mut carry, roots);
-                probe::phase_begin();
-                let subset = carry.committable_subset(&carry_previous, &accepted, &quarantined);
-                measured.subset_peak_carry = probe::phase_peak();
-                assert_eq!(
-                    apc_quarantine_bytes(&subset),
-                    apc_quarantine_bytes(&carry),
-                    "every paired advance without a prior entity is carried"
-                );
-                drop(subset);
-                measured
-            });
-            let record_v1 =
-                serde_json::to_vec(&apc_m2_index(1, 0).claude_usage_authority_quarantine)
-                    .unwrap()
-                    .len();
-            let one = apc_m2_index(1, owed);
-            let record_v2 = serde_json::to_vec(&one.claude_usage_authority_quarantine)
-                .unwrap()
-                .len();
-            let correction = one.claude_usage_authority_quarantine[&apc_m2_root(0)]
-                .proof_correction
-                .clone()
-                .unwrap();
-            assert_eq!(
-                record_v2 - record_v1,
-                ",\"proof_correction\":".len() + serde_json::to_vec(&correction).unwrap().len(),
-                "the record grows by exactly its serialized correction"
-            );
-            assert_eq!(
-                measured.encoded_v2 - measured.encoded_v1,
-                roots * (record_v2 - record_v1),
-                "the index grows by exactly one correction per granted record"
-            );
-            assert!(measured.clone_v2 >= measured.clone_v1);
-            assert_eq!(measured.candidate_count, roots * owed);
-            assert_eq!(
-                measured.advance_count, roots,
-                "one paired advance per family"
-            );
-            apc_emit(json!({
-                "receipt": "claude_authority_proof_correction_bytes:v1",
-                "synthetic_family_roots": roots,
-                "members_per_root": APC_M2_MEMBERS,
-                "owed_members_per_root": owed,
-                "record_encoded_bytes_v1": record_v1,
-                "record_encoded_bytes_added": record_v2 - record_v1,
-                "index_encoded_bytes_v1": measured.encoded_v1,
-                "index_encoded_bytes_added": measured.encoded_v2 - measured.encoded_v1,
-                "index_clone_requested_bytes_v1": measured.clone_v1,
-                "index_clone_requested_bytes_added": measured.clone_v2 - measured.clone_v1,
-                "committable_subset_requested_peak_bytes_v1": measured.subset_peak_v1,
-                "committable_subset_requested_peak_bytes_v2": measured.subset_peak_v2,
-                "committable_subset_requested_live_bytes_v2": measured.subset_live_v2,
-                "captured_candidate_count": measured.candidate_count,
-                "captured_candidates_requested_bytes": measured.candidates_live,
-                "layout_bound_bytes_v1": measured.layout_bound_v1,
-                "layout_bound_bytes_v2": measured.layout_bound_v2,
-                "empty_map_advance_count": measured.advance_count,
-                "empty_map_advance_requested_bytes": measured.advance_live,
-                "committable_subset_requested_peak_bytes_v2_advance_rollback": measured.subset_peak_rollback,
-                "committable_subset_requested_peak_bytes_v2_advance_carry": measured.subset_peak_carry,
-                "scope_requested_peak_bytes": scope.requested_peak,
-                "scope_allocations": scope.allocations,
-            }));
-        }
-    }
 }
 
 /// Source-pinned pre-change decoder. The record type and its predicate are
@@ -2581,7 +2237,10 @@ fn apc_without_unbound_record(index: &ScanIndex) -> Value {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn load_drops_unbound_authority_record_and_keeps_index() {
     let scratch = crate::test_scratch::ScratchDir::new("authority-load-containment");
     let index = apc_unbound_fixture();
@@ -2613,7 +2272,10 @@ fn load_drops_unbound_authority_record_and_keeps_index() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn contained_unbound_authority_record_does_not_latch_claude_reemission_stop() {
     let scratch = crate::test_scratch::ScratchDir::new("authority-load-no-rebuild-stop");
     let index = apc_unbound_fixture();
@@ -2699,4 +2361,156 @@ fn empty_map_restore_never_removes_owed_member() {
         "rolled-back empty facts cannot certify a revision"
     );
     apc_save_reload(&mut index, &scratch.join("index.json"));
+}
+
+/// R2 page, CONTROLLED: the committed grant owes the root (with the agent too,
+/// unless `last_owed`), and the root's body is accepted. This page sees the
+/// root at `revision` with the same entity and body set, as a family sidecar
+/// touch leaves it, and its captured current-proof body no-op-drains on the
+/// working index before save selection, as `finish_sync_source` orders it.
+fn apc_r2_page(last_owed: bool, revision: &str) -> (ScanIndex, ScanIndex, ClaudeProofBodyDrains) {
+    let [root, agent] = apc_members();
+    let [root_key, _] = apc_keys();
+    let fingerprint = apc_hex('c');
+    let body = apc_hex('7');
+    let mut committed = apc_granted();
+    committed
+        .files
+        .get_mut(&root_key)
+        .unwrap()
+        .last_upload_body_witness = Some(snapshot_file_upload_body_set_hex([body.as_str()]));
+    if last_owed {
+        apc_settled(&mut committed, &agent);
+    }
+    let mut working = committed.clone();
+    working
+        .files
+        .get_mut(&root_key)
+        .unwrap()
+        .source_file_fingerprint = revision.to_string();
+    let candidate = ClaudeProofCorrectionCandidate {
+        index_key: root_key.clone(),
+        root: APC_ROOT.to_string(),
+        member: root.clone(),
+        proof: apc_record(&committed).proven_witness_fingerprint.clone(),
+        revision: revision.to_string(),
+        fingerprint,
+        body_witness: body,
+    };
+    let drains = working.settle_claude_proof_corrections(
+        &committed,
+        std::slice::from_ref(&candidate),
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+    );
+    assert!(
+        !apc_owed(&working).is_some_and(|owed| owed.contains(&root)),
+        "the no-op drains in memory, with no upload"
+    );
+    if last_owed {
+        assert!(
+            !working
+                .claude_usage_authority_quarantine
+                .contains_key(APC_ROOT),
+            "the last owed member's drain clears the record"
+        );
+        assert!(!working.claude_usage_family_pending.contains_key(APC_ROOT));
+    } else {
+        assert_eq!(apc_map(&working)[&root], revision);
+    }
+    (committed, working, drains)
+}
+
+/// R2 (main, production default): a no-op drain at a revision the partial
+/// save does not select is reverted. The shed page restores the committed
+/// entry, so the member stays owed with its pre-drain pair: the saved record
+/// names the saved file's revision. Proof, counter, deadline, pending proof
+/// and every accepted body are unchanged, and the restarted index parses the
+/// member again for its correction.
+#[test]
+fn r2_a_no_op_drain_whose_revision_the_partial_save_does_not_select_stays_owed() {
+    let [root, _] = apc_members();
+    let [root_key, _] = apc_keys();
+    let moved = apc_hex('5');
+    let scratch = crate::test_scratch::ScratchDir::new("proof-correction-r2-revert");
+    for last_owed in [false, true] {
+        let label = format!("last owed {last_owed}");
+        let (committed, working, drains) = apc_r2_page(last_owed, &moved);
+        let committed_revision = committed.files[&root_key].source_file_fingerprint.clone();
+        assert_ne!(committed_revision, moved, "{label}: the revision moved");
+        let mut subset = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+        assert_eq!(
+            subset.files[&root_key].source_file_fingerprint, committed_revision,
+            "{label}: nothing settled, so the save keeps the committed entry"
+        );
+        assert!(
+            subset.restore_unselected_claude_proof_body_drains(drains),
+            "{label}: the member owes again"
+        );
+        assert!(apc_owed(&subset).unwrap().contains(&root), "{label}");
+        assert_eq!(
+            apc_record(&subset),
+            apc_record(&committed),
+            "{label}: the pre-drain record: pair, owed set, proof, counter, deadline"
+        );
+        assert_eq!(
+            apc_map(&subset)[&root],
+            subset.files[&root_key].source_file_fingerprint,
+            "{label}: the saved record names the saved file's revision"
+        );
+        assert_eq!(
+            subset.claude_usage_family_pending.get(APC_ROOT),
+            committed.claude_usage_family_pending.get(APC_ROOT),
+            "{label}: the pending proof stays with its record"
+        );
+        assert_eq!(apc_debts(&subset), apc_debts(&committed), "{label}");
+        let drops = claude_authority_drops_for_test();
+        let loaded = apc_save_reload(&mut subset, &scratch.join(format!("shed-{last_owed}.json")));
+        assert_eq!(
+            claude_authority_drops_for_test(),
+            drops,
+            "{label}: the re-bound record is valid and bound; nothing is dropped"
+        );
+        assert_eq!(
+            apc_decision(&loaded, &apc_candidate(&loaded, 0)),
+            PARSE_FOR_AUTHORITY,
+            "{label}: the owed member is parsed again after restart"
+        );
+    }
+}
+
+/// R2 controls. A drain whose revision the save does select is kept exactly
+/// as before: with an unmoved revision the committed entry is that revision,
+/// and with a moved one a save that carries the working entry (a page with
+/// no holds) carries it. The restore changes nothing in either case.
+#[test]
+fn r2_a_drain_at_the_selected_revision_settles_exactly_as_before() {
+    let [root, _] = apc_members();
+    let [root_key, _] = apc_keys();
+    let unmoved = apc_revisions()[0].clone();
+    for last_owed in [false, true] {
+        let label = format!("last owed {last_owed}");
+        let (committed, working, drains) = apc_r2_page(last_owed, &unmoved);
+        let mut subset = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+        let selected = serde_json::to_vec(&subset).unwrap();
+        assert!(
+            !subset.restore_unselected_claude_proof_body_drains(drains),
+            "{label}: an unmoved revision is selected"
+        );
+        assert_eq!(serde_json::to_vec(&subset).unwrap(), selected, "{label}");
+
+        let (_, mut working, drains) = apc_r2_page(last_owed, &apc_hex('5'));
+        let carried = serde_json::to_vec(&working).unwrap();
+        assert!(
+            !working.restore_unselected_claude_proof_body_drains(drains),
+            "{label}: the carried working entry is the drained revision"
+        );
+        assert_eq!(serde_json::to_vec(&working).unwrap(), carried, "{label}");
+        if !last_owed {
+            assert_eq!(
+                apc_map(&working)[&root],
+                working.files[&root_key].source_file_fingerprint
+            );
+        }
+    }
 }

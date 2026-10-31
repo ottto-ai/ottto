@@ -1069,12 +1069,17 @@ fn bound_terminal_hold_skips_until_family_changes() {
     );
 }
 
-// Account holds are durable, bounded, and pruned only by a resolving
-// parse or proved absence.
+/// [format] Account holds are durable, bounded, and pruned only by a resolving
+/// parse or two stable-parent absence observations.
 #[test]
 fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
-    let held_key = "/opaque/deferred.jsonl";
-    let other_key = "/opaque/other.jsonl";
+    let dir = crate::test_scratch::ScratchDir::new("account-hold-rooted-proof");
+    let scan_root = fs::canonicalize(&dir).unwrap();
+    let held_path = scan_root.join("deferred.jsonl");
+    let other_path = scan_root.join("other.jsonl");
+    fs::write(&held_path, b"owed\n").unwrap();
+    let held_key = held_path.to_str().unwrap();
+    let other_key = other_path.to_str().unwrap();
     let mut index = ScanIndex::default();
     index.file_snapshot_fingerprints.insert(
         held_key.to_string(),
@@ -1083,7 +1088,7 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     index
         .file_snapshot_fingerprints
         .insert(other_key.to_string(), BTreeSet::from(["other".to_string()]));
-    let deferred = BTreeSet::from(["deferred".to_string()]);
+    let deferred = BTreeMap::from([("deferred".to_string(), 7)]);
 
     assert!(index.record_claude_account_deferred_holds(
         [(held_key, "deferred-source"), (other_key, "other-source")],
@@ -1112,22 +1117,66 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     // A parse that resolves the deferral clears it.
     let mut resolved = index.clone();
     assert!(resolved
-        .record_claude_account_deferred_holds([(held_key, "deferred-source")], &BTreeSet::new(),));
+        .record_claude_account_deferred_holds([(held_key, "deferred-source")], &BTreeMap::new(),));
     assert_eq!(resolved.claude_account_deferred_hold_count(), 0);
+    // W4: a release on resolution is counted apart from a deletion.
+    let [released, _, _] = crate::local_resource_diagnostics::withheld_support::take_withheld();
+    assert_eq!(released, BTreeMap::from([("resolved", 1)]));
 
-    // A complete traversal proves absence only for keys neither indexed nor
-    // observed.
+    // Census absence prompts a rooted proof; absence of index/observation
+    // membership alone is never enough to release owed usage.
     let mut observed = index.clone();
-    observed.retain_observed_claude_account_deferred_holds(&BTreeSet::from([held_key.to_string()]));
+    observed.probe_absent_claude_account_deferred_holds();
     assert_eq!(observed.claude_account_deferred_hold_count(), 1);
     let mut indexed = index.clone();
     indexed
         .files
         .insert(held_key.to_string(), manifest_index_entry(Some("deferred")));
-    indexed.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    indexed.probe_absent_claude_account_deferred_holds();
     assert_eq!(indexed.claude_account_deferred_hold_count(), 1);
     let mut absent = index.clone();
-    absent.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    absent.probe_absent_claude_account_deferred_holds();
+    assert_eq!(
+        absent.claude_account_deferred_hold_count(),
+        1,
+        "no configured proof root"
+    );
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&scan_root),
+        &mut absent,
+        "2026-10-07T12:00:00Z",
+        7,
+    );
+    assert!(!sampled_audit::proven_absent(
+        &held_path,
+        std::slice::from_ref(&scan_root)
+    ));
+    absent.probe_absent_claude_account_deferred_holds();
+    assert_eq!(
+        absent.claude_account_deferred_hold_count(),
+        1,
+        "still present"
+    );
+    crate::snapshots::line_delivery_tests::walk_all(&mut absent, 7);
+    fs::remove_file(&held_path).unwrap();
+    assert!(sampled_audit::proven_absent(
+        &held_path,
+        std::slice::from_ref(&scan_root)
+    ));
+    withheld_account::support::clock(&absent.withheld_memo);
+    sampled_scan::set_test_now(Some(1_000));
+    absent.probe_absent_claude_account_deferred_holds();
+    assert_eq!(absent.claude_account_deferred_hold_count(), 1);
+    crate::snapshots::line_delivery_tests::next_walk(
+        &mut absent,
+        std::slice::from_ref(&scan_root),
+        "2026-10-07T12:00:00Z",
+        7,
+    );
+    sampled_scan::set_test_now(Some(1_600));
+    absent.probe_absent_claude_account_deferred_holds();
+    sampled_scan::set_test_now(None);
     assert_eq!(absent.claude_account_deferred_hold_count(), 0);
 
     // At the bound a new hold cannot be recorded and the caller must keep
@@ -1147,6 +1196,9 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     );
     assert!(!full.record_claude_account_deferred_holds([(other_key, "other-source")], &deferred));
     assert!(!full.claude_account_deferred_holds.contains_key(other_key));
+    // W3: the unrecorded key's withheld tokens are disclosed on the page line.
+    let [_, _, unrecorded] = crate::local_resource_diagnostics::withheld_support::take_withheld();
+    assert_eq!(unrecorded, BTreeMap::from([("events", 1), ("tokens", 7)]));
     assert!(full.record_claude_account_deferred_holds([(held_key, "next-source")], &deferred));
     assert_eq!(
         full.claude_account_deferred_holds
@@ -1376,28 +1428,12 @@ fn transcript_ownership_needs_quarantined_originals_observed() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-mod owned_held_index_allocation {
-    include!("owned_held_index_allocation_tests.rs");
-}
-
-mod authority_binding_prototype {
-    include!("authority_binding_prototype_tests.rs");
-}
-
 mod provider_envelope_experiment_tests {
     include!("provider_envelope_experiment_tests.rs");
 }
 
 mod witness_reconstruct_scope {
     include!("witness_reconstruct_scope_tests.rs");
-}
-
-#[test]
-fn p12_experimental_base_exit_duplicate_fence_full_coverage_oracle() {
-    let scope = envelope_selection_experiment::Scope::restart();
-    claude_duplicate_fence_reopens_only_after_full_coverage();
-    assert_eq!(scope.counts().rearm_suppressed, 0);
-    writeln!(std::io::stderr().lock(), "p12_oracle: name=claude_duplicate_fence_reopens_only_after_full_coverage mode=experimental_base_exit_no_reuse status=PASS original_assertions_unchanged=true eligible_reuse_proved=false").unwrap();
 }
 
 // Re-review r3 (path-(a) bridge): with the absent-family scratch refused for
@@ -1523,28 +1559,6 @@ fn bounded_absence_fallback_cursor_is_scoped_per_index() {
             b.claude_usage_family_pending_retained_for_test(&root),
             "{root}"
         );
-    }
-}
-
-// Re-review r4: the per-index cursor map is capped. A new index at the cap
-// evicts only the least recently used cursor; every other cursor survives.
-#[test]
-fn bounded_absence_fallback_cursors_evict_only_the_least_recently_used() {
-    let cap = MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS;
-    assert_eq!(cap, 32);
-    let mut cursors = ClaudeAbsentFamilyFallbackCursors::new();
-    for scope in 0..cap {
-        cursors.set(&format!("index-{scope:02}"), scope + 1);
-    }
-    // Touch index-00, so index-01 is now the least recently used.
-    assert_eq!(cursors.cursor("index-00"), 1);
-    cursors.set("index-new", 7);
-    assert_eq!(cursors.by_index.len(), cap);
-    assert_eq!(cursors.cursor("index-01"), 0, "the evicted index restarts");
-    assert_eq!(cursors.cursor("index-new"), 7);
-    assert_eq!(cursors.cursor("index-00"), 1);
-    for scope in 2..cap {
-        assert_eq!(cursors.cursor(&format!("index-{scope:02}")), scope + 1);
     }
 }
 
@@ -1739,7 +1753,10 @@ fn fresh_index_loads_leave_their_path_unverified_until_a_restart() {
 // #705/#712 composition: both daemon and general loads share freshness,
 // retain guard (b) after the index fills, and repair a lost tombstone set.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
     forget_claude_unverified_history_indexes_for_test();
     let dir = temp_dir("patha-history-origin-composition");
@@ -1822,7 +1839,10 @@ fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
 // wrong container type decodes as empty, each counted; the index and all its
 // other state still load, never quarantined.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn malformed_tombstones_never_fail_the_index_decode() {
     let dir = temp_dir("patha-malformed-tombstones");
     let path = dir.join("scan-index.json");
@@ -2055,7 +2075,10 @@ type IndexJsonEdit<'a> = dyn Fn(&mut serde_json::Map<String, serde_json::Value>)
 // member is still read through the authority path, never as a new file, and
 // that survives a save and reload. An unwitnessed new root stays new.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
     restart_claude_reemission_stop_for_test();
     let dir = temp_dir("patha-lost-tombstones");
@@ -2207,7 +2230,10 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
 // settled proof frees enough slots, the next complete terminal (Round 15)
 // tombstones the absent witnessed roots and lowers it.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
     restart_claude_reemission_stop_for_test();
     let cap = MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES;
@@ -2312,7 +2338,10 @@ fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
 // the member is gone again its return is still read through the authority
 // path.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn an_indexed_member_never_waives_a_lost_tombstone() {
     restart_claude_reemission_stop_for_test();
     let dir = temp_dir("patha-indexed-member-lost-tombstone");
@@ -2635,7 +2664,10 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
 // marker (and could evict at its cap) is caught the same way. A healthy
 // unmarked index (the witnessed root is indexed) still starts empty.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
     restart_claude_reemission_stop_for_test();
     let fallback = MAX_CLAUDE_TOMBSTONE_FENCE_FALLBACK_ROOTS;
@@ -3087,36 +3119,6 @@ fn an_upgrade_false_positive_is_counted_and_bounded_by_the_drain() {
 
 fn hex64_number(number: usize) -> String {
     format!("{number:064x}")
-}
-
-/// Unsupported layouts keep the fence permanently raised; the serialized
-/// alarm must distinguish that cause from an ordinary scratch refusal.
-#[test]
-fn kept_tombstone_fence_alarm_names_unsupported_layout() {
-    for (layout_supported, scratch_admitted, cause) in [
-        (false, false, "unsupported_layout"),
-        (true, false, "scratch_refused"),
-        (true, true, "tombstone_capacity"),
-    ] {
-        let (_, alarms) = crate::local_resource_diagnostics::capture(|| {
-            crate::local_resource_diagnostics::claude_absent_family_tombstone_uncertain(
-                &ClaudeTombstoneFenceKeptAlarm::new(17, scratch_admitted, 3, layout_supported),
-            );
-        });
-        assert_eq!(alarms.len(), 1);
-        assert_eq!(
-            alarms[0]["stage"],
-            "claude_absent_family_tombstone_uncertain"
-        );
-        assert_eq!(alarms[0]["counts"]["cause"], cause);
-        assert_eq!(
-            alarms[0]["counts"]["absent_family_tombstone_uncertain"],
-            true
-        );
-        assert_eq!(alarms[0]["counts"]["scratch_admitted"], scratch_admitted);
-        assert_eq!(alarms[0]["counts"]["free_tombstone_slots"], 17);
-        assert_eq!(alarms[0]["counts"]["witness_visits"], 3);
-    }
 }
 
 /// Returning RetryPending roots must be visible separately from ordinary

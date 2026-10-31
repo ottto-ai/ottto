@@ -183,7 +183,7 @@ fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
-                &BTreeMap::new(),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
             );
             assert_eq!(candidate.is_some(), admitted, "{source:?} at {bytes}");
             assert_eq!(census.oversized_file_count, usize::from(!admitted));
@@ -218,7 +218,7 @@ fn three_hundred_mib_admission_is_claude_only() {
             &mut census,
             None,
             BACKFILL_WINDOW_DAYS,
-            &BTreeMap::new(),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
         );
         assert_eq!(candidate.is_some(), admitted);
         assert_eq!(census.oversized_file_count, usize::from(!admitted));

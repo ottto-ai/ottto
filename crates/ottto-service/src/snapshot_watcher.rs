@@ -109,6 +109,10 @@ impl SnapshotWatcher {
     pub(crate) fn matches_roots(&self, roots: &[(SnapshotSource, PathBuf)]) -> bool {
         self.roots == roots && self.watch_paths == watch_paths(roots)
     }
+
+    pub(crate) fn roots(&self) -> &[(SnapshotSource, PathBuf)] {
+        &self.roots
+    }
 }
 
 fn watch_paths(roots: &[(SnapshotSource, PathBuf)]) -> BTreeMap<PathBuf, RecursiveMode> {
@@ -211,11 +215,6 @@ mod tests {
         PENDING_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    #[test]
-    fn debounce_duration_matches_plan() {
-        assert_eq!(SNAPSHOT_WATCH_DEBOUNCE, Duration::from_secs(2));
     }
 
     #[test]

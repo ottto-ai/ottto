@@ -56,6 +56,7 @@ fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
         head_etag: None,
         head_challenge: None,
         unchanged_basis: None,
+        retained_proof_missing: Vec::new(),
     }
 }
 
@@ -109,6 +110,22 @@ fn cycle(
     now: u64,
     server: impl Fn(&SnapshotItem) -> SnapshotBatchResponse,
 ) -> (Result<ResumableUploadResult>, Value) {
+    cycle_with_transport(progress, item, now, |item| Ok(server(item)))
+}
+
+fn cycle_with_transport(
+    progress: &mut SnapshotUploadProgress,
+    item: &SnapshotItem,
+    now: u64,
+    server: impl Fn(&SnapshotItem) -> Result<SnapshotBatchResponse>,
+) -> (Result<ResumableUploadResult>, Value) {
+    let root = crate::test_scratch::ScratchDir::new("head-conflict-cycle");
+    let path = root.join("progress.json");
+    // Each call starts from this view, then saves at the real page boundary.
+    let mut durable = progress.clone();
+    durable.generation = 0;
+    durable.save(&path).unwrap();
+    progress.generation = durable.generation;
     let mut items = vec![item.clone()];
     items[0].cache_base_head_etag = progress
         .accepted_cache_heads
@@ -130,13 +147,29 @@ fn cycle(
         |batch| {
             let request = request(batch);
             wire = serde_json::to_value(request.wire_with_head_cas())?;
-            let mut response = server(&request.snapshots[0]);
+            let mut response = server(&request.snapshots[0])?;
             response.validate_entity_ack_with_head_cas(&request, true)?;
             response.bind_conflict_rescans(&request);
             Ok(response)
         },
-        |_| Ok(()),
+        |state| state.save(&path),
     );
+    if result.is_ok() {
+        let restored = SnapshotUploadProgress::load(
+            &path,
+            &progress.destination_namespace_hash,
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.head_conflict_challenges,
+            progress.head_conflict_challenges
+        );
+        assert_eq!(
+            restored.accepted_body_witnesses,
+            progress.accepted_body_witnesses
+        );
+    }
     progress.active_quarantine_retries.clear();
     (result, wire)
 }
@@ -240,6 +273,15 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
         clean_envelope.as_object_mut().unwrap().remove(field);
     }
     assert_eq!(answer, clean_envelope, "same identity, revision and totals");
+    let mut normalized_answer = answer_wire.clone();
+    let mut normalized_clean = clean_wire.clone();
+    normalized_answer["snapshots"][0]["semantic_envelope"] = answer;
+    normalized_clean["snapshots"][0]["semantic_envelope"] = clean_envelope;
+    assert_eq!(
+        serde_json::to_vec(&normalized_answer).unwrap(),
+        serde_json::to_vec(&normalized_clean).unwrap(),
+        "exact wire bytes outside handshake"
+    );
 
     assert_eq!(progress.accepted_cache_heads[&key], "2".repeat(64));
     assert!(progress.head_conflict_challenges.is_empty());
@@ -258,6 +300,43 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
     assert!(envelope(&next_wire)
         .get("conflict_head_challenge")
         .is_none());
+
+    let mut not_stored = progress_with_stale_head(&item);
+    let _ = cycle(&mut not_stored, &item, 1_004, |item| {
+        conflict(item, &challenge(0xc))
+    });
+    let (result, _) = cycle(&mut not_stored, &item, 1_005, |item| {
+        let mut response = accepted(item, &"3".repeat(64));
+        response.accepted = 0;
+        let mut entity = response.accepted_entities.pop().unwrap();
+        entity.unchanged_basis = Some("usage_identical".into());
+        response.unchanged_entities.push(entity);
+        response
+    });
+    assert!(result.is_ok());
+    assert!(not_stored.head_conflict_challenges.is_empty());
+    assert!(not_stored.accepted_body_witnesses.is_empty());
+    assert!(not_stored.fresh_context_body_acks.is_empty());
+    assert!(not_stored
+        .quarantined_fingerprints
+        .contains_key(&item.snapshot_fingerprint));
+
+    let root = crate::test_scratch::ScratchDir::new("head-conflict-destination");
+    let path = root.join("progress.json");
+    let mut other = progress_with_stale_head(&item);
+    let _ = cycle(&mut other, &item, 1_006, |item| {
+        conflict(item, &challenge(0xc))
+    });
+    other.generation = 0;
+    other.save(&path).unwrap();
+    let foreign = SnapshotUploadProgress::load(
+        &path,
+        &"b".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::Codex),
+    )
+    .unwrap();
+    assert!(foreign.head_conflict_challenges.is_empty());
+    assert!(foreign.accepted_body_witnesses.is_empty());
 }
 
 #[test]
@@ -327,6 +406,23 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
         challenge(0xd)
     );
 
+    assert_eq!(progress.head_conflict_challenges[&key].answer_attempts, 0);
+    assert_eq!(progress.head_conflict_challenges[&key].last_answer_unix, 0);
+    let before = progress.clone();
+    let (lost, wire) = cycle_with_transport(&mut progress, &item, 1_003, |_| {
+        Err(anyhow!("synthetic lost reply"))
+    });
+    assert!(lost.is_err());
+    assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xd));
+    assert_eq!(
+        progress.head_conflict_challenges,
+        before.head_conflict_challenges
+    );
+    assert_eq!(
+        progress.accepted_body_witnesses,
+        before.accepted_body_witnesses
+    );
+
     // The challenge answer settles and the saved head is current again.
     let (result, wire) = cycle(&mut progress, &item, 1_003, |item| {
         accepted(item, &"3".repeat(64))
@@ -338,6 +434,7 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
 }
 
 #[test]
+#[serial_test::serial(client_report)]
 fn refused_answers_are_counted_and_paced_by_the_quarantine_window() {
     let item = item();
     let key = cache_session_key(&item.source_session_id);
@@ -401,6 +498,111 @@ fn refused_answers_are_counted_and_paced_by_the_quarantine_window() {
         progress.quarantined_fingerprints[&item.snapshot_fingerprint].disposition,
         SnapshotQuarantineDisposition::RetryPending
     );
+
+    let cap = ack_retention::default_ack_capacity();
+    let held = progress.quarantined_fingerprints.clone();
+    let template = progress.head_conflict_challenges[&key].clone();
+    for n in 0..cap - 1 {
+        progress
+            .head_conflict_challenges
+            .insert(format!("{n:064x}"), template.clone());
+    }
+    assert_eq!(progress.head_conflict_challenges.len(), cap);
+    head_conflict::REFUSALS.with(|counts| counts.borrow_mut().clear());
+    let mut overflow = item.clone();
+    overflow.source_session_id = "synthetic-new-over-cap".into();
+    overflow.snapshot_fingerprint = "9".repeat(64);
+    progress
+        .accepted_cache_heads
+        .insert(cache_session_key(&overflow.source_session_id), stale_head());
+    let (result, _) = cycle(&mut progress, &overflow, 2_000, |item| {
+        conflict(item, &challenge(0xa))
+    });
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 1 }
+    );
+    assert_eq!(progress.head_conflict_challenges.len(), cap);
+    assert!(!progress
+        .head_conflict_challenges
+        .contains_key(&cache_session_key(&overflow.source_session_id)));
+    assert!(progress
+        .quarantined_fingerprints
+        .contains_key(&overflow.snapshot_fingerprint));
+    assert_eq!(
+        progress.quarantined_fingerprints[&item.snapshot_fingerprint],
+        held[&item.snapshot_fingerprint]
+    );
+    head_conflict::REFUSALS.with(|counts| assert_eq!(&*counts.borrow(), &["capacity_hold"]));
+    // Existing keys still update at the cap, including their pacing count.
+    let (result, _) = cycle(
+        &mut progress,
+        &item,
+        current_unix_seconds() + window,
+        |item| conflict(item, &challenge(0xb)),
+    );
+    assert!(result.is_ok());
+    assert_eq!(
+        progress.head_conflict_challenges[&key].challenge,
+        challenge(0xb)
+    );
+    assert_eq!(progress.head_conflict_challenges[&key].answer_attempts, 3);
+    let owed = progress.quarantined_fingerprints.clone();
+    progress.retire_head_conflict_challenges(&BTreeSet::new(), false);
+    assert_eq!(
+        progress.head_conflict_challenges.len(),
+        cap,
+        "partial census keeps held sessions"
+    );
+    progress.retire_head_conflict_challenges(
+        &BTreeSet::from([item.snapshot_fingerprint.clone()]),
+        true,
+    );
+    assert_eq!(progress.head_conflict_challenges.len(), cap);
+    progress.retire_head_conflict_challenges(&BTreeSet::from(["8".repeat(64)]), true);
+    assert!(
+        progress.head_conflict_challenges.is_empty(),
+        "complete census retires superseded/vanished metadata"
+    );
+    assert_eq!(
+        progress.quarantined_fingerprints, owed,
+        "retirement never retires debt"
+    );
+
+    for permanent in [false, true] {
+        let mut rejected = progress_with_stale_head(&item);
+        let _ = cycle(&mut rejected, &item, 1_000, |item| {
+            conflict(item, &challenge(0xc))
+        });
+        let (result, _) = cycle(&mut rejected, &item, 1_001, |item| {
+            let mut response = empty_ack();
+            response
+                .rejected_entities
+                .push(crate::snapshot_client::SnapshotEntityRejection {
+                    source_session_id: item.source_session_id.clone(),
+                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                    occurrence_count: 1,
+                    permanent,
+                    reason: if permanent {
+                        "body_exceeds_max_bytes"
+                    } else {
+                        "usage_decrease_held_for_review"
+                    }
+                    .into(),
+                    detail: String::new(),
+                });
+            response
+        });
+        assert!(result.is_ok());
+        assert_eq!(rejected.head_conflict_challenges.is_empty(), permanent);
+        assert!(rejected.accepted_body_witnesses.is_empty());
+        assert!(rejected
+            .quarantined_fingerprints
+            .contains_key(&item.snapshot_fingerprint));
+        if !permanent {
+            assert_eq!(rejected.head_conflict_challenges[&key].answer_attempts, 0);
+        }
+    }
 }
 
 #[test]
@@ -432,6 +634,7 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
     progress.head_conflict_challenges.insert(
         key.clone(),
         HeadConflictChallenge {
+            snapshot_fingerprint: Some(item.snapshot_fingerprint.clone()),
             challenge: challenge(0xc),
             stale_revision_v2_hash: revision_v2(&item),
             answer_attempts: 0,
@@ -447,6 +650,21 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
         0
     );
     assert!(withheld[0].cache_conflict_answer.is_none());
+    let mut no_base = vec![item.clone()];
+    no_base[0].cache_base_head_etag = None;
+    assert_eq!(
+        attach_head_conflict_answers(&mut no_base, &progress, 1_000),
+        0
+    );
+    assert!(no_base[0].cache_conflict_answer.is_none());
+    let saved = progress.head_conflict_challenges.clone();
+    let (foreign, _) = cycle(&mut progress, &item, 1_000, |item| {
+        let mut response = conflict(item, &challenge(0xe));
+        response.conflict_entities[0].source_session_id = "synthetic-foreign".into();
+        response
+    });
+    assert!(foreign.is_err());
+    assert_eq!(progress.head_conflict_challenges, saved);
     progress.head_conflict_challenges.clear();
 
     // A conflict without a challenge or a bound request body records nothing.
@@ -470,4 +688,93 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
     )
     .unwrap();
     assert!(progress.head_conflict_challenges.is_empty());
+}
+
+#[test]
+fn released_0205_rewrite_preserves_money_ledgers_and_drops_only_recovery_metadata() {
+    let item = item();
+    let key = cache_session_key(&item.source_session_id);
+    let mut progress = progress_with_stale_head(&item);
+    let _ = cycle(&mut progress, &item, 1_000, |item| {
+        conflict(item, &challenge(0xc))
+    });
+    progress.record_body(&"b".repeat(64), &"c".repeat(64));
+    progress.quarantine_permanent_body(&"d".repeat(64), &"e".repeat(64), "body_exceeds_max_bytes");
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    let identity = serde_json::json!({"source_session_id":"synthetic-compat",
+        "provenance":{"collector":crate::snapshots::claude_request_identity::COLLECTOR},
+        "request_evidence":[{"identity_basis":"telemetry_login"}],
+        "usage_buckets":[{"bucket_start":"2026-09-01T10:00:00Z","model_usage":[{
+            "model":"claude-synthetic","evidence_ref":0,"account_identifier_hash":"a".repeat(64),
+            "input_tokens":10,"cost_usd":"1.00"}]}]});
+    progress.accepted_identity_buckets.record(&identity);
+    progress
+        .accepted_identity_buckets
+        .record_proved(&identity, true, &[]);
+    assert!(!progress.accepted_identity_buckets.is_empty());
+    let bytes = serde_json::to_vec(&progress).unwrap();
+    let old: head_conflict_released_progress_fixture::SnapshotUploadProgress =
+        serde_json::from_slice(&bytes).unwrap();
+    let rewritten = serde_json::to_vec(&old).unwrap();
+    let rewritten_value: Value = serde_json::from_slice(&rewritten).unwrap();
+    assert!(rewritten_value.get("head_conflict_challenges").is_none());
+    let mut known: Value = serde_json::from_slice(&bytes).unwrap();
+    known
+        .as_object_mut()
+        .unwrap()
+        .remove("head_conflict_challenges");
+    assert_eq!(
+        rewritten_value, known,
+        "released codec preserves every known durable field"
+    );
+    let mut upgraded: SnapshotUploadProgress = serde_json::from_slice(&rewritten).unwrap();
+    upgraded
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    assert!(
+        upgraded.head_conflict_challenges.is_empty(),
+        "pacing continuity is deliberately lost"
+    );
+    assert_eq!(
+        upgraded.accepted_identity_buckets,
+        progress.accepted_identity_buckets
+    );
+    assert_eq!(
+        upgraded.accepted_body_witnesses,
+        progress.accepted_body_witnesses
+    );
+    assert_eq!(upgraded.permanent_rejections, progress.permanent_rejections);
+    assert_eq!(
+        upgraded.quarantined_fingerprints,
+        progress.quarantined_fingerprints
+    );
+    assert_eq!(upgraded.accepted_cache_heads, progress.accepted_cache_heads);
+    let _ = cycle(&mut upgraded, &item, 1_001, |item| {
+        conflict(item, &challenge(0xd))
+    });
+    assert_eq!(upgraded.head_conflict_challenges[&key].answer_attempts, 0);
+    assert_eq!(
+        upgraded.head_conflict_challenges[&key].challenge,
+        challenge(0xd)
+    );
+
+    // Bad optional records cannot erase even opaque accepted proof/tombstones.
+    let mut malformed: Value = serde_json::from_slice(&bytes).unwrap();
+    malformed["head_conflict_challenges"][&key]["snapshot_fingerprint"] = Value::Bool(false);
+    let roundtrip: SnapshotUploadProgress = serde_json::from_value(malformed).unwrap();
+    assert!(roundtrip.head_conflict_challenges.is_empty());
+    assert_eq!(
+        serde_json::to_value(&roundtrip.accepted_identity_buckets).unwrap(),
+        serde_json::to_value(&progress.accepted_identity_buckets).unwrap()
+    );
+    assert_eq!(
+        roundtrip.accepted_body_witnesses,
+        progress.accepted_body_witnesses
+    );
+    assert_eq!(
+        roundtrip.permanent_rejections,
+        progress.permanent_rejections
+    );
 }

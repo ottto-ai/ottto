@@ -639,10 +639,15 @@ fn quarantine_invalid_scan_index(
     // structural damage must not permanently block collection, but never
     // overwrite the unreadable witness in place.
     let quarantine_path = unique_checkpoint_sibling(path, "corrupt");
+    let persistence_recovery =
+        scan_index_integration::prepare_legacy_recovery(path, &quarantine_path)?;
     fs::rename(path, &quarantine_path).context("quarantine invalid local snapshot scan index")?;
     sync_checkpoint_parent(path)?;
     note_scan_index_quarantine_rebuild(cause, discarded_file_entries, source);
-    Ok(ScanIndex::default())
+    Ok(ScanIndex {
+        persistence_legacy_recovery: persistence_recovery,
+        ..ScanIndex::default()
+    })
 }
 
 fn note_scan_index_quarantine_rebuild(
@@ -971,8 +976,29 @@ impl ScanIndex {
         let durable_head = sampled_scan::durable_tail::rederive_head_bytes_total(source);
         #[cfg(not(unix))]
         let durable_head = 0_u64;
+        if !claude_terminal_off() {
+            emit_scan_index_containment_line(format!(
+                "local snapshot census: source={} census_complete={} retained_carried_entries={retained_carried} history_held_carried_entries={history_held_carried} durable_rederive_head_bytes={durable_head} carried_ack_pending_age_seconds={age}",
+                source.api_slug(), census_complete
+            ));
+            return;
+        }
+        let (retention, retention_alarms) = if source == SnapshotSource::ClaudeCode {
+            let debt = self.terminal_off_retention(now);
+            let alarms = if claude_terminal_off() {
+                self.terminal_retention_alarms(&debt)
+            } else {
+                serde_json::Value::Null
+            };
+            (
+                serde_json::to_string(&debt).expect("fixed retention gauges"),
+                alarms,
+            )
+        } else {
+            ("null".into(), serde_json::Value::Null)
+        };
         emit_scan_index_containment_line(format!(
-            "local snapshot census: source={} census_complete={} retained_carried_entries={retained_carried} history_held_carried_entries={history_held_carried} durable_rederive_head_bytes={durable_head} carried_ack_pending_age_seconds={age}",
+            "local snapshot census: source={} census_complete={} retained_carried_entries={retained_carried} history_held_carried_entries={history_held_carried} durable_rederive_head_bytes={durable_head} terminal_off_retention={retention} terminal_off_retention_alarms={retention_alarms} carried_ack_pending_age_seconds={age}",
             source.api_slug(), census_complete
         ));
     }

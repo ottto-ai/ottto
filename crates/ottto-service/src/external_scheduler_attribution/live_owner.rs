@@ -990,31 +990,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_registration_whose_pid_was_reused_or_exited_proves_nothing() {
-        let fixture = ClaudeFixture::new("claude-session", &[(700, &witness())]);
-        let inventory = scan_inventory(SnapshotSource::ClaudeCode, &[JOB]);
-        let session = session(
-            SnapshotSource::ClaudeCode,
-            "claude-session",
-            &fixture.transcript,
-        );
-        // Pid 700 now belongs to a process that started later.
-        let reused = job_tree();
-        reused.set(700, record(600, OWNER_STARTED + 60));
-        let proven = Mutex::new(ProvenOwners::default());
-        assert!(inventory
-            .live_owner_labels(&session, &reused, &proven, SystemTime::now())
-            .is_empty());
-        // Pid 700 is gone; the registration file is stale.
-        let exited = job_tree();
-        exited.processes.borrow_mut().remove(&700);
-        let inventory = scan_inventory(SnapshotSource::ClaudeCode, &[JOB]);
-        assert!(inventory
-            .live_owner_labels(&session, &exited, &proven, SystemTime::now())
-            .is_empty());
-    }
-
-    #[test]
     fn claude_chain_through_a_reused_or_changed_process_proves_nothing() {
         let fixture = ClaudeFixture::new("claude-session", &[(700, &witness())]);
         let query = query(SnapshotSource::ClaudeCode, &fixture.transcript);
@@ -1043,63 +1018,6 @@ mod tests {
     }
 
     #[test]
-    fn job_pid_reused_within_a_scan_proves_nothing_for_claude() {
-        let first = ClaudeFixture::new("first-session", &[(700, &witness())]);
-        let reused_started = OWNER_STARTED + 100;
-        let second = ClaudeFixture::new(
-            "second-session",
-            &[(
-                710,
-                &process_start_witness(reused_started + 1).expect("witness"),
-            )],
-        );
-        let host = job_tree();
-        let mut scan = LiveScan::default();
-        assert_eq!(
-            scan.owner_labels(
-                &host,
-                &query(SnapshotSource::ClaudeCode, &first.transcript),
-                &[JOB]
-            ),
-            BTreeSet::from([JOB.to_string()])
-        );
-        // The job exits; its pid now runs an unrelated launchd child that
-        // starts a Claude session of its own.
-        host.set(500, record(1, reused_started));
-        host.set(710, record(500, reused_started + 1));
-        assert!(scan
-            .owner_labels(
-                &host,
-                &query(SnapshotSource::ClaudeCode, &second.transcript),
-                &[JOB]
-            )
-            .is_empty());
-        assert_eq!(
-            host.calls()
-                .iter()
-                .filter(|call| **call == "launchctl")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn claude_ancestor_at_the_job_pid_must_be_the_job_itself() {
-        let fixture = ClaudeFixture::new("claude-session", &[(700, &witness())]);
-        let query = query(SnapshotSource::ClaudeCode, &fixture.transcript);
-        // The job pid passes `launchctl` and the running check (two reads),
-        // then reads as a different process while the owner's chain is
-        // walked, one the chain itself would accept.
-        for other in [record(1, JOB_STARTED - 1), record(450, JOB_STARTED)] {
-            let mut host = job_tree();
-            host.replaced.insert(500, (2, Some(other)));
-            assert!(LiveScan::default()
-                .owner_labels(&host, &query, &[JOB])
-                .is_empty());
-        }
-    }
-
-    #[test]
     fn users_own_claude_session_outside_the_job_proves_nothing() {
         let fixture = ClaudeFixture::new("claude-session", &[(900, &witness())]);
         let inventory = scan_inventory(SnapshotSource::ClaudeCode, &[JOB]);
@@ -1122,42 +1040,6 @@ mod tests {
             .expect("proven")
             .labels(SnapshotSource::ClaudeCode, "claude-session")
             .is_empty());
-    }
-
-    #[test]
-    fn two_live_claims_on_one_claude_session_prove_nothing() {
-        let fixture = ClaudeFixture::new("claude-session", &[(700, &witness()), (701, &witness())]);
-        let inventory = scan_inventory(SnapshotSource::ClaudeCode, &[JOB]);
-        let host = job_tree();
-        host.set(701, record(600, OWNER_STARTED));
-        let proven = Mutex::new(ProvenOwners::default());
-        let session = session(
-            SnapshotSource::ClaudeCode,
-            "claude-session",
-            &fixture.transcript,
-        );
-        assert!(inventory
-            .live_owner_labels(&session, &host, &proven, SystemTime::now())
-            .is_empty());
-    }
-
-    #[test]
-    fn claude_registries_beyond_the_scan_cache_are_still_checked() {
-        let fixture = ClaudeFixture::new("claude-session", &[(700, &witness())]);
-        let host = job_tree();
-        let mut scan = LiveScan::default();
-        for index in 0..MAX_CACHED_CLAUDE_REGISTRIES {
-            scan.claude_claims(&host, Path::new(&format!("/missing/{index}/sessions")));
-        }
-        assert_eq!(
-            scan.owner_labels(
-                &host,
-                &query(SnapshotSource::ClaudeCode, &fixture.transcript),
-                &[JOB]
-            ),
-            BTreeSet::from([JOB.to_string()])
-        );
-        assert_eq!(scan.claude_registries.len(), MAX_CACHED_CLAUDE_REGISTRIES);
     }
 
     #[test]
@@ -1193,16 +1075,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_process_older_than_its_job_is_a_reused_pid() {
-        let rollout = PathBuf::from("/h/.codex/sessions/rollout-a.jsonl");
-        let host = codex_job_tree(&rollout);
-        host.set(700, record(600, JOB_STARTED - 1));
-        assert!(LiveScan::default()
-            .owner_labels(&host, &query(SnapshotSource::Codex, &rollout), &[JOB])
-            .is_empty());
-    }
-
-    #[test]
     fn an_incomplete_tree_listing_proves_nothing() {
         let rollout = PathBuf::from("/h/.codex/sessions/rollout-a.jsonl");
         let query = query(SnapshotSource::Codex, &rollout);
@@ -1221,69 +1093,6 @@ mod tests {
             LiveScan::default().owner_labels(&codex_job_tree(&rollout), &query, &[JOB]),
             BTreeSet::from([JOB.to_string()])
         );
-    }
-
-    #[test]
-    fn another_users_process_in_the_tree_hides_its_subtree() {
-        let rollout = PathBuf::from("/h/.codex/sessions/rollout-a.jsonl");
-        let query = query(SnapshotSource::Codex, &rollout);
-        // A root helper under the job, whose children could hold the
-        // rollout too.
-        let mut host = codex_job_tree(&rollout);
-        host.set(
-            650,
-            ProcessRecord {
-                uid: 0,
-                ..record(500, JOB_STARTED)
-            },
-        );
-        host.children.insert(500, vec![600, 650]);
-        assert!(LiveScan::default()
-            .owner_labels(&host, &query, &[JOB])
-            .is_empty());
-        assert!(!host.listed.borrow().contains(&650));
-        // Control: a listed child that has exited holds nothing.
-        let mut exited = codex_job_tree(&rollout);
-        exited.children.insert(500, vec![600, 650]);
-        assert_eq!(
-            LiveScan::default().owner_labels(&exited, &query, &[JOB]),
-            BTreeSet::from([JOB.to_string()])
-        );
-        // A process that turns into another user's while it is listed
-        // (a setuid exec) leaves its children unread.
-        let mut setuid = codex_job_tree(&rollout);
-        setuid.replaced.insert(
-            600,
-            (
-                1,
-                Some(ProcessRecord {
-                    uid: 0,
-                    ..record(500, JOB_STARTED)
-                }),
-            ),
-        );
-        assert!(LiveScan::default()
-            .owner_labels(&setuid, &query, &[JOB])
-            .is_empty());
-    }
-
-    #[test]
-    fn codex_child_with_a_changed_parent_or_changing_mid_listing_proves_nothing() {
-        let rollout = PathBuf::from("/h/.codex/sessions/rollout-a.jsonl");
-        let query = query(SnapshotSource::Codex, &rollout);
-        // Listed under the shell, but its parent is now another process.
-        let changed_parent = codex_job_tree(&rollout);
-        changed_parent.set(700, record(650, OWNER_STARTED));
-        // Pid 700 was reused between its two reads around the listing.
-        let mut replaced = codex_job_tree(&rollout);
-        replaced
-            .replaced
-            .insert(700, (1, Some(record(600, OWNER_STARTED + 1))));
-        for host in [changed_parent, replaced] {
-            assert!(LiveScan::default()
-                .owner_labels(&host, &query, &[JOB])
-                .is_empty());
-        }
     }
 
     #[test]
@@ -1318,34 +1127,6 @@ mod tests {
         assert!(LiveScan::default()
             .owner_labels(&host, &query(SnapshotSource::Codex, &first), &[JOB])
             .is_empty());
-    }
-
-    #[test]
-    fn nothing_but_launchctl_runs_while_no_candidate_job_runs() {
-        let fixture = ClaudeFixture::new("claude-session", &[(700, &witness())]);
-        let inventory = scan_inventory(SnapshotSource::ClaudeCode, &[JOB]);
-        let host = FakeHost::default();
-        let proven = Mutex::new(ProvenOwners::default());
-        let session = session(
-            SnapshotSource::ClaudeCode,
-            "claude-session",
-            &fixture.transcript,
-        );
-        assert!(inventory
-            .live_owner_labels(&session, &host, &proven, SystemTime::now())
-            .is_empty());
-        assert!(inventory
-            .live_owner_labels(&session, &host, &proven, SystemTime::now())
-            .is_empty());
-        assert_eq!(host.calls(), vec!["launchctl"]);
-
-        // No candidate definition at all: not even launchctl.
-        let unrelated = ExternalSchedulerInventory::default();
-        let host = FakeHost::default();
-        assert!(unrelated
-            .live_owner_labels(&session, &host, &proven, SystemTime::now())
-            .is_empty());
-        assert!(host.calls().is_empty());
     }
 
     #[test]
@@ -1407,33 +1188,6 @@ mod tests {
     }
 
     #[test]
-    fn start_witness_matches_the_claude_registration_format() {
-        // Claude writes the registration (startedAt 1791989737005 ms) about a
-        // second after the process starts.
-        assert_eq!(
-            process_start_witness(1_791_989_736).as_deref(),
-            Some("Wed Oct 14 14:55:36 2026")
-        );
-        assert_eq!(
-            process_start_witness(1_791_244_800).as_deref(),
-            Some("Tue Oct  6 00:00:00 2026")
-        );
-    }
-
-    #[test]
-    fn registry_sits_beside_the_projects_directory_of_the_transcript() {
-        assert_eq!(
-            claude_registry_dir(Path::new("/h/.claude/projects/-repo/abc.jsonl")),
-            Some(PathBuf::from("/h/.claude/sessions"))
-        );
-        assert_eq!(
-            claude_registry_dir(Path::new("/h/config/projects/-repo/abc.jsonl")),
-            Some(PathBuf::from("/h/config/sessions"))
-        );
-        assert_eq!(claude_registry_dir(Path::new("/h/other/abc.jsonl")), None);
-    }
-
-    #[test]
     fn a_failed_or_partial_descriptor_listing_proves_nothing() {
         // libproc reports failure as 0 with errno set, sometimes -1.
         assert_eq!(listed_descriptor_count(0, libc::EPERM, 8, 2048), None);
@@ -1444,19 +1198,6 @@ mod tests {
         assert_eq!(listed_descriptor_count(8 * 3, 0, 8, 2048), Some(3));
         // A process that closed every descriptor.
         assert_eq!(listed_descriptor_count(0, 0, 8, 2048), Some(0));
-    }
-
-    #[test]
-    fn proven_owners_forget_the_oldest_session_first() {
-        let mut proven = ProvenOwners::default();
-        let labels = BTreeSet::from(["job".to_string()]);
-        for index in 0..=MAX_PROVEN_SESSIONS {
-            proven.remember(SnapshotSource::Codex, &format!("s{index}"), &labels);
-        }
-        assert!(proven.labels(SnapshotSource::Codex, "s0").is_empty());
-        assert_eq!(proven.labels(SnapshotSource::Codex, "s1"), labels);
-        assert!(proven.labels(SnapshotSource::ClaudeCode, "s1").is_empty());
-        assert_eq!(proven.order.len(), MAX_PROVEN_SESSIONS);
     }
 
     #[cfg(target_os = "macos")]

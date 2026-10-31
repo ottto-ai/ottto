@@ -280,16 +280,57 @@ impl Checkpoint {
     pub(crate) fn audit_debt(&self) -> Option<AuditDebt> {
         self.audit_debt
     }
+    /// The interpretation scope this checkpoint was made under.
+    pub(crate) fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    /// Cheap quiet-file validation, never historical Full verification. The
+    /// host must require complete c provenance and a loss-free Unchanged read.
+    pub(crate) fn quiet_audit_matches(
+        &self,
+        file: &mut File,
+        scope: &Scope,
+        bytes_read: &mut usize,
+    ) -> io::Result<bool> {
+        if self.audit_debt.is_none()
+            || scope != &self.scope
+            || self.samples.sealed_offset != self.stamp.length
+            || !self.samples.valid_for(self.stamp.length)
+            || !self.stamp_matches(file)?
+        {
+            return Ok(false);
+        }
+        let head = sample_at(file, 0, &self.samples.head, bytes_read)?;
+        let boundary = sample_at(
+            file,
+            self.samples.sealed_offset - self.samples.boundary.len() as u64,
+            &self.samples.boundary,
+            bytes_read,
+        )?;
+        #[cfg(test)]
+        between_guards();
+        let eof = file.seek(SeekFrom::End(0))?;
+        Ok(head && boundary && eof == self.stamp.length && self.stamp_matches(file)?)
+    }
+
+    /// Only after quiet validation AND native completion; grants no Full credit.
+    pub(crate) fn retire_quiet_audit(&mut self) {
+        self.audit_debt = None;
+    }
     #[cfg(test)]
     pub(crate) fn last_full_verified(&self) -> u64 {
         self.last_full_verified_unix_seconds
     }
 
+    // Admission and completion use the same ordinary-certificate policy.
+    const EXACT_STAMP: bool = false;
+
     /// The parts of this certificate `select_mode` reads.
     fn view(&self) -> CertificateView<'_> {
         CertificateView {
             stamp: &self.stamp,
-            exact_stamp: false,
+            exact_stamp: Self::EXACT_STAMP,
             scope: &self.scope.0,
             sealed_offset: self.samples.sealed_offset,
             samples_valid: self.samples.valid_for(self.stamp.length),
@@ -534,9 +575,8 @@ pub(crate) enum PrefixRefusal {
     Invalidated(FullReason),
     /// The interpretation scope or another dependency changed: invalidates.
     Dependency,
-    /// A tail reached its audit deadline before commit. Like
-    /// `commit_after_native_completion`, a tail never certifies past it;
-    /// the next read is the full audit. Not an invalidation.
+    /// Audit expiry outside ordinary checkpoint reuse. The exact-stamp
+    /// proof horizon remains separate from acquisition completion.
     AuditDue,
     /// Every object check holds but the native read was lossy. The result
     /// publishes uncertified, exactly like a lossy full read.
@@ -624,7 +664,20 @@ fn read_sample(file: &mut File, offset: u64, len: usize, count: &mut usize) -> i
     let mut bytes = vec![0; len];
     let mut read = 0;
     while read < bytes.len() {
-        let n = file.read(&mut bytes[read..])?;
+        #[cfg(test)]
+        let read_offset = file.stream_position().map_err(|error| error.kind());
+        let result = file.read(&mut bytes[read..]);
+        #[cfg(test)]
+        SAMPLE_READS.with(|reads| {
+            if let Some(reads) = reads.borrow_mut().as_mut() {
+                reads.push(SampleRead {
+                    offset: read_offset,
+                    requested: bytes.len() - read,
+                    result: result.as_ref().copied().map_err(io::Error::kind),
+                });
+            }
+        });
+        let n = result?;
         *count += n;
         if n == 0 {
             return Err(io::Error::new(
@@ -688,6 +741,10 @@ enum SampleAt {
     Boundary,
 }
 
+fn audit_due(exact_stamp: bool, debt: Option<AuditDebt>, now: u64) -> bool {
+    exact_stamp && debt.is_some_and(|debt| now >= debt.due_unix_seconds)
+}
+
 /// `prepare`'s mode decision. `sample_eq` compares one sample window of the
 /// held FD with the certificate's; it is called only when the decision needs
 /// that window, in the order head then boundary.
@@ -699,14 +756,22 @@ fn select_mode(
     now: u64,
     mut sample_eq: impl FnMut(SampleAt) -> io::Result<bool>,
 ) -> io::Result<ReadMode> {
-    let clock_changed = old.as_ref().is_some_and(|old| now < old.verified)
-        || debt.is_some_and(|d| {
-            now.checked_add(AUDIT_INTERVAL_SECONDS)
-                .is_some_and(|latest| d.due_unix_seconds > latest)
-        });
+    // Only PrefixSeal uses the exact-stamp view. Its proof horizon stays
+    // intact until S1; acquisition checkpoints reuse by content checks,
+    // regardless of the audit clock or a carried deadline. A missing
+    // checkpoint is StateMissing; debt never supplies Full authority.
+    let proof_horizon = old.as_ref().is_some_and(|old| old.exact_stamp);
+    let clock_changed = old
+        .as_ref()
+        .is_some_and(|old| old.exact_stamp && now < old.verified)
+        || (proof_horizon
+            && debt.is_some_and(|d| {
+                now.checked_add(AUDIT_INTERVAL_SECONDS)
+                    .is_some_and(|latest| d.due_unix_seconds > latest)
+            }));
     Ok(if clock_changed {
         ReadMode::Full(FullReason::ClockChanged)
-    } else if debt.is_some_and(|d| now >= d.due_unix_seconds) {
+    } else if audit_due(proof_horizon, debt, now) {
         ReadMode::Full(FullReason::AuditDue)
     } else if let Some(old) = old {
         if !old.samples_valid {
@@ -727,7 +792,7 @@ fn select_mode(
             ReadMode::Full(FullReason::HeadChanged)
         } else if !sample_eq(SampleAt::Boundary)? {
             ReadMode::Full(FullReason::BoundaryChanged)
-        } else {
+        } else if old.exact_stamp {
             let due = old
                 .verified
                 .checked_add(AUDIT_INTERVAL_SECONDS)
@@ -739,6 +804,8 @@ fn select_mode(
             } else {
                 ReadMode::Tail
             }
+        } else {
+            ReadMode::Tail
         }
     } else {
         ReadMode::Full(FullReason::StateMissing)
@@ -806,11 +873,9 @@ impl ReadPlan {
             let verified = checkpoint
                 .expect("tail requires checkpoint")
                 .last_full_verified_unix_seconds;
-            let due = verified
-                .checked_add(AUDIT_INTERVAL_SECONDS)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "audit deadline overflow")
-                })?;
+            // Legacy provenance is still carried; overflow or age is never
+            // permission to block an otherwise valid acquisition Tail.
+            let due = verified.saturating_add(AUDIT_INTERVAL_SECONDS);
             earlier_debt(
                 debt,
                 Some(AuditDebt {
@@ -970,12 +1035,8 @@ impl ReadPlan {
             ReadMode::Unchanged => (self.last_full_verified_unix_seconds, self.debt),
             ReadMode::Tail => (self.last_full_verified_unix_seconds, self.debt),
         };
-        if audit_debt.is_some_and(|debt| now >= debt.due_unix_seconds) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "full audit became due during sampled acquisition",
-            ));
-        }
+        // Carry debt without promoting this completion to Full-audit
+        // credit. Its age cannot discard a valid Tail/Unchanged checkpoint.
         Ok(Checkpoint {
             stamp: self.stamp,
             scope: self.scope,
@@ -1091,10 +1152,11 @@ impl ReadPlan {
         if current_scope != &self.scope {
             return Err(PrefixRefusal::Dependency);
         }
-        if let (ReadMode::Tail, Some(debt)) = (self.mode, self.debt) {
-            if now >= debt.due_unix_seconds {
-                return Err(PrefixRefusal::AuditDue);
-            }
+        // ReadPlan::prepare accepts Checkpoint::view, never PrefixSeal's
+        // exact-stamp view. Use the selector's identical horizon predicate;
+        // overdue ordinary Tail still carries its prior verification/debt.
+        if self.mode == ReadMode::Tail && audit_due(Checkpoint::EXACT_STAMP, self.debt, now) {
+            return Err(PrefixRefusal::AuditDue);
         }
         if lossy {
             return Err(PrefixRefusal::Lossy);
@@ -1462,11 +1524,6 @@ pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
 impl Checkpoint {
     /// This checkpoint as a content-free durable certificate. `None` when its
     /// samples are not valid for its stamp (such a checkpoint never admits).
-    /// The interpretation scope this checkpoint was made under.
-    pub(crate) fn scope(&self) -> &Scope {
-        &self.scope
-    }
-
     pub(crate) fn durable_certificate(&self, birth_nanos: u64) -> Option<DurableCertificate> {
         if !self.samples.valid_for(self.stamp.length)
             || self.samples.head.len() != self.samples.boundary.len()
@@ -1666,6 +1723,43 @@ pub(crate) fn samples_match_calls() -> u64 {
     SAMPLES_MATCH_CALLS.with(|calls| calls.replace(0))
 }
 
+/// Test-only observations at the actual File::read call in read_sample.
+/// They include short/failed reads, not inferred completed-plan metrics.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SampleRead {
+    pub(crate) offset: Result<u64, io::ErrorKind>,
+    pub(crate) requested: usize,
+    pub(crate) result: Result<usize, io::ErrorKind>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAMPLE_READS: std::cell::RefCell<Option<Vec<SampleRead>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn capture_sample_reads<T>(read: impl FnOnce() -> T) -> (T, Vec<SampleRead>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SAMPLE_READS.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    SAMPLE_READS.with(|slot| {
+        assert!(slot.borrow().is_none(), "sample capture cannot nest");
+        *slot.borrow_mut() = Some(Vec::new());
+    });
+    let _reset = Reset;
+    let value = read();
+    let reads = SAMPLE_READS.with(|slot| slot.borrow_mut().take().unwrap());
+    (value, reads)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1760,33 +1854,6 @@ mod tests {
     }
 
     #[test]
-    fn both_record_shapes_use_identical_tail_and_audit_decisions() {
-        // Shapes only: provider-native semantic/ownership parity is an integration gate.
-        for row in [
-            b"{\"type\":\"assistant\",\"message\":{\"usage\":{\"output_tokens\":1}}}\n".as_slice(),
-            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}\n".as_slice(),
-        ] {
-            let f = Fixture::new(row);
-            let mut cp = initial(&f, 100);
-            let mut offset = row.len() as u64;
-            for i in 1..=120 {
-                f.append(row);
-                let (mode, next, bytes) = run(&f, Some(&cp), cp.audit_debt(), 100 + i);
-                assert_eq!(mode, ReadMode::Tail);
-                assert_eq!(next.sealed_offset(), offset + row.len() as u64);
-                assert_eq!(next.audit_debt().unwrap().due_unix_seconds, 3700);
-                assert!(bytes <= 2 * SAMPLE_BYTES);
-                cp = next;
-                offset += row.len() as u64;
-            }
-            assert_eq!(
-                run(&f, Some(&cp), cp.audit_debt(), 3700).0,
-                ReadMode::Full(FullReason::AuditDue)
-            );
-        }
-    }
-
-    #[test]
     fn idle_debt_survives_loss_of_ram_and_cannot_postpone_deadline() {
         let f = Fixture::new(b"one\n");
         let cp = initial(&f, 10);
@@ -1797,14 +1864,14 @@ mod tests {
         assert_eq!(idle.audit_debt(), persisted_debt);
         assert_eq!(
             run(&f, None, persisted_debt, 3610).0,
-            ReadMode::Full(FullReason::AuditDue)
+            ReadMode::Full(FullReason::StateMissing)
         );
         let (_, verified, _) = run(&f, None, persisted_debt, 3610);
         assert_eq!(verified.audit_debt(), None);
     }
 
     #[test]
-    fn hidden_middle_edit_can_miss_sampling_then_idle_audit_fully_reads_it() {
+    fn hidden_middle_edit_is_not_permission_for_an_hourly_reread() {
         let mut old = vec![b'a'; 3 * SAMPLE_BYTES];
         old[SAMPLE_BYTES + 10] = b'1';
         old.push(b'\n');
@@ -1817,85 +1884,247 @@ mod tests {
         let (mode, cp, read) = run(&f, Some(&cp), None, 200);
         assert_eq!(mode, ReadMode::Tail);
         assert_eq!(read, 2 * SAMPLE_BYTES);
-        // This is an explicitly accepted interim miss, never a prefix-integrity proof.
-        let mut file = f.open();
-        let mut p =
-            ReadPlan::prepare(&mut file, Some(&cp), &scope(), cp.audit_debt(), 3700).unwrap();
-        assert_eq!(p.mode(), ReadMode::Full(FullReason::AuditDue));
-        assert_eq!(p.start_offset(), 0);
-        let mut all = Vec::new();
-        file.read_to_end(&mut all).unwrap();
-        assert_eq!(all, changed);
-        p.observe_complete_records(&all).unwrap();
-        assert_eq!(
-            p.commit_after_native_completion(&file, &scope(), 3700)
-                .unwrap()
-                .audit_debt(),
-            None
-        );
+        // Ron's accepted residual: unchanged head/boundary samples can miss
+        // an interior edit in a growth-shaped file, without a later audit.
+        let debt = cp.audit_debt();
+        let (mode, next, read) = run(&f, Some(&cp), debt, 3700);
+        assert_eq!(mode, ReadMode::Unchanged);
+        assert_eq!(read, 0);
+        assert_eq!(next.audit_debt(), debt);
+        assert_eq!(next.last_full_verified(), 100);
     }
 
+    /// The production persisted certificate is restored after the checkpoint
+    /// is dropped; actual FD reads below prove only the appended suffix runs.
     #[test]
-    fn head_and_old_boundary_edits_growing_file_reset_to_full() {
-        for offset in [1, SAMPLE_BYTES + 100] {
-            let mut bytes = vec![b'a'; 2 * SAMPLE_BYTES];
-            bytes.push(b'\n');
-            let f = Fixture::new(&bytes);
-            let cp = initial(&f, 0);
-            bytes[offset] = b'b';
-            bytes.extend_from_slice(b"new\n");
-            f.replace_bytes(&bytes);
-            let mode = run(&f, Some(&cp), None, 1).0;
+    fn durable_checkpoint_ignores_audit_age_and_clock_without_full_credit() {
+        use crate::durable_tail_store as store;
+        struct StoreDir(PathBuf);
+        impl Drop for StoreDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        for (now, due, append) in [
+            (8_000, None, true),
+            (8_000, Some(1_100), true),
+            (8_000, Some(1_100), false),
+            (181_000, Some(1_100), true),
+            (900, Some(u64::MAX), true),
+        ] {
+            let f = Fixture::new(b"one\n");
+            let mut cp = initial(&f, 1_000);
+            cp.audit_debt = due.map(|due_unix_seconds| AuditDebt { due_unix_seconds });
+            // Main persists this certificate in the binary store envelope;
+            // Serde derives exist only on the excluded bootstrap branch.
+            let state = StoreDir(f.0.with_extension("certificate-state"));
+            fs::create_dir_all(&state.0).unwrap();
+            let lock = crate::locked_state_dir::LockedStateDir::acquire(&state.0).unwrap();
+            crate::snapshots::ScanIndex::default()
+                .save(&state.0.join("index.json"))
+                .unwrap();
+            let source = store::DurableSource::Codex;
+            let key = store::key_digest(source, "certificate-roundtrip");
+            // The store preserves unknown shapes, so use the shipped v1
+            // Codex allowlist and its existing real-codec fixture body.
+            let pin = "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1";
+            let allowlist =
+                std::array::from_fn(|i| u8::from_str_radix(&pin[2 * i..2 * i + 2], 16).unwrap());
+            let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
+            let saved = store::PendingRecord {
+                binding: store::Binding {
+                    source,
+                    key,
+                    context: store::context_digest("certificate-fixture", None),
+                    scope: store::scope_digest(&scope().0, &allowlist, "", ""),
+                    entry: store::entry_digest("certificate-fixture", None),
+                },
+                certificate: cp.durable_certificate(0).unwrap(),
+                body: crate::snapshots::durable_store_fixture_body(
+                    crate::snapshots::SnapshotSource::Codex,
+                    1,
+                    7,
+                ),
+                allowlist,
+            };
             assert_eq!(
-                mode,
-                ReadMode::Full(if offset < SAMPLE_BYTES {
-                    FullReason::HeadChanged
+                disk.write_after_save(&lock, 1, vec![saved])
+                    .unwrap()
+                    .written,
+                1
+            );
+            drop(disk);
+            drop(cp);
+            if append {
+                f.append(b"two\n");
+            }
+            let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
+            let certificate = match disk.read(&key) {
+                store::ReadOutcome::Found(record) => record.record.certificate,
+                other => panic!("{other:?}"),
+            };
+            let mut file = f.open();
+            let (result, reads) = capture_sample_reads(|| certificate.restore(&mut file, scope()));
+            let (restored, admission) = result.unwrap();
+            assert_eq!(
+                reads,
+                vec![
+                    SampleRead {
+                        offset: Ok(0),
+                        requested: 4,
+                        result: Ok(4)
+                    },
+                    SampleRead {
+                        offset: Ok(0),
+                        requested: 4,
+                        result: Ok(4)
+                    },
+                ]
+            );
+            assert_eq!(
+                admission.sample_bytes_read, 8,
+                "quiet restore is not zero I/O"
+            );
+            assert_eq!(restored.last_full_verified(), 1_000);
+            assert_eq!(
+                restored.audit_debt(),
+                None,
+                "#865: no envelope debt fallback"
+            );
+            let current_index_debt = due.map(|due_unix_seconds| AuditDebt { due_unix_seconds });
+            let mut plan = ReadPlan::prepare(
+                &mut file,
+                Some(&restored),
+                &scope(),
+                current_index_debt,
+                now,
+            )
+            .unwrap();
+            assert_eq!(
+                plan.mode(),
+                if append {
+                    ReadMode::Tail
                 } else {
-                    FullReason::BoundaryChanged
-                })
+                    ReadMode::Unchanged
+                }
+            );
+            assert_eq!(plan.start_offset(), 4);
+            let mut suffix = Vec::new();
+            file.read_to_end(&mut suffix).unwrap();
+            assert_eq!(
+                suffix,
+                if append {
+                    b"two\n".as_slice()
+                } else {
+                    b"".as_slice()
+                }
+            );
+            if append {
+                plan.observe_complete_records(&suffix).unwrap();
+            }
+            let next = plan
+                .commit_after_native_completion(&file, &scope(), now)
+                .unwrap();
+            assert_eq!(next.last_full_verified(), 1_000, "no Full credit");
+            assert_eq!(next.sealed_offset(), if append { 8 } else { 4 });
+            assert_eq!(
+                next.audit_debt().unwrap().due_unix_seconds,
+                due.unwrap_or(4_600)
+                    .min(if append { 4_600 } else { u64::MAX })
             );
         }
     }
 
     #[test]
-    fn shrink_and_replacement_reset_even_with_identical_samples() {
-        let f = Fixture::new(b"one\ntwo\n");
-        let cp = initial(&f, 0);
-        f.replace_bytes(b"one\n");
-        assert_eq!(
-            run(&f, Some(&cp), None, 1).0,
-            ReadMode::Full(FullReason::Shrunk)
-        );
-        let other = Fixture::new(b"one\ntwo\n");
-        assert_eq!(
-            run(&other, Some(&cp), None, 1).0,
-            ReadMode::Full(FullReason::Replaced)
-        );
-    }
-
-    #[test]
-    fn same_size_edit_resets_and_scope_change_cannot_reuse_state() {
-        let f = Fixture::new(b"one\n");
-        let cp = initial(&f, 0);
-        f.replace_bytes(b"two\n");
-        // Force a distinct mtime as well, independent of filesystem clock granularity.
-        let file = f.open();
-        file.set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
-            .unwrap();
-        assert_eq!(
-            run(&f, Some(&cp), None, 1).0,
-            ReadMode::Full(FullReason::SameSizeEdit)
-        );
-        let mut file = f.open();
-        let p = ReadPlan::prepare(
-            &mut file,
-            Some(&cp),
-            &Scope("changed-parent-policy".into()),
-            None,
-            1,
-        )
-        .unwrap();
-        assert_eq!(p.mode(), ReadMode::Full(FullReason::ScopeChanged));
+    fn quiet_sampling_requires_both_windows_stable_stamp_scope_and_eof() {
+        for arm in [
+            "quiet",
+            "size",
+            "mtime",
+            "head",
+            "boundary",
+            "partial",
+            "scope",
+            "changed_after_samples",
+        ] {
+            let bytes = wide_rows("quiet-check");
+            let f = Fixture::new(&bytes);
+            let mut cp = initial(&f, 100);
+            cp.audit_debt = Some(AuditDebt {
+                due_unix_seconds: 101,
+            });
+            let original_modified = f.open().metadata().unwrap().modified().unwrap();
+            match arm {
+                "size" => f.append(b"appended\n"),
+                "mtime" => f
+                    .open()
+                    .set_modified(original_modified + std::time::Duration::from_secs(1))
+                    .unwrap(),
+                "head" | "boundary" => {
+                    let mut changed = bytes.clone();
+                    let offset = if arm == "head" { 1 } else { changed.len() - 2 };
+                    changed[offset] ^= 1;
+                    f.replace_bytes(&changed);
+                    f.open().set_modified(original_modified).unwrap();
+                }
+                "partial" => cp.samples.sealed_offset -= 1,
+                _ => {}
+            }
+            let checked_scope = if arm == "scope" {
+                Scope("other".into())
+            } else {
+                scope()
+            };
+            if matches!(arm, "head" | "boundary") {
+                assert!(cp.stamp_matches(&f.open()).unwrap());
+            }
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    set_between_guards(None);
+                }
+            }
+            let _reset = Reset;
+            if arm == "changed_after_samples" {
+                let path = f.0.clone();
+                set_between_guards(Some(Box::new(move || {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(b"grown\n")
+                        .unwrap();
+                })));
+            }
+            let mut read = 0;
+            let (result, reads) = capture_sample_reads(|| {
+                cp.quiet_audit_matches(&mut f.open(), &checked_scope, &mut read)
+            });
+            assert_eq!(result.unwrap(), arm == "quiet", "{arm}");
+            assert_eq!(
+                cp.audit_debt(),
+                Some(AuditDebt {
+                    due_unix_seconds: 101
+                }),
+                "check alone never retires"
+            );
+            if matches!(arm, "quiet" | "head" | "boundary" | "changed_after_samples") {
+                assert_eq!(reads.len(), 2, "both windows read");
+                assert_eq!(read, 2 * SAMPLE_BYTES);
+                assert_eq!(reads[0].offset, Ok(0));
+                assert_eq!(
+                    reads[1].offset,
+                    Ok(bytes.len() as u64 - SAMPLE_BYTES as u64)
+                );
+            } else {
+                assert_eq!(read, 0);
+            }
+            if arm == "quiet" {
+                cp.retire_quiet_audit();
+                assert_eq!(cp.audit_debt(), None);
+                assert_eq!(cp.last_full_verified(), 100);
+            }
+        }
     }
 
     #[test]
@@ -2005,12 +2234,12 @@ mod tests {
         );
         assert_eq!(
             run(&f, Some(&cp), cp.audit_debt(), 500).0,
-            ReadMode::Full(FullReason::AuditDue)
+            ReadMode::Unchanged
         );
     }
 
     #[test]
-    fn a_deadline_crossed_during_acquisition_cannot_publish_sampled_verification() {
+    fn a_deadline_crossed_during_acquisition_keeps_debt_without_blocking_completion() {
         let f = Fixture::new(b"one\n");
         let cp = initial(&f, 100);
         f.append(b"two\n");
@@ -2023,13 +2252,12 @@ mod tests {
         let mut suffix = Vec::new();
         file.read_to_end(&mut suffix).unwrap();
         p.observe_complete_records(&suffix).unwrap();
-        assert!(p
+        let completed = p
             .commit_after_native_completion(&file, &scope(), 500)
-            .is_err());
-        assert_eq!(
-            run(&f, Some(&cp), debt, 500).0,
-            ReadMode::Full(FullReason::AuditDue)
-        );
+            .unwrap();
+        assert_eq!(completed.audit_debt(), debt);
+        assert_eq!(completed.last_full_verified(), cp.last_full_verified());
+        assert_eq!(run(&f, Some(&cp), debt, 500).0, ReadMode::Tail);
     }
 
     #[test]
@@ -2075,39 +2303,6 @@ mod tests {
         assert_eq!(mode, ReadMode::Tail);
         assert_eq!(cp.sealed_offset(), data.len() as u64 + 1);
     }
-    #[test]
-    fn backwards_clock_and_implausible_debt_cannot_strand_audit() {
-        let f = Fixture::new(b"one\n");
-        let cp = initial(&f, 1000);
-        f.append(b"two\n");
-        let (_, cp, _) = run(&f, Some(&cp), None, 1001);
-        let (mode, verified, _) = run(&f, Some(&cp), cp.audit_debt(), 20);
-        assert_eq!(mode, ReadMode::Full(FullReason::ClockChanged));
-        assert_eq!(verified.audit_debt(), None);
-        let (mode, _, _) = run(
-            &f,
-            None,
-            Some(AuditDebt {
-                due_unix_seconds: u64::MAX,
-            }),
-            100,
-        );
-        assert_eq!(mode, ReadMode::Full(FullReason::ClockChanged));
-        // AD-T3: a multi-page read whose clock stepped back keeps its start
-        // even on an unchanged object, so the next read fails closed.
-        let stable = Fixture::new(b"one\n");
-        let (mut file, plan, frozen) = sealed_read(&stable, 1000);
-        let regressed = plan
-            .commit_sealed_prefix(&mut file, true, &scope(), 1000, 900, false, frozen)
-            .unwrap();
-        assert_eq!(regressed.last_full_verified(), 1000);
-        assert_eq!(regressed.audit_debt(), None);
-        assert_eq!(
-            run(&stable, Some(&regressed), None, 950).0,
-            ReadMode::Full(FullReason::ClockChanged)
-        );
-    }
-
     /// A cursor-style read: freeze at open, consume complete records up to the
     /// frozen length, then let the caller mutate the file before commit.
     fn sealed_read(f: &Fixture, started: u64) -> (File, ReadPlan, u64) {
@@ -2153,7 +2348,7 @@ mod tests {
         );
         assert_eq!(
             run(&stable, Some(&cp), None, 200 + AUDIT_INTERVAL_SECONDS).0,
-            ReadMode::Full(FullReason::AuditDue)
+            ReadMode::Tail
         );
     }
 
@@ -2250,10 +2445,11 @@ mod tests {
         }
     }
 
-    /// M1: a multi-page tail that reaches its audit deadline before commit is
-    /// refused (the next read is the audit), exactly like a single-page tail.
+    /// Ordinary checkpoint completion shares admission's audit predicate;
+    /// the exact-stamp proof seal still refuses elapsed debt. At 57ffaa32,
+    /// the overdue ordinary seal below returns PrefixRefusal::AuditDue.
     #[test]
-    fn tail_prefix_reaching_its_audit_deadline_is_refused_for_the_audit() {
+    fn overdue_tail_seals_with_identical_debt_but_proof_horizon_still_refuses() {
         let f = Fixture::new(b"one\n");
         let cp = initial(&f, 1000);
         f.append(b"two\n");
@@ -2268,14 +2464,24 @@ mod tests {
             file.read_to_end(&mut bytes).unwrap();
             plan.observe_complete_records(&bytes).unwrap();
             let consumed = plan.frozen_length();
-            plan.commit_sealed_prefix(&mut file, true, &scope(), 1100, commit_at, false, consumed)
+            let before = (plan.last_full_verified_unix_seconds, plan.debt);
+            let next = plan
+                .commit_sealed_prefix(&mut file, true, &scope(), 1100, commit_at, false, consumed)
+                .unwrap();
+            assert_eq!((next.last_full_verified(), next.audit_debt()), before);
+            next
         };
-        assert_eq!(tail(1500).unwrap_err(), PrefixRefusal::AuditDue);
-        let certified = tail(1499).unwrap();
-        assert_eq!(certified.sealed_offset(), 8);
+        for now in [1499, 1500, 181_000] {
+            let certified = tail(now);
+            assert_eq!(certified.sealed_offset(), 8);
+            assert_eq!(certified.last_full_verified(), 1000);
+            assert_eq!(certified.audit_debt(), debt);
+        }
+        let nongated = tail(1499).seal(1499);
+        assert_eq!(nongated.admits(&mut f.open(), &scope(), 1499, false), Ok(0));
         assert_eq!(
-            certified.audit_debt().map(|debt| debt.due_unix_seconds),
-            Some(1500)
+            nongated.admits(&mut f.open(), &scope(), 1500, false),
+            Err(FullReason::AuditDue)
         );
     }
 
@@ -2377,17 +2583,14 @@ mod tests {
         assert_eq!(grown.audit_debt().unwrap().due_unix_seconds, late);
         assert_eq!(
             run(&g, Some(&grown), grown.audit_debt(), late + 1).0,
-            ReadMode::Full(FullReason::AuditDue)
+            ReadMode::Tail
         );
         // AD-T1 continued: after an append, the stable read's checkpoint
-        // tails until `late + I` and is audited from then on.
+        // continues to Tail even after the legacy audit horizon.
         f.append(b"three\n");
         let horizon = late + AUDIT_INTERVAL_SECONDS;
         assert_eq!(run(&f, Some(&cp), None, horizon - 1).0, ReadMode::Tail);
-        assert_eq!(
-            run(&f, Some(&cp), None, horizon).0,
-            ReadMode::Full(FullReason::AuditDue)
-        );
+        assert_eq!(run(&f, Some(&cp), None, horizon).0, ReadMode::Tail);
     }
     /// Rows large enough that the head and boundary windows are disjoint.
     fn wide_rows(tag: &str) -> Vec<u8> {
@@ -2433,9 +2636,10 @@ mod tests {
     /// checkpoint whose length equals its sealed offset `s`, a seal admits
     /// exactly when `prepare` would reuse the checkpoint, with the same
     /// refusal reason and the same sample bytes read, on every identity,
-    /// sample, scope and clock case but one: a ctime-only change, which
+    /// sample and scope case but a ctime-only change, which
     /// `prepare` reuses (E1 S3) and a seal refuses as `SameSizeEdit` (C1: a
-    /// seal keeps the exact stamp until a birth fence exists).
+    /// seal keeps the exact stamp until a birth fence exists). The seal
+    /// also retains its proof horizon, while acquisition ignores audit age.
     ///
     /// `partial` rows use a checkpoint with an unsealed EOF fragment
     /// (`s < L`). The seal certifies only `[0, s)`, so it admits an
@@ -2445,7 +2649,7 @@ mod tests {
     /// against the unnormalized stamp refuses them. A shrink to exactly `s`
     /// is refused by both, with different reasons.
     #[test]
-    fn prefix_seal_admits_exactly_when_prepare_reuses_the_checkpoint() {
+    fn prefix_seal_keeps_proof_fences_while_prepare_ignores_audit_age() {
         type Mutate = fn(&Fixture, &[u8]) -> Option<Fixture>;
         struct Row {
             case: &'static str,
@@ -2576,20 +2780,24 @@ mod tests {
                 true,
                 Err(FullReason::ScopeChanged),
             ),
-            same(
-                "clock moved back",
-                append,
-                50,
-                false,
-                Err(FullReason::ClockChanged),
-            ),
-            same(
-                "audit horizon",
-                append,
-                100 + AUDIT_INTERVAL_SECONDS,
-                false,
-                Err(FullReason::AuditDue),
-            ),
+            Row {
+                case: "clock moved back",
+                partial: false,
+                mutate: append,
+                now: 50,
+                rescope: false,
+                prepare: Ok(windows),
+                admits: Err(FullReason::ClockChanged),
+            },
+            Row {
+                case: "audit horizon",
+                partial: false,
+                mutate: append,
+                now: 100 + AUDIT_INTERVAL_SECONDS,
+                rescope: false,
+                prepare: Ok(windows),
+                admits: Err(FullReason::AuditDue),
+            },
             same(
                 "unchanged past the horizon",
                 |_, _| None,
@@ -2681,65 +2889,6 @@ mod tests {
         }
     }
 
-    /// U-T30: debt clock regression and invalid samples refuse as `prepare`
-    /// does, and a tampered seal never underflows at `sealed - len`.
-    #[test]
-    fn prefix_seal_refuses_clock_regression_and_invalid_samples_as_prepare_does() {
-        let bytes = wide_rows("invalid");
-        let f = Fixture::new(&bytes);
-        let cp = initial(&f, 1000);
-        f.append(b"next\n");
-        // Debt due later than one interval from now: the clock moved back.
-        let mut far = cp.clone();
-        far.audit_debt = Some(AuditDebt {
-            due_unix_seconds: 1000 + 10 * AUDIT_INTERVAL_SECONDS,
-        });
-        assert_eq!(
-            prepared(&f, &far, &scope(), 1100),
-            Err(FullReason::ClockChanged)
-        );
-        assert_eq!(
-            far.seal(1000).admits(&mut f.open(), &scope(), 1100, false),
-            Err(FullReason::ClockChanged)
-        );
-        // Unequal windows: `seal_as` marks them, both refuse.
-        let mut unequal = cp.clone();
-        unequal.samples.head.pop();
-        assert_eq!(
-            prepared(&f, &unequal, &scope(), 1100),
-            Err(FullReason::InvalidCheckpoint)
-        );
-        assert_eq!(
-            unequal
-                .seal(1000)
-                .admits(&mut f.open(), &scope(), 1100, false),
-            Err(FullReason::InvalidCheckpoint)
-        );
-        // Tampered persisted seals.
-        let good = serde_json::to_value(cp.seal(1000)).unwrap();
-        let digest = good["head_sha256"].as_str().unwrap().to_string();
-        let tampered: [(&str, serde_json::Value); 5] = [
-            ("sample_len", serde_json::json!(u32::MAX)),
-            ("sample_len", serde_json::json!(SAMPLE_BYTES - 1)),
-            ("head_sha256", serde_json::json!(digest[..63])),
-            ("boundary_sha256", serde_json::json!(digest.to_uppercase())),
-            (
-                "head_sha256",
-                serde_json::json!(format!("{}g", &digest[..63])),
-            ),
-        ];
-        for (field, value) in tampered {
-            let mut seal = good.clone();
-            seal[field] = value.clone();
-            let seal: PrefixSeal = serde_json::from_value(seal).unwrap();
-            assert_eq!(
-                seal.admits(&mut f.open(), &scope(), 1100, false),
-                Err(FullReason::InvalidCheckpoint),
-                "{field} = {value}"
-            );
-        }
-    }
-
     /// U1a-2a Q-U28: `samples_match` is true for a ctime-only change and
     /// for a same-size change that moved mtime (both of which `admits`
     /// still refuses as `SameSizeEdit`: a seal keeps the exact stamp, E1 S3
@@ -2825,7 +2974,7 @@ mod tests {
 
     /// U-T30: staged debt. A tail checkpoint's debt is carried by its seal;
     /// an outlived seal's one publication use has no debt yet and measures
-    /// the horizon from minting, and every later use refuses as `prepare` does.
+    /// the horizon from minting; later proof use retains its own expiry.
     /// A seal that is not outlived ignores `publication`, so it cannot push
     /// its deadline back.
     #[test]
@@ -2838,7 +2987,12 @@ mod tests {
         let seal = tail.seal(1100);
         assert!(seal.has_debt() && !seal.outlived());
         for now in [due - 1, due] {
-            let expected = prepared(&f, &tail, &scope(), now);
+            assert_eq!(prepared(&f, &tail, &scope(), now), Ok(0));
+            let expected = if now < due {
+                Ok(0)
+            } else {
+                Err(FullReason::AuditDue)
+            };
             for publication in [false, true] {
                 assert_eq!(
                     seal.admits(&mut f.open(), &scope(), now, publication),
@@ -2857,7 +3011,7 @@ mod tests {
         let horizon = 1000 + AUDIT_INTERVAL_SECONDS;
         assert_eq!(
             prepared(&f, &cp, &scope(), horizon),
-            Err(FullReason::AuditDue)
+            Ok(cp.samples.head.len() + cp.samples.boundary.len())
         );
         assert_eq!(
             late_minted.admits(&mut f.open(), &scope(), horizon, true),
@@ -2923,196 +3077,6 @@ mod tests {
         walk(&serde_json::from_str(json).unwrap(), allowed);
     }
     const STAMP_KEYS: [&str; 6] = ["stamp", "length", "device", "inode", "modified", "changed"];
-
-    /// `seal_as` normalizes the length to the sealed offset, takes the given
-    /// scope, and serializes without any sample byte.
-    #[test]
-    fn seal_as_normalizes_the_sealed_length_and_keeps_no_sample_bytes() {
-        let f = Fixture::new(b"{\"secret\":\"U1A1-SENTINEL\"}\npartial");
-        let cp = initial(&f, 100);
-        assert_eq!(cp.sealed_offset(), 27);
-        let side = Scope("side-scope".into());
-        let seal = cp.seal_as(100, &side);
-        assert_eq!(seal.sealed_offset(), 27);
-        assert!(seal.scope_is(&side) && !seal.scope_is(&scope()));
-        assert!(!seal.has_debt());
-        assert_eq!(seal.admits(&mut f.open(), &side, 200, false), Ok(2 * 27));
-        assert_eq!(
-            seal.admits(&mut f.open(), &scope(), 200, false),
-            Err(FullReason::ScopeChanged)
-        );
-        let json = serde_json::to_string(&seal).unwrap();
-        assert!(!json.contains("U1A1-SENTINEL"), "{json}");
-        let keys = [
-            &STAMP_KEYS[..],
-            &[
-                "scope",
-                "sample_len",
-                "head_sha256",
-                "boundary_sha256",
-                "verified_unix_seconds",
-                "sealed_unix_seconds",
-                "audit_debt_unix_seconds",
-            ][..],
-        ]
-        .concat();
-        assert_content_free(&json, &keys, 1024);
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["stamp"]["length"], 27);
-        assert_eq!(value["stamp"]["modified"].as_array().unwrap().len(), 2);
-        assert!(value.get("audit_debt_unix_seconds").is_none());
-        assert_eq!(serde_json::from_str::<PrefixSeal>(&json).unwrap(), seal);
-    }
-
-    /// U-T56 (ta): the one `append_compatible` rule on `FileStamp`, against
-    /// `LossyPrefixIdentity::holds`'s replaced inline predicate.
-    #[test]
-    fn append_compatible_truth_table_matches_the_replaced_inline_predicate() {
-        let base = FileStamp {
-            length: 100,
-            device: 7,
-            inode: 11,
-            modified: (1, 2),
-            changed: (3, 4),
-        };
-        let cases = [
-            ("identical", base.clone(), true),
-            (
-                "grown",
-                FileStamp {
-                    length: 150,
-                    modified: (5, 6),
-                    ..base.clone()
-                },
-                true,
-            ),
-            (
-                "equal-length edit",
-                FileStamp {
-                    modified: (5, 6),
-                    ..base.clone()
-                },
-                false,
-            ),
-            (
-                "shrink",
-                FileStamp {
-                    length: 50,
-                    ..base.clone()
-                },
-                false,
-            ),
-            (
-                "replaced",
-                FileStamp {
-                    inode: 12,
-                    ..base.clone()
-                },
-                false,
-            ),
-            (
-                "replaced and grown",
-                FileStamp {
-                    device: 8,
-                    length: 150,
-                    ..base.clone()
-                },
-                false,
-            ),
-        ];
-        for (case, now, expected) in cases {
-            let inline = base.same_object(&now) && (now == base || now.length > base.length);
-            assert_eq!(append_compatible(&base, &now), expected, "{case}");
-            assert_eq!(inline, expected, "{case}: replaced inline predicate");
-        }
-        // E1 S3: a ctime-only change is the same content, which the replaced
-        // inline predicate refused; every content field still counts.
-        let ctime_only = FileStamp {
-            changed: (5, 6),
-            ..base.clone()
-        };
-        assert_ne!(ctime_only, base, "structural equality keeps ctime");
-        assert!(base.same_content(&ctime_only));
-        assert!(append_compatible(&base, &ctime_only), "ctime only");
-        for (case, now) in [
-            (
-                "length",
-                FileStamp {
-                    length: 101,
-                    ..base.clone()
-                },
-            ),
-            (
-                "device",
-                FileStamp {
-                    device: 8,
-                    ..base.clone()
-                },
-            ),
-            (
-                "inode",
-                FileStamp {
-                    inode: 12,
-                    ..base.clone()
-                },
-            ),
-            (
-                "mtime seconds",
-                FileStamp {
-                    modified: (9, 2),
-                    ..base.clone()
-                },
-            ),
-            (
-                "mtime nanoseconds",
-                FileStamp {
-                    modified: (1, 3),
-                    ..base.clone()
-                },
-            ),
-        ] {
-            assert!(!base.same_content(&now), "{case}");
-            assert!(!now.same_content(&base), "{case}");
-        }
-        // `holds` keeps its behaviour on an equal-length in-place edit.
-        let g = Fixture::new(b"one\ntwo\n");
-        let (mut file, plan, frozen) = sealed_read(&g, 100);
-        let (_, identity) = plan.commit_sealed_prefix_or_lossy_identity(
-            &mut file,
-            true,
-            &scope(),
-            100,
-            200,
-            true,
-            frozen,
-        );
-        let identity = identity.unwrap();
-        assert!(identity.holds(&mut file));
-        let mut writer = g.open();
-        writer.seek(SeekFrom::Start(5)).unwrap();
-        writer.write_all(b"W").unwrap();
-        writer
-            .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
-            .unwrap();
-        assert!(!identity.holds(&mut file), "equal-length edit");
-        // It holds on growth and refuses a shrink.
-        let h = Fixture::new(b"one\ntwo\n");
-        let (mut file, plan, frozen) = sealed_read(&h, 100);
-        let (_, identity) = plan.commit_sealed_prefix_or_lossy_identity(
-            &mut file,
-            true,
-            &scope(),
-            100,
-            200,
-            true,
-            frozen,
-        );
-        let identity = identity.unwrap();
-        h.append(b"three\n");
-        assert!(identity.holds(&mut file), "grown");
-        file.set_len(4).unwrap();
-        assert!(!identity.holds(&mut file), "shrink");
-    }
 
     /// A multi-page read: consume `rows` complete rows and one partial row.
     fn partial_read(f: &Fixture, rows: usize, partial: usize) -> (ReadPlan, u64) {
@@ -3510,51 +3474,6 @@ mod tests {
         }
     }
 
-    /// E1 S3 (Ron's re-read rule): a metadata-only change at equal length
-    /// is the same content. Before `prepare` it is `Unchanged` with zero
-    /// sample bytes read (never `SameSizeEdit`) and `stamp_matches` keeps
-    /// the copy, while a seal of the same checkpoint keeps the pre-S3 exact
-    /// stamp and refuses it as `SameSizeEdit` (C1); with growth it is a
-    /// `Tail`; a moved mtime at equal length is still `SameSizeEdit`. Every
-    /// decision is inside the horizon with no debt: before S1 an old or
-    /// debt-due checkpoint is `Full(AuditDue)` whatever ctime does, so these
-    /// fixtures stay clear of it.
-    #[test]
-    fn metadata_only_change_before_prepare_is_unchanged_and_reads_nothing() {
-        for meta in metas() {
-            let bytes = wide_rows("s3-before");
-            let f = Fixture::new(&bytes);
-            let cp = initial(&f, 1000);
-            let seal = cp.seal(1000);
-            metadata_only(&f.0, meta);
-            assert!(cp.stamp_matches(&f.open()).unwrap(), "{meta:?}");
-            assert_eq!(
-                seal.admits(&mut f.open(), &scope(), 1100, false),
-                Err(FullReason::SameSizeEdit),
-                "{meta:?}: a seal keeps the exact stamp"
-            );
-            let (mode, next, read) = run(&f, Some(&cp), None, 1100);
-            assert_eq!((mode, read), (ReadMode::Unchanged, 0), "{meta:?}");
-            assert_eq!(next.sealed_offset(), cp.sealed_offset());
-
-            // Growth and a metadata change: a tail of the appended row.
-            f.append(b"{\"next\":1}\n");
-            metadata_only(&f.0, meta);
-            let (mode, grown, read) = run(&f, Some(&next), None, 1200);
-            assert_eq!((mode, read), (ReadMode::Tail, 2 * SAMPLE_BYTES), "{meta:?}");
-            assert_eq!(grown.sealed_offset(), bytes.len() as u64 + 11);
-
-            // A moved mtime at equal length is still a same-size edit.
-            touch(&f);
-            assert!(!grown.stamp_matches(&f.open()).unwrap(), "{meta:?}");
-            assert_eq!(
-                run(&f, Some(&grown), None, 1300).0,
-                ReadMode::Full(FullReason::SameSizeEdit),
-                "{meta:?}"
-            );
-        }
-    }
-
     /// E1 S3: a change between a decision's opening stamp and its
     /// re-capture (the `between_guards` hook). Metadata only keeps
     /// `prepare`'s tail and `unpark`'s resume; a moved mtime there still
@@ -3618,89 +3537,6 @@ mod tests {
                     "{change:?}: {reason:?}"
                 ),
             }
-        }
-    }
-
-    /// E1 S3: a change between the native parse and its commit. Metadata
-    /// only still commits `commit_after_native_completion`, still verifies a
-    /// complete Full read at `commit_sealed_prefix` (AD-1) and keeps the
-    /// lossy identity's `holds`; a moved mtime at equal length still
-    /// refuses each.
-    #[test]
-    fn metadata_only_change_between_parse_and_commit_still_commits() {
-        for change in changes() {
-            let kept = matches!(change, Change::Meta(_));
-            let f = Fixture::new(b"one\ntwo\n");
-            let mut file = f.open();
-            let mut plan = ReadPlan::prepare(&mut file, None, &scope(), None, 100).unwrap();
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).unwrap();
-            plan.observe_complete_records(&bytes).unwrap();
-            apply(&f.0, change, 1);
-            let committed = plan.commit_after_native_completion(&file, &scope(), 100);
-            assert_eq!(committed.is_ok(), kept, "{change:?}");
-
-            let f = Fixture::new(b"one\ntwo\n");
-            let (mut file, plan, frozen) = sealed_read(&f, 100);
-            apply(&f.0, change, 1);
-            let sealed =
-                plan.commit_sealed_prefix(&mut file, true, &scope(), 100, 200, false, frozen);
-            if kept {
-                let cp = sealed.unwrap();
-                assert_eq!((cp.last_full_verified(), cp.audit_debt()), (200, None));
-            } else {
-                assert_eq!(
-                    sealed.err(),
-                    Some(PrefixRefusal::Invalidated(FullReason::SameSizeEdit))
-                );
-            }
-
-            let f = Fixture::new(b"one\ntwo\n");
-            let (mut file, plan, frozen) = sealed_read(&f, 100);
-            let (_, identity) = plan.commit_sealed_prefix_or_lossy_identity(
-                &mut file,
-                true,
-                &scope(),
-                100,
-                200,
-                true,
-                frozen,
-            );
-            let identity = identity.unwrap();
-            apply(&f.0, change, 1);
-            assert_eq!(identity.holds(&mut file), kept, "{change:?}");
-        }
-    }
-
-    /// E1 S3: a change while a read is parked. Metadata only unparks at the
-    /// resume offset and finishes with the uninterrupted read's certificate;
-    /// a moved mtime at equal length (no byte changed) refuses as
-    /// `SameSizeEdit`.
-    #[test]
-    fn metadata_only_change_while_parked_resumes_the_read() {
-        for change in changes() {
-            let f = Fixture::new(&wide_rows("s3-park"));
-            let (plan, consumed) = partial_read(&f, 2, 7);
-            let (control, _) = partial_read(&f, 2, 7);
-            let parked = plan.park(100);
-            drop(plan);
-            let uninterrupted = finish_read(&f, control, consumed, 100, 200);
-            apply(&f.0, change, 1);
-            let mut held = f.open();
-            let unparked = ReadPlan::unpark(&mut held, &parked, None);
-            if let Change::Mtime = change {
-                assert_eq!(unparked.err(), Some(FullReason::SameSizeEdit));
-                continue;
-            }
-            let Ok(unparked) = unparked else {
-                panic!("{change:?}: refused");
-            };
-            assert_eq!(held.stream_position().unwrap(), consumed);
-            assert_eq!(
-                finish_read(&f, unparked.plan, consumed, unparked.started, 200),
-                uninterrupted,
-                "{change:?}"
-            );
         }
     }
 }

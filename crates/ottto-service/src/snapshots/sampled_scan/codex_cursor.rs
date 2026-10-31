@@ -458,12 +458,30 @@ pub(in crate::snapshots) struct OpenStamp {
 }
 crate::heap_layout_bound::fields!(OpenStamp; dev, ino, extent, modified, changed);
 
+/// The cursor/acquisition content key, without metadata-only ctime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct ContentStamp {
+    dev: u64,
+    ino: u64,
+    extent: u64,
+    modified: (i64, i64),
+}
+crate::heap_layout_bound::fields!(ContentStamp; dev, ino, extent, modified);
+impl ContentStamp {
+    pub(in crate::snapshots) fn extent(&self) -> u64 {
+        self.extent
+    }
+    pub(in crate::snapshots) fn same_content(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 impl OpenStamp {
     pub(in crate::snapshots) fn capture(file: &File) -> std::io::Result<Self> {
         Ok(Self::of(&file.metadata()?))
     }
 
-    fn of(metadata: &fs::Metadata) -> Self {
+    pub(in crate::snapshots) fn of(metadata: &fs::Metadata) -> Self {
         Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
@@ -471,6 +489,23 @@ impl OpenStamp {
             modified: (metadata.mtime(), metadata.mtime_nsec()),
             changed: (metadata.ctime(), metadata.ctime_nsec()),
         }
+    }
+
+    pub(in crate::snapshots) fn candidate(candidate: &super::super::CandidateFile) -> Option<Self> {
+        let [dev, ino] = candidate.physical_identity?;
+        Some(Self {
+            dev,
+            ino,
+            extent: candidate.size_bytes,
+            modified: (
+                (candidate.modified_unix_nanos / 1_000_000_000) as i64,
+                (candidate.modified_unix_nanos % 1_000_000_000) as i64,
+            ),
+            changed: (
+                (candidate.fingerprint_changed_nanos / 1_000_000_000) as i64,
+                (candidate.fingerprint_changed_nanos % 1_000_000_000) as i64,
+            ),
+        })
     }
 
     /// The object `path` names now, without following a final symlink.
@@ -494,7 +529,16 @@ impl OpenStamp {
     /// `transcript_acquisition::FileStamp::same_content`'s rule: the same
     /// object, extent and nanosecond mtime; never ctime.
     pub(in crate::snapshots) fn same_content(&self, other: &Self) -> bool {
-        self.same_object(other) && self.extent == other.extent && self.modified == other.modified
+        self.content_stamp().same_content(&other.content_stamp())
+    }
+
+    pub(in crate::snapshots) fn content_stamp(&self) -> ContentStamp {
+        ContentStamp {
+            dev: self.dev,
+            ino: self.ino,
+            extent: self.extent,
+            modified: self.modified,
+        }
     }
 
     /// The memo and parked wake rule, on stamps `SharedCache::retained_stamp`
@@ -815,26 +859,6 @@ impl JobMeta {
         self.fence.is_some() && self.fence == census_token(index)
     }
 
-    /// The live job's copy-budget charge without a walk (E3): the last
-    /// `completed_bound` plus every byte the reader consumed since plus the
-    /// reader buffer's capacity growth since (`buffer` is its capacity now).
-    /// Not a strict upper bound: an accumulator collection that regrows can
-    /// add more than the bytes that caused it. That slack lasts at most
-    /// `CHARGE_REFRESH_BYTES` of input and is corrected by the next walk;
-    /// the pause and completion walks are exact. None when no charge is
-    /// recorded, the reader restarted, or `CHARGE_REFRESH_BYTES` were
-    /// consumed since (the caller walks again: at most one walk per that
-    /// many bytes, never one per line). The scanner reads it through
-    /// `job_charge_estimate`, which also covers group jobs.
-    #[cfg(test)]
-    pub(in crate::snapshots) fn charge_estimate(
-        &self,
-        consumed: u64,
-        buffer: usize,
-    ) -> Option<usize> {
-        estimate_charge(self.charge, consumed, buffer, 1)
-    }
-
     /// Record a walked charge (`usize::MAX` when the walk refused) taken at
     /// reader position `consumed` with reader buffer capacity `buffer`.
     pub(in crate::snapshots) fn record_charge(
@@ -1060,38 +1084,20 @@ impl JobPace {
     }
 }
 
-impl HeapLayoutBound for JobPace {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        // A key, two `Instant`s, a `Duration` and a flag: nothing on the heap.
-        c.add(0)
-    }
-}
+// A key, two `Instant`s, a `Duration` and a flag: nothing on the heap.
+crate::heap_layout_bound::no_heap!(true; JobPace);
 
 /// A `Duration` held inline (no heap), for the page's ordinary equivalent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) struct InlineDuration(std::time::Duration);
 
-impl HeapLayoutBound for InlineDuration {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; InlineDuration);
 
 /// An `Instant` held inline (no heap), for a continuation page's deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) struct InlineInstant(std::time::Instant);
 
-impl HeapLayoutBound for InlineInstant {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; InlineInstant);
 
 /// The counting view of `candidate`'s index entries (K8): what a fresh
 /// singleton parser would be configured with now. Recorded at job start,
@@ -1909,14 +1915,8 @@ impl Default for PaceTable {
     }
 }
 
-impl HeapLayoutBound for PaceTable {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        // Fixed slots of keys, `Instant`s, `OpenStamp`s and offsets.
-        c.add(0)
-    }
-}
+// Fixed slots of keys, `Instant`s, `OpenStamp`s and offsets.
+crate::heap_layout_bound::no_heap!(true; PaceTable);
 
 /// The guard's start rule for one large ordinary start (§6 table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2162,13 +2162,7 @@ impl Default for ParentRestarts {
         Self([None; ROTATION_KEYS])
     }
 }
-impl HeapLayoutBound for ParentRestarts {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ParentRestarts);
 impl ParentRestarts {
     /// The slot of `key` (`parent_restart_key(namespace, scope)`), created as
     /// needed; refreshes `touched`. There is no reset branch: a new receipt
@@ -3603,7 +3597,10 @@ pub(in crate::snapshots) fn group_memo_digest(
         receipt_scope.to_owned(),
         group_counting_view(members.iter().copied(), index),
         format!("{}:{}", live.dev, live.ino),
-        if codex.created_thread_census_unscoped_incomplete {
+        if members
+            .iter()
+            .any(|member| codex.created_thread_census_incomplete_for(&member.path))
+        {
             "created_incomplete".to_owned()
         } else {
             "created_complete".to_owned()
@@ -6413,13 +6410,7 @@ pub(in crate::snapshots) enum DebtReason {
     /// it is strict; parked until a member changes.
     ProbeBudgetOrder,
 }
-impl HeapLayoutBound for DebtReason {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; DebtReason);
 
 impl DebtReason {
     fn settleable(self) -> bool {
@@ -6814,7 +6805,7 @@ pub(in crate::snapshots) fn memo_digest(
         // Class 7: an identity conflict on a candidate changes the blocked
         // ids of any hold, sidecar-woken or not.
         &conflicted_identities(codex, &candidate.path),
-        if codex.created_thread_census_unscoped_incomplete {
+        if codex.created_thread_census_incomplete_for(&candidate.path) {
             "created_incomplete"
         } else {
             "created_complete"
@@ -6931,6 +6922,7 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
         index.extend_codex_blocked_attribution(&index_key, blocked);
     }
     targets.pending_finalization.push(PendingIndexFinalization {
+        withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: index
             .files

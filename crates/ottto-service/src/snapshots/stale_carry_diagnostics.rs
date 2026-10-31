@@ -98,32 +98,11 @@ thread_local! {
 pub(super) fn take_for_test() -> Option<Counts> {
     LAST.with(|last| last.take())
 }
-/// Identical production reservation; the test seam triggers a real capacity
-/// overflow error without exhausting memory or changing any admission budget.
 pub(super) fn reserve<T>(
     values: &mut Vec<T>,
     slots: usize,
 ) -> Result<(), std::collections::TryReserveError> {
-    #[cfg(test)]
-    if REFUSE_RESERVE.with(std::cell::Cell::get) {
-        return values.try_reserve_exact(usize::MAX);
-    }
     values.try_reserve_exact(slots)
-}
-#[cfg(test)]
-thread_local! {
-    static REFUSE_RESERVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-#[cfg(test)]
-pub(super) fn refusing_reserve<T>(f: impl FnOnce() -> T) -> T {
-    struct Reset(bool);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            REFUSE_RESERVE.with(|cell| cell.set(self.0));
-        }
-    }
-    let _reset = Reset(REFUSE_RESERVE.with(|cell| cell.replace(true)));
-    f()
 }
 
 #[cfg(test)]

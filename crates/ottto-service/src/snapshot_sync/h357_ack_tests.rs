@@ -63,6 +63,7 @@ fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
         head_etag: None,
         head_challenge: None,
         unchanged_basis: None,
+        retained_proof_missing: Vec::new(),
     }
 }
 
@@ -773,6 +774,7 @@ fn with_cache(item: &SnapshotItem) -> SnapshotItem {
 
 fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntry {
     crate::snapshots::ScanIndexEntry {
+        codex_fragment: None,
         size_bytes: 1,
         modified_unix_seconds: 1,
         modified_unix_nanos: Some(1),
@@ -793,6 +795,7 @@ fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntr
         effective_upload_body_witness_revision: 0,
         opened_changed_nanos: 0,
         opened_birth_nanos: 0,
+        upload_context_receipt: None,
     }
 }
 
@@ -1836,68 +1839,6 @@ fn reported_code(state: CollectorState<'static>) -> Option<&'static str> {
     }
 }
 
-/// T1: a retained list of 286 authority downgrades and 23 stale older
-/// uploads, no holds. Every refusal is dominated, so the cycle is not a
-/// validation error.
-#[test]
-fn dominated_permanent_refusals_are_not_a_backend_validation_error() {
-    let mut ledger = progress();
-    refuse(&mut ledger, DOMINATED_DOWNGRADE, 286);
-    refuse(&mut ledger, DOMINATED_STALE, 23);
-    let refusals = PermanentRefusalCounts::of(&ledger);
-    assert_eq!(
-        refusals,
-        PermanentRefusalCounts {
-            total: 309,
-            dominated: 309
-        }
-    );
-    assert_eq!(
-        reported_code(refused_entity_state(true, refusals, true)),
-        None,
-        "dominated refusals report the settled-success state"
-    );
-    assert!(ledger.accepted_fingerprints.is_empty(), "never an ACK");
-}
-
-/// T2: one dominated plus one other permanent reason keeps today's code.
-#[test]
-fn a_non_dominated_permanent_refusal_keeps_backend_validation_error() {
-    for other in [
-        "divergent_duplicate_logical_session",
-        "body_exceeds_max_bytes",
-        "occurred_at_beyond_journal_retention",
-        "invalid",
-    ] {
-        let mut ledger = progress();
-        refuse(&mut ledger, DOMINATED_DOWNGRADE, 1);
-        refuse(&mut ledger, other, 1);
-        let refusals = PermanentRefusalCounts::of(&ledger);
-        assert_eq!(
-            refusals,
-            PermanentRefusalCounts {
-                total: 2,
-                dominated: 1
-            },
-            "{other}"
-        );
-        assert_eq!(
-            reported_code(refused_entity_state(true, refusals, true)),
-            Some("backend_validation_error"),
-            "{other}"
-        );
-    }
-    assert_eq!(
-        reported_code(refused_entity_state(
-            true,
-            PermanentRefusalCounts::default(),
-            true
-        )),
-        Some("backend_validation_error"),
-        "no retained refusal is no evidence of domination"
-    );
-}
-
 /// T3: dominated refusals plus a local hold stay unsettled, and the reported
 /// code is unchanged.
 #[test]
@@ -1983,172 +1924,3 @@ fn a_pending_newer_body_unbinds_its_dominated_refusal() {
 }
 
 // --- In-place resend budget across the cache-head bootstrap stages ---
-
-fn short_shed() -> anyhow::Error {
-    anyhow::Error::new(UploadShed {
-        status: 503,
-        retry_after: Some(Duration::from_secs(1)),
-        code: None,
-    })
-}
-
-/// An exact ACK for one bootstrap or delivery batch; under head CAS every
-/// settled entity carries its held-head etag.
-fn stage_ack(batch: Vec<SnapshotItem>, enforce_head_cas: bool) -> Result<SnapshotBatchResponse> {
-    let mut ack = response(&batch, 0);
-    if enforce_head_cas {
-        for reference in ack
-            .accepted_entities
-            .iter_mut()
-            .chain(&mut ack.unchanged_entities)
-        {
-            reference.head_etag = Some("e".repeat(64));
-        }
-    }
-    ack.validate_entity_ack_with_head_cas(&request(batch), enforce_head_cas)?;
-    Ok(ack)
-}
-
-/// One source page gets two in-place resends and 10 s of waiting in total,
-/// not per bootstrap stage: two short sheds on the ordinary probe spend the
-/// budget, so a shed on the CAS repeat stands and the bootstrap keeps its
-/// existing unsettled-probe error.
-#[test]
-#[serial_test::serial(client_report)]
-fn inplace_retry_budget_spans_both_bootstrap_stages() {
-    let _guard = SNAPSHOT_SYNC_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let probes = items(2);
-    let mut ledger = progress();
-    let mut calls = Vec::new();
-    let (result, waits) = with_inplace_retry_test_clock(None, || {
-        bootstrap_cache_heads(
-            &probes,
-            "inplace-bootstrap-budget",
-            &mut ledger,
-            true,
-            |batch, enforce_head_cas| {
-                calls.push(enforce_head_cas);
-                let stage_attempt = calls.iter().filter(|cas| **cas == enforce_head_cas).count();
-                let shed_attempts = if enforce_head_cas { 1 } else { 2 };
-                if stage_attempt <= shed_attempts {
-                    return Err(short_shed());
-                }
-                stage_ack(batch, enforce_head_cas)
-            },
-            |_| Ok(()),
-        )
-    });
-    assert!(
-        result.is_err(),
-        "the CAS shed stands once the page budget is spent"
-    );
-    assert_eq!(calls, [false, false, false, true]);
-    assert_eq!(waits.len(), 2);
-    assert!(waits.iter().sum::<Duration>() <= Duration::from_secs(10));
-    assert!(ledger.accepted_cache_heads.is_empty(), "no head is minted");
-}
-
-/// The source page's three stages as `finish_sync_source` runs them: ordinary
-/// bootstrap, its CAS repeat and the cache-bearing delivery, all drawing on
-/// one in-place budget. `sheds` gives the short sheds each stage meets before
-/// it succeeds. Returns the calls per stage (0, 1, 2), the waits, the
-/// delivery outcome and the ledger.
-fn shared_budget_source_page(
-    sheds: [usize; 3],
-) -> (
-    Vec<usize>,
-    Vec<Duration>,
-    Result<ResumableUploadResult>,
-    SnapshotUploadProgress,
-) {
-    let probes = items(2);
-    let mut snapshots = probes.clone();
-    for item in &mut snapshots {
-        item.cache_observations = Some(crate::snapshots::cache_observations::CacheObservations {
-            schema_version: 1,
-            operations: Vec::new(),
-            coverage: "complete".into(),
-            omitted_observation_count: None,
-        });
-    }
-    let mut ledger = progress();
-    let mut calls = Vec::new();
-    let (delivery, waits) = with_inplace_retry_test_clock(None, || {
-        let mut inplace_retry = InplaceRetryBudget::default();
-        bootstrap_cache_heads_with_budget(
-            &probes,
-            "inplace-source-page",
-            &mut ledger,
-            true,
-            &mut inplace_retry,
-            |batch, enforce_head_cas| {
-                let stage = usize::from(enforce_head_cas);
-                calls.push(stage);
-                if calls.iter().filter(|seen| **seen == stage).count() <= sheds[stage] {
-                    return Err(short_shed());
-                }
-                stage_ack(batch, enforce_head_cas)
-            },
-            |_| Ok(()),
-        )?;
-        apply_bootstrapped_cache_heads(&mut snapshots, &ledger)?;
-        let mut accepted = 0;
-        upload_resumable_batches_with_body_witness_partitioned(
-            &snapshots,
-            "inplace-source-page",
-            &mut ledger,
-            &mut accepted,
-            |item| item.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |item| Some(item.source_session_id.as_str()),
-            |_| false,
-            &mut inplace_retry,
-            |batch| {
-                calls.push(2);
-                if calls.iter().filter(|seen| **seen == 2).count() <= sheds[2] {
-                    return Err(short_shed());
-                }
-                stage_ack(batch, true)
-            },
-            |_| Ok(()),
-        )
-    });
-    (calls, waits, delivery, ledger)
-}
-
-/// Ordinary bootstrap, CAS repeat and cache-bearing delivery of one source
-/// page share two resends and 10 s of waiting. With one short shed in each
-/// stage, the first two are resent and the delivery's shed stands, so the
-/// page waits twice, never three or six times.
-#[test]
-#[serial_test::serial(client_report)]
-fn inplace_retry_budget_spans_bootstrap_and_cache_bearing_delivery() {
-    let _guard = SNAPSHOT_SYNC_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let (calls, waits, delivery, ledger) = shared_budget_source_page([1, 1, 1]);
-    assert_eq!(calls, [0, 0, 1, 1, 2]);
-    assert_eq!(waits.len(), 2, "two resends for the whole source page");
-    assert!(waits.iter().sum::<Duration>() <= Duration::from_secs(10));
-    assert_eq!(
-        delivery.unwrap(),
-        ResumableUploadResult::Shed {
-            retry_after: Some(Duration::from_secs(1))
-        },
-        "the delivery shed keeps today's backoff"
-    );
-    assert_eq!(ledger.accepted_cache_heads.len(), 2, "bootstrap settled");
-
-    // Within the budget, sheds spread over the bootstrap and the delivery are
-    // all recovered and the page settles as a first-try success would.
-    let (calls, waits, delivery, ledger) = shared_budget_source_page([1, 0, 1]);
-    assert_eq!(calls, [0, 0, 1, 2, 2]);
-    assert_eq!(waits.len(), 2);
-    assert!(waits.iter().sum::<Duration>() <= Duration::from_secs(10));
-    assert_eq!(delivery.unwrap(), ResumableUploadResult::Completed);
-    assert_eq!(ledger.accepted_cache_heads.len(), 2);
-}

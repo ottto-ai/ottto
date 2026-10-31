@@ -76,13 +76,19 @@ the `sampled acquisition` text line: full-read reasons now come from
 Version 1 readers that need reasons must retain their text fallback while
 accepting version 1 binaries; there is no version negotiation.
 
+| Stage | Local fields | Meaning |
+| --- | --- | --- |
+| `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
+
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
 full/tail/unchanged selection counts describe acquisition decisions, including
 repeated or subsequently failed plans; they are not distinct file counts.
-`completed_native_bytes` and `completed_guard_bytes` count only completed
-sampled JSONL read plans. Failed reads, joined-file replay, discovery, headers,
-sidecars and independent identity reads are excluded. Zero here does not prove
+`completed_native_bytes` counts completed sampled JSONL read plans.
+`completed_guard_bytes` also includes actual returned head/boundary bytes from
+quiet-retirement validation attempts, including attempts that keep their debt.
+Other failed reads, joined-file replay, discovery, headers, sidecars and
+independent identity reads are excluded. Zero here does not prove
 zero filesystem work. Collection timing covers native initialization and steps,
 including time parked between steps, and ends before post-policy finalization
 and upload. A capped/partial page is still a completed page.
@@ -95,8 +101,59 @@ Their sum equals `full_selections`. It also records `priority_full_replays`,
 `audits_started`, `audits_completed`, `max_start_overdue_seconds` and
 `max_completion_overdue_seconds`. Separate `index_state_at_page_end` gauges
 record `pending_audits`, `overdue_audits` and `oldest_due_age_seconds` using the
-existing index calculations. These are state, not events; overdue work remains
-owed until full verification. Both objects are absent when sampling is null.
+existing index calculations. These three fields are state gauges. The same
+object adds page-event counts `audit_quiet_retired` and `audit_cap_full`.
+To keep the existing native page under its 4 KiB budget, `audit_cap_delay`
+emits a separate nonzero-only `sampled_audit_cap_delay` record on this carrier;
+`pace_evicted` is emitted by `sampled_audit_pace_alarm`. Values remain exact.
+Full counts actual per-file cap fallbacks; refused prefix/lossy completions and
+paced candidates count as delays. The RAM
+pace is six hours per key, 256 fixed slots, oldest-evicted on overflow. Its
+SystemTime clock expires on backwards time or jumps beyond 30 days. A restart
+allows at most one extra cap Full per key. Existing marked Tails stay enabled.
+A positive Full count emits `sampled_audit_cap_alarm` immediately (`> 0`);
+positive `pace_evicted` emits its own `sampled_audit_pace_alarm` immediately.
+Delayed paths keep their committed size and clear the existing source
+fingerprint as a durable reparse witness. It remains age-exempt across partial
+saves, restarts and context-changing traversal replacements; the watcher queue
+alone is not its custody.
+The clear uses the process-local rearm wrapper: a later Full reports
+`rearm_cleared{audit_cap_delay}` with its count and completed native bytes.
+That tag survives an index reload in the same process; a process restart loses
+the diagnostic tag while retaining the persisted retry witness.
+
+Due complete-c quiet retirement requires both samples, stable EOF/stamp and native
+completion/RAM admission. With an active durable store the scheduling marker
+remains until the same writer durably stores no debt and a second index CAS
+clears the marker. The existing diagnostics carrier then emits
+`sampled_audit_retirement` with `audit_quiet_retired` and `pending_audits`.
+The page's retirement count is zero while that receipt remains outstanding.
+Writer errors, skipped records and deferrals keep the obligation scheduled.
+Freed slots become usable on the next committed scan; the current page reserves
+them because partial-save reconciliation can restore an unacknowledged marker.
+Quiet retirement keeps the old Full verification time and grants no
+`audits_completed`, source, census or ACK credit.
+Before the deadline, incidental telemetry-only Unchanged reuse keeps the exact
+index and checkpoint debt. A cap Full keeps its frozen acquisition extent even
+though it cannot sample; independent grown-prefix/marker refusals still apply.
+
+`audit_retired_absent{events}` counts an obligation retired on positively proven absence:
+ENOENT on a no-follow descriptor chain from a readable configured root.
+A missing intermediate directory counts only beneath the nearest securely
+opened readable ancestor; all pinned directories are revalidated. Symlinks,
+dangling links, unreadable/missing roots and other errors keep it owed. Codex-protected history
+remains retained; this counter grants no Full or source/census credit. Account
+removal also emits `withheld_hold_released{deleted}`. Ordinary unavailable audit
+markers are never evicted.
+The absence predicate is shared with the hardened account-hold proof. The
+`audit_retired_absent` and deleted-hold counts currently use temporary traversal
+point carriers; integration must replace them with the shared account/absence
+diagnostics, preserving both retirement paths without double counting.
+Both keys and their count meanings are shared with the integrated diagnostics.
+Deleted-hold tokens aren't reported until the shared withheld-account
+bookkeeping lands. Whichever change integrates second must use one emitter for
+each count; the deletion fixture pins one emission per key, then none on retry.
+The sampled acquisition objects are absent when sampling is null.
 
 Additive version 2 Claude counts on the existing page/check-in carrier classify
 refused census-member NotFounds by the **existing immediate-parent metadata
@@ -176,18 +233,36 @@ lifetime memory high-water mark, not a collection/cycle peak or current RSS.
 `process_lifetime_max_rss_before_bytes` preserves the start sample when both
 samples are available and non-regressing; otherwise it is `null`. A rise
 correlates only with a process-wide time window, not allocation ownership.
-Unavailable measurements and regressing CPU deltas are `null`. Unix observation
-time and process id support comparison with an independently measured matching
-process. Never subtract or sum overlapping windows or infer per-stage memory
-use: the finish window contains its batch-call windows.
+`source_prepare` wraps synchronous source preparation (including index load
+and baseline construction); it emits an empty counts object on normal return,
+including errors or no-frame returns. Like `source_finish`, it emits no record
+on panic. Both stages, for Claude Code, Codex and Pi, include
+`stage_peak_footprint_bytes`, `stage_start_footprint_bytes`,
+`stage_end_footprint_bytes` and `footprint_samples` when available. One shared
+background thread samples current process footprint every 50 ms while stages
+are open and parks when idle. Start and end reads also contribute to the peak
+and successful sample count. macOS uses `TASK_VM_INFO.phys_footprint`, falling
+back to resident size; Linux uses resident pages from `/proc/self/statm`.
+These are sampled process-wide peaks during a stage, including concurrent work;
+shorter spikes can be missed. They do not establish allocation ownership.
+Up to 16 overlapping stages have independent bounded counters; overflow or
+thread-start failure leaves the measurements absent. `footprint_sample_failures`
+counts unavailable reads (or one refused sampler/slot attempt). Failed endpoints
+and wholly unavailable measurements are absent, as are all footprint fields
+on unsampled stages. Other unavailable measurements and regressing CPU deltas
+are `null`. Unix observation time and process id support comparison with an
+independently measured matching process. Never subtract or sum overlapping
+windows or infer allocation ownership: the finish window contains its batch-call
+windows.
 
 There is one bounded observation per completed page, batch call and normally
-returned finish, with two OS resource samples per observation, no per-row
-sampling, extra transcript reads or new diagnostic store. Version 2 adds one
-record per finish and removes one text line per sampled page; total log writes
-are not unchanged. Output is a synchronous best-effort write on the calling
-thread under std's stderr lock; errors are ignored, with no retry, queue or
-thread. It may block for the duration of a regular-file write, like existing
+returned prepare or finish, with two CPU/lifetime-RSS samples per observation,
+plus the bounded prepare/finish footprint sampler. There is no per-row sampling,
+extra transcript read or new diagnostic store. Version 2 adds one record per
+finish and removes one text line per sampled page; the footprint gauge adds one
+record per prepare. Output is a synchronous best-effort write on the calling
+thread under std's stderr lock; errors are ignored, with no retry or queue for
+log output. It may block for the duration of a regular-file write, like existing
 service stderr lines. Log output uses existing service retention and may be
 unavailable; diagnostic write errors do not fail collection or upload.
 Status/quota refresh, OTLP reception and independent metadata/discovery work are
@@ -210,6 +285,22 @@ memory-only for the process. While a key is held, its source's census stays
 retryable (red) for the whole hold, so census close, retirement and
 account-family proof wait for that source; a held key is not yet terminal
 disclosed residue.
+
+The `durable_tail` line also carries `store_write_after_save_failed[files]`
+(records offered to a post-save batch that returned an error; the store keeps
+their predecessors) and **`store_write_failed_restart_full[files,bytes]`
+(upper bound)**: Fulls whose restore refused the record as
+`ineligible.entry_changed`, with the completed native bytes those Fulls read.
+It is not an exact count of write failures. It reuses the existing
+`entry_changed` refusal, and no persisted marker records that a write failed,
+so it also counts a record that was never offered (deferred or evicted before
+the write) and any RAM-miss restore of such a record. Both are process totals.
+On the first counted file in a process, a `durable_tail_restart_full_alarm`
+record (`store_write_failed_restart_full` `[files, bytes]` and the
+write-failure total) is emitted at once, then at most once per 24 h in that
+process; a restarted process alarms again on its own first file. The counter
+remains the persistent signal. The mark and the alarm time are RAM-only;
+nothing is persisted.
 
 An absent record is a restore `missing` outcome and keeps the existing Full
 admission; it is not a held key. There is no `upgrade_state_missing` counter or
@@ -286,6 +377,38 @@ These are store bytes, separate from transcript re-derivation bytes. Counters
 on the durable pass summary are process totals; `take_pass` store receipts reset
 their flows while retaining disk levels. Alarm counts retain the delta/total
 contract above.
+
+### Claude Census Retirement Overlap
+
+A complete Claude terminal retires transcript census records whose file was
+last modified more than 35 days before the census window. An aged record that
+shares a request id with another unretired census record is kept instead, so a
+resumed copy keeps its cross-session copy proof while both files stay indexed.
+The terminal then emits `claude_census_retire_kept_overlap` with
+`census_retire_kept_overlap_records`, `census_retire_kept_overlap_hashes`,
+`census_retire_kept_overflow` and its two reasons,
+`census_retire_kept_overflow_occupancy` and
+`census_retire_kept_overflow_admission`, each with a `_total` process total,
+and `census_missing_over_budget`: the same terminal's census-full tombstone
+count (the shadow's `missing_over_budget`), so both read together.
+Kept records stay while the census, after the other aged records retire, is
+at most 90% full by both its hash budget and its serialized budget. Above
+that, the oldest kept records (equal ages in path order) retire until it is
+back at 90%, counted as occupancy overflow, so one index always yields one
+kept set. Kept records never cost another record its admission: a transcript
+record that does not fit whole first retires, oldest first, the records the
+age rule would retire at that window but that still hold their hashes, only
+as many as it needs; if retiring all of them would still not admit it, none
+retires and the record is tombstoned as before. Each such insert emits a row with zero kept counts, no
+`census_missing_over_budget`, and the records it retired as admission
+overflow. The census holds at most 65,536 records, live as on load: a new
+transcript key past that gets no record (read as missing) and emits a row
+with `census_record_limit_refused` = 1 and no `census_missing_over_budget`.
+Every row carries `census_record_limit_refused` and its `_total`. A positive
+overflow, by either reason, or a positive refusal also emits
+`claude_census_retire_kept_overlap_alarm` with the same counts. Each terminal
+decides again, so a kept record retires once its partner is pruned or
+retired. Counts only; no path, id or wire event.
 
 ## Credential File Cap Refusals
 
@@ -366,12 +489,308 @@ page events, not gauges, and are never summed across observers:
   page ending or being dropped mid-file. A file the observer skipped is not
   counted. A later page can count the same file again.
 
-`counts.line_delivery_unselected` counts discovery skip decisions for the
-page's source: `age` (outside the backfill window and not held for
-verification) and `size` (over the source's file-size cap). They are recorded
+**Owed-key discovery retention.** `DiscoveryRetention` (`snapshots.rs`) is the
+one shared exemption from the discovery window, used by every age gate: the
+Claude/Pi walk, candidate revalidation and open, the Codex roster and
+`codex_parent_outside_window`. A key owed by a registered source stays
+discoverable and observed whatever its age while it is owed, so reconciliation
+never prunes it. Its growth goes through the counted Tail path. Only a validated
+catch-up or a proven, counted removal releases it, and it is never a Full cause.
+File-size caps still apply. Registered sources today are the unverified
+sampled-generation marker (any source) and Claude withheld-account holds. A new
+owed source (a Codex owed-residue set, a compressed hold) registers as one field
+plus its lines in `discovery_retention!`, `unverified` and `owes`; it adds no
+separate exemption.
+
+`counts.line_delivery_unselected` counts discovery skip decisions for the page's
+source: `age` (outside the backfill window, not held for verification and not
+withheld for an unresolved Claude account) and `size` (over the source's
+file-size cap). `withheld_oversized` counts the decisions, at the walk,
+candidate revalidation or open, that keep an over-cap key observed without a
+full parse while its parsed revision is withheld for an unresolved account: the
+entry and hold stay, and growth past the cap is not read. They are recorded
 after the existing decision, are drained by that source's next completed page,
 and count repeated decisions, not distinct files or bytes. They are recorded
 whether or not an observer is registered.
+
+`DiscoveryRetention::owes_with_len` also retains a file whose current length
+exceeds its committed indexed `size_bytes`, using metadata already available at
+the age gate. Grown since committed: retention ends when the growth is committed
+(`size_bytes` catches up). Untouched and truncated files gain no exemption. This
+covers the walk, candidate/open rechecks, Codex roster and opened parent.
+`counts.discovery_retained.grown` counts aged growth-retention decisions by
+source on the #799 page line, drained per page and omitted at zero. It counts
+one event per gate check, even if another retention source also matches; a file
+may pass several gates. Oversized growth stays observed for reconciliation
+without a full parse under the existing size cap. Retention grants no new
+Full-read cause. Directory traversal does not prune old directories by age. This
+arm performs only an indexed committed-size lookup and reuses current metadata,
+adding zero stat calls and zero directory walks; all discovery remains inside
+the existing per-pass walk budget. Tail starts at the committed extent where the
+RAM layout is supported. Unsupported layout, restart or eviction takes the
+existing counted Full fallback; shrink retains A2.
+
+After a successful index save, the existing `local_resources` schema also emits
+`stage: discovery_growth_fate` for any page that observed indexed growth. The
+same `DiscoveryRetention` collects metadata already available to the walk,
+roster, candidate and open gates, including size refusals, for **all sources**
+(Claude, Codex and Pi). `counts.discovery_retained_grown_fate` gives one outcome
+per observed key: `committed` when the saved index extent catches up to the
+observed length, `still_retained` when it remains behind, and `unindexed` when
+no saved entry remains. This is evaluated after held-key restoration and index
+save, including partial checkpoints; a completed parse alone cannot count as a
+commit. It is an extent comparison, not an upload ACK or verification grant.
+The row is a snapshot of that saved page, not an additive lifetime total. The
+older `discovery_retained.grown` remains the separate per-age-gate flow counter.
+
+`counts.discovery_retained_grown_age` counts only the still-retained keys in
+that snapshot: `le_30d`, `d31_90`, `gt_90d`, and `unknown`. Age is a **wall-clock
+estimate since the last available file mtime**, recomputed at save time, not a
+persisted growth/hold start time or a retry deadline. Touches can reset this
+estimate; missing or future mtimes are unknown. A page includes recent growth
+as well as age-exempt growth. It does not estimate undiscovered keys, unparsed
+usage or bytes appended after its last metadata observation. Repeated gates
+for a key update one observation instead of multiplying its population count.
+
+This is page scratch in the existing resource probe and then scan result,
+charged by the scan owner's existing heap accounting. It is discarded with the
+page, adds no persisted field or cross-page ledger, and performs no additional
+stat, transcript read or directory walk. Scratch admits at most 4,096 observations per page, below the existing
+10,000-entry discovery-tick bound. `counts.observation_overflow` reports refused
+diagnostic observations (possibly repeated), making coverage explicitly partial
+when roster/selection observations plus walking exceed it. This diagnostic cap
+never caps growth retention. A failed save emits no committed outcome; a page
+that never reaches a save has no fate row. Population/age rows describe bounded
+page observations, not a whole-index census.
+
+Retention changes no refusal/backoff or acquisition decision. Unchanged account
+refusals keep the existing content memo skip; oversized growth remains observed
+without parsing each pass. The dedicated `discovery_growth_tests` fixtures cover
+real account-hold classification, Completed restoration and two unchanged passes
+with zero extra body bytes, saved catch-up, and oversized aging in all three
+sources. Existing identity/anchor controls remain in
+`reread_trigger_content_tests::truncate_regrow_with_unchanged_samples_is_reread_by_mtime`,
+`transcript_acquisition::tests::head_and_old_boundary_edits_growing_file_reset_to_full`,
+`transcript_acquisition::tests::shrink_and_replacement_reset_even_with_identical_samples`,
+`fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure`,
+`fe_claude_sp5b_regrow_after_reader_passes_frozen_with_new_head_refuses`,
+and `sampled_scan::durable_tail_tests::certificate_sample_truncation_is_shrunk_for_both_windows`.
+They retain counted rebuilds for observed rewrites/shrink/sample mismatches;
+length-only retention grants no Tail authority. Existing sampled acquisition's
+accepted unsampled-interior-edit limitations still apply.
+
+Oversized retention costs count attempts, not unique files. An
+over-cap grown file cannot commit the unread suffix: it stays observed and is
+counted in both grown retention and size refusal on every eligible pass,
+indefinitely until its state changes. Counting has no once-per-process cap.
+Codex's already-known unterminated EOF fragment is excluded from grown retention
+and its fate/age population when a validated cursor certificate and retained
+prefix reduction bind the entire residual to the unchanged object. This RAM-only
+binding reuses discovery metadata (no additional stat), requires known birth,
+and grants no audit completion or custody release. The selector also requires
+the existing sampled fingerprint to match, after independent audit/context gates.
+Real extra bytes, termination, replacement or missing binding use the ordinary
+counted catch-up path; a length difference alone never proves a known fragment.
+
+The fragment-only Codex exclusion holds within a source preparation; the witness
+isn't retained across index reloads yet, so an aged, unchanged unterminated-fragment
+Codex file may be counted grown and Tail-read once per preparation past the window
+(bounded; never Full). Follow-up: cache-retained witness.
+
+The retained-cache residual is **at most one Tail per unchanged unterminated
+fragment per source preparation; never Full; fail-open; fragment bytes only
+(from the committed fragment offset to EOF)**. A preparation is a fresh source
+scan frame: the ordinary rotation offers each due source once per sync cycle
+(`snapshot_sync.rs:4569`, index reload `:6051`), after its negotiated cadence and
+backend-backoff gates. Resuming a parked frame's `step` does not reload it.
+Each admitted Codex continuation worker page also prepares and reloads its own
+frame (`snapshot_sync/continuation.rs:1078`, `snapshot_sync.rs:6528,6594`); it is
+not limited to once per outer sync cycle. Thus the bound is per preparation,
+not per process or per day.
+
+On the #799 Codex `native_collection_page` line,
+`counts.codex_fragment_tail_repeat{files, bytes}` counts this residual using the
+approved fallback: actual aged Tail completions with no RAM fragment witness,
+an unchanged sampled source fingerprint, a start equal to the committed prefix,
+an end at the observed EOF and no newly terminated record. `files` counts read
+attempts, not unique paths; `bytes` is the native fragment range, excluding
+identity/guard samples. It is recorded after reading, never used to select or
+pace a read, and drained per emitted page. It does not count Full reads, real
+appends/completed records, or in-preparation Skips with a retained witness.
+The literal never-Full bound describes the retained, valid prefix-cache case;
+true cache loss, unsupported layouts and due audits retain their separately
+named existing Full causes and are outside this Tail-repeat counter.
+
+
+Withheld ownership debt is a **correctness hold**: it stays Unknown, remains
+discoverable while recorded, and publishes or settles nothing until resolution
+or eligible absence. The approved interim Full exception is the named, counted
+`withheld_reparse{start,evidence,growth}` path; it is unpaced because it publishes
+nothing and matches main's recovery. This is not a Full cause for arbitrary
+ownership holds. At the 4,096-hold cap new unrecorded debt stays withheld/Unknown
+without an invented age exemption; unknown identity cannot grant a memo Skip.
+
+On Claude pages, `counts.withheld_reparse` counts re-parses of keys withheld for
+an unresolved account: `start` (first in this process), `evidence` (same size,
+but the sampled content, the file object, its api/trace sidecar stamps or the
+request identity contract changed) and `growth` (the size changed). A withheld
+key whose content and evidence are unchanged is skipped and not counted; an
+mtime, ctime or xattr change alone causes no parse or line delivery; existing
+bounded identity samples still read the opened file. A validated completed parse
+records its content witness immediately. Equal committed fingerprints never
+grant an ordinary Skip to a recorded hold without that CONTENT witness. Missing,
+refused or poisoned advisory state recovers through the existing counted parse;
+genuine authority/correction/rearm constraints retain priority. Unknown object
+generation (including missing birth identity) fails closed to that same path. A
+past-due sampled audit on such a key is deferred to its next counted re-parse
+(it cannot settle while held). Restored upload-context, body-witness adoption
+and missing-activity repair debt likewise cannot settle an account hold on
+unchanged content. The completed CONTENT witness is scoped to the active body
+revision and upload context: within that authority it defers repeated local
+adoption/activity repair, including after one counted restart/discard recovery.
+A newly activated revision/context, actual quarantine retry, family correction
+or genuine external rearm still selects independently. W2 token/age disclosure
+remains available while the memo is admitted. The memo behind that skip is RAM only.
+`counts.withheld_birth_clamp_accepted.events` counts an accepted backwards
+birth/mtime clamp, emitted on the Claude page and drained per page (numeric
+only, not unique keys). A completed RAM CONTENT memo may continue only with the
+same device/inode, length, bounded samples and account/output evidence, a
+strictly earlier known birth, and birth exactly equal to mtime in the platform's
+normalized nanoseconds. Acceptance updates the memo birth to that clamp once;
+identical later passes neither re-parse nor recount it. This is platform-neutral
+code: Linux normally retains birth unchanged. Forward birth, unequal birth and
+mtime, changed identity/content/evidence or unavailable identity keep the
+existing fences and counted acquisition paths. This avoids parse/line delivery;
+existing bounded identity samples remain. No new persisted state or read occurs.
+
+Known gap: APFS birth-clamp continuation accepts an object with an identical [device,inode], length, bounded samples and evidence whose birth moved down to its mtime. A reused-inode replacement crafted to match all of these (unsampled interior differing) would inherit the withheld memo until binding or real change. APFS does not reuse inode numbers in normal operation; Linux cannot produce the signature. Counted by withheld_birth_clamp_accepted.
+The effect is a withheld memo Skip until binding or a real change, never a wrong upload; no unprivileged continuity witness is available (`st_gen` needs root). No ACK, census or money credit is granted.
+
+The virtual N1 audit delay is a **bounded/transient scheduling hold**, ending at
+its existing due time. Unknown identity or resource refusal grants no new Skip
+or completion credit. It applies only to an aged grown key admitted solely by the
+grown-since-committed retention arm. A recent grown key keeps main's immediate
+TranscriptChanged selection. At its retained due time, the aged key takes the
+existing Audit cause. Main's #903 fixes virtual-deadline to sampled-marker
+conversion: restoration carries the minimum owed due time, and only a successful
+secure open marks the slot attempted. Failed opens preserve the owed due time;
+stat-aware backoff and parking pace retries. The RAM backoff map admits 256 keys;
+longest-quiet eviction is counted and transfers the evicted owed deadline into
+the next slot, failing toward reading rather than dropping the obligation.
+
+`counts.withheld_hold_released` counts released holds: `deleted` (the held file
+was proved absent), `deleted_tokens` (its last-known withheld tokens, when
+available), and `resolved` (a parse bound the account). A held audit obligation
+is retired only after two consecutive rooted NotFound observations at least
+600 seconds apart under the same validated parent, after a later directory
+walk has started and completed (details below). Elapsed witness time uses
+RAM-only monotonic `Instant`, independently of wall-clock corrections; an earlier
+monotonic observation resets the sequence. Each observation uses
+`sampled_audit::proven_absent`: ENOENT of the file or a missing intermediate
+directory beneath a readable configured root. Descriptor-relative nofollow
+opens revalidate the chain before accepting absence. The existing capped memo
+pins the nearest existing parent's descriptor and missing-component depth
+between probes; inode reuse cannot substitute a different parent. Presence,
+symlink/non-directory ancestors, permission errors, parent replacement,
+missing/unreadable roots or unavailable memo state reset the sequence and keep
+debt. Restart loses the witness and requires two new observations. Descriptor
+open failures also fail closed. The memo admits at most 32 retained parent
+descriptors and at most one eighth of the process soft descriptor limit; failure
+to query the limit refuses admission. Unadmitted keys keep their debt and retry
+on later inventory passes as admitted keys retire.
+The inventory probes at most 4,096 recorded holds at each Claude page end,
+including held-new keys, outside aggregate terminal authority. These are metadata-
+only rooted openat walks, never transcript reads. A pinned parent on a removable
+root can delay eject for at least 600 seconds. Each discovered held-file presence
+check resets its witness using one key construction and memo lookup. Indexed reconciliation and removal hints
+share this eligibility gate; generic file removal preserves account holds.
+Retirement preserves audited fingerprint incidence and existing ACK custody,
+and counts `counts.audit_retired_absent.events` when it removes audit debt and
+`Vanished::RequestCensusRemoved` when it removes a request-census record. It
+provides no Full, source, census, manifest, ACK or money completion credit.
+Codex-protected entries keep their separate protected history.
+`counts.withheld_hold_unrecorded` counts refused admission attempts past the
+4,096-hold cap (`events`) and their withheld `tokens`; these are attempts, never
+unique keys. Admission follows the completed-parse order; existing holds remain
+updateable. Such an unrecorded key has no hold age exemption and remains
+Unknown; no $0 is invented. All three are drained like
+`line_delivery_unselected`. `counts.withheld_memo` is a gauge of that memo:
+`entries` (at most 4,096) and `retained_bytes`, the bytes charged to the sync
+owner's process-retained bound using a conservative layout-independent allowance
+(1,536 bytes per entry for a possible B-tree node, boxed content witness and
+pinned absence witness, plus a
+root and state header).
+Codex-version, native-comparison and continuation graphs are admitted first;
+this memo is charged only from the remainder. Its own refusal drops only the
+memo details and cannot discard those admitted sibling graphs or BASE-exit
+native comparison. An unsupported sibling alone does not discard a memo that
+fits the available allowance. Persistently refused memo details remain unknown
+and require the existing counted recovery path until they can be retained.
+An empty memo releases its B-tree root and optional heap charge. The existing
+transcript-cache owner shares the memo with its working index handles in all
+builds; rotation prices its optional state once. The completed content witness
+is a fixed 64-byte value boxed in the memo. A compact map entry and its box fit the same
+existing per-entry allowance; pending completion owns its value inline. `counts.withheld_held_tokens` is a gauge of the withheld
+tokens across recorded holds (each key's tokens at its last parse), and
+`counts.withheld_held_age` counts those held keys by wall-clock estimates since
+this process first recorded them held: `le_30d`, `31_90d` and `gt_90d`. Both are
+counts only and RAM only, and omitted while nothing is held.
+`counts.withheld_held_count` discloses the durable population;
+`withheld_memo_unavailable: true` explicitly discloses missing/refused advisory
+details, omitting unknown tokens/ages instead of reporting zero. First-seen
+resets on restart or refused retained charge, so these wall-clock age estimates
+are a lower bound; after a restart each held key re-enters on its one `start`
+re-parse. A released key (resolved, deleted, or dropped from the hold map)
+leaves both. The map is charged with the memo.
+
+A held file whose rename preserves its member (session stem/subagent root)
+within a configured root keeps its **correctness hold**. Before age rejection,
+both bounded directory discovery and candidate gates (including watcher hints)
+reuse the birth/move owner's recorded physical generation (device/inode, known
+birth and append-compatible extent). Proven custody moves its hold, indexed
+audit debt, incidence, stored copy-removal groups/retry age, money marks and
+advisory memo to the destination. Copy proofs naming the moved holder follow it.
+The owned committed baseline follows before held-result restoration. Moving
+custody grants no upload, ACK, census or release credit. An indexed destination
+keeps its current checkpoint/exact incidence; carried-ACK custody preserves the
+prior incidence, and only the normal classifier resolves transferred debt.
+
+Temporary bounded member lookups are derived once per walk/selection batch or
+page, with at most two observed paths per held member. They are not move proof
+or another registry. No extra walk, stat or transcript read proves a move: the
+walk/candidate gate reuses metadata it already holds. Unknown, replaced or
+ambiguous identity keeps old-path custody; filesystems without birth time keep
+but never move that hold. The existing observed-key view records same-member
+presence even when age skips it. An ambiguous surviving sibling can retain the
+stale hold indefinitely, consuming a slot under the 4096 cap and delaying complete
+rebuild. `counts.line_delivery_unselected.withheld_absence_ambiguous` counts each
+F4 refusal for that reason (probe decisions, not unique files).
+
+F4 additionally requires a completed directory walk whose traversal window is
+later than the one at the first NotFound. Pending directories keep the witness
+but cannot authorize release; unreadable coverage, directory-entry cap refusal
+or ambiguous presence resets it. Two validated NotFound probes under a retained stable parent must
+still be at least 600 monotonic seconds apart. A resumed old generation, even if
+held open beyond 600 seconds, cannot retire the hold; a restart loses the RAM
+witness and waits again. This uses ordinary bounded traversal only. Renames
+that change the member are not attempted, and out-of-root destinations are not
+covered; these retain ordinary positively proven deletion semantics. Hold caps
+and ordinary size gates remain.
+
+Known limitations: same-size middle-only rewrites remain Ron's accepted interior-edit residual.
+Evidence outside stamped inputs (including API/trace metadata tokens and
+reader-health recovery) wakes only after restart: a delay while a recorded hold
+keeps the file discoverable, not an age-based drop. A never-binding account
+keeps usage off the server; token/age disclosure is implemented, and
+bounded-lifetime release remains a SOURCE follow-up.
+
+`counts.source_rotation_serial_fallback` counts failed parking decisions while
+sibling sources wait, drained by that source's next completed page. Closed
+causes are `unsupported_layout` and `bound_refused`. A refused bound (`None`)
+covers both opaque ownership and over-limit frames; it does not distinguish
+their causes. Unavailable shared allowance also uses `bound_refused`.
+Each decision continues the same owned frame serially and counts once; ordinary
+serial turns with no waiting sibling do not count.
 
 ## Context Footprint Discovery
 
@@ -613,6 +1032,78 @@ OTLP sources can serve again. A busy approved port can then produce the mismatch
 finding above. Without an approved candidate, the fallback chain applies immediately.
 Startup retains its existing behavior of falling back if the approved port is
 busy.
+
+## Claude Stale Exporter Port
+
+Claude Code keeps its telemetry endpoint for the life of a session. Ottto can
+serve up to two older approved candidate ports on loopback, accepting only
+`POST /v1/logs`, `/v1/metrics` and `/v1/traces` through the same local export
+handler. Control and health routes return 404 on these listeners. A private,
+versioned port record retains the newest two previous approvals. On first
+approval it seeds once from retained Ottto-owned Claude settings backups,
+reading at most the newest ten JSON backups with the existing size and
+no-symlink checks. Ports must be in the current user's relay candidate list;
+seed discovery does not guess ports or connect to them. Busy ports are skipped
+and retried every 60 seconds. Legacy binds first probe IPv4 and dual-stack
+IPv6 wildcard addresses, then bind IPv4 loopback. Successful wildcard probes
+stay bound through the loopback bind and listen, closing that acquisition gap.
+All three binds use `SO_REUSEADDR`: live wildcard or IPv4 loopback listeners veto
+the port, while our connected sockets and TIME_WAIT allow immediate replacement.
+IPv4 remains available when the probe reports that IPv6 is unavailable.
+A port observed as the current approval is removed from legacy ingress; primary
+recovery releases that legacy socket before attempting its bind.
+
+Every legacy export rechecks Claude endpoint approval and the listener's live
+approval generation immediately before capture. Refused exports return 403 and
+store no evidence or successful-request activity. Claude telemetry disable,
+default-approval removal and setup opt-out operations invalidate that generation
+synchronously and wait up to two seconds for the supervisor to persist
+retirement and close sockets. Secondary-account removal
+and browser-login cleanup preserve legacy listeners and default approval;
+acknowledgement waits never hold the Claude settings lock. Each tick captures
+its generation before reading approval, so a concurrent revoke also fences
+sockets created later in that tick. A pending revoke also blocks exports and
+new/refreshed listener activity until retirement is persisted and sockets close.
+Periodic checks retire ports only after two consecutive definite non-approval
+reads. I/O errors, missing
+settings and truncated or unparsable JSON are unknown: that export is refused,
+but listeners/history are preserved and the consecutive-revocation streak resets.
+Idle expiry also retires a port. Retirement survives restarts and prevents
+re-seeding or reopening until that port is explicitly approved again and then
+superseded. The primary listener continues its existing behavior for all sources.
+The optional record is separate from existing daemon formats: older daemons
+ignore it, and missing fields or unknown extra fields decode without error.
+Retirement is persisted before socket closure, with a separate owner-only
+`legacy-relay-retired.json` tombstone protecting against replay of a stale main
+record after a failed write. A write failure closes legacy listeners and attempts
+to remove the stale main record. If both state and tombstone writes fail,
+compatibility supervision stops and logs the failure; retirement may be unknown
+after restart. Existing atomic-file durability guarantees apply.
+
+A legacy entry retires after 24 hours without a successful OTLP request, starting
+when it enters the persisted record even if a busy port never binds. Entry time
+and request activity persist across daemon restarts; activity writes are
+limited to once per 10 minutes, so a crash can lose up to that much recent
+activity and shorten retention. No request content or identity is in the port
+record. The primary relay's `/healthz` response includes process-local counts
+under `legacy_relay`: `otlp_legacy_listener_bound` (current gauge),
+`otlp_legacy_listener_requests`, `otlp_legacy_listener_busy` and
+`otlp_legacy_listener_closed` (cumulative counts since process start). Busy means
+bind attempts skipped. Closed counts only actually open sockets released,
+including on supervisor exit; retiring a never-bound entry adds no close.
+With no open sockets the supervisor waits until its next tick or a command.
+Live sockets drain up to 16 pending connections per turn. Resource-related
+accept failures back off; unusable sockets release for later tick rebind, keeping
+recent request activity. Release checks descriptor ownership before closing. Accept
+error logs are limited to one line per minute per socket.
+
+Canonical health reports `claude_stale_exporter_port` as a `Warning` owned by
+`source`, with runtime authority, while a legacy listener has accepted OTLP
+within the last hour in this process. Restart those Claude Code sessions to
+reload the current telemetry endpoint. The uploaded warning contains no port
+number. It follows blocking account and source findings in the blocker list.
+This restores future local evidence; it cannot recover dropped batches
+and does not change consent, account attribution or money calculations.
 
 ## Common Diagnostics Flow
 
@@ -961,6 +1452,93 @@ Capacity/availability retain their existing degraded behavior. Full-cause
 admission and its other counter projections arrive in subsequent slices.
 
 
+## Claude Family Census Shadow (schema 2 additive)
+
+Each Claude Code scan page emits one `local_resources` record with stage
+`claude_family_census_shadow`, under `counts`. It estimates, per session family
+(a root transcript and its subagents), whether the family would be complete in
+the current census window. It is shadow-only: the record changes no read,
+census bit, manifest, upload, retirement or other decision. Other sources emit
+no such record. The row holds counts, ages, fixed reason names and one order-free
+digest; no paths, ids, account hashes or request hashes.
+
+**Units.** A page evaluates the families its selection touched
+(`touched_families`, with `touched_families_over_cap` beyond the bound of 1,024),
+the families its previous page parsed (`followup_families`), and up to 64 others
+from a rotating cursor (`rotation_families`). Family counts are evaluations on
+this page: a family can repeat across pages, so they are neither distinct
+families nor a stock, and rows must not be summed into one.
+
+**Strict partition.** Every evaluated family (`families_evaluated`) is exactly
+one of `family_census_complete`, `family_complete_deferred.quantum` (complete past
+the limit of 64 per page), or one first-match reason in
+`family_census_incomplete`, tried in this order: `membership_unknown`, `queued`,
+`refused_read`, `refused_read_unattributed`, `held`, `quarantine`, `residue`,
+`evidence`, `evidence/presence_only`, `not_current_window`, `path_not_unique`.
+`singleton_families_evaluated` is included in `families_evaluated`.
+`families_unevaluated_member_budget` counts families left for a later page, which
+are not in `families_evaluated`.
+
+**Freshness.** `pending_census_members` describes the skipped set: `count`
+(queue plus replay entries), `replay`, `replay_repeat`, `oldest_age_s`,
+`over_24h`, `tracked`, `unqueued_unresolved`, `pace_evicted` and `stamped_for_s`.
+`skipped_set` holds `digest` and `retained`, the entries the previous page also
+skipped. `sticky_vetoes` holds `namespace_loss_age_s` and `unattributed_age_s`,
+null when the veto is not latched. These are process-local, and restart, a scope
+change or an eviction (`pace_evicted`) resets them, so every age is a LOWER BOUND
+across a restart and `stamped_for_s` caps it. Attestations reset the same way, so
+after a restart members count `evidence/presence_only` until ordinary work attests
+them again. Attestations and vetoes also reset with each new traversal generation.
+
+**Work counters.** These are approximate units, not exact operations.
+`member_keys_visited` is range advances of the member lookups, at most 16,384.
+Under `cost`: `root_index_keys_processed` is keys the uniqueness pass consumed,
+at most 8,192, plus one check per parse; the merged loop may also peek up to 2
+keys it does not count. `rotation_keys_visited`, `queue_entries_visited` (two
+passes over the queue, not bounded by a constant) and `history_gates_visited`
+count entries. `predicate_cpu_us` is thread CPU, and excludes mutex wait.
+`families_evaluated`, `attested_keys`, `attestations_evicted` and
+`runtime_heap_bytes` (retained shadow state after the page, excluding page
+transients) are gauges. `root_index_restarted`, `root_index_complete`,
+`root_index_overflowed`, `queued_roots_overflowed` and `history_gates_overflowed`
+are flags. At the top level, `shadow_decision_calls`
+and `shadow_attest_micros` measure this page's equality attestation, and
+`attest_capped` counts Skips past the limit of 4,096 per page, not attested.
+
+**Zero and unavailable.** A zero count is a real zero for that page. An absent
+record means the page had no traversal state or was not Claude. Uniqueness is
+unavailable while `cost.root_index_complete` is false, and families then count
+`path_not_unique`.
+
+## Pi reported-cost parsing
+
+Pi cost fields use checked decimal arithmetic and an inclusive $100,000 ceiling
+per field per source record. Negative values, including numeric or string `-0`,
+and malformed fields remain Unknown. Arithmetic overflow or a value above the
+ceiling also remains Unknown, preserving valid sibling fields. Strings retain
+their original decimal lexeme; JSON floating numbers use serde_json's shortest
+round-trip f64 representation because their original lexeme is unavailable.
+Integers remain exact.
+
+More than twelve fractional decimal places after applying the exponent rounds
+half-to-even to picos. `pi_cost_precision_rounded` counts each accepted field with
+that precision, including trailing zeros and values rounded to zero. It measures
+lexical source precision, not an anomaly: Pi computes costs with floating point,
+so their decimal representations often carry more than twelve fractional digits.
+`pi_cost_refused_overflow` counts each field refused for arithmetic overflow or
+the ceiling, including a sub-pico excess above it. A string lexeme whose digits
+overflow checked `u128` arithmetic also counts, even when its mathematical value
+is in range; that field safely remains Unknown. Other invalid fields do not increment
+these counters.
+
+Both counters are cumulative saturating process totals in the lifecycle registry,
+reported through `process_retained_cache_lifecycle_totals`. There is no labelled
+log line or per-line diagnostic emission. Counts are per observed usage line,
+before response deduplication, timestamp drops and token-field validation;
+rereads count again. Shape probes do not count. These are observations rather
+than retention failures.
+
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with
@@ -1128,3 +1706,210 @@ values.
 A later complete native parse still emits its exclusive body for a session with
 an earlier state-only row. An emitted total alone does not prove a server-side
 overwrite; backend authority rules independently govern successor acceptance.
+
+## Claude request-identity cap priority
+
+`native_collection_page.counts.identity_cap` contains sparse page observations
+for `retained_buckets`, `refused_new_buckets`, `accepted_state_unknown`, and
+`accepted_overflow.{same_as_parent,differs}`, `accepted_share_changed`,
+`unpriced_part_untagged`, `accepted_row_vanished` and
+`accepted_state_unknown_cause.{no_key,epoch_changed,untracked_session,incomplete}`.
+Labels are append-only.
+`accepted_share_changed` counts bucket observations where a previously accepted
+row gains a different authority or loses a tagged share/presence. Unchanged
+shares stay tagged; changed/missing shares become untagged with one refusal
+per affected row. Such a bucket is not counted as retained.
+`accepted_state_unknown_cause` splits each `accepted_state_unknown` attempt
+into exactly one cause: `no_key` (no usable attribution key, so share
+protection is off while shares are still tagged), `epoch_changed` (this pass
+discarded hints of a different key epoch), `untracked_session` (no hints for
+the session: never stored-body ACKed, evicted or invalid) or `incomplete`
+(whole buckets evicted at the share limit). `accepted_row_vanished` counts
+frozen tagged rows absent from their still-present accepted bucket, such as
+usage moved to a new row key by late effort or billing resolution; it is
+counts-only and changes no tag or money.
+
+The final derived rows mirror the receiver's identity-part money presence
+rule: a row carrying a cost field needs it on every part. A share whose
+contributing buckets all lack a cost its priced row carries has no exact
+value, and no zero or guessed identity stands in. That whole model row (top
+row and every bucket row) goes out untagged with unchanged money and one
+refusal per newly untagged bucket row; orphaned evidence is pruned and the
+wire is reconciled again. `unpriced_part_untagged` counts such model rows; a
+stripped row with frozen accepted shares also counts in
+`accepted_overflow.differs`.
+
+The default classifier always uses `differs`: a local starting login, creator
+hint or display cannot prove the backend's parent binding. Zero
+`same_as_parent` is explicit when this object is present. Counts describe tagging
+attempts, including retries, rather than distinct sessions.
+
+Within the existing item caps, acknowledged tagged buckets have priority over
+never-acknowledged buckets. If those accepted buckets overflow, a fitting open
+current-hour accepted bucket has priority; settled buckets are considered newest first, preferring to drop the oldest
+within the classifier's priority. One unencodable bucket does not erase
+independent accepted proof; the complete accepted set is checked first. Dropped usage goes out untagged with a
+row refusal; there is no upload hold. Top-level shares are refolded from exactly
+the kept bucket shares and the untagged remainder, as required by receiver
+reconciliation. Evidence is pruned and references remapped. Display names only
+accounts still proved by emitted bucket rows.
+
+Accepted overflow removes buckets from the collective set in that drop order,
+using reversible per-share sums and money-presence counts. A bucket need not
+fit alone: multiple buckets can collapse a temporary top-level parts row. Only an unavoidable representation
+lower bound can exclude an impossible bucket before the collective check.
+Row byte deltas and reference widths are updated incrementally; allocation
+does not serialize the growing item for each candidate or removal.
+
+Money follows the receiver's presence arithmetic independently for all five
+cost fields: add present values, ignore absent contributions, and leave the
+sum absent only if none was present. All eight counters sum exactly. There
+is no unpriced-witness rule: an absent contribution cannot erase known money.
+Re-admission can complete a shared top row when this collapses Parts to Single;
+failed row completions are cached until selection changes. The byte budget
+includes the existing semantic envelope, the largest policy flag encoding and
+a possible cache predecessor. The upload owner reserves any cache reconciliation
+growth once before selection, without changing the local cache patch. Full
+wire size is checked again after allocation; 640 KiB is unchanged.
+Individual shared-row completions are tried before their union, so unrelated
+new buckets sharing another row cannot prevent a fitting accepted completion.
+
+The destination-scoped upload progress stores class L hints: hashed session
+keys, sorted bucket starts, and SHA-256 row/authority fingerprints of each
+row's first accepted share set, including whether an untagged share was present.
+It never stores or reconstructs identities. Only stored-body ACKs update it;
+a later stripped/refused ACK cannot bless a new authority or missing presence.
+Restoration still requires current held proof. An always-missing sibling row
+has no accepted tagged fingerprint and is not spuriously refused.
+
+Limits are 16 sessions, 5,000 starts and 1,536 share-presence records per session.
+Each share record occupies 80 inline bytes on the requested 64-bit layout;
+the maximum requested-layout fixture is 2,628,072 bytes (below 3 MiB). Whole buckets are
+evicted from the hint ledger at the share limit, never partial share sets;
+`accepted_state_unknown` counts attempts using incomplete or missing state.
+Eviction, timestamp-only migration and older-decoder loss degrade to currently
+proved buckets that fit. The append-only progress field still defaults empty;
+invalid L hints do not invalidate neighbouring billing ACKs. No wire cap or
+backend rule changes.
+
+The pure `measure_identity_cap(item, accepted_state)` hook returns
+`tagged_recent_buckets`, `refused_recent_buckets`, `accepted_retained`,
+`accepted_overflow` and `item_bytes` without reading evidence, logging or
+uploading. Here recent means the currently proved, never-accepted candidate
+buckets; already stripped proof cannot be recovered from the hint ledger.
+
+Upstream authority-key allocation loss remains fail-closed: inherited partitions
+are not reclassified as request proof by budget recovery or a uniform starting-account
+retry. Only an intact current grouping can enter the cap allocator.
+
+### Option (ii): `identity_retained` bucket rows
+
+Off unless the activity hint carries exactly
+`session_request_identity_retained_contract: "session_request_identity_retained:v1"`;
+any other value keeps the bodies above byte-identical. When on, the backend
+retains per-row proof, so the accepted priority is not used: fresh tags take
+the plain newest-first order within the unchanged caps.
+
+A bucket row enters the local proved-row ledger only when a stored-body entity
+ACK (no `unchanged_basis`) covers a body where that row carried a positive tag,
+only while the capability is on, and only when that ACK declares a body witness
+version and its digest equals the local body witness of a body that has a
+public witness version (context curve, session account evidence or cache
+observations), so the ACK validator also checked the exact version. The
+ledger keeps truncated keyed digests of the row key and of that proof
+(authorities plus the eight counts and five costs); later positive proof
+replaces it. Per revision, a proved row whose current proof equals the ACKed
+proof in a closed hour, or whose transcript no longer proves it, is sent
+untagged with full amounts and `identity_retained: true`; it is not a refusal.
+Different proof, the open hour and never-proved rows get fresh tags. A row is
+never both tagged and marked; top-level rows are never marked. If the
+untagged fallback cannot fit every marker beside the stripped body, it keeps
+the newest that fit and counts each dropped proved row as a refusal.
+
+Before any upload, a proved row that the outgoing body freshly tags with a
+different proof becomes a proof-free tombstone, and progress is saved before
+the request, so a lost reply cannot leave a stale proof that a later marker
+would honour. While that tombstone stands, a row the transcript no longer
+proves is a counted refusal; the replacement's ACK replaces it.
+A stored-body ACK's optional `retained_proof_missing` bucket starts remove that
+body's marked rows, so a later revision re-tags them through the same
+allocator. A destination namespace or historical replay generation change
+clears all proved rows, as do key rotation and session eviction (the class L
+last-ACK LRU above). Limits: 1,024 proved rows per session, persisted as
+versioned base64 of 73-byte records, and 64 pending missing buckets (diagnostic
+only). Each proved record also stores the proving revision's optional row-level
+account hash (class H, bounded and erased with the session). Login markers resend
+that ACK-bound hash for grain only; parts markers have no hash. Old records without
+hash provenance fail closed to fresh tags. Markers require contract 6
+(`claude_request_owned_usage:v1`); contract-5-only bodies send fresh tags.
+Rows evicted at the proof cap also send fresh tags through the usual caps. At every cap the progress JSON stays below 8 MiB and the
+requested-layout maximum below 4 MiB.
+
+Sparse `identity_cap` counters, omitted while zero: `retained_marker_rows`,
+`retained_proof_missing_received`, `retained_set_cleared`, `proved_rows_capped`
+(rows not retained at the proof cap), and
+`retained_missing_unfit` (a missing-proof bucket whose fresh proof did not fit
+and kept today's untagged/refused rule). `accepted_share_changed` also counts
+proved rows sent with different proof.
+
+### Money freshness (Claude queue and replay)
+
+The default-ON Claude shadow and freshness gauges share one
+`claude_family_census_shadow` emission. Gauges are flattened into
+`counts.pending_census_members`: the existing `oldest_age_s`, `over_24h`, `tracked`
+and `unqueued_unresolved` describe the bounded pending stamps; no duplicate
+oldest-skipped or skipped-tracked fields or second queue traversal is added.
+`count` includes queue/replay occurrences, while age thresholds count retained
+unique queued files. `tracked` also includes unresolved files no longer queued.
+All ages are process-local LOWER BOUNDS, never inputs to decisions.
+
+A regular file `money_freshness_disabled` in the normal support directory turns
+BOTH the shadow and gauges OFF. Missing marker, directories and symlinks leave
+them ON. Policy is read once per process; restart after adding/removing the
+marker. OFF skips Touched allocation, equality attestation, page observation and
+metadata observation before any tracker mutex, clone or candidate decision. It
+emits neither shadow nor freshness data. The ordinary scan and skipped-file audit
+count continue unchanged. Fixtures use thread-local guards and never consult the
+host marker.
+
+`discovered_unread_tracked_files`, `oldest_discovered_unread_age_seconds` and
+`discovered_unread_over_24h_tracked_files` cover unindexed, non-replay queued work.
+Indexed or replay work is counted separately. No retained index is not proof a
+physical file has never been read. Queue/replay overlaps are deduplicated among
+retained stamps. `skipped_untracked_entries` and
+`discovered_unread_untracked_entries` disclose lost coverage at the existing
+16,384-stamp bound; they are occurrences, not invented distinct-file counts.
+Directories not yet enumerated and files outside the skipped view are uncovered.
+
+`changed_since_scan_files` and `unchanged_since_scan_files` compare metadata
+already observed on the opened candidate with indexed size and second/nanosecond
+mtime. No transcript read or extra candidate stat is added. Missing or stale
+samples and files without an indexed scan count as
+`changed_since_scan_unknown_files`; `changed_since_scan_complete_count` is null
+when coverage is incomplete. The first page may have only unknown coverage.
+These counters are folded into the existing FirstPending traversal and bounded
+stamp work, with no third queue pass or second map.
+
+`changed_over_6h_alarm` is true after observed changed positives on consecutive
+passes span **more than 21,600 seconds**; the same row includes unread count and
+age. There is no second alarm emission. Zero/unknown-only observations, scope
+reset, restart or clock rollback break the episode. Inter-pass continuity is a
+sampled condition, not proof of continuous filesystem state.
+
+The restart proxy is DERIVED server/log-side from this same emission:
+`tracker_initialized && changed_since_scan_files > 0`, correlated with its
+`process_id` and source. `tracker_initialized` is claimed by an independent
+process-wide atomic at completed emission, so it is true AT MOST ONCE per process.
+Tracker resets, index reloads, scope/path changes and kill-switch toggles never
+re-arm it. No per-scope ledger, restart_* payload field or persisted evidence is
+needed. This counts starts with an observed positive condition; it does not prove
+a prior episode. A positive condition cleared before the first completed pass,
+or hidden by unknown initial metadata, is not counted. A disabled process emits
+nothing and does not claim a first observation.
+
+Memory remains bounded by the existing 16,384 stamps (48 bytes each, +512 KiB
+versus the original shadow), accounted by runtime_heap_bytes and its retained
+bound. Classification is transient in the existing bounded heap/vector; there
+is no separate gauge dedup allocation or scope ledger. Enlarged stamp transients
+are conservatively bounded by an additional 4 MiB. No child-finalize eligibility
+measurement, dormant family-consumer API or money/read/census decision is added.

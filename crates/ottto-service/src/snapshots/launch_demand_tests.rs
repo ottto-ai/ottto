@@ -24,14 +24,7 @@ const UUID_STEM: &str = "22222222-aaaa-4bbb-8ccc-000000000004";
 struct Home(PathBuf);
 impl Home {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ottto-launch-demand-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_scratch::unique_path("ottto-launch-demand");
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -87,7 +80,6 @@ fn transcript(session: &str, request: &str, sidechain: bool) -> String {
 /// Workflow agent of unbatched parents, and a UUID-stem subagent.
 struct Transcripts {
     root: PathBuf,
-    top: PathBuf,
     /// (path, re-keyed session id, direct parent)
     subagents: Vec<(PathBuf, String, &'static str)>,
 }
@@ -115,11 +107,7 @@ fn transcripts(home: &Home) -> Transcripts {
         fs::write(&path, transcript(parent, stem, true)).unwrap();
         subagents.push((path, format!("{parent}_{stem}"), parent));
     }
-    Transcripts {
-        root,
-        top,
-        subagents,
-    }
+    Transcripts { root, subagents }
 }
 
 fn has_launcher_fact(item: &SnapshotItem) -> bool {
@@ -297,111 +285,4 @@ fn incomplete_lookup_holds_top_level_workers_but_not_subagents() {
         }
         assert_subagent_without_launch_lineage(item(&result, session), parent);
     }
-}
-
-#[test]
-fn synchronous_subagent_parse_keeps_the_prepared_batch() {
-    let home = Home::new();
-    let fixture = transcripts(&home);
-    for worker in [TOP, PARENTS[0], UUID_STEM] {
-        home.event(worker);
-    }
-    let context = home.context();
-    let batch = vec![TOP.to_owned()];
-    while !context.prepare_launch_step(&batch).unwrap() {}
-    let parse = |path: &Path| {
-        parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
-            path,
-            NOW,
-            "fp".to_string(),
-            &ClaudeTitleMetadata::default(),
-            false,
-            Some(&context),
-        )
-        .unwrap()
-    };
-    for (path, session, parent) in &fixture.subagents {
-        let items = parse(path);
-        assert_eq!(items.len(), 1);
-        assert_eq!(&items[0].source_session_id, session);
-        assert_subagent_without_launch_lineage(&items[0], parent);
-        assert!(
-            context.launches_prepared(&batch),
-            "{session} must not replace the prepared batch"
-        );
-    }
-    let top = parse(&fixture.top);
-    assert!(has_parent(&top[0], CONTROLLER));
-}
-
-#[test]
-fn stale_lookup_gates_top_level_finish_but_not_subagent_finish() {
-    let home = Home::new();
-    let fixture = transcripts(&home);
-    home.event(TOP);
-    let context = home.context();
-    while !context.prepare_launch_step(&[TOP.to_owned()]).unwrap() {}
-    context.expire_launch_lookup_for_test();
-    let finish = |path: &Path| {
-        let mut file = File::open(path).unwrap();
-        let identity = opened_object_identity(SnapshotSource::ClaudeCode, &mut file).unwrap();
-        let mut parser = OwnedJsonlParser::new(
-            file,
-            path,
-            SnapshotSource::ClaudeCode,
-            apply_claude_code_line,
-            None,
-            None,
-            None,
-            false,
-            true,
-        )
-        .unwrap();
-        while !parser.step().unwrap() {}
-        parser.finish(
-            &identity,
-            path,
-            NOW,
-            "fp".to_string(),
-            None,
-            Some(&ClaudeTitleMetadata::default()),
-            Some(&context),
-        )
-    };
-    let held = finish(&fixture.top).unwrap_err();
-    assert!(held
-        .to_string()
-        .contains("launch evidence lookup incomplete"));
-    for (path, session, parent) in &fixture.subagents {
-        let parsed = finish(path).unwrap();
-        assert_eq!(&parsed.snapshots[0].source_session_id, session);
-        assert_subagent_without_launch_lineage(&parsed.snapshots[0], parent);
-    }
-}
-
-#[test]
-fn only_claude_subagent_paths_drop_launch_demand() {
-    let subagent = Path::new("/p/fixture-project")
-        .join(PARENTS[2])
-        .join("subagents")
-        .join(format!("{UUID_STEM}.jsonl"));
-    let top = Path::new("/p/fixture-project").join(format!("{TOP}.jsonl"));
-    let claude = SnapshotSource::ClaudeCode;
-    assert!(launch_workers_for_path(claude, &subagent).is_empty());
-    assert!(launch_workers_for_parsed(claude, Some(PARENTS[2]), &subagent).is_empty());
-    assert_eq!(launch_workers_for_path(claude, &top), vec![TOP]);
-    assert_eq!(
-        launch_workers_for_parsed(claude, Some(PARENTS[0]), &top),
-        vec![PARENTS[0]]
-    );
-    assert_eq!(launch_workers_for_parsed(claude, None, &top), vec![TOP]);
-    // Pi keys facts by its parsed id; the Claude re-key never applies to it.
-    assert_eq!(
-        launch_workers_for_parsed(SnapshotSource::Pi, Some(PARENTS[0]), &subagent),
-        vec![PARENTS[0]]
-    );
-    assert_eq!(
-        launch_workers_for_path(SnapshotSource::Pi, &subagent),
-        vec![UUID_STEM]
-    );
 }

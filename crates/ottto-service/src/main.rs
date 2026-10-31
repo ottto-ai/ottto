@@ -10,8 +10,11 @@ use ottto_service::{current_rfc3339_timestamp, macos_service, ControlToken, Loca
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Command as ProcessCommand;
 use std::time::Duration;
+
+#[cfg(unix)]
+mod service_bootstrap;
 
 #[derive(Debug, Parser)]
 #[command(name = "ottto-service")]
@@ -23,9 +26,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[cfg(feature = "replay-harness")]
-    #[command(hide = true)]
-    ReplayHarness(ottto_service::snapshot_sync::replay_harness::Args),
     #[command(hide = true)]
     ContextCompositionWorker,
     #[command(hide = true)]
@@ -40,6 +40,30 @@ enum Command {
         code_fd: i32,
         #[arg(long)]
         ready_fd: i32,
+    },
+    /// Plan or queue a scoped Claude copy-prefix history re-read. Never enables collection.
+    ClaudeCopyPrefixReread {
+        /// Private JSON array of absolute affected main-file paths.
+        #[arg(long)]
+        scope: PathBuf,
+        /// Exact destination-scoped native Claude scan index (read-only).
+        #[arg(long)]
+        index: PathBuf,
+        #[arg(long)]
+        support_dir: PathBuf,
+        /// Current negotiated scan window, in days (from the ordinary daemon).
+        #[arg(long)]
+        window_days: u64,
+        #[arg(
+            long,
+            alias = "dry-run",
+            conflicts_with = "apply",
+            required_unless_present = "apply"
+        )]
+        estimate: bool,
+        /// Publish local intent for the ordinary daemon; operator authorization required.
+        #[arg(long)]
+        apply: bool,
     },
     Status {
         #[arg(long)]
@@ -180,10 +204,30 @@ enum ServiceCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    // Replay exits before even the normal daemon's Keychain/UI setup.
-    #[cfg(feature = "replay-harness")]
-    if let Some(Command::ReplayHarness(args)) = cli.command {
-        std::process::exit(ottto_service::snapshot_sync::replay_harness::run(args));
+    // Administrative planning exits before Keychain or daemon initialization.
+    if let Some(Command::ClaudeCopyPrefixReread {
+        ref scope,
+        ref index,
+        ref support_dir,
+        apply,
+        window_days,
+        ..
+    }) = cli.command
+    {
+        match ottto_service::snapshots::claude_copy_prefix_reread::run(
+            scope,
+            support_dir,
+            index,
+            apply,
+            window_days,
+        ) {
+            Ok(counts) => println!("{}", serde_json::to_string(&counts)?),
+            Err(_) => {
+                eprintln!("copy-prefix re-read request refused");
+                std::process::exit(2);
+            }
+        }
+        return Ok(());
     }
 
     // This is a background service: it must never block on an interactive
@@ -193,8 +237,9 @@ fn main() -> Result<()> {
     ottto_core::disable_keychain_user_interaction();
 
     match cli.command.unwrap_or(Command::Status { json: true }) {
-        #[cfg(feature = "replay-harness")]
-        Command::ReplayHarness(_) => unreachable!("replay handled before service startup"),
+        Command::ClaudeCopyPrefixReread { .. } => {
+            unreachable!("administrative command handled before startup")
+        }
         Command::ContextCompositionWorker => {
             ottto_service::context_composition::run_context_composition_worker()?;
         }
@@ -431,14 +476,7 @@ fn main() -> Result<()> {
                 if json {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "ok": false,
-                            "error": {
-                                "code": "launch_agent_owner_conflict",
-                                "message": error.to_string(),
-                                "retryable": false
-                            }
-                        }))?
+                        serde_json::to_string_pretty(&service_command_error_payload(&error))?
                     );
                     std::process::exit(2);
                 }
@@ -448,6 +486,40 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn service_command_error_payload(error: &anyhow::Error) -> serde_json::Value {
+    // A mutation failure takes precedence over any nested preflight marker.
+    let (code, retryable) = if error
+        .downcast_ref::<macos_service::LaunchAgentLifecycleFailure>()
+        .is_some()
+    {
+        ("launch_agent_lifecycle_failed", false)
+    } else if error
+        .downcast_ref::<macos_service::LaunchAgentOwnerConflict>()
+        .is_some()
+    {
+        ("launch_agent_owner_conflict", false)
+    } else if service_transaction_is_busy(error) {
+        ("launch_agent_transaction_busy", true)
+    } else {
+        ("launch_agent_lifecycle_failed", false)
+    };
+    json!({"ok": false, "error": {"code": code, "message": format!("{error:#}"), "retryable": retryable}})
+}
+
+fn service_transaction_is_busy(error: &anyhow::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error
+            .downcast_ref::<ottto_core::service_lifecycle::ServiceLifecycleBusy>()
+            .is_some()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn load_registered_device_sources() -> Option<LocalDeviceBinding> {
@@ -513,21 +585,15 @@ fn handle_service_command(command: ServiceCommand) -> Result<()> {
     config.companion_code_requirement = companion_code_requirement;
     let plist_path = macos_service::launch_agent_path(&home);
     let plan = if write {
-        // Install, repair, and app-update registration paths all pass here.
-        // Remove the retired locald registration before touching the current
-        // single-owner LaunchAgent.
-        ottto_service::legacy_service::cleanup_legacy_services(&home);
-        macos_service::ensure_launch_agent_write_allowed(&config, &plist_path, migrate_owner)?;
-        macos_service::write_launch_agent(&config, &plist_path)?
+        #[cfg(unix)]
+        {
+            service_bootstrap::install(&home, &config, &plist_path, migrate_owner, execute)?
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("LaunchAgent installation requires Unix");
     } else {
         macos_service::install_plan(&config, &plist_path)
     };
-
-    if execute {
-        for command in service_bootstrap_commands(&plan, service_loaded(&plan)) {
-            run_command(&command)?;
-        }
-    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -735,32 +801,7 @@ fn home_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("HOME is not set"))
 }
 
-fn run_command(args: &[String]) -> Result<()> {
-    let Some((program, rest)) = args.split_first() else {
-        anyhow::bail!("empty command");
-    };
-    let status = ProcessCommand::new(program).args(rest).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("command failed with status {status}: {}", args.join(" "))
-    }
-}
-
-fn service_loaded(plan: &macos_service::LaunchAgentInstallPlan) -> bool {
-    let Some(service_target) = plan.enable_command.last() else {
-        return false;
-    };
-    ProcessCommand::new("launchctl")
-        .arg("print")
-        .arg(service_target)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
+#[cfg(any(unix, test))]
 fn service_bootstrap_commands(
     plan: &macos_service::LaunchAgentInstallPlan,
     loaded: bool,
@@ -1094,35 +1135,6 @@ mod tests {
         assert_eq!(startup_steps(false), recovery.to_vec());
     }
 
-    /// `serve` and `serve-xpc` finish their startup steps, including the
-    /// local state sweep, before they build the daemon and start relays.
-    #[test]
-    fn local_state_sweep_and_recovery_precede_relays_in_serve_commands() {
-        let source = include_str!("main.rs");
-        let source = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
-        let arm = |start: &str, end: &str| {
-            let from = source.find(start).expect("command arm");
-            &source[from..from + source[from..].find(end).expect("next arm")]
-        };
-        for (arm, prepare) in [
-            (
-                arm("Command::Serve { socket, once } =>", "Command::ServeXpc {"),
-                "prepare_to_serve(!once);",
-            ),
-            (
-                arm("Command::ServeXpc {", "Command::Service { command } =>"),
-                "prepare_to_serve(true);",
-            ),
-        ] {
-            let at = |needle: &str| arm.find(needle).unwrap_or_else(|| panic!("{needle}"));
-            assert_eq!(arm.matches("prepare_to_serve(").count(), 1, "{arm}");
-            assert!(at(prepare) < at("load_or_create_control_token()"), "{arm}");
-            assert!(at(prepare) < at("LocalDaemon::new("), "{arm}");
-            assert!(at(prepare) < at("start_builtin_relays(&daemon)"), "{arm}");
-            assert!(!arm.contains("sweep_local_state_at_startup"), "{arm}");
-        }
-    }
-
     /// Every daemon entry point takes the state-directory lock before it
     /// marks itself serving, runs a startup step or touches any state.
     #[test]
@@ -1275,22 +1287,19 @@ mod tests {
 
     #[test]
     fn account_scope_differs_between_accounts_on_one_machine() {
-        // The whole point of the field: two macOS user accounts on one Mac share
-        // a `machine_id` but must not share an `account_scope`.
-        assert_ne!(ALPHA_UID_501, ALPHA_UID_502);
-        assert_eq!(
-            account_scope_from_uid("otm_machine_alpha", Some(502)).as_deref(),
-            Some(ALPHA_UID_502)
-        );
-    }
-
-    #[test]
-    fn account_scope_differs_for_the_same_account_on_another_machine() {
-        assert_ne!(ALPHA_UID_501, BETA_UID_501);
-        assert_eq!(
-            account_scope_from_uid("otm_machine_beta", Some(501)).as_deref(),
-            Some(BETA_UID_501)
-        );
+        for (machine, uid, expected) in [
+            ("otm_machine_alpha", Some(502), Some(ALPHA_UID_502)),
+            ("otm_machine_beta", Some(501), Some(BETA_UID_501)),
+            ("otm_machine_alpha", None, None),
+        ] {
+            assert_eq!(account_scope_from_uid(machine, uid).as_deref(), expected);
+            assert_ne!(Some(ALPHA_UID_501), expected);
+        }
+        let scope = account_scope_from_uid("otm_machine_alpha", Some(501)).unwrap();
+        let machine_style = stable_machine_id_from_seed("account:otm_machine_alpha:501");
+        assert!(scope.starts_with("otu_"));
+        assert!(machine_style.starts_with("otm_"));
+        assert_ne!(scope, machine_style);
     }
 
     #[test]
@@ -1307,21 +1316,6 @@ mod tests {
         assert!(!scope.contains("501"));
         assert!(!scope.contains("machine_alpha"));
         assert!(!scope.contains('/'));
-    }
-
-    #[test]
-    fn account_scope_never_collides_with_the_machine_id_namespace() {
-        let scope = account_scope_from_uid("otm_machine_alpha", Some(501)).expect("scope");
-        let machine_style = stable_machine_id_from_seed("account:otm_machine_alpha:501");
-
-        assert!(scope.starts_with("otu_"));
-        assert!(machine_style.starts_with("otm_"));
-        assert_ne!(scope, machine_style);
-    }
-
-    #[test]
-    fn account_scope_is_absent_when_no_posix_uid_is_available() {
-        assert_eq!(account_scope_from_uid("otm_machine_alpha", None), None);
     }
 
     #[test]

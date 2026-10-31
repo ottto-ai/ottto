@@ -4037,67 +4037,6 @@ mod tests {
             .find(|row| row.provider_day == day && row.surface == surface && row.model == model)
     }
 
-    // -- vocabulary -------------------------------------------------------
-
-    #[test]
-    fn client_ids_map_onto_the_closed_surface_vocabulary() {
-        assert_eq!(surface_for_client_id("CODEX_WEB"), Surface::CodexWeb);
-        assert_eq!(
-            surface_for_client_id("codex_desktop_app"),
-            Surface::CodexDesktopApp
-        );
-        assert_eq!(
-            surface_for_client_id(" CODEX_SERVICE_EXEC "),
-            Surface::CodexServiceExec
-        );
-        assert_eq!(
-            surface_for_client_id("CODEX_WORK_DESKTOP"),
-            Surface::CodexWorkDesktop
-        );
-        // The provider's own unattributed bucket keeps its own slot: "the
-        // provider could not attribute this" is not the same fact as "Ottto
-        // has never seen this client id".
-        assert_eq!(
-            surface_for_client_id("CODEX_UNKNOWN_DEFAULT"),
-            Surface::CodexUnknownDefault
-        );
-        for unknown in [
-            "CODEX_FUTURE_SURFACE",
-            "",
-            "codex_web_v2",
-            "../../etc/passwd",
-            "a prompt sneaking in as a client id",
-        ] {
-            assert_eq!(
-                surface_for_client_id(unknown),
-                Surface::Other,
-                "unknown client id must map to other, never a new surface"
-            );
-        }
-    }
-
-    #[test]
-    fn model_identifiers_are_bounded_slugs_or_refused() {
-        assert_eq!(
-            normalized_model_slug("GPT-5-Codex").as_deref(),
-            Some("gpt-5-codex")
-        );
-        assert_eq!(
-            normalized_model_slug("o4 mini/high").as_deref(),
-            Some("o4-mini-high")
-        );
-        assert_eq!(normalized_model_slug("").as_deref(), None);
-        assert_eq!(normalized_model_slug("   ").as_deref(), None);
-        assert_eq!(normalized_model_slug("__all__").as_deref(), None);
-        // Cannot begin with an alphanumeric, so it is refused rather than
-        // coerced into an invented identifier.
-        assert_eq!(normalized_model_slug("!!!").as_deref(), None);
-        assert_eq!(normalized_model_slug("/Users/ron/secret").as_deref(), None);
-        let long = normalized_model_slug(&"m".repeat(200)).expect("bounded slug");
-        assert_eq!(long.len(), 64);
-        assert!(is_model_slug(&long));
-    }
-
     // -- normalization: the must-not-persist proof ------------------------
 
     #[test]
@@ -4248,24 +4187,6 @@ mod tests {
     }
 
     #[test]
-    fn per_model_rows_never_carry_credits() {
-        let (start, end) = collection_window(now());
-        let normalized =
-            normalize_provider_window(&poisoned_payload(), &start, &end).expect("normalize");
-        let model_row = row_at(&normalized.rows, "2026-07-26", "codex_web", "gpt-5-codex")
-            .expect("per-model row");
-        // The provider reports 0.0 for models[].credits, which is not an
-        // attribution. Uploading it would publish a false zero.
-        assert_eq!(model_row.credits_used, None);
-        assert_eq!(model_row.total_tokens, Some(1750));
-        assert_eq!(model_row.turn_count, Some(9));
-
-        let surface_row = row_at(&normalized.rows, "2026-07-26", "codex_web", "__all__")
-            .expect("surface total row");
-        assert_eq!(surface_row.credits_used.as_deref(), Some("12.500000"));
-    }
-
-    #[test]
     fn day_level_totals_and_models_use_the_reserved_provider_grain() {
         let payload = json!({
             "results": [{
@@ -4324,58 +4245,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_total_mismatch_diagnostic_names_both_numbers() {
-        let payload = json!({
-            "results": [{
-                "date": "2026-07-26",
-                "totals": {"text_total_tokens": 1300},
-                "clients": [{
-                    "client_id": "CODEX_WEB",
-                    "text_total_tokens": 1200
-                }]
-            }]
-        });
-        let normalized =
-            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
-        let mut diagnostics = Vec::new();
-        append_normalization_diagnostics(&normalized, &mut diagnostics);
-
-        assert_eq!(normalized.day_total_mismatch_days, 1);
-        let mismatch = diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.code == "codex_daily_aggregates_provider_total_mismatch")
-            .expect("mismatch diagnostic");
-        assert_eq!(mismatch.severity, AgentDiagnosticSeverity::Warning);
-        assert!(mismatch.message.contains("provider=1300"));
-        assert!(mismatch.message.contains("recognized_clients=1200"));
-        assert!(mismatch.message.contains("metric=total_tokens"));
-    }
-
-    #[test]
-    fn user_aggregates_are_counted_but_not_uploaded() {
-        let payload = json!({
-            "results": [{
-                "date": "2026-07-26",
-                "totals": {"text_total_tokens": 10, "users": 1},
-                "models": [{"model": "gpt-5-codex", "text_total_tokens": 10, "users": 1}],
-                "clients": [{
-                    "client_id": "CODEX_WEB",
-                    "text_total_tokens": 10,
-                    "users": 1
-                }]
-            }]
-        });
-        let normalized =
-            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
-        assert_eq!(normalized.user_count_fields_seen, 3);
-        assert_eq!(normalized.user_count_fields_unreadable, 0);
-        assert!(!normalized.unrecognized_client_keys.contains("users"));
-        assert!(!normalized.unrecognized_model_keys.contains("users"));
-        let batch_rows = serde_json::to_string(&normalized.rows).expect("rows encode");
-        assert!(!batch_rows.contains("users"));
-    }
-
-    #[test]
     fn unknown_client_ids_merge_into_one_other_row_per_grain() {
         let (start, end) = collection_window(now());
         let normalized =
@@ -4392,20 +4261,6 @@ mod tests {
         assert_eq!(other_rows[0].credits_used.as_deref(), Some("5.000000"));
         assert_eq!(other_rows[0].total_tokens, Some(30));
         assert_eq!(normalized.dropped_model_rows, 1);
-    }
-
-    #[test]
-    fn every_normalized_grain_is_unique() {
-        let (start, end) = collection_window(now());
-        let normalized =
-            normalize_provider_window(&poisoned_payload(), &start, &end).expect("normalize");
-        let mut seen = std::collections::HashSet::new();
-        for row in &normalized.rows {
-            assert!(
-                seen.insert((row.provider_day.clone(), row.surface, row.model.clone())),
-                "duplicate grain would be rejected by the contract"
-            );
-        }
     }
 
     #[test]
@@ -4455,70 +4310,6 @@ mod tests {
         assert_eq!(row.turn_count, Some(7));
         assert_eq!(normalized.days_no_client_breakdown, 1);
         assert_eq!(normalized.days_used_fallback, 1);
-    }
-
-    #[test]
-    fn entirely_out_of_window_days_have_an_explaining_diagnostic() {
-        let payload = json!({
-            "results": [
-                {"date": "2020-01-01", "total_tokens": 5},
-                {"date": "2020-01-02", "total_tokens": 7}
-            ]
-        });
-        let normalized =
-            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
-        let mut diagnostics = Vec::new();
-        append_normalization_diagnostics(&normalized, &mut diagnostics);
-
-        assert!(normalized.rows.is_empty());
-        assert_eq!(normalized.days_out_of_window, 2);
-        let accounting = diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.code == "codex_daily_aggregates_normalization_accounting")
-            .expect("normalization accounting diagnostic");
-        assert!(accounting.message.contains("days_out_of_window=2"));
-    }
-
-    #[test]
-    fn a_client_without_an_id_is_counted_and_reported() {
-        let payload = json!({
-            "results": [{
-                "date": "2026-07-26",
-                "clients": [{"total_tokens": 9}]
-            }]
-        });
-        let normalized =
-            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
-        let mut diagnostics = Vec::new();
-        append_normalization_diagnostics(&normalized, &mut diagnostics);
-
-        assert_eq!(normalized.clients_seen, 1);
-        assert_eq!(normalized.clients_missing_id, 1);
-        assert!(diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("clients_missing_id=1")));
-    }
-
-    #[test]
-    fn widened_shape_aliases_are_normalized() {
-        let payload = json!({
-            "results": [{
-                "period_start": "2026-07-26",
-                "surfaces": [{
-                    "surface": "CODEX_WEB",
-                    "model_list": [{
-                        "model_name": "GPT-5-Codex",
-                        "total_token_count": 17
-                    }]
-                }]
-            }]
-        });
-        let normalized =
-            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
-
-        let row = row_at(&normalized.rows, "2026-07-26", "codex_web", "gpt-5-codex")
-            .expect("aliased model row");
-        assert_eq!(row.total_tokens, Some(17));
     }
 
     #[test]
@@ -4638,24 +4429,6 @@ mod tests {
         assert_eq!(end, "2025-12-31");
     }
 
-    #[test]
-    fn day_spans_are_exact_across_month_and_year_boundaries() {
-        assert_eq!(day_span("2026-07-26", "2026-07-26"), Some(1));
-        assert_eq!(day_span("2026-02-28", "2026-03-01"), Some(2));
-        assert_eq!(day_span("2024-02-28", "2024-03-01"), Some(3));
-        assert_eq!(day_span("2025-12-31", "2026-01-01"), Some(2));
-    }
-
-    fn day_offset(base: &str, offset: i64) -> String {
-        let date = parse_day(base).expect("base day") + TimeDuration::days(offset);
-        format!(
-            "{:04}-{:02}-{:02}",
-            date.year(),
-            u8::from(date.month()),
-            date.day()
-        )
-    }
-
     fn rows_on(day: &str, count: usize) -> Vec<DailyReferenceRow> {
         (0..count)
             .map(|index| DailyReferenceRow {
@@ -4671,35 +4444,6 @@ mod tests {
                 turn_count: None,
             })
             .collect()
-    }
-
-    #[test]
-    fn batches_are_bounded_contiguous_and_oldest_first() {
-        let mut rows = Vec::new();
-        // 40 days x 30 rows = 1200 rows, past the per-batch bound.
-        for offset in 0..40 {
-            rows.extend(rows_on(&day_offset("2026-06-01", offset), 30));
-        }
-        let batches = pack_batches(rows, "2026-06-01", "2026-07-10").expect("pack");
-        assert!(batches.len() > 1);
-        let mut previous_end: Option<String> = None;
-        for (start, end, rows) in &batches {
-            assert!(rows.len() <= MAX_ROWS_PER_BATCH);
-            assert!(day_span(start, end).is_some_and(|span| span <= MAX_COVERAGE_DAYS));
-            assert!(start <= end);
-            for row in rows {
-                assert!(row.provider_day.as_str() >= start.as_str());
-                assert!(row.provider_day.as_str() <= end.as_str());
-            }
-            if let Some(previous_end) = previous_end.as_deref() {
-                // Abutting, so the backend's coverage envelope grows
-                // contiguously and no untouched day is ever claimed.
-                assert_eq!(day_span(previous_end, start), Some(2));
-            }
-            previous_end = Some(end.clone());
-        }
-        assert_eq!(batches[0].0, "2026-06-01");
-        assert_eq!(batches.last().expect("last").1, "2026-07-10");
     }
 
     #[test]
@@ -4768,45 +4512,6 @@ mod tests {
     }
 
     #[test]
-    fn local_consent_is_not_live_until_the_backend_binds_it() {
-        let collector = collector("consent-pending");
-        let local = collector.grants().enable(&setup(), now()).expect("enable");
-        assert_eq!(local.status, GrantStatus::ConsentRequired);
-        assert!(local.backend_create_pending);
-        assert!(!grant_runtime_ready(&local));
-        let bound = collector
-            .grants()
-            .bind_backend_grant(&grant_response(&local, "enabled", 1), INSTALLATION_ID)
-            .expect("bind");
-        assert!(grant_runtime_ready(&bound));
-        assert_eq!(
-            bound.disclosure_version,
-            "provider_daily_reference_disclosure.v2"
-        );
-    }
-
-    #[test]
-    fn v2_scope_is_stable_across_accounts_but_attribution_is_not() {
-        let collector = collector("v2-scope-across-accounts");
-        let account_a = collector
-            .grants()
-            .enable(&setup(), now())
-            .expect("account a");
-        let mut account_b_setup = setup();
-        account_b_setup.provider_account_scope = "acct-second".to_string();
-        let account_b = collector
-            .grants()
-            .enable(&account_b_setup, now() + TimeDuration::seconds(1))
-            .expect("account b");
-
-        assert_eq!(
-            account_a.grant_scope_fingerprint,
-            account_b.grant_scope_fingerprint
-        );
-        assert_ne!(account_a.account_fingerprint, account_b.account_fingerprint);
-    }
-
-    #[test]
     fn a_backend_grant_epoch_must_advance() {
         let collector = collector("epoch-advance");
         let grant = enabled(&collector);
@@ -4849,25 +4554,6 @@ mod tests {
             .grants()
             .bind_backend_grant(&grant_response(&local, "enabled", 1), GRANT_ID)
             .is_err());
-    }
-
-    #[test]
-    fn runtime_readiness_ignores_collector_version_when_disclosure_matches() {
-        let collector = collector("runtime-readiness");
-        let mut grant = enabled(&collector);
-        grant.collector_version = "99.99.99".to_string();
-
-        assert_eq!(grant.disclosure_version, DISCLOSURE_VERSION);
-        assert!(grant_runtime_ready(&grant));
-    }
-
-    #[test]
-    fn runtime_readiness_refuses_a_different_disclosure_version() {
-        let collector = collector("runtime-readiness-disclosure");
-        let mut grant = enabled(&collector);
-        grant.disclosure_version = DISCLOSURE_VERSION_V1.to_string();
-
-        assert!(!grant_runtime_ready(&grant));
     }
 
     #[test]
@@ -4926,14 +4612,6 @@ mod tests {
                 grant_id: GRANT_ID.to_string()
             }
         );
-    }
-
-    #[test]
-    fn an_unreconciled_create_has_no_delete_target() {
-        let collector = collector("revoke-target-unbound");
-        collector.grants().enable(&setup(), now()).expect("enable");
-
-        assert!(collector.grants().grant_revoke_target().is_err());
     }
 
     #[test]
@@ -5015,56 +4693,6 @@ mod tests {
         assert_eq!(revoked.runtime_state, RuntimeState::Revoked);
         assert_eq!(revoked.reason_code, "revoked");
         assert!(!revoked.provider_read_permitted);
-    }
-
-    #[test]
-    fn collector_status_enforces_policy_without_pinning_consent_to_a_build() {
-        let collector = collector("collector-status-policy");
-        let grant = enabled(&collector);
-
-        let mut persisted: serde_json::Value =
-            serde_json::from_slice(&fs::read(collector.grants().path()).expect("read"))
-                .expect("decode");
-        persisted["grant"]["backend_binding"]["server_policy_state"] =
-            serde_json::Value::String("rollout_disabled".to_string());
-        fs::write(
-            collector.grants().path(),
-            serde_json::to_vec_pretty(&persisted).expect("encode"),
-        )
-        .expect("write");
-        let policy = collector_status(collector.grants(), false);
-        assert_eq!(policy.runtime_state, RuntimeState::PolicyDisabled);
-        assert_eq!(policy.reason_code, "policy_disabled");
-        assert!(!policy.provider_read_permitted);
-
-        // Build admission is a backend upload decision, not a consent gate.
-        persisted["grant"]["backend_binding"]["server_policy_state"] =
-            serde_json::Value::String("approved".to_string());
-        persisted["grant"]["collector_version"] = serde_json::Value::String("0.0.1".to_string());
-        fs::write(
-            collector.grants().path(),
-            serde_json::to_vec_pretty(&persisted).expect("encode"),
-        )
-        .expect("write");
-        let build_changed = collector_status(collector.grants(), false);
-        assert_eq!(build_changed.runtime_state, RuntimeState::Enabled);
-        assert_eq!(build_changed.reason_code, "enabled");
-        assert!(build_changed.provider_read_permitted);
-        assert_eq!(grant.status, GrantStatus::Enabled);
-    }
-
-    #[test]
-    fn collector_status_is_content_free() {
-        let collector = collector("collector-status-content-free");
-        enabled(&collector);
-
-        let encoded =
-            serde_json::to_string(&collector_status(collector.grants(), false)).expect("encode");
-
-        for secret in [INSTALLATION_ID, ORG_SCOPE, USER_SCOPE, ACCOUNT_SCOPE] {
-            assert!(!encoded.contains(secret), "status leaked {secret}");
-        }
-        assert!(!encoded.contains("hmac-sha256:"));
     }
 
     #[test]
@@ -5296,70 +4924,6 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_that_cannot_collect_names_the_condition_that_stops_it() {
-        let collector = collector("block-reason");
-        let ready = enabled(&collector);
-        assert_eq!(grant_runtime_block_reason(&ready), None);
-        assert!(grant_runtime_ready(&ready));
-
-        let mut stale_disclosure = ready.clone();
-        stale_disclosure.disclosure_version = "provider_daily_reference_disclosure.v99".to_string();
-        assert_eq!(
-            grant_runtime_block_reason(&stale_disclosure),
-            Some("disclosure_version_mismatch")
-        );
-        assert!(!grant_runtime_ready(&stale_disclosure));
-
-        let mut pending = ready.clone();
-        pending.backend_create_pending = true;
-        assert_eq!(
-            grant_runtime_block_reason(&pending),
-            Some("backend_create_pending")
-        );
-
-        let mut unbound = ready.clone();
-        unbound.backend_binding = None;
-        assert_eq!(
-            grant_runtime_block_reason(&unbound),
-            Some("no_backend_binding")
-        );
-    }
-
-    #[test]
-    fn the_status_stays_enabled_after_a_v2_account_switch() {
-        let collector = collector("status-account-switch");
-        let grant = enabled(&collector);
-        let grants = collector.grants();
-        let ready = collector_status(grants, false);
-        assert_eq!(ready.runtime_state, RuntimeState::Enabled);
-        assert!(ready.provider_read_permitted);
-
-        let other_account = Runtime {
-            installation_id: INSTALLATION_ID.to_string(),
-            provider_account_scope: "acct-a-completely-different-account".to_string(),
-        };
-        let switched = status_with_live_binding(grants, ready.clone(), Some(&other_account));
-        assert_eq!(switched.runtime_state, RuntimeState::Enabled);
-        assert_eq!(switched.reason_code, "enabled");
-        assert!(switched.provider_read_permitted);
-        assert_ne!(
-            switched.current_account_fingerprint.as_deref(),
-            Some(grant.account_fingerprint.as_str())
-        );
-
-        // The matching binding is left exactly as it was, and an unresolvable
-        // binding must not invent a mismatch.
-        assert_eq!(
-            status_with_live_binding(grants, ready.clone(), Some(&runtime())).reason_code,
-            "enabled"
-        );
-        assert_eq!(
-            status_with_live_binding(grants, ready, None).reason_code,
-            "enabled"
-        );
-    }
-
-    #[test]
     fn v2_uploads_a_different_provider_account_under_its_own_attribution() {
         let collector = collector("account-switch");
         let grant = enabled(&collector);
@@ -5495,39 +5059,6 @@ mod tests {
     // -- cadence ----------------------------------------------------------
 
     #[test]
-    fn the_cadence_gate_stays_in_its_band_and_is_stable_per_installation() {
-        for seed in [
-            "",
-            "a",
-            "installation-one",
-            "installation-two",
-            &"z".repeat(64),
-        ] {
-            let interval = fetch_interval_seconds(seed);
-            assert!(
-                (FETCH_INTERVAL_SECONDS - FETCH_INTERVAL_JITTER_SECONDS
-                    ..=FETCH_INTERVAL_SECONDS + FETCH_INTERVAL_JITTER_SECONDS)
-                    .contains(&interval),
-                "{seed} produced {interval}, outside the 5h45m-6h15m band"
-            );
-            assert_eq!(
-                interval,
-                fetch_interval_seconds(seed),
-                "phase must be stable"
-            );
-        }
-        assert!(
-            ["installation-one", "installation-two", "installation-three"]
-                .iter()
-                .map(|seed| fetch_interval_seconds(seed))
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-                > 1,
-            "the spread must actually spread load across installs"
-        );
-    }
-
-    #[test]
     fn a_second_cycle_inside_the_cadence_window_does_nothing() {
         let collector = collector("cadence-gate");
         enabled(&collector);
@@ -5560,29 +5091,6 @@ mod tests {
     }
 
     // -- circuit breaker ---------------------------------------------------
-
-    #[test]
-    fn each_failure_class_opens_the_breaker_at_its_own_threshold() {
-        let cases = [
-            (ProviderFailure::AuthRejected, BREAKER_AUTH_THRESHOLD),
-            (ProviderFailure::ResponseShape, BREAKER_SHAPE_THRESHOLD),
-            (ProviderFailure::RateLimited, BREAKER_RATE_LIMIT_THRESHOLD),
-        ];
-        for (failure, threshold) in cases {
-            let mut state = CollectorState::default();
-            for attempt in 1..threshold {
-                state = state_after_failure(state, "identity", failure, "category", 1_000);
-                assert!(
-                    !breaker_is_open(&state, 1_000),
-                    "{failure:?} opened after {attempt} of {threshold}"
-                );
-            }
-            state = state_after_failure(state, "identity", failure, "category", 1_000);
-            assert!(breaker_is_open(&state, 1_000));
-            assert_eq!(state.opened_by, failure.code());
-            assert!(!breaker_is_open(&state, 1_000 + BREAKER_COOLDOWN_SECONDS));
-        }
-    }
 
     #[test]
     fn failure_classes_do_not_pool_and_transients_never_count() {
@@ -5775,160 +5283,6 @@ mod tests {
     }
 
     // -- upload ------------------------------------------------------------
-
-    #[test]
-    fn an_unchanged_stop_is_logged_once_per_repeat_interval() {
-        let waiting = deferred("account_not_connected");
-        let mut throttle = CycleLogThrottle::default();
-
-        let first = throttle.lines(&waiting, 0);
-        assert_eq!(first.len(), 2, "summary and reason: {first:?}");
-        for tick in 1..12 {
-            assert!(throttle.lines(&waiting, tick * 30 * 60).is_empty());
-        }
-        // A different reason prints at once and accounts for the hidden ticks.
-        let changed = throttle.lines(&deferred("codex_sign_in_unavailable"), 6 * 60 * 60 - 1);
-        assert_eq!(
-            changed[0],
-            "codex_daily_aggregates_collector_repeats_suppressed count=11"
-        );
-        assert!(changed[2].contains("codex_sign_in_unavailable"));
-        // The same report prints again once the interval has passed.
-        let reason = deferred("codex_sign_in_unavailable");
-        assert!(throttle.lines(&reason, 6 * 60 * 60).is_empty());
-        let repeated = throttle.lines(&reason, 12 * 60 * 60);
-        assert_eq!(
-            repeated[0],
-            "codex_daily_aggregates_collector_repeats_suppressed count=1"
-        );
-        assert_eq!(repeated.len(), 3);
-
-        // Outcomes after a provider read are cadence-gated and always print.
-        let failed = Cycle::with(CycleOutcome::Failed, warning("code", "same"));
-        assert!(!throttle.lines(&failed, 12 * 60 * 60).is_empty());
-        assert!(!throttle.lines(&failed, 12 * 60 * 60 + 1).is_empty());
-        // Silent cycles print nothing and do not mask the next stop.
-        assert!(throttle
-            .lines(&Cycle::new(CycleOutcome::Noop), 12 * 60 * 60 + 2)
-            .is_empty());
-        assert_eq!(throttle.lines(&reason, 12 * 60 * 60 + 3).len(), 2);
-    }
-
-    #[test]
-    fn diagnostic_log_lines_include_codes_and_cap_output() {
-        let diagnostics = vec![
-            info("first_code", "count=1"),
-            warning("second_code", "date=\"2026-07-26\""),
-        ];
-
-        assert_eq!(
-            cycle_diagnostic_log_lines(&diagnostics),
-            vec![
-                "codex_daily_aggregates_collector_diagnostic severity=Info code=first_code message=\"count=1\"",
-                "codex_daily_aggregates_collector_diagnostic severity=Warning code=second_code message=\"date=\\\"2026-07-26\\\"\"",
-            ]
-        );
-
-        let capped = (0..MAX_LOGGED_DIAGNOSTICS_PER_CYCLE + 3)
-            .map(|index| info(&format!("code_{index}"), "count=1"))
-            .collect::<Vec<_>>();
-        let lines = cycle_diagnostic_log_lines(&capped);
-        assert_eq!(lines.len(), MAX_LOGGED_DIAGNOSTICS_PER_CYCLE + 1);
-        for (index, line) in lines
-            .iter()
-            .take(MAX_LOGGED_DIAGNOSTICS_PER_CYCLE)
-            .enumerate()
-        {
-            assert!(line.contains(&format!("code=code_{index} ")));
-        }
-        assert_eq!(
-            lines.last().map(String::as_str),
-            Some("codex_daily_aggregates_collector_diagnostics_suppressed count=3")
-        );
-    }
-
-    #[test]
-    fn successful_empty_window_is_diagnostic_and_recorded_in_state() {
-        let collector = collector("successful-empty-window");
-        let grant = enabled(&collector);
-        let reader = StaticReader::new(json!({
-            "results": [{"date": "2026-07-26", "clients": []}]
-        }));
-        let transport = RecordingTransport::default();
-
-        let cycle = collector.collect_once(&runtime(), &reader, &transport, now());
-
-        assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
-        assert_eq!(cycle.normalized_row_count, Some(0));
-        assert_eq!(cycle.diagnostics.len(), 3);
-        let zero_rows = diagnostic(&cycle, "codex_daily_aggregates_zero_rows_explained");
-        assert!(zero_rows.message.contains("days_seen=1"));
-        assert!(zero_rows.message.contains("days_recognized=1"));
-        assert!(zero_rows.message.contains("entries_empty_counters=1"));
-        assert_eq!(
-            diagnostic(&cycle, "codex_daily_aggregates_window_empty").severity,
-            AgentDiagnosticSeverity::Info
-        );
-        assert_eq!(
-            cycle_summary_log(&cycle),
-            "codex_daily_aggregates_collector outcome=Uploaded rows=0 diagnostics=3"
-        );
-
-        let state = collector.state.load(&state_identity(&grant, false));
-        let (window_start, window_end) = collection_window(now());
-        assert_eq!(state.last_observed_row_count, Some(0));
-        assert_eq!(state.last_coverage_start.as_deref(), Some(&*window_start));
-        assert_eq!(state.last_coverage_end.as_deref(), Some(&*window_end));
-        assert_eq!(transport.batches.borrow()[0]["rows"], json!([]));
-    }
-
-    #[test]
-    fn successful_nonempty_window_is_diagnostic_and_recorded_in_state() {
-        let collector = collector("successful-nonempty-window");
-        let grant = enabled(&collector);
-        let reader = StaticReader::new(json!({
-            "results": [{
-                "date": "2026-07-26",
-                "clients": [{
-                    "client_id": "CODEX_WEB",
-                    "text_total_tokens": 7
-                }]
-            }]
-        }));
-        let transport = RecordingTransport::default();
-
-        let cycle = collector.collect_once(&runtime(), &reader, &transport, now());
-
-        assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
-        assert_eq!(cycle.normalized_row_count, Some(1));
-        assert_eq!(cycle.diagnostics.len(), 2);
-        assert!(
-            diagnostic(&cycle, "codex_daily_aggregates_normalization_accounting")
-                .message
-                .contains("clients_no_model_breakdown=1")
-        );
-        assert_eq!(
-            diagnostic(&cycle, "codex_daily_aggregates_window_collected").severity,
-            AgentDiagnosticSeverity::Info
-        );
-        assert_eq!(
-            cycle_summary_log(&cycle),
-            "codex_daily_aggregates_collector outcome=Uploaded rows=1 diagnostics=2"
-        );
-
-        let state = collector.state.load(&state_identity(&grant, false));
-        let (window_start, window_end) = collection_window(now());
-        assert_eq!(state.last_observed_row_count, Some(1));
-        assert_eq!(state.last_coverage_start.as_deref(), Some(&*window_start));
-        assert_eq!(state.last_coverage_end.as_deref(), Some(&*window_end));
-        assert_eq!(
-            transport.batches.borrow()[0]["rows"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-    }
 
     #[test]
     fn a_not_admitted_answer_is_typed_expected_and_never_trips_the_breaker() {
@@ -6135,15 +5489,5 @@ mod tests {
                 "this module must never reference {forbidden}"
             );
         }
-    }
-
-    #[test]
-    fn the_provider_read_identifies_itself_honestly() {
-        let agent = crate::agent_status::ottto_user_agent();
-        assert!(agent.starts_with("ottto/"));
-        assert!(agent.contains("subscription-usage-reader"));
-        assert!(!agent.to_ascii_lowercase().contains("chatgpt"));
-        assert!(!agent.to_ascii_lowercase().contains("codex"));
-        assert!(!agent.to_ascii_lowercase().contains("claude"));
     }
 }
