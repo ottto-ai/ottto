@@ -1887,6 +1887,10 @@ fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() 
                 assert!(retired.claude_account_deferred_holds.contains_key(&key));
                 assert!(retired.files[&key].has_unverified_source());
                 sampled_scan::set_test_now(Some(sampled_scan::now_seconds() + 600));
+                crate::snapshots::line_delivery_tests::next_walk(
+                    &mut retired,
+                    BACKFILL_WINDOW_DAYS,
+                );
                 let ((next, _, modes), next_diagnostics) =
                     crate::local_resource_diagnostics::capture(|| {
                         production_scan(

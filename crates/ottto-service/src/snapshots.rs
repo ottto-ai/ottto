@@ -31586,6 +31586,18 @@ impl OwnedSourceScan {
                 }
                 let terminal_effects_allowed = source != SnapshotSource::ClaudeCode
                     || claude_terminal_authority(index, true, &census_window_end);
+                // Current-page metadata/open uncertainty must reach every F4
+                // caller before any hold can retire. The remaining census fold
+                // below keeps its existing order; each count is merged once.
+                if let Some(traversal) = index.traversal.as_mut() {
+                    traversal.counts.directory_entry_cap_exceeded_count +=
+                        census.directory_entry_cap_exceeded_count;
+                    traversal.counts.unreadable_path_count += census.unreadable_path_count;
+                    traversal
+                        .counts
+                        .unreadable_causes
+                        .merge(census.unreadable_causes);
+                }
                 // Per-key absence is independent of aggregate terminal authority.
                 if source == SnapshotSource::ClaudeCode {
                     index.probe_absent_claude_account_deferred_holds();
@@ -31638,14 +31650,7 @@ impl OwnedSourceScan {
                     traversal
                         .observed_index_keys
                         .extend(census.observed_index_keys.iter().cloned());
-                    traversal.counts.directory_entry_cap_exceeded_count +=
-                        census.directory_entry_cap_exceeded_count;
                     traversal.counts.symlink_rejected_count += census.symlink_rejected_count;
-                    traversal.counts.unreadable_path_count += census.unreadable_path_count;
-                    traversal
-                        .counts
-                        .unreadable_causes
-                        .merge(census.unreadable_causes);
                     traversal
                         .counts
                         .parent_unresolvable

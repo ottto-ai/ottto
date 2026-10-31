@@ -1026,7 +1026,11 @@ mod tests {
                             .get(&second_key)
                             .is_some());
                         super::super::sampled_scan::set_test_now(Some(1_600));
-                        pages.extend(claude_generation(&mut index, &dir, LATER, 1, &[]));
+                        super::super::line_delivery_tests::next_walk(
+                            &mut index,
+                            BACKFILL_WINDOW_DAYS,
+                        );
+                        pages.extend(claude_generation(&mut index, &dir, RETRY, 1, &[]));
                     }
                     pages
                 })

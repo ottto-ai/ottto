@@ -819,6 +819,7 @@ mod tests {
         index.probe_absent_claude_account_deferred_holds();
         assert_eq!(index.claude_account_deferred_hold_count(), 1);
         super::sampled_scan::set_test_now(Some(191 * DAY + 600));
+        crate::snapshots::line_delivery_tests::next_walk(&mut index, 7);
         index.probe_absent_claude_account_deferred_holds();
         fs::remove_dir_all(dir).unwrap();
         assert!(index.claude_account_deferred_holds.is_empty());
