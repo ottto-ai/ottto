@@ -9,10 +9,10 @@
 //! with a cold Full read of the same file.
 use super::sampled_scan::durable_tail::{durable_source, Counters};
 use super::sampled_scan::test_hooks::{self as scan_hooks, Point};
+use super::sampled_scan::transition_fixture::native_cold::{self as fixture, NativeColdStore};
 use super::sampled_scan::SharedCache;
 use super::*;
 use crate::durable_tail_store::{self as store, test_hooks as store_hooks};
-use crate::locked_state_dir::test_locks;
 use crate::transcript_acquisition::{AuditDebt, Scope};
 use serde_json::{json, Value};
 use std::cell::Cell;
@@ -46,16 +46,13 @@ fn claude_line(session: &str, n: u64) -> String {
 
 fn codex_head(session: &str) -> String {
     let at = "2026-10-07T10:00:00Z";
-    [
+    fixture::jsonl([
         json!({"type":"session_meta","timestamp":at,"payload":{"id":session,
             "timestamp":at,"cwd":"/tmp/m3-d3","originator":"codex_cli_rs",
             "cli_version":"0.50.0","source":"cli"}}),
         json!({"type":"turn_context","timestamp":at,
             "payload":{"turn_id":"turn-1","cwd":"/tmp/m3-d3","model":"gpt-5.2"}}),
-    ]
-    .iter()
-    .map(|line| line.to_string() + "\n")
-    .collect()
+    ])
 }
 
 fn codex_line(n: u64) -> String {
@@ -114,7 +111,7 @@ fn scan_with_window(
     namespace: &Scope,
     backfill_window_days: u64,
 ) -> (ScanIndex, Vec<SnapshotItem>) {
-    let mut scan = OwnedSourceScan::new(
+    let scan = OwnedSourceScan::new(
         source,
         &[sessions.to_path_buf()],
         index,
@@ -128,30 +125,18 @@ fn scan_with_window(
         true,
     )
     .with_sampled_acquisition(cache, namespace.clone());
-    for _ in 0..10_000 {
-        match scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => scan = next,
-            OwnedSourceScanStep::Complete {
-                mut index,
-                mut scan,
-                ..
-            } => {
-                finalize_scan_after_policy_with_body_witness(
-                    source,
-                    &mut scan,
-                    &mut index,
-                    snapshot_upload_body_witness,
-                );
-                if source == SnapshotSource::Codex {
-                    // The fixture accepts its finalized body. Production ends
-                    // this protected traversal after capturing recovery facts.
-                    scan.finish_codex_capture_boundary(&mut index);
-                }
-                return (index, scan.snapshots);
-            }
-        }
+    let (mut index, mut scan, _, _) = fixture::scan(scan, 10_000);
+    finalize_scan_after_policy_with_body_witness(
+        source,
+        &mut scan,
+        &mut index,
+        snapshot_upload_body_witness,
+    );
+    if source == SnapshotSource::Codex {
+        // End the finalized recovery traversal at the same explicit boundary.
+        scan.finish_codex_capture_boundary(&mut index);
     }
-    panic!("production scan did not complete");
+    (index, scan.snapshots)
 }
 
 /// What one pass published and reported.
@@ -200,22 +185,14 @@ impl Pass {
 
 /// A daemon-shaped state directory: index, store and transcripts under one
 /// root whose state-directory lock this process holds.
-struct Rig {
-    source: SnapshotSource,
-    root: PathBuf,
-    sessions: PathBuf,
-    index_path: PathBuf,
-    namespace: Scope,
-    cache: Arc<SharedCache>,
-    index: ScanIndex,
-    _scratch: Option<crate::test_scratch::ScratchDir>,
-}
+type Rig = NativeColdStore;
 impl Rig {
     fn new(source: SnapshotSource, tag: &str) -> Self {
-        let scratch = crate::test_scratch::ScratchDir::new(tag);
-        let mut rig = Self::open(source, scratch.to_path_buf());
-        rig._scratch = Some(scratch);
-        rig
+        assert!(
+            crate::heap_layout_bound::layout_supported(),
+            "validated native admission layout"
+        );
+        Self::with_scope(source, tag, Scope("m3-d3".into()))
     }
     /// Takes this process's lock on `root`; a killed child released its own.
     fn open(source: SnapshotSource, root: PathBuf) -> Self {
@@ -223,30 +200,7 @@ impl Rig {
             crate::heap_layout_bound::layout_supported(),
             "validated native admission layout"
         );
-        let sessions = root.join("sessions");
-        fs::create_dir_all(&sessions).unwrap();
-        test_locks::hold(&root);
-        let index_path = root.join("index.json");
-        let index = if index_path.exists() {
-            ScanIndex::load(&index_path).unwrap()
-        } else {
-            ScanIndex::default()
-        };
-        Self {
-            source,
-            root,
-            sessions,
-            index_path,
-            namespace: Scope("m3-d3".into()),
-            cache: Arc::new(SharedCache::default()),
-            index,
-            _scratch: None,
-        }
-    }
-    /// A new process view: no RAM, the index as last saved, the store on disk.
-    fn restart(&mut self) {
-        self.cache = Arc::new(SharedCache::default());
-        self.index = ScanIndex::load(&self.index_path).unwrap();
+        Self::open_with_scope(source, root, Scope("m3-d3".into()))
     }
     /// One production pass: begin, scan, save, then the post-save hook that
     /// writes M1 copies, collects garbage and reports the diagnostics line.
@@ -262,7 +216,7 @@ impl Rig {
                 cache.clone(),
                 &self.namespace,
             );
-            index.save(&self.index_path).unwrap();
+            fixture::save(&self.index_path, &mut index);
             durable_after_save(&cache, &self.root, self.source, &index);
             (index, snapshots)
         });
@@ -284,18 +238,6 @@ impl Rig {
             &self.namespace,
         );
         witness_of(self.source, &snapshots, session).expect("cold Full publishes the session")
-    }
-    fn path(&self, session: &str) -> PathBuf {
-        self.sessions.join(format!("{session}.jsonl"))
-    }
-    fn key(&self, session: &str) -> String {
-        local_index_key(&self.path(session))
-    }
-    fn digest(&self, session: &str) -> store::Digest32 {
-        store::key_digest(durable_source(self.source).unwrap(), &self.key(session))
-    }
-    fn store_dir(&self) -> PathBuf {
-        store::store_dir_for_index(&self.index_path)
     }
     fn record(&self, session: &str) -> PathBuf {
         let hex = self

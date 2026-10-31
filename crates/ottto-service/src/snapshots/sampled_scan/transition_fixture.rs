@@ -1100,13 +1100,17 @@ pub(crate) mod native_cold {
         scratch: Option<crate::test_scratch::ScratchDir>,
     }
     impl NativeColdStore {
-        pub(crate) fn new(source: SnapshotSource, tag: &str, namespace: Scope) -> Self {
+        pub(crate) fn with_scope(source: SnapshotSource, tag: &str, namespace: Scope) -> Self {
             let scratch = crate::test_scratch::ScratchDir::new(tag);
-            let mut fixture = Self::open(source, scratch.to_path_buf(), namespace);
+            let mut fixture = Self::open_with_scope(source, scratch.to_path_buf(), namespace);
             fixture.scratch = Some(scratch);
             fixture
         }
-        pub(crate) fn open(source: SnapshotSource, root: PathBuf, namespace: Scope) -> Self {
+        pub(crate) fn open_with_scope(
+            source: SnapshotSource,
+            root: PathBuf,
+            namespace: Scope,
+        ) -> Self {
             let sessions = root.join("sessions");
             fs::create_dir_all(&sessions).unwrap();
             let writer = test_locks::hold(&root);
