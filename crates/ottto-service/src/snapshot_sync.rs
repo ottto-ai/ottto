@@ -21909,7 +21909,37 @@ mod tests {
                 Err(_) => break,
             }
         }
-        String::from_utf8_lossy(&request).to_string()
+        decoded_http_request(&request)
+    }
+
+    // Mock receivers inspect decoded JSON just as the backend does. Keep the
+    // raw bounded_native_read fixture for tests asserting encoded wire bytes.
+    fn decoded_http_request(request: &[u8]) -> String {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return String::from_utf8_lossy(request).into_owned();
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        if !headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip"))
+        {
+            return String::from_utf8_lossy(request).into_owned();
+        }
+        let mut body = String::new();
+        flate2::read::GzDecoder::new(&request[header_end + 4..])
+            .read_to_string(&mut body)
+            .expect("decode gzip fixture request");
+        let headers = headers
+            .lines()
+            .filter(|line| {
+                !line.split_once(':').is_some_and(|(name, _)| {
+                    name.eq_ignore_ascii_case("Content-Length")
+                        || name.eq_ignore_ascii_case("Content-Encoding")
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        format!("{headers}\r\nContent-Length: {}\r\n\r\n{body}", body.len())
     }
 
     fn http_request_complete(request: &[u8]) -> bool {
