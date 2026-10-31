@@ -146,16 +146,7 @@ impl Mapper for ClaudeMapper {
         // A COMMIT advanced control.generation; the proof must compare the
         // normalized G graph against that one deliberate G+1 control change.
         let mut tx = store.begin(TxnMode::Read)?;
-        let mut verified = verify_normalized_with_checkpoints(
-            &mut tx,
-            index,
-            original,
-            identity.binding,
-            generation,
-            cx.committed.clone(),
-        )?;
-        verified.committed = cx.committed;
-        Ok(verified)
+        verify_normalized_at(&mut tx, index, original, identity.binding, generation)
     }
     fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
         let mut tx = store.begin(TxnMode::Read)?;
@@ -796,30 +787,12 @@ fn verify_normalized(
 ) -> Result<KindCx> {
     verify_normalized_at(tx, index, original, binding, index.generation)
 }
-#[cfg(test)]
 fn verify_normalized_at(
     tx: &mut dyn Transaction,
     index: &ScanIndex,
     original: &Original,
     binding: super::super::scan_index_persistence::Binding,
     generation: u64,
-) -> Result<KindCx> {
-    verify_normalized_with_checkpoints(
-        tx,
-        index,
-        original,
-        binding,
-        generation,
-        std::collections::BTreeMap::new(),
-    )
-}
-fn verify_normalized_with_checkpoints(
-    tx: &mut dyn Transaction,
-    index: &ScanIndex,
-    original: &Original,
-    binding: super::super::scan_index_persistence::Binding,
-    generation: u64,
-    checkpoints: std::collections::BTreeMap<String, super::resume::ResumeCheckpoint>,
 ) -> Result<KindCx> {
     let mut proof = ReadBack {
         inner: tx,
@@ -830,16 +803,6 @@ fn verify_normalized_with_checkpoints(
     let mut cx = KindCx::default();
     cx.binding = Some(binding);
     cx.presence = original.presence.clone();
-    // Import parity reads the additional exact-reference rows in the same
-    // read-back transaction, without treating them as v1 parser state.
-    if !checkpoints.is_empty() {
-        cx.prepared = Some(super::resume::Prepared {
-            generation: index.generation,
-            signature: super::resume::files_signature(index)?,
-            checkpoints: checkpoints.clone(),
-        });
-    }
-
     kinds::populate(index, &mut proof, &mut cx)?;
     let mut count = 0_u64;
     let mut after = None;
