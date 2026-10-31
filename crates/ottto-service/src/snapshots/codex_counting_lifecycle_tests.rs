@@ -44,7 +44,7 @@ fn scan(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
 }
 
 fn scan_at(root: &Path, index: &mut ScanIndex, collected_at: &str) -> SourceScanResult {
-    scan_source_roots_with_test_limit(
+    let mut scan = scan_source_roots_with_test_limit(
         SnapshotSource::Codex,
         &[root.join("sessions"), root.join("archived_sessions")],
         index,
@@ -53,7 +53,11 @@ fn scan_at(root: &Path, index: &mut ScanIndex, collected_at: &str) -> SourceScan
         10,
         false,
     )
-    .unwrap()
+    .unwrap();
+    // The parser no longer builds curves; a retained body-tracking curve keeps
+    // a changed body's witness distinct.
+    attach_retained_context_curve(&mut scan.snapshots, true);
+    scan
 }
 
 /// One ACKed singleton at its original path, saved and reloaded.

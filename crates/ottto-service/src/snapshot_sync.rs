@@ -13219,7 +13219,7 @@ mod tests {
 
     fn cache_effective_wire_released143_index(root: &Path) -> (ScanIndex, SnapshotUploadProgress) {
         let scan = |index: &mut ScanIndex| {
-            crate::snapshots::scan_source_roots_with_test_limit(
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
                 SnapshotSource::Codex,
                 &[root.to_path_buf()],
                 index,
@@ -13228,7 +13228,10 @@ mod tests {
                 MAX_BACKFILL_FILES_PER_SOURCE,
                 true,
             )
-            .unwrap()
+            .unwrap();
+            // The parser no longer builds curves; restore a retained one.
+            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots, false);
+            scan
         };
         let mut index = ScanIndex::default();
         let mut progress = test_upload_progress();
@@ -13492,7 +13495,7 @@ mod tests {
     fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         let root = cache_effective_wire_fixture_root();
         let scan = |index: &mut ScanIndex| {
-            crate::snapshots::scan_source_roots_with_test_limit(
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
                 SnapshotSource::Codex,
                 std::slice::from_ref(&root),
                 index,
@@ -13501,7 +13504,10 @@ mod tests {
                 MAX_BACKFILL_FILES_PER_SOURCE,
                 true,
             )
-            .unwrap()
+            .unwrap();
+            // The parser no longer builds curves; restore a retained one.
+            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots, false);
+            scan
         };
         let response = |items: Vec<SnapshotItem>, enforce: bool, head: Option<String>| {
             let request = SnapshotBatchRequest {
@@ -13817,6 +13823,8 @@ mod tests {
             true,
         )
         .unwrap();
+        // The parser no longer builds curves; restore a retained one.
+        crate::snapshots::attach_retained_context_curve(&mut next.snapshots, false);
         assert_eq!(
             next.snapshots.len(),
             1,
@@ -13896,6 +13904,8 @@ mod tests {
             true,
         )
         .unwrap();
+        // The parser no longer builds curves; restore a retained one.
+        crate::snapshots::attach_retained_context_curve(&mut retry.snapshots, false);
         apply_upload_policy(
             SnapshotSource::Codex,
             &mut retry.snapshots,
@@ -14000,7 +14010,7 @@ mod tests {
         );
         index.activate_upload_context("cache-off".into());
         let scan = |index: &mut ScanIndex| {
-            crate::snapshots::scan_source_roots_with_test_limit(
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
                 SnapshotSource::Codex,
                 std::slice::from_ref(&root),
                 index,
@@ -14009,7 +14019,10 @@ mod tests {
                 MAX_BACKFILL_FILES_PER_SOURCE,
                 true,
             )
-            .unwrap()
+            .unwrap();
+            // The parser no longer builds curves; restore a retained one.
+            crate::snapshots::attach_retained_context_curve(&mut scan.snapshots, false);
+            scan
         };
         let mut off = scan(&mut index);
         assert_eq!(off.snapshots.len(), 1);

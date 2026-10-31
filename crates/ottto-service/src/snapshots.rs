@@ -52877,6 +52877,39 @@ pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<P
         .collect()
 }
 
+/// Reads a curve from a committed golden fixture at a JSON pointer ("" is the
+/// whole file). The daemon no longer builds curves; retained bodies may still
+/// carry one.
+#[cfg(test)]
+pub(crate) fn context_curve_golden_fixture(file: &str, pointer: &str) -> SnapshotContextCurve {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/snapshot-audit")
+        .join(file);
+    let value: Value =
+        serde_json::from_slice(&fs::read(path).expect("read curve fixture")).expect("json");
+    serde_json::from_value(value.pointer(pointer).expect("curve pointer").clone())
+        .expect("curve fixture decodes")
+}
+
+/// Test-only vehicle for the retained curve-bearing body path: attaches the
+/// stored Codex cache golden curve. Curves are hash-neutral, so only the body
+/// witness sees it. With `tracks_body` every point takes the item's input
+/// tokens, as the retired builder's curve followed the body.
+#[cfg(test)]
+pub(crate) fn attach_retained_context_curve(items: &mut [SnapshotItem], tracks_body: bool) {
+    let curve =
+        context_curve_golden_fixture("cache_observation_codex_v1.json", "/snapshot/context_curve");
+    for item in items {
+        let mut curve = curve.clone();
+        if tracks_body {
+            for point in &mut curve.points {
+                point.effective_input_tokens = item.input_tokens.max(1);
+            }
+        }
+        item.context_curve = Some(curve);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     mod claude_file_cap_tests {
@@ -52945,23 +52978,8 @@ mod tests {
         path
     }
 
-    /// Reads a curve from the cross-language golden fixtures. The daemon no
-    /// longer builds curves; retained bodies may still carry one.
-    fn context_curve_golden_fixture(file: &str, key: Option<&str>) -> SnapshotContextCurve {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/snapshot-audit")
-            .join(file);
-        let value: Value =
-            serde_json::from_slice(&fs::read(path).expect("read curve fixture")).expect("json");
-        let value = match key {
-            Some(key) => value[key].clone(),
-            None => value,
-        };
-        serde_json::from_value(value).expect("curve fixture decodes")
-    }
-
     fn max_fractional_context_curve_fixture() -> SnapshotContextCurve {
-        context_curve_golden_fixture("context-curve-v1-max-fractional.json", None)
+        context_curve_golden_fixture("context-curve-v1-max-fractional.json", "")
     }
 
     /// One owned request as the retired builder emitted it: ordinal 1 carries
@@ -70498,9 +70516,8 @@ mod tests {
     fn context_curve_cross_language_golden_is_canonical_and_current() {
         // The builder is retired; the committed fixture is the source of
         // truth and must still round-trip byte-for-byte.
-        let codex = context_curve_golden_fixture("context-curve-v1-golden.json", Some("codex"));
-        let claude =
-            context_curve_golden_fixture("context-curve-v1-golden.json", Some("claude_code"));
+        let codex = context_curve_golden_fixture("context-curve-v1-golden.json", "/codex");
+        let claude = context_curve_golden_fixture("context-curve-v1-golden.json", "/claude_code");
         let witness = |curve: SnapshotContextCurve,
                        tool_usage: Option<Vec<SnapshotToolUsage>>,
                        tool_usage_truncated: bool| {
@@ -70796,9 +70813,14 @@ mod tests {
             if !exclusive {
                 item.usage_accounting_contract = None;
             }
-            if !with_curve {
-                item.context_curve = None;
-            }
+            // The parser no longer builds curves; the curve case carries its
+            // stored golden curve.
+            item.context_curve = with_curve.then(|| {
+                context_curve_golden_fixture(
+                    "body-witness-ack-normalization-v1.json",
+                    "/session_account_cases/exclusive_with_curve/wire/snapshots/0/context_curve",
+                )
+            });
             assert_eq!(
                 (item.input_tokens, item.output_tokens, item.request_count),
                 (100, 5, 1)
@@ -71066,8 +71088,7 @@ mod tests {
         assert!(parsed.cache_observations.is_some());
         assert!(parsed.context_curve.is_none());
         // The parser no longer builds curves; curve cases carry a retained one.
-        let retained_curve =
-            context_curve_golden_fixture("context-curve-v1-golden.json", Some("codex"));
+        let retained_curve = context_curve_golden_fixture("context-curve-v1-golden.json", "/codex");
         assert_eq!((parsed.input_tokens, parsed.output_tokens), (300_000, 3));
         let mut cases = Vec::new();
         for capability in ["creator", "cache", "combined", "legacy"] {
@@ -72728,9 +72749,14 @@ mod tests {
                         item.cache_observations = None;
                         item.cache_observations_state = None;
                     }
-                    if !curve {
-                        item.context_curve = None;
-                    }
+                    // The parser no longer builds curves; curve cases carry the
+                    // stored golden curve.
+                    item.context_curve = curve.then(|| {
+                        context_curve_golden_fixture(
+                            "claude-original-source-corpus-v1.json",
+                            "/cases/1/wire/snapshots/0/context_curve",
+                        )
+                    });
                     let source_item = item;
                     for tools in [
                         "omitted",
@@ -83306,6 +83332,8 @@ pub(crate) mod cache_adapter_tests {
                 None,
             )
             .remove(0);
+        // The parser no longer builds curves; restore the stored golden curve.
+        super::attach_retained_context_curve(std::slice::from_mut(&mut item), false);
         prepare_cache_observations(&mut item, None);
         item
     }
