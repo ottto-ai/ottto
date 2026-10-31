@@ -121,22 +121,60 @@ fn empty_custody_scope_rejection_precedes_audit_clock_and_all_body_reads() {
     }
 }
 
-// Direct legacy codec oracle, not a production cold restore or read grant.
-fn legacy_rederive_oracle(
-    path: &Path,
-    body: &[u8],
-    source: SnapshotSource,
-) -> CachedJsonlReduction {
-    let decoded = codec::decode(body, source).unwrap();
-    let parser = codec::rederive_parser(File::open(path).unwrap(), path, &decoded).unwrap();
-    decoded
-        .rederive(
-            parser,
-            &mut File::open(path).unwrap(),
-            jsonl_line_cap() as u64,
+// Compare persisted state to an independent native Full, then finish the
+// production bounded replay through the existing emitted-money oracle.
+fn assert_cold_full_body(path: &Path, body: &[u8], source: SnapshotSource, scope: &Scope) {
+    let mut cold = owned_parser(source, path, File::open(path).unwrap());
+    assert!(matches!(
+        cold.prepare_acquisition(None, scope, None, 1_800_000_000)
+            .unwrap(),
+        crate::transcript_acquisition::ReadMode::Full(_)
+    ));
+    while !cold.step().unwrap() {}
+    assert_eq!(
+        codec::encode(
+            &cold.durable_test_reduction_copy(),
+            store::RECORD_BYTES,
+            jsonl_line_cap() as u64
         )
+        .unwrap(),
+        body
+    );
+    let checkpoint = match cold
+        .certify_without_retention(scope, 1_800_000_000)
         .unwrap()
-        .0
+    {
+        sampled_jsonl::SideCertificate::Certified { completed, .. } => completed.checkpoint,
+        _ => panic!("a clean cold Full is certified"),
+    };
+    let decoded = codec::decode(body, source).unwrap();
+    let plan = decoded.rederive_plan().unwrap();
+    let (state, _, _) = decoded
+        .rederive_content_planned(&File::open(path).unwrap(), &plan)
+        .unwrap();
+    let mut restored = owned_parser(source, path, File::open(path).unwrap());
+    assert_eq!(
+        restored
+            .prepare_acquisition(
+                Some(crate::transcript_cache::Retained { checkpoint, state }),
+                scope,
+                None,
+                1_800_000_000
+            )
+            .unwrap(),
+        crate::transcript_acquisition::ReadMode::Unchanged
+    );
+    let cold = codec::test_finish_items(cold, path, source);
+    let actual = codec::test_finish_items(restored, path, source);
+    let mut differences = Vec::new();
+    super::super::transition_fixture::money_oracle::diff(
+        "native_body",
+        &cold,
+        &actual,
+        &mut differences,
+    );
+    assert!(differences.is_empty(), "{source:?}: {differences:#?}");
+    assert_eq!(actual, cold);
 }
 fn assert_rederive_pending(
     outcome: RestoreOutcome,
@@ -2478,12 +2516,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
                 &interpretation,
             );
             assert_rederive_pending(outcome, &restart, source, &key);
-            let direct = legacy_rederive_oracle(path, body, source);
-            assert_eq!(
-                codec::encode(&direct, store::RECORD_BYTES, cap).unwrap(),
-                *body,
-                "{arm}"
-            );
+            assert_cold_full_body(path, body, source, &scope);
         }
         let (counts, disk) = restart.durable_counters(source).unwrap();
         println!("dt_budget {arm} restart: {}", counts.summary(source, &disk));
@@ -3743,6 +3776,7 @@ fn save_without_per_pass_setup_keeps_valid_records() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// [format] Original binding inputs and failed rewrites preserve the authoritative record.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites() {
@@ -3876,12 +3910,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
             );
             if arm == "equal" {
                 if content_hold {
-                    let direct = legacy_rederive_oracle(&path, &pending.body, source);
-                    assert_eq!(
-                        codec::encode(&direct, store::RECORD_BYTES, jsonl_line_cap() as u64)
-                            .unwrap(),
-                        pending.body
-                    );
+                    assert_cold_full_body(&path, &pending.body, source, &scope);
                 } else {
                     let taken = result.expect("no-input record actually restored");
                     assert_eq!(
