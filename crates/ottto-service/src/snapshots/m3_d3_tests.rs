@@ -131,6 +131,11 @@ fn scan(
                     &mut index,
                     snapshot_upload_body_witness,
                 );
+                if source == SnapshotSource::Codex {
+                    // The fixture accepts its finalized body. Production ends
+                    // this protected traversal after capturing recovery facts.
+                    scan.finish_codex_capture_boundary(&mut index);
+                }
                 return (index, scan.snapshots);
             }
         }
