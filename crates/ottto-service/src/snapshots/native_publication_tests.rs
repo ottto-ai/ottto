@@ -1,4 +1,8 @@
-//! E1's transport/mapping controls. E5 owns the eight native Pi capture cases.
+//! Transport and disposition mapper controls, including typed WriteOutcome inputs.
+//! These do not prove real store failures. Injected Pi rows additionally check
+//! downstream HTTP/ACK behaviour in retry_live_native_tests.rs. Real-path proof:
+//! durable_transition_pi_tests::pi_stale_survivor_holds_then_resolves_with_a_counted_tail
+//! and retry_live_native_tests::pi_e4_receipted_captures_and_posts (uninjected).
 use super::*;
 pub(crate) use sampled_scan::durable_tail::{
     Degraded, DegradedCause, HeldCause, NotPersisted, Unprepared, UnpreparedDisposition,
@@ -11,7 +15,8 @@ fn acquisition() -> FinishAcquisition {
     FinishAcquisition::Uncertified(DurableCustody::default())
 }
 
-/// [money] codex strict rebind keeps the existing publishing class.
+/// [money] Mapper: Codex strict rebind keeps the existing publishing class.
+/// Typed outcomes exercise disposition conversion, not a real store failure.
 #[test]
 fn codex_strict_rebind_keeps_the_existing_publishing_class() {
     let cache = sampled_scan::SharedCache::default();
@@ -36,7 +41,8 @@ fn codex_strict_rebind_keeps_the_existing_publishing_class() {
     );
 }
 
-/// [money] claude and pi strict rebind are held publication decisions.
+/// [money] Mapper: Claude and Pi strict rebind are held publication decisions.
+/// Typed outcomes exercise disposition conversion, not a real store failure.
 #[test]
 fn claude_and_pi_strict_rebind_are_held_publication_decisions() {
     let cache = sampled_scan::SharedCache::default();
@@ -65,7 +71,8 @@ fn claude_and_pi_strict_rebind_are_held_publication_decisions() {
     }
 }
 
-/// [money] native publication has exactly five publishing and three held classes.
+/// [money] Mapper: native publication has five publishing and three held classes.
+/// Typed outcomes exercise disposition conversion, not a real store failure.
 #[test]
 fn native_publication_has_exactly_five_publishing_and_three_held_classes() {
     let cache = sampled_scan::SharedCache::default();
@@ -75,7 +82,7 @@ fn native_publication_has_exactly_five_publishing_and_three_held_classes() {
     let write = |outcome| write_disposition(&cache, &mut acquisition(), source, outcome, None).0;
     let cause = Unprepared::NotPersisted(NotPersisted::Codec);
     // The receipt policy is a typed value here; real candidate/receipt binding
-    // stays in the existing facade fixtures and E5's native outcome tests.
+    // stays in the existing facade fixtures and the uninjected Pi receipt test.
     let publishing = [
         NativePublication::Receipted,
         unprepared(UnpreparedDisposition::PublishWithoutRecord { cause }),
@@ -176,9 +183,10 @@ fn held_decision_survives_later_publishing_siblings_and_empty_page_transport() {
     }
 }
 
-// Typed e4 inputs at the native consumer boundary. Receipt cases use the real
-// store; injected non-receipt outcomes discard the actual private stage and
-// run the same production disposition/custody mapping before any body effect.
+/// Typed mapper inputs at the native consumer boundary, not real store failures.
+/// Injected outcomes discard the actual private stage and run production
+/// disposition/custody mapping before downstream HTTP/ACK effects. The uninjected
+/// receipt and stale-survivor tests named above provide real-path evidence.
 pub(crate) enum E4Outcome {
     Write(WriteOutcome),
     Unprepared(UnpreparedDisposition),
@@ -192,6 +200,7 @@ impl Drop for SettlementGuard {
         SETTLEMENT.with(|slot| *slot.borrow_mut() = None);
     }
 }
+/// Inject a mapper input; this seam does not fail a store operation.
 pub(crate) fn inject_settlement(key: String, outcome: E4Outcome) -> SettlementGuard {
     SETTLEMENT.with(|slot| {
         assert!(slot.borrow().is_none());
@@ -209,6 +218,7 @@ pub(super) fn take_outcome(key: &str) -> Option<E4Outcome> {
         }
     })
 }
+/// Map the supplied WriteOutcome/UnpreparedDisposition through production policy.
 pub(super) fn map_settlement(
     cache: &sampled_scan::SharedCache,
     acquisition: &mut FinishAcquisition,
@@ -225,6 +235,7 @@ pub(super) fn map_settlement(
         }
     }
 }
+/// Confirm the mapper input was consumed, not that a real store failure occurred.
 pub(crate) fn assert_settlement_consumed() {
     SETTLEMENT.with(|slot| {
         assert!(

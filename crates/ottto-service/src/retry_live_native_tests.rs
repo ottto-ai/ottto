@@ -1422,6 +1422,10 @@ fn pi_publication_post(f: &mut PiLiveFixture, retained: bool) {
     }
 }
 
+/// Injected rows prove the WriteOutcome/UnpreparedDisposition -> disposition
+/// mapper and downstream HTTP/ACK behaviour, not real store failures. Real-path
+/// proof is pi_e4_receipted_captures_and_posts (None here) and
+/// durable_transition_pi_tests::pi_stale_survivor_holds_then_resolves_with_a_counted_tail.
 fn pi_native_publication_page(
     files: usize,
     outcome: Option<crate::snapshots::native_publication_tests::E4Outcome>,
@@ -1612,7 +1616,7 @@ use crate::snapshots::native_publication_tests::{
     NotPersisted as PiNotPersisted, Unprepared as PiUnprepared,
     UnpreparedDisposition as PiUnpreparedDisposition, WriteOutcome as PiWriteOutcome,
 };
-/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
+/// [money] Uninjected Pi receipt proves real-store retained retry and HTTP/ACK.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1620,7 +1624,8 @@ fn pi_e4_receipted_captures_and_posts() {
     pi_publication_case(crate::snapshots::NativePublication::Receipted, None);
 }
 
-/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
+/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
+/// These typed outcome rows do not prove a real store failure.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1635,7 +1640,8 @@ fn pi_e4_publish_without_record_captures_and_posts() {
     );
 }
 
-/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
+/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
+/// These typed outcome rows do not prove a real store failure.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1648,7 +1654,8 @@ fn pi_e4_failed_published_without_record_captures_and_posts() {
     );
 }
 
-/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
+/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
+/// These typed outcome rows do not prove a real store failure.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1664,7 +1671,8 @@ fn pi_e4_publish_retaining_prior_captures_and_posts() {
     );
 }
 
-/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
+/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
+/// These typed outcome rows do not prove a real store failure.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1679,7 +1687,8 @@ fn pi_e4_publish_store_untouched_captures_and_posts() {
     );
 }
 
-/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
+/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
+/// These typed outcome rows do not prove a real store failure.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1690,7 +1699,8 @@ fn pi_e4_failed_held_refuses_retained_retry() {
     );
 }
 
-/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
+/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
+/// These typed outcome rows do not prove a real store failure.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1701,7 +1711,8 @@ fn pi_e4_receipt_pending_refuses_retained_retry() {
     );
 }
 
-/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
+/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
+/// These typed outcome rows do not prove a real store failure.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1717,7 +1728,8 @@ fn pi_e4_unprepared_hold_and_strict_rebind_refuse_retained_retry() {
     }
 }
 
-/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
+/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
+/// These typed outcome rows do not prove a real store failure.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
