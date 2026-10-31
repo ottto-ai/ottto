@@ -641,28 +641,32 @@ pub(super) fn reset_open_backoff_for_test() {
 #[cfg(test)]
 mod open_backoff_tests;
 
-/// Secure open spends this key's progress turn and clears throttling, NOT
-/// the owed verification. Another key may own the slot, so retain the exact
+/// The queued progress Full for `key` passed its secure open: the slot's
+/// turn is spent, so the next preparation rotates to a fresh interval, and
+/// any failed-open backoff ends. Terminal-off clears throttling, NOT the
+/// owed verification: another key may own the slot, so it retains the exact
 /// numeric due in the bounded map until a marker/native acquisition carries
 /// it or a completed source verification retires it.
 pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
-    if !claude_terminal_off() {
-        return progress_opened_main(index, key);
-    }
-
+    let terminal_off = claude_terminal_off();
     if let Some(slot) = index
         .held_audit_progress
         .as_mut()
         .filter(|slot| slot.key == key)
     {
         slot.attempted = true;
-    }
-    with_open_backoff(|backoff| {
-        if let Some(failure) = backoff.keys.get_mut(key) {
-            failure.failures = 0;
-            failure.retry_page = backoff.page;
+        if !terminal_off {
+            with_open_backoff(|backoff| backoff.keys.remove(key));
         }
-    });
+    }
+    if terminal_off {
+        with_open_backoff(|backoff| {
+            if let Some(failure) = backoff.keys.get_mut(key) {
+                failure.failures = 0;
+                failure.retry_page = backoff.page;
+            }
+        });
+    }
 }
 
 #[derive(Serialize)]
@@ -1834,17 +1838,6 @@ mod absence_non_unix_tests {
             std::path::Path::new("missing/file.jsonl"),
             &[std::path::PathBuf::from("missing")]
         ));
-    }
-}
-
-pub(super) fn progress_opened_main(index: &mut ScanIndex, key: &str) {
-    if let Some(slot) = index
-        .held_audit_progress
-        .as_mut()
-        .filter(|slot| slot.key == key)
-    {
-        slot.attempted = true;
-        with_open_backoff(|backoff| backoff.keys.remove(key));
     }
 }
 
