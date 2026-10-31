@@ -28,40 +28,62 @@ fn assert_archive_ru_residue(result: &SourceScanResult, rows: &[Value], cause: C
     );
 }
 
+/// [behaviour] Unfunded quiet held/refused sites and a settlement-exhausted
+/// parser error each report one archive residue under their cause, construct
+/// no decoder, and leave the healthy sibling's census work to proceed.
 #[test]
-fn quiet_held_and_refused_site_has_no_ru_and_healthy_census_work_proceeds() {
-    for disposition in [
-        ArchiveDisposition::Held {
-            cause: CodexZstCause::OutputHeld,
-        },
-        ArchiveDisposition::Refused {
-            cause: CodexZstCause::DecodeFailed,
-        },
+fn unfunded_archive_residue_has_no_ru_and_healthy_census_work_proceeds() {
+    for (disposition, decode_attempts, cause) in [
+        (
+            ArchiveDisposition::Held {
+                cause: CodexZstCause::OutputHeld,
+            },
+            0,
+            CodexZstCause::OutputHeld,
+        ),
+        (
+            ArchiveDisposition::Refused {
+                cause: CodexZstCause::DecodeFailed,
+            },
+            0,
+            CodexZstCause::DecodeFailed,
+        ),
+        // stop_exhausted runs before decoder funding and holds the archive.
+        (
+            ArchiveDisposition::Pending {
+                attempts: 6,
+                retry_after: 0,
+            },
+            6,
+            CodexZstCause::DecodeBudget,
+        ),
     ] {
-        let f = ArchiveFixture::new(b"quiet-stamp-only");
+        let f = ArchiveFixture::new(b"unfunded-stamp-only");
         let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
-        let cause = match disposition {
-            ArchiveDisposition::Held { cause } | ArchiveDisposition::Refused { cause } => cause,
-            _ => unreachable!(),
-        };
         evidence.disposition = disposition;
+        evidence.decode_attempts = decode_attempts;
         let mut index = ScanIndex::default();
         index
             .files
             .entry(local_index_key(&f.0))
             .or_default()
             .archive = Some(Box::new(evidence));
-        let (_, result, rows, _) =
+        let (index, result, rows, _) =
             archive_pass_with(&f, index, false, None, &[], archive_ru_healthy_sibling);
-        assert_eq!(
-            decodes(&rows),
-            0,
-            "quiet caller must not construct a decoder"
-        );
+        assert_eq!(decodes(&rows), 0, "no decoder for {cause:?}");
+        match &archive_evidence(&index, &f).disposition {
+            ArchiveDisposition::Held { cause: kept }
+            | ArchiveDisposition::Refused { cause: kept } => {
+                assert_eq!(*kept, cause)
+            }
+            other => panic!("{cause:?} site must stay held or refused: {other:?}"),
+        }
         assert_archive_ru_residue(&result, &rows, cause);
     }
 }
 
+/// [behaviour] A quiet Pending attempt without a current body is disclosed as unreadable each pass,
+/// despite historical output.
 #[test]
 fn quiet_pending_discloses_a_bodyless_current_attempt_despite_historical_output() {
     for current_body in [None, Some("current-body".to_owned())] {
@@ -143,37 +165,8 @@ fn quiet_pending_discloses_a_bodyless_current_attempt_despite_historical_output(
     }
 }
 
-#[test]
-fn settlement_exhausted_parser_error_has_no_ru_and_healthy_census_work_proceeds() {
-    let f = ArchiveFixture::new(b"exhausted-stamp-only");
-    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
-    evidence.decode_attempts = 6;
-    evidence.disposition = ArchiveDisposition::Pending {
-        attempts: 6,
-        retry_after: 0,
-    };
-    let mut index = ScanIndex::default();
-    index
-        .files
-        .entry(local_index_key(&f.0))
-        .or_default()
-        .archive = Some(Box::new(evidence));
-    let (index, result, rows, _) =
-        archive_pass_with(&f, index, false, None, &[], archive_ru_healthy_sibling);
-    assert_eq!(
-        decodes(&rows),
-        0,
-        "stop_exhausted runs before decoder funding"
-    );
-    assert!(matches!(
-        archive_evidence(&index, &f).disposition,
-        ArchiveDisposition::Held {
-            cause: CodexZstCause::DecodeBudget
-        }
-    ));
-    assert_archive_ru_residue(&result, &rows, CodexZstCause::DecodeBudget);
-}
-
+/// [behaviour] A native-finish OutputHeld archive reports its residue while healthy census work
+/// proceeds.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -212,6 +205,7 @@ fn native_finish_output_held_has_no_ru_and_healthy_census_work_proceeds() {
     assert_archive_ru_residue(&result, &rows, CodexZstCause::OutputHeld);
 }
 
+/// [behaviour] Parser admission starvation becomes residue at the archive's own twelfth yield.
 #[test]
 fn parser_admission_ru_ends_at_own_twelfth_yield() {
     let _lock = ARCHIVE_TEST_LOCK
@@ -246,6 +240,7 @@ fn parser_admission_ru_ends_at_own_twelfth_yield() {
     admission_streak(&key, false);
 }
 
+/// [behaviour] Parser errors without an admission yield or bodyless Pending add no generic residue.
 #[test]
 fn parser_errors_without_admission_yield_or_bodyless_pending_have_no_generic_ru() {
     let f = ArchiveFixture::new(b"classification-only");
@@ -291,6 +286,8 @@ fn parser_errors_without_admission_yield_or_bodyless_pending_have_no_generic_ru(
     assert_eq!(body_retained.unreadable_path_count, 0);
 }
 
+/// [behaviour] Scoped header and constructor failures keep the witness without a terminal archive
+/// marker.
 #[test]
 fn scoped_header_and_constructor_failures_survive_witness_without_terminal_archive_marker() {
     for cause in [

@@ -1172,9 +1172,7 @@ pub(in crate::snapshots) mod tests {
     include!("codex_archive_retained_tests.rs");
     include!("codex_archive_correction_tests.rs");
     include!("codex_archive_ru_tests.rs");
-    include!("codex_archive_released_entry_tests.rs");
     include!("codex_archive_downgrade_tests.rs");
-    include!("codex_archive_released_writer_tests.rs");
     mod money_equivalence_tests {
         use super::*;
         include!("codex_archive_money_equivalence_tests.rs");

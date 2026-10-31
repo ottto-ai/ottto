@@ -156,6 +156,7 @@ fn normal(root: &Path, index: ScanIndex, hints: &[PathBuf]) -> (ScanIndex, Sourc
     ))
 }
 
+/// [behaviour] Publication validation skips a newly held file before sampling.
 #[test]
 fn publication_validation_skips_a_newly_held_file_before_sampling() {
     let root = crate::test_scratch::private_dir("custody-publication-validation");
@@ -191,6 +192,7 @@ fn publication_validation_skips_a_newly_held_file_before_sampling() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [money] Watcher removal, save, restart and recreation keep unprotected accepted evidence.
 #[test]
 fn watcher_removal_full_save_restart_recreation_keeps_unprotected_accepted_evidence() {
     let root = crate::test_scratch::private_dir("custody-watcher");
@@ -229,6 +231,7 @@ fn watcher_removal_full_save_restart_recreation_keeps_unprotected_accepted_evide
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [money] Replay keeps historical coverage without new ACK credit.
 #[test]
 fn replay_retains_historical_coverage_without_new_ack_credit() {
     let root = crate::test_scratch::private_dir("custody-replay");
@@ -295,6 +298,7 @@ fn replay_retains_historical_coverage_without_new_ack_credit() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [format] An unsafe committable-subset overlay keeps the real entries in both rollback cases.
 #[test]
 fn unsafe_subset_overlay_preserves_real_entries_in_both_rollback_cases() {
     let root = crate::test_scratch::private_dir("custody-subset");
@@ -358,6 +362,7 @@ fn unsafe_subset_overlay_preserves_real_entries_in_both_rollback_cases() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] Parent-role opens and retained-ledger validation refuse before content I/O.
 #[test]
 fn parent_role_opens_and_retained_ledger_validation_refuse_before_content_io() {
     let root = crate::test_scratch::private_dir("custody-grandchild");
@@ -405,6 +410,7 @@ fn parent_role_opens_and_retained_ledger_validation_refuse_before_content_io() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [format] Unknown persisted hold values hold; field loss from an older writer is accepted.
 #[test]
 fn unknown_field_values_hold_but_older_writer_field_loss_is_accepted() {
     let root = crate::test_scratch::private_dir("custody-field");
@@ -441,6 +447,7 @@ fn unknown_field_values_hold_but_older_writer_field_loss_is_accepted() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] An ordinary blocked plain entry is not recovered as compressed custody.
 #[test]
 fn ordinary_blocked_plain_entry_is_not_recovered_as_compressed_custody() {
     let root = crate::test_scratch::private_dir("custody-ordinary-control");
@@ -457,6 +464,7 @@ fn ordinary_blocked_plain_entry_is_not_recovered_as_compressed_custody() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [money] Read bound: custody keeps parser identity and never selects a migration or parse.
 #[test]
 fn custody_preserves_parser_identity_and_never_selects_migration_or_parse() {
     let root = crate::test_scratch::private_dir("custody-identity");
@@ -521,6 +529,8 @@ fn custody_preserves_parser_identity_and_never_selects_migration_or_parse() {
 
 /// The CI driver supplies an output directory, then feeds these actual writer
 /// bytes to the production loaders compiled from both pinned old source trees.
+/// [format] Writes the branch bytes the pinned old loaders read
+/// (scripts/test_codex_zst_downgrade.py).
 #[test]
 fn write_codex_zst_downgrade_fixture() {
     let root = crate::test_scratch::private_dir("custody-downgrade-writer");
@@ -590,6 +600,7 @@ fn write_codex_zst_downgrade_fixture() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [format] Re-upgrade loads the old loaders' saves without reset; the hold field loss is accepted.
 #[test]
 fn verify_codex_zst_downgrade_roundtrip() {
     // The driver executes this after both real old-code saves. Without the
@@ -627,6 +638,7 @@ fn verify_codex_zst_downgrade_roundtrip() {
     }
 }
 
+/// [behaviour] Unknown-owner coverage defers present or absent held siblings.
 #[test]
 fn foundation_unknown_owner_coverage_defers_present_or_absent_held_siblings() {
     for absent in [false, true] {
@@ -653,6 +665,7 @@ fn foundation_unknown_owner_coverage_defers_present_or_absent_held_siblings() {
     }
 }
 
+/// [format] A malformed large persisted hold streams to generic custody.
 #[test]
 fn malformed_large_hold_streams_to_generic_custody() {
     let root = crate::test_scratch::private_dir("custody-large-field");
@@ -677,6 +690,7 @@ fn malformed_large_hold_streams_to_generic_custody() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] The custody lexical mask runs before reader allocation and keeps entry evidence.
 #[test]
 fn custody_lexical_mask_precedes_reader_allocation_and_keeps_entry_evidence() {
     let root = crate::test_scratch::private_dir("custody-lexical-bound");
@@ -807,6 +821,7 @@ fn staged(root: &Path, index: ScanIndex, paths: &[PathBuf]) -> OwnedSourceScan {
     scan
 }
 
+/// [behaviour] Shared history is paged with inline current-owner flags and a bound-plus-one probe.
 #[test]
 fn shared_history_is_paged_with_inline_current_owner_flags_and_bound_plus_one() {
     let root = crate::test_scratch::private_dir("custody-bounded-history");
@@ -847,6 +862,8 @@ fn shared_history_is_paged_with_inline_current_owner_flags_and_bound_plus_one() 
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [money] Present custody without a header keeps the legacy tombstone through two censuses and
+/// restart.
 #[test]
 fn present_custody_no_header_keeps_legacy_tombstone_through_two_censuses_and_restart() {
     use codex_counting_version::{AckEvidence, CountingTombstone};
@@ -908,6 +925,7 @@ fn present_custody_no_header_keeps_legacy_tombstone_through_two_censuses_and_res
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] Scratch overflow serves unheld plain work in one page and discloses pending custody.
 #[test]
 fn scratch_overflow_serves_unheld_plain_in_one_page_and_discloses_pending_custody() {
     let root = crate::test_scratch::private_dir("custody-overflow-service");
@@ -979,6 +997,7 @@ fn scratch_overflow_serves_unheld_plain_in_one_page_and_discloses_pending_custod
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] Unattributed custody keeps plain progress; the archive waits across restart.
 #[test]
 fn unattributed_custody_keeps_plain_progress_and_archive_waits_across_restart() {
     let root = crate::test_scratch::private_dir("custody-unknown-scope");
@@ -1083,6 +1102,7 @@ fn unattributed_custody_keeps_plain_progress_and_archive_waits_across_restart() 
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] Paged custody keeps the complete OsStr path lookup order.
 #[test]
 fn paged_custody_preserves_complete_osstr_path_lookup_order() {
     let root = crate::test_scratch::private_dir("custody-path-order");
@@ -1109,6 +1129,7 @@ fn paged_custody_preserves_complete_osstr_path_lookup_order() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] Unattributed hold lookup pages unheld retained entries too.
 #[test]
 fn unattributed_hold_lookup_pages_unheld_retained_entries_too() {
     let root = crate::test_scratch::private_dir("custody-all-files-pager");
@@ -1145,6 +1166,7 @@ fn unattributed_hold_lookup_pages_unheld_retained_entries_too() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] Publication validation never reopens a newly custodied sibling.
 #[test]
 fn publication_validation_never_reopens_newly_custodied_sibling() {
     let root = crate::test_scratch::private_dir("custody-publication-validation");
@@ -1179,9 +1201,11 @@ fn publication_validation_never_reopens_newly_custodied_sibling() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [money] A legacy owner barrier, file-attributed or path-scoped, holds the smaller sibling
+/// quietly and keeps its body witness; unrelated plain money publishes.
 #[test]
-fn selective_legacy_owner_barrier_keeps_smaller_sibling_quiet_and_unrelated_plain_publishes() {
-    for absent in [false, true] {
+fn legacy_owner_barrier_keeps_smaller_sibling_quiet_and_unrelated_plain_publishes() {
+    for (attributed, absent) in [(true, false), (true, true), (false, false), (false, true)] {
         let root = crate::test_scratch::private_dir("custody-selective-legacy-owner");
         let held = member(&root, "sessions", OWNER, false);
         let unrelated = member(&root, "sessions", PARENT, false);
@@ -1193,7 +1217,14 @@ fn selective_legacy_owner_barrier_keeps_smaller_sibling_quiet_and_unrelated_plai
             .codex_joined_member_set
             .is_none());
         latch(&mut index, &held);
-        assert!(index.codex_state_only_blocked_by_file[&local_index_key(&held)].contains(OWNER));
+        if attributed {
+            assert!(
+                index.codex_state_only_blocked_by_file[&local_index_key(&held)].contains(OWNER)
+            );
+        } else {
+            // Path-scoped legacy owner: no file attribution remains.
+            index.codex_state_only_blocked_by_file.clear();
+        }
         let smaller = held.with_file_name(format!("rollout-2026-10-01T11-00-00-{OWNER}.jsonl"));
         fs::write(
             &smaller,
@@ -1232,61 +1263,8 @@ fn selective_legacy_owner_barrier_keeps_smaller_sibling_quiet_and_unrelated_plai
     }
 }
 
-#[test]
-fn unattributed_path_scoped_legacy_owner_keeps_smaller_sibling_quiet_and_unrelated_plain_publishes()
-{
-    for absent in [false, true] {
-        let root = crate::test_scratch::private_dir("custody-selective-legacy-owner");
-        let held = member(&root, "sessions", OWNER, false);
-        let unrelated = member(&root, "sessions", PARENT, false);
-        let mut index = accepted(&root, &held);
-        assert!(index.files[&local_index_key(&held)]
-            .codex_protected_owner
-            .is_none());
-        assert!(index.files[&local_index_key(&held)]
-            .codex_joined_member_set
-            .is_none());
-        latch(&mut index, &held);
-        index.codex_state_only_blocked_by_file.clear();
-        assert!(index.codex_state_only_blocked_by_file.is_empty());
-        let smaller = held.with_file_name(format!("rollout-2026-10-01T11-00-00-{OWNER}.jsonl"));
-        fs::write(
-            &smaller,
-            codex_file_join::tests::member(OWNER, "shorter", 1, 1)
-                .iter()
-                .map(|v| v.to_string() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
-        let witness = index.files[&local_index_key(&held)]
-            .last_upload_body_witness
-            .clone();
-        assert!(witness.is_some());
-        if absent {
-            fs::remove_file(&held).unwrap();
-        }
-        let (index, result) = no_open(&held, || normal(&root, index, &[]));
-        assert_eq!(result.unreadable_path_count, 0);
-        assert!(!result.snapshots.is_empty());
-        assert!(result
-            .snapshots
-            .iter()
-            .all(|s| s.source_session_id == PARENT && s.input_tokens > 0));
-        assert!(index.files[&local_index_key(&unrelated)]
-            .last_snapshot_fingerprint
-            .is_some());
-        assert_eq!(
-            index.files[&local_index_key(&held)].last_upload_body_witness,
-            witness
-        );
-        assert_eq!(
-            index.files[&local_index_key(&smaller)].codex_compressed_hold,
-            Some(CodexZstCause::ParentLedgerUnbound)
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-}
-
+/// [money] An opaque filename uses the retained counting binding as negative scope; unrelated money
+/// publishes.
 #[test]
 fn unattributed_opaque_filename_uses_retained_counting_binding_as_negative_scope() {
     for absent in [false, true] {
@@ -1389,6 +1367,7 @@ fn unattributed_opaque_filename_uses_retained_counting_binding_as_negative_scope
     }
 }
 
+/// [behaviour] A stale header never mints custody after rewrite or replacement, even on refusal.
 #[test]
 fn stale_header_never_mints_custody_after_rewrite_or_replacement_even_on_refusal() {
     for refused in [false, true] {
@@ -1486,6 +1465,7 @@ fn stale_header_never_mints_custody_after_rewrite_or_replacement_even_on_refusal
     }
 }
 
+/// [money] State-only exclusion refusal keeps the prior fingerprint, activity and manifest.
 #[test]
 fn state_only_exclusion_refusal_keeps_prior_fingerprint_activity_and_manifest() {
     fn with_state(root: &Path, index: ScanIndex, present: bool) -> (ScanIndex, SourceScanResult) {
@@ -1598,6 +1578,7 @@ fn state_only_exclusion_refusal_keeps_prior_fingerprint_activity_and_manifest() 
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] A parser-bound fork latches custody; a spawn edge alone does not.
 #[test]
 fn parser_bound_fork_latches_but_spawn_edge_alone_does_not() {
     for fork in [false, true] {
@@ -1649,6 +1630,7 @@ fn parser_bound_fork_latches_but_spawn_edge_alone_does_not() {
     }
 }
 
+/// [behaviour] A side parse of a fork finishes its guard without main custody.
 #[test]
 fn side_parse_of_fork_finishes_its_guard_without_main_custody() {
     let root = crate::test_scratch::private_dir("custody-side-exit");
@@ -1712,6 +1694,7 @@ fn side_parse_of_fork_finishes_its_guard_without_main_custody() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] A custodied owner sibling is not red and does not become a header witness.
 #[test]
 fn custodied_owner_sibling_is_non_red_without_becoming_a_header_witness() {
     let root = crate::test_scratch::private_dir("custody-sibling");
@@ -1732,6 +1715,7 @@ fn custodied_owner_sibling_is_non_red_without_becoming_a_header_witness() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [money] A missing held path still blocks a new same-owner member.
 #[test]
 fn missing_held_path_still_blocks_new_same_owner_member() {
     let root = crate::test_scratch::private_dir("custody-absent-owner");
@@ -1751,6 +1735,7 @@ fn missing_held_path_still_blocks_new_same_owner_member() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] Proven local fork boundaries publish without parent custody.
 #[test]
 fn proven_local_fork_boundaries_publish_without_parent_custody() {
     for ordinal in [false, true] {
@@ -1829,6 +1814,7 @@ fn prepared(inv: &mut codex_file_join::HeaderInventory, index: &mut ScanIndex) -
     steps
 }
 
+/// [behaviour] A two-archive family across distinct homes holds every archive.
 #[test]
 fn distinct_home_two_archive_family_holds_every_archive() {
     let root = crate::test_scratch::private_dir("family-two-archives");
@@ -1888,6 +1874,7 @@ fn distinct_home_two_archive_family_holds_every_archive() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [money] Mixed-family plain money matches the plain reader; only the archive hold is sticky.
 #[test]
 fn mixed_family_plain_money_matches_plain_reader_and_only_archive_is_sticky() {
     for distinct in [false, true] {
@@ -1958,6 +1945,7 @@ fn mixed_family_plain_money_matches_plain_reader_and_only_archive_is_sticky() {
     }
 }
 
+/// [money] Validated plain/archive twins count once and the plain body is unchanged.
 #[test]
 fn validated_plain_archive_twins_count_once_and_plain_body_is_unchanged() {
     let root = crate::test_scratch::private_dir("family-twins");
@@ -1998,6 +1986,7 @@ fn validated_plain_archive_twins_count_once_and_plain_body_is_unchanged() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] Plain-only families and a single archive are not held.
 #[test]
 fn plain_only_family_and_single_archive_controls_are_unheld() {
     let root = crate::test_scratch::private_dir("family-controls");
@@ -2028,6 +2017,7 @@ fn plain_only_family_and_single_archive_controls_are_unheld() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [money] A present family archive keeps the legacy tombstone across two censuses.
 #[test]
 fn present_family_archive_keeps_legacy_tombstone_across_two_censuses() {
     use codex_counting_version::{AckEvidence, CountingTombstone};
@@ -2110,6 +2100,7 @@ fn present_family_archive_keeps_legacy_tombstone_across_two_censuses() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [money] Excluded-archive priority receipts cannot be bypassed by a plain replacement.
 #[test]
 fn excluded_archive_priority_receipts_cannot_be_bypassed_by_plain_replacement() {
     for twin in [false, true] {
@@ -2196,6 +2187,7 @@ fn excluded_archive_priority_receipts_cannot_be_bypassed_by_plain_replacement() 
     }
 }
 
+/// [money] A historical family cannot weaken a new member's parent custody.
 #[test]
 fn historical_family_cannot_weaken_new_member_parent_custody() {
     let root = crate::test_scratch::private_dir("family-parent-precedence");
@@ -2222,6 +2214,7 @@ fn historical_family_cannot_weaken_new_member_parent_custody() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [money] A replaced held path cannot retire its hidden current legacy owner.
 #[test]
 fn replaced_held_path_cannot_retire_its_hidden_current_legacy_owner() {
     use codex_counting_version::{AckEvidence, CountingTombstone};
@@ -2282,6 +2275,7 @@ fn replaced_held_path_cannot_retire_its_hidden_current_legacy_owner() {
 
 /// Historical money survives custody/replay; current archive credit still
 /// requires the current attempt's exact body witness, never its old fingerprint.
+/// [money] Exact ACK: held archive replay does not settle from a historical fingerprint alone.
 #[test]
 fn held_archive_replay_does_not_settle_from_historical_fingerprint_alone() {
     for current_body in [false, true] {
@@ -2393,6 +2387,8 @@ fn held_archive_replay_does_not_settle_from_historical_fingerprint_alone() {
     }
 }
 
+/// [behaviour] A prior tombstone with an omitted archive keeps plain progress across clean census
+/// and restart.
 #[test]
 fn prior_tombstone_omitted_archive_clean_census_restart_keeps_plain_progress() {
     use codex_counting_version::{AckEvidence, CountingTombstone};
@@ -2452,6 +2448,7 @@ fn prior_tombstone_omitted_archive_clean_census_restart_keeps_plain_progress() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [money] Departed-owner custody precedes the #926 F3 header lookup; plain still publishes.
 #[test]
 fn departed_owner_custody_precedes_f3_header_lookup_and_plain_still_publishes() {
     let root = crate::test_scratch::private_dir("activation-prefilter-custody");
@@ -2501,6 +2498,7 @@ fn departed_owner_custody_precedes_f3_header_lookup_and_plain_still_publishes() 
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [format] A singleton saved by the old census schedules one first read on re-upgrade.
 #[test]
 fn historical_census_saved_singleton_schedules_a1_on_reupgrade() {
     let Some(root) = std::env::var_os("OTTTO_ZST_DOWNGRADE_FIXTURE_DIR").map(PathBuf::from) else {
@@ -2561,6 +2559,7 @@ fn historical_census_saved_singleton_schedules_a1_on_reupgrade() {
     }
 }
 
+/// [money] A declined ordinary archive ACK replacement keeps custody and the accepted body.
 #[test]
 fn declined_ordinary_archive_ack_replacement_keeps_custody_and_accepted_body() {
     let root = crate::test_scratch::private_dir("activation-declined-archive-ack");

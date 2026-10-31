@@ -36,6 +36,7 @@ fn synthetic_permission(scan: &mut OwnedSourceScan) {
     scan.codex_join_inventory = Some(inventory);
 }
 
+/// [money] Read bound: one re-decode per user-setting generation; internal churn grants none.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -94,6 +95,7 @@ fn user_setting_generation_redecodes_once_and_internal_churn_does_not() {
     }
 }
 
+/// [money] Correction waits for power; the settled historical witness stays without a decode.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -144,6 +146,7 @@ fn correction_waits_for_power_and_a4_keeps_historical_witness_without_decode() {
     assert!(archive_evidence(&index, &f).user_change);
 }
 
+/// [money] Read bound: transient failures continue and six decodes exhaust the budget.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -196,6 +199,7 @@ fn transient_attempt_three_continues_and_six_decodes_exhaust_budget() {
     assert_eq!(decodes(&rows), 0);
 }
 
+/// [money] Terminal failures count once per attempt; only a late exact ACK revives a stuck archive.
 #[test]
 fn terminal_failures_count_once_per_attempt_and_late_exact_ack_revives_stuck() {
     let f = ArchiveFixture::new(b"stamp-only");
@@ -247,6 +251,7 @@ fn terminal_failures_count_once_per_attempt_and_late_exact_ack_revives_stuck() {
     assert_eq!(next_census.unreadable_path_count, 0);
 }
 
+/// [behaviour] Terminal archive residue skips only its session; Pending archives still reduce.
 #[test]
 fn terminal_archive_residue_skips_only_affected_session_and_pending_still_reduces() {
     let f = ArchiveFixture::new(b"stamp-only");
@@ -370,6 +375,7 @@ fn terminal_archive_residue_skips_only_affected_session_and_pending_still_reduce
     assert!(pending.archive_terminal_sessions.is_empty());
 }
 
+/// [behaviour] Admission starvation is counted per archive and the alarm reports the source count.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -436,6 +442,7 @@ fn rotating_admission_starvation_is_per_archive_and_alarm_reports_source_count()
     admission_streak(&keys[1], false);
 }
 
+/// [behaviour] Activation discovers an exact archive beside plain files without decoding.
 #[test]
 fn activation_discovers_exact_archive_beside_plain_without_decoding() {
     let before = super::super::codex_zst_refusal_tests::activity().0;
@@ -472,6 +479,8 @@ fn activation_discovers_exact_archive_beside_plain_without_decoding() {
     assert_eq!(super::super::codex_zst_refusal_tests::activity().0, before);
 }
 
+/// [money] Reservation is persisted before bytes; crashes spend attempts and retries need the saved
+/// reservation.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -545,6 +554,8 @@ fn reservation_crashes_spend_six_attempts_and_retry_counter_requires_saved_reser
     assert_eq!(archive_evidence(&prior, &other).decode_attempts, 1);
 }
 
+/// [money] A terminal session block survives an empty final census page, so held usage is not
+/// retired.
 #[test]
 fn terminal_session_block_survives_empty_final_census_page() {
     let f = ArchiveFixture::new(b"stamp-only");
@@ -619,6 +630,7 @@ fn terminal_session_block_survives_empty_final_census_page() {
     panic!("final census page did not complete");
 }
 
+/// [money] A removal hint keeps unknown raw custody scoped without a counting owner.
 #[test]
 fn compressed_removal_hint_keeps_scoped_unknown_without_counting_owner() {
     let f = ArchiveFixture::new(b"stamp-only");
@@ -697,6 +709,7 @@ fn compressed_removal_hint_keeps_scoped_unknown_without_counting_owner() {
     panic!("removal-hint page did not finish");
 }
 
+/// [format] Crash safety: lost terminal outcomes still stop at exactly six decodes.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -756,6 +769,8 @@ fn crash_lost_terminal_outcomes_stop_at_exactly_six_decodes() {
     ));
 }
 
+/// [behaviour] A replaced archive gets a first read under its new stamp without the old correction
+/// permission.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -788,6 +803,7 @@ fn replaced_archive_uses_new_stamp_first_read_without_old_correction_permission(
         .any(|r| r["counts"]["compressed_user_change"] == 1));
 }
 
+/// [money] Correction ACK debt survives restart without regranting a Full read.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -860,6 +876,8 @@ fn correction_ack_debt_survives_restart_without_regranting_full() {
     assert_eq!(archive_evidence(&restored, &f).body_witness, witness);
 }
 
+/// [format] Crash safety: a crash after the correction reservation spends the grant before any
+/// byte.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -933,6 +951,7 @@ fn correction_crash_after_reservation_spends_grant_before_any_byte() {
     assert_eq!(archive_evidence(&next, &f).user_change_spent, 2);
 }
 
+/// [behaviour] First-read budget and repeated ACKed correction generations are independent.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -998,6 +1017,7 @@ fn sixth_first_read_success_and_repeated_acked_a3_generations_are_independent() 
 }
 
 // Partial fields model unreleased intermediate builds, not a released writer.
+/// [format] Missing spent fields or a malformed persisted context never mint correction permission.
 #[test]
 fn missing_spent_fields_and_malformed_context_never_mint_a3_permission() {
     let f = ArchiveFixture::new(b"stamp-only");
@@ -1024,6 +1044,8 @@ fn missing_spent_fields_and_malformed_context_never_mint_a3_permission() {
         .contains("synthetic raw text"));
 }
 
+/// [format] A persisted entry missing only its spent generation stays exhausted until an
+/// independent user change.
 #[test]
 fn missing_only_spent_generation_is_exhausted_until_an_independent_user_change() {
     let f = ArchiveFixture::new(b"stamp-only");

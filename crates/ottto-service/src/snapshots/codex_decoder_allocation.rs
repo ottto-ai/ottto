@@ -203,6 +203,8 @@ impl Drop for Context {
 mod tests {
     use super::*;
 
+    /// [behaviour] Native decoder resize overlap spends live native bytes against the admitted
+    /// credit.
     #[test]
     fn resize_overlap_spends_live_native_bytes_before_admission() {
         let mut charge = Charge {
