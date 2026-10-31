@@ -370,20 +370,21 @@ pub(super) fn progress_debt(index: &ScanIndex, key: &str, now: u64) -> Option<Au
 }
 
 pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
-    if !claude_terminal_off() {
-        return debt_for_key_main(index, key, now);
-    }
-
-    index
+    let obligation = index
         .files
         .get(key)
-        .and_then(|entry| entry.audit_obligation(now))
-        .into_iter()
-        .chain(progress_debt(index, key, now))
-        .map(|debt| debt.due_unix_seconds)
-        .chain(failed_open_debt(key, now))
-        .min()
-        .map(|due_unix_seconds| AuditDebt { due_unix_seconds })
+        .and_then(|entry| entry.audit_obligation(now));
+    if claude_terminal_off() {
+        // The earliest of the entry, progress and failed-open obligations.
+        return obligation
+            .into_iter()
+            .chain(progress_debt(index, key, now))
+            .map(|debt| debt.due_unix_seconds)
+            .chain(failed_open_debt(key, now))
+            .min()
+            .map(|due_unix_seconds| AuditDebt { due_unix_seconds });
+    }
+    obligation.or_else(|| progress_debt(index, key, now))
 }
 
 /// A held key the slot may serve: bounded, still awaiting restoration, and
@@ -1834,14 +1835,6 @@ mod absence_non_unix_tests {
             &[std::path::PathBuf::from("missing")]
         ));
     }
-}
-
-pub(super) fn debt_for_key_main(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
-    index
-        .files
-        .get(key)
-        .and_then(|entry| entry.audit_obligation(now))
-        .or_else(|| progress_debt(index, key, now))
 }
 
 pub(super) fn progress_opened_main(index: &mut ScanIndex, key: &str) {
