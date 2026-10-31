@@ -24,6 +24,166 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+/// Checked historical bytes and independent generation facts, for transition consumers.
+pub(crate) struct V1Golden<'a> {
+    pub(crate) case_id: &'static str,
+    pub(crate) record: &'a [u8],
+    pub(crate) input: &'a [u8],
+    pub(crate) expected: Value,
+    pub(crate) metadata: Value,
+}
+
+impl V1Golden<'_> {
+    /// Relocate only the envelope key for a scratch-path rebuild fixture.
+    /// The body, old pin, generation, certificate and interpretation stay archived;
+    /// this is NOT evidence of a portable old-writer restore binding.
+    pub(crate) fn relocated_record(&self, key: [u8; 32]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut bytes = self.record.to_vec();
+        bytes[43..75].copy_from_slice(&key);
+        let end = bytes.len() - 32;
+        let checksum = Sha256::digest(&bytes[..end]);
+        bytes[end..].copy_from_slice(&checksum);
+        bytes
+    }
+}
+
+#[derive(Clone, Copy)]
+struct V1Files<'a> {
+    case_id: &'static str,
+    record: &'a [u8],
+    input: &'a [u8],
+    expected: &'a [u8],
+}
+
+const V1_MANIFEST: &[u8] = include_bytes!("../../../testdata/v1/MANIFEST.json");
+const V1_FILES: [V1Files<'static>; 4] = {
+    macro_rules! case {
+        ($id:literal) => {
+            V1Files {
+                case_id: $id,
+                record: include_bytes!(concat!("../../../testdata/v1/", $id, ".rec")),
+                input: include_bytes!(concat!("../../../testdata/v1/inputs/", $id, ".jsonl")),
+                expected: include_bytes!(concat!("../../../testdata/v1/expected/", $id, ".json")),
+            }
+        };
+    }
+    [
+        case!("claude-three-request"),
+        case!("claude-selector-unequal"),
+        case!("codex-legacy-acked"),
+        case!("codex-v2-24b"),
+    ]
+};
+
+/// Validate provenance and every file before returning any fixture authority.
+pub(crate) fn load_v1_goldens() -> Result<Vec<V1Golden<'static>>, String> {
+    validate_v1_goldens(
+        serde_json::from_slice(V1_MANIFEST).map_err(|e| e.to_string())?,
+        &V1_FILES,
+    )
+}
+
+fn validate_v1_goldens<'a>(
+    manifest: Value,
+    files: &[V1Files<'a>; 4],
+) -> Result<Vec<V1Golden<'a>>, String> {
+    use sha2::{Digest, Sha256};
+    let bad = || "invalid v1 golden manifest or file".to_owned();
+    if manifest["schema_version"] != 1
+        || manifest["source_sha"] != "53d05a4304f2e87effbaa48661e10286bff01c58"
+        || manifest["repo"] != "ottto-ai/ottto"
+        || manifest["workflow_path"] != ".github/workflows/linux-tests.yml"
+        || manifest["artifact_id"] != 13031099044u64
+        || manifest["artifact_name"] != "v1-goldens-53d05a43"
+        || [
+            "generator_commit",
+            "run_id",
+            "run_attempt",
+            "run_url",
+            "toolchain",
+            "rustc",
+            "runner_os",
+            "runner_arch",
+        ]
+        .iter()
+        .any(|key| manifest[*key].as_str().map_or(true, str::is_empty))
+    {
+        return Err(bad());
+    }
+    let cases = manifest["cases"]
+        .as_array()
+        .filter(|cases| cases.len() == 4)
+        .ok_or_else(bad)?;
+    files
+        .iter()
+        .zip(cases)
+        .map(|(file, case)| {
+            if case["case_id"] != file.case_id {
+                return Err(bad());
+            }
+            for (metadata, bytes, path) in [
+                (case, file.record, format!("{}.rec", file.case_id)),
+                (
+                    &case["input"],
+                    file.input,
+                    format!("inputs/{}.jsonl", file.case_id),
+                ),
+                (
+                    &case["expected"],
+                    file.expected,
+                    format!("expected/{}.json", file.case_id),
+                ),
+            ] {
+                if metadata["path"] != path
+                    || metadata["byte_length"].as_u64() != Some(bytes.len() as u64)
+                    || metadata["sha256"] != format!("{:x}", Sha256::digest(bytes))
+                {
+                    return Err(bad());
+                }
+            }
+            let expected: Value =
+                serde_json::from_slice(file.expected).map_err(|e| e.to_string())?;
+            if expected["case_id"] != file.case_id || expected["facts"] != case["expected_facts"] {
+                return Err(bad());
+            }
+            Ok(V1Golden {
+                case_id: file.case_id,
+                record: file.record,
+                input: file.input,
+                expected,
+                metadata: case.clone(),
+            })
+        })
+        .collect()
+}
+
+/// [format] Historical fixtures lose authority on provenance, inventory or byte tampering.
+#[test]
+fn v1_golden_provenance_and_tampering() {
+    let manifest: Value = serde_json::from_slice(V1_MANIFEST).unwrap();
+    assert_eq!(load_v1_goldens().unwrap().len(), 4);
+    for pointer in ["/source_sha", "/cases/0/sha256", "/run_id"] {
+        let mut changed = manifest.clone();
+        *changed.pointer_mut(pointer).unwrap() = Value::Null;
+        assert!(
+            validate_v1_goldens(changed, &V1_FILES).is_err(),
+            "{pointer}"
+        );
+    }
+    let mut missing = manifest.clone();
+    missing.as_object_mut().unwrap().remove("run_id");
+    assert!(validate_v1_goldens(missing, &V1_FILES).is_err());
+    let mut incomplete = manifest.clone();
+    incomplete["cases"].as_array_mut().unwrap().pop();
+    assert!(validate_v1_goldens(incomplete, &V1_FILES).is_err());
+    let mut changed = V1_FILES[0].record.to_vec();
+    changed[crate::durable_tail_store::HEADER_BYTES] ^= 1;
+    let mut files = V1_FILES;
+    files[0].record = &changed;
+    assert!(validate_v1_goldens(manifest, &files).is_err());
+}
+
 /// Keep private acquisition internals private; sibling test adapters enter here.
 pub(crate) fn local_key(path: &Path) -> String {
     super::super::local_index_key(path)
@@ -32,10 +192,9 @@ pub(crate) fn seed_old_writer(
     cache: &super::SharedCache,
     source: SnapshotSource,
     key: &str,
-    index: &super::super::ScanIndex,
     pin: &str,
 ) -> Vec<u8> {
-    super::durable_tail::transition_seed::seed_pinned_v1(cache, source, key, index, pin)
+    super::durable_tail::transition_seed::seed_pinned_v1(cache, source, key, pin)
 }
 
 /// The production body allowlist, without exposing the private codec module.

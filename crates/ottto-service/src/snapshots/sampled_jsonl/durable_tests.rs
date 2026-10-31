@@ -15,6 +15,274 @@ const COLLECTED: &str = "2026-10-20T12:00:00Z";
 const CLAUDE_SESSION: &str = "5f0c2a8e-1111-4222-8333-944445555666";
 const CODEX_SESSION: &str = "0199f7a0-0000-7000-8000-0000000d7a11";
 
+// The store publishes no reduction from a retired pin. In particular, a valid
+// checksum never turns opaque old-writer bytes into current money authority.
+fn assert_v1_has_no_record(
+    golden: &crate::snapshots::sampled_scan::transition_fixture::V1Golden<'_>,
+    bytes: &[u8],
+    corrupt: Option<bool>,
+) {
+    use crate::durable_tail_store::{DurableSource, DurableTailStore, ReadOutcome, Refusal};
+    let scratch = Scratch::new(golden.case_id);
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = if golden.metadata["source_tag"] == 1 {
+        DurableSource::ClaudeCode
+    } else {
+        DurableSource::Codex
+    };
+    let key = bytes[43..75].try_into().unwrap();
+    let path = scratch.0.join(format!("{}.rec", hex(key)));
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut disk = DurableTailStore::new(scratch.0.clone(), source);
+    assert_eq!(
+        disk.missing_cause(&key),
+        Some("repin"),
+        "{}",
+        golden.case_id
+    );
+    // `body` is the existing store hook immediately before body input is
+    // read for verification/decode. No body input means no decoder can run.
+    struct ClearAccess;
+    impl Drop for ClearAccess {
+        fn drop(&mut self) {
+            crate::durable_tail_store::test_hooks::set_before_access(None);
+        }
+    }
+    let clear = ClearAccess;
+    let headers = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = headers.clone();
+    crate::durable_tail_store::test_hooks::set_before_access(Some(Box::new(
+        move |_, operation| {
+            assert_ne!(
+                operation, "body",
+                "retired dispatch must precede body input/decode"
+            );
+            if operation == "header" {
+                seen.set(seen.get() + 1);
+            }
+            Ok(())
+        },
+    )));
+    assert_eq!(disk.read(&key), ReadOutcome::Missing, "{}", golden.case_id);
+    assert_eq!(headers.get(), 1, "the header was actually classified");
+    if corrupt.is_none() {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        return; // ClearAccess drops: no body input/decode in this entire row.
+    }
+    drop(clear);
+    let corrupt = corrupt.unwrap();
+    assert_eq!(disk.full_hold(&key, corrupt), None);
+    assert_eq!(
+        disk.full_hold(&key, false),
+        corrupt.then_some(Refusal::Corrupt)
+    );
+    assert_eq!(disk.read(&key), ReadOutcome::Missing);
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+/// [format] Exact retired v1 pins dispatch to a rebuild without decoding a body.
+#[test]
+fn v1_goldens_retired_pin_dispatches_without_a_record() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        assert_eq!(
+            golden.input.len() as u64,
+            golden.expected["post_save"]["entry"]["size_bytes"]
+        );
+        for (name, range) in [
+            ("key", 43..75),
+            ("context", 75..107),
+            ("scope", 107..139),
+            ("entry", 139..171),
+        ] {
+            assert_eq!(
+                hex(golden.record[range].try_into().unwrap()),
+                golden.expected["binding"][name]
+            );
+        }
+        assert_eq!(
+            u64::from_le_bytes(golden.record[171..179].try_into().unwrap()),
+            golden.metadata["index_generation"]
+        );
+        assert_v1_has_no_record(&golden, golden.record, Some(false));
+    }
+}
+
+/// [format] A one-byte body edit cannot supply a reduction; the integrity guard
+/// refuses its corrupt envelope after the single ordinary rebuild allowance.
+#[test]
+fn v1_goldens_one_byte_body_edit_refuses_a_record() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        let mut changed = golden.record.to_vec();
+        changed[crate::durable_tail_store::HEADER_BYTES] ^= 1;
+        assert_v1_has_no_record(&golden, &changed, Some(true));
+    }
+}
+
+/// [format] Swapping the archived selector maps cannot publish a reduction.
+#[test]
+fn v1_goldens_selector_swap_refuses_a_record() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        if golden.metadata["selector_span"].is_null() {
+            continue;
+        }
+        let span = &golden.metadata["selector_span"];
+        let start = span["offset"].as_u64().unwrap() as usize;
+        let context_len = span["context"]["length"].as_u64().unwrap() as usize;
+        let length = span["length"].as_u64().unwrap() as usize;
+        let mut changed = golden.record.to_vec();
+        changed[start..start + length].rotate_left(context_len);
+        assert_ne!(changed, golden.record);
+        assert_v1_has_no_record(&golden, &changed, Some(true));
+    }
+}
+
+fn resign_v1_mutation(bytes: &mut [u8]) {
+    use sha2::{Digest, Sha256};
+    let end = bytes.len() - 32;
+    let checksum = Sha256::digest(&bytes[..end]);
+    bytes[end..].copy_from_slice(&checksum);
+}
+
+// Attack the current representation too: retired dispatch alone would make
+// every body mutation below vacuous. A changed pin must not launder old bytes.
+fn assert_v1_mutation_refused(
+    golden: &crate::snapshots::sampled_scan::transition_fixture::V1Golden<'_>,
+    bytes: &[u8],
+) {
+    use crate::durable_tail_store::{DurableSource, DurableTailStore, ReadOutcome};
+    assert_v1_has_no_record(golden, bytes, None);
+    let source = if golden.metadata["source_tag"] == 1 {
+        SnapshotSource::ClaudeCode
+    } else {
+        SnapshotSource::Codex
+    };
+    let ds = if source == SnapshotSource::ClaudeCode {
+        DurableSource::ClaudeCode
+    } else {
+        DurableSource::Codex
+    };
+    let mut attack = bytes.to_vec();
+    attack[10..42].copy_from_slice(&allowlist_digest(source));
+    resign_v1_mutation(&mut attack);
+    let scratch = Scratch::new(golden.case_id);
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let key = attack[43..75].try_into().unwrap();
+    let path = scratch.0.join(format!("{}.rec", hex(key)));
+    fs::write(&path, &attack).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut disk = DurableTailStore::new(scratch.0.clone(), ds);
+    assert!(
+        matches!(disk.read(&key), ReadOutcome::Refused(_)),
+        "{}: current-pin attack cannot publish a reduction",
+        golden.case_id
+    );
+    assert_eq!(
+        fs::read(path).unwrap(),
+        attack,
+        "refusal leaves the input immutable"
+    );
+}
+
+/// [money] Opaque serializer-header tokens inside an archived payload, even
+/// with a valid checksum, never grant restored money authority under M3.
+#[test]
+fn pinned_v1_refuses_impl_with_opaque_header_tokens() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        for header in [
+            "impl<T: Marker<{ /* { */ 2 }>> Durable for Added<T>",
+            r##"impl<T: Marker<{ { let _ = r#"{}"#; 2 } }>> Durable for Added<T>"##,
+            "#[cfg(unix)] impl<T> Durable for Added<T>",
+            "macro_rules! nested { () => { impl<T: Marker<{ 2 }>> Durable for Added<T> { BODY } }; }",
+        ] {
+            for value in [9, 7] {
+                let body = format!("fn put(&self, e: &mut Enc) {{ e.varint({value}) }}");
+                let mutation = if header.contains("BODY") {
+                    header.replace("BODY", &body)
+                } else {
+                    format!("{header} {{ {body} }}")
+                };
+                let mut changed = golden.record.to_vec();
+                let start = crate::durable_tail_store::HEADER_BYTES;
+                changed[start..start + mutation.len()].copy_from_slice(mutation.as_bytes());
+                resign_v1_mutation(&mut changed);
+                assert_v1_mutation_refused(&golden, &changed);
+            }
+        }
+    }
+}
+
+/// [money] Reversed publication and shadowed iteration over archived fields
+/// never publish an old reduction, including with a recomputed checksum.
+#[test]
+fn pinned_v1_refuses_body_publication_and_shadowed_iterator() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        for shadowed_iterator in [false, true] {
+            let mut changed = golden.record.to_vec();
+            let start = crate::durable_tail_store::HEADER_BYTES;
+            let end = changed.len() - 32;
+            if shadowed_iterator {
+                // Reverse iteration over two same-typed, unequal selector maps.
+                let span = &golden.metadata["selector_span"];
+                if span.is_null() {
+                    continue;
+                }
+                let offset = span["offset"].as_u64().unwrap() as usize;
+                let length = span["length"].as_u64().unwrap() as usize;
+                let context_len = span["context"]["length"].as_u64().unwrap() as usize;
+                changed[offset..offset + length].rotate_left(context_len);
+            } else {
+                changed[start..end].reverse();
+            }
+            assert_ne!(changed, golden.record);
+            resign_v1_mutation(&mut changed);
+            assert_v1_mutation_refused(&golden, &changed);
+        }
+    }
+}
+
+/// [format] Unequal historical selector maps catch both reader and writer swaps.
+#[test]
+fn v1_golden_selector_named_fields_and_writer_order() {
+    use crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens;
+    let golden = load_v1_goldens()
+        .unwrap()
+        .into_iter()
+        .find(|g| g.case_id == "claude-selector-unequal")
+        .unwrap();
+    let span = &golden.metadata["selector_span"];
+    let offset = span["offset"].as_u64().unwrap() as usize;
+    let length = span["length"].as_u64().unwrap() as usize;
+    let bytes = &golden.record[offset..offset + length];
+    let mut d = Dec::new(bytes);
+    let capture = SelectorCapture::take(&mut d).unwrap();
+    d.finish().unwrap();
+    let independent = SelectorCapture {
+        context: BTreeMap::from([("service_tier".into(), "priority".into())]),
+        sources: BTreeMap::from([("service_tier".into(), "derived_from_logs_2".into())]),
+    };
+    assert_eq!(capture, independent);
+    let mut e = Enc::bytes(length);
+    independent.put(&mut e).unwrap();
+    assert_eq!(e.into_bytes(), bytes);
+    let map_span = |name: &str| {
+        let offset = span[name]["offset"].as_u64().unwrap() as usize;
+        let length = span[name]["length"].as_u64().unwrap() as usize;
+        &golden.record[offset..offset + length]
+    };
+    assert_eq!([map_span("context"), map_span("sources")].concat(), bytes);
+    let swapped_bytes = [map_span("sources"), map_span("context")].concat();
+    let mut d = Dec::new(&swapped_bytes);
+    let swapped = SelectorCapture::take(&mut d).unwrap();
+    d.finish().unwrap();
+    assert_eq!(swapped.context, independent.sources);
+    assert_eq!(swapped.sources, independent.context);
+    assert_ne!(
+        swapped, independent,
+        "same-type map swap parses but changes semantics"
+    );
+}
+
 struct Scratch(PathBuf);
 impl Scratch {
     fn new(tag: &str) -> Self {
