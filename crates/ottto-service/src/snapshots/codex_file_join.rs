@@ -798,7 +798,7 @@ impl HeaderInventory {
                     .checked_add(2 * std::mem::size_of::<String>())?,
             )?,
         )?;
-        for (path, owner) in self
+        let names = self
             .headers
             .iter()
             .map(|h| (h.candidate.path.as_path(), h.owner.len()))
@@ -808,17 +808,18 @@ impl HeaderInventory {
                     .map(|k| (Path::new(k), 0)),
             )
             .chain(self.deferred_archives.iter().map(|k| (Path::new(k), 0)))
-        {
-            // One result key, up to two filename owners (bounded by the
-            // filename), and transient key/owner generation.
-            cost.add(
-                path.as_os_str()
-                    .len()
-                    .checked_mul(2)?
-                    .checked_add(path.file_name().map_or(0, |n| n.len()).checked_mul(4)?)?
-                    .checked_add(owner.checked_mul(2)?)?,
-            )?;
-        }
+            .try_fold(0_usize, |bytes, (path, owner)| {
+                // One result key, up to two filename owners (bounded by the
+                // filename), and transient key/owner generation.
+                bytes.checked_add(
+                    path.as_os_str()
+                        .len()
+                        .checked_mul(2)?
+                        .checked_add(path.file_name().map_or(0, |n| n.len()).checked_mul(4)?)?
+                        .checked_add(owner.checked_mul(2)?)?,
+                )
+            })?;
+        cost.add(names)?;
         if let Some(index) = index {
             // Three negative owners per retained file at most (protected + two
             // filename candidates), plus hash and filename-generation scratch.
@@ -828,9 +829,9 @@ impl HeaderInventory {
                     .len()
                     .checked_mul(3 * (std::mem::size_of::<(String, String)>() + 64))?,
             )?;
-            for key in index.files.keys() {
-                cost.add(key.len().checked_mul(5)?)?;
-            }
+            cost.add(index.files.keys().try_fold(0_usize, |bytes, key| {
+                bytes.checked_add(key.len().checked_mul(5)?)
+            })?)?;
         }
         if cost.bytes > crate::source_rotation::PARKED_BUDGET {
             crate::local_resource_diagnostics::traversal_point(

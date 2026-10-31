@@ -33908,13 +33908,11 @@ impl OwnedSourceScan {
             ) {
                 Ok((codex_archive_catchup::Admission::Read, scope)) => scope,
                 Ok((codex_archive_catchup::Admission::Held(cause), _)) => {
-                    if cause == CodexZstCause::CorrectionUnapplied {
-                        let archive = index
-                            .files
-                            .get(&local_index_key(&candidate.path))
-                            .and_then(|e| e.archive.as_deref());
-                        census.archive_residue(&candidate.path, archive, cause);
-                    }
+                    let archive = index
+                        .files
+                        .get(&local_index_key(&candidate.path))
+                        .and_then(|e| e.archive.as_deref());
+                    census.archive_residue(&candidate.path, archive, cause);
                     codex_archive_catchup::retain_residue(
                         &mut residue_index_keys,
                         &candidate.path,
