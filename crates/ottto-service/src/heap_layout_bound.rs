@@ -451,6 +451,22 @@ macro_rules! unit_enum {
 }
 pub(crate) use unit_enum;
 
+/// Peak bytes of a `Vec<T>` collected to `n` elements from a lower size hint
+/// of 0: 4 slots doubling, so the last `4 * 2^k` plus the half beside it
+/// during the last growth (the allocation probe's overlap). `None` on overflow.
+pub(crate) fn pushed_vec_peak<T>(n: usize) -> Option<usize> {
+    if n == 0 {
+        return Some(0);
+    }
+    let last = n.checked_next_power_of_two()?.max(4);
+    let slots = if last > 4 {
+        last.checked_add(last / 2)?
+    } else {
+        last
+    };
+    slots.checked_mul(size_of::<T>())
+}
+
 impl HeapLayoutBound for &'static str {
     const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {

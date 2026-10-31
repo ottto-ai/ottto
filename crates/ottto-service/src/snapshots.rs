@@ -21365,22 +21365,11 @@ fn fact_limit_scratch_bound(producers: usize, collected_at: usize) -> Option<usi
 /// across `finish`. It collects one `u64` per book record with a request id
 /// (every response's stored records, limit-exceeded ones included: at most
 /// `records`) through `flat_map`/`filter_map`/`take`, whose lower size hint
-/// is 0: `Vec` starts at 4 slots and doubles, so its last buffer is the
-/// smallest `4 * 2^k` holding them, with half of it alongside during the
-/// last growth (the allocation probe's overlap). `claude_request_hash` and
+/// is 0 (`heap_layout_bound::pushed_vec_peak`). `claude_request_hash` and
 /// `sort_unstable`/`dedup` allocate nothing. Stack-only, checked; `None` on
 /// overflow.
 fn buffered_request_hashes_bound(records: usize) -> Option<usize> {
-    if records == 0 {
-        return Some(0);
-    }
-    let last = records.checked_next_power_of_two()?.max(4);
-    let slots = if last > 4 {
-        last.checked_add(last / 2)?
-    } else {
-        last
-    };
-    slots.checked_mul(std::mem::size_of::<u64>())
+    crate::heap_layout_bound::pushed_vec_peak::<u64>(records)
 }
 
 /// X_out U1 (#665 r36, AutoReview P2): the most a `len`-byte desktop title
@@ -21411,18 +21400,7 @@ fn buffered_request_hashes_bound(records: usize) -> Option<usize> {
 fn desktop_title_bound(len: usize) -> Option<usize> {
     const MAX_TITLE_CHARS: usize = 255;
     const MAX_DISPLAY_CHARS: usize = 120;
-    let words = match len.div_ceil(2) {
-        0 => 0,
-        words => {
-            let last = words.checked_next_power_of_two()?.max(4);
-            let slots = if last > 4 {
-                last.checked_add(last / 2)?
-            } else {
-                last
-            };
-            slots.checked_mul(std::mem::size_of::<&str>())?
-        }
-    };
+    let words = crate::heap_layout_bound::pushed_vec_peak::<&str>(len.div_ceil(2))?;
     let kept = len.min(4 * MAX_TITLE_CHARS);
     let collect = kept.max(8).checked_mul(3)?;
     let safety = kept.min(4 * MAX_DISPLAY_CHARS).checked_mul(2)?;
