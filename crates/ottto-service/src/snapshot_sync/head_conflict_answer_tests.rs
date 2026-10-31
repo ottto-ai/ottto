@@ -37,7 +37,15 @@ fn progress_with_stale_head(item: &SnapshotItem) -> SnapshotUploadProgress {
 fn request(items: Vec<SnapshotItem>) -> SnapshotBatchRequest {
     SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
-        source: "codex".into(),
+        source: if items
+            .iter()
+            .all(crate::snapshots::claude_request_money::is_request_owned_literal)
+        {
+            SnapshotSource::ClaudeCode.api_slug()
+        } else {
+            SnapshotSource::Codex.api_slug()
+        }
+        .into(),
         machine_id: "a".repeat(64),
         collector_version: None,
         snapshots: items,
@@ -307,7 +315,7 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
     });
     let (result, _) = cycle(&mut not_stored, &item, 1_005, |item| {
         let mut response = accepted(item, &"3".repeat(64));
-        response.accepted = 0;
+        // Accepted count covers stored AND unchanged occurrence refs.
         let mut entity = response.accepted_entities.pop().unwrap();
         entity.unchanged_basis = Some("usage_identical".into());
         response.unchanged_entities.push(entity);
@@ -570,11 +578,16 @@ fn refused_answers_are_counted_and_paced_by_the_quarantine_window() {
     );
 
     for permanent in [false, true] {
-        let mut rejected = progress_with_stale_head(&item);
-        let _ = cycle(&mut rejected, &item, 1_000, |item| {
+        let mut rejected_item = item.clone();
+        rejected_item.usage_accounting_contract =
+            Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT.into());
+        rejected_item.snapshot_fingerprint =
+            crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &rejected_item);
+        let mut rejected = progress_with_stale_head(&rejected_item);
+        let _ = cycle(&mut rejected, &rejected_item, 1_000, |item| {
             conflict(item, &challenge(0xc))
         });
-        let (result, _) = cycle(&mut rejected, &item, 1_001, |item| {
+        let (result, _) = cycle(&mut rejected, &rejected_item, 1_001, |item| {
             let mut response = empty_ack();
             response
                 .rejected_entities
@@ -598,7 +611,7 @@ fn refused_answers_are_counted_and_paced_by_the_quarantine_window() {
         assert!(rejected.accepted_body_witnesses.is_empty());
         assert!(rejected
             .quarantined_fingerprints
-            .contains_key(&item.snapshot_fingerprint));
+            .contains_key(&rejected_item.snapshot_fingerprint));
         if !permanent {
             assert_eq!(rejected.head_conflict_challenges[&key].answer_attempts, 0);
         }
