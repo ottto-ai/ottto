@@ -1,8 +1,7 @@
 //! Cumulative process-global cache transitions, including overlapping scans.
 //! Independent relaxed loads are not a transactional snapshot. These counters
 //! cannot assign an absent entry's historical cause to a file or namespace.
-lifetime_counters! {
-    sparse, on_add = super::claude_reread::cache_event;
+sparse_lifetime_counters! {
     take_hit: TakeHit,
     take_absent: TakeAbsent,
     take_poisoned_lock: TakePoisonedLock,

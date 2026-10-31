@@ -8,30 +8,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// One lifecycle module's cumulative process totals: `Counts` (one `u64` per
 /// field), `Event`, saturating `add`/`record`, `Counts::totals` and the
-/// test-only `observe` seam. `sparse, on_add = hook;` also derives `Sparse`,
-/// `Counts::{add, merge, is_empty}` and calls `hook(event, amount)` first.
+/// test-only `observe` seam.
 macro_rules! lifetime_counters {
-    (sparse, on_add = $hook:path; $($field:ident: $event:ident),+ $(,)?) => {
-        lifetime_counters!(@core [$hook] $($field: $event),+);
-        pub(crate) struct Sparse(pub(crate) Counts);
-        impl ::serde::Serialize for Sparse {
-            fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                use ::serde::ser::SerializeMap;
-                let mut map = serializer.serialize_map(None)?;
-                $(if self.0.$field != 0 { map.serialize_entry(stringify!($field), &self.0.$field)?; })+
-                map.end()
-            }
-        }
-        impl Counts {
-            pub(crate) fn add(&mut self, event: Event, amount: u64) {
-                match event { $(Event::$event => self.$field = self.$field.saturating_add(amount)),+ }
-            }
-            pub(crate) fn merge(&mut self, other: Self) {
-                $(self.$field = self.$field.saturating_add(other.$field);)+
-            }
-            pub(crate) fn is_empty(&self) -> bool { $(self.$field == 0)&&+ }
-        }
-    };
     ($($field:ident: $event:ident),+ $(,)?) => {
         lifetime_counters!(@core [] $($field: $event),+);
     };
@@ -92,6 +70,31 @@ macro_rules! lifetime_counters {
             let counts = TEST_EVENTS.with(|events| Counts::from_array(events.get().unwrap()));
             drop(reset);
             (value, counts)
+        }
+    };
+}
+/// `lifetime_counters!` plus `Sparse` and `Counts::{add, merge, is_empty}`;
+/// each `add` first feeds `claude_reread::cache_event` (cache_lifecycle).
+macro_rules! sparse_lifetime_counters {
+    ($($field:ident: $event:ident),+ $(,)?) => {
+        lifetime_counters!(@core [super::claude_reread::cache_event] $($field: $event),+);
+        pub(crate) struct Sparse(pub(crate) Counts);
+        impl ::serde::Serialize for Sparse {
+            fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use ::serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(None)?;
+                $(if self.0.$field != 0 { map.serialize_entry(stringify!($field), &self.0.$field)?; })+
+                map.end()
+            }
+        }
+        impl Counts {
+            pub(crate) fn add(&mut self, event: Event, amount: u64) {
+                match event { $(Event::$event => self.$field = self.$field.saturating_add(amount)),+ }
+            }
+            pub(crate) fn merge(&mut self, other: Self) {
+                $(self.$field = self.$field.saturating_add(other.$field);)+
+            }
+            pub(crate) fn is_empty(&self) -> bool { $(self.$field == 0)&&+ }
         }
     };
 }
