@@ -26671,9 +26671,8 @@ impl OwnedSourceScan {
         }
 
         let audit_now = sampled_scan::now_seconds();
-        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
-            source == SnapshotSource::ClaudeCode,
-        );
+        // Every source: a non-Claude page emits only its retained-cache events.
+        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let mut resource_probe = crate::local_resource_diagnostics::Probe::start()
             .with_withheld_memo(owned_index.withheld_memo.clone());
         let index = &mut owned_index;
@@ -27486,9 +27485,7 @@ impl OwnedSourceScan {
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
-        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
-            self.source == SnapshotSource::ClaudeCode,
-        );
+        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let _acquire_window = state_v2::telemetry::acquire_window(&self.index);
         let mut result = self.step_with_capture_credit_inner(attribution_context, capture_credit);
         match &result {
