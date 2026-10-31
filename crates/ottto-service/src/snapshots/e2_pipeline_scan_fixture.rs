@@ -24,8 +24,12 @@ impl E2ScanFixture {
     /// Opt in when the fixture asserts marker/identity behavior. Money-only
     /// fixtures retain their historical capture-off scope and bytes.
     pub(crate) fn capturing_identity() -> Self {
+        Self::with_identity_capture(true)
+    }
+
+    pub(crate) fn with_identity_capture(capture_claude_identity: bool) -> Self {
         Self {
-            capture_claude_identity: true,
+            capture_claude_identity,
             ..Self::default()
         }
     }

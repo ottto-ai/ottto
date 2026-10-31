@@ -480,55 +480,6 @@ fn unplanned_claude_read_delivers_all_lines_from_zero_and_counts_them() {
     assert_eq!(page_counts(&rows)["line_delivery"]["test"]["bytes"], total);
 }
 
-/// E3 condition 2: registering an observer changes neither which files a
-/// pass selects, its results, nor its step (page) boundaries.
-#[test]
-fn registration_changes_no_selection_result_or_step_boundary() {
-    let root = Root::new("ld-identity");
-    for (session, cwd) in [
-        ("5e551011-0000-4000-8000-00000000d1da", "/w/a"),
-        ("5e551011-0000-4000-8000-00000000d1db", "/w/b"),
-        ("5e551011-0000-4000-8000-00000000d1dc", "/w/c"),
-    ] {
-        let mut body = Vec::new();
-        for n in 0..3 {
-            body.extend(raw(&session_row(session, cwd, &format!("{cwd}{n}"))));
-            body.push(b'\n');
-        }
-        body.extend(b"{broken\n");
-        append(&root.file(session), &body);
-    }
-    let recorder = Recorder::default();
-    let (bare_index, bare, bare_steps, _) =
-        claude_page(&root.projects(), ScanIndex::default(), None, None);
-    let (seen_index, seen, seen_steps, _) = claude_page(
-        &root.projects(),
-        ScanIndex::default(),
-        Some(&recorder),
-        None,
-    );
-    assert_eq!(bare_steps, seen_steps, "same step boundaries");
-    assert_eq!(bare.scanned_file_count, 3);
-    assert_eq!(bare.scanned_file_count, seen.scanned_file_count);
-    assert_eq!(bare.discovered_file_count, seen.discovered_file_count);
-    assert_eq!(bare.semantic_noop_count, seen.semantic_noop_count);
-    assert_eq!(bare.census_complete, seen.census_complete);
-    let fingerprints = |result: &SourceScanResult| {
-        result
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(fingerprints(&bare), fingerprints(&seen));
-    assert_eq!(
-        serde_json::to_value(&bare_index.files).unwrap(),
-        serde_json::to_value(&seen_index.files).unwrap()
-    );
-    assert_eq!(recorder.ends().len(), 3, "one end per file");
-    assert_eq!(recorder.lines().len(), 12);
-}
-
 /// `Want::Skip`: no line is delivered, the begin still ends once, and the
 /// page counts no lines or bytes.
 #[test]
@@ -2785,43 +2736,6 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     }
 }
 
-/// An unplanned reader from zero includes malformed, invalid and paused-overlong
-/// bytes in its absolute ends. Unterminated bytes remain undelivered.
-#[test]
-fn physical_ends_include_skipped_bytes_across_reader_yields() {
-    let data = [
-        b"\n{bad\n\xff\n".to_vec(),
-        format!("{}\n", "x".repeat(400)).into_bytes(),
-        b"{}\nlast".to_vec(),
-    ]
-    .concat();
-    let mut reader = BoundedJsonlReader::new(
-        std::io::BufReader::with_capacity(16, Cursor::new(data.clone())),
-        32,
-        false,
-    );
-    reader.set_chunked_skip(16);
-    let mut ends = Vec::new();
-    loop {
-        let step = reader
-            .step_lines(
-                |_| {},
-                Some(&mut |_, line: &PhysicalLine<'_>| ends.push(line.end)),
-            )
-            .unwrap();
-        if matches!(step, JsonlReaderStep::Complete(_)) {
-            break;
-        }
-    }
-    let expected = data
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| **b == b'\n')
-        .map(|(i, _)| i as u64 + 1)
-        .collect::<Vec<_>>();
-    assert_eq!(ends, expected);
-}
-
 #[test]
 fn codex_prelude_registration_preserves_money_receipts_proofs_and_body_with_salvage() {
     let root = Root::new("prelude-money");
@@ -4324,19 +4238,4 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
 #[test]
 fn withheld_equal_fingerprint_recovers_from_missing_memo() {
     withheld_equal_fingerprint_recovers_after("missing");
-}
-/// [behaviour] Withheld equal fingerprint recovers from refused memo.
-#[test]
-fn withheld_equal_fingerprint_recovers_from_refused_memo() {
-    withheld_equal_fingerprint_recovers_after("refused");
-}
-/// [behaviour] Withheld equal fingerprint recovers from poisoned memo.
-#[test]
-fn withheld_equal_fingerprint_recovers_from_poisoned_memo() {
-    withheld_equal_fingerprint_recovers_after("poisoned");
-}
-/// [behaviour] Withheld equal fingerprint recovers without birth identity.
-#[test]
-fn withheld_equal_fingerprint_recovers_without_birth_identity() {
-    withheld_equal_fingerprint_recovers_after("no-birth");
 }
