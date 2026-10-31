@@ -56,6 +56,11 @@ pub(crate) struct Properties {
     /// The complete structural walk, including the end check, on the
     /// caller's decoder (which may observe it, e.g. for private labels).
     pub(super) verify: fn(&mut crate::durable_tail_codec::Dec<'_>) -> Result<(), Corrupt>,
+    /// The body walks and what the source's body adds to the allowlist shape.
+    pub(super) put: durable::PutBody,
+    pub(super) take:
+        fn(&mut crate::durable_tail_codec::Dec<'_>) -> Result<durable::Decoded, Corrupt>,
+    pub(super) shape_extension: fn(&mut crate::durable_tail_codec::Shape),
 }
 
 // Current PL-retained schema only. Historical pins refuse at dispatch; there is
@@ -78,6 +83,9 @@ pub(crate) const SOURCES: &[Properties] = &[
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
         verify: durable::verify_body,
+        put: durable::put_body,
+        take: durable::take_body,
+        shape_extension: durable::no_shape_extension,
     },
     Properties {
         source: DurableSource::Codex,
@@ -95,6 +103,9 @@ pub(crate) const SOURCES: &[Properties] = &[
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
         verify: durable::verify_body,
+        put: durable::put_body,
+        take: durable::take_body,
+        shape_extension: durable::no_shape_extension,
     },
     Properties {
         source: DurableSource::Pi,
@@ -112,6 +123,9 @@ pub(crate) const SOURCES: &[Properties] = &[
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
         verify: durable::pi::verify_body,
+        put: durable::pi::put_body,
+        take: durable::pi::take_body,
+        shape_extension: durable::pi::shape_extension,
     },
 ];
 

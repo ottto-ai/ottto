@@ -19,7 +19,7 @@ crate::durable_tail_codec::durable_struct!(borrowed PiSection {
 });
 
 /// What `A_P` adds after the shared shapes.
-pub(super) fn shape_extension(shape: &mut Shape) {
+pub(in crate::snapshots) fn shape_extension(shape: &mut Shape) {
     shape.push("ottto-dt-ext:pi-ledger:v1");
     PiSection::shape(shape);
 }
