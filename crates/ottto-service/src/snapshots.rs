@@ -34477,7 +34477,7 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]
-                        let mut retail_attempt = None;
+                        let mut restored_plan = None;
                         #[cfg(unix)]
                         let mut restored_durable = false;
                         #[cfg(unix)]
@@ -34507,9 +34507,9 @@ impl OwnedSourceScan {
                                 resource_probe.full_causes.restore_outcome.record(&restore);
                                 match restore {
                                     sampled_scan::durable_tail::RestoreOutcome::Restored(
-                                        taken,
+                                        mut taken,
                                         lease,
-                                    ) => {
+                                    ) => 'restored_transfer: {
                                         preparation_lease = Some(lease);
                                         restored_durable = restart_restore::enabled();
                                         retained_offset =
@@ -34519,6 +34519,60 @@ impl OwnedSourceScan {
                                             taken.finalization_charge,
                                             taken.retained.state.usage_witness(),
                                         );
+                                        // The cold transfer still owns its paid lease. Plan
+                                        // once, and attach Q11 before any prepare rejection
+                                        // can return this Taken to ordinary RAM reuse.
+                                        if restored_durable && source == SnapshotSource::ClaudeCode {
+                                            let plan = match crate::transcript_acquisition::ReadPlan::prepare(
+                                                parser.reader.reader.get_mut(),
+                                                Some(&taken.retained.checkpoint),
+                                                &scope,
+                                                debt,
+                                                sampled_scan::now_seconds(),
+                                            ) {
+                                                Ok(plan) => plan,
+                                                Err(_) => {
+                                                    // No plan means no reusable cold transfer.
+                                                    // Drop the graph before releasing its funding;
+                                                    // leave the committed record available to retry.
+                                                    drop(taken);
+                                                    preparation_lease.take().expect("cold transfer lease").release();
+                                                    claude_request_census::retain_held(index, &candidate);
+                                                    census.record_unreadable(UnreadableCause::Reduction, 1);
+                                                    pending!();
+                                                }
+                                            };
+                                            if plan.mode() == crate::transcript_acquisition::ReadMode::Tail {
+                                                let accepted_end = durable_accepted.expect("restored floor").end;
+                                                match context.cache.begin_retail(
+                                                    source, &key, &taken.retained.checkpoint,
+                                                    parser.reader.reader.get_ref(), accepted_end,
+                                                    std::time::Instant::now(),
+                                                ) {
+                                                    Ok(attempt) => taken.durable.put_retail(attempt),
+                                                    Err(reason) => {
+                                                        let full = matches!(reason,
+                                                            sampled_scan::durable_tail::RetailHold::Exhausted |
+                                                            sampled_scan::durable_tail::RetailHold::AccountingLost)
+                                                            && context.cache.retail_full(&key, parser.reader.reader.get_ref(), accepted_end, SystemTime::now());
+                                                        // A refused grant must never leave a
+                                                        // guardless graph in the warm cache.
+                                                        drop(taken);
+                                                        preparation_lease.take().expect("cold transfer lease").release();
+                                                        if full {
+                                                            paced_full_granted = true;
+                                                            break 'restored_transfer (None, None, debt);
+                                                        } else {
+                                                            context.cache.durable_retail_hold(source, reason, index, &candidate);
+                                                            pending!();
+                                                        }
+                                                    }
+                                                }
+                                                // A successful Tail keeps its guard on Taken;
+                                                // the same plan enters native preparation below.
+                                            }
+                                            restored_plan = Some(plan);
+                                        }
                                         (Some(taken), Some(admission), debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::FloorHeld => {
@@ -34722,6 +34776,12 @@ impl OwnedSourceScan {
                         // original back with its receipt debt and funding.
                         if !allow_sample {
                             if let Some(taken) = retained.take() {
+                                // A returned copy cannot supply a Tail plan to
+                                // the fresh Full prepared without that copy.
+                                #[cfg(unix)]
+                                {
+                                    restored_plan = None;
+                                }
                                 if restart_restore::enabled()
                                     && source == SnapshotSource::ClaudeCode
                                 {
@@ -34736,46 +34796,15 @@ impl OwnedSourceScan {
                         let old = retained;
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);
-                        #[cfg(unix)]
-                        let mut retail_hold = None;
-                        let mode = match parser.prepare_acquisition_owned_with_reuse_gate(
+                        let mode = match parser.prepare_acquisition_owned_planned(
                             old,
                             &scope,
                             debt,
                             sampled_scan::now_seconds(),
-                            |checkpoint, file| {
-                                #[cfg(unix)]
-                                if restart_restore::enabled() && restored_durable && source == SnapshotSource::ClaudeCode {
-                                    let accepted_end = durable_accepted.expect("restored floor").end;
-                                    match context.cache.begin_retail(
-                                        source, &key, checkpoint, file, accepted_end, std::time::Instant::now(),
-                                    ) {
-                                        Ok(attempt) => retail_attempt = Some(attempt),
-                                        Err(reason) => {
-                                            if matches!(reason,
-                                                sampled_scan::durable_tail::RetailHold::Exhausted |
-                                                sampled_scan::durable_tail::RetailHold::AccountingLost)
-                                                && context.cache.retail_full(&key, file, accepted_end, std::time::SystemTime::now()) {
-                                                paced_full_granted = true;
-                                                return Ok(false);
-                                            }
-                                            retail_hold = Some(reason);
-                                            return Err(anyhow::anyhow!("durable retail held"));
-                                        }
-                                    }
-                                }
-                                #[cfg(not(unix))]
-                                let _ = (checkpoint, file);
-                                Ok(true)
-                            },
+                            restored_plan,
                         ) {
                             Ok(mode) => mode,
                             Err(rejected) => {
-                                #[cfg(unix)]
-                                if let Some(reason) = retail_hold {
-                                    context.cache.durable_retail_hold(source, reason, index, &candidate);
-                                    pending!();
-                                }
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
                                 #[cfg(unix)]
@@ -34789,7 +34818,9 @@ impl OwnedSourceScan {
                                     }
                                 };
                                 if let Some(taken) = rejected.taken {
-                                    if restart_restore::enabled() && source == SnapshotSource::ClaudeCode {
+                                    if restart_restore::enabled()
+                                        && source == SnapshotSource::ClaudeCode
+                                    {
                                         claude_request_census::retain_held(index, &candidate);
                                     }
                                     return_original!(taken, refusal);
@@ -34861,14 +34892,6 @@ impl OwnedSourceScan {
                                     lease.release();
                                 }
                                 pending!();
-                            }
-                        }
-                        #[cfg(unix)]
-                        if let Some(attempt) = retail_attempt {
-                            if mode == crate::transcript_acquisition::ReadMode::Tail {
-                                parser.reader.reader.put_retail(attempt);
-                            } else {
-                                attempt.finish();
                             }
                         }
                         // S2 again against the actual native plan, after preparation
