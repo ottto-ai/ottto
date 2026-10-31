@@ -13,6 +13,12 @@ pub(in crate::snapshots) fn marker_at(support: &Path, name: &str) -> bool {
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
 }
 
+/// A process-pinned support-dir switch behind the caller's own lock-free
+/// cell. The owner changes the marker and restarts the daemon to apply it.
+pub(in crate::snapshots) fn pinned_marker(cell: &std::sync::OnceLock<bool>, name: &str) -> bool {
+    *cell.get_or_init(|| marker_at(&ottto_core::default_support_dir(), name))
+}
+
 pub(super) fn enabled() -> bool {
     #[cfg(test)]
     {
