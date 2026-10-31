@@ -534,6 +534,10 @@ fn fork_cutoff_uses_envelope_then_provider_only_when_envelope_is_absent() {
             acc.accepted_usage_totals.input_tokens, 100,
             "unknown header clock"
         );
+        let (_, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            acc.seen_pi_usage_keys.finish_fork_read(|_| true)
+        });
+        assert_eq!(counts.pi_fork_cutoff_unknown, 1);
     }
 }
 

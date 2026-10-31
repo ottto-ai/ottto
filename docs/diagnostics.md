@@ -1654,6 +1654,9 @@ again. `pi_fork_parent_unseen` counts skipped entries whose parent path is absen
 from the Pi index at the end of a Full read. Tail restores retain the cutoff
 without the parent path, so this unseen-parent count is unavailable for Tail
 skips, rather than evidence that their parent is known.
+`pi_fork_cutoff_unknown` counts Full reads of a fork whose header names a parent
+but has a missing or invalid time; every copied entry in such a fork counts as
+the fork's own usage.
 
 Historical parent spend is excluded even if its file was never uploaded. Copies
 from a machine whose clock ran ahead can have timestamps at or after the fork

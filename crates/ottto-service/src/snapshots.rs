@@ -42314,19 +42314,21 @@ impl PiLedger {
 
     /// After a read: counts this read's skipped copies as
     /// `pi_fork_parent_unseen` when the header's parent is not a known Pi
-    /// session, then drops `parentSession`. A Tail never sees the header, so
-    /// only Full reads count.
+    /// session, and the read as `pi_fork_cutoff_unknown` when the header has
+    /// no valid time, then drops `parentSession`. A Tail never sees the
+    /// header, so only Full reads count.
     pub(crate) fn finish_fork_read(&mut self, known: impl FnOnce(&str) -> bool) {
+        use crate::local_resource_diagnostics::cache_lifecycle::{add, Event};
         let Some(fork) = self.fork.as_deref_mut() else {
             return;
         };
         let copies = std::mem::take(&mut fork.copies_this_read);
         if let Some(parent) = fork.parent_ref.take() {
+            if fork.header_nanos.is_none() {
+                add(Event::PiForkCutoffUnknown, 1);
+            }
             if copies > 0 && !known(&parent) {
-                crate::local_resource_diagnostics::cache_lifecycle::add(
-                    crate::local_resource_diagnostics::cache_lifecycle::Event::PiForkParentUnseen,
-                    copies,
-                );
+                add(Event::PiForkParentUnseen, copies);
             }
         }
     }
