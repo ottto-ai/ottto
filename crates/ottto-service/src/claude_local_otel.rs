@@ -1154,11 +1154,17 @@ fn decode_api_sidecar(
         health.unreadable_lines += 1;
         return Ok(empty(health));
     }
-    // The opened length plus a sentinel bounds concurrent growth, not history.
-    let limit = allowance.min(opened.len().saturating_add(1));
+    // Preserve ordinary API read-through on concurrent appends. Only an
+    // explicit pass budget bounds the read at opened length plus a sentinel.
+    let limit = if strict_budget::active() {
+        allowance.min(opened.len().saturating_add(1))
+    } else {
+        allowance
+    };
     let mut reader = BufReader::new((&file).take(limit));
     let (rows, _) = decode_api_rows(&mut reader, session_id, &mut health);
     let bytes = limit - reader.get_ref().limit();
+    health.oversized_files = u64::from(opened.len().max(bytes) >= MAX_EVIDENCE_FILE_BYTES);
     strict_budget::consumed(bytes);
     #[cfg(test)]
     API_AFTER_READ.with(|hook| {
@@ -1569,8 +1575,8 @@ pub(crate) fn claude_trace_ownership_evidence_dir(support_dir: &Path) -> PathBuf
     support_dir.join(TRACE_STORE_DIR)
 }
 
-/// True only when neither paired sidecar exists. Oversized, non-file or
-/// unreadable sidecars are failures, not absence.
+/// True only when neither paired sidecar exists. Existing sidecars of any
+/// size, non-files and unreadable sidecars are never absence.
 pub(crate) fn claude_sidecars_absent(support_dir: &Path, session_id: &str) -> bool {
     [
         evidence_path(support_dir, session_id),

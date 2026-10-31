@@ -26,6 +26,9 @@ impl Drop for StrictReadBudget {
         REMAINING.with(|remaining| remaining.set(None));
     }
 }
+pub(super) fn active() -> bool {
+    REMAINING.with(|remaining| remaining.get().is_some())
+}
 /// Without a pass budget, one streaming root is its own read turn. A larger
 /// pair gets a protected allowance rather than being permanently refused.
 pub(super) fn allowance(pair_bytes: u64) -> u64 {
