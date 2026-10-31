@@ -38,6 +38,7 @@ mod trace_read_bound_tests;
 
 pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
+// Pressure warning only; never an append or completeness limit.
 const MAX_EVIDENCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 // Keep the usage-ledger revision: request_identity is additive local evidence,
@@ -300,7 +301,6 @@ impl ClaudeLocalOtelLoadHealth {
         self.missing_files == 0
             && self.malformed_lines == 0
             && self.unreadable_lines == 0
-            && self.oversized_files == 0
             && self.invalid_session_rows == 0
             && self.missing_request_ids == 0
             && self.conflicting_request_ids.is_empty()
@@ -345,8 +345,8 @@ pub struct ClaudeTraceOwnershipLoadReport {
     pub rows_discarded: ClaudeTraceRowsDiscarded,
 }
 
-/// Strict trace reads whose decoded rows were dropped, by reason. Each such
-/// read also counts as an oversized file, so the report is never complete.
+/// Strict trace reads whose decoded rows were dropped, by reason. These
+/// witnesses always make the report incomplete, independently of size warnings.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ClaudeTraceRowsDiscarded {
     /// Reads that found bytes past the opened length (the file grew).
@@ -375,10 +375,10 @@ impl ClaudeTraceOwnershipLoadReport {
         self.missing_files == 0
             && self.malformed_lines == 0
             && self.unreadable_lines == 0
-            && self.oversized_files == 0
             && self.invalid_session_rows == 0
             && self.missing_request_ids == 0
             && self.conflicting_request_ids.is_empty()
+            && self.rows_discarded.is_empty()
     }
 }
 
@@ -784,9 +784,9 @@ fn api_file_generation(metadata: &fs::Metadata) -> Option<ApiFileGeneration> {
 
 impl ClaudeApiEvidenceRead {
     /// Borrow the existing decode and its full health witness without I/O.
-    /// Missing/capped/malformed reads remain present but incomplete; a root
-    /// outside this reader's cohort has no report. The reader owns the strict
-    /// cap boundary and conflicting-id detection, including empty-row reads.
+    /// Missing/malformed reads remain present but incomplete; a root outside
+    /// this reader's cohort has no report. The reader owns strict allowance
+    /// exhaustion and conflicting-id detection, including empty-row reads.
     pub(crate) fn session_report(
         &self,
         root: &str,
@@ -1003,7 +1003,7 @@ impl ClaudeApiEvidenceRead {
             }
         }
         // Drop the old owned rows before rereading. Appends, replacement,
-        // truncation, caps, non-files and errors cannot reuse stale evidence.
+        // truncation, non-files and errors cannot reuse stale evidence.
         drop(rows);
         load_claude_api_request_evidence_report(support_dir, [session_id.to_string()])
     }
@@ -1092,15 +1092,6 @@ fn decode_api_sidecar(
     support_dir: &Path,
     session_id: &str,
 ) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
-    // ON charges the pass-local strict allowance; OFF keeps the fixed cap.
-    let terminal_off = crate::snapshots::claude_terminal_off();
-    let cap = || {
-        if terminal_off {
-            strict_budget::allowance()
-        } else {
-            MAX_EVIDENCE_FILE_BYTES
-        }
-    };
     let path = evidence_path(support_dir, session_id);
     let mut health = ClaudeLocalOtelLoadHealth::default();
     let empty = |health| {
@@ -1126,10 +1117,6 @@ fn decode_api_sidecar(
     // Refuse before opening: a directory/erroring stream must never loop.
     if !metadata.is_file() {
         anyhow::bail!("Claude effort evidence is not a regular file");
-    }
-    if metadata.len() >= cap() {
-        health.oversized_files += 1;
-        return Ok(empty(health));
     }
     let before_path = api_file_generation(&metadata);
     #[cfg(test)]
@@ -1158,23 +1145,21 @@ fn decode_api_sidecar(
     if !opened.is_file() {
         anyhow::bail!("opened Claude effort evidence is not a regular file");
     }
-    if opened.len() >= cap() {
-        health.oversized_files += 1;
+    health.oversized_files = u64::from(opened.len() >= MAX_EVIDENCE_FILE_BYTES);
+    let before_opened = api_file_generation(&opened);
+    let allowance = strict_budget::allowance(
+        strict_cohort_bytes(support_dir, session_id).max(opened.len().saturating_add(1)),
+    );
+    if opened.len() >= allowance {
+        health.unreadable_lines += 1;
         return Ok(empty(health));
     }
-    let before_opened = api_file_generation(&opened);
-    // A concurrent writer must not defeat the existing per-file read bound.
-    let limit = if terminal_off {
-        cap().min(opened.len().saturating_add(1))
-    } else {
-        MAX_EVIDENCE_FILE_BYTES
-    };
+    // The opened length plus a sentinel bounds concurrent growth, not history.
+    let limit = allowance.min(opened.len().saturating_add(1));
     let mut reader = BufReader::new((&file).take(limit));
-    let (rows, mut bytes) = decode_api_rows(&mut reader, session_id, &mut health);
-    if terminal_off {
-        bytes = limit - reader.get_ref().limit();
-        strict_budget::consumed(bytes);
-    }
+    let (rows, _) = decode_api_rows(&mut reader, session_id, &mut health);
+    let bytes = limit - reader.get_ref().limit();
+    strict_budget::consumed(bytes);
     #[cfg(test)]
     API_AFTER_READ.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
@@ -1182,7 +1167,7 @@ fn decode_api_sidecar(
         }
     });
     if bytes >= limit {
-        health.oversized_files += 1;
+        health.unreadable_lines += 1;
         return Ok(empty(health));
     }
     let after_opened = file
@@ -1312,10 +1297,6 @@ pub fn load_claude_trace_ownership_evidence(
             report.unreadable_lines += 1;
             continue;
         }
-        if metadata.len() >= strict_budget::allowance() {
-            report.oversized_files += 1;
-            continue;
-        }
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -1334,13 +1315,21 @@ pub fn load_claude_trace_ownership_evidence(
             report.unreadable_lines += 1;
             continue;
         };
-        if !opened.is_file() || opened.len() >= strict_budget::allowance() {
-            report.oversized_files += 1;
+        if !opened.is_file() {
+            report.unreadable_lines += 1;
+            continue;
+        }
+        report.oversized_files += u64::from(opened.len() >= MAX_EVIDENCE_FILE_BYTES);
+        let allowance = strict_budget::allowance(
+            strict_cohort_bytes(support_dir, &session_id).max(opened.len().saturating_add(1)),
+        );
+        if opened.len() >= allowance {
+            report.unreadable_lines += 1;
             continue;
         }
         // A concurrent writer must not extend the read past the opened
         // length; one extra byte is the growth sentinel.
-        let limit = strict_budget::allowance().min(opened.len().saturating_add(1));
+        let limit = allowance.min(opened.len().saturating_add(1));
         #[cfg(test)]
         TRACE_BEFORE_READ.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
@@ -1520,7 +1509,7 @@ pub fn load_claude_effort_by_request(
         let Ok(metadata) = fs::metadata(&path) else {
             continue;
         };
-        if !metadata.is_file() || metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+        if !metadata.is_file() {
             continue;
         }
         let Ok(file) = File::open(&path) else {
@@ -1555,7 +1544,7 @@ pub fn claude_effort_sidecar_fingerprint(support_dir: &Path, session_id: &str) -
     let Ok(metadata) = fs::metadata(path) else {
         return String::new();
     };
-    if !metadata.is_file() || metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+    if !metadata.is_file() {
         return String::new();
     }
     let modified_nanos = metadata
@@ -1620,7 +1609,7 @@ fn sidecar_fingerprint(path: PathBuf, namespace: &str) -> String {
     let Ok(metadata) = fs::metadata(path) else {
         return String::new();
     };
-    if !metadata.is_file() || metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+    if !metadata.is_file() {
         return String::new();
     }
     let modified_nanos = metadata
@@ -1941,12 +1930,7 @@ fn append_evidence(support_dir: &Path, item: &ClaudeLocalOtelEvidence) -> Result
         .context("open Claude effort evidence append file")?;
     let mut encoded = serde_json::to_vec(item)?;
     encoded.push(b'\n');
-    let current_bytes = file
-        .metadata()
-        .context("stat Claude effort evidence")?
-        .len();
-    append_evidence_bytes(&mut file, current_bytes, &encoded)
-        .context("append Claude effort evidence")
+    append_evidence_bytes(&mut file, &encoded).context("append Claude effort evidence")
 }
 
 fn append_trace_ownership_evidence(
@@ -1970,39 +1954,13 @@ fn append_trace_ownership_evidence(
         .context("open Claude trace ownership evidence append file")?;
     let mut encoded = serde_json::to_vec(item)?;
     encoded.push(b'\n');
-    let current_bytes = file
-        .metadata()
-        .context("stat Claude trace ownership evidence")?
-        .len();
-    append_evidence_bytes(&mut file, current_bytes, &encoded)
-        .context("append Claude trace ownership evidence")
+    append_evidence_bytes(&mut file, &encoded).context("append Claude trace ownership evidence")
 }
 
-/// Local capture success means the whole row was appended below the strict
-/// reader's usable boundary.
-///
-/// Preserve the existing final-row append when it reaches/crosses the boundary:
-/// the resulting file size is the existing durable incomplete-evidence signal.
-/// Refusing that row *before* writing would leave a readable prefix falsely
-/// eligible for complete accounting after an auxiliary request was dropped.
-/// This does not provide growth/recovery or crash-durable capture (no fsync).
-fn append_evidence_bytes(
-    writer: &mut impl Write,
-    current_bytes: u64,
-    encoded: &[u8],
-) -> Result<()> {
-    anyhow::ensure!(
-        current_bytes < MAX_EVIDENCE_FILE_BYTES,
-        "Claude local evidence file is at its byte limit"
-    );
-    let resulting_bytes = current_bytes
-        .checked_add(u64::try_from(encoded.len())?)
-        .context("Claude local evidence length overflow")?;
+/// Capture succeeds only after the complete row has been written. The warning
+/// threshold never rejects a row; I/O errors still propagate to the relay.
+fn append_evidence_bytes(writer: &mut impl Write, encoded: &[u8]) -> Result<()> {
     writer.write_all(encoded)?;
-    anyhow::ensure!(
-        resulting_bytes < MAX_EVIDENCE_FILE_BYTES,
-        "Claude local evidence reached its byte limit; strict proof unavailable"
-    );
     Ok(())
 }
 
@@ -2151,6 +2109,7 @@ mod otlp_proto {
 #[cfg(test)]
 mod tests {
 
+    /// [regress] Failed writes must never be reported as captured rows.
     #[test]
     fn append_partial_and_zero_byte_write_errors_never_report_capture_success() {
         struct FailingWriter {
@@ -2177,127 +2136,163 @@ mod tests {
                 bytes: Vec::new(),
                 remaining: limit,
             };
-            assert!(append_evidence_bytes(&mut writer, 0, row).is_err());
+            assert!(append_evidence_bytes(&mut writer, row).is_err());
             assert_eq!(writer.bytes.len(), limit);
-            assert!(append_evidence_bytes(&mut writer, limit as u64, row).is_err());
+            assert!(append_evidence_bytes(&mut writer, row).is_err());
             assert_eq!(writer.bytes.len(), limit);
         }
         // A zero-byte I/O error cannot leave a durable loss signal in this
         // format. This test asserts refusal, not persistent completeness.
     }
 
+    /// [regress] ID1: capture and the shared streaming readers retain every
+    /// request after a sidecar crosses its warning threshold, including retries.
     #[test]
-    fn api_and_trace_crossing_rows_are_preserved_but_capture_refuses() {
-        use std::io::{Read, Seek, SeekFrom};
-        let dir = std::env::temp_dir().join(format!("ottto-cap-crossing-{}", std::process::id()));
-        let api_body = identity_json(&[], &[]);
-        let trace_body = trace_body(vec![llm_span("req-cap", None)]);
-        let mut api_row =
-            serde_json::to_vec(&api_evidence_from_json(&api_body).unwrap()[0]).unwrap();
-        api_row.push(b'\n');
-        let mut trace_row =
-            serde_json::to_vec(&trace_evidence_from_protobuf(&trace_body).unwrap()[0]).unwrap();
-        trace_row.push(b'\n');
-        let capture = |trace| {
-            if trace {
-                capture_claude_llm_request_traces(&dir, &trace_body, "application/x-protobuf")
-            } else {
-                capture_claude_api_request_logs(&dir, &api_body, "application/json")
-            }
-        };
-        for (trace, row, path) in [
-            (false, api_row, evidence_path(&dir, "identity-session")),
-            (true, trace_row, trace_evidence_path(&dir, "sess-traces")),
-        ] {
-            assert_eq!(capture(trace).unwrap(), 1);
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
+    fn api_and_trace_past_warning_threshold_keep_every_request() {
+        // Exercise the existing allowance seam cheaply, and the real 64 MiB
+        // boundary with only three distinct rows and streamed whitespace.
+        for quantum in [128, MAX_EVIDENCE_FILE_BYTES] {
+            let scratch = crate::test_scratch::ScratchDir::new("sidecar-no-cap");
+            for trace in [false, true] {
+                let session = if trace {
+                    "sess-traces"
+                } else {
+                    "identity-session"
+                };
+                let capture = |request| {
+                    if trace {
+                        capture_claude_llm_request_traces(
+                            &scratch,
+                            &trace_body(vec![llm_span(request, None)]),
+                            "application/x-protobuf",
+                        )
+                    } else {
+                        capture_claude_api_request_logs(
+                            &scratch,
+                            &identity_json(&[], &[("request_id", request)]),
+                            "application/json",
+                        )
+                    }
+                };
+                assert_eq!(capture("request-1").unwrap(), 1);
+                let path = if trace {
+                    trace_evidence_path(&scratch, session)
+                } else {
+                    evidence_path(&scratch, session)
+                };
+                let before = fs::metadata(&path).unwrap().len();
+                let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+                std::io::copy(
+                    &mut std::io::repeat(b' ').take(quantum.saturating_sub(before)),
+                    &mut file,
+                )
                 .unwrap();
-            for before in [
-                MAX_EVIDENCE_FILE_BYTES - row.len() as u64,
-                MAX_EVIDENCE_FILE_BYTES - 1,
-            ] {
-                // Sparse synthetic padding tests actual appender/capture I/O;
-                // it is not used as a healthy below-cap reader fixture.
-                file.set_len(before).unwrap();
-                assert!(capture(trace).is_err());
-                let after = before + row.len() as u64;
-                assert_eq!(file.metadata().unwrap().len(), after);
-                let mut found = vec![0; row.len()];
-                file.seek(SeekFrom::Start(0)).unwrap();
-                file.read_exact(&mut found).unwrap();
-                assert_eq!(found, row, "existing bytes preserved");
-                file.seek(SeekFrom::End(-(row.len() as i64))).unwrap();
-                file.read_exact(&mut found).unwrap();
-                assert_eq!(found, row, "final boundary row preserved");
-                assert!(capture(trace).is_err());
-                assert_eq!(
-                    file.metadata().unwrap().len(),
-                    after,
-                    "retry appends nothing"
+                assert_eq!(capture("request-2").unwrap(), 1);
+                assert_eq!(capture("request-3").unwrap(), 1);
+                // Re-export is still deduplicated by the SAME decoder.
+                assert_eq!(capture("request-2").unwrap(), 1);
+                assert!(fs::metadata(&path).unwrap().len() > quantum);
+                let allowance = strict_budget::protected_allowance(
+                    quantum,
+                    strict_cohort_bytes(&scratch, session),
                 );
+                let _budget = strict_budget::StrictReadBudget::new(allowance);
+                let (requests, oversized) = if trace {
+                    assert!(
+                        !claude_trace_ownership_sidecar_fingerprint(&scratch, session).is_empty()
+                    );
+                    let report = load_claude_trace_ownership_evidence(&scratch, [session.into()]);
+                    assert!(report.is_complete());
+                    (
+                        report.evidence[session]
+                            .iter()
+                            .map(|row| row.request_id.clone())
+                            .collect::<Vec<_>>(),
+                        report.oversized_files,
+                    )
+                } else {
+                    assert!(!claude_effort_sidecar_fingerprint(&scratch, session).is_empty());
+                    let mut read = ClaudeApiEvidenceRead::load(&scratch, [session.into()]).unwrap();
+                    let report = read.take_strict_report(&scratch, session);
+                    assert!(report.health.is_complete());
+                    (
+                        report.evidence[session]
+                            .iter()
+                            .map(|row| row.request_id.clone())
+                            .collect::<Vec<_>>(),
+                        report.health.oversized_files,
+                    )
+                };
+                assert_eq!(requests, ["request-1", "request-2", "request-3"]);
+                assert_eq!(oversized, u64::from(quantum == MAX_EVIDENCE_FILE_BYTES));
             }
         }
-        fs::remove_dir_all(dir).unwrap();
     }
 
+    /// [money] Under-cap streaming/reuse preserves exact tokens, reported cost
+    /// and request-owned accounts, including duplicate exports.
     #[test]
-    fn api_and_trace_capture_refuse_capped_files_with_consistent_reader_health() {
-        let dir = std::env::temp_dir().join(format!("ottto-cap-refusal-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let api_body = parent_and_subagent_body();
-        let trace_body = trace_body(vec![llm_span("req-cap", None)]);
-        // Capture once through both public APIs, then exercise the actual file
-        // path at exactly and over the boundary without allocating a giant row.
-        assert!(capture_claude_api_request_logs(&dir, api_body, "application/json").unwrap() > 0);
-        assert_eq!(
-            capture_claude_llm_request_traces(&dir, &trace_body, "application/x-protobuf").unwrap(),
-            1
-        );
-        for bytes in [MAX_EVIDENCE_FILE_BYTES, MAX_EVIDENCE_FILE_BYTES + 1] {
-            for entry in fs::read_dir(dir.join(STORE_DIR)).unwrap() {
-                let path = entry.unwrap().path();
-                OpenOptions::new()
-                    .write(true)
-                    .open(path)
-                    .unwrap()
-                    .set_len(bytes)
-                    .unwrap();
-            }
-            let trace_path = trace_evidence_path(&dir, "sess-traces");
-            OpenOptions::new()
-                .write(true)
-                .open(&trace_path)
-                .unwrap()
-                .set_len(bytes)
-                .unwrap();
-            assert!(capture_claude_api_request_logs(&dir, api_body, "application/json").is_err());
-            assert!(
-                capture_claude_llm_request_traces(&dir, &trace_body, "application/x-protobuf")
-                    .is_err()
+    fn under_cap_tokens_cost_and_accounts_are_unchanged() {
+        let scratch = crate::test_scratch::ScratchDir::new("sidecar-money");
+        for (request, account, input, output, cost) in [
+            ("request-A", ACCOUNT, "12", "3", "1250"),
+            ("request-B", ORGANIZATION, "7", "5", "2000"),
+            ("request-A", ACCOUNT, "12", "3", "1250"),
+        ] {
+            assert_eq!(
+                capture_claude_api_request_logs(
+                    &scratch,
+                    &identity_json(
+                        &[],
+                        &[
+                            ("request_id", request),
+                            ("user.account_uuid", account),
+                            ("organization.id", OTHER_ORGANIZATION),
+                            ("input_tokens", input),
+                            ("output_tokens", output),
+                            ("cost_usd_micros", cost),
+                        ]
+                    ),
+                    "application/json",
+                )
+                .unwrap(),
+                1
             );
-            for entry in fs::read_dir(dir.join(STORE_DIR)).unwrap() {
-                assert_eq!(entry.unwrap().metadata().unwrap().len(), bytes);
-            }
-            assert_eq!(fs::metadata(&trace_path).unwrap().len(), bytes);
-            assert!(claude_effort_sidecar_fingerprint(&dir, "sess-mixed").is_empty());
-            assert!(claude_trace_ownership_sidecar_fingerprint(&dir, "sess-traces").is_empty());
-            let api = load_claude_api_request_evidence_report(&dir, ["sess-mixed".into()]);
-            assert_eq!(api.health.oversized_files, 1);
-            assert!(!api.health.is_complete());
-            assert!(api.evidence.is_empty());
-            assert!(load_claude_effort_evidence(&dir, ["sess-mixed".into()])
-                .unwrap()
-                .is_empty());
-            assert!(load_claude_effort_by_request(&dir, ["sess-mixed".into()]).is_empty());
-            let trace = load_claude_trace_ownership_evidence(&dir, ["sess-traces".into()]);
-            assert_eq!(trace.oversized_files, 1);
-            assert!(!trace.is_complete());
-            assert!(trace.evidence.is_empty());
         }
-        fs::remove_dir_all(dir).unwrap();
+        let mut read = ClaudeApiEvidenceRead::load(&scratch, ["identity-session".into()]).unwrap();
+        let report = read.take_strict_report(&scratch, "identity-session");
+        assert!(report.health.is_complete());
+        assert_eq!(report.health.oversized_files, 0);
+        let rows = &report.evidence["identity-session"];
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().map(|row| row.input_tokens).sum::<u64>(), 19);
+        assert_eq!(rows.iter().map(|row| row.output_tokens).sum::<u64>(), 8);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.cost_usd_micros.unwrap())
+                .sum::<u64>(),
+            3250
+        );
+        for (row, request, account, input, output, cost) in [
+            (&rows[0], "request-A", ACCOUNT, 12, 3, 1250),
+            (&rows[1], "request-B", ORGANIZATION, 7, 5, 2000),
+        ] {
+            assert_eq!(row.request_id, request);
+            assert_eq!(
+                (row.input_tokens, row.output_tokens, row.cost_usd_micros),
+                (input, output, Some(cost))
+            );
+            let expected = ottto_core::billing_identity_hash("anthropic", "account", account);
+            assert_eq!(row.account_identifier_hash, expected);
+            assert_eq!(
+                row.request_identity
+                    .as_ref()
+                    .unwrap()
+                    .account
+                    .unambiguous_hash(),
+                expected
+            );
+        }
     }
 
     use super::*;
@@ -3520,8 +3515,8 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_decode_reuse_missing_nonfile_and_cap_never_reuse_rows() {
-        for change in ["missing", "nonfile", "cap", "over-cap"] {
+    fn sidecar_decode_reuse_missing_nonfile_and_malformed_never_reuse_rows() {
+        for change in ["missing", "nonfile", "malformed"] {
             let (dir, _) = decode_reuse_fixture(change);
             let path = evidence_path(&dir, "sess-mixed");
             let mut read = ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into()]).unwrap();
@@ -3531,12 +3526,7 @@ mod tests {
                     fs::remove_file(&path).unwrap();
                     fs::create_dir(&path).unwrap();
                 }
-                _ => File::options()
-                    .write(true)
-                    .open(&path)
-                    .unwrap()
-                    .set_len(MAX_EVIDENCE_FILE_BYTES + u64::from(change == "over-cap"))
-                    .unwrap(),
+                _ => fs::write(&path, b"malformed\n").unwrap(),
             }
             let expected = load_claude_api_request_evidence_report(&dir, ["sess-mixed".into()]);
             let actual = read.take_strict_report(&dir, "sess-mixed");

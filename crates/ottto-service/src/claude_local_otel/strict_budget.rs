@@ -26,8 +26,27 @@ impl Drop for StrictReadBudget {
         REMAINING.with(|remaining| remaining.set(None));
     }
 }
-pub(super) fn allowance() -> u64 {
-    REMAINING.with(|remaining| remaining.get().unwrap_or(super::MAX_EVIDENCE_FILE_BYTES))
+/// Without a pass budget, one streaming root is its own read turn. A larger
+/// pair gets a protected allowance rather than being permanently refused.
+pub(super) fn allowance(pair_bytes: u64) -> u64 {
+    REMAINING.with(|remaining| {
+        remaining
+            .get()
+            .unwrap_or_else(|| protected_allowance(super::MAX_EVIDENCE_FILE_BYTES, pair_bytes))
+    })
+}
+pub(crate) fn protected_allowance(quantum: u64, pair_bytes: u64) -> u64 {
+    if pair_bytes > quantum {
+        crate::local_resource_diagnostics::traversal_point(
+            "claude_sidecar_read",
+            "claude_code",
+            &std::collections::BTreeMap::from([
+                ("oversized_root_alone", 1),
+                ("allowance_bytes", pair_bytes),
+            ]),
+        );
+    }
+    quantum.max(pair_bytes)
 }
 pub(super) fn consumed(bytes: u64) {
     REMAINING.with(|remaining| {

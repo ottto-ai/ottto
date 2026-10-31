@@ -9776,8 +9776,16 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     let usage_roots = strict_plan.roots;
     let strict_budget = crate::snapshots::claude_terminal_off().then(|| {
+        let pair_bytes = usage_roots
+            .iter()
+            .map(|root| crate::claude_local_otel::strict_cohort_bytes(support_dir, root))
+            .max()
+            .unwrap_or(0);
         crate::claude_local_otel::strict_budget::StrictReadBudget::new(
-            strict_cohort::BYTES_PER_PASS,
+            crate::claude_local_otel::strict_budget::protected_allowance(
+                strict_cohort::BYTES_PER_PASS,
+                pair_bytes,
+            ),
         )
     });
 
