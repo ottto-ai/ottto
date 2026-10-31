@@ -1090,6 +1090,6 @@ fn codex_v2_staged_turn_charge_stays_within_the_stated_bound() {
 fn codex_counting_v2_compiled_cutover_is_frozen() {
     assert_eq!(
         codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
-        Some(1_793_016_000_000)
+        1_793_016_000_000
     );
 }
