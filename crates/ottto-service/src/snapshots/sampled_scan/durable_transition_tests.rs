@@ -1285,9 +1285,10 @@ impl TransitionDriver for Codex24b {
             Vec::new()
         } else {
             let bytes = other_wire(source, &scan);
-            let request: SnapshotBatchRequest = serde_json::from_slice(&bytes).unwrap();
+            let mut typed = request(&scan.snapshots);
+            typed.source = source.api_slug().into();
             let response = ack(&scan.snapshots).unwrap();
-            response.validate_entity_ack(&request).unwrap();
+            response.validate_entity_ack(&typed).unwrap();
             index.record_accepted_snapshot_fingerprints(
                 &scan
                     .snapshots
