@@ -86,52 +86,13 @@ the exact cohort token in that cycle's activity hint (`emission_permit`). See
   - Each file keeps at most 64 markers. Overflow switches transcript bases off
     for that file.
   - No email or raw text is kept: a local digest only detects an email
-    change, with the positions of the first email and the first switch.
-- **`transcript_email`** (terminal/SDK; compiled out unless both
-  `EMISSION_ENABLED` and `TRANSCRIPT_EMAIL_ENABLED`, each `false`) **never
-  binds a login.** No qualified join from a recorded email to a login exists,
-  and sampled status coverage cannot prove that one login ran continuously
-  (equal samples 300 s apart do not exclude an unseen A→B→A switch). So it
-  only decides whether a request keeps its earlier meaning:
-  - Not applicable (the org-only path stands): compiled out, Desktop, no
-    unchanged email before the request, the shared default folder, or a
-    folder proven never registered over the window (unregistered at every
-    pass since registration became known, before the window began, and not
-    a removed slot).
-  - Otherwise the request is refused, never weakened to `transcript_org`.
-    The reasons are typed locally and counted on the wire:
-    `CoverageUnavailable` (feed failed or not run since restart, a removed
-    slot or forgotten registration, unknown session start, gap, unavailable sample, logout, eviction, window past
-    the last sample), `ContradictoryOrg` (a nearby sample names another org
-    or another login), and `CoverageUnqualified` (samples span the window
-    but prove nothing). Usage and money are conserved, and the positive
-    refusal blocks Desktop-pair fill.
-  - Qualifying it needs an approved continuity witness and an approved
-    email-to-login join; neither exists, so the flag stays off.
-- **Status-coverage feed** (`claude_status_coverage.rs`, same gate):
-  - The Claude status pass reports each registered slot's already-qualified
-    login/org hashes after `claude_slot_post_resolution_gate`, or
-    unavailable/signed-out on every failure branch, plus the registered
-    folders at the end of the pass. It adds no read, provider call or cadence
-    change, and returns nothing to the status pass.
-  - A process-local ledger keeps sampled runs (freshness only): consecutive
-    same-identity samples at most 600 s apart. Caps: 10 slots, 32 runs per
-    slot, 30 days, 64 KiB (worst case 63,360 B). Nothing is persisted or
-    uploaded; a restart forgets both history and registration.
-  - Removing a slot clears its history but records the loss in a bounded
-    set (at most 10 folders). The same request stays refused rather than
-    turning org-only. One more loss than the set holds, more registered
-    folders than the 10 the ledger keeps, a restart, or a window that began
-    before registration was first known makes every unregistered folder
-    unknown (refused), never proven absent.
-  - Slots past the status pass's collection capacity are still reported as
-    registered folders. Scan roots and descriptors read the same registry
-    string, and the folder key is lexical.
-  - The ledger's (login, org) pairings prove marker-org membership for
-    login-only telemetry (§2a.12(b)).
-  - A status-pass fixture shows byte-identical status output (SOURCE account
-    and plans, quota, health, persisted slot state) with the feed working,
-    failed, or holding a conflicting history.
+    change.
+- **`transcript_email` and its status-coverage feed** were deleted on
+  2026-10-31 while still compiled off (dormant-switch cleanup). The path could
+  only refuse: no qualified email-to-login join or continuity witness exists.
+  The `transcript_email` basis token stays accepted wire vocabulary. The
+  retired `OrgMarkers` email positions and folder key are kept but never
+  written, so the warm-cache allowlist digest is unchanged.
 - **`transcript_sole_login`** (Desktop only) needs all of the following:
   - `TRANSCRIPT_SOLE_LOGIN_ENABLED`, a separate constant that is `false`
     until the receiver's time-scoped sole-login veto is verified as deployed.

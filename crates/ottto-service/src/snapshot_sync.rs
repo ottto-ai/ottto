@@ -9925,7 +9925,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_identity::desktop_census(index),
         )
         .with_unhealthy_reasons(unhealthy_reasons)
-        .with_status_coverage(crate::claude_status_coverage::snapshot())
         .with_native_originals(&originals)
         .with_accepted_buckets(accepted_identity_buckets)
         .with_wire_size_reservation(wire_size_reservation)

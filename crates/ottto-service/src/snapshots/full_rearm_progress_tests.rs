@@ -1960,8 +1960,6 @@ fn pipeline_auxiliary_bad_clock_preserves_refusal_without_whole_index_rearm() {
                 marker: claude_request_identity::MarkerVerdict::None,
                 desktop: false,
                 scan_unix_seconds: Some(CENSUS_CLOCK),
-                email_home: None,
-                session_start_unix_seconds: None,
                 duplicated_elsewhere: false,
             }
         ),
