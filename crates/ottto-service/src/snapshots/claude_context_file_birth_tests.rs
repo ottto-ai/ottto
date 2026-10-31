@@ -1287,6 +1287,39 @@ fn api_sidecar_without_trace_sidecar_still_vetoes() {
 }
 
 #[test]
+fn api_row_without_trace_row_counts_as_owned() {
+    let dir = temp_dir("claude-file-birth-api-only");
+    let now = OffsetDateTime::now_utc();
+    let (path, parsed) = root_session(
+        &dir,
+        ROOT,
+        &[
+            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
+            assistant(ROOT, "req_a2", &stamp(now, -29), 300),
+        ],
+    );
+    let mut items = vec![parsed];
+    let mut index = indexed(&[&path], true);
+    let evidence = reports(&[(ROOT, "req_a1", 1, 100), (ROOT, "req_a2", 2, 300)], false);
+
+    let disposition = fold(&mut items, &evidence, &mut index, true);
+
+    assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
+    assert_eq!(
+        posture(&items[0]),
+        (Some(100), Some(300), Some(300), Some(0))
+    );
+    assert_eq!(
+        disposition
+            .context_file_birth
+            .total
+            .telemetry_confirmed_session_count,
+        1
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn telemetry_proven_session_keeps_todays_numbers() {
     // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -1343,6 +1376,33 @@ fn telemetry_proven_session_keeps_todays_numbers() {
     assert_eq!(birth.compaction_events, strict.compaction_events);
     assert!(!strict.local_context_points.is_empty());
     assert_eq!(birth.local_context_points, strict.local_context_points);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn id_less_responses_share_the_one_scalar_source() {
+    let dir = temp_dir("claude-file-birth-id-less");
+    let now = OffsetDateTime::now_utc();
+    let (path, parsed) = root_session(
+        &dir,
+        ROOT,
+        &[
+            id_less_assistant(ROOT, &stamp(now, -30), 500),
+            assistant(ROOT, "req_a1", &stamp(now, -29), 100),
+        ],
+    );
+    assert!(!parsed.claude_context_curve_identity_complete);
+    let evidence = reports(&[(ROOT, "req_a1", 1, 100)], true);
+    for fence_closed in [false, true] {
+        let mut items = vec![parsed.clone()];
+        let mut index = indexed(&[&path], fence_closed);
+        fold(&mut items, &evidence, &mut index, true);
+        assert_eq!(
+            posture(&items[0]),
+            (Some(500), Some(500), Some(100), Some(0)),
+            "fence_closed={fence_closed}"
+        );
+    }
     let _ = fs::remove_dir_all(dir);
 }
 

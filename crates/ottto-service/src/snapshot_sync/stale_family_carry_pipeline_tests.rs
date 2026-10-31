@@ -433,6 +433,36 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
     assert!(!base.family_pending_after);
 }
 
+/// Q4 strict: the witnessed family's pending from the red window is invalid
+/// (the shape a cap or member-change invalidation leaves). The retry re-arms
+/// it whole, exactly as BASE.
+#[test]
+#[serial(source_manifests)]
+fn c1b_invalid_pending_keeps_base_rearm() {
+    if !c1a_layout_supported("c1b_invalid_pending") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let invalidate = |fixture: &RearmFixture| {
+        c1a_edit_index(fixture, |saved| {
+            let pending = saved["claude_usage_family_pending"][REARM_ROOT]
+                .as_object_mut()
+                .expect("the red window keeps the family pending");
+            pending.insert("member_request_id_hashes".to_owned(), serde_json::json!({}));
+            pending.remove("member_occurrences");
+            pending.insert("invalid".to_owned(), serde_json::json!(true));
+        });
+    };
+    let fix = c1b_red_chain("c1b-invalid-pending", "fix", invalidate);
+    let base = c1b_base_red_chain("c1b-invalid-pending-base", invalidate);
+    let family = rearm_family_sessions().len();
+    let retry = &fix.windows[2];
+    assert_eq!(retry.family_reads, family, "the invalid family re-arms");
+    assert_eq!(retry.family_reads, base.windows[2].family_reads);
+    assert_eq!(retry.start, base.windows[2].start, "the start is BASE's");
+    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
+}
+
 /// SI I3 and Condition X(a): after the red window the root's API rows gain
 /// account evidence, so the sidecar-inclusive selection fingerprint of every
 /// member changes (M1). The carry keeps the committed revisions, the walk
