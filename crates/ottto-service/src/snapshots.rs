@@ -78561,6 +78561,8 @@ mod tests {
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions");
         let clock = ParentlessClock::now();
+        // Keep birth-time proof real while the owning header predates the test epoch.
+        let _cutover = codex_counting_version::TestCutover::set(clock.base_ms + 1);
         let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let admitted = "01a04e11-49cf-7460-9fd7-f7dbfd2f05e4";
         let wrapped = "01a04e12-49cf-7460-9fd7-f7dbfd2f05e4";
