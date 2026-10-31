@@ -4,8 +4,10 @@
 
 /// The M4 shape: settled sweep, contract latch, a cap-invalid family with no
 /// stored evidence, and a prior admission that never completes off terminal-off.
+/// `on` with a saturated pending occurrence cap, as on M4.
 fn settled_contract_deadlock_start(on: bool) -> (serde_json::Value, ScopedRetryFixture) {
     let _on = on.then(settled_contract_carry::SettledContractCarryForTest::enabled);
+    let _cap = on.then(|| settled_contract_carry::OccurrenceCapForTest::set(0));
     let mut fixture = contract_debt_fixture(3);
     let invalid = fixture.roots[2].clone();
     let pending = fixture
@@ -49,7 +51,8 @@ fn settled_contract_admission_vetoes_health(index: &ScanIndex) -> bool {
 /// Main keeps the unfinished admission (health vetoed) and re-reads the
 /// invalid family; ON keeps that family unread and uncredited, carries the
 /// rest whole and drops the admission (no unoffered due work), so the walk can
-/// retire healthy.
+/// retire healthy. Cap room for its recorded requests, or a changed member,
+/// ends the keep.
 #[test]
 fn settled_contract_carry_breaks_latched_admission_deadlock() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -78,8 +81,22 @@ fn settled_contract_carry_breaks_latched_admission_deadlock() {
         scoped_retry_full_reads(index, &on_fixture.candidates),
         0
     );
-    // A changed member ends the keep: the family re-arms as on main.
+    let invalid_key = local_index_key(&on_fixture.candidates[2].path);
+    assert!(
+        !index.claude_request_census.retry_carry_record(&invalid_key).unwrap().request_hashes().is_empty(),
+        "the kept family has recorded requests the saturated cap cannot take"
+    );
+    // Cap room for its recorded requests ends the keep (Lead B Q1).
     let _on = settled_contract_carry::SettledContractCarryForTest::enabled();
+    let stale = on_fixture.roots.iter().cloned().collect();
+    let (kept, _) = settled_contract_carry::kept_invalid_roots(index, &stale);
+    assert_eq!(kept, BTreeSet::from([on_fixture.roots[2].clone()]));
+    assert_eq!(settled_contract_carry::cap_room_roots(index, &kept), kept);
+    {
+        let _cap = settled_contract_carry::OccurrenceCapForTest::set(0);
+        assert!(settled_contract_carry::cap_room_roots(index, &kept).is_empty());
+    }
+    // A changed member ends the keep: the family re-arms as on main.
     let mut changed = on_fixture;
     let key = local_index_key(&changed.candidates[2].path);
     changed.index.files.get_mut(&key).unwrap().source_file_fingerprint = "f".repeat(64);

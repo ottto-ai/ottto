@@ -6,8 +6,9 @@
 //! - Q3: an invalid family with no stored evidence whose every member is the
 //!   exact revision its census record was parsed from in that family's window,
 //!   with an ACKed head, behind a closed fence, is kept beside the carry: not
-//!   re-read, credits nothing, stays invalid. A changed member, an open fence,
-//!   or pending occurrence-cap room after the start's clears re-arms it.
+//!   re-read, credits nothing, stays invalid. A changed member or an open
+//!   fence ends the keep; so does pending occurrence-cap room for its recorded
+//!   requests after the start's clears.
 //! - Sticky admission: an unfinished retry admission no longer forces the
 //!   batch path; the whole carry is tried first and, when it fits, settles the
 //!   admission's root walk (every uncarried stale family is re-armed as on
@@ -121,22 +122,72 @@ pub(super) fn kept_invalid_roots(
     (roots, files)
 }
 
-/// Lead B Q1: the pending occurrence cap (the accumulation's own count and
-/// bound) has room for another occurrence.
-pub(super) fn occurrence_cap_has_room(index: &ScanIndex) -> bool {
-    let retained = index
+/// Lead B Q1 (rev F3): kept families whose recorded requests (their census
+/// records' request hashes) fit the pending occurrence cap, counted as the
+/// accumulation counts it, after this start's clears. Admitted in root order,
+/// each taking its room; a re-read of these may reach a proof, so they re-arm.
+pub(super) fn cap_room_roots(index: &ScanIndex, kept: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut requests = BTreeMap::<&str, usize>::new();
+    for key in index.files.keys() {
+        let Some(root) =
+            claude_index_path_member_ref(Path::new(key)).and_then(|member| kept.get(member.root))
+        else {
+            continue;
+        };
+        let count = index
+            .claude_request_census
+            .retry_carry_record(key)
+            .map_or(0, |record| record.request_hashes().len());
+        let slot = requests.entry(root.as_str()).or_default();
+        *slot = slot.saturating_add(count);
+    }
+    let mut retained = index
         .claude_usage_family_pending
         .values()
         .flat_map(|pending| pending.member_occurrences.values())
         .map(BTreeMap::len)
         .fold(0_usize, usize::saturating_add);
-    claude_pending_occurrence_count_after_replace(
-        retained,
-        0,
-        1,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    )
-    .is_some()
+    let cap = occurrence_cap();
+    requests
+        .into_iter()
+        .filter_map(|(root, incoming)| {
+            retained = claude_pending_occurrence_count_after_replace(retained, 0, incoming, cap)?;
+            Some(root.to_owned())
+        })
+        .collect()
+}
+
+fn occurrence_cap() -> usize {
+    #[cfg(test)]
+    {
+        CAP.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAP: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(MAX_CLAUDE_PENDING_USAGE_OCCURRENCES) };
+}
+/// A fixture saturates the pending cap on its own thread (M4: 249,782 of
+/// 250,000 retained) without building that many occurrences.
+#[cfg(test)]
+pub(super) struct OccurrenceCapForTest(usize, std::marker::PhantomData<std::rc::Rc<()>>);
+#[cfg(test)]
+impl OccurrenceCapForTest {
+    pub(super) fn set(cap: usize) -> Self {
+        Self(CAP.with(|slot| slot.replace(cap)), std::marker::PhantomData)
+    }
+}
+#[cfg(test)]
+impl Drop for OccurrenceCapForTest {
+    fn drop(&mut self) {
+        CAP.with(|slot| slot.set(self.0));
+    }
 }
 
 /// Rev F2: the admission still owes due paths its existing selector has not

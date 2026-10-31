@@ -43019,20 +43019,25 @@ fn ensure_bounded_traversal(
                 }
             }
         }
-        // Lead B Q1 (rev F3): once this start's clears leave the pending
-        // occurrence cap room, a kept-invalid family re-arms like any other.
-        let settled_cap_room =
-            !settled_kept.is_empty() && settled_contract_carry::occurrence_cap_has_room(index);
-        if settled_cap_room {
+        // Lead B Q1 (rev F3): a kept-invalid family whose recorded requests
+        // fit the pending occurrence cap after this start's clears re-arms.
+        let settled_cap_rearmed = if settled_kept.is_empty() {
+            BTreeSet::new()
+        } else {
+            settled_contract_carry::cap_room_roots(index, &settled_kept)
+        };
+        let mut settled_cap_rearmed_files = 0_usize;
+        if !settled_cap_rearmed.is_empty() {
             for (index_key, entry) in &mut index.files {
                 if !entry.source_file_fingerprint.is_empty()
                     && claude_index_path_member_ref(Path::new(index_key))
-                        .is_some_and(|member| settled_kept.contains(member.root))
+                        .is_some_and(|member| settled_cap_rearmed.contains(member.root))
                 {
                     rearm_cause::clear(index_key, entry, transition.rearm_cause());
-                    rearmed_file_count += 1;
+                    settled_cap_rearmed_files += 1;
                 }
             }
+            rearmed_file_count += settled_cap_rearmed_files;
         }
         if window_rearmed_file_count > 0 {
             claude_full_rearm_window_note_stale_rearm(index, collected_at, window_member_digests);
@@ -43094,21 +43099,9 @@ fn ensure_bounded_traversal(
                  kept_invalid_files={} kept_invalid_cap_room_rearmed_families={} \
                  prior_admission_dropped={} prior_admission_due_retained={} admission={} \
                  latched={} priced_roots={} priced_bytes={} headroom_alarm={}",
-                if settled_cap_room {
-                    0
-                } else {
-                    settled_kept.len()
-                },
-                if settled_cap_room {
-                    0
-                } else {
-                    settled_kept_files
-                },
-                if settled_cap_room {
-                    settled_kept.len()
-                } else {
-                    0
-                },
+                settled_kept.len() - settled_cap_rearmed.len(),
+                settled_kept_files.saturating_sub(settled_cap_rearmed_files),
+                settled_cap_rearmed.len(),
                 settled_admission_dropped,
                 settled_due_retained,
                 admission.is_some(),
