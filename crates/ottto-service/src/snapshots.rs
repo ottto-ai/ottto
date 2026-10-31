@@ -29252,9 +29252,9 @@ impl OwnedSourceScan {
                 // and an unsampled read keep the step-start budget. Any other
                 // sampled singleton is measured exactly at completion
                 // (P1-RETAIN R0, Q-PR13b; `try_lock`, so contention gives 0).
-                // A Tail/Unchanged singleton (shape F) also decides whether a
-                // release of lower-ranked residents would make its copy
-                // fit; that release is deferred into its retention, after
+                // A Tail/Unchanged/Full singleton also decides, under blocking
+                // locks, whether a release of lower-ranked residents would make
+                // its copy fit; that release is deferred into its retention, after
                 // every non-budget gate. Nothing is evicted here. Each branch
                 // also returns the walk behind its budget (`copy_measure`, for
                 // `retire_proof_beside_copy`); `copy_budget` is the
@@ -29277,7 +29277,7 @@ impl OwnedSourceScan {
                         None,
                     )
                 } else if active.sampling.is_some() {
-                    if sampled_scan::borrows_only_retained_reduction(&active) {
+                    if sampled_scan::releases_at_completion(&active) {
                         sampled_scan::tail_completion_budget(sampling.as_ref(), &mut active)
                     } else {
                         let (budget, measure) = sampled_scan::copy_budget_step(

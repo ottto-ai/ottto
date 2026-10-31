@@ -1496,6 +1496,129 @@ fn cache_policy_m_a_codex_keeps_the_legacy_release() {
     );
 }
 
+/// [regress] A long-lived daemon's cache full of small idle residents locked
+/// out every later Full: its copy budget beside a full cache is zero, only a
+/// Tail or Unchanged read could release, so a growing file read Full on every
+/// page. A Full singleton now releases at completion: only residents ranked
+/// strictly below its plan's mtime leave, and a later page takes the copy as a
+/// Tail. With residents of equal or newer rank nothing leaves, the copy is
+/// refused and the next page is Full again. Small residents keep `|P*|` above
+/// `|P_C|`, as on a real daemon: a Claude Full takes no churn bound. A Codex
+/// Full proves `K = C` without an X_out (ruling 5), so finalization may still
+/// refuse its copy after the release; the printed receipt shows which.
+#[test]
+fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
+    if unexecuted("full_singleton_release") {
+        return;
+    }
+    let now = unix_now();
+    let file_modified = now - 600;
+    let newer_modified = now - 300;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for (idle_modified, releases) in [
+            (now - OLD_SECONDS, true),
+            (file_modified, false),
+            (newer_modified, false),
+        ] {
+            let label = format!("{source:?} idle_modified={idle_modified}");
+            let cache = Arc::new(sampled_scan::SharedCache::default());
+            let idle = ScanFixture::new(SnapshotSource::ClaudeCode);
+            idle.append_usage(SnapshotSource::ClaudeCode, 0..filler_records() / 10);
+            idle.set_modified(idle_modified);
+            let mut residents_inserted = 0;
+            observe(|| {
+                while optional_resident(&cache) < POLICY_STATE_BYTES / 10 * 9 {
+                    let retained = retained_reduction(&idle);
+                    assert!(
+                        cache
+                            .retained()
+                            .expect("retained cache lock")
+                            .insert(format!("cache-policy-idle-{residents_inserted}"), retained),
+                        "precondition: {label} idle resident is admitted"
+                    );
+                    residents_inserted += 1;
+                }
+            });
+            for (key, modified) in [
+                ("cache-policy-equal", file_modified),
+                ("cache-policy-newer", newer_modified),
+            ] {
+                let entry = ScanFixture::new(SnapshotSource::ClaudeCode);
+                entry.append(&usage(SnapshotSource::ClaudeCode, 100, 0, MODEL));
+                entry.set_modified(modified);
+                let retained = retained_reduction(&entry);
+                assert!(
+                    cache
+                        .retained()
+                        .expect("retained cache lock")
+                        .insert(key.to_string(), retained),
+                    "precondition: {label} {key} is admitted"
+                );
+            }
+            let before = residents(&cache);
+            assert_eq!(
+                before.len(),
+                residents_inserted + 2,
+                "precondition: {label} the fill evicts nothing"
+            );
+
+            let grown = ScanFixture::new(source);
+            grown.append(&usage(source, 100, 0, MODEL));
+            // A zero copy budget: its line buffer alone exceeds the room left.
+            append_padding(&grown);
+            grown.append(&usage(source, 141, 1, MODEL));
+            grown.set_modified(file_modified);
+            let (full, counts) =
+                observe(|| observed_scan(&grown, source, ScanIndex::default(), &cache));
+            assert_eq!(full.modes, (1, 0, 0), "precondition: {label} a Full");
+            let after = residents(&cache);
+            let left: Vec<_> = before
+                .iter()
+                .filter(|(key, _, _)| !after.iter().any(|(resident, _, _)| resident == key))
+                .map(|(key, rank, _)| (key.clone(), *rank))
+                .collect();
+            let admitted = cache.retained_checkpoint(&grown.key()).is_some();
+            eprintln!(
+                "CACHE_POLICY test=full_singleton_release {label} residents={residents_inserted} left={} admitted={admitted} produced={} finalization_refused={}",
+                left.len(),
+                counts.retention_produced,
+                counts.retention_finalization_bound_refused,
+            );
+            assert_eq!(
+                counts.copy_refusal_admission_evicted as usize,
+                left.len(),
+                "{label}: by the release only"
+            );
+            assert_eq!(wipe_clears(&counts), 0, "{label}: nothing wiped");
+            for (key, rank) in &left {
+                assert!(
+                    *rank < (i64::try_from(file_modified).unwrap(), 0),
+                    "{label}: {key} was not strictly older"
+                );
+            }
+            if releases {
+                assert!(!left.is_empty(), "{label}: older residents leave");
+            } else {
+                assert!(left.is_empty(), "{label}: equal or newer residents stay");
+                assert!(!admitted, "{label}: the copy is refused");
+            }
+
+            grown.append(&usage(source, 182, 2, MODEL));
+            grown.set_modified(file_modified + 1);
+            let next = observed_scan(&grown, source, full.index, &cache);
+            if admitted {
+                assert_eq!(next.modes, (0, 1, 0), "{label}: the next page is a Tail");
+            } else {
+                assert_eq!(next.modes, (1, 0, 0), "{label}: the next page is Full");
+                assert_eq!(next.state_missing(), 1, "{label}");
+            }
+            if source == SnapshotSource::ClaudeCode && releases {
+                assert!(admitted, "{label}: X_out proves the copy is admitted");
+            }
+        }
+    }
+}
+
 /// A workspace path no other test uses: the repository-identity cache is
 /// process-global.
 fn unique_workspace(tag: &str) -> String {

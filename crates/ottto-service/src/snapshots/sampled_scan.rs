@@ -722,7 +722,27 @@ pub(super) fn borrows_only_retained_reduction(active: &OwnedActiveFile) -> bool 
         .sampling
         .as_ref()
         .is_some_and(|sampling| matches!(sampling.mode, ReadMode::Tail | ReadMode::Unchanged))
-        && !active.comparison_target
+        && sampled_singleton(active)
+}
+
+/// A completion that may release lower-ranked residents for its copy
+/// (`tail_completion_budget`): shape F, or a sampled Full singleton, which
+/// would otherwise never get back into a full cache and so reads Full on every
+/// growth. A side read retains nothing, so it proves nothing.
+pub(super) fn releases_at_completion(active: &OwnedActiveFile) -> bool {
+    borrows_only_retained_reduction(active)
+        || (active
+            .sampling
+            .as_ref()
+            .is_some_and(|sampling| matches!(sampling.mode, ReadMode::Full(_)))
+            && active.side_origin.is_none()
+            && sampled_singleton(active))
+}
+
+/// One file on its own plan: no comparison, cursor job, group, alias, receipt
+/// or tier join. Each conjunct is checked even where another implies it today.
+fn sampled_singleton(active: &OwnedActiveFile) -> bool {
+    !active.comparison_target
         && active.cursor.is_none()
         && active.group.is_none()
         && active.aliases.is_empty()
@@ -1282,7 +1302,7 @@ pub(super) enum RetainBudget {
     TierOrJoinExcluded { raw: usize },
     /// A cursor job with applied bytes outside its certified prefix.
     Unsealed { raw: usize },
-    /// Shape F: admit against `budget_after`, and only after `release` has
+    /// A proven release: admit against `budget_after`, and only after `release` has
     /// run, which happens after every non-budget gate (`retain_reduction`).
     Deferred {
         raw: usize,
@@ -1406,9 +1426,9 @@ pub(super) enum ReleaseOutcome {
     Unmeasurable,
 }
 
-/// A shape-F completion's release of residents ranked strictly below its
-/// copy's re-admission rank, sized at completion for both its clone and its
-/// insert (`prove_release`). It runs at most once, inside
+/// A completion's release (`releases_at_completion`) of residents ranked
+/// strictly below its copy's re-admission rank, sized at completion for both
+/// its clone and its insert (`prove_release`). It runs at most once, inside
 /// `retain_reduction`, after every non-budget gate; anything less than the
 /// exact prefix evicts nothing.
 pub(super) struct DeferredRelease {
@@ -1432,7 +1452,7 @@ pub(super) struct DeferredRelease {
     /// limit, so the insert's entry and key bounds cannot refuse it (e).
     pub(super) entry_limit: usize,
     /// M-a's churn bound: at most `|P_C|` victims (`prove_release`); `None`
-    /// on the legacy path.
+    /// on the legacy path and for a Full, which has no copy to continue.
     max_victims: Option<usize>,
 }
 impl DeferredRelease {
@@ -1469,14 +1489,13 @@ impl DeferredRelease {
     }
 }
 
-/// P1-RETAIN R0 at a shape-F completion (a sampled Tail/Unchanged singleton,
-/// `borrows_only_retained_reduction`): one exact measure, the budget this
-/// copy is admitted against without a release, and the facts a release
-/// proof needs (`ReleaseProof`). Nothing is decided or mutated here: the
+/// P1-RETAIN R0 at a completion that may release (`releases_at_completion`):
+/// one exact measure, the budget this copy is admitted against without a
+/// release, and the facts a release proof needs (`ReleaseProof`). Nothing is decided or mutated here: the
 /// release is proven only at the retention site, after main's proof
 /// retirement and #667's peak reservation (`prove_release`, M-a S-a), and
-/// runs only after every non-budget gate. This is the shape's only release:
-/// the step start releases nothing for it (Q-PR14,
+/// runs only after every non-budget gate. This is the only release of its
+/// own copy: the step start makes no room for it (Q-PR14,
 /// `release_for_copy_refusal`).
 ///
 /// The rank (Q-PR14 amendment) is the one this copy is admitted at: its read
@@ -1494,7 +1513,9 @@ impl DeferredRelease {
 /// active) grants nothing and proves nothing. The insert's own slot
 /// (`ins_extra`) and `A` are never held at once (`finish` consumes the
 /// parser first), so they combine by `max`. No proof is carried for a copy
-/// in the insert's entry/key band, a first read, or one without a plan.
+/// in the insert's entry/key band or one without a plan. A Full has no
+/// previous finalization charge or taken usage; its first copy is ranked like
+/// any other, so a newer file displaces only older idle residents.
 pub(super) fn tail_completion_budget(
     sampling: Option<&Context>,
     active: &mut OwnedActiveFile,
@@ -1516,6 +1537,7 @@ pub(super) fn tail_completion_budget(
         return measured;
     };
     let continued = file.retained_hint.is_some();
+    let full = matches!(file.mode, ReadMode::Full(_));
     let finalization_prev = file.retained_finalization_charge;
     let taken_usage = file.retained_usage;
     let key_len = file.key.len();
@@ -1583,8 +1605,8 @@ pub(super) fn tail_completion_budget(
     if clone > entry_limit {
         return (granted, step, None);
     }
-    // 3. The re-admission rank, once; only a continued copy with a plan.
-    if !continued {
+    // 3. The re-admission rank, once; a continued copy or a Full, with a plan.
+    if !continued && !full {
         return (granted, step, None);
     }
     let Some(modified) = active.parser.planned_modified_hint() else {
@@ -1608,6 +1630,7 @@ pub(super) fn tail_completion_budget(
             clone,
             finalization_prev,
             usage_grew,
+            full,
             rank,
             modified,
             entry_limit,
@@ -1615,7 +1638,7 @@ pub(super) fn tail_completion_budget(
     )
 }
 
-/// What a shape-F completion owns for its release decision (M-a, S-a):
+/// What a releasing completion owns for its release decision (M-a, S-a):
 /// everything `prove_release` needs after main's proof retirement and decode
 /// peak reservation, measured once in `tail_completion_budget`. Inline only.
 pub(super) struct ReleaseProof {
@@ -1632,6 +1655,9 @@ pub(super) struct ReleaseProof {
     finalization_prev: usize,
     /// This read added usage since the take (Q-PR15 (b)).
     usage_grew: bool,
+    /// A Full completion: no copy to continue, so no churn bound
+    /// (`proven_release`).
+    full: bool,
     rank: (i64, i64),
     modified: (i64, i64),
     entry_limit: usize,
@@ -1676,7 +1702,10 @@ pub(super) fn x_out_for(source: SnapshotSource, bound: impl FnOnce() -> Option<u
 /// together under the retained lock; release iff `|P*| <= |P_C|` (as
 /// `K' >= C`, exactly when the copy-only prefix suffices), capped at
 /// `|P_C|` at execution. Anything unknown, overflowing, infeasible or over
-/// the bound releases nothing.
+/// the bound releases nothing. A Full has no churn bound: X_out is what its
+/// copy needs to survive finalization, so `|P*|` of strictly older residents
+/// is its cost, fit-or-nothing. It evicts only while the cache is over the
+/// room, so the room it leaves funds the next completion.
 pub(super) fn prove_release(
     granted: RetainBudget,
     proof: Option<ReleaseProof>,
@@ -1835,7 +1864,7 @@ fn proven_release(
     };
     #[cfg(test)]
     test_hooks::probe(|probe| probe.prefixes = Some((victims, copy_only)));
-    if victims > copy_only {
+    if !proof.full && victims > copy_only {
         return None;
     }
     // The copy is admitted against its share, its decode peak reserved
@@ -1850,7 +1879,7 @@ fn proven_release(
             rank: proof.rank,
             modified: proof.modified,
             entry_limit: proof.entry_limit,
-            max_victims: Some(copy_only),
+            max_victims: (!proof.full).then_some(copy_only),
         },
     })
 }
