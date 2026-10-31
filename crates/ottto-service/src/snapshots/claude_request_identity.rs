@@ -464,7 +464,8 @@ pub(crate) struct Grouping {
     /// Why the caller found no accepted state, when it found none.
     accepted_miss: accepted::UnknownCause,
     /// X-B1 (Lead B 2026-10-31): bucket rows sent with `copy_invalidated`,
-    /// by bucket start. Empty unless the copy-prefix switch is on.
+    /// by bucket start. Empty unless the copy-prefix switch is on and the
+    /// receiver advertised option (ii) retention.
     copy_invalidated: BTreeMap<String, BTreeSet<RowKey>>,
     failed: Option<Ineligible>,
     /// Requests a `RequestSink` admitted: those the item's transcript holds,
@@ -839,6 +840,45 @@ pub(crate) fn apply_with_reserved_bytes_for_test(
             c.identity.as_ref(),
             Some(&c.bucket_start),
         );
+    }
+    let known = accepted.get(&item.source_session_id);
+    grouping.accepted_miss = accepted.miss_cause();
+    apply_grouped_with_accepted(item, grouping, known, accepted.retained_enabled())
+}
+
+/// `apply_with_reserved_bytes_for_test` with `flagged` buckets' rows marked
+/// `copy_invalidated` and, for `fallback`, upstream proof lost.
+#[cfg(test)]
+pub(crate) fn apply_copy_invalidated_for_test(
+    item: &mut SnapshotItem,
+    contributions: &[Contribution],
+    accepted: &AcceptedBuckets,
+    flagged: &[&str],
+    fallback: bool,
+    extra_wire_bytes: usize,
+) -> Result<Tagged, Ineligible> {
+    let mut grouping = Grouping::new(bucket_row_count(item));
+    grouping.extra_wire_bytes = extra_wire_bytes;
+    for c in contributions {
+        grouping.add_at(
+            &c.bucket_start,
+            &c.row_key,
+            &c.usage,
+            c.identity.as_ref(),
+            Some(&c.bucket_start),
+        );
+    }
+    if fallback {
+        grouping.lose_upstream_proof_for_test();
+    }
+    for bucket in &item.usage_buckets {
+        if flagged.contains(&bucket.bucket_start.as_str()) {
+            grouping
+                .copy_invalidated
+                .entry(bucket.bucket_start.clone())
+                .or_default()
+                .extend(bucket.model_usage.iter().map(row_key_from_model_usage));
+        }
     }
     let known = accepted.get(&item.source_session_id);
     grouping.accepted_miss = accepted.miss_cause();
@@ -1227,7 +1267,8 @@ const COPY_INVALIDATED_BYTES: usize = r#","copy_invalidated":true"#.len();
 /// X-B1 (Lead B 2026-10-31): bucket rows F5 tombstoned, this pass or earlier
 /// and still tombstoned, flagged so a retaining receiver never re-applies
 /// their retained proof. One bool per bucket row, so bounded by the rows the
-/// item carries; flags are reserved before measurement like markers.
+/// item carries; flags are reserved before measurement like markers. The
+/// identity leaf hashes each flag (`row_leaf`).
 struct CopyMarks(BTreeMap<String, BTreeSet<RowKey>>);
 
 impl CopyMarks {
@@ -2526,6 +2567,22 @@ fn deref(
 }
 
 fn row_leaf(row: &SnapshotModelUsage, evidence: &[SnapshotRequestEvidence]) -> Value {
+    let leaf = identity_leaf(row, evidence);
+    if !row.copy_invalidated {
+        return leaf;
+    }
+    // X-B1: the flag reaches content identity, so a body differing only by
+    // it is never suppressed as already accepted.
+    match leaf {
+        Value::Object(mut leaf) => {
+            leaf.insert("copy_invalidated".into(), json!(true));
+            Value::Object(leaf)
+        }
+        _ => json!({"copy_invalidated": true}),
+    }
+}
+
+fn identity_leaf(row: &SnapshotModelUsage, evidence: &[SnapshotRequestEvidence]) -> Value {
     // Option (ii): the receiver's leaf for a row deferring to retained proof.
     if row.identity_retained {
         return json!({"retained": true});
@@ -5233,8 +5290,10 @@ fn tag_item(
             .map_or(0, |reserve| reserve(item));
         grouping.accepted_miss = miss;
         let copy_derived = copy_derived_rows(item, &grouping, accepted);
-        // Switch off sends no flag, so its bytes stay main's.
-        if super::claude_request_money::e2::resumed_prefix_enabled() {
+        // Like `identity_retained`, only a receiver advertising option (ii)
+        // retention mirrors the flag in its identity leaf (and only it holds
+        // proof to drop). Switch off sends no flag, so its bytes stay main's.
+        if retained && super::claude_request_money::e2::resumed_prefix_enabled() {
             grouping.copy_invalidated = copy_invalidated_rows(item, &copy_derived, accepted);
         }
         let invalidated = accepted

@@ -4202,10 +4202,10 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
             for once in [1, 0] {
                 let (copy, invalidated) = pass(&c, &mut ledger);
                 assert_eq!(invalidated, once, "one tombstone per copy-derived row");
-                // The invalidation upload flags the X row; later uploads do
-                // while option (ii)'s durable tombstone holds it (#909-only
-                // mode witnesses no proof, so no server proof to drop).
-                assert_eq!(flags(&copy), [once == 1 || retained, false]);
+                // Option (ii) flags the X row on the invalidation upload and
+                // later ones while its durable tombstone holds. #909-only
+                // mode has no retaining receiver, so it never flags.
+                assert_eq!(flags(&copy), [retained, false]);
                 let got = rows(&copy);
                 assert_eq!(got[0], today[0], "the X row moves to today's attribution");
                 assert_eq!((&got[1].0, got[1].1, got[1].2, &got[1].3),
@@ -4237,20 +4237,21 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
             assert_eq!(copy.request_identity_refusals, u64::from(!retained), "only B's row refuses");
             assert_eq!(flags(copy), [retained, false]);
             if retained {
-                // X-B1: a one-cycle capability lapse keeps the ledger, so B's
-                // row refuses beside server-retained proof; the X row still
-                // carries the flag, so that refusal cannot restore X's proof.
+                // X-B1: a one-cycle capability lapse (B's row refuses) sends
+                // no flag the receiver may not mirror, and keeps the ledger
+                // tombstone, so the next advertised upload flags X again.
                 ledger.set_retained_enabled(false);
                 let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
                 page.enrich_with(&c, Some(&mut ledger));
                 let copy = body(&page, COPY).unwrap();
                 assert_eq!(copy.request_identity_refusals, 1, "the sibling refusal");
-                assert_eq!(flags(copy), [true, false]);
+                assert_eq!(flags(copy), [false, false]);
                 ledger.set_retained_enabled(true);
             }
             std::fs::remove_file(&effort).unwrap();
             // The invalidated row reads as never accepted: own evidence tags it fresh.
             let (copy, _) = pass(&c, &mut ledger);
+            assert_eq!(flags(&copy), [retained, false]);
             ack(&mut ledger, &copy);
             text += &switched(org_b, "");
             text += &line_by(COPY, "own-early", "2026-08-02T07:05:00Z", 10, RESUME_WRITER);
@@ -4331,7 +4332,8 @@ fn e2_pipeline_copy_derived_rows_of_a_later_path_twin_are_invalidated() {
             assert!(copy.usage_buckets.iter().flat_map(|bucket| &bucket.model_usage)
                 .all(|row| !row.identity_retained), "no retained X marker");
             assert!(copy.usage_buckets.iter().flat_map(|bucket| &bucket.model_usage)
-                .all(|row| row.copy_invalidated), "X-B1: both X rows carry the flag");
+                .all(|row| row.copy_invalidated == retained),
+                "X-B1: option (ii) flags both X rows");
             assert_eq!(org_shares(copy).get(&x), None);
         });
     }

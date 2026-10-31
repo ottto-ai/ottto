@@ -2094,8 +2094,10 @@ pub struct SnapshotModelUsage {
     pub identity_retained: bool,
     /// Wire contract 5, bucket rows only, copy-prefix switch on (X-B1, Lead B
     /// 2026-10-31): the row's accepted proof was copy-derived and is
-    /// tombstoned; a retaining receiver drops that proof for good. Omitted
-    /// when false, so switch-off bytes are unchanged.
+    /// tombstoned; a retaining receiver drops that proof for good. Like
+    /// `identity_retained`, only sent when the server advertised option (ii)
+    /// and hashed in the identity leaf. Omitted when false, so switch-off
+    /// bytes are unchanged.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub copy_invalidated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]

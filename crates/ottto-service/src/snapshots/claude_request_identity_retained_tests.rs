@@ -632,6 +632,41 @@ fn copy_invalidated_row_wire_golden_for_the_receiver_contract() {
     assert_eq!(flagged.len() - plain.len(), r#","copy_invalidated":true"#.len());
 }
 
+/// [money] X-B1: a fallback body refuses its lost rows, and the flagged row
+/// still carries `copy_invalidated`, so that refusal cannot restore its
+/// retained proof. The identity leaf hashes the flag, so a body differing only
+/// by it is a new revision. Beside the stripped body an unfit flag is
+/// counted, never silently dropped.
+#[test]
+fn copy_invalidated_survives_a_refusal_bearing_fallback_and_reaches_the_fingerprint() {
+    let (item, proof) = retained_session(2);
+    let state = retained_state();
+    let first = item.usage_buckets[0].bucket_start.clone();
+    let run = |flagged: &[&str], extra: usize| {
+        let mut item = item.clone();
+        identity::take_identity_counts();
+        let tagged = identity::apply_copy_invalidated_for_test(
+            &mut item, &proof, &state, flagged, true, extra,
+        )
+        .unwrap();
+        assert!(matches!(tagged, Tagged::Fallback { .. }));
+        (item, retained_counts())
+    };
+    let flags = |item: &SnapshotItem| {
+        item.usage_buckets.iter().map(|bucket| bucket.model_usage[0].copy_invalidated).collect::<Vec<_>>()
+    };
+    let (plain, _) = run(&[], 0);
+    let (flagged, counts) = run(&[first.as_str()], 0);
+    assert!(flagged.request_identity_refusals > 0, "a refusal-bearing body");
+    assert_eq!(flags(&flagged), [true, false]);
+    assert_eq!(counts["copy_invalidated_rows"], 1);
+    assert_ne!(flagged.snapshot_fingerprint, plain.snapshot_fingerprint);
+    assert_eq!(flagged.request_identity_refusals, plain.request_identity_refusals);
+    let (unfit, counts) = run(&[first.as_str()], identity::MAX_ITEM_BYTES);
+    assert_eq!(flags(&unfit), [false, false]);
+    assert_eq!(counts["copy_invalidated_unfit"], 1);
+}
+
 fn retained_login_session() -> (SnapshotItem, Vec<Contribution>) {
     let (item, mut proof) = retained_session(2);
     for c in &mut proof { c.identity = login_key(OWNER_A); }

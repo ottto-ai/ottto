@@ -146,8 +146,12 @@ marker lent is tombstoned before upload (SOURCE F5). Lead B's X-B1 ruling
 proof for good. A later refusal-bearing upload can then never re-apply it.
 The flag goes on this pass's copy-derived rows and on rows the option (ii)
 ledger still holds as the `INVALIDATED_PROOF` tombstone. A later witnessed
-proof that replaces the tombstone ends the flag. #909-only mode witnesses no
-proof, so its rows carry the flag only on the invalidation upload.
+proof that replaces the tombstone ends the flag. Like `identity_retained`, it
+is sent only when the server advertises option (ii) retention. Only such a
+receiver holds proof to drop, and it mirrors the flag in its identity leaf.
+`row_leaf` hashes the flag into the `request_identity` leaf, so a body that
+differs only by the flag is a new revision. A cycle without the capability
+sends none and keeps the ledger tombstone.
 
 The flag is one bool per bucket row, omitted when false. OFF bytes are main's,
 and older receivers ignore the member. Its bytes are reserved before the
