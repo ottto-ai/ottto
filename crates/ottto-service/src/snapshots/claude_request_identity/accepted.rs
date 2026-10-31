@@ -722,7 +722,7 @@ impl AcceptedBuckets {
     }
     /// The session's entry, refreshed as the last ACK; a full ledger evicts
     /// its least recently ACKed session (#909 LRU).
-    fn session_entry(&mut self, session: &str) -> Option<&mut AcceptedSession> {
+    fn session_entry(&mut self, session: &str, report: bool) -> Option<&mut AcceptedSession> {
         let fingerprint_key = self.1.as_ref()?;
         let key = session_key(fingerprint_key, session);
         let last_ack = self
@@ -740,10 +740,12 @@ impl AcceptedBuckets {
                 .map(|(key, _)| key.clone())
                 .expect("full ledger");
             self.0.remove(&oldest);
-            super::budget::record(&super::budget::Counts {
-                accepted_state_evicted: 1,
-                ..Default::default()
-            });
+            if report {
+                super::budget::record(&super::budget::Counts {
+                    accepted_state_evicted: 1,
+                    ..Default::default()
+                });
+            }
         }
         let entry = self.0.entry(key).or_insert_with(|| AcceptedSession {
             key_epoch: key_epoch(fingerprint_key),
@@ -825,7 +827,7 @@ impl AcceptedBuckets {
         // `record` normally settled (and LRU-refreshed) this ACK's session;
         // refreshing again would only churn persisted bytes.
         if self.session_mut(session).is_none() {
-            self.session_entry(session);
+            self.session_entry(session, true);
         }
         let Some(entry) = self.session_mut(session) else {
             return;
@@ -936,6 +938,13 @@ impl AcceptedBuckets {
     /// Record only the body actually stored. A stripped ACK preserves prior
     /// fingerprints while the bucket is present; fingerprints never restore tags.
     pub(crate) fn record(&mut self, body: &Value) {
+        self.record_with_diagnostics(body, true);
+    }
+    /// Pre-upload custody sizing must not report hypothetical evictions.
+    pub(crate) fn preview_record(&mut self, body: &Value) {
+        self.record_with_diagnostics(body, false);
+    }
+    fn record_with_diagnostics(&mut self, body: &Value, report: bool) {
         let Some(fingerprint_key) = self.1.as_ref() else {
             return;
         };
@@ -953,7 +962,9 @@ impl AcceptedBuckets {
         }
         let fingerprint_key = fingerprint_key.clone();
         let fingerprint_key = &fingerprint_key;
-        let entry = self.session_entry(session).expect("bound fingerprint key");
+        let entry = self
+            .session_entry(session, report)
+            .expect("bound fingerprint key");
         let mut shares = std::mem::take(&mut entry.shares)
             .into_iter()
             .collect::<BTreeSet<_>>();

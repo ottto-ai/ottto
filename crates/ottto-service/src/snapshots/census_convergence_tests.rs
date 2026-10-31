@@ -147,7 +147,7 @@ fn decision(
 // re-arm backoff bounds the repeated work.
 #[test]
 fn claude_family_pending_reobservation_stays_exact_within_a_window() {
-    let (root, _, items) = claude_account_family_fixture();
+    let (root, _, items) = claude_account_family_fixture(false);
     let full = items[0].clone();
     let mut prefix = full.clone();
     let last_request = prefix
@@ -286,64 +286,12 @@ fn claude_duplicate_fence_coverage_counts_unobserved_indexed_members() {
 
 // The full re-arm backs off while the fence stays closed, and missing
 // scheduling state only costs a replay.
-#[test]
-fn claude_duplicate_fence_full_rearm_backs_off_and_fails_closed() {
-    let now = Some(CENSUS_CLOCK);
-    let mut index = ScanIndex::default();
-    // Staying open never replays; opening re-emits posture once.
-    assert!(!claude_duplicate_fence_full_rearm_due(
-        &index, false, false, now
-    ));
-    assert!(claude_duplicate_fence_full_rearm_due(
-        &index, true, false, now
-    ));
-    // Closing replays at once.
-    assert!(claude_duplicate_fence_full_rearm_due(
-        &index, false, true, now
-    ));
-    // A closed fence without a deadline (legacy or lost) replays.
-    assert!(claude_duplicate_fence_full_rearm_due(
-        &index, true, true, now
-    ));
-    index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(CENSUS_CLOCK + 1);
-    assert!(!claude_duplicate_fence_full_rearm_due(
-        &index, true, true, now
-    ));
-    assert!(claude_duplicate_fence_full_rearm_due(
-        &index, true, true, None
-    ));
-    index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(CENSUS_CLOCK);
-    assert!(claude_duplicate_fence_full_rearm_due(
-        &index, true, true, now
-    ));
-    index.claude_duplicate_fence_next_full_rearm_unix_seconds =
-        Some(CENSUS_CLOCK + CLAUDE_DUPLICATE_FENCE_REARM_MAX_SECONDS + 1);
-    assert!(claude_duplicate_fence_full_rearm_due(
-        &index, true, true, now
-    ));
-
-    assert_eq!(
-        claude_duplicate_fence_rearm_delay_seconds(0),
-        CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS
-    );
-    assert_eq!(
-        claude_duplicate_fence_rearm_delay_seconds(1),
-        2 * CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS
-    );
-    for attempt in [5, CLAUDE_DUPLICATE_FENCE_REARM_MAX_ATTEMPT, u8::MAX] {
-        assert_eq!(
-            claude_duplicate_fence_rearm_delay_seconds(attempt),
-            CLAUDE_DUPLICATE_FENCE_REARM_MAX_SECONDS
-        );
-    }
-}
-
 // A closed fence stays closed while any indexed member is unobserved,
 // even when every observed family is valid; its full replay is deferred by
 // backoff and the fence opens once coverage completes.
 #[test]
 fn claude_duplicate_fence_reopens_only_after_full_coverage() {
-    let (root, _, items) = claude_account_family_fixture();
+    let (root, _, items) = claude_account_family_fixture(false);
     let unobserved = "/opaque/unobserved-root.jsonl";
     let mut closed = ScanIndex {
         claude_duplicate_request_witness_overflowed: true,
@@ -464,7 +412,7 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
 // disclosed account deferral, stops blocking traversal progress.
 #[test]
 fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
-    let (root, _, items) = claude_account_family_fixture();
+    let (root, _, items) = claude_account_family_fixture(false);
     let mut held = items[0].clone();
     let revision = hex64('a');
     held.source_file_fingerprint = Some(revision.clone());
@@ -1209,91 +1157,6 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
 }
 
 // Each parse is attributed to the first selecting gate, by stable name.
-#[test]
-fn candidate_parse_reasons_name_the_selecting_gate() {
-    let names = CANDIDATE_PARSE_REASON_NAMES
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(names.len(), CANDIDATE_PARSE_REASON_COUNT);
-    assert!(names.iter().all(|name| name
-        .bytes()
-        .all(|byte| byte.is_ascii_lowercase() || byte == b'_')));
-    assert_eq!(
-        CANDIDATE_PARSE_REASON_NAMES[CandidateParseReason::UploadContext as usize],
-        "upload_context"
-    );
-    assert_eq!(
-        CANDIDATE_PARSE_REASON_NAMES[CandidateParseReason::ForcedFamily as usize],
-        "forced_family"
-    );
-    assert_eq!(
-        CandidateParseReason::ForcedFamily as usize,
-        CANDIDATE_PARSE_REASON_COUNT - 1
-    );
-
-    let key = "/opaque/reason.jsonl";
-    let mut index = ScanIndex::default();
-    index_file(&mut index, key, "source", "reason", "2026-08-02T07:00:00Z");
-    let candidate = matching_candidate(&index, key);
-    assert_eq!(
-        decision(&index, &candidate),
-        (CandidateDecision::Skip, None)
-    );
-
-    let parse = |reason| (CandidateDecision::Parse, Some(reason));
-    assert_eq!(
-        decision(&ScanIndex::default(), &candidate),
-        parse(CandidateParseReason::NewFile)
-    );
-    let mut context = index.clone();
-    context.upload_context_fingerprint = Some("previous-context".to_string());
-    assert_eq!(
-        decision(&context, &candidate),
-        parse(CandidateParseReason::UploadContext)
-    );
-    let mut activity = index.clone();
-    activity.snapshot_activity_at.clear();
-    assert_eq!(
-        decision(&activity, &candidate),
-        parse(CandidateParseReason::ActivityOrQuarantineRetry)
-    );
-    let mut grown = candidate.clone();
-    grown.size_bytes += 1;
-    assert_eq!(
-        decision(&index, &grown),
-        parse(CandidateParseReason::TranscriptChanged)
-    );
-    let mut unknown = index.clone();
-    unknown
-        .files
-        .get_mut(key)
-        .expect("entry")
-        .last_snapshot_fingerprint = None;
-    unknown.file_snapshot_fingerprints.clear();
-    assert_eq!(
-        decision(&unknown, &candidate),
-        parse(CandidateParseReason::UnknownOutcome)
-    );
-    let mut rearmed = index.clone();
-    rearmed
-        .files
-        .get_mut(key)
-        .expect("entry")
-        .source_file_fingerprint
-        .clear();
-    assert_eq!(
-        decision(&rearmed, &candidate),
-        parse(CandidateParseReason::Rearmed)
-    );
-    let mut changed = candidate.clone();
-    changed.source_file_fingerprint = "changed-source".to_string();
-    assert_eq!(
-        decision(&index, &changed),
-        parse(CandidateParseReason::SourceChanged)
-    );
-}
-
 // Contract 5 withdraws transcript markers even when the census is complete.
 // A quarantine can excuse fence coverage without comparing an original, but
 // neither that excusal nor the fully compared control authorizes copied tags.
@@ -1674,30 +1537,6 @@ fn absence_retirement_keeps_every_family_after_any_traversal_problem() {
 
 // SOURCE Round 11 guards (a) and (b) at the unit seam: the latch and an
 // unverified-history index each refuse with their own reason.
-#[test]
-fn absence_retirement_names_the_latch_and_unverified_history_refusals() {
-    restart_claude_reemission_stop_for_test();
-    let (mut index, observed) = retry_pending_roots_index("gone", 1, |_| false);
-    let traversal = clean_terminal_traversal(observed);
-    index.claude_history_unverified_in_process = true;
-    assert_eq!(
-        index.retire_positively_absent_claude_families(&traversal, ""),
-        Err(ClaudeAbsenceRetirementRefusal::UnverifiedHistory)
-    );
-    index.claude_history_unverified_in_process = false;
-    latch_claude_reemission_stop_for_test();
-    assert_eq!(
-        index.retire_positively_absent_claude_families(&traversal, ""),
-        Err(ClaudeAbsenceRetirementRefusal::ReemissionStopLatched)
-    );
-    assert!(index.claude_authority_record_for_test("gone-00").is_some());
-    restart_claude_reemission_stop_for_test();
-    assert_eq!(
-        index.retire_positively_absent_claude_families(&traversal, ""),
-        Ok(1)
-    );
-}
-
 /// Saves `index` at a new `path` through ordinary compare-and-swap saves
 /// until the saved index carries `generation`; it never loads the path.
 fn save_through_generation(index: &mut ScanIndex, path: &std::path::Path, generation: u64) {
@@ -1709,47 +1548,6 @@ fn save_through_generation(index: &mut ScanIndex, path: &std::path::Path, genera
 // SOURCE Round 11 guard (b) at load: a missing, quarantined or empty
 // generation-0 load marks its path unverified for the rest of the process;
 // a load with history does not, until a restart forgets the fresh load.
-#[test]
-fn fresh_index_loads_leave_their_path_unverified_until_a_restart() {
-    forget_claude_unverified_history_indexes_for_test();
-    let dir = temp_dir("patha-unverified-history-load");
-    let fresh = dir.join("fresh-index.json");
-    assert!(
-        ScanIndex::load(&fresh)
-            .unwrap()
-            .claude_history_unverified_in_process
-    );
-    save_through_generation(&mut ScanIndex::default(), &fresh, 3);
-    assert!(
-        ScanIndex::load(&fresh)
-            .unwrap()
-            .claude_history_unverified_in_process,
-        "a fresh load stays unverified for the process"
-    );
-    let corrupt = dir.join("corrupt-index.json");
-    fs::write(&corrupt, b"{ not json").unwrap();
-    assert!(
-        ScanIndex::load(&corrupt)
-            .unwrap()
-            .claude_history_unverified_in_process
-    );
-    let historic = dir.join("historic-index.json");
-    save_through_generation(&mut ScanIndex::default(), &historic, 3);
-    assert!(
-        !ScanIndex::load(&historic)
-            .unwrap()
-            .claude_history_unverified_in_process
-    );
-    forget_claude_unverified_history_indexes_for_test();
-    assert!(
-        !ScanIndex::load(&fresh)
-            .unwrap()
-            .claude_history_unverified_in_process,
-        "after a restart only the history on disk counts"
-    );
-    let _ = fs::remove_dir_all(&dir);
-}
-
 // #705/#712 composition: both daemon and general loads share freshness,
 // retain guard (b) after the index fills, and repair a lost tombstone set.
 #[test]

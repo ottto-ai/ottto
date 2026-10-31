@@ -40,7 +40,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::heap_layout_bound::split_fields as money_heap_fields;
 
-pub(crate) const GATE: bool = true;
 /// A record this much older than its file's effective birth was copied in.
 /// Copies written within it are counted (known residual, disclosed nowhere).
 pub(in crate::snapshots) const SLACK: i128 = 2_000_000_000;
@@ -107,44 +106,6 @@ mod legacy;
 #[path = "e2_pre_change_builder.rs"]
 mod pre_change_builder;
 
-pub(crate) fn enabled() -> bool {
-    #[cfg(test)]
-    if let Some(on) = ENABLED.with(std::cell::Cell::get) {
-        return on;
-    }
-    GATE
-}
-#[cfg(test)]
-thread_local! { static ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
-/// Forces the gate on this thread until dropped, then restores the previous
-/// setting. `GateForTest::off()` pins a test of the gate-off (pre-flip) path.
-#[cfg(test)]
-pub(crate) struct GateForTest(Option<bool>);
-#[cfg(test)]
-impl GateForTest {
-    pub(crate) fn set(on: bool) -> Self {
-        Self(ENABLED.with(|v| v.replace(Some(on))))
-    }
-    pub(crate) fn off() -> Self {
-        Self::set(false)
-    }
-}
-#[cfg(test)]
-impl Drop for GateForTest {
-    fn drop(&mut self) {
-        ENABLED.with(|v| v.set(self.0));
-    }
-}
-#[cfg(test)]
-fn with_gate_for_test<T>(on: bool, f: impl FnOnce() -> T) -> T {
-    let _gate = GateForTest::set(on);
-    f()
-}
-#[cfg(test)]
-pub(crate) fn with_enabled<T>(f: impl FnOnce() -> T) -> T {
-    let _prefix = ResumedPrefixForTest::set(true);
-    with_gate_for_test(true, f)
-}
 /// Owner B (SOURCE Amendment 14): revision 3 keeps a listed family, and
 /// every family while the list pauses adoption, on ordinary (pre-E2)
 /// money. With the gate on, E2 applies to every other family; a family it
@@ -172,13 +133,7 @@ pub(in crate::snapshots) fn file_applies(context: &ReadContext<'_>) -> bool {
 }
 
 fn applies_unless_listed(index: &ScanIndex, listed: bool) -> bool {
-    enabled() && !listed && !index.claude_reemission_exclusions.pauses_adoption()
-}
-/// A build from before the switch-on (gate off), e.g. a fixture cycle that
-/// stands in for an older daemon at body-witness revision 1 or 2.
-#[cfg(test)]
-pub(crate) fn with_disabled<T>(f: impl FnOnce() -> T) -> T {
-    with_gate_for_test(false, f)
+    !listed && !index.claude_reemission_exclusions.pauses_adoption()
 }
 // Synthetic transcripts are created when a test runs, after their records'
 // fixed timestamps, so E2 would read every record as copied in. A fixture
@@ -523,7 +478,7 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
     let Some(&(current, _)) = rules.last() else {
         return;
     };
-    if !enabled() || stored >= current {
+    if stored >= current {
         return;
     }
     let mask = rules
@@ -584,9 +539,6 @@ pub(crate) struct ClaudeEntityBody {
     pub(super) live_maps_initialized: bool,
     pub(crate) activity_unix: u64,
     pub(crate) activity_nanos: i128,
-    /// Gate off: what the counters read, in place of `grains` (which then
-    /// stays empty).
-    pub(super) dark: DarkTally,
 }
 impl Default for ClaudeEntityBody {
     fn default() -> Self {
@@ -604,7 +556,6 @@ impl Default for ClaudeEntityBody {
             live_maps_initialized: false,
             activity_unix: 0,
             activity_nanos: 0,
-            dark: DarkTally::default(),
         }
     }
 }
@@ -634,11 +585,6 @@ impl ClaudeEntityBody {
         at: Option<i128>,
         account: AccountPartition,
     ) {
-        if !enabled() {
-            let hour = origin.is_none().then(|| bucket_hour(&key.0)).flatten();
-            self.dark.add(hour, tokens, requests, cost);
-            return;
-        }
         self.live_maps_initialized = true;
         if let Some(at) = at {
             self.note_activity(&key.0, at, at);
@@ -727,7 +673,6 @@ impl ClaudeEntityBody {
         for (bucket, (first, last)) in &other.bucket_activity {
             self.note_activity(bucket, *first, *last);
         }
-        self.dark.absorb(&other.dark);
     }
     /// Path twins of one session sum into the one emitted entity.
     fn sum(&mut self, other: &Self) {
@@ -745,8 +690,8 @@ impl ClaudeEntityBody {
         self.activity_nanos = self.activity_nanos.max(other.activity_nanos);
     }
     fn totals(&self) -> (ClaudeMoneyTokens, u64) {
-        let mut tokens = self.dark.side.tokens;
-        let mut requests = self.dark.side.requests;
+        let mut tokens = ClaudeMoneyTokens::default();
+        let mut requests = 0u64;
         for grain in self.grains.values() {
             tokens.add(&grain.tokens);
             requests = requests.saturating_add(grain.requests);
@@ -760,7 +705,6 @@ impl ClaudeEntityBody {
             .filter(|((_, origin, _), _)| origin.is_none())
             .map(|(_, grain)| grain.requests)
             .sum::<u64>()
-            + self.dark.estimated_in(0, u32::MAX)
     }
     /// Responses folded in (grains and the dark tally).
     fn contributions(&self) -> u64 {
@@ -768,7 +712,6 @@ impl ClaudeEntityBody {
             .values()
             .map(|grain| grain.contributions)
             .sum::<u64>()
-            + self.dark.side.contributions
     }
     /// Take one estimated request back from `slot` (its usage moves to a
     /// reported grain next). False when the slot cannot give it back.
@@ -783,8 +726,7 @@ impl ClaudeEntityBody {
         requests: u64,
     ) -> bool {
         let Some(grain) = self.grains.get_mut(slot) else {
-            return bucket_hour(&slot.0 .0)
-                .is_some_and(|hour| self.dark.take(hour, tokens, requests));
+            return false;
         };
         self.live_maps_initialized = true;
         let (Some(left), Some(left_requests)) = (
@@ -804,100 +746,6 @@ impl ClaudeEntityBody {
     }
 }
 
-/// Gate off (dark): no per-hour grain map. `unmatched_1h` reads the
-/// estimated requests per unix hour that telemetry attach has not moved.
-/// 8 bytes per hour with estimated usage.
-#[derive(Debug, Clone, Default)]
-pub(super) struct DarkTally {
-    side: ClaudeGrainSide,
-    /// (unix hour, estimated requests), sorted by hour.
-    estimated: Vec<(u32, u32)>,
-}
-money_heap_fields!(DarkTally; inline: [side]; heap: [estimated]);
-impl DarkTally {
-    fn add(
-        &mut self,
-        hour: Option<u32>,
-        tokens: &ClaudeMoneyTokens,
-        requests: u64,
-        cost: Option<u64>,
-    ) {
-        self.side.add(tokens, requests, cost);
-        if let Some(hour) = hour {
-            self.bump(hour, requests);
-        }
-    }
-    fn bump(&mut self, hour: u32, requests: u64) {
-        let requests = u32::try_from(requests).unwrap_or(u32::MAX);
-        // Responses arrive in transcript order: almost always the last hour.
-        match self.estimated.last_mut() {
-            Some((last, count)) if *last == hour => *count = count.saturating_add(requests),
-            Some((last, _)) if *last > hour => {
-                match self.estimated.binary_search_by_key(&hour, |(at, _)| *at) {
-                    Ok(at) => {
-                        let count = &mut self.estimated[at].1;
-                        *count = count.saturating_add(requests);
-                    }
-                    Err(at) => self.estimated.insert(at, (hour, requests)),
-                }
-            }
-            _ => self.estimated.push((hour, requests)),
-        }
-    }
-    fn take(&mut self, hour: u32, tokens: &ClaudeMoneyTokens, requests: u64) -> bool {
-        let Ok(at) = self.estimated.binary_search_by_key(&hour, |(at, _)| *at) else {
-            return false;
-        };
-        let (Some(count), Some(left), Some(left_requests)) = (
-            u32::try_from(requests)
-                .ok()
-                .and_then(|requests| self.estimated[at].1.checked_sub(requests)),
-            self.side.tokens.checked_sub(tokens),
-            self.side.requests.checked_sub(requests),
-        ) else {
-            return false;
-        };
-        if count == 0 {
-            self.estimated.remove(at);
-        } else {
-            self.estimated[at].1 = count;
-        }
-        self.side.tokens = left;
-        self.side.requests = left_requests;
-        self.side.contributions = self.side.contributions.saturating_sub(1);
-        self.side.unpriced = self.side.unpriced.saturating_sub(1);
-        true
-    }
-    fn absorb(&mut self, other: &Self) {
-        ClaudeEntityBody::merge_grain(&mut self.side, &other.side);
-        for &(hour, requests) in &other.estimated {
-            self.bump(hour, u64::from(requests));
-        }
-    }
-    /// Estimated requests in hours `[from, to)`.
-    fn estimated_in(&self, from: u32, to: u32) -> u64 {
-        self.estimated
-            .iter()
-            .filter(|(hour, _)| (from..to).contains(hour))
-            .map(|(_, requests)| u64::from(*requests))
-            .sum()
-    }
-    fn shrink(&mut self) {
-        self.estimated.shrink_to_fit();
-    }
-}
-
-/// The unix hour of a normalized bucket start (`activity_bucket_from_timestamp`).
-fn bucket_hour(bucket: &str) -> Option<u32> {
-    u32::try_from(rfc3339_unix_nanos(bucket)?.div_euclid(HOUR_NANOS)).ok()
-}
-
-/// The gate-off grain key: the hour bucket only. Dark keeps no grain map, so
-/// it never builds a placement for a key it would not keep.
-fn hour_key(timestamp: &str) -> Option<ClaudeLiveKey> {
-    let (bucket, _) = super::super::activity_bucket_from_timestamp(timestamp)?;
-    Some((bucket, String::new(), BTreeMap::new()))
-}
 // A never-initialized live map cannot have a retained empty root. Charging
 // fictitious roots here makes a dark file exceed the native finish budget.
 // Initialized maps keep the ordinary conservative bound even after emptying.
@@ -907,7 +755,6 @@ macro_rules! entity_heap_method {
             let Self {
                 grains,
                 bucket_activity,
-                dark,
                 live_maps_initialized,
                 removed: _,
                 removed_requests: _,
@@ -926,7 +773,7 @@ macro_rules! entity_heap_method {
                 crate::heap_layout_bound::HeapLayoutBound::$method(grains, c)?;
                 crate::heap_layout_bound::HeapLayoutBound::$method(bucket_activity, c)?;
             }
-            crate::heap_layout_bound::HeapLayoutBound::$method(dark, c)
+            Some(())
         }
     };
 }
@@ -1309,9 +1156,6 @@ impl FileFold {
         context: Option<&ReadContext<'_>>,
         first_sequence: Option<u64>,
     ) {
-        if !enabled() {
-            return;
-        }
         let started = Instant::now();
         let subagent = context
             .and_then(|c| claude_index_path_member_ref(c.path))
@@ -1413,8 +1257,7 @@ impl FileFold {
         let Some(placed) = placed else {
             return;
         };
-        let live = enabled();
-        if placed.fell_back && live {
+        if placed.fell_back {
             self.model_fallbacks.insert(sequence, placed.model.clone());
         }
         let Some(placement) = placed.placement.as_ref() else {
@@ -1424,7 +1267,7 @@ impl FileFold {
             return;
         };
         // Gate off keeps only the hour tally: read the hour, build no key.
-        let key = if live {
+        let key = {
             Grain::Live(live_key(
                 &placed.model,
                 placement.bucket.clone(),
@@ -1432,8 +1275,6 @@ impl FileFold {
                 &placement.row_key,
                 effort,
             ))
-        } else {
-            Grain::Hour(bucket_hour(&placement.bucket))
         };
         let account = self.accounts.as_mut().and_then(|accounts| {
             accounts.observe(sequence, copied == Some(true));
@@ -1526,14 +1367,14 @@ impl FileFold {
         #[cfg(test)]
         if PRE_CHANGE_BUILDER.with(std::cell::Cell::get) {
             self.decide_native_pre_change(context, markers, fork_parent);
-            self.entity.dark.shrink();
+
             self.skipped.shrink_to_fit();
             self.spend(started);
             return;
         }
         self.decide_native(context, markers, fork_parent);
         // The fold lives until the page finishes: keep no parse-time slack.
-        self.entity.dark.shrink();
+
         self.skipped.shrink_to_fit();
         self.spend(started);
     }
@@ -1712,14 +1553,6 @@ impl FileFold {
         &self,
         occurrence: &ClaudeTranscriptUsageOccurrence,
     ) -> Option<ClaudeLiveKey> {
-        if !enabled() {
-            return hour_key(
-                occurrence
-                    .timestamp
-                    .as_deref()
-                    .or(self.bucket_fallback.as_deref())?,
-            );
-        }
         let model = occurrence
             .model
             .as_deref()
@@ -1843,9 +1676,6 @@ impl FileFold {
         let Some(start) = self.telemetry.start_bucket.as_deref() else {
             return 0;
         };
-        let dark = bucket_hour(start)
-            .zip(bucket_hour(hour_ago_bucket))
-            .map_or(0, |(from, to)| self.entity.dark.estimated_in(from, to));
         self.entity
             .grains
             .iter()
@@ -1854,7 +1684,6 @@ impl FileFold {
             })
             .map(|(_, grain)| grain.requests)
             .sum::<u64>()
-            + dark
     }
 
     fn telemetry_complete(&self) -> bool {
@@ -1876,9 +1705,6 @@ fn grain_key(
     timestamp: Option<&str>,
     fallback: Option<&str>,
 ) -> Option<ClaudeLiveKey> {
-    if !enabled() {
-        return hour_key(timestamp.or(fallback)?);
-    }
     let placed = claude_row_placement(model, base, selector, effort, timestamp, fallback)?;
     Some(live_key(
         model,
@@ -1893,7 +1719,6 @@ fn grain_key(
 /// hour (gate off, what `ClaudeEntityBody::add` keeps of an origin-less key).
 enum Grain {
     Live(ClaudeLiveKey),
-    Hour(Option<u32>),
 }
 
 impl Grain {
@@ -1907,7 +1732,6 @@ impl Grain {
     ) {
         match self {
             Grain::Live(key) => into.add(key, tokens, requests, None, None, at, account),
-            Grain::Hour(hour) => into.dark.add(hour, tokens, requests, None),
         }
     }
 }
@@ -2139,7 +1963,7 @@ pub(crate) fn decide_page_copies(
             ..PrefixTally::default()
         };
         let proof = fold.proof.clone();
-        if enabled() && !matches!(proof, Some(CopyProof::Holders(_))) {
+        if !matches!(proof, Some(CopyProof::Holders(_))) {
             if let Some(Located(file)) = fold.location {
                 if index.claude_copy_removals.pending(file) {
                     resolved_holds.push(file);
@@ -2165,14 +1989,14 @@ pub(crate) fn decide_page_copies(
             state.clear_hold(file);
         }
     }
-    if enabled() {
-        for at in holders {
-            finish_holder_identity(&mut items[at]);
-        }
-        for item in items.iter_mut() {
-            tally_unproven_prefix(item, index.claude_copy_removals.metadata_lost());
-        }
+
+    for at in holders {
+        finish_holder_identity(&mut items[at]);
     }
+    for item in items.iter_mut() {
+        tally_unproven_prefix(item, index.claude_copy_removals.metadata_lost());
+    }
+
     updates
 }
 
@@ -2612,25 +2436,24 @@ fn decide_holders(
             // removals stand, counted, instead of re-adding a proven copy.
             let mut stored = BTreeSet::new();
             let mut absent = BTreeSet::new();
-            if enabled() {
-                for (holder, held) in index.claude_copy_removals.get(order.1) {
-                    let key = live
-                        .get_or_init(|| indexed_main_files(index))
-                        .get(holder)
-                        .copied();
-                    for &hash in held.iter() {
-                        if hashes.binary_search(&hash).is_err()
-                            || stored_holder_answer(index, key, hash) == Some(false)
-                        {
-                            continue;
-                        }
-                        stored.insert(hash);
-                        if key.is_none() {
-                            absent.insert(hash);
-                        }
+            for (holder, held) in index.claude_copy_removals.get(order.1) {
+                let key = live
+                    .get_or_init(|| indexed_main_files(index))
+                    .get(holder)
+                    .copied();
+                for &hash in held.iter() {
+                    if hashes.binary_search(&hash).is_err()
+                        || stored_holder_answer(index, key, hash) == Some(false)
+                    {
+                        continue;
+                    }
+                    stored.insert(hash);
+                    if key.is_none() {
+                        absent.insert(hash);
                     }
                 }
             }
+
             Some(Wanted {
                 at,
                 session: item.source_session_id.clone(),
@@ -2699,12 +2522,14 @@ fn decide_holders(
     let pending = std::cell::OnceCell::<BTreeSet<String>>::new();
     let pending_files = std::cell::OnceCell::new();
     let mut updates = CopyRemovalUpdates::default();
-    if enabled() {
+
+    {
         let mut state = index.claude_copy_removals.clone();
         let live = live.get_or_init(|| indexed_main_files(index));
         state.retain_files(|file| live.contains_key(&file));
         updates.state = Some(state);
     }
+
     for wanted in wanted {
         let uncovered = wanted
             .hashes
@@ -3032,11 +2857,7 @@ fn attach_one(
     let Some(occurrence) = claude_usage_occurrences.get_mut(row.request_id.as_str()) else {
         return false;
     };
-    if !enabled() {
-        let attached = attach_dark(fold, occurrence, row);
-        occurrence.telemetry_attached |= attached;
-        return attached;
-    }
+
     // The hour the estimated key is placed in (`occurrence_key`): its clock,
     // else the file's fallback; none or unreadable places no key.
     let clock = occurrence.timestamp.as_deref();
@@ -3236,32 +3057,6 @@ impl SlotMemo {
 struct AttachMemo {
     estimated: SlotMemo,
     reported: SlotMemo,
-}
-
-/// Gate off, `attach_one` without a grain map: the same checks and the same
-/// tally moves. The estimated slot is its hour (`occurrence_key`, then
-/// `take_estimated`'s fallback); the reported key only has to exist, and
-/// with a transcript clock it is that clock's hour, already checked. The
-/// tally ignores the reported key and clock, so neither is built.
-fn attach_dark(
-    fold: &mut FileFold,
-    occurrence: &ClaudeTranscriptUsageOccurrence,
-    row: &ClaudeLocalOtelEvidence,
-) -> bool {
-    let Some(estimated) = fold.occurrence_key(occurrence) else {
-        return false;
-    };
-    if occurrence.timestamp.is_none() && hour_key(&row.observed_at).is_none() {
-        return false;
-    }
-    let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
-    let requests = occurrence.usage.request_count;
-    let tally = &mut fold.entity.dark;
-    if !bucket_hour(&estimated.0).is_some_and(|hour| tally.take(hour, &tokens, requests)) {
-        return false;
-    }
-    tally.add(None, &tokens, requests, row.cost_usd_micros);
-    true
 }
 
 /// Re-place an already-counted native request after the identity owner has
@@ -3499,11 +3294,11 @@ pub(crate) fn side_calls_page(
 
     let _spent = PageSpent::start("page.side_calls");
     let mut unresolved = BTreeSet::new();
-    if enabled() {
-        timed("side.inherit", || {
-            claude_request_identity::inherit_root_accounts(items, false)
-        });
-    }
+
+    timed("side.inherit", || {
+        claude_request_identity::inherit_root_accounts(items, false)
+    });
+
     let owing = |item: &SnapshotItem| {
         item.claude_money
             .as_deref()
@@ -3741,11 +3536,11 @@ pub(crate) fn side_calls_page(
             } else {
                 ClaudeRequestUsageOrigin::TelemetryUnpriced
             };
-            if enabled() {
-                if let Some(at) = at {
-                    fold.entity.note_activity(&key.0, at, at);
-                }
+
+            if let Some(at) = at {
+                fold.entity.note_activity(&key.0, at, at);
             }
+
             timed("side.add", || {
                 fold.entity.add(
                     key,
@@ -3763,7 +3558,7 @@ pub(crate) fn side_calls_page(
                 fold.root_fallbacks += 1;
             }
         }
-        if waiting && enabled() {
+        if waiting {
             // The root's session is withheld (re-read on a later page, once
             // the walk lists the directory) and its owed history waits too.
             if let Some(&at) = targets.get(root.as_str()) {
@@ -3934,10 +3729,10 @@ pub(crate) fn finish_page(
         .and_then(|clock| super::super::activity_bucket_from_timestamp(&clock))
         .map(|(bucket, _)| bucket)
         .unwrap_or_default();
-    if enabled() {
-        claude_request_identity::inherit_root_accounts(items, true);
-        claude_request_identity::record_page_identity_counts(items);
-    }
+
+    claude_request_identity::inherit_root_accounts(items, true);
+    claude_request_identity::record_page_identity_counts(items);
+
     let mut corrected_sessions = BTreeSet::new();
     let mut sessions = BTreeMap::<&str, Session>::new();
     for item in items.iter_mut() {
@@ -4034,7 +3829,7 @@ pub(crate) fn finish_page(
             );
             entity.activity_nanos = entity.activity_nanos.max(0);
         } else {
-            if session.folds == 2 && enabled() {
+            if session.folds == 2 {
                 session.first_original = Some(session.entity.clone());
             }
             session.entity.sum(&fold.entity);
@@ -4058,18 +3853,7 @@ pub(crate) fn finish_page(
             .locations
             .extend(fold.location.map(|located| located.0));
     }
-    if !enabled() {
-        // Dark: a session the gate would hold is undecided, not disclosed.
-        for session in sessions.into_values() {
-            record_decided(session.entity.held, session.decided);
-        }
-        // Nothing reads a fold after counting. Release them so the page
-        // neither keeps them nor clones them with every upload attempt.
-        for item in items.iter_mut() {
-            item.claude_money = None;
-        }
-        return BTreeSet::new();
-    }
+
     let locations = sessions
         .iter()
         .map(|(session, state)| (*session, state.locations.as_slice()))

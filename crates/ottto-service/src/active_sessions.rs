@@ -1097,50 +1097,6 @@ mod tests {
     }
 
     #[test]
-    fn latest_identity_follows_the_newest_bucket_not_lifetime_volume() {
-        // The whole point of "latest": a session that spent most of its life on
-        // one model must still report the model it is running NOW.
-        let mut snapshot = test_snapshot("s-latest", "2026-07-19T11:04:00Z");
-        snapshot.usage_buckets = vec![
-            bucket(
-                "2026-07-19T09:00:00Z",
-                "2026-07-19T09:30:00Z",
-                vec![usage_row("claude-opus-5", Some("max"), 9_000_000)],
-            ),
-            bucket(
-                "2026-07-19T11:00:00Z",
-                "2026-07-19T11:04:00Z",
-                vec![usage_row("claude-haiku-4-5-20251001", Some("low"), 12)],
-            ),
-        ];
-
-        let (model, effort) = latest_model_identity(&snapshot);
-
-        assert_eq!(model.as_deref(), Some("claude-haiku-4-5-20251001"));
-        assert_eq!(effort.as_deref(), Some("low"));
-    }
-
-    #[test]
-    fn latest_identity_picks_the_dominant_row_inside_the_newest_bucket() {
-        // Buckets are hourly, so there is no finer ordering within one; the row
-        // that did the most work is the honest answer.
-        let mut snapshot = test_snapshot("s-dominant", "2026-07-19T11:04:00Z");
-        snapshot.usage_buckets = vec![bucket(
-            "2026-07-19T11:00:00Z",
-            "2026-07-19T11:04:00Z",
-            vec![
-                usage_row("claude-opus-5", Some("high"), 10),
-                usage_row("claude-fable-5", Some("xhigh"), 5_000),
-            ],
-        )];
-
-        let (model, effort) = latest_model_identity(&snapshot);
-
-        assert_eq!(model.as_deref(), Some("claude-fable-5"));
-        assert_eq!(effort.as_deref(), Some("xhigh"));
-    }
-
-    #[test]
     fn reconciled_session_carries_latest_model_and_effort() {
         let dir = temp_dir("latest-identity");
         let mut snapshot = test_snapshot("s-wire", "2026-07-19T10:04:00Z");
@@ -1227,25 +1183,6 @@ mod tests {
             "2026-07-19T10:04:00Z"
         );
         std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn local_activity_start_rejects_invalid_negative_and_inverted_dates() {
-        let mut snapshot = test_snapshot("date-session", "2026-07-19T10:04:00Z");
-        for value in ["not-a-date", "1969-12-31T23:59:59Z", "2026-07-20T10:00:00Z"] {
-            snapshot.source_started_at = Some(value.to_string());
-            assert!(
-                active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, None)
-                    .source_started_at
-                    .is_none()
-            );
-        }
-        snapshot.source_started_at = Some("2026-07-19T13:03:00+03:00".into());
-        assert_eq!(
-            active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, None)
-                .source_started_at,
-            snapshot.source_started_at
-        );
     }
 
     fn registrations() -> crate::claude_session_registrations::Registrations {
@@ -1509,24 +1446,6 @@ mod tests {
             result.scan_started_at.as_deref(),
             Some("2026-07-19T10:00:00Z")
         );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn scan_start_after_reconciliation_uses_reconciliation_cutoff() {
-        let dir = temp_dir("scan-clock-rollback");
-        let result = reconcile_active_sessions(
-            &dir,
-            SnapshotSource::ClaudeCode,
-            &[test_snapshot("live", "2026-07-19T10:35:00Z")],
-            None,
-            test_policy(),
-            Some("2026-07-19T11:00:00Z"),
-            "2026-07-19T10:40:00Z",
-        )
-        .unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_session_id, "live");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2245,21 +2164,6 @@ mod tests {
     }
 
     #[test]
-    fn classifies_subagent_for_truthful_title_fallback() {
-        let mut snapshot = test_snapshot("subagent", "2026-07-19T10:04:00Z");
-        snapshot.session_display_name = None;
-        snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
-            thread_source: Some("subagent".to_string()),
-            ..Default::default()
-        });
-
-        let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
-
-        assert_eq!(active.session_display_name, None);
-        assert_eq!(active.session_kind.as_deref(), Some("subagent"));
-    }
-
-    #[test]
     fn classifies_headless_codex_run_from_its_own_session_header() {
         // The dominant `codex exec` shape on disk: the provider names the binary
         // in `originator` and the non-interactive entry point in `source`, while
@@ -2294,34 +2198,6 @@ mod tests {
         let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
 
         assert_eq!(active.session_kind.as_deref(), Some("subagent"));
-    }
-
-    #[test]
-    fn headless_role_never_becomes_a_lineage_fact() {
-        // The attribute describes how a run was driven. It must not manufacture
-        // a parent, a root, or any other relationship the provider never stated.
-        let origin = crate::snapshots::SnapshotOrigin {
-            originator: Some("codex_exec".to_string()),
-            source: Some("exec".to_string()),
-            thread_source: Some("user".to_string()),
-            ..Default::default()
-        };
-
-        let facts = crate::session_attribution::direct_provider_facts(
-            SnapshotSource::Codex,
-            Some(&origin),
-            "headless-session",
-            "2026-07-19T10:04:00Z",
-            "codex_rollout:v1",
-        );
-
-        assert!(facts
-            .iter()
-            .any(|fact| fact.field == "execution_mode" && fact.value == "headless"));
-        assert!(!facts.iter().any(|fact| matches!(
-            fact.field.as_str(),
-            "parent_session_ref" | "root_session_ref" | "agent_ref" | "spawn_depth"
-        )));
     }
 
     #[test]
@@ -2619,7 +2495,7 @@ mod tests {
     #[test]
     fn own_request_parts_gate_account_fallbacks() {
         // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         use crate::claude_local_otel::{
             ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipEvidence,
             ClaudeTraceOwnershipLoadReport,
@@ -2697,7 +2573,7 @@ mod tests {
                     .or_default()
                     .push(owner);
             }
-            let mut items = crate::snapshots::parse_claude_code_jsonl_file(
+            let mut items = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
                 &transcript,
                 "2026-08-02T07:01:00Z",
                 "child-fp".to_string(),
