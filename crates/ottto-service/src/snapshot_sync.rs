@@ -7538,6 +7538,7 @@ fn finish_sync_source(
                     .as_deref()
                     == Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT),
         );
+    let _state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
     if let Some(lease) = native_comparison_lease.as_mut() {

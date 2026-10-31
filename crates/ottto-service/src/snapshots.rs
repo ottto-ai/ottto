@@ -86245,6 +86245,11 @@ pub(crate) fn maintain_state_v2_idle(path: &Path, index: &ScanIndex, quiet: bool
     state_v2::telemetry::retained_pass_end(index);
     result
 }
+/// Hold for the whole collection cycle: releases a committed-page baseline on
+/// every exit, including the error exits that skip maintain_state_v2_idle.
+pub(crate) fn state_v2_baseline_release(path: &Path, index: &ScanIndex) -> impl Drop {
+    state_v2::BaselineRelease::new(path, index)
+}
 pub(crate) fn state_v2_side_effect_guard(
     path: &Path,
     index: &ScanIndex,

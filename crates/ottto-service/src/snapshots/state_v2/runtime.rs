@@ -918,6 +918,25 @@ pub(super) fn purge_policy() -> (Duration, Duration) {
     (Duration::from_secs(seconds), Duration::from_secs(2))
 }
 
+/// idle releases the page baseline when a cycle completes; an error exit skips
+/// idle, so dropping this at the cycle's end releases it as well.
+pub(in super::super) struct BaselineRelease(Option<PathBuf>);
+impl BaselineRelease {
+    pub(in super::super) fn new(path: &Path, index: &ScanIndex) -> Self {
+        // v2 OFF has no runtime: hold nothing, so drop is a no-op.
+        Self(index.v2().persistence_v2.as_ref().map(|_| path.to_owned()))
+    }
+}
+impl Drop for BaselineRelease {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = with_state(path, |state| {
+                state.save_baseline = None;
+                Ok(())
+            });
+        }
+    }
+}
 pub(in super::super) fn idle(path: &Path, index: &ScanIndex, quiet: bool) -> Result<()> {
     let Some(runtime) = &index.v2().persistence_v2 else {
         return Ok(());

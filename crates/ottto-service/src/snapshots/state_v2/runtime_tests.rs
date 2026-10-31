@@ -590,6 +590,14 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         Ok(())
     })
     .unwrap();
+    // A cycle that errors skips idle; its drop guard still releases it.
+    drop(BaselineRelease::new(&f.path, &index));
+    with_state(&f.path, |state| {
+        assert!(state.save_baseline.is_none());
+        state.save_baseline = Some(index.clone());
+        Ok(())
+    })
+    .unwrap();
     let _ = idle(&f.path, &index, true);
     with_state(&f.path, |state| {
         assert!(state.save_baseline.is_none());
