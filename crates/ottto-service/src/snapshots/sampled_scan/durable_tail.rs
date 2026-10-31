@@ -1220,9 +1220,14 @@ impl SharedCache {
         let Some(source) = durable_source(snapshot_source) else {
             return;
         };
-        let touched = match self.durable() {
-            Some(mut stores) if stores.slot(source).is_some() => stores.touched.clone(),
-            _ => return,
+        let touched = {
+            let Some(mut stores) = self.durable() else {
+                return;
+            };
+            if stores.slot(source).is_none() {
+                return;
+            }
+            stores.touched.clone()
         };
         let fenced = {
             let Ok(cache) = self.retained() else {
