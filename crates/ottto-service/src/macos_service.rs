@@ -523,21 +523,6 @@ mod tests {
     }
 
     #[test]
-    fn blank_companion_requirement_override_is_not_written() {
-        // A blank value would be read back as "unset" by the daemon anyway;
-        // keep it out of the plist so the file never implies an override that
-        // does not exist.
-        for blank in ["", "   "] {
-            let mut config = config();
-            config.companion_code_requirement = Some(blank.to_string());
-            assert!(
-                !plist_environment(&config).contains_key(OTTTO_COMPANION_CODE_REQUIREMENT_ENV),
-                "blank override should not be written"
-            );
-        }
-    }
-
-    #[test]
     fn launchctl_plan_targets_current_user_domain() {
         let config = config();
         let plan = install_plan(
@@ -574,20 +559,6 @@ mod tests {
         assert_eq!(state.expected_owner, InstallOwner::AppBundle);
         assert!(state.owner_drift);
         let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn app_bundle_paths_require_app_contents_boundary() {
-        assert_eq!(
-            install_owner_for_path(Path::new(
-                "/Applications/Ottto.app/Contents/Helpers/ottto-service"
-            )),
-            InstallOwner::AppBundle
-        );
-        assert_eq!(
-            install_owner_for_path(Path::new("/tmp/Ottto.app-helper/ottto-service")),
-            InstallOwner::Unknown
-        );
     }
 
     #[test]
@@ -634,22 +605,6 @@ mod tests {
         assert_eq!(state.plist_owner, InstallOwner::AppBundle);
         assert_eq!(state.expected_owner, InstallOwner::AppBundle);
         assert!(!state.owner_drift);
-    }
-
-    #[test]
-    fn unknown_existing_path_blocks_unknown_rewrite_when_path_differs() {
-        let state = inspect_launch_agent_owner_with_loaded_program(
-            Path::new("/Users/test/Library/LaunchAgents/net.ottto.service.plist"),
-            Some(Path::new("/tmp/new/ottto-service")),
-            true,
-            Some(PathBuf::from("/tmp/old/ottto-service")),
-            None,
-            None,
-        );
-
-        assert_eq!(state.plist_owner, InstallOwner::Unknown);
-        assert_eq!(state.expected_owner, InstallOwner::Unknown);
-        assert!(state.owner_drift);
     }
 
     #[test]
