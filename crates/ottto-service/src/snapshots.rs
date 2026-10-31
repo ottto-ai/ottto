@@ -44149,16 +44149,20 @@ fn advance_bounded_directory_traversal_with_budget(
                 }
                 continue;
             }
-            if relisting
-                && index
-                    .files
-                    .get(&local_index_key(&path))
-                    .is_some_and(|entry| entry.same_listing_stamp_as(&metadata))
-            {
+            if relisting {
+                let key = local_index_key(&path);
                 // Unchanged since its last read: seen, never queued. Missing
-                // state is the owed resolver's, not discovery's (#1025).
-                traversal.observed_index_keys.insert(local_index_key(&path));
-                continue;
+                // state is the owed resolver's, not discovery's (#1025). A
+                // file this generation already saw with no entry (held,
+                // oversized) has no stamp; its owner's floor re-offers it.
+                let seen = match index.files.get(&key) {
+                    Some(entry) => entry.same_listing_stamp_as(&metadata),
+                    None => traversal.observed_index_keys.contains(&key),
+                };
+                if seen {
+                    traversal.observed_index_keys.insert(key);
+                    continue;
+                }
             }
             if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
                 // Record physically validated presence BEFORE any enqueue-only

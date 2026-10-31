@@ -756,9 +756,15 @@ fn listing_repass_reads_only_stamp_changes_for_every_source() {
             .source_file_fingerprint
             .clear();
         let (_, _, reads, _) = f.page(source, index);
+        // Acquisition keeps the read mode (L1 adds none): Pi re-reads a
+        // grown session in Full; only what is queued is under test here.
+        let grown_mode = match source {
+            SnapshotSource::Pi => DeliveryMode::Full,
+            _ => growth_mode(),
+        };
         let mut expected = vec![
             format!("{:?}", DeliveryMode::Full),
-            format!("{:?}", growth_mode()),
+            format!("{grown_mode:?}"),
         ];
         expected.sort();
         assert_eq!(modes(&reads), expected, "{source:?}");

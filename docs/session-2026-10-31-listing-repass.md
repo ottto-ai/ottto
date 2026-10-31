@@ -9,7 +9,13 @@ chooses Tail or Full. A new file joins the census like a hint does; growth of
 an already observed file does not. The pass never starts a generation, never
 re-arms, and records no walk problem or census count, so it can only delay a
 generation's discovery, never complete it. Codex keeps its "no selection while
-directories are pending" rule only for the first walk.
+directories are pending" rule only for the first walk. A file the generation
+already saw that has no index entry (a hold, an oversized file) has no stamp,
+so the pass leaves it to its owner's floor. A Claude terminal-off rediscovery
+upgrades a pending re-listing root to its own full walk.
+
+New files no longer wait for the oversized/unhealthy 6-hour floor: the pass
+finds them within about 30 minutes, without a hint or a restart.
 
 Watcher hints for existing files go through the same stamp compare, so a
 metadata-only event never queues an unchanged file. Owner re-enqueues (the

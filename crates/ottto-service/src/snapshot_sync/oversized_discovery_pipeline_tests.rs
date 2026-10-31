@@ -50,6 +50,21 @@ fn oversized_clock(now: u64) -> String {
         .unwrap()
 }
 
+/// The 30 min re-listing pass stamps only its own clock and count; an
+/// unchanged generation's traversal is otherwise byte-identical.
+fn without_listing_clock(traversal: &serde_json::Value) -> serde_json::Value {
+    let mut traversal = traversal.clone();
+    traversal
+        .as_object_mut()
+        .unwrap()
+        .remove("listing_started_unix_seconds");
+    traversal["counts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("listing_generations");
+    traversal
+}
+
 fn oversized_tick(fixture: &RearmFixture, now: u64) -> RearmPage {
     let (page, rows) = crate::local_resource_diagnostics::capture(|| {
         fixture.page(&oversized_clock(now), RearmUpload::Accept)
@@ -82,7 +97,10 @@ fn oversized_unchanged_has_no_clock_restarts_and_keeps_incomplete_disclosure() {
         );
         assert_eq!(page.scan.scanned_file_count, 0);
         let current = c1a_saved(&fixture);
-        assert_eq!(current["traversal"], saved["traversal"]);
+        assert_eq!(
+            without_listing_clock(&current["traversal"]),
+            without_listing_clock(&saved["traversal"])
+        );
         assert_eq!(c1a_latch(&fixture), latch);
     }
     // The only new durable content consists of hashes plus a sighting count.
@@ -554,13 +572,14 @@ fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor
     .unwrap();
     // Every fixture page independently reloads the exhausted checkpoint: no
     // process-local state or watcher input can discover this file for it.
-    let quiet = oversized_tick(&fixture, floor - 1);
-    assert!(!quiet.parsed.contains(NEW_SESSION));
-    let (retry, starts) = oversized_walk(&fixture, floor, RearmUpload::Accept);
-    assert_eq!(starts.len(), 1);
-    assert!(retry.iter().any(|page| page.parsed.contains(NEW_SESSION)));
+    // The re-listing pass (L1) finds it inside the floor, with no traversal
+    // restart (oversized_tick asserts none).
+    let quiet = (0..C1B_MAX_PAGES as u64)
+        .map(|number| oversized_tick(&fixture, floor - 600 + number))
+        .collect::<Vec<_>>();
+    assert!(quiet.iter().any(|page| page.parsed.contains(NEW_SESSION)));
     assert!(
-        retry
+        quiet
             .iter()
             .any(|page| page.scan.snapshots.iter().any(|item| {
                 item.source_session_id == NEW_SESSION
@@ -569,6 +588,9 @@ fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor
             })),
         "no-hint discovery reaches the real uploader and durable ACK"
     );
+    assert!(quiet.iter().all(|page| !page.scan.census_complete));
+    let (retry, starts) = oversized_walk(&fixture, floor, RearmUpload::Accept);
+    assert_eq!(starts.len(), 1);
     assert!(!retry.last().unwrap().scan.census_complete);
     assert_eq!(retry.last().unwrap().scan.oversized_file_count, 1);
     assert!(fixture.hinted_paths.is_empty());
