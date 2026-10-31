@@ -66,11 +66,14 @@ jobs:
 
       # Credential-path checks reject group/world-writable ancestors such as
       # /tmp (1777). macOS hands each user a private TMPDIR; mirror that.
+      # macOS TMPDIR also sits under a symlink (/var -> /private/var), and
+      # code that refuses symlinked ancestors fails only there; mirror it too.
       - name: Private temp directory
         run: |
           set -euo pipefail
-          install -d -m 0700 "$RUNNER_TEMP/tmp"
-          echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
+          install -d -m 0700 "$RUNNER_TEMP/private/var/tmp"
+          ln -s private/var "$RUNNER_TEMP/var"
+          echo "TMPDIR=$RUNNER_TEMP/var/tmp" >> "$GITHUB_ENV"
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
