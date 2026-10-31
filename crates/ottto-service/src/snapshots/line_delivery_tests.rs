@@ -2082,7 +2082,8 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     let today = days_from_now(0);
     let clamp_events = std::cell::Cell::new(0_u64);
     let last_page = RefCell::new(Value::Null);
-    let page = |index: ScanIndex, cache: &Arc<sampled_scan::SharedCache>| {
+    let page = |mut index: ScanIndex, cache: &Arc<sampled_scan::SharedCache>| {
+        cache.bind_withheld(&mut index);
         let recorder = Recorder::default();
         let ((index, result, _), rows) = capture(|| {
             finish(
@@ -2399,6 +2400,30 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
         let (_, again, reads) = page(bound.clone(), &cache);
         assert_eq!(reads, Vec::new(), "generation {generation} after binding");
         assert_eq!(again.scanned_file_count, 0);
+    }
+
+    // Regression: a second path for the held session participates in the
+    // constructor's twin preflight. Reload must bind the warm CONTENT memo
+    // before that preflight, or ForcedFamily reparses it on every page.
+    let twin = root
+        .projects()
+        .join("twin")
+        .join(format!("{SESSION}.jsonl"));
+    fs::create_dir_all(twin.parent().unwrap()).unwrap();
+    fs::copy(&path, &twin).unwrap();
+    append(&path, &assistant_line("twin-held"));
+    append(&twin, &assistant_line("twin-held"));
+    let (parsed, result, _) = page(bound.clone(), &cache);
+    withhold(&mut bound, parsed, &result);
+    assert_eq!(bound.claude_account_deferred_hold_count(), 2);
+    let incidence = bound.file_snapshot_fingerprints.clone();
+    for generation in 0..2 {
+        let (quiet, again, reads) = page(bound.clone(), &cache);
+        assert!(reads.is_empty(), "held twins, generation {generation}");
+        assert_eq!(again.scanned_file_count, 0);
+        assert!(again.snapshots.is_empty());
+        assert_eq!(quiet.claude_account_deferred_hold_count(), 2);
+        assert_eq!(quiet.file_snapshot_fingerprints, incidence);
     }
 }
 

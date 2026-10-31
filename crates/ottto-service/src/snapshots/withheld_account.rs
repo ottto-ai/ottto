@@ -606,8 +606,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn absence_sequence_resets_on_presence_substitution_or_uncertainty() {
-        let memo = Memo::default();
-        support::clock(&memo);
         use std::os::unix::fs::{symlink, PermissionsExt};
         for interruption in [
             "present",

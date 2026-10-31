@@ -51558,7 +51558,7 @@ impl ScanIndex {
             return (CandidateDecision::Skip, None);
         }
         // Bounded/transient scheduling hold: the aged virtual N1 delay ends at
-        // the retained due time; unknown identity/cap refusal cannot grant a Skip.
+        // the retained due time; without a retained slot this delay cannot apply.
         // The virtual N1 recovery slot schedules its own one permitted Full.
         // Grown retention keeps the key observed, but cannot bypass that due
         // time after a marker-erasing reload (there may be no reusable copy).

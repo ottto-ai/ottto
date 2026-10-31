@@ -218,6 +218,14 @@ impl SharedCache {
 }
 
 impl SharedCache {
+    /// Bind before constructor-time discovery/selection, which consults CONTENT.
+    pub(crate) fn bind_withheld(&self, index: &mut ScanIndex) {
+        index.withheld_memo = self.withheld_memo.clone();
+        index
+            .withheld_memo
+            .retain_held(&index.claude_account_deferred_holds);
+    }
+
     /// The retained-copy lock. Lock order: retained, then cursor, never the
     /// reverse; never twice on one thread (both checked in debug builds).
     pub(super) fn retained(&self) -> std::sync::LockResult<RetainedGuard<'_>> {
@@ -611,10 +619,7 @@ impl OwnedSourceScan {
     ) -> Self {
         self.durable_guard = Some(Arc::downgrade(&cache));
         if self.source == SnapshotSource::ClaudeCode {
-            self.index.withheld_memo = cache.withheld_memo.clone();
-            self.index
-                .withheld_memo
-                .retain_held(&self.index.claude_account_deferred_holds);
+            cache.bind_withheld(&mut self.index);
             self.resource_probe
                 .set_withheld_memo(self.index.withheld_memo.clone());
         }

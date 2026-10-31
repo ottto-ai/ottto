@@ -66,6 +66,7 @@ struct PipelinePage {
 }
 
 struct PipelineFixture {
+    cache: crate::snapshots::sampled_scan::SharedCache,
     base: PathBuf,
     root: PathBuf,
     support: PathBuf,
@@ -89,6 +90,7 @@ impl PipelineFixture {
             .expect("write synthetic Claude transcript");
         }
         let fixture = Self {
+            cache: Default::default(),
             index_path: base.join("claude-scan-index.json"),
             page_files: PIPELINE_PAGE_FILES,
             durable_progress: false,
@@ -119,6 +121,7 @@ impl PipelineFixture {
             .expect("write synthetic Claude transcript");
         }
         Self {
+            cache: Default::default(),
             index_path: base.join("claude-scan-index.json"),
             page_files: PIPELINE_PAGE_FILES,
             durable_progress: false,
@@ -191,6 +194,7 @@ impl PipelineFixture {
         reoffers: bool,
     ) -> PipelinePage {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.cache.bind_withheld(&mut index);
         index.activate_upload_context(cycle.upload_context.to_string());
         if cycle.historical_replay {
             index.prepare_historical_replay(cycle.replay_generation.to_string());
@@ -502,9 +506,16 @@ impl PipelineFixture {
         reoffers: bool,
     ) -> PipelinePage {
         if crate::snapshots::ClaudeTerminalOffForTest::active() {
-            return self.terminal_off_on_page_with_reoffers_born(collected_at, cycle, upload, before_classify, reoffers);
+            return self.terminal_off_on_page_with_reoffers_born(
+                collected_at,
+                cycle,
+                upload,
+                before_classify,
+                reoffers,
+            );
         }
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.cache.bind_withheld(&mut index);
         index.activate_upload_context(cycle.upload_context.to_string());
         if cycle.historical_replay {
             index.prepare_historical_replay(cycle.replay_generation.to_string());
@@ -900,6 +911,7 @@ impl PipelineFixture {
     /// leave them. Returns that revision.
     fn seed_retry_pending_authority(&self, session: &str) -> String {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.cache.bind_withheld(&mut index);
         let revision = index.files[&Self::key(&index, session)]
             .source_file_fingerprint
             .clone();
@@ -924,7 +936,6 @@ impl PipelineFixture {
     fn walk(&self, hour: u32, cycle: &PipelineCycle<'_>) -> Vec<PipelinePage> {
         self.walk_from(hour, cycle, |_| {})
     }
-
 
     /// `walk`, with `before_classify` run on the first page only.
     fn walk_from(
@@ -961,6 +972,7 @@ impl PipelineFixture {
     /// would leave them. Returns that revision.
     fn seed_terminal_authority(&self, session: &str) -> String {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.cache.bind_withheld(&mut index);
         let revision = index.files[&Self::key(&index, session)]
             .source_file_fingerprint
             .clone();
@@ -2945,11 +2957,11 @@ const ABSENCE_CYCLE: PipelineCycle<'static> = PipelineCycle {
 };
 
 impl PipelineFixture {
-
     /// Seed the pending proof a RetryPending family retains from the census
     /// window that proved it, so the absence tests see it go or stay.
     fn seed_retry_pending_family_pending(&self, session: &str) {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.cache.bind_withheld(&mut index);
         index.insert_claude_usage_family_pending_for_test(session, "2026-08-01T00:00:00Z");
         index.save(&self.index_path).expect("save scan index");
         let index = ScanIndex::load(&self.index_path).expect("reload scan index");
@@ -4220,7 +4232,6 @@ fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause(
         .index
         .claude_usage_family_pending_retained_for_test(PIPELINE_HELD_SESSION));
 }
-
 
 /// Receiving-side adapter: ACK only actual offered identities and public body
 /// witnesses, through the same request validator as the HTTP client.

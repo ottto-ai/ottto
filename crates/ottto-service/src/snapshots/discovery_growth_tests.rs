@@ -48,8 +48,9 @@ impl Fixture {
     fn page(
         &self,
         source: SnapshotSource,
-        index: ScanIndex,
+        mut index: ScanIndex,
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
+        self.cache.bind_withheld(&mut index);
         let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
         let reads = Reads::default();
         let ((index, result), rows) = capture(|| {

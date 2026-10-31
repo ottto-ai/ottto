@@ -6499,6 +6499,9 @@ fn prepare_sync_source_inner(
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
     index.require_persistence_available()?;
+    if source == SnapshotSource::ClaudeCode {
+        daemon.transcript_cache.bind_withheld(&mut index);
+    }
     upload_progress.recover_ack_retirement_handoff(
         &mut index,
         &index_path,
