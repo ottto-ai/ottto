@@ -1620,21 +1620,63 @@ pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) 
 /// Missing roots, symlinks and permission errors keep the audit and account debt.
 /// This is absence authority, never source verification or census credit.
 pub(super) fn proven_absent(path: &Path, roots: &[PathBuf]) -> bool {
+    absence_parent(path, roots).is_some()
+}
+
+/// Pin the nearest existing parent so its inode cannot be reused between probes.
+/// Depth binds the missing component when an intermediate directory is absent.
+#[derive(Debug)]
+pub(super) struct AbsenceParent {
+    directory: File,
+    depth: usize,
+}
+impl AbsenceParent {
+    pub(super) fn same_parent(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.depth == other.depth
+                && self
+                    .directory
+                    .metadata()
+                    .ok()
+                    .zip(other.directory.metadata().ok())
+                    .is_some_and(|(a, b)| a.dev() == b.dev() && a.ino() == b.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (self, other);
+            false
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for AbsenceParent {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            directory: _,
+            depth: _,
+        } = self;
+        c.add(0)
+    }
+}
+
+pub(super) fn absence_parent(path: &Path, roots: &[PathBuf]) -> Option<AbsenceParent> {
     #[cfg(unix)]
     {
         roots
             .iter()
-            .any(|root| proven_absent_beneath_root(path, root).unwrap_or(false))
+            .find_map(|root| proven_absent_beneath_root(path, root).ok().flatten())
     }
     #[cfg(not(unix))]
     {
         let _ = (path, roots);
-        false
+        None
     }
 }
 
 #[cfg(unix)]
-fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool> {
+fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<Option<AbsenceParent>> {
     fn open_directory(parent: &File, name: &std::ffi::CStr) -> std::io::Result<File> {
         // Match open_candidate_beneath_root: every directory is readable and
         // no component below the configured root may redirect through a link.
@@ -1683,26 +1725,26 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
             .components()
             .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
     {
-        return Ok(false);
+        return Ok(None);
     }
     // Preserve the nofollow check on the root's final component even when its
     // configured spelling has a trailing separator or `/.`.
     let root: PathBuf = root.components().collect();
     let Ok(relative) = path.strip_prefix(&root) else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut names = Vec::new();
     for component in relative.components() {
         let Component::Normal(name) = component else {
-            return Ok(false);
+            return Ok(None);
         };
         let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
-            return Ok(false);
+            return Ok(None);
         };
         names.push(name);
     }
     let Some((final_name, parents)) = names.split_last() else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut root_options = fs::OpenOptions::new();
     root_options
@@ -1723,7 +1765,7 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
         }
     }
     if !name_absent(directories.last().expect("opened ancestor"), missing_name)? {
-        return Ok(false);
+        return Ok(None);
     }
 
     // A removed/replaced ancestor can leave a readable but detached descriptor.
@@ -1732,15 +1774,21 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
     // or recreation (even an empty directory) keeps the debt.
     let mut directory = root_options.open(&root)?;
     if !same_directory(&directory, &directories[0])? {
-        return Ok(false);
+        return Ok(None);
     }
     for (name, original) in parents.iter().zip(&directories[1..]) {
         directory = open_directory(&directory, name)?;
         if !same_directory(&directory, original)? {
-            return Ok(false);
+            return Ok(None);
         }
     }
-    name_absent(&directory, missing_name)
+    if !name_absent(&directory, missing_name)? {
+        return Ok(None);
+    }
+    Ok(Some(AbsenceParent {
+        directory,
+        depth: directories.len(),
+    }))
 }
 
 #[cfg(all(test, unix))]

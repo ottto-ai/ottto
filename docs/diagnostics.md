@@ -671,18 +671,24 @@ the next slot, failing toward reading rather than dropping the obligation.
 `counts.withheld_hold_released` counts released holds: `deleted` (the held file
 was proved absent), `deleted_tokens` (its last-known withheld tokens, when
 available), and `resolved` (a parse bound the account). A held audit obligation
-is retired only by `sampled_audit::proven_absent`: ENOENT of the file or a missing
-intermediate directory beneath a readable configured root. The chain to the
-nearest existing ancestor uses descriptor-relative nofollow opens, is readable,
-and is revalidated before accepting absence. Symlink/non-directory ancestors,
-permission errors, substitutions, or a missing/unreadable configured root keep
-debt; a removed `projects/<p>` directory under a healthy projects root permits
-release. A bounded inventory of up to 4,096 recorded holds applies this same proof
-to held-new keys without committed entries. Healthy-census retirement finishes
-that item, preserving audited fingerprint incidence and existing ACK custody
-rather than falling through ordinary deletion. This additionally emits
-`counts.audit_retired_absent.events` and, when a request-census record was
-removed, `Vanished::RequestCensusRemoved`; no Full/source/census credit is granted.
+is retired only after two consecutive rooted NotFound observations at least
+600 seconds apart under the same validated parent. Each observation uses
+`sampled_audit::proven_absent`: ENOENT of the file or a missing intermediate
+directory beneath a readable configured root. Descriptor-relative nofollow
+opens revalidate the chain before accepting absence. The existing capped memo
+pins the nearest existing parent's descriptor and missing-component depth
+between probes; inode reuse cannot substitute a different parent. Presence,
+symlink/non-directory ancestors, permission errors, parent replacement,
+missing/unreadable roots or unavailable memo state reset the sequence and keep
+debt. Restart loses the witness and requires two new observations. Descriptor
+open failures also fail closed.
+The inventory probes at most 4,096 recorded holds, including held-new keys,
+outside aggregate terminal authority. Indexed reconciliation and removal hints
+share this eligibility gate; generic file removal preserves account holds.
+Retirement preserves audited fingerprint incidence and existing ACK custody,
+and counts `counts.audit_retired_absent.events` when it removes audit debt and
+`Vanished::RequestCensusRemoved` when it removes a request-census record. It
+provides no Full, source, census, manifest, ACK or money completion credit.
 Codex-protected entries keep their separate protected history.
 `counts.withheld_hold_unrecorded` counts refused admission attempts past the
 4,096-hold cap (`events`) and their withheld `tokens`; these are attempts, never
@@ -692,7 +698,8 @@ Unknown; no $0 is invented. All three are drained like
 `line_delivery_unselected`. `counts.withheld_memo` is a gauge of that memo:
 `entries` (at most 4,096) and `retained_bytes`, the bytes charged to the sync
 owner's process-retained bound using a conservative layout-independent allowance
-(1,536 bytes per entry for a possible B-tree node and boxed witness, plus a
+(1,536 bytes per entry for a possible B-tree node, boxed content witness and
+pinned absence witness, plus a
 root and state header).
 Codex-version, native-comparison and continuation graphs are admitted first;
 this memo is charged only from the remainder. Its own refusal drops only the

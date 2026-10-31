@@ -1853,6 +1853,7 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
     }
 }
 
+/// [behaviour] Secure absence retires audit debt; account holds require a second spaced probe.
 #[test]
 fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1913,6 +1914,25 @@ fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() 
                     )
                 });
             assert_eq!(modes, (0, 0, 0));
+            let mut diagnostics = diagnostics;
+            if source == SnapshotSource::ClaudeCode {
+                assert!(retired.claude_account_deferred_holds.contains_key(&key));
+                assert!(retired.files[&key].has_unverified_source());
+                sampled_scan::set_test_now(Some(sampled_scan::now_seconds() + 600));
+                let ((next, _, modes), next_diagnostics) =
+                    crate::local_resource_diagnostics::capture(|| {
+                        production_scan(
+                            &fixture,
+                            source,
+                            retired,
+                            Some(cache.clone()),
+                            "absence-retirement",
+                        )
+                    });
+                assert_eq!(modes, (0, 0, 0));
+                retired = next;
+                diagnostics.extend(next_diagnostics);
+            }
             assert_eq!(
                 diagnostics
                     .iter()
@@ -2092,8 +2112,9 @@ fn audit_absence_preserves_legacy_counting_evidence_or_retains_its_entry() {
     }
 }
 
+/// [behaviour] Hold-only removal requires stable rooted absence twice.
 #[test]
-fn hold_only_inventory_requires_secure_absence_and_keeps_observed_keys() {
+fn hold_only_inventory_requires_two_secure_absence_observations() {
     use std::os::unix::fs::symlink;
     for ancestor in [
         "present",
@@ -2137,13 +2158,15 @@ fn hold_only_inventory_requires_secure_absence_and_keeps_observed_keys() {
             BACKFILL_WINDOW_DAYS,
         );
         assert!(index.files.is_empty(), "held-new has no committed entry");
-        index.retain_observed_claude_account_deferred_holds(&BTreeSet::from([key.clone()]));
+        sampled_scan::set_test_now(Some(1_000));
+        index.probe_absent_claude_account_deferred_holds();
         assert!(
             index.claude_account_deferred_holds.contains_key(&key),
-            "observation alone keeps custody"
+            "one observation keeps custody"
         );
+        sampled_scan::set_test_now(Some(1_600));
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            index.retain_observed_claude_account_deferred_holds(&BTreeSet::new())
+            index.probe_absent_claude_account_deferred_holds()
         });
         let removed = matches!(ancestor, "present" | "missing");
         assert_eq!(
@@ -2159,9 +2182,11 @@ fn hold_only_inventory_requires_secure_absence_and_keeps_observed_keys() {
             usize::from(removed)
         );
         assert!(index.files.is_empty(), "no membership invented");
+        sampled_scan::set_test_now(None);
     }
 }
 
+/// [behaviour] Inventory never probes an imported tail beyond the existing cap.
 #[test]
 fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
     let fixture = ScanFixture::new(SnapshotSource::ClaudeCode);
@@ -2185,7 +2210,7 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
         NOW,
         BACKFILL_WINDOW_DAYS,
     );
-    index.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    index.probe_absent_claude_account_deferred_holds();
     assert_eq!(
         index.claude_account_deferred_holds.len(),
         MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS + 1
@@ -2197,7 +2222,11 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
     index
         .claude_account_deferred_holds
         .retain(|key, _| key == &eligible);
-    index.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    index.probe_absent_claude_account_deferred_holds();
+    assert_eq!(index.claude_account_deferred_hold_count(), 1);
+    sampled_scan::set_test_now(Some(sampled_scan::now_seconds() + 600));
+    index.probe_absent_claude_account_deferred_holds();
+    sampled_scan::set_test_now(None);
     assert!(
         index.claude_account_deferred_holds.is_empty(),
         "the next bounded inventory proves eligible absence"

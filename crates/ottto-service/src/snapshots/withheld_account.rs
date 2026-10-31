@@ -30,13 +30,14 @@ const CONTENT: &str = "claude_withheld_account_content:v1";
 
 /// One bounded entry keeps the boxed completion witness and W2 gauge in
 /// the same capped population. `None` tokens mean unknown, never zero owed.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Entry {
     seen: Option<Box<Seen>>,
     tokens: Option<u64>,
     first_seen: u64,
+    absence: Option<(u64, Box<sampled_audit::AbsenceParent>)>,
 }
-crate::heap_layout_bound::fields!(Entry; seen, tokens, first_seen);
+crate::heap_layout_bound::fields!(Entry; seen, tokens, first_seen, absence);
 type Entries = BTreeMap<[u8; 32], Entry>;
 struct State {
     entries: Entries,
@@ -67,6 +68,7 @@ impl State {
             seen: None,
             tokens: None,
             first_seen: super::sampled_scan::now_seconds(),
+            absence: None,
         }))
     }
 
@@ -291,6 +293,37 @@ impl ScanIndex {
     }
 }
 
+/// The existing capped memo owns removal evidence too. Refusal, poison, clock
+/// reversal or any uncertain/present observation starts a new sequence.
+pub(super) fn absence_eligible(
+    key: &str,
+    parent: Option<sampled_audit::AbsenceParent>,
+    now: u64,
+) -> bool {
+    with_state(|state| {
+        if state.refused {
+            return false;
+        }
+        let Some(parent) = parent else {
+            if let Some(entry) = state.entries.get_mut(&memo_key(key)) {
+                entry.absence = None;
+            }
+            return false;
+        };
+        let Some(entry) = state.entry(memo_key(key)) else {
+            return false;
+        };
+        if let Some((first, before)) = &entry.absence {
+            if now >= *first && before.same_parent(&parent) {
+                return now - first >= 600;
+            }
+        }
+        entry.absence = Some((now, Box::new(parent)));
+        false
+    })
+    .unwrap_or(false)
+}
+
 /// Parent calls at durable hold removal, before admitting a replacement.
 pub(super) fn released_resolved(key: &str) {
     remove_released(key);
@@ -321,6 +354,7 @@ pub(super) fn hold_tokens(key: &str, tokens: u64) {
     with_state(|state| {
         if let Some(entry) = state.entry(memo_key(key)) {
             entry.tokens = Some(tokens);
+            entry.absence = None;
         }
     });
 }
@@ -347,7 +381,7 @@ pub(super) fn retain_held(holds: &BTreeMap<String, String>) {
 }
 
 /// Portable conservative allowance for a full B-tree node plus one boxed Seen
-/// per entry, and a root. Keys and the remaining value fields own no heap. This exceeds the
+/// and one pinned absence witness per entry, and a root. This exceeds the
 /// validated native tree_node_bytes layout; charging never gates on the
 /// generic graph walk's layout_supported toolchain/platform whitelist.
 const NODE_UPPER_BYTES: usize = 1536;
@@ -487,6 +521,97 @@ pub(super) fn poison_for_test() {
 mod tests {
     use super::*;
 
+    /// [behaviour] F4 requires consecutive rooted absence under one pinned parent.
+    #[test]
+    #[cfg(unix)]
+    fn absence_sequence_resets_on_presence_substitution_or_uncertainty() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for interruption in ["present", "parent", "symlink", "missing-root", "unreadable"] {
+            if interruption == "unreadable" && unsafe { libc::geteuid() } == 0 {
+                continue;
+            }
+            reset();
+            let scratch = crate::test_scratch::ScratchDir::new("withheld-absence-reset");
+            let root = fs::canonicalize(&scratch).unwrap().join("root");
+            let parent = root.join("parent");
+            fs::create_dir_all(&parent).unwrap();
+            let path = parent.join("held.jsonl");
+            let key = local_index_key(&path);
+            let mut index = ScanIndex::default();
+            index
+                .claude_account_deferred_holds
+                .insert(key.clone(), "held".into());
+            hold_tokens(&key, 7);
+            retain_held(&index.claude_account_deferred_holds);
+            ensure_bounded_traversal(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-10-07T12:00:00Z",
+                7,
+            );
+            sampled_scan::set_test_now(Some(1_000));
+            index.probe_absent_claude_account_deferred_holds();
+            assert_eq!(index.claude_account_deferred_hold_count(), 1);
+            let saved = root.with_extension("saved");
+            match interruption {
+                "present" => fs::write(&path, b"present").unwrap(),
+                "parent" | "symlink" => {
+                    fs::rename(&parent, &saved).unwrap();
+                    if interruption == "parent" {
+                        fs::create_dir(&parent).unwrap();
+                    } else {
+                        symlink(&saved, &parent).unwrap();
+                    }
+                }
+                "missing-root" => fs::rename(&root, &saved).unwrap(),
+                "unreadable" => {
+                    fs::set_permissions(&parent, fs::Permissions::from_mode(0o0)).unwrap()
+                }
+                _ => unreachable!(),
+            }
+            sampled_scan::set_test_now(Some(1_600));
+            index.probe_absent_claude_account_deferred_holds();
+            assert_eq!(
+                index.claude_account_deferred_hold_count(),
+                1,
+                "{interruption}"
+            );
+            assert_eq!(held_gauge().unwrap().withheld_held_tokens, Some(7));
+            match interruption {
+                "present" => fs::remove_file(&path).unwrap(),
+                "symlink" => {
+                    fs::remove_file(&parent).unwrap();
+                    fs::rename(&saved, &parent).unwrap();
+                }
+                "missing-root" => fs::rename(&saved, &root).unwrap(),
+                "unreadable" => {
+                    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap()
+                }
+                _ => (),
+            }
+            // A changed parent began a fresh sequence at 1600; uncertain
+            // observations cannot begin one until the readable path returns.
+            sampled_scan::set_test_now(Some(1_601));
+            index.probe_absent_claude_account_deferred_holds();
+            sampled_scan::set_test_now(Some(2_199));
+            index.probe_absent_claude_account_deferred_holds();
+            assert_eq!(
+                index.claude_account_deferred_hold_count(),
+                1,
+                "{interruption}"
+            );
+            sampled_scan::set_test_now(Some(2_201));
+            index.probe_absent_claude_account_deferred_holds();
+            assert_eq!(
+                index.claude_account_deferred_hold_count(),
+                0,
+                "{interruption}"
+            );
+        }
+        sampled_scan::set_test_now(None);
+    }
+
     #[test]
     fn completion_witness_has_no_heap_and_costs_one_visit() {
         use crate::heap_layout_bound::{Counter, HeapLayoutBound};
@@ -513,6 +638,7 @@ mod tests {
 
     use crate::heap_layout_bound::tree_node_bytes;
 
+    /// [behaviour] Held tokens and ages leave only on resolution or eligible absence.
     #[test]
     fn held_gauge_sums_tokens_ages_from_first_seen_and_drops_on_release() {
         const DAY: u64 = 86_400;
@@ -570,7 +696,10 @@ mod tests {
             "2026-10-07T12:00:00Z",
             7,
         );
-        index.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+        index.probe_absent_claude_account_deferred_holds();
+        assert_eq!(index.claude_account_deferred_hold_count(), 1);
+        super::sampled_scan::set_test_now(Some(191 * DAY + 600));
+        index.probe_absent_claude_account_deferred_holds();
         fs::remove_dir_all(dir).unwrap();
         assert!(index.claude_account_deferred_holds.is_empty());
         assert_eq!(gauge(), Value::Null);
@@ -882,6 +1011,7 @@ mod tests {
         );
     }
 
+    /// [behaviour] The capped memo, including absence witnesses, fits its existing allowance.
     #[test]
     fn memo_at_the_hold_cap_has_a_conservative_portable_charge() {
         reset();
@@ -898,14 +1028,12 @@ mod tests {
                         seen: Some(Box::new(seen)),
                         tokens: Some(1),
                         first_seen: 0,
+                        absence: None,
                     },
                 )
             })
             .collect();
-        with_state(|state| {
-            state.entries = full.clone();
-            state.held_count = full.len();
-        });
+
         let expected = charge(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS).unwrap();
         assert!(
             expected < 8 << 20,
@@ -914,10 +1042,11 @@ mod tests {
         // Assert even on Linux or an unvalidated compiler. The real charge
         // has no layout gate, and its native comparison remains an extra check.
         assert!(
-            tree_node_bytes::<[u8; 32], Entry>().unwrap() + std::mem::size_of::<Seen>()
+            tree_node_bytes::<[u8; 32], Entry>().unwrap()
+                + std::mem::size_of::<Seen>()
+                + std::mem::size_of::<sampled_audit::AbsenceParent>()
                 <= NODE_UPPER_BYTES
         );
-        assert_eq!(retained_bound(usize::MAX), Some(expected));
         if crate::heap_layout_bound::layout_supported() {
             let native = crate::heap_layout_bound::completed_bound(&full, usize::MAX).unwrap();
             assert!(
@@ -925,13 +1054,18 @@ mod tests {
                 "native {native} exceeds portable {expected}"
             );
         }
+        with_state(|state| {
+            state.held_count = full.len();
+            state.entries = full;
+        });
+        assert_eq!(retained_bound(usize::MAX), Some(expected));
         let line = serde_json::to_value(census()).unwrap();
         assert_eq!(line["entries"], MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS);
         assert_eq!(line["retained_bytes"], expected);
         discard_if_refused();
         assert_eq!(
             with_state(|state| state.entries.len()),
-            Some(full.len()),
+            Some(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS),
             "an unrelated graph fallback preserves this known bounded graph"
         );
         assert_eq!(

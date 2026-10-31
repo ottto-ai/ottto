@@ -31565,12 +31565,10 @@ impl OwnedSourceScan {
                 }
                 let terminal_effects_allowed = source != SnapshotSource::ClaudeCode
                     || claude_terminal_authority(index, true, &census_window_end);
-                // TODO(withheld-discovery integration): per-key held-account
-                // release belongs OUTSIDE this aggregate terminal gate. Reuse
-                // sampled_audit::proven_absent + retire_absent_account_hold
-                // once available; two consecutive stable-parent NotFound
-                // observations >=10m apart (or verified unlink), <=4096 holds.
-                // No observed-only pruning, census or manifest credit.
+                // Per-key absence is independent of aggregate terminal authority.
+                if source == SnapshotSource::ClaudeCode {
+                    index.probe_absent_claude_account_deferred_holds();
+                }
                 if !terminal_effects_allowed
                     && index.traversal.as_ref().is_some_and(|t| {
                         t.pending_directories.is_empty()
@@ -32112,9 +32110,6 @@ impl OwnedSourceScan {
                     .saturating_add(usize::from(parent_resolution_restart));
                 if raw_census_complete {
                     index.record_scan_residue_witness(source, &traversal_snapshot);
-                    index.retain_observed_claude_account_deferred_holds(
-                        &traversal_snapshot.observed_index_keys,
-                    );
                 }
                 let mut terminal_native_traversal = None;
                 let mut carried_next_generation = Vec::new();
@@ -44451,6 +44446,12 @@ impl<'a> DiscoveryRetention<'a> {
         modified: u64,
         stamp: Option<codex_fragment::Stamp>,
     ) {
+        let key = local_index_key(path);
+        if self.account_holds.contains_key(&key) {
+            // This gate already has physical presence; invalidate an earlier
+            // absence even if the file disappears again before page completion.
+            withheld_account::absence_eligible(&key, None, 0);
+        }
         if let Some(page) = self.growth {
             let key = local_index_key(path);
             if self
@@ -49834,19 +49835,16 @@ impl ScanIndex {
         self.claude_account_deferred_holds.len()
     }
 
-    /// Census absence is only a prompt to prove removal. Hold-only keys have
-    /// no committed entry to visit during reconciliation, but own the same
-    /// debt. Inventory at most the existing 4,096-hold cap; no transcript read
-    /// or second directory walk; unreadable or unsafe ancestors keep the hold.
-    fn retain_observed_claude_account_deferred_holds(&mut self, observed: &BTreeSet<String>) {
-        let unobserved = self
+    /// Inventory includes hold-only keys and needs no census completion credit.
+    /// Every caller of retirement uses the same stable-parent eligibility gate.
+    fn probe_absent_claude_account_deferred_holds(&mut self) {
+        let held = self
             .claude_account_deferred_holds
             .keys()
-            .filter(|key| !observed.contains(*key))
             .take(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
             .cloned()
             .collect::<Vec<_>>();
-        for key in unobserved {
+        for key in held {
             self.retire_absent_account_hold(&key);
         }
     }
@@ -50920,12 +50918,15 @@ impl ScanIndex {
     /// Retire only obligations made unfulfillable by positively proven absence.
     /// Codex protection retains the entry and its own lineage/receipt state.
     fn retire_absent_account_hold(&mut self, key: &str) -> bool {
-        if !self.claude_account_deferred_holds.contains_key(key)
-            || !self
-                .traversal
-                .as_ref()
-                .is_some_and(|walk| sampled_audit::proven_absent(Path::new(key), &walk.scan_roots))
-        {
+        if !self.claude_account_deferred_holds.contains_key(key) {
+            return false;
+        }
+        let parent = self.traversal.as_ref().and_then(|walk| {
+            sampled_audit::proven_absent(Path::new(key), &walk.scan_roots)
+                .then(|| sampled_audit::absence_parent(Path::new(key), &walk.scan_roots))
+                .flatten()
+        });
+        if !withheld_account::absence_eligible(key, parent, sampled_scan::now_seconds()) {
             return false;
         }
         let census_record = self.claude_request_census.get(key).is_some();
@@ -51021,6 +51022,12 @@ impl ScanIndex {
 
     fn remove_file_entry_unless_held(&mut self, key: &str, vanished: bool) {
         if !self.persistence_available() {
+            return;
+        }
+
+        // Account debt leaves only through a resolving parse or F4. Generic
+        // age/removal callers cannot bypass the per-key absence sequence.
+        if self.claude_account_deferred_holds.contains_key(key) {
             return;
         }
 

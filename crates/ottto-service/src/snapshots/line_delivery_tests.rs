@@ -1769,7 +1769,75 @@ fn held_growth_mode() -> DeliveryMode {
     }
 }
 
-/// F-INDEX and census completion: a present aged withheld key is observed, so
+/// [money] F4 releases once after ten minutes without acquiring or emitting money.
+#[test]
+#[cfg(unix)]
+fn absent_account_hold_retires_without_money_or_completion_credit() {
+    use sampled_scan::transition_fixture::{money_oracle, Accepted, Mode, RouteResult};
+    let root = Root::new("ld-withheld-f4-money");
+    let path = root.file(SESSION);
+    append(&path, &assistant_line("f4"));
+    let (mut index, cold_scan, _) = finish(new_scan(&root.projects(), ScanIndex::default()));
+    assert!(!cold_scan.snapshots.is_empty());
+    let mut request = super::tests::valid_v6_batch_request();
+    request.snapshots = cold_scan.snapshots.clone();
+    request.source = SnapshotSource::ClaudeCode.api_slug().into();
+    let mut cold = RouteResult::emitted(
+        Mode::ColdFull,
+        SnapshotSource::ClaudeCode,
+        vec![serde_json::to_vec(&request).unwrap()],
+        &cold_scan.snapshots,
+    );
+    cold.accepted = cold_scan
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                Accepted {
+                    body: cold.snapshots[&item.source_session_id].clone(),
+                    witness: snapshot_upload_body_witness(item),
+                },
+            )
+        })
+        .collect();
+    let key = local_index_key(&path);
+    let fingerprint = index.files[&key].source_file_fingerprint.clone();
+    let tokens = cold_scan
+        .snapshots
+        .iter()
+        .map(|item| (item.snapshot_fingerprint.clone(), 30))
+        .collect();
+    assert!(
+        index.record_claude_account_deferred_holds([(key.as_str(), fingerprint.as_str())], &tokens)
+    );
+    assert_eq!(index.claude_account_deferred_hold_count(), 1);
+    fs::remove_file(&path).unwrap();
+    crate::local_resource_diagnostics::take_withheld_for_test();
+    for (now, held) in [(1_000, 1), (1_599, 1), (1_600, 0), (2_200, 0)] {
+        sampled_scan::set_test_now(Some(now));
+        let (next, scan, _) = finish(new_scan(&root.projects(), index));
+        index = next;
+        assert_eq!(index.claude_account_deferred_hold_count(), held);
+        assert_eq!(scan.scanned_file_count, 0);
+        assert!(scan.snapshots.is_empty());
+        let mut route = RouteResult::emitted(
+            Mode::Ram,
+            SnapshotSource::ClaudeCode,
+            Vec::new(),
+            &scan.snapshots,
+        );
+        route.accepted = cold.accepted.clone();
+        money_oracle::assert_held(SESSION, &cold, &route, &cold);
+    }
+    sampled_scan::set_test_now(None);
+    assert_eq!(
+        crate::local_resource_diagnostics::take_withheld_for_test()[0],
+        BTreeMap::from([("deleted", 1), ("deleted_tokens", 30)])
+    );
+}
+
+/// [behaviour] F-INDEX and census completion: a present aged withheld key is observed, so
 /// reconciliation and the raw-census prune keep its entry and hold. A held key
 /// whose file is gone is still proved absent and retired with its hold, so a
 /// deleted file cannot pin the hold (and the unsettled receipt) forever.
@@ -1808,13 +1876,15 @@ fn reconciliation_keeps_present_withheld_keys_and_retires_absent_ones() {
     ));
     // The gone key is never a candidate: its release reads nothing.
     assert_eq!(candidates(&index), vec![file("held")]);
-    let observed = index
-        .traversal
-        .as_ref()
-        .unwrap()
-        .observed_index_keys
-        .clone();
-    index.retain_observed_claude_account_deferred_holds(&observed);
+    sampled_scan::set_test_now(Some(1_000));
+    index.probe_absent_claude_account_deferred_holds();
+    assert_eq!(index.claude_account_deferred_hold_count(), 2);
+    sampled_scan::set_test_now(Some(1_599));
+    index.probe_absent_claude_account_deferred_holds();
+    assert_eq!(index.claude_account_deferred_hold_count(), 2);
+    sampled_scan::set_test_now(Some(1_600));
+    index.probe_absent_claude_account_deferred_holds();
+    sampled_scan::set_test_now(None);
     // Lead A round 2: "deleted held file: hold released, counted".
     assert_eq!(
         crate::local_resource_diagnostics::take_withheld_for_test()[0],

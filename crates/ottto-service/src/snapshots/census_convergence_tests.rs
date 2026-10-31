@@ -1069,8 +1069,8 @@ fn bound_terminal_hold_skips_until_family_changes() {
     );
 }
 
-// Account holds are durable, bounded, and pruned only by a resolving
-// parse or proved absence.
+/// [format] Account holds are durable, bounded, and pruned only by a resolving
+/// parse or two stable-parent absence observations.
 #[test]
 fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     let dir = crate::test_scratch::ScratchDir::new("account-hold-rooted-proof");
@@ -1126,16 +1126,16 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     // Census absence prompts a rooted proof; absence of index/observation
     // membership alone is never enough to release owed usage.
     let mut observed = index.clone();
-    observed.retain_observed_claude_account_deferred_holds(&BTreeSet::from([held_key.to_string()]));
+    observed.probe_absent_claude_account_deferred_holds();
     assert_eq!(observed.claude_account_deferred_hold_count(), 1);
     let mut indexed = index.clone();
     indexed
         .files
         .insert(held_key.to_string(), manifest_index_entry(Some("deferred")));
-    indexed.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    indexed.probe_absent_claude_account_deferred_holds();
     assert_eq!(indexed.claude_account_deferred_hold_count(), 1);
     let mut absent = index.clone();
-    absent.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    absent.probe_absent_claude_account_deferred_holds();
     assert_eq!(
         absent.claude_account_deferred_hold_count(),
         1,
@@ -1152,7 +1152,7 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
         &held_path,
         std::slice::from_ref(&scan_root)
     ));
-    absent.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    absent.probe_absent_claude_account_deferred_holds();
     assert_eq!(
         absent.claude_account_deferred_hold_count(),
         1,
@@ -1163,7 +1163,12 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
         &held_path,
         std::slice::from_ref(&scan_root)
     ));
-    absent.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    sampled_scan::set_test_now(Some(1_000));
+    absent.probe_absent_claude_account_deferred_holds();
+    assert_eq!(absent.claude_account_deferred_hold_count(), 1);
+    sampled_scan::set_test_now(Some(1_600));
+    absent.probe_absent_claude_account_deferred_holds();
+    sampled_scan::set_test_now(None);
     assert_eq!(absent.claude_account_deferred_hold_count(), 0);
 
     // At the bound a new hold cannot be recorded and the caller must keep
