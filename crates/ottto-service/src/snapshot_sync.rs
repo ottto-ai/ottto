@@ -760,6 +760,18 @@ impl LocalHoldSettlement {
                 scan_result.completed_parses(),
                 &disposition.account_deferred_tokens(&scan_result.snapshots),
             );
+        if held_entity_count > 0 {
+            let counts = serde_json::json!({
+                "request_owned": disposition.request_owned_hold_reasons,
+                "account_binding": account_deferred_fingerprints.len(),
+                "authority_demotion": disposition.context_file_birth.demotion_quarantined_session_count,
+            });
+            eprintln!(
+                "local snapshot sync: hold disposition source={} held_entities={} counts={counts}",
+                source.api_slug(),
+                held_entity_count,
+            );
+        }
         scan_result.remember_withheld_content(index);
         let progress_blocking_held_fingerprints = disposition.progress_blocking_held_fingerprints(
             &scan_result.snapshots,
@@ -10214,7 +10226,15 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         } else {
             crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
         },
+        &mut disposition.request_owned_hold_reasons,
+        &scan_result.claude_queued_family_deferred_paths,
     );
+    if !trace_discard_unfolded.is_empty() {
+        *disposition
+            .request_owned_hold_reasons
+            .entry("trace_discarded")
+            .or_default() += trace_discard_unfolded.len() as u64;
+    }
     withheld.extend(trace_discard_unfolded);
     if let Some((cache, committed)) = retained {
         cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
