@@ -13143,51 +13143,55 @@ fn retired_missing_native_rebuild_then_successor_tails_without_double_count() {
 /// [off=main] No-record growth follows the ordinary Full path with zero store I/O.
 #[test]
 fn off_no_record_growth_uses_ordinary_full_without_store_io() {
-    let _off = crate::snapshots::RestartRestoreForTest::disabled();
-    let root = crate::test_scratch::ScratchDir::new("off-no-record");
-    let projects = root.join("projects");
-    std::fs::create_dir(&projects).unwrap();
-    let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
-    std::fs::write(&path, a1a_row("accepted", 100)).unwrap();
-    let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
-    let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
-    let index_path = root.join("index.json");
-    owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
-    store::test_hooks::set_before_access(Some(Box::new(|_, _| panic!("OFF store I/O"))));
-    let scan = |index| {
-        owner.scan(
-            std::slice::from_ref(&projects),
-            &root,
-            index,
-            100,
-            true,
-            &births,
-            &[],
+    // The fold is initialized before the scan driver's per-file birth setter.
+    // Give that existing constructor seam the same synthetic physical birth.
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        let _off = crate::snapshots::RestartRestoreForTest::disabled();
+        let root = crate::test_scratch::ScratchDir::new("off-no-record");
+        let projects = root.join("projects");
+        std::fs::create_dir(&projects).unwrap();
+        let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+        std::fs::write(&path, a1a_row("accepted", 100)).unwrap();
+        let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
+        let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
+        let index_path = root.join("index.json");
+        owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
+        store::test_hooks::set_before_access(Some(Box::new(|_, _| panic!("OFF store I/O"))));
+        let scan = |index| {
+            owner.scan(
+                std::slice::from_ref(&projects),
+                &root,
+                index,
+                100,
+                true,
+                &births,
+                &[],
+            )
+        };
+        let (mut prior, mut first, modes) = scan(ScanIndex::default());
+        assert_eq!(modes.0, 1);
+        a1a_wire(&root, &mut prior, &mut first);
+        let (prior, quiet, modes) = scan(prior);
+        assert!(quiet.snapshots.is_empty());
+        assert_eq!(modes.0 + modes.1, 0);
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            a1a_row("growth", 200).as_bytes(),
         )
-    };
-    let (mut prior, mut first, modes) = scan(ScanIndex::default());
-    assert_eq!(modes.0, 1);
-    a1a_wire(&root, &mut prior, &mut first);
-    let (prior, quiet, modes) = scan(prior);
-    assert!(quiet.snapshots.is_empty());
-    assert_eq!(modes.0 + modes.1, 0);
-    std::io::Write::write_all(
-        &mut std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap(),
-        a1a_row("growth", 200).as_bytes(),
-    )
-    .unwrap();
-    let (mut prior, mut grown, modes) = scan(prior);
-    store::test_hooks::set_before_access(None);
-    assert_eq!(modes.0, 1);
-    assert_eq!(modes.1, 0);
-    a1a_wire(&root, &mut prior, &mut grown);
-    assert_eq!(grown.snapshots[0].input_tokens, 300);
-    assert!(owner
-        .cache
-        .durable_counters(SnapshotSource::ClaudeCode)
-        .is_none());
-    assert!(!store::store_dir_for_index(&index_path).exists());
+        .unwrap();
+        let (mut prior, mut grown, modes) = scan(prior);
+        store::test_hooks::set_before_access(None);
+        assert_eq!(modes.0, 1);
+        assert_eq!(modes.1, 0);
+        a1a_wire(&root, &mut prior, &mut grown);
+        assert_eq!(grown.snapshots[0].input_tokens, 300);
+        assert!(owner
+            .cache
+            .durable_counters(SnapshotSource::ClaudeCode)
+            .is_none());
+        assert!(!store::store_dir_for_index(&index_path).exists());
+    });
 }

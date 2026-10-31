@@ -1618,10 +1618,12 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 },
                 "the legacy fault requires a real V1 predecessor"
             );
-            assert!(
+            assert_eq!(
                 record.envelope_audit_debt.is_some(),
-                "#865's envelope carries the debt"
+                fault != "legacy_index_clear",
+                "V3 carries envelope debt; V1 keeps the deadline in the index"
             );
+            assert!(index.files[&key].has_unverified_source());
             let full_time = cache
                 .retained_checkpoint(&key)
                 .unwrap()
