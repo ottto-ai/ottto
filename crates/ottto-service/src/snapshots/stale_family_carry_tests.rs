@@ -4651,9 +4651,11 @@ fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
 
 /// [money] A re-stamp's proof equals a fresh
 /// Full's (the family pending a Full folds in this window: same ids, same
-/// occurrences, observed for fence coverage); an owed cap-invalid family gets
-/// no read and no credit unless its recorded requests fit the cap; and census
-/// completion retires only proven families.
+/// occurrences, observed for fence coverage), including a confirmed-empty
+/// member with no pending re-stamped from its census record (a Full folds
+/// nothing for it); an owed cap-invalid family gets no read and no credit
+/// unless its recorded requests fit the cap; and census completion retires
+/// only proven families.
 #[test]
 fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -4685,6 +4687,77 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         claude_duplicate_fence_coverage_missing_member_count(&fixture.index, &window),
         0
     );
+
+    // A confirmed-empty member whose family has no pending (retired at a
+    // completion): its record is current and holds no requests, so it
+    // re-stamps from the record with no read. Pending stays exactly as a Full
+    // leaves it (the empty parse yields no snapshot to fold) and the member
+    // counts as observed. Under the latch, or with requests in the record, it
+    // still reads.
+    let (fixture, window) = owed_rearmed(2, true);
+    let candidates = &fixture.candidates[1..];
+    let key = local_index_key(&candidates[0].path);
+    let (root, _) = claude_index_path_family_member(&candidates[0].path).unwrap();
+    let record = |hashes: Option<&str>| {
+        let mut value = serde_json::json!({
+            "v": claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
+            "fp": fixture.index.files[&key].source_file_fingerprint,
+            "w": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+            "s": if hashes.is_some() { "exact" } else { "empty" },
+            "bi": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+            "bd": 1, "bn": 1,
+        });
+        if let Some(hashes) = hashes {
+            value["h"] = hashes.into();
+        }
+        scoped_retry_record(&key, value)
+    };
+    let mut empty = fixture.index.clone();
+    empty.claude_request_identity_contract =
+        Some(claude_request_identity::cycle_contract(true).into());
+    empty.claude_usage_family_pending.remove(&root);
+    empty.confirmed_empty_files.insert(key.clone());
+    empty
+        .claude_request_census
+        .insert(key.clone(), record(None));
+    let full = empty.claude_usage_family_pending.clone();
+    assert_eq!(
+        claude_duplicate_fence_coverage_missing_member_count(&empty, &window),
+        2
+    );
+    let mut index = empty.clone();
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let parsed = owed_selected_parses(
+        &mut index,
+        &mut evidence_owed::Page::default(),
+        candidates,
+        &window,
+    );
+    assert_eq!(parsed, 0);
+    assert_eq!(scope.finish().contract.evidence_owed.restamped_from_record, 1);
+    assert_eq!(index.claude_usage_family_pending, full);
+    assert!(!index.files[&key].evidence_owed);
+    assert_eq!(
+        claude_duplicate_fence_coverage_missing_member_count(&index, &window),
+        1
+    );
+    for (latched, requests) in [(true, false), (false, true)] {
+        let mut index = empty.clone();
+        index.claude_request_identity_contract_changed = latched;
+        if requests {
+            index
+                .claude_request_census
+                .insert(key.clone(), record(Some("0123456789abcdef")));
+        }
+        let parsed = owed_selected_parses(
+            &mut index,
+            &mut evidence_owed::Page::default(),
+            candidates,
+            &window,
+        );
+        assert_eq!(parsed, 1, "latched={latched} requests={requests}");
+        assert!(index.files[&key].evidence_owed);
+    }
 
     // Cap-invalid: invalid, evidence-free pending from the record's window.
     let (mut fixture, window) = owed_rearmed(1, true);

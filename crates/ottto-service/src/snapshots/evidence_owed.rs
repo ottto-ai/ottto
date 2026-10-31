@@ -6,7 +6,8 @@
 //!
 //! The traversal resolves an owed, unchanged member at selection:
 //! - (a) its stored occurrences are bound to this revision: re-stamp them into
-//!   the current census window, no read;
+//!   the current census window, no read; a confirmed-empty member whose
+//!   current census record holds no requests re-stamps from that record;
 //! - (c) cap-invalid family, unchanged, its occurrences still do not fit:
 //!   stays owed, no read, no credit;
 //! - otherwise one counted `Rearmed` parse, paced per page; with the
@@ -453,6 +454,13 @@ pub(super) fn resolve(
     }
     let must_read = entry.owed_read;
     if let Some((root, member)) = family.filter(|_| enabled() && !must_read) {
+        if empty_from_record(index, &key, &root) {
+            claude_contract::note(|c| c.evidence_owed.restamped_from_record += 1);
+            if let Some(entry) = index.files.get_mut(&key) {
+                entry.evidence_owed = false;
+            }
+            return;
+        }
         match restamp(index, &key, &root, &member, census_window_end) {
             Ok(Restamp::Observed) => {
                 claude_contract::note(|c| c.evidence_owed.restamped += 1);
@@ -658,6 +666,29 @@ fn restamp(
     } else {
         Restamp::Observed
     })
+}
+
+/// A confirmed-empty member re-stamps from its census record, no read. Its
+/// parse yields no snapshot, so a Full of this revision folds nothing into the
+/// family's pending; clearing the debt leaves pending exactly as that Full
+/// leaves it. Only while the record is current for this revision and holds no
+/// requests, under the recorded cycle contract with no latch, and with no
+/// account or decode hold. Changed members never reach here. A member with
+/// requests cannot use this: the record keeps 8-byte id prefixes and no usage,
+/// not the pending a Full folds.
+fn empty_from_record(index: &ScanIndex, key: &str, root: &str) -> bool {
+    let Some(entry) = index.files.get(key) else {
+        return false;
+    };
+    !index.claude_request_identity_contract_changed
+        && EvidenceContract::current(index).is_some()
+        && entry.scan_identity_version.as_deref() == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+        && index.confirmed_empty_files.contains(key)
+        && !index.claude_account_deferred_holds.contains_key(key)
+        && !index.decode_holds_family(root)
+        && index.claude_request_census.get(key).is_some_and(|record| {
+            record.current_for(&entry.source_file_fingerprint) && record.request_hashes().is_empty()
+        })
 }
 
 /// Under ON a family with an owed member is not proven at completion: owed

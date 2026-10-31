@@ -45,6 +45,7 @@ counters!(ContextChange {
 // family's stored evidence window against this census window.
 counters!(EvidenceOwed {
     restamped,
+    restamped_from_record,
     restamped_under_latch,
     read,
     read_required,
