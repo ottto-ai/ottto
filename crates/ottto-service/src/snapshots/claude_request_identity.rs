@@ -4256,7 +4256,7 @@ impl DesktopCensusWitness {
     }
 }
 
-fn inventory_digest(store_dirs: &BTreeSet<PathBuf>) -> String {
+pub(super) fn inventory_digest(store_dirs: &BTreeSet<PathBuf>) -> String {
     let mut digest = sha2::Sha256::new();
     for dir in store_dirs {
         digest.update(dir.to_string_lossy().as_bytes());
