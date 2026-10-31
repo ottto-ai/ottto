@@ -151,14 +151,6 @@ impl PiBound {
         store_snapshot(&store::store_dir_for_index(&self.index_path))
     }
 
-    /// Exactly enough for input + transferred graph reserve + key, never the
-    /// typed decode: structural even with the global FIFO idle.
-    fn structural_limit(&self) -> u64 {
-        store::RESTORE_INPUT_BYTES
-            + (store::RECORD_BYTES + super::super::super::AUDIT_AND_SCRATCH_BYTES) as u64
-            + 4 * self.key.len() as u64
-    }
-
     /// An independent cold Full over the same prior index and bytes.
     fn cold_wire(&self, prior: ScanIndex, end: u64) -> Vec<u8> {
         let (mut index, mut cold, modes) = self.run(Arc::new(SharedCache::default()), prior);
@@ -218,7 +210,9 @@ fn pi_structural_growth_paced_no_record_publish_and_no_prune() {
     let now = std::time::SystemTime::now();
     cache.durable().unwrap().retail_full_now = Some(now);
     let records_read = cache.durable_counters(SOURCE).unwrap().1.records_read;
-    store::active::set_active_budget_for_test(Some(f.structural_limit()));
+    store::active::set_active_budget_for_test(Some(
+        crate::snapshots::sampled_scan::transition_fixture::structural_active_budget(&f.key),
+    ));
     let prior = index.clone();
     let (((mut next, mut caught, modes), reads), events) =
         crate::local_resource_diagnostics::capture(|| a0h_observe(|| f.run(cache.clone(), index)));

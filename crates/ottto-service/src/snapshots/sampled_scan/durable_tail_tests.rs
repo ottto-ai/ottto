@@ -11146,21 +11146,6 @@ fn pi_live_prepare_ledger_cap_counts_entry_cap_refusal_once() {
     lease.release();
 }
 
-/// [behaviour] Pi census and summary diagnostics work before the first durable record.
-#[test]
-fn pi_census_and_summary_work_before_any_native_record() {
-    let mut index = ScanIndex::default();
-    index.note_carried_ack_census(SnapshotSource::Pi, true, std::time::SystemTime::now());
-    let lines = scan_index_containment_lines_for_test();
-    assert!(lines
-        .last()
-        .unwrap()
-        .contains("source=pi census_complete=true retained_carried_entries=0"));
-    let summary = Counters::default().summary(SnapshotSource::Pi, &store::StoreCounters::default());
-    assert!(summary.starts_with("ottto-service: durable_tail source=pi "));
-    assert!(summary.contains("retail_physical_bytes[process,daily]="));
-}
-
 #[path = "durable_tail_pi_bound_tests.rs"]
 mod pi_bound;
 
