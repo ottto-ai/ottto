@@ -2002,6 +2002,9 @@ fn generate_53d05a43_v1_goldens() {
                 u64::from_le_bytes(record[171..179].try_into().unwrap()),
                 index.generation
             );
+            // Independent source rule: snapshots.rs:34971-34976 at 53d05a43
+            // unconditionally stamps Codex's provider and provenance. The
+            // fixture has no additional Codex selector inputs.
             let facts = json!({"source_session_id":ROOT,"input_tokens":input,"output_tokens":output,
                 "request_count":requests,"counting_version":if claude { "not_applicable" } else if legacy { "Legacy" } else { "V2" },
                 "cache_read_tokens":if claude { 9 } else { 0 },
@@ -2013,8 +2016,8 @@ fn generate_53d05a43_v1_goldens() {
                 "request_3_context_tokens":if claude { Some(40) } else { None },
                 "opening_output_tokens":if claude { Some(30) } else { None },
                 "cli_version":if !claude && !legacy { Some("0.148.9") } else { None },
-                "selector_context":if selector { json!({"service_tier":"priority"}) } else { json!({}) },
-                "selector_sources":if selector { json!({"service_tier":"derived_from_logs_2"}) } else { json!({}) },
+                "selector_context":if selector { json!({"service_tier":"priority"}) } else if !claude { json!({"model_provider":"openai"}) } else { json!({}) },
+                "selector_sources":if selector { json!({"service_tier":"derived_from_logs_2"}) } else if !claude { json!({"model_provider":"derived_from_codex_source"}) } else { json!({}) },
                 "accepted_body_witness":true,"tier_replay_finished":!claude,
                 "tier_replay_persisted":false,"protected_tier_receipt_present":false});
             assert_eq!(item.cache_read_tokens, if claude { 9 } else { 0 });
@@ -2037,6 +2040,88 @@ fn generate_53d05a43_v1_goldens() {
             fs::write(out.join(&record_path), &record).unwrap();
             fs::write(out.join(&input_path), &text).unwrap();
             let expected_bytes = write_json(&out.join(&expected_path), &expected);
+
+            // Read the actual store-written envelope with the real old reader,
+            // then decode/rederive the exported body's bytes using the same
+            // production path as restore_rederives_the_exact_retained_copy.
+            let exported = fs::read(out.join(&record_path)).unwrap();
+            assert_eq!(exported, record);
+            let crate::durable_tail_store::ReadOutcome::Found(stored) =
+                disk.read(&binding.key, &allowlist)
+            else {
+                panic!("{case}: real old store reader must accept the generated record");
+            };
+            let exported_body = &exported[store::HEADER_BYTES..exported.len() - 32];
+            assert_eq!(stored.record.body, exported_body);
+            let decoded = decode(exported_body, source).unwrap();
+            let acc = &decoded.reduction.accumulator;
+            let counting_version = if let Some(counting) = acc.codex_counting.as_ref() {
+                // A configured Legacy decision is a present object without a
+                // V2 reducer, never an absent/unconfigured counting slot.
+                assert!(!claude);
+                let mut receipts = crate::codex_scan_diagnostics::CountingV2Receipts::default();
+                counting.fold_receipts(&mut receipts);
+                assert_eq!(
+                    serde_json::to_value(receipts).unwrap(),
+                    expected["counting_receipts"]
+                );
+                if acc.codex_counting_v2() {
+                    "V2"
+                } else {
+                    "Legacy"
+                }
+            } else {
+                assert!(claude, "{case}: missing serialized counting selection");
+                "not_applicable"
+            };
+            let fresh = rederive_parser(File::open(&path).unwrap(), &path, &decoded).unwrap();
+            let (restored, _) = decoded
+                .rederive(fresh, &mut File::open(&path).unwrap(), line_cap())
+                .unwrap();
+            let selector = restored.accumulator.current_selector.clone();
+            let tier_replay_persisted = restored.accumulator.codex_tier_replay.is_some();
+            let mut acc = restored.accumulator;
+            if claude {
+                acc.finalize_claude_responses();
+            }
+            let restored_items = acc.into_items(&path, COLLECTED, fingerprint.clone(), None);
+            assert_eq!(restored_items.len(), 1, "{case}");
+            let restored_item = &restored_items[0];
+            let start = restored_item.session_start.as_deref();
+            // Opening-window facts in this corpus describe Claude's closed
+            // three-request window; Codex uses the client-version fact only.
+            let actual = json!({
+                "source_session_id":restored_item.source_session_id,
+                "input_tokens":restored_item.input_tokens,"output_tokens":restored_item.output_tokens,
+                "request_count":restored_item.request_count,"counting_version":counting_version,
+                "cache_read_tokens":restored_item.cache_read_tokens,
+                "cache_creation_5m_tokens":restored_item.cache_creation_5m_tokens,
+                "cache_creation_1h_tokens":restored_item.cache_creation_1h_tokens,
+                "cli_version":if !claude { start.and_then(|s| s.client_version.as_deref()) } else { None },
+                "opening_request_count":if claude { start.and_then(|s| s.opening_request_count) } else { None },
+                "request_2_context_tokens":if claude { start.and_then(|s| s.request_2_context_tokens) } else { None },
+                "request_3_context_tokens":if claude { start.and_then(|s| s.request_3_context_tokens) } else { None },
+                "opening_output_tokens":if claude { start.and_then(|s| s.opening_output_tokens) } else { None },
+                "selector_context":selector.context,"selector_sources":selector.sources,
+                "tier_replay_persisted":tier_replay_persisted,
+            });
+            let mut persisted_facts = expected["facts"].clone();
+            for name in [
+                "accepted_body_witness",
+                "telemetry_cost_micros",
+                "tier_replay_finished",
+                "protected_tier_receipt_present",
+            ] {
+                assert!(persisted_facts
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(name)
+                    .is_some());
+            }
+            assert_eq!(
+                actual, persisted_facts,
+                "{case}: every persisted expected fact must match the real old reader"
+            );
             cases.push(json!({"case_id":case,"path":record_path,"byte_length":record.len(),"sha256":sha(&record),
                 "envelope_version":1,"source_tag":if claude { 1 } else { 2 },"historical_allowlist":hex(&allowlist),
                 "index_generation":index.generation,
