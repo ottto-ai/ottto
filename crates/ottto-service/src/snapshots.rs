@@ -10718,12 +10718,22 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             diagnostic.update(|d| d.terminal_rearm = Some(rearm));
         }
 
+        // RF1 #992 GUARD (evidence_owed ON): completion retires only families
+        // with a completed family proof; every other indexed family stays owed.
+        let guard = evidence_owed::enabled();
         index
             .claude_usage_family_pending
-            .retain(|root_session_id, _| {
-                index
-                    .claude_usage_authority_quarantine
-                    .contains_key(root_session_id)
+            .retain(|root_session_id, pending| {
+                (guard
+                    && evidence_owed::owed_at_completion(
+                        root_session_id,
+                        pending,
+                        proven.contains_key(root_session_id),
+                        &indexed_claude_family_ids,
+                    ))
+                    || index
+                        .claude_usage_authority_quarantine
+                        .contains_key(root_session_id)
             });
         let progress = &mut index.claude_full_rearm_progress;
         progress.observed_window = None;

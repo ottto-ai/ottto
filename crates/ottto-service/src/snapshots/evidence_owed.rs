@@ -12,6 +12,9 @@
 //! - otherwise one counted `Rearmed` parse; with the fingerprint kept the
 //!   existing RAM/durable restore may serve it (b), else it reads Full (d).
 //!
+//! GUARD (RF1 #992, folded here): census completion retires only families
+//! with a completed family proof; every other indexed family stays owed.
+//!
 //! Real invalidations keep main's clear: a traversal context change, an audit
 //! cap delay, an unACKed head re-offer and every non-re-arm clear site.
 use super::*;
@@ -93,17 +96,27 @@ pub(super) fn carry_debt(retained: &mut ScanIndexEntry, working: &ScanIndexEntry
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Arm {
+pub(super) enum Arm {
     KeptOwed,
     Read,
 }
 
 /// Per page: one decision per family, and the pending occurrence count the
 /// cap-room rule admits against.
-#[derive(Default)]
 pub(super) struct Page {
-    families: BTreeMap<String, Arm>,
-    retained: Option<usize>,
+    pub(super) families: BTreeMap<String, Arm>,
+    pub(super) retained: Option<usize>,
+    /// The pending occurrence cap a kept family's re-read must fit.
+    pub(super) cap: usize,
+}
+impl Default for Page {
+    fn default() -> Self {
+        Self {
+            families: BTreeMap::new(),
+            retained: None,
+            cap: MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        }
+    }
 }
 
 fn evidence_free(pending: &ClaudeUsageFamilyPending) -> bool {
@@ -164,12 +177,7 @@ fn cap_room(index: &ScanIndex, page: &mut Page, root: &str) -> bool {
         .filter_map(|key| index.claude_request_census.retry_carry_record(key))
         .map(|record| record.request_hashes().len())
         .fold(0_usize, usize::saturating_add);
-    match claude_pending_occurrence_count_after_replace(
-        retained,
-        0,
-        requests,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    ) {
+    match claude_pending_occurrence_count_after_replace(retained, 0, requests, page.cap) {
         Some(next) => {
             page.retained = Some(next);
             true
@@ -314,4 +322,92 @@ fn record_hashes(hashes: &BTreeSet<String>) -> Option<Vec<u64>> {
     prefixes.sort_unstable();
     prefixes.dedup();
     Some(prefixes)
+}
+
+/// GUARD: an indexed family this census did not prove stays owed; only a
+/// completed family proof retires pending.
+pub(super) fn owed_at_completion(
+    root_session_id: &str,
+    pending: &ClaudeUsageFamilyPending,
+    proven: bool,
+    indexed_claude_family_ids: &BTreeSet<String>,
+) -> bool {
+    !proven
+        && (indexed_claude_family_ids.contains(root_session_id)
+            || pending
+                .member_request_id_hashes
+                .keys()
+                .chain(pending.member_occurrences.keys())
+                .any(|member| indexed_claude_family_ids.contains(member)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry() -> ScanIndexEntry {
+        serde_json::from_value(serde_json::json!({
+            "size_bytes": 1, "modified_unix_seconds": 2,
+            "source_file_fingerprint": "revision", "last_snapshot_fingerprint": null
+        }))
+        .unwrap()
+    }
+
+    /// [off=main] Default OFF: only a local regular marker enables it, and an
+    /// OFF re-arm clears the fingerprint exactly as main, owing nothing.
+    #[test]
+    fn switch_defaults_off_and_off_rearm_clears_like_main() {
+        let scratch = crate::test_scratch::ScratchDir::new("evidence-owed-policy");
+        assert!(!enabled_at(&scratch));
+        std::fs::write(scratch.join(NAME), b"").unwrap();
+        assert!(enabled_at(&scratch));
+        std::fs::remove_file(scratch.join(NAME)).unwrap();
+        std::fs::create_dir(scratch.join(NAME)).unwrap();
+        assert!(!enabled_at(&scratch));
+        assert!(!enabled(), "fixture process never consults host marker");
+        for cause in [
+            rearm_cause::Cause::NoRetainedTraversal,
+            rearm_cause::Cause::TerminalUnhealthyRetry,
+            rearm_cause::Cause::CarryInvalidation,
+        ] {
+            let mut off = entry();
+            rearm_cause::clear("/k.jsonl", &mut off, cause);
+            assert!(off.source_file_fingerprint.is_empty() && !off.evidence_owed);
+            let _on = EvidenceOwedForTest::on();
+            let mut on = entry();
+            rearm_cause::clear("/k.jsonl", &mut on, cause);
+            assert_eq!(
+                (on.source_file_fingerprint.as_str(), on.evidence_owed),
+                ("revision", true)
+            );
+            assert!(on.rearmed());
+        }
+        let _on = EvidenceOwedForTest::on();
+        for cause in [
+            rearm_cause::Cause::ContextChanged,
+            rearm_cause::Cause::AuditCapDelay,
+        ] {
+            let mut real = entry();
+            rearm_cause::clear("/k.jsonl", &mut real, cause);
+            assert!(real.source_file_fingerprint.is_empty() && !real.evidence_owed);
+        }
+    }
+
+    /// [format] An index written before the field decodes not owed and
+    /// re-encodes byte-identically; an owed entry round-trips.
+    #[test]
+    fn evidence_owed_is_downgrade_safe_and_round_trips() {
+        let old = serde_json::to_vec(&entry()).unwrap();
+        let decoded: ScanIndexEntry = serde_json::from_slice(&old).unwrap();
+        assert!(!decoded.evidence_owed);
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), old);
+        let mut owed = entry();
+        owed.evidence_owed = true;
+        let bytes = serde_json::to_vec(&owed).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["evidence_owed"], true);
+        assert_eq!(value["source_file_fingerprint"], "revision");
+        let back: ScanIndexEntry = serde_json::from_slice(&bytes).unwrap();
+        assert!(back.evidence_owed && back.rearmed());
+    }
 }

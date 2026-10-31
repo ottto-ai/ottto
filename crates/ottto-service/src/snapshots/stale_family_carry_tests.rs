@@ -4700,3 +4700,160 @@ fn terminal_off_suppressed_start_still_rearms_an_unacked_head() {
     let again = terminal_off_red_retry_start(&mut index, CARRY_SECOND_RETRY);
     assert_eq!(again["rearmed_index_files"], 1);
 }
+
+/// AR1 R1 fixture: the scoped-retry families, each member's census record bound
+/// to the request ids its stored pending holds, after one whole-set re-arm
+/// (BASE start: nothing carried) under `on`.
+fn owed_rearmed(healthy: usize, on: bool) -> (ScopedRetryFixture, String) {
+    let mut fixture = scoped_retry_fixture(0, healthy, false);
+    for candidate in &fixture.candidates {
+        let key = local_index_key(&candidate.path);
+        let (root, member) = claude_index_path_family_member(&candidate.path).unwrap();
+        let hashes = &fixture.index.claude_usage_family_pending[&root].member_request_id_hashes
+            [&member];
+        let record = scoped_retry_record(
+            &key,
+            serde_json::json!({
+                "v": claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
+                "fp": fixture.index.files[&key].source_file_fingerprint,
+                "w": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+                "s": "exact",
+                "h": hashes.iter().map(|hash| &hash[..16]).collect::<String>(),
+                "bi": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+                "bd": 1, "bn": 1,
+            }),
+        );
+        fixture.index.claude_request_census.insert(key, record);
+    }
+    {
+        let _base = KeepStaleClaudeFamilyRearmForTest::new();
+        let _owed = on.then(evidence_owed::EvidenceOwedForTest::on);
+        let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(row["rearmed_index_files"], healthy);
+    }
+    let window = fixture.index.traversal.as_ref().unwrap().census_window_end.clone();
+    (fixture, window)
+}
+
+/// The traversal's selection with the owed resolver: the members it parses.
+fn owed_selected_parses(
+    index: &mut ScanIndex,
+    page: &mut evidence_owed::Page,
+    candidates: &[CandidateFile],
+    window: &str,
+) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            let (mut decision, mut reason) = index.candidate_decision_with_reason_at(candidate, 0);
+            evidence_owed::resolve(index, page, candidate, window, &mut decision, &mut reason);
+            decision == CandidateDecision::Parse
+        })
+        .count()
+}
+
+/// [regress] AR1 R1 (RC4: 31,738 of 36,992 Claude Fulls in 14.6 h were
+/// `selection_cleared`): a whole-set re-arm of unchanged ACKed families reads
+/// every member on main; with evidence owed it reads none of them, and a
+/// changed member is read once.
+#[test]
+fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for on in [false, true] {
+        let (mut fixture, window) = owed_rearmed(4, on);
+        let _owed = on.then(evidence_owed::EvidenceOwedForTest::on);
+        let mut candidates = fixture.candidates.clone();
+        candidates[0].source_file_fingerprint = "f".repeat(64);
+        let parsed = owed_selected_parses(
+            &mut fixture.index,
+            &mut evidence_owed::Page::default(),
+            &candidates,
+            &window,
+        );
+        assert_eq!(parsed, if on { 1 } else { 4 }, "on={on}");
+        let owed = fixture.index.files.values().filter(|e| e.evidence_owed);
+        assert_eq!(owed.count(), usize::from(on), "only the changed member stays owed");
+    }
+}
+
+/// [money] Lead B ruling 1 (2026-10-31): a re-stamp's proof equals a fresh
+/// Full's (the family pending a Full folds in this window: same ids, same
+/// occurrences, observed for fence coverage); an owed cap-invalid family gets
+/// no read and no credit unless its recorded requests fit the cap; and census
+/// completion retires only proven families (GUARD).
+#[test]
+fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _owed = evidence_owed::EvidenceOwedForTest::on();
+    let (mut fixture, window) = owed_rearmed(2, true);
+    let before = fixture.index.claude_usage_family_pending.clone();
+    assert_eq!(
+        claude_duplicate_fence_coverage_missing_member_count(&fixture.index, &window),
+        2,
+        "owed members are not observed before their selection"
+    );
+    let parsed = owed_selected_parses(
+        &mut fixture.index,
+        &mut evidence_owed::Page::default(),
+        &fixture.candidates,
+        &window,
+    );
+    assert_eq!(parsed, 0);
+    for (root, pending) in &before {
+        let full = ClaudeUsageFamilyPending {
+            census_window_end: window.clone(),
+            ..pending.clone()
+        };
+        assert_eq!(fixture.index.claude_usage_family_pending[root], full);
+    }
+    assert_eq!(
+        claude_duplicate_fence_coverage_missing_member_count(&fixture.index, &window),
+        0
+    );
+
+    // Cap-invalid: invalid, evidence-free pending from the record's window.
+    let (mut fixture, window) = owed_rearmed(1, true);
+    let root = fixture.roots[0].clone();
+    let pending = fixture.index.claude_usage_family_pending.get_mut(&root).unwrap();
+    pending.member_occurrences.clear();
+    pending.member_request_id_hashes.clear();
+    pending.invalid = true;
+    let invalid = pending.clone();
+    for (cap, parsed) in [(0, 0), (MAX_CLAUDE_PENDING_USAGE_OCCURRENCES, 1)] {
+        let mut index = fixture.index.clone();
+        let mut page = evidence_owed::Page {
+            cap,
+            ..Default::default()
+        };
+        assert_eq!(
+            owed_selected_parses(&mut index, &mut page, &fixture.candidates, &window),
+            parsed,
+            "cap {cap}"
+        );
+        assert_eq!(index.claude_usage_family_pending[&root], invalid);
+        assert!(index.files.values().all(|entry| entry.evidence_owed));
+        assert_eq!(
+            claude_duplicate_fence_coverage_missing_member_count(&index, &window),
+            1
+        );
+    }
+
+    // GUARD: an indexed family this census did not prove stays owed.
+    let indexed = BTreeSet::from([root.clone()]);
+    assert!(evidence_owed::owed_at_completion(
+        &root, &invalid, false, &indexed
+    ));
+    assert!(!evidence_owed::owed_at_completion(
+        &root, &invalid, true, &indexed
+    ));
+    assert!(!evidence_owed::owed_at_completion(
+        &root,
+        &invalid,
+        false,
+        &BTreeSet::new()
+    ));
+}
