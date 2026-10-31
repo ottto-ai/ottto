@@ -30,6 +30,7 @@ fn content_witness(scan_root: &Path, path: &Path) -> std::io::Result<(u64, Strin
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let mut file = open_candidate_beneath_root(&candidate)?;
     let metadata = file.metadata()?;

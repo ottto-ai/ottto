@@ -1765,13 +1765,9 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
             "2026-10-29T12:00:00Z",
             BACKFILL_WINDOW_DAYS,
         );
+        advance_bounded_directory_traversal(f.source, &mut f.index, BACKFILL_WINDOW_DAYS, None);
         let traversal = f.index.traversal.as_mut().unwrap();
-        advance_bounded_directory_traversal(
-            f.source,
-            traversal,
-            BACKFILL_WINDOW_DAYS,
-            &f.index.files,
-        );
+
         let a = f.root.join("a.jsonl");
         traversal
             .pending_candidates
@@ -1960,8 +1956,9 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
         "2026-10-29T12:00:00Z",
         BACKFILL_WINDOW_DAYS,
     );
+    advance_bounded_directory_traversal(f.source, &mut f.index, BACKFILL_WINDOW_DAYS, None);
     let traversal = f.index.traversal.as_mut().unwrap();
-    advance_bounded_directory_traversal(f.source, traversal, BACKFILL_WINDOW_DAYS, &f.index.files);
+
     traversal
         .pending_candidates
         .make_contiguous()

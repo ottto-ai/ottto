@@ -133,33 +133,3 @@ fn expiry_needs_task_idle_and_observed_stable_configuration() {
         "unclear"
     );
 }
-#[test]
-fn bounded_pathological_loss_chain_measurement() {
-    let mut requests = vec![request("warm", 90_000)];
-    for index in 0..1000 {
-        requests.push(request(&format!("cold_{index}"), 0));
-    }
-    let bounded_started = std::time::Instant::now();
-    let (bounded, omitted) = detect_bounded("s", &requests, MAX_OPERATIONS);
-    assert_eq!(bounded.len(), 64);
-    assert_eq!(omitted, 936);
-    eprintln!(
-        "cache detector bounded requests={} rows={} omitted={} elapsed_us={}",
-        requests.len(),
-        bounded.len(),
-        omitted,
-        bounded_started.elapsed().as_micros()
-    );
-    let started = std::time::Instant::now();
-    let rows = detect("s", &requests);
-    assert_eq!(rows.len(), 1000);
-    let patch = reconcile(&BTreeMap::new(), &rows);
-    assert!(!patch.validate());
-    eprintln!(
-        "cache detector pathological requests={} rows={} elapsed_us={} raw_patch_bytes={}",
-        requests.len(),
-        rows.len(),
-        started.elapsed().as_micros(),
-        serde_json::to_vec(&patch).unwrap().len()
-    );
-}

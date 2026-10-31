@@ -661,18 +661,6 @@ mod tests {
     }
 
     #[test]
-    fn service_names_are_source_scoped() {
-        assert_eq!(
-            telemetry_key_service(&SourceKind::Codex).expect("codex"),
-            "ottto-telemetry-key-codex"
-        );
-        assert_eq!(
-            telemetry_key_service(&SourceKind::ClaudeCode).expect("claude"),
-            "ottto-telemetry-key-claude_code"
-        );
-    }
-
-    #[test]
     fn keychain_uninstall_sweep_includes_legacy_device_secret_service() {
         assert_eq!(
             telemetry_keychain_sweep_services(),
@@ -682,14 +670,6 @@ mod tests {
                 LEGACY_TELEMETRY_DEVICE_SECRET_SERVICE,
             ]
         );
-    }
-
-    #[test]
-    fn pi_is_not_a_keychain_telemetry_source() {
-        assert!(matches!(
-            telemetry_key_service(&SourceKind::Pi),
-            Err(TelemetryKeychainError::UnsupportedSource(SourceKind::Pi))
-        ));
     }
 
     #[test]

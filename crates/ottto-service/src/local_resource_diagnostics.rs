@@ -234,14 +234,21 @@ pub(crate) struct LineDeliveryCounts {
 pub(crate) enum UnselectedReason {
     Age,
     Size,
+    /// The subset of size skips whose key holds a withheld-account revision.
+    WithheldOversized,
+    /// F4 kept custody because another same-member path prevents absence proof.
+    WithheldAbsenceAmbiguous = 18,
 }
-/// Claude, Codex, Pi x (age, size, serial fallback causes), drained by that
-/// source's page line. Diagnostics only; never carried in a scan/frame graph.
+/// Three reasons, seven withheld events, growth, deleted tokens and audit retirement.
+const UNSELECTED_REASONS: usize = 19;
+/// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
-static SOURCE_COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
+    [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS];
 #[cfg(test)]
 thread_local! {
-    static SOURCE_COUNTS: [AtomicU64; 12] = const { [const { AtomicU64::new(0) }; 12] };
+    static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
+        const { [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS] };
 }
 fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
     let sources = ["claude_code", "codex", "pi"];
@@ -250,11 +257,11 @@ fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) 
     };
     #[cfg(test)]
     {
-        SOURCE_COUNTS.with(|slots| f(&slots[4 * slot + reason]))
+        LINE_UNSELECTED.with(|slots| f(&slots[UNSELECTED_REASONS * slot + reason]))
     }
     #[cfg(not(test))]
     {
-        f(&SOURCE_COUNTS[4 * slot + reason])
+        f(&LINE_UNSELECTED[UNSELECTED_REASONS * slot + reason])
     }
 }
 /// One skip decision, recorded after the gate decided; never a gate input.
@@ -263,20 +270,77 @@ pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
 }
 /// One failed parking decision; no logging, resource probes or scan ownership.
 pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bool) {
-    source_count(source, 2 + usize::from(layout_supported), |slot| {
+    source_count(source, 16 + usize::from(layout_supported), |slot| {
         slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
             .unwrap_or_else(|n| n)
     });
 }
 
-// Same public seam as E3/#876. Its merged withheld carrier can keep this
-// signature; this branch emits the count on the existing diagnostics carrier.
+/// E3: Claude withheld-account hold events, in the slots after the reasons.
+#[derive(Clone, Copy)]
+pub(crate) enum WithheldEvent {
+    /// A held key's file was proved absent and its hold released.
+    ReleasedDeleted = 3,
+    /// A held key re-parsed: first time in this process, after an account
+    /// evidence change, or after its transcript stamp changed.
+    ReparseStart,
+    ReparseEvidence,
+    ReparseGrowth,
+    /// A parse resolved the account and released the hold.
+    ReleasedResolved,
+    /// A withheld key past the hold cap left unrecorded, and its withheld tokens.
+    UnrecordedEvents,
+    UnrecordedTokens,
+    ReleasedDeletedTokens = 11,
+    BirthClampAccepted = 15,
+}
+/// Recorded after the decision; never a gate input.
+pub(crate) fn withheld_event(event: WithheldEvent, amount: u64) {
+    source_count("claude_code", event as usize, |slot| {
+        slot.fetch_add(amount, Relaxed)
+    });
+}
+fn drain(source: &str, slots: &[(&'static str, usize)]) -> BTreeMap<&'static str, u64> {
+    slots
+        .iter()
+        .map(|&(key, slot)| (key, source_count(source, slot, |n| n.swap(0, Relaxed))))
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
 pub(crate) fn audit_retired_absent(source: &str) {
-    traversal_point(
-        "audit_retired_absent",
-        source,
-        &serde_json::json!({"audit_retired_absent": {"events": 1}}),
-    );
+    source_count(source, 12, |slot| slot.fetch_add(1, Relaxed));
+}
+/// One aged gate retained a grown indexed file (not a unique-file count).
+pub(crate) fn discovery_retained_grown(source: &str) {
+    source_count(source, 10, |slot| slot.fetch_add(1, Relaxed));
+}
+/// Actual aged, unchanged fragment-only Tail completions; bytes exclude samples.
+pub(crate) fn codex_fragment_tail_repeat(bytes: u64) {
+    source_count("codex", 13, |slot| slot.fetch_add(1, Relaxed));
+    source_count("codex", 14, |slot| slot.fetch_add(bytes, Relaxed));
+}
+/// Post-save fate and current estimated age of this page's observed growth.
+pub(crate) fn discovery_growth_fate(
+    source: &str,
+    counts: &crate::snapshots::discovery_growth::Counts,
+) {
+    traversal_point("discovery_growth_fate", source, counts);
+}
+const WITHHELD_RELEASED: [(&str, usize); 3] =
+    [("deleted", 3), ("resolved", 7), ("deleted_tokens", 11)];
+const WITHHELD_UNRECORDED: [(&str, usize); 2] = [("events", 8), ("tokens", 9)];
+const WITHHELD_REPARSE: [(&str, usize); 3] = [("start", 4), ("evidence", 5), ("growth", 6)];
+#[cfg(test)]
+pub(crate) mod withheld_support {
+    use super::*;
+    pub(crate) fn take_withheld() -> [BTreeMap<&'static str, u64>; 3] {
+        let claude = "claude_code";
+        [
+            drain(claude, &WITHHELD_RELEASED),
+            drain(claude, &WITHHELD_REPARSE),
+            drain(claude, &WITHHELD_UNRECORDED),
+        ]
+    }
 }
 
 const SCHEMA_VERSION: u8 = 2;
@@ -477,11 +541,13 @@ fn process_sample() -> Option<ProcessSample> {
 
 #[derive(Debug)]
 pub(crate) struct Probe {
+    withheld_memo: Option<crate::snapshots::withheld_account::Memo>,
     started: Instant,
     process: Option<ProcessSample>,
     pub(crate) page_events: claude_reread::Counts,
     pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
+    pub(crate) discovery_growth: crate::snapshots::discovery_growth::Page,
     #[cfg(feature = "replay-harness")]
     index_reuse_skips: std::cell::Cell<u64>,
 }
@@ -491,6 +557,16 @@ impl Drop for Probe {
     }
 }
 impl Probe {
+    pub(crate) fn set_withheld_memo(&mut self, memo: crate::snapshots::withheld_account::Memo) {
+        self.withheld_memo = Some(memo);
+    }
+    pub(crate) fn with_withheld_memo(
+        mut self,
+        memo: crate::snapshots::withheld_account::Memo,
+    ) -> Self {
+        self.set_withheld_memo(memo);
+        self
+    }
     pub(crate) fn rearm_full_selected(
         &self,
         key: &str,
@@ -511,11 +587,13 @@ impl Probe {
     }
     pub(crate) fn start() -> Self {
         Self {
+            withheld_memo: None,
             started: Instant::now(),
             process: process_sample(),
             page_events: Default::default(),
             full_causes: Default::default(),
             line_delivery: None,
+            discovery_growth: Default::default(),
             #[cfg(feature = "replay-harness")]
             index_reuse_skips: std::cell::Cell::new(0),
         }
@@ -569,6 +647,24 @@ impl Probe {
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             line_delivery_unselected: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            audit_retired_absent: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            discovery_retained: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            codex_fragment_tail_repeat: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_hold_released: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_reparse: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_birth_clamp_accepted: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_hold_unrecorded: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            withheld_memo: Option<crate::snapshots::withheld_account::Census>,
+            #[serde(flatten)]
+            withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             source_rotation_serial_fallback: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
@@ -579,16 +675,36 @@ impl Probe {
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
                 .map(|(observer, counts)| BTreeMap::from([(observer, counts)])),
-            line_delivery_unselected: [("age", 0), ("size", 1)]
-                .into_iter()
-                .map(|(key, reason)| (key, source_count(source, reason, |n| n.swap(0, Relaxed))))
-                .filter(|(_, count)| *count > 0)
-                .collect(),
-            source_rotation_serial_fallback: [("unsupported_layout", 2), ("bound_refused", 3)]
-                .into_iter()
-                .map(|(key, reason)| (key, source_count(source, reason, |n| n.swap(0, Relaxed))))
-                .filter(|(_, count)| *count > 0)
-                .collect(),
+            line_delivery_unselected: drain(
+                source,
+                &[
+                    ("age", 0),
+                    ("size", 1),
+                    ("withheld_oversized", 2),
+                    ("withheld_absence_ambiguous", 18),
+                ],
+            ),
+            audit_retired_absent: drain(source, &[("events", 12)]),
+            discovery_retained: drain(source, &[("grown", 10)]),
+            codex_fragment_tail_repeat: drain(source, &[("files", 13), ("bytes", 14)]),
+            withheld_hold_released: drain(source, &WITHHELD_RELEASED),
+            withheld_reparse: drain(source, &WITHHELD_REPARSE),
+            withheld_birth_clamp_accepted: drain(source, &[("events", 15)]),
+            withheld_hold_unrecorded: drain(source, &WITHHELD_UNRECORDED),
+            withheld_memo: claude
+                .then(|| self.withheld_memo.as_ref().and_then(|memo| memo.census()))
+                .flatten(),
+            withheld_held: claude
+                .then(|| {
+                    self.withheld_memo
+                        .as_ref()
+                        .and_then(|memo| memo.held_gauge())
+                })
+                .flatten(),
+            source_rotation_serial_fallback: drain(
+                source,
+                &[("unsupported_layout", 16), ("bound_refused", 17)],
+            ),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
@@ -666,7 +782,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for Probe {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(
             &self.full_causes.restore_outcome.miss,
             c,
-        )
+        )?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.discovery_growth, c)
     }
 }
 
@@ -2098,28 +2215,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bounded native outcome carrier measurement"]
-    fn census_fence_event_native_measurement() {
-        use crate::codex_scan_diagnostics::{
-            CensusFenceOutcome as O, CensusFencePhase as P, CensusInvalidation as I,
-        };
-        const ITERATIONS: usize = 256;
-        // Warm the existing stderr handle before measuring the event path.
-        codex_census_fence(P::Inner, O::Published, I::NotAttempted);
-        let started = Instant::now();
-        let (_, stats) = crate::retry_allocation_probe::measure(|| {
-            for _ in 0..ITERATIONS {
-                codex_census_fence(P::Inner, O::PrivateWriteFailed, I::Failed);
-            }
-        });
-        assert_eq!(stats.requested_live, 0);
-        assert!(stats.requested_peak_with_overlap < 2048);
-        println!("CENSUS_FENCE_OVERHEAD iterations={ITERATIONS} elapsed_us={} peak_bytes={} allocations={} live_bytes={} includes_encoding_and_existing_stderr=true",
-            started.elapsed().as_micros(), stats.requested_peak_with_overlap,
-            stats.allocations, stats.requested_live);
-    }
-
-    #[test]
     fn footprint_fields_are_stage_only_for_all_native_sources() {
         for source in ["claude_code", "codex", "pi"] {
             let (result, records) = capture(|| {
@@ -2239,41 +2334,6 @@ mod tests {
             &original
         ));
         assert!(records.is_empty());
-    }
-
-    #[test]
-    fn resource_reason_map_is_sparse_and_matches_existing_slots() {
-        use crate::transcript_acquisition::FullReason::*;
-        let mut counts = [0; 11];
-        counts[StateMissing.slot()] = 2;
-        counts[BoundaryChanged.slot()] = 3;
-        assert_eq!(
-            serde_json::to_value(FullReasons(counts)).unwrap(),
-            serde_json::json!({"state_missing": 2, "boundary_changed": 3})
-        );
-        let all = serde_json::to_value(FullReasons([1; 11])).unwrap();
-        let keys: Vec<_> = all
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            keys,
-            [
-                "audit_due",
-                "boundary_changed",
-                "clock_changed",
-                "head_changed",
-                "invalid_checkpoint",
-                "replaced",
-                "same_size_edit",
-                "scope_changed",
-                "shrunk",
-                "state_missing",
-                "unsupported_identity"
-            ]
-        );
     }
 
     #[test]

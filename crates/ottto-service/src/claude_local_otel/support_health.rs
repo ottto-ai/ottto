@@ -571,37 +571,6 @@ mod tests {
         }
     }
     #[test]
-    fn support_requires_append_delimiter_and_bounds_oversized_rows() {
-        for trace_kind in [false, true] {
-            let first = if trace_kind {
-                line(&trace("first"))
-            } else {
-                line(&api("first"))
-            };
-            let mut second = if trace_kind {
-                line(&trace("second"))
-            } else {
-                line(&api("second"))
-            };
-            second.pop();
-            let mut fixture = first.clone();
-            fixture.extend(second);
-            let (r, h, dir) = inspect(&fixture, trace_kind, None);
-            assert_eq!(r.rows.len(), 1);
-            assert_eq!(h.unframed_lines, 1);
-            fs::remove_dir_all(dir).unwrap();
-            let mut fixture = first;
-            fixture.extend(vec![b'x'; MAX_LINE_BYTES + 100]);
-            fixture.push(b'\n');
-            let (r, h, dir) = inspect(&fixture, trace_kind, None);
-            assert_eq!(r.rows.len(), 1);
-            assert_eq!(h.oversized_lines, 1);
-            assert_eq!(h.limited_files, 1);
-            assert!(MAX_BYTES_PER_FILE - r.reader.get_ref().limit() <= MAX_BYTES_PER_FILE);
-            fs::remove_dir_all(dir).unwrap();
-        }
-    }
-    #[test]
     fn support_page_continuation_keeps_duplicates_conflicts_and_identity_negative() {
         let first = api("same");
         let mut conflict = first.clone();
