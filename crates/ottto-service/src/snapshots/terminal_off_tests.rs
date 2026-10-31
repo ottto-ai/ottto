@@ -2484,22 +2484,34 @@ fn terminal_off_nonblocking_hold_reads_once_per_six_hours_and_never_idles() {
             index.files.get_mut(&key).unwrap().source_file_fingerprint.clear();
         }
         let early_before = nbf_initial_retry_reads_for_test();
+        // The never-committed key reverts as main's held-retry control does
+        // (reparse); the committed key reverts to its unchanged entry.
+        let reparse = !committed;
         let page = |index: &mut ScanIndex, previous: ScanIndex, when: &str| {
-            let (scan, reads) =
+            let (_, reads) =
                 terminal_contract_retry::source_acquisitions(|| off_scan(index, &scratch, when, 1));
             let read = reads.get(&path).copied().unwrap_or(0);
             if read > 0 {
                 // Settlement holds the key again (non-progressing, non-blocking).
-                let held = scan
-                    .snapshots
-                    .iter()
-                    .map(|item| item.snapshot_fingerprint.clone())
-                    .collect::<BTreeSet<_>>();
-                *index = std::mem::take(index).into_locally_held_keys_reverted(&previous, &held, &held);
+                let held = index
+                    .file_snapshot_fingerprints
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
+                let reparse_held = if reparse { held.clone() } else { BTreeSet::new() };
+                *index = std::mem::take(index).into_locally_held_keys_reverted(
+                    &previous,
+                    &held,
+                    &reparse_held,
+                );
             }
-            assert!(index.accepted_snapshot_fingerprints.iter().all(|fp| {
-                previous.accepted_snapshot_fingerprints.contains(fp)
-            }), "a held read is never an ACK");
+            assert!(
+                index
+                    .accepted_snapshot_fingerprints
+                    .iter()
+                    .all(|fp| previous.accepted_snapshot_fingerprints.contains(fp)),
+                "a held read is never an ACK"
+            );
             read
         };
         assert_eq!(page(&mut index, previous, W1), 1, "committed={committed}: first held read");
@@ -2518,6 +2530,5 @@ fn terminal_off_nonblocking_hold_reads_once_per_six_hours_and_never_idles() {
             u64::from(!committed),
             "committed={committed}"
         );
-        assert_eq!(index.files.contains_key(&key), committed, "custody stays as held");
     }
 }

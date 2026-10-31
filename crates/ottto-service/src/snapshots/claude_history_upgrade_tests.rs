@@ -2088,29 +2088,41 @@ fn terminal_off_semantic_stale_clear_skips_only_a_current_exact_ack() {
     // Main's OFF builder accepts both members; ON then mints their receipts.
     let (home, root, mut index) = families("r11-skip-clear", 1);
     let _on = ClaudeTerminalOffForTest::enabled();
-    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-1".into());
-    expire_terminal_off_discovery_for_test(&index);
-    let mut rescan = scan_source_roots_with_limit(
-        SnapshotSource::ClaudeCode,
-        &[root.clone()],
-        &mut index,
-        COLLECTED_AT,
-        BACKFILL_WINDOW_DAYS,
-        MAX_BACKFILL_FILES_PER_SOURCE,
-        true,
-    )
-    .unwrap();
-    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut rescan, &mut index);
-    let candidates = index.file_upload_context_ack_candidates(&rescan.snapshots);
-    let acks = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(
-        SnapshotSource::ClaudeCode,
-        &rescan.snapshots,
-    );
-    index
-        .accepted_snapshot_fingerprints
-        .extend(acks.keys().cloned());
-    index.accept_file_upload_context_acks(&candidates, &acks);
+    // A new per-file context (the source stays adopted at `ctx-1`): both
+    // members owe it; ON paces context-only reads, so drain real pages and
+    // record each page's validated uploader ACKs as receipts.
     index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-on".into());
+    for _ in 0..4 {
+        if index
+            .files
+            .iter()
+            .all(|(key, entry)| index.receipt_matches(key, entry))
+        {
+            break;
+        }
+        expire_terminal_off_discovery_for_test(&index);
+        let mut page = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            COLLECTED_AT,
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut page, &mut index);
+        let candidates = index.file_upload_context_ack_candidates(&page.snapshots);
+        let acks = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(
+            SnapshotSource::ClaudeCode,
+            &page.snapshots,
+        );
+        index
+            .accepted_snapshot_fingerprints
+            .extend(acks.keys().cloned());
+        index.accept_file_upload_context_acks(&candidates, &acks);
+    }
     let skips = |index: &ScanIndex| {
         with_no_list_cutoff(u64::MAX, || {
             index
@@ -2125,7 +2137,8 @@ fn terminal_off_semantic_stale_clear_skips_only_a_current_exact_ack() {
         let _base = KeepStaleClaudeFamilyRearmForTest::new();
         assert_eq!(skips(&index), [false, false], "BASE keeps main's re-arm");
     }
-    let cases: [(&str, fn(&mut ScanIndex)); 5] = [
+    type Change = fn(&mut ScanIndex);
+    let cases: [(&str, Change); 5] = [
         ("context change", |index| {
             index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-2".into())
         }),
