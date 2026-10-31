@@ -99,15 +99,14 @@ mod tests;
 pub(super) fn enabled() -> bool {
     #[cfg(not(test))]
     {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
+        !super::terminal_off_policy::pinned_marker("money_freshness_disabled")
     }
     #[cfg(test)]
     ENABLED.with(std::cell::Cell::get)
 }
+#[cfg(test)]
 fn enabled_at(support: &std::path::Path) -> bool {
-    !std::fs::symlink_metadata(support.join("money_freshness_disabled"))
-        .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+    !super::terminal_off_policy::marker_at(support, "money_freshness_disabled")
 }
 #[cfg(test)]
 thread_local! {

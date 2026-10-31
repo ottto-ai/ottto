@@ -3,6 +3,7 @@
 use std::path::Path;
 
 pub(super) const NAME: &str = "claude_terminal_off_enabled";
+#[cfg(test)]
 fn enabled_at(support: &Path) -> bool {
     marker_at(support, NAME)
 }
@@ -13,31 +14,40 @@ pub(in crate::snapshots) fn marker_at(support: &Path, name: &str) -> bool {
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
 }
 
+/// Shared process pin for local sentinels. A name is statted only on its
+/// first lookup; #990/#998 can use the same helper without another pin owner.
+#[cfg(not(test))]
+pub(in crate::snapshots) fn pinned_marker(name: &'static str) -> bool {
+    static MARKERS: std::sync::Mutex<std::collections::BTreeMap<&'static str, bool>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let mut markers = MARKERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *markers
+        .entry(name)
+        .or_insert_with(|| marker_at(&ottto_core::default_support_dir(), name))
+}
+
 pub(super) fn enabled() -> bool {
     #[cfg(test)]
     {
-        // A test must opt in on its own thread, never read the host setting.
         ENABLED.with(std::cell::Cell::get)
     }
     #[cfg(not(test))]
     {
-        // Pin policy for this process, including worker threads and yields.
-        // Ron changes the marker himself and restarts the daemon to apply it.
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
+        pinned_marker(NAME)
     }
 }
 
-/// Q-D3: hash the child's consumed root evidence instead of sidecar stats.
+/// Q-D3 opt-in. No marker changes or daemon restarts are performed by agents.
 pub(in crate::snapshots) fn child_evidence_digest() -> bool {
     #[cfg(test)]
-    { false }
+    {
+        false
+    }
     #[cfg(not(test))]
     {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| marker_at(
-            &ottto_core::default_support_dir(), "claude_child_evidence_digest_enabled",
-        ))
+        pinned_marker("claude_child_evidence_digest_enabled")
     }
 }
 

@@ -3737,6 +3737,7 @@ fn decode_api_sidecar_main(
     // A concurrent writer must not defeat the existing per-file read bound.
     let mut reader = BufReader::new((&file).take(MAX_EVIDENCE_FILE_BYTES));
     let (rows, bytes) = decode_api_rows(&mut reader, session_id, &mut health);
+    strict_budget::consumed(bytes);
     #[cfg(test)]
     API_AFTER_READ.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
