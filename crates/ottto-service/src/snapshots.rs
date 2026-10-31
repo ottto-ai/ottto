@@ -4044,7 +4044,7 @@ pub struct ScanIndex {
     /// Reuses the existing appended positional slot.
     #[serde(
         default,
-        skip_serializing_if = "Option::is_none",
+        skip_serializing_if = "claude_desktop_store_inventory_is_legacy",
         deserialize_with = "deserialize_lenient_default"
     )]
     claude_desktop_store_inventory: Option<String>,
@@ -16832,19 +16832,6 @@ impl ClaudeTitleMetadata {
         // The witness serves only contract 5; scans without a permit neither
         // keep nor persist one. Reconciled before the backoff return: a store
         // inventory that changed during backoff never keeps the old witness.
-        let inventory = format!(
-            "desktop_profile_cursor:v1:{}",
-            claude_request_identity::inventory_digest(store_dirs)
-        );
-        if index.claude_desktop_store_inventory.as_ref() != Some(&inventory) {
-            index.claude_desktop_store_inventory = Some(inventory);
-            index.claude_desktop_store_cursor = None;
-            index.claude_desktop_store_upper_bound = None;
-            index.claude_desktop_store_sweep_had_errors = false;
-            index.claude_desktop_identity_census_complete = false;
-            index.claude_desktop_lineage_census_complete = false;
-            index.claude_desktop_census_witness = None;
-        }
         if identity_capture {
             claude_request_identity::DesktopCensusWitness::retain_for_inventory(
                 &mut index.claude_desktop_census_witness,
@@ -16852,6 +16839,26 @@ impl ClaudeTitleMetadata {
             );
         } else {
             index.claude_desktop_census_witness = None;
+        }
+        // Keep the existing 64-byte inventory decoder boundary. The non-hex
+        // version marker distinguishes this 248-bit cursor fence from #851's
+        // legacy SHA-256 digest. This is never account/identity proof.
+        let mut inventory = claude_request_identity::inventory_digest(store_dirs);
+        inventory.replace_range(..2, "p1");
+        if index.claude_desktop_store_inventory.as_ref() != Some(&inventory) {
+            // A retained completion witness already binds a legacy cursor to
+            // these same stores. Preserve that established healthy refresh.
+            let witnessed_inventory = index.claude_desktop_store_inventory.is_none()
+                && index.claude_desktop_census_witness.is_some();
+            index.claude_desktop_store_inventory = Some(inventory);
+            if !witnessed_inventory {
+                index.claude_desktop_store_cursor = None;
+                index.claude_desktop_store_upper_bound = None;
+                index.claude_desktop_store_sweep_had_errors = false;
+                index.claude_desktop_identity_census_complete = false;
+                index.claude_desktop_lineage_census_complete = false;
+                index.claude_desktop_census_witness = None;
+            }
         }
         // A newly discovered profile may hold a conflicting copy. Until the
         // whole inventory is read, an old census cannot prove uniqueness.
@@ -17371,6 +17378,12 @@ fn read_claude_transcript_live_window(
             last_unix_nanos: last,
         });
     Ok((metadata, window))
+}
+
+fn claude_desktop_store_inventory_is_legacy(inventory: &Option<String>) -> bool {
+    inventory
+        .as_deref()
+        .is_none_or(|value| value.len() != 64 || !value.starts_with("p1"))
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -74801,8 +74814,34 @@ mod tests {
         );
         assert!(first.original_identity_census_incomplete);
         assert!(index.claude_desktop_census_witness.is_none());
-        // Exercise the same persisted continuation the production caller reloads.
-        index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        // Exercise the actual bounded production serializer and decoder.
+        let index_path = home.join("scan-index.json");
+        index.save(&index_path).unwrap();
+        index = ScanIndex::load(&index_path).unwrap();
+        let complete = ClaudeTitleMetadata::load_from_roots_with_index(
+            std::slice::from_ref(&projects),
+            &mut index,
+            "2026-07-10T10:05:00Z",
+            true,
+        );
+        assert!(!complete.original_identity_census_incomplete);
+        assert_eq!(
+            complete
+                .session_account_evidence("shared")
+                .identity_disposition,
+            Some("complete")
+        );
+        let refresh = ClaudeTitleMetadata::load_from_roots_with_index(
+            std::slice::from_ref(&projects),
+            &mut index,
+            "2026-07-10T10:06:00Z",
+            true,
+        );
+        assert!(refresh.sidecar_census_incomplete);
+        // A missing completion witness must not disable the inventory fence.
+        index.claude_desktop_census_witness = None;
+        index.save(&index_path).unwrap();
+        index = ScanIndex::load(&index_path).unwrap();
         let alt = support.join("Claude-ALT");
         let other = alt
             .join("claude-code-sessions")
@@ -74814,13 +74853,14 @@ mod tests {
         let deferred = ClaudeTitleMetadata::load_from_roots_with_index(
             std::slice::from_ref(&projects),
             &mut index,
-            "2026-07-10T10:04:01Z",
+            "2026-07-10T10:06:01Z",
             true,
         );
         assert!(deferred.original_identity_census_incomplete);
         assert!(index.claude_desktop_census_witness.is_none());
-        index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
-        for at in ["2026-07-10T10:05:00Z", "2026-07-10T10:07:00Z"] {
+        index.save(&index_path).unwrap();
+        index = ScanIndex::load(&index_path).unwrap();
+        for at in ["2026-07-10T10:07:00Z", "2026-07-10T10:09:00Z"] {
             let metadata = ClaudeTitleMetadata::load_from_roots_with_index(
                 std::slice::from_ref(&projects),
                 &mut index,
@@ -74834,7 +74874,8 @@ mod tests {
                 Some("conflict")
             );
             assert!(metadata.account_identifier_hash("shared").is_none());
-            index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+            index.save(&index_path).unwrap();
+            index = ScanIndex::load(&index_path).unwrap();
         }
         assert!(index.claude_desktop_identity_census_complete);
     }
