@@ -1,6 +1,7 @@
 //! Offline shared-reader, native-reducer and production-scanner regression tests.
 //! No fixture content comes from a provider account.
 use super::*;
+use crate::snapshots::sampled_scan::transition_fixture::native_cold;
 use crate::transcript_acquisition::{ReadMode, Scope};
 use crate::transcript_cache::{Retained, TranscriptCache};
 use std::fs::OpenOptions;
@@ -4431,8 +4432,6 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
 fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
-    use crate::transcript_acquisition::ReadPlan;
-    use std::io::Read;
     // Match production_scan's cfg(test) capture mode for both sources.
     let identity_capture = true;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
@@ -4446,16 +4445,10 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
         let record_key = store::key_digest(ds, &key);
         let now = unix_seconds(SystemTime::now()).unwrap();
         let mut file = File::open(&fixture.file.0).unwrap();
-        let mut plan = ReadPlan::prepare(&mut file, None, &namespace, None, now).unwrap();
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        plan.observe_complete_records(&bytes).unwrap();
-        let checkpoint = plan
-            .commit_after_native_completion(&file, &namespace, now)
-            .unwrap();
+        let checkpoint = native_cold::checkpoint(&mut file, &namespace, now);
         let mut certificate = checkpoint.durable_certificate(0).unwrap();
         certificate.audit_debt_unix_seconds = Some(now + 60);
-        let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        let mut disk = native_cold::store(&index_path, ds);
         let pending = store::PendingRecord {
             acquisition: Some(store::AcquisitionFields {
                 acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
@@ -4582,8 +4575,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
                 original,
                 "the verified Full owns its native write-ahead receipt"
             );
-            let mut disk =
-                store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+            let mut disk = native_cold::store(&index_path, ds);
             assert!(
                 matches!(disk.read(&record_key), store::ReadOutcome::Found(record) if record.format == store::FORMAT_V3)
             );
@@ -4601,7 +4593,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
             original,
             "Full replaces the predecessor"
         );
-        let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        let mut disk = native_cold::store(&index_path, ds);
         let store::ReadOutcome::Found(replacement) = disk.read(&record_key) else {
             panic!("Full replacement must remain on disk");
         };
@@ -4706,8 +4698,6 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
 fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_both_sources() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
-    use crate::transcript_acquisition::ReadPlan;
-    use std::io::Read;
     // Match production_scan's cfg(test) capture mode for both sources.
     let identity_capture = true;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
@@ -4721,16 +4711,10 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
         let record_key = store::key_digest(ds, &key);
         let now = unix_seconds(SystemTime::now()).unwrap();
         let mut file = File::open(&fixture.file.0).unwrap();
-        let mut plan = ReadPlan::prepare(&mut file, None, &namespace, None, now).unwrap();
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        plan.observe_complete_records(&bytes).unwrap();
-        let checkpoint = plan
-            .commit_after_native_completion(&file, &namespace, now)
-            .unwrap();
+        let checkpoint = native_cold::checkpoint(&mut file, &namespace, now);
         let mut certificate = checkpoint.durable_certificate(0).unwrap();
         certificate.audit_debt_unix_seconds = Some(now);
-        let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        let mut disk = native_cold::store(&index_path, ds);
         let pending = store::PendingRecord {
             acquisition: Some(store::AcquisitionFields {
                 acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
@@ -4917,8 +4901,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
                 1
             );
             assert_ne!(fs::read(&record_path).unwrap(), original);
-            let mut disk =
-                store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+            let mut disk = native_cold::store(&index_path, ds);
             let store::ReadOutcome::Found(record) = disk.read(&record_key) else {
                 panic!("verified Full must replace the old debt record");
             };
@@ -4951,8 +4934,6 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
 fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
-    use crate::transcript_acquisition::ReadPlan;
-    use std::io::Read;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         for matching in [true, false] {
             let fixture = ScanFixture::new(source);
@@ -4965,17 +4946,10 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
             let record_key = store::key_digest(ds, &key);
             let now = unix_seconds(SystemTime::now()).unwrap();
             let mut file = File::open(&fixture.file.0).unwrap();
-            let mut plan = ReadPlan::prepare(&mut file, None, &namespace, None, now).unwrap();
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).unwrap();
-            plan.observe_complete_records(&bytes).unwrap();
-            let checkpoint = plan
-                .commit_after_native_completion(&file, &namespace, now)
-                .unwrap();
+            let checkpoint = native_cold::checkpoint(&mut file, &namespace, now);
             let mut certificate = checkpoint.durable_certificate(0).unwrap();
             certificate.audit_debt_unix_seconds = Some(now + 600);
-            let mut disk =
-                store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+            let mut disk = native_cold::store(&index_path, ds);
             let pending = store::PendingRecord {
                 acquisition: Some(store::AcquisitionFields {
                     acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
@@ -5658,8 +5632,8 @@ fn native_v3_ordinary_save_then_second_restart_tails_without_a_full() {
         assert_eq!(after_gc.guard_header_bytes, before_gc.guard_header_bytes);
         assert_eq!(after_gc.guard_verify_bytes, before_gc.guard_verify_bytes);
         assert!(after_gc.gc_bytes_read > before_gc.gc_bytes_read);
-        let mut disk = store::DurableTailStore::new(
-            store::store_dir_for_index(&index_path),
+        let mut disk = native_cold::store(
+            &index_path,
             sampled_scan::durable_tail::durable_source(source).unwrap(),
         );
         let record = match disk.read(&store::key_digest(

@@ -1,6 +1,7 @@
 //! Offline cursor-job, page-budget, S5 reader and singleton-memo tests.
 //! Every fixture is synthetic; no provider account content.
 use super::*;
+use crate::snapshots::sampled_scan::transition_fixture::native_cold;
 use std::fs::OpenOptions;
 use std::io::{BufReader, Write};
 use std::os::unix::fs::FileExt;
@@ -12551,7 +12552,6 @@ fn mcp_version_waits_for_resumed_cursor_eof() {
 fn parked_singleton_across_fresh_index_reprobes_record_debt() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
-    use std::io::Read;
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -12575,21 +12575,13 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
     let now = crate::snapshots::sampled_scan::now_seconds();
     let due = now - 90;
     let mut file = fs::File::open(&path).unwrap();
-    let mut plan =
-        crate::transcript_acquisition::ReadPlan::prepare(&mut file, None, &scope, None, now)
-            .unwrap();
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).unwrap();
-    plan.observe_complete_records(&bytes).unwrap();
-    let mut certificate = plan
-        .commit_after_native_completion(&file, &scope, now)
-        .unwrap()
+    let mut certificate = native_cold::checkpoint(&mut file, &scope, now)
         .durable_certificate(0)
         .unwrap();
     certificate.audit_debt_unix_seconds = Some(due);
     let ds = store::DurableSource::Codex;
     let lock = crate::locked_state_dir::test_locks::hold(&state);
-    let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let mut disk = native_cold::store(&index_path, ds);
     let pending = store::PendingRecord {
         acquisition: Some(store::AcquisitionFields {
             acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
