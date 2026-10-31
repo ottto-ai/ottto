@@ -900,9 +900,46 @@ impl HeaderInventory {
             .checked_add(results.checked_mul(48)?)?;
         // Owners move from facts into the table. The fact allocation is gone
         // before results are built; the table is gone before holds are applied.
-        let fact_phase = base.checked_add(fact_bytes)?.checked_add(owners)?;
-        let table_phase = base.checked_add(fact_bytes)?.checked_add(table_bytes)?;
-        let result_phase = base.checked_add(table_bytes)?.checked_add(result_bytes)?;
+        // A prior view keeps its keys alive after the old classification is
+        // released. Those allocations coexist with construction scratch until
+        // the new roster is complete and the view keys can be rebound.
+        let mut retained_views = 0usize;
+        if self.archive_classes.is_empty() {
+            retained_views = self
+                .family_held
+                .0
+                .capacity()
+                .checked_mul(std::mem::size_of::<(Arc<String>, bool)>())?
+                .checked_add(
+                    self.deferred_archives
+                        .0
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<(Arc<String>, ())>())?,
+                )?;
+            for key in self.family_held.0.iter().map(|(key, _)| key).chain(
+                self.deferred_archives
+                    .0
+                    .iter()
+                    .filter(|(key, _)| {
+                        self.family_held
+                            .position(key)
+                            .map_or(true, |at| !Arc::ptr_eq(key, &self.family_held.0[at].0))
+                    })
+                    .map(|(key, _)| key),
+            ) {
+                retained_views = retained_views.checked_add(key.capacity().checked_add(48)?)?;
+            }
+        }
+        let construction_base = base.checked_add(retained_views)?;
+        let fact_phase = construction_base
+            .checked_add(fact_bytes)?
+            .checked_add(owners)?;
+        let table_phase = construction_base
+            .checked_add(fact_bytes)?
+            .checked_add(table_bytes)?;
+        let result_phase = construction_base
+            .checked_add(table_bytes)?
+            .checked_add(result_bytes)?;
         let mut peak = fact_phase.max(table_phase).max(result_phase);
         // The compact result stays live while custody maps/sets are populated.
         // Fund their resident bytes and every prospective insertion before any
@@ -988,6 +1025,7 @@ impl HeaderInventory {
                         .capacity()
                         .checked_add(self.deferred_archives.0.capacity())?
                         .checked_add(additions)?
+                        .max(4)
                         .checked_mul(32)?,
                 )?;
                 cost.add(
@@ -1026,6 +1064,10 @@ impl HeaderInventory {
             "codex_zst_held",
             "codex",
             &BTreeMap::from([
+                (
+                    "archive_classification_retained_views_bytes",
+                    retained_views as u64,
+                ),
                 ("archive_classification_fact_bytes", fact_phase as u64),
                 ("archive_classification_table_bytes", table_phase as u64),
                 ("archive_classification_result_bytes", result_phase as u64),
