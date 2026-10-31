@@ -1,4 +1,5 @@
 use crate::claude_status_coverage::Observation as CoverageObservation;
+use crate::locked_state_dir::open_private_lock_file;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
 use ottto_core::claude_account_identifier_hash;
@@ -9273,33 +9274,18 @@ fn merge_claude_slot_collection_state_at(
 }
 
 fn claude_slot_collection_state_guard() -> std::io::Result<ClaudeSlotCollectionStateGuard> {
+    use std::os::fd::AsRawFd;
     let process = CLAUDE_SLOT_COLLECTION_STATE_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     fs::create_dir_all(default_support_dir())?;
-    #[cfg(unix)]
-    let file = {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        file
-    };
-    #[cfg(not(unix))]
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE))?;
+    let file = open_private_lock_file(
+        &default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE),
+    )?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(ClaudeSlotCollectionStateGuard {
         _process: process,
         file: Some(file),
@@ -12790,6 +12776,7 @@ fn try_claude_oauth_collection_attempt(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
 ) -> Option<ClaudeOAuthCollectionAttemptGuard> {
+    use std::os::fd::AsRawFd;
     let process_lock = {
         let mut locks = CLAUDE_OAUTH_COLLECTION_ATTEMPT_LOCKS
             .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -12812,31 +12799,10 @@ fn try_claude_oauth_collection_attempt(
     if fs::create_dir_all(&account_root).is_err() {
         return None;
     }
-    let lock_path = account_root.join(".collection-attempt.lock");
-    #[cfg(unix)]
-    let file = {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(lock_path)
-            .ok()?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return None;
-        }
-        file
-    };
-    #[cfg(not(unix))]
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(lock_path)
-        .ok()?;
+    let file = open_private_lock_file(&account_root.join(".collection-attempt.lock")).ok()?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
     Some(ClaudeOAuthCollectionAttemptGuard {
         _process: process,
         file,

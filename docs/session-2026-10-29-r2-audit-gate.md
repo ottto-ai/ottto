@@ -290,8 +290,8 @@ tokens remain unreported until shared withheld-account bookkeeping lands.
 Whichever implementation integrates second must unify onto one emitter per
 count and retain the exactly-once fixture; both retirement paths stay present.
 
-Round17 composes with main's rearm attribution, optional Codex header facts and
-development replay harness. Incidental telemetry-only Unchanged reads before
+Round17 composes with main's rearm attribution and optional Codex header facts.
+Incidental telemetry-only Unchanged reads before
 the audit deadline preserve index and checkpoint debt exactly; only a due,
 eligible sampled quiet validation can retire it. Cap Full fallback keeps the
 ordinary frozen acquisition extent while existing prefix/marker refusals stay.
