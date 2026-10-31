@@ -4,9 +4,12 @@ use std::path::Path;
 
 pub(super) const NAME: &str = "claude_terminal_off_enabled";
 fn enabled_at(support: &Path) -> bool {
+    marker_at(support, NAME)
+}
+pub(in crate::snapshots) fn marker_at(support: &Path, name: &str) -> bool {
     // As with mcp_inventory/disabled and context_footprint/disabled, the
     // owner's local marker is the setting. Refuse symlinks and non-files.
-    std::fs::symlink_metadata(support.join(NAME))
+    std::fs::symlink_metadata(support.join(name))
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
 }
 
