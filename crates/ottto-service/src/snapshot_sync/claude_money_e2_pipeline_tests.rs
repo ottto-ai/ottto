@@ -252,6 +252,7 @@ impl Page {
                     Some((&self.cache, &self.committed)),
                     accepted,
                     None,
+                    None,
                 )
                 .unwrap()
             });

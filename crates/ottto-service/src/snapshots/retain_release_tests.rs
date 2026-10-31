@@ -1181,6 +1181,9 @@ fn x_out_coverage_witness_names_every_finished_field() {
             claude_org_markers: _, // M
             claude_account_withheld_reason: _, // I (&'static str)
             claude_account_display: _, // K (None at finish; set post-scan, contract-5 tagging)
+            history_segment: _, // K (None at finish; set by the settled-history cut)
+            history_segments: _, // K (None at finish; set by the settled-history cut)
+            history_cut: _,  // K (empty at finish; set by the settled-history cut)
         } = item;
     };
 }

@@ -474,3 +474,189 @@ fn replay_generation_or_namespace_change_clears_retained_proof() {
     assert_eq!(counts["identity_cap"]["retained_set_cleared"], json!(2));
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
+
+/// One settled-history group: a segment of the old window and the live body
+/// past `through`, each tagged with its own account, as bodies on the wire.
+fn history_group() -> [Value; 2] {
+    let row = |account: char| json!({"model":"claude-synthetic","evidence_ref":0,"account_identifier_hash":account.to_string().repeat(64)});
+    let body = |session: &str, fingerprint: char, start: &str, account: char, extra: Value| {
+        let mut body = json!({"source_session_id": session, "snapshot_fingerprint": fingerprint.to_string().repeat(64),
+            "provenance":{"collector":crate::snapshots::claude_request_identity::COLLECTOR},
+            "request_evidence":[{"identity_basis":"telemetry_login"}],
+            "usage_buckets":[{"bucket_start": start, "model_usage":[row(account)]}]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    [
+        body(
+            "synthetic-group#w20260827",
+            'd',
+            "2026-08-28T10:00:00Z",
+            'a',
+            json!({"history_segment":{"of":"synthetic-group","window_start":"2026-08-27T00:00:00Z","window_end":"2026-09-03T00:00:00Z"}}),
+        ),
+        body(
+            "synthetic-group",
+            'e',
+            "2026-09-29T10:00:00Z",
+            'b',
+            json!({"history_segments":{"through":"2026-09-03T00:00:00Z","count":1}}),
+        ),
+    ]
+}
+
+fn group_page(progress: &mut SnapshotUploadProgress, items: &[Value], conflicted: &[usize]) {
+    let mut accepted = 0;
+    attempt_snapshot_page(
+        items,
+        &(0..items.len()).collect::<Vec<_>>(),
+        "synthetic-history-group",
+        progress,
+        &mut accepted,
+        &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
+        &|_: &Value| "c".repeat(64),
+        &|value: &Value| value["source_session_id"].as_str(),
+        &mut |_| {
+            let entity = |index: usize| crate::snapshot_client::SnapshotEntityRef {
+                source_session_id: items[index]["source_session_id"].as_str().unwrap().into(),
+                snapshot_fingerprint: items[index]["snapshot_fingerprint"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                occurrence_count: 1,
+                body_witness_version: None,
+                body_witness_digest: None,
+                head_etag: None,
+                head_challenge: None,
+                unchanged_basis: None,
+                retained_proof_missing: Vec::new(),
+            };
+            let (conflict, accepted): (Vec<_>, Vec<_>) =
+                (0..items.len()).partition(|index| conflicted.contains(index));
+            Ok(crate::snapshot_client::SnapshotBatchResponse {
+                accepted: accepted.len() as u64,
+                sessions_reconciled: 0,
+                session_ids: vec![],
+                disabled: false,
+                disabled_reason: None,
+                entity_ack_contract: Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+                accepted_entities: accepted.into_iter().map(entity).collect(),
+                unchanged_entities: vec![],
+                rejected_entities: vec![],
+                conflict_entities: conflict.into_iter().map(entity).collect(),
+            })
+        },
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+}
+
+/// [money] Lead B C3: a settled-history group settles whole. With the live
+/// ACK lost (conflicted), nothing of the group is recorded or settled, so
+/// the moved bucket stays protected by the live entry and the segment is
+/// offered again; once the whole group ACKs, the segment records into its own
+/// sibling entry before the live body drops the moved bucket.
+#[test]
+fn history_group_settles_whole_segments_before_live() {
+    let mut progress = progress();
+    progress
+        .accepted_identity_segments
+        .bind_test_key(Some([0x42; 32]));
+    let [segment, live] = history_group();
+    // The unsegmented body was ACKed before: the live entry holds both hours.
+    let mut whole = live.clone();
+    whole.as_object_mut().unwrap().remove("history_segments");
+    whole["usage_buckets"] = json!([segment["usage_buckets"][0], live["usage_buckets"][0]]);
+    progress.record_cache_state(&whole, false).unwrap();
+    let held = progress
+        .accepted_identity_buckets
+        .get("synthetic-group")
+        .unwrap()
+        .len();
+    assert_eq!(held, 2);
+    let items = [segment, live];
+    group_page(&mut progress, &items, &[1]);
+    assert!(!progress.accepted_fingerprints.contains(&"d".repeat(64)));
+    assert!(progress
+        .accepted_identity_segments
+        .get("synthetic-group#w20260827")
+        .is_none());
+    assert_eq!(
+        progress
+            .accepted_identity_buckets
+            .get("synthetic-group")
+            .unwrap()
+            .len(),
+        2
+    );
+    progress.active_quarantine_retries.clear();
+    progress.quarantined_fingerprints.clear();
+    group_page(&mut progress, &items, &[]);
+    for fingerprint in ['d', 'e'] {
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&fingerprint.to_string().repeat(64)));
+    }
+    assert_eq!(
+        progress
+            .accepted_identity_segments
+            .get("synthetic-group#w20260827")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        progress
+            .accepted_identity_buckets
+            .get("synthetic-group")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// [format] Segment hints persist in their own sibling field, beside the
+/// live map; an older progress decoder ignores the field and keeps ACKs.
+#[test]
+fn segment_hints_persist_in_a_sibling_field_older_decoders_ignore() {
+    let mut progress = progress();
+    progress
+        .accepted_identity_segments
+        .bind_test_key(Some([0x42; 32]));
+    let [segment, _] = history_group();
+    progress.record_body(&"d".repeat(64), &"c".repeat(64));
+    progress.record_cache_state(&segment, false).unwrap();
+    assert!(progress
+        .accepted_identity_buckets
+        .get("synthetic-group#w20260827")
+        .is_none());
+    let bytes = serde_json::to_vec(&progress).unwrap();
+    let saved: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(saved.get("accepted_identity_buckets").is_none());
+    assert_eq!(
+        saved["accepted_identity_segments"]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut restored: SnapshotUploadProgress = serde_json::from_slice(&bytes).unwrap();
+    restored
+        .accepted_identity_segments
+        .bind_test_key(Some([0x42; 32]));
+    assert_eq!(
+        restored.accepted_identity_segments,
+        progress.accepted_identity_segments
+    );
+    #[derive(Deserialize)]
+    struct OlderProgress {
+        accepted_body_witnesses: BTreeMap<String, String>,
+    }
+    let older: OlderProgress = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        older.accepted_body_witnesses,
+        progress.accepted_body_witnesses
+    );
+}

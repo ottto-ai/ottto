@@ -481,6 +481,7 @@ impl SnapshotUploadProgress {
                 .context("upload witness missing")?,
         );
         projected.accepted_identity_buckets = self.accepted_identity_buckets.clone();
+        projected.accepted_identity_segments = self.accepted_identity_segments.clone();
         let mut padding = 20_u64; // generation may grow to u64::MAX at save
         for &item in items {
             let fp = fingerprint(item);
@@ -501,16 +502,27 @@ impl SnapshotUploadProgress {
                 projected.accepted_cache_heads.insert(key, "f".repeat(64));
             }
             let before_identity = serde_json::to_value(&projected.accepted_identity_buckets)?;
+            let before_segments = serde_json::to_value(&projected.accepted_identity_segments)?;
             projected.record_stored_state(item, false, None, true)?;
             let after_identity = serde_json::to_value(&projected.accepted_identity_buckets)?;
-            if let Some(sessions) = after_identity.as_object() {
-                for (key, session) in sessions {
-                    if before_identity.get(key) != Some(session) {
+            let after_segments = serde_json::to_value(&projected.accepted_identity_segments)?;
+            for (field, before, after) in [
+                (
+                    "accepted_identity_buckets",
+                    &before_identity,
+                    &after_identity,
+                ),
+                (
+                    "accepted_identity_segments",
+                    &before_segments,
+                    &after_segments,
+                ),
+            ] {
+                for (key, session) in after.as_object().into_iter().flatten() {
+                    if before.get(key) != Some(session) {
                         padding = padding.saturating_add(
-                            serde_json::to_vec_pretty(
-                                &serde_json::json!({"accepted_identity_buckets": {key: session}}),
-                            )?
-                            .len() as u64,
+                            serde_json::to_vec_pretty(&serde_json::json!({field: {key: session}}))?
+                                .len() as u64,
                         );
                     }
                 }
@@ -554,6 +566,8 @@ impl SnapshotUploadProgress {
         // session snapshots above reserve mixed-response/replacement space;
         // unchanged cloned sessions must not consume the budget a second time.
         projected.accepted_identity_buckets = Default::default();
+        projected.accepted_identity_segments =
+            crate::snapshots::claude_request_identity::AcceptedBuckets::segments();
         let mut length = SnapshotPackingLength { bytes: 0 };
         serde_json::to_writer_pretty(&mut length, self)?;
         serde_json::to_writer_pretty(&mut length, &projected)?;

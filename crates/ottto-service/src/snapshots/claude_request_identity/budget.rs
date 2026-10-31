@@ -52,13 +52,17 @@ pub(crate) struct Counts {
     pub(crate) retained_missing_unfit: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) proved_rows_capped: u64,
+    /// Settled-history segment entries above the stated design maximum.
+    /// An alarm only: segment entries are never evicted by count.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) accepted_segments_over_design: u64,
 }
 impl Counts {
     pub(super) fn is_empty(&self) -> bool {
         self == &Self::default()
     }
 }
-const COUNTER_COUNT: usize = 18;
+const COUNTER_COUNT: usize = 19;
 #[cfg(not(test))]
 static COUNTERS: [AtomicU64; COUNTER_COUNT] = [const { AtomicU64::new(0) }; COUNTER_COUNT];
 #[cfg(test)]
@@ -97,13 +101,14 @@ pub(super) fn record(counts: &Counts) {
             counts.retained_set_cleared,
             counts.retained_missing_unfit,
             counts.proved_rows_capped,
+            counts.accepted_segments_over_design,
         ]) {
             let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(value)));
         }
     });
 }
 pub(super) fn take_counts() -> Counts {
-    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, accepted_state_evicted, same_as_parent, differs, unpriced_part_untagged, accepted_row_vanished, no_key, epoch_changed, untracked_session, incomplete, retained_marker_rows, retained_proof_missing_received, retained_set_cleared, retained_missing_unfit, proved_rows_capped] =
+    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, accepted_state_evicted, same_as_parent, differs, unpriced_part_untagged, accepted_row_vanished, no_key, epoch_changed, untracked_session, incomplete, retained_marker_rows, retained_proof_missing_received, retained_set_cleared, retained_missing_unfit, proved_rows_capped, accepted_segments_over_design] =
         counters(|counters| counters.each_ref().map(|counter| counter.swap(0, Relaxed)));
     Counts {
         retained_buckets,
@@ -128,6 +133,7 @@ pub(super) fn take_counts() -> Counts {
         retained_set_cleared,
         retained_missing_unfit,
         proved_rows_capped,
+        accepted_segments_over_design,
     }
 }
 

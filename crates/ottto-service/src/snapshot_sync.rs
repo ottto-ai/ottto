@@ -93,7 +93,7 @@ const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: i64 = 15;
 // bound for pathological backfill batches. Normal incremental scans are
 // usually a single small chunk; historical replay avoids count-only 50-item
 // requests that could consume the backend's full wire budget.
-const SNAPSHOT_BATCH_LIMIT: usize = 50;
+pub(crate) const SNAPSHOT_BATCH_LIMIT: usize = 50;
 // Leave half of the backend's 4 MiB uncompressed request cap for derived
 // semantic envelopes and bounded request metadata. The exact request serializer
 // is still checked immediately before network I/O by
@@ -1503,6 +1503,14 @@ struct SnapshotUploadProgress {
         skip_serializing_if = "crate::snapshots::claude_request_identity::AcceptedBuckets::is_empty"
     )]
     accepted_identity_buckets: crate::snapshots::claude_request_identity::AcceptedBuckets,
+    /// Class L hints of settled-history segment entities, beside (never in)
+    /// the capped live map; an older daemon ignores this field.
+    #[serde(
+        default = "crate::snapshots::claude_request_identity::AcceptedBuckets::segments",
+        deserialize_with = "crate::snapshots::claude_request_identity::decode_segments",
+        skip_serializing_if = "crate::snapshots::claude_request_identity::AcceptedBuckets::is_empty"
+    )]
+    accepted_identity_segments: crate::snapshots::claude_request_identity::AcceptedBuckets,
     #[serde(default)]
     accepted_cache_heads: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1571,6 +1579,8 @@ impl SnapshotUploadProgress {
             retained_stale_ack_count: 0,
             accepted_cache_states: BTreeMap::new(),
             accepted_identity_buckets: Default::default(),
+            accepted_identity_segments:
+                crate::snapshots::claude_request_identity::AcceptedBuckets::segments(),
             accepted_cache_heads: BTreeMap::new(),
             pending_cache_heads: BTreeMap::new(),
             quarantined_fingerprints: BTreeMap::new(),
@@ -1628,6 +1638,9 @@ impl SnapshotUploadProgress {
             if progress.destination_namespace_hash != expected_destination_namespace_hash {
                 progress
                     .accepted_identity_buckets
+                    .count_retained_cleared_if_any();
+                progress
+                    .accepted_identity_segments
                     .count_retained_cleared_if_any();
             }
         }
@@ -2202,6 +2215,7 @@ impl SnapshotUploadProgress {
         }
         self.historical_replay_generation = Some(generation.to_string());
         self.accepted_identity_buckets.clear_retained();
+        self.accepted_identity_segments.clear_retained();
         self.accepted_fingerprints.clear();
         self.accepted_body_witnesses.clear();
         self.accepted_body_contexts.clear();
@@ -2332,10 +2346,17 @@ impl SnapshotUploadProgress {
         else {
             return Ok(());
         };
-        if preview {
-            self.accepted_identity_buckets.preview_record(&value);
+        // Settled-history segments key their own sibling entries (C1).
+        let segment = value["history_segment"].is_object();
+        let ledger = if segment {
+            &mut self.accepted_identity_segments
         } else {
-            self.accepted_identity_buckets.record(&value);
+            &mut self.accepted_identity_buckets
+        };
+        if preview {
+            ledger.preview_record(&value);
+        } else {
+            ledger.record(&value);
         }
         if let Some((entity, local_witness)) = stored {
             // Mirrors `snapshot_ack_body_witness_version`'s public domains.
@@ -2346,17 +2367,22 @@ impl SnapshotUploadProgress {
             ]
             .iter()
             .any(|field| value.get(field).is_some_and(|leaf| !leaf.is_null()));
-            let witnessed = self.accepted_identity_buckets.retained_enabled()
+            let ledger = if segment {
+                &mut self.accepted_identity_segments
+            } else {
+                &mut self.accepted_identity_buckets
+            };
+            let witnessed = ledger.retained_enabled()
                 && versioned_body
                 && entity.body_witness_version.is_some()
                 && entity.body_witness_digest.as_deref() == Some(local_witness);
             if witnessed || !entity.retained_proof_missing.is_empty() {
-                self.accepted_identity_buckets.record_proved(
-                    &value,
-                    witnessed,
-                    &entity.retained_proof_missing,
-                );
+                ledger.record_proved(&value, witnessed, &entity.retained_proof_missing);
             }
+        }
+        if !segment && !preview {
+            // The live body's cut is stored: segments past it are retired.
+            self.accepted_identity_segments.retire(&value);
         }
         let key = cache_session_key(session);
         // Count-only legacy ACKs cannot distinguish changed from unchanged.
@@ -2931,6 +2957,7 @@ impl SnapshotUploadProgress {
             && self.accepted_cache_heads.is_empty()
             && self.pending_cache_heads.is_empty()
             && self.accepted_identity_buckets.is_empty()
+            && self.accepted_identity_segments.is_empty()
         {
             return self.clear(path);
         }
@@ -4882,6 +4909,9 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         claude_org_markers: None,
         claude_account_withheld_reason: None,
         claude_account_display: None,
+        history_segment: None,
+        history_segments: None,
+        history_cut: Vec::new(),
         session_account_evidence: item.session_account_evidence.clone(),
         source_session_id: item.source_session_id.clone(),
         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
@@ -7516,18 +7546,22 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
-    upload_progress
-        .accepted_identity_buckets
-        .bind_context(attribution_context.as_ref());
-    upload_progress
-        .accepted_identity_buckets
-        .set_retained_enabled(
-            source == SnapshotSource::ClaudeCode
-                && activity_hint
-                    .session_request_identity_retained_contract
-                    .as_deref()
-                    == Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT),
-        );
+    let retained_enabled = source == SnapshotSource::ClaudeCode
+        && activity_hint
+            .session_request_identity_retained_contract
+            .as_deref()
+            == Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT);
+    for ledger in [
+        &mut upload_progress.accepted_identity_buckets,
+        &mut upload_progress.accepted_identity_segments,
+    ] {
+        ledger.bind_context(attribution_context.as_ref());
+        ledger.set_retained_enabled(retained_enabled);
+    }
+    // Settled-history segments: only the server's exact token cuts a body.
+    let history_segments_now = (activity_hint.session_history_segments_contract.as_deref()
+        == Some(crate::snapshots::history_segments::CONTRACT))
+    .then(|| OffsetDateTime::now_utc().unix_timestamp());
     let _state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
@@ -7666,6 +7700,7 @@ fn finish_sync_source(
             native_comparison_lease.as_ref(),
             Some((&daemon.transcript_cache, &committed_index)),
             Some(&upload_progress.accepted_identity_buckets),
+            history_segments_now.map(|now| (&upload_progress.accepted_identity_segments, now)),
             Some(&reserve_cache_bytes),
         );
         let (disposition, census_withheld, stats) = match applied {
@@ -7777,6 +7812,15 @@ fn finish_sync_source(
         },
     );
     backfill_succeeded &= scan_result.census_complete;
+    // Settled-history segments: one shared cut, after policy and the account
+    // cutoff and before capture and finalization see the page's entities.
+    crate::snapshots::history_segments::expand_page(
+        source,
+        &mut scan_result.snapshots,
+        history_segments_now,
+        upload_policy,
+    );
+    claude_authority_disposition.hold_segments_with_live(&scan_result.snapshots);
     let deferred_cache_head_identities = capture_deferred_cache_head_identities(
         source,
         &scan_result.snapshots,
@@ -8194,7 +8238,8 @@ fn finish_sync_source(
             snapshot_upload_body_witness,
             |snapshot| Some(snapshot.source_session_id.as_str()),
             |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
-            crate::snapshots::claude_request_money::request_owned_family_root,
+            // A cut session's group is one packing unit, so it shares a batch.
+            crate::snapshots::history_segments::packing_unit,
             &mut inplace_retry,
             |snapshots| {
                 // A first Codex/Claude scan can spend several minutes parsing local
@@ -9703,6 +9748,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
         None,
         accepted_identity_buckets,
         None,
+        None,
     )
     .expect("evidence fixture has no resource refusal")
 }
@@ -9749,6 +9795,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         None,
         None,
         None,
+        None,
     )
     .expect("ordinary or logical comparison evidence fixture has no resource refusal")
 }
@@ -9771,6 +9818,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
     retained: Option<(&crate::snapshots::sampled_scan::SharedCache, &ScanIndex)>,
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
+    history_segments: Option<(
+        &crate::snapshots::claude_request_identity::AcceptedBuckets,
+        i64,
+    )>,
     wire_size_reservation: Option<&dyn Fn(&SnapshotItem) -> usize>,
 ) -> std::result::Result<
     (
@@ -10146,6 +10197,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .with_status_coverage(crate::claude_status_coverage::snapshot())
         .with_native_originals(&originals)
         .with_accepted_buckets(accepted_identity_buckets)
+        .with_history_segments(
+            history_segments.map(|(segments, _)| segments),
+            history_segments.map(|(_, now)| now),
+        )
         .with_wire_size_reservation(wire_size_reservation)
     });
     if !full_rearm_evidence_complete {
@@ -10789,12 +10844,18 @@ where
     }
     let mut replaced_retained_proof = false;
     // Only proof the ledger holds can be replaced, whatever the capability.
-    if progress.accepted_identity_buckets.has_retained() {
+    if progress.accepted_identity_buckets.has_retained()
+        || progress.accepted_identity_segments.has_retained()
+    {
         for item in &batch {
             let value = serde_json::to_value(item)?;
-            replaced_retained_proof |= progress
-                .accepted_identity_buckets
-                .invalidate_replaced(&value);
+            // Tombstones key per item: a segment's proof is its own entity's.
+            let ledger = if value["history_segment"].is_object() {
+                &mut progress.accepted_identity_segments
+            } else {
+                &mut progress.accepted_identity_buckets
+            };
+            replaced_retained_proof |= ledger.invalidate_replaced(&value);
         }
     }
     // Option (ii): the server may store a replacement proof even if this
@@ -10871,9 +10932,26 @@ where
             .filter(|entity| entity.unchanged_basis.is_none())
             .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
             .collect::<BTreeMap<_, _>>();
-        for index in indices {
+        // Settled-history groups settle whole (Lead B C3): a member stays
+        // unsettled, and is offered again with its group, unless every
+        // member on this page settled. Segments record before their live body.
+        let groups = history_groups(items, indices)?;
+        let unsettled_groups = groups
+            .iter()
+            .filter(|(index, _)| !settled.contains(fingerprint(&items[*index])))
+            .filter_map(|(_, group)| group.as_ref().map(|(live, _)| live.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut ordered = groups;
+        ordered.sort_by_key(|(_, group)| group.as_ref().is_some_and(|(_, segment)| !segment));
+        for (index, group) in &ordered {
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
+            let group_settled = group
+                .as_ref()
+                .map_or(true, |(live, _)| !unsettled_groups.contains(live));
+            if settled.contains(item_fingerprint) && !group_settled {
+                continue;
+            }
             if settled.contains(item_fingerprint) {
                 let witness = body_witness(item);
                 progress.record_body(item_fingerprint, &witness);
@@ -11055,6 +11133,31 @@ fn literal_family_groups(members: Vec<(usize, usize, bool)>) -> Vec<Vec<(usize, 
         groups.push(group);
     }
     groups
+}
+
+/// A page item's settled-history group: the live session id and whether the
+/// item is a segment (`None` outside any cut session).
+type HistoryGroup = Option<(String, bool)>;
+
+/// Each page index with its settled-history group.
+fn history_groups<T: Serialize>(
+    items: &[T],
+    indices: &[usize],
+) -> Result<Vec<(usize, HistoryGroup)>> {
+    indices
+        .iter()
+        .map(|index| {
+            let value = serde_json::to_value(&items[*index])?;
+            let group = match value["history_segment"]["of"].as_str() {
+                Some(live) => Some((live.to_owned(), true)),
+                None => value
+                    .get("history_segments")
+                    .and_then(|_| value["source_session_id"].as_str())
+                    .map(|live| (live.to_owned(), false)),
+            };
+            Ok((*index, group))
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11269,9 +11372,14 @@ where
         }
     }
     for (root, mut members) in literal_families {
+        // Settled-history segments lead their live body, then root first.
         members.sort_by_key(|(index, _, _)| {
             let member = session_id(&items[*index]);
-            (member != Some(root), member)
+            (
+                !member.is_some_and(crate::snapshots::history_segments::is_segment_id),
+                member != Some(root),
+                member,
+            )
         });
         for group in literal_family_groups(members) {
             order.extend(group);
@@ -23911,7 +24019,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_segments, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

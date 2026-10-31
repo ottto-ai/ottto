@@ -11,6 +11,10 @@ pub(crate) const MAX_SESSIONS: usize = 16;
 pub(crate) const MAX_BUCKETS: usize = 5_000;
 const MAX_SHARES: usize = 1_536;
 pub(crate) const MAX_PROVED_ROWS: usize = 1_024;
+/// Stated design maximum of settled-history segment entries (rule 9 heap
+/// bound). Above it only an alarm counts: segment entries are never evicted
+/// by count or recency, only with their session's retirement (Lead B Q2).
+pub(crate) const SEGMENT_DESIGN_MAX: usize = 64;
 /// Tombstone for a proof superseded before upload: a keyed digest is never zero.
 const REPLACED_PROOF: [u8; 16] = [0; 16];
 /// Pending `retained_proof_missing` buckets feed one diagnostic only.
@@ -24,11 +28,14 @@ impl std::fmt::Debug for FingerprintKey {
         f.write_str("FingerprintKey([redacted])")
     }
 }
-/// Third field: epoch changed this pass; fourth: per-cycle retained capability.
+/// Third field: epoch changed this pass; fourth: per-cycle retained
+/// capability; fifth: the sibling settled-history segment ledger, which has
+/// no session cap and no recency eviction.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AcceptedBuckets(
     BTreeMap<String, AcceptedSession>,
     Option<FingerprintKey>,
+    bool,
     bool,
     bool,
 );
@@ -76,6 +83,10 @@ pub(crate) struct AcceptedSession {
     /// witnessed body re-proves them. Local diagnostics only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     missing: Vec<i64>,
+    /// Segment entries only: the keyed digest of their live session, so the
+    /// live body's cut retires them. Live entries never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    of: Option<String>,
 }
 /// Truncated keyed digests: the (bucket, row) grain and its exact proof.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -420,85 +431,108 @@ impl AcceptedSession {
 }
 impl<'de> Deserialize<'de> for AcceptedBuckets {
     fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        struct Hints;
-        impl<'de> Visitor<'de> for Hints {
-            type Value = AcceptedBuckets;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("optional accepted identity hints")
+        decoder.deserialize_any(Hints { segments: false })
+    }
+}
+/// The sibling `accepted_identity_segments` field: every valid entry decodes,
+/// with no session cap. An older daemon ignores the field.
+pub(crate) fn decode_segments<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<AcceptedBuckets, D::Error> {
+    decoder.deserialize_any(Hints { segments: true })
+}
+struct Hints {
+    segments: bool,
+}
+impl<'de> Visitor<'de> for Hints {
+    type Value = AcceptedBuckets;
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("optional accepted identity hints")
+    }
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+        let mut states = BTreeMap::new();
+        while let Some(session) = map.next_key::<String>()? {
+            if !hash_is_valid(&session) || (!self.segments && states.len() == MAX_SESSIONS) {
+                map.next_value::<IgnoredAny>()?;
+                continue;
             }
-            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
-                let mut states = BTreeMap::new();
-                while let Some(session) = map.next_key::<String>()? {
-                    if !hash_is_valid(&session) || states.len() == MAX_SESSIONS {
-                        map.next_value::<IgnoredAny>()?;
-                        continue;
-                    }
-                    // At most one session Value tree, consumed without cloning.
-                    // Malformed/old hints never invalidate neighbouring ordinary ACKs.
-                    let value = map.next_value::<Value>()?;
-                    let Ok(mut state) = serde_json::from_value::<AcceptedSession>(value) else {
-                        continue;
-                    };
-                    if state.starts.len() > MAX_BUCKETS
-                        || state.shares.len() > MAX_SHARES
-                        || state.proved.len() > MAX_PROVED_ROWS
-                        || state.missing.len() > MAX_PENDING_MISSING
-                    {
-                        continue;
-                    }
-                    state.proved.sort_unstable();
-                    state.proved.dedup_by_key(|entry| (entry.bucket, entry.row));
-                    state.missing.sort_unstable();
-                    state.missing.dedup();
-                    state.starts.sort_unstable();
-                    state.starts.dedup();
-                    state.shares.sort_unstable();
-                    state.shares.dedup();
-                    if state
-                        .shares
-                        .iter()
-                        .any(|share| state.starts.binary_search(&share.bucket).is_err())
-                    {
-                        continue;
-                    }
-                    state.starts = state.starts.into_boxed_slice().into_vec();
-                    state.shares = state.shares.into_boxed_slice().into_vec();
-                    state.proved = state.proved.into_boxed_slice().into_vec();
-                    state.missing = state.missing.into_boxed_slice().into_vec();
-                    states.insert(session, state);
-                }
-                Ok(AcceptedBuckets(states, None, false, false))
+            // At most one session Value tree, consumed without cloning.
+            // Malformed/old hints never invalidate neighbouring ordinary ACKs.
+            let value = map.next_value::<Value>()?;
+            let Ok(mut state) = serde_json::from_value::<AcceptedSession>(value) else {
+                continue;
+            };
+            if state.starts.len() > MAX_BUCKETS
+                || state.shares.len() > MAX_SHARES
+                || state.proved.len() > MAX_PROVED_ROWS
+                || state.missing.len() > MAX_PENDING_MISSING
+            {
+                continue;
             }
-            fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
-                while seq.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(AcceptedBuckets::default())
+            state.proved.sort_unstable();
+            state.proved.dedup_by_key(|entry| (entry.bucket, entry.row));
+            state.missing.sort_unstable();
+            state.missing.dedup();
+            state.starts.sort_unstable();
+            state.starts.dedup();
+            state.shares.sort_unstable();
+            state.shares.dedup();
+            if state
+                .shares
+                .iter()
+                .any(|share| state.starts.binary_search(&share.bucket).is_err())
+            {
+                continue;
             }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(AcceptedBuckets::default())
-            }
-            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
-                self.visit_unit()
-            }
-            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
-                self.visit_unit()
-            }
-            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
-                self.visit_unit()
-            }
-            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
-                self.visit_unit()
-            }
-            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
-                self.visit_unit()
-            }
+            state.starts = state.starts.into_boxed_slice().into_vec();
+            state.shares = state.shares.into_boxed_slice().into_vec();
+            state.proved = state.proved.into_boxed_slice().into_vec();
+            state.missing = state.missing.into_boxed_slice().into_vec();
+            states.insert(session, state);
         }
-        decoder.deserialize_any(Hints)
+        Ok(AcceptedBuckets(states, None, false, false, self.segments))
+    }
+    fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        self.visit_unit()
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(AcceptedBuckets(
+            BTreeMap::new(),
+            None,
+            false,
+            false,
+            self.segments,
+        ))
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        self.visit_unit()
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        self.visit_unit()
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        self.visit_unit()
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        self.visit_unit()
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        self.visit_unit()
     }
 }
 impl AcceptedBuckets {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(BTreeMap::new(), Some(fixture_key()), false, false)
+        Self(BTreeMap::new(), Some(fixture_key()), false, false, false)
+    }
+    #[cfg(test)]
+    pub(crate) fn segments_for_test() -> Self {
+        Self(BTreeMap::new(), Some(fixture_key()), false, false, true)
+    }
+    /// An empty sibling segment ledger.
+    pub(crate) fn segments() -> Self {
+        Self(BTreeMap::new(), None, false, false, true)
     }
     #[cfg(test)]
     pub(crate) fn maximum_for_test() -> Self {
@@ -538,11 +572,13 @@ impl AcceptedBuckets {
                             starts,
                             shares,
                             incomplete: true,
+                            of: None,
                         },
                     )
                 })
                 .collect(),
             Some(key),
+            false,
             false,
             false,
         )
@@ -665,7 +701,15 @@ impl AcceptedBuckets {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        if !self.0.contains_key(&key) && self.0.len() == MAX_SESSIONS {
+        if self.4 {
+            // Segment entries leave only with their session's cut (`retire`).
+            if !self.0.contains_key(&key) && self.0.len() >= SEGMENT_DESIGN_MAX && report {
+                super::budget::record(&super::budget::Counts {
+                    accepted_segments_over_design: 1,
+                    ..Default::default()
+                });
+            }
+        } else if !self.0.contains_key(&key) && self.0.len() == MAX_SESSIONS {
             let oldest = self
                 .0
                 .iter()
@@ -849,6 +893,32 @@ impl AcceptedBuckets {
             });
         }
     }
+    /// Segment ledger only, after the live body of `live_body` was recorded:
+    /// its cut is now accepted, so entries of this session at or past its
+    /// `through` (or all of them when it carries none: a whole body retired
+    /// the segments) leave. Never by count or recency.
+    pub(crate) fn retire(&mut self, live_body: &Value) {
+        let (Some(key), Some(live)) = (self.1.as_ref(), live_body["source_session_id"].as_str())
+        else {
+            return;
+        };
+        if !self.4 || live_body["history_segment"].is_object() {
+            return;
+        }
+        let of = session_key(key, live);
+        let through = live_body["history_segments"]["through"]
+            .as_str()
+            .and_then(bucket_key);
+        self.0.retain(|_, entry| {
+            entry.of.as_deref() != Some(of.as_str())
+                || through
+                    .is_some_and(|through| entry.starts.last().map_or(true, |last| *last < through))
+        });
+    }
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
     pub(crate) fn get(&self, session: &str) -> Option<&AcceptedSession> {
         let key = self.1.as_ref()?;
         self.0
@@ -882,9 +952,15 @@ impl AcceptedBuckets {
         }
         let fingerprint_key = fingerprint_key.clone();
         let fingerprint_key = &fingerprint_key;
+        let segments = self.4;
         let entry = self
             .session_entry(session, report)
             .expect("bound fingerprint key");
+        if segments {
+            entry.of = body["history_segment"]["of"]
+                .as_str()
+                .map(|live| session_key(fingerprint_key, live));
+        }
         let mut shares = std::mem::take(&mut entry.shares)
             .into_iter()
             .collect::<BTreeSet<_>>();
@@ -973,6 +1049,57 @@ impl AcceptedBuckets {
             .into_vec();
     }
 }
+/// A segment's accepted hints for its `buckets`: per bucket its own entry
+/// when that holds the bucket, else the live entry's shares (Lead B C2).
+/// Retained proof comes from its own entry only: until the segment entity
+/// has its own accepted proof it sends full identity rows (C4).
+pub(crate) fn segment_view(
+    own: Option<&AcceptedSession>,
+    live: Option<&AcceptedSession>,
+    buckets: &[i64],
+) -> Option<AcceptedSession> {
+    let base = own.or(live)?;
+    let mut view = AcceptedSession {
+        key_epoch: base.key_epoch,
+        key: base.key.clone(),
+        incomplete: own.is_some_and(|own| own.incomplete),
+        ..Default::default()
+    };
+    let mut buckets = buckets.to_vec();
+    buckets.sort_unstable();
+    buckets.dedup();
+    for bucket in buckets {
+        let holder = [own, live]
+            .into_iter()
+            .flatten()
+            .find(|entry| entry.starts.binary_search(&bucket).is_ok());
+        if let Some(holder) = holder {
+            view.starts.push(bucket);
+            let first = holder.shares.partition_point(|share| share.bucket < bucket);
+            view.shares.extend(
+                holder.shares[first..]
+                    .iter()
+                    .take_while(|share| share.bucket == bucket)
+                    .cloned(),
+            );
+        } else if live.is_some_and(|live| live.incomplete) {
+            view.incomplete = true;
+        }
+        if let Some(own) = own {
+            let first = own.proved.partition_point(|row| row.bucket < bucket);
+            view.proved.extend(
+                own.proved[first..]
+                    .iter()
+                    .take_while(|row| row.bucket == bucket)
+                    .cloned(),
+            );
+            if own.missing.binary_search(&bucket).is_ok() {
+                view.missing.push(bucket);
+            }
+        }
+    }
+    Some(view)
+}
 impl crate::heap_layout_bound::HeapLayoutBound for AcceptedSession {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         c.add(
@@ -994,7 +1121,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for AcceptedSession {
             self.missing
                 .capacity()
                 .checked_mul(std::mem::size_of::<i64>())?,
-        )
+        )?;
+        c.add(self.of.as_ref().map_or(0, String::capacity))
     }
 }
 impl crate::heap_layout_bound::HeapLayoutBound for AcceptedBuckets {
@@ -1084,6 +1212,7 @@ mod heap_tests {
                                 MAX_SHARES
                             ],
                             incomplete: false,
+                            of: None,
                             proved: Vec::new(),
                             missing: Vec::new(),
                         },
@@ -1091,6 +1220,7 @@ mod heap_tests {
                 })
                 .collect(),
             None,
+            false,
             false,
             false,
         );
@@ -1521,6 +1651,7 @@ mod retained_heap_tests {
                                 MAX_SHARES
                             ],
                             incomplete: false,
+                            of: None,
                             proved: vec![
                                 ProvedRow {
                                     bucket: 1,
@@ -1538,6 +1669,7 @@ mod retained_heap_tests {
             None,
             false,
             false,
+            false,
         );
         let mut counter = Counter::new(4 * 1024 * 1024);
         counter.add(std::mem::size_of_val(&state)).unwrap();
@@ -1548,5 +1680,169 @@ mod retained_heap_tests {
             "accepted-share+proved-row requested-layout maximum={} bytes",
             counter.bytes
         );
+    }
+}
+
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+    const OLD: &str = "2026-08-28T10:00:00Z";
+    const LATE: &str = "2026-08-29T10:00:00Z";
+    const NEW: &str = "2026-09-29T10:00:00Z";
+    const LIVE: &str = "synthetic";
+    const SEGMENT: &str = "synthetic#w20260827";
+    fn body(session: &str, starts: &[&str], account: char, extra: Value) -> Value {
+        let mut body = json!({"source_session_id": session, "provenance": {"collector": COLLECTOR},
+            "request_evidence": [{"identity_basis": TELEMETRY_LOGIN}],
+            "usage_buckets": starts.iter().map(|start| json!({"bucket_start": start, "model_usage": [
+                {"model": "claude-synthetic", "evidence_ref": 0, "input_tokens": 1,
+                 "account_identifier_hash": account.to_string().repeat(64)}]})).collect::<Vec<_>>()});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    }
+    fn row() -> RowKey {
+        wire_row_key(&json!({"model": "claude-synthetic"})).unwrap()
+    }
+    fn of() -> Value {
+        json!({"history_segment": {"of": LIVE}})
+    }
+
+    /// [money] Lead B C2/C4: a segment's own entry wins per bucket; a bucket
+    /// it lacks (late in its window, or a lost live ACK) takes the live
+    /// entry's shares; retained proof is the segment's own only.
+    #[test]
+    fn segment_view_falls_back_per_bucket_and_keeps_proof_its_own() {
+        let mut live = AcceptedBuckets::for_test();
+        live.record(&body(LIVE, &[OLD, LATE], 'b', json!({})));
+        let mut proving = live.clone();
+        proving.record_proved(&body(LIVE, &[OLD, LATE], 'b', json!({})), true, &[]);
+        let mut segments = AcceptedBuckets::segments_for_test();
+        segments.record(&body(SEGMENT, &[OLD], 'a', of()));
+        let (old, late) = (bucket_key(OLD).unwrap(), bucket_key(LATE).unwrap());
+        let own = segments.get(SEGMENT);
+        let view = segment_view(own, proving.get(LIVE), &[late, old]).unwrap();
+        assert_eq!(&*view, &[old, late]);
+        assert_eq!(
+            view.row_shares(old, &row()),
+            own.unwrap().row_shares(old, &row())
+        );
+        assert_eq!(
+            view.row_shares(late, &row()),
+            live.get(LIVE).unwrap().row_shares(late, &row())
+        );
+        assert_ne!(view.row_shares(old, &row()), view.row_shares(late, &row()));
+        assert!(proving.get(LIVE).unwrap().proved_row(old, &row()).is_some());
+        assert!(view.proved_row(old, &row()).is_none() && view.proved_row(late, &row()).is_none());
+        assert!(segment_view(None, None, &[old]).is_none());
+    }
+
+    /// [money] Lead B Q2: segment entries are never evicted by count (only an
+    /// alarm above the design maximum) and leave only with their session's
+    /// cut: a live body past their window keeps them, a live body whose cut
+    /// is lower (or absent) retires them.
+    #[test]
+    fn segment_entries_leave_only_with_their_session_cut() {
+        let mut segments = AcceptedBuckets::segments_for_test();
+        for n in 0..=SEGMENT_DESIGN_MAX {
+            segments.record(&body(
+                &format!("other{n}#w20260827"),
+                &[OLD],
+                'a',
+                json!({"history_segment": {"of": format!("other{n}")}}),
+            ));
+        }
+        segments.record(&body(SEGMENT, &[OLD], 'a', of()));
+        assert_eq!(segments.len(), SEGMENT_DESIGN_MAX + 2);
+        assert_eq!(
+            super::super::budget::take_counts().accepted_segments_over_design,
+            2
+        );
+        let live = |through: Option<&str>| {
+            body(
+                LIVE,
+                &[NEW],
+                'a',
+                through.map_or(
+                    json!({}),
+                    |through| json!({"history_segments": {"through": through, "count": 1}}),
+                ),
+            )
+        };
+        segments.retire(&live(Some("2026-09-03T00:00:00Z")));
+        assert!(segments.get(SEGMENT).is_some());
+        segments.retire(&live(Some("2026-08-27T00:00:00Z")));
+        assert!(segments.get(SEGMENT).is_none());
+        segments.record(&body(SEGMENT, &[OLD], 'a', of()));
+        segments.retire(&live(None));
+        assert!(segments.get(SEGMENT).is_none());
+        assert_eq!(segments.len(), SEGMENT_DESIGN_MAX + 1);
+    }
+
+    /// [format] The sibling field decodes every entry (no session cap) and
+    /// keeps each entry's live link; the live map keeps its cap.
+    #[test]
+    fn segment_ledger_decodes_uncapped_with_its_live_link() {
+        let mut segments = AcceptedBuckets::segments_for_test();
+        for n in 0..(MAX_SESSIONS + 4) {
+            segments.record(&body(&format!("{LIVE}{n}#w20260827"), &[OLD], 'a', of()));
+        }
+        let bytes = serde_json::to_vec(&segments).unwrap();
+        let mut decoded =
+            decode_segments(&mut serde_json::Deserializer::from_slice(&bytes)).unwrap();
+        decoded.bind_test_key(Some([0x42; 32]));
+        assert_eq!(decoded, segments);
+        let capped = AcceptedBuckets::restore_for_test(&bytes);
+        assert_eq!(capped.len(), MAX_SESSIONS);
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod segment_heap_tests {
+    use super::*;
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    /// [format] Rule 9 heap bound of the sibling segment ledger at its stated
+    /// design maximum: 64 entries, each at MAX_SHARES with full proof. A real
+    /// entry spans one 7-day window (at most 168 hourly buckets).
+    #[test]
+    fn segment_ledger_at_its_design_maximum_has_a_fourteen_mib_heap_bound() {
+        let key = fixture_key();
+        let mut state = AcceptedBuckets::segments_for_test();
+        for n in 0..SEGMENT_DESIGN_MAX {
+            let starts = (0..MAX_SHARES as i64).collect::<Vec<_>>();
+            state.0.insert(
+                session_key(&key, &format!("max-{n}#w20260827")),
+                AcceptedSession {
+                    key_epoch: key_epoch(&key),
+                    key: Some(key.clone()),
+                    last_ack: u64::MAX,
+                    shares: starts
+                        .iter()
+                        .map(|bucket| AcceptedShare {
+                            bucket: *bucket,
+                            row: [255; 32],
+                            authority: Some([255; 32]),
+                        })
+                        .collect(),
+                    proved: (0..MAX_PROVED_ROWS as i64)
+                        .map(|bucket| ProvedRow {
+                            bucket,
+                            row: [255; 16],
+                            proof: [255; 16],
+                            account: Some([255; 32]),
+                        })
+                        .collect(),
+                    missing: (0..MAX_PENDING_MISSING as i64).collect(),
+                    starts,
+                    incomplete: true,
+                    of: Some(session_key(&key, &format!("max-{n}"))),
+                },
+            );
+        }
+        let mut counter = Counter::new(16 * 1024 * 1024);
+        counter.add(std::mem::size_of_val(&state)).unwrap();
+        state.heap_bound(&mut counter).unwrap();
+        assert!(counter.bytes < 14 * 1024 * 1024, "{}", counter.bytes);
     }
 }

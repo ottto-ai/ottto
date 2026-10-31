@@ -1,0 +1,717 @@
+//! Settled-history segments (`session_history_segments:v1`). A session body
+//! over `TRIGGER_BYTES` sends every fixed 7-day UTC window (aligned to the
+//! Unix epoch) that ended at least 72 h ago as its own ordinary entity,
+//! `<live id>#w<YYYYMMDD>`; the live body keeps the newer buckets and names
+//! the cut with `history_segments.through`. Each hour stays in exactly one
+//! entity. The partition is derived from the full body every pass, so a
+//! restart recomputes it and nothing new is persisted.
+//!
+//! One path for every source. Bucket rows travel unchanged with their window;
+//! top rows and scalars are re-summed per piece and must conserve the full
+//! body exactly, else nothing is cut. Contract-5 Claude bodies are cut only
+//! by their tagger (`claude_request_identity`), which tags every piece from
+//! the whole-session grouping, so each piece carries its own evidence table.
+use super::{SnapshotCost, SnapshotItem, SnapshotModelUsage, SnapshotSource, SnapshotUsageBucket};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+/// Exact activity-hint token; any other value keeps today's bodies.
+pub(crate) const CONTRACT: &str = "session_history_segments:v1";
+/// Full bodies at or under this size are never cut.
+pub(crate) const TRIGGER_BYTES: usize = 512 * 1024;
+const DAY_SECONDS: i64 = 86_400;
+const WINDOW_SECONDS: i64 = 7 * DAY_SECONDS;
+const SETTLED_SECONDS: i64 = 72 * 3_600;
+/// Non-bucket framing charged per piece when sizing the group's one batch.
+const PIECE_FRAMING_BYTES: usize = 4 * 1024;
+const SEPARATOR: &str = "#w";
+
+/// Wire: this body is the window `[window_start, window_end)` of `of`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotHistorySegment {
+    pub of: String,
+    pub window_start: String,
+    pub window_end: String,
+}
+
+/// Wire: the live body carries no bucket before `through`; `count` segments.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotHistorySegments {
+    pub through: String,
+    pub count: u64,
+}
+
+crate::heap_layout_bound::fields!(SnapshotHistorySegment; of, window_start, window_end);
+crate::heap_layout_bound::fields!(SnapshotHistorySegments; through, count);
+
+/// One segment piece: a half-open UTC window and its bucket indices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Piece {
+    pub(crate) start: i64,
+    pub(crate) end: i64,
+    pub(crate) buckets: Vec<usize>,
+}
+
+/// The deterministic cut of one full body: segments oldest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Plan {
+    pub(crate) segments: Vec<Piece>,
+    pub(crate) through: i64,
+}
+
+/// Why an oversized body stayed whole this pass (class N alarm reasons).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Skipped {
+    /// The group would not fit one upload batch: today's body is kept.
+    GroupOverBatch,
+    /// Top rows, scalars or money did not re-sum exactly: today's body is kept.
+    Unbalanced,
+}
+
+#[derive(Serialize)]
+struct Alarm {
+    skipped: Skipped,
+}
+
+/// Local alarm only (counts, no id): never expected at today's sizes.
+pub(crate) fn alarm(source: SnapshotSource, skipped: Skipped) {
+    crate::local_resource_diagnostics::traversal_point(
+        "history_segments_skipped",
+        source.api_slug(),
+        &Alarm { skipped },
+    );
+}
+
+fn rfc3339(unix: i64) -> Option<String> {
+    OffsetDateTime::from_unix_timestamp(unix)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
+}
+
+fn bucket_unix(bucket: &SnapshotUsageBucket) -> Option<i64> {
+    OffsetDateTime::parse(&bucket.bucket_start, &Rfc3339)
+        .ok()
+        .map(OffsetDateTime::unix_timestamp)
+}
+
+/// `<live>#w<YYYYMMDD>` of the piece starting at `start`.
+pub(crate) fn segment_id(live: &str, start: i64) -> Option<String> {
+    let date = OffsetDateTime::from_unix_timestamp(start).ok()?.date();
+    Some(format!(
+        "{live}{SEPARATOR}{:04}{:02}{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day()
+    ))
+}
+
+/// Upload packing unit: a cut session's group, else its request-owned
+/// family. A group fits one batch by construction (`plan`).
+pub(crate) fn packing_unit(item: &SnapshotItem) -> Option<&str> {
+    group_of(item).or_else(|| super::claude_request_money::request_owned_family_root(item))
+}
+
+/// Whether `id` names a segment entity: `<live>#w<YYYYMMDD>`.
+pub(crate) fn is_segment_id(id: &str) -> bool {
+    id.rsplit_once(SEPARATOR).is_some_and(|(live, date)| {
+        !live.is_empty() && date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// The live session id of a cut session's group: a segment's `of`, or the
+/// live body's own id. `None` outside any cut.
+pub(crate) fn group_of(item: &SnapshotItem) -> Option<&str> {
+    match &item.history_segment {
+        Some(segment) => Some(segment.of.as_str()),
+        None => item
+            .history_segments
+            .as_ref()
+            .map(|_| item.source_session_id.as_str()),
+    }
+}
+
+/// Plan the cut of a full body measuring `full_bytes`, or `None` when it
+/// stays one body. `item_limit` is the per-item wire limit: a window over
+/// half of it halves at whole days (never seen at today's sizes). The whole
+/// group (segments first, then live) must fit one upload batch.
+pub(crate) fn plan(
+    source: SnapshotSource,
+    item: &SnapshotItem,
+    full_bytes: usize,
+    now: i64,
+    item_limit: usize,
+) -> Option<Plan> {
+    if full_bytes <= TRIGGER_BYTES
+        || item.history_segment.is_some()
+        || item.source_session_id.contains(SEPARATOR)
+    {
+        return None;
+    }
+    let settled_before = now.checked_sub(SETTLED_SECONDS)?;
+    let mut windows = BTreeMap::<i64, Vec<usize>>::new();
+    for (index, bucket) in item.usage_buckets.iter().enumerate() {
+        let start = bucket_unix(bucket)?;
+        let window = start.div_euclid(WINDOW_SECONDS) * WINDOW_SECONDS;
+        if window + WINDOW_SECONDS <= settled_before {
+            windows.entry(window).or_default().push(index);
+        }
+    }
+    let through = windows.keys().next_back()? + WINDOW_SECONDS;
+    let mut segments = Vec::new();
+    for (window, buckets) in windows {
+        halve(
+            item,
+            window,
+            window + WINDOW_SECONDS,
+            buckets,
+            item_limit / 2,
+            &mut segments,
+        );
+    }
+    let pieces = segments.len() + 1;
+    if pieces > crate::snapshot_sync::SNAPSHOT_BATCH_LIMIT
+        || full_bytes.saturating_add(pieces.saturating_mul(PIECE_FRAMING_BYTES))
+            > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES
+    {
+        alarm(source, Skipped::GroupOverBatch);
+        return None;
+    }
+    Some(Plan { segments, through })
+}
+
+fn halve(
+    item: &SnapshotItem,
+    start: i64,
+    end: i64,
+    buckets: Vec<usize>,
+    half_limit: usize,
+    out: &mut Vec<Piece>,
+) {
+    let bytes = buckets
+        .iter()
+        .map(|index| {
+            serde_json::to_vec(&item.usage_buckets[*index])
+                .map_or(usize::MAX, |bytes| bytes.len() + 1)
+        })
+        .fold(0usize, usize::saturating_add);
+    let days = (end - start) / DAY_SECONDS;
+    if bytes <= half_limit || days < 2 {
+        out.push(Piece {
+            start,
+            end,
+            buckets,
+        });
+        return;
+    }
+    let middle = start + (days / 2) * DAY_SECONDS;
+    let (older, newer): (Vec<_>, Vec<_>) = buckets
+        .into_iter()
+        .partition(|index| bucket_unix(&item.usage_buckets[*index]).is_some_and(|at| at < middle));
+    for (start, end, buckets) in [(start, middle, older), (middle, end, newer)] {
+        if !buckets.is_empty() {
+            halve(item, start, end, buckets, half_limit, out);
+        }
+    }
+}
+
+/// Exact wire money: digits with at most 12 decimals, as picodollars.
+fn picos(text: &str) -> Option<u128> {
+    super::claude_request_identity::wire_usd_picos(text)
+}
+
+/// One row's eight counts and five optional costs.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct RowSum {
+    counts: [u64; 8],
+    costs: [Option<u128>; 5],
+    rows: u64,
+}
+
+fn row_counts(row: &SnapshotModelUsage) -> [u64; 8] {
+    [
+        row.input_tokens,
+        row.output_tokens,
+        row.cache_read_tokens,
+        row.cache_creation_5m_tokens,
+        row.cache_creation_1h_tokens,
+        row.reasoning_output_tokens,
+        row.unattributed_total_tokens,
+        row.request_count,
+    ]
+}
+
+fn row_costs(row: &SnapshotModelUsage) -> [&Option<String>; 5] {
+    [
+        &row.cost_usd,
+        &row.input_cost_usd,
+        &row.output_cost_usd,
+        &row.cache_read_cost_usd,
+        &row.cache_creation_cost_usd,
+    ]
+}
+
+impl RowSum {
+    /// `None` when a count overflows, a cost does not parse, or one cost
+    /// field is present on some rows and absent on others.
+    fn add(&mut self, row: &SnapshotModelUsage) -> Option<()> {
+        for (total, value) in self.counts.iter_mut().zip(row_counts(row)) {
+            *total = total.checked_add(value)?;
+        }
+        for (total, text) in self.costs.iter_mut().zip(row_costs(row)) {
+            let value = text.as_deref().map(picos).map(|value| value.ok_or(()));
+            *total = match (self.rows == 0, *total, value) {
+                (_, _, Some(Err(()))) => return None,
+                (true, _, None) => None,
+                (true, _, Some(Ok(value))) => Some(value),
+                (false, None, None) => None,
+                (false, Some(total), Some(Ok(value))) => Some(total.checked_add(value)?),
+                (false, _, _) => return None,
+            };
+        }
+        self.rows += 1;
+        Some(())
+    }
+
+    fn of(row: &SnapshotModelUsage) -> Option<Self> {
+        let mut sum = Self::default();
+        sum.add(row)?;
+        Some(sum)
+    }
+
+    fn write(&self, row: &mut SnapshotModelUsage) {
+        [
+            row.input_tokens,
+            row.output_tokens,
+            row.cache_read_tokens,
+            row.cache_creation_5m_tokens,
+            row.cache_creation_1h_tokens,
+            row.reasoning_output_tokens,
+            row.unattributed_total_tokens,
+            row.request_count,
+        ] = self.counts;
+        let [total, input, output, cache_read, cache_creation] =
+            self.costs.map(|cost| cost.map(super::usd_picos_string));
+        row.cost_usd = total;
+        row.input_cost_usd = input;
+        row.output_cost_usd = output;
+        row.cache_read_cost_usd = cache_read;
+        row.cache_creation_cost_usd = cache_creation;
+    }
+}
+
+fn scalars(item: &SnapshotItem) -> [u64; 8] {
+    [
+        item.input_tokens,
+        item.output_tokens,
+        item.cache_read_tokens,
+        item.cache_creation_5m_tokens,
+        item.cache_creation_1h_tokens,
+        item.reasoning_output_tokens,
+        item.unattributed_total_tokens,
+        item.request_count,
+    ]
+}
+
+fn set_scalars(item: &mut SnapshotItem, values: [u64; 8]) {
+    [
+        item.input_tokens,
+        item.output_tokens,
+        item.cache_read_tokens,
+        item.cache_creation_5m_tokens,
+        item.cache_creation_1h_tokens,
+        item.reasoning_output_tokens,
+        item.unattributed_total_tokens,
+        item.request_count,
+    ] = values;
+}
+
+fn cost_fields(cost: &SnapshotCost) -> [&Option<String>; 5] {
+    [
+        &cost.total_cost_usd,
+        &cost.input_cost_usd,
+        &cost.output_cost_usd,
+        &cost.cache_read_cost_usd,
+        &cost.cache_creation_cost_usd,
+    ]
+}
+
+/// Bucket rows of `buckets`, re-summed onto the full body's top-row keys.
+fn top_rows(
+    full: &SnapshotItem,
+    buckets: &[SnapshotUsageBucket],
+) -> Option<BTreeMap<usize, RowSum>> {
+    let keys = full
+        .model_usage
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (super::row_key_from_model_usage(row), index))
+        .collect::<BTreeMap<_, _>>();
+    if keys.len() != full.model_usage.len() {
+        return None;
+    }
+    let mut sums = BTreeMap::<usize, RowSum>::new();
+    for row in buckets.iter().flat_map(|bucket| &bucket.model_usage) {
+        let index = *keys.get(&super::row_key_from_model_usage(row))?;
+        sums.entry(index).or_default().add(row)?;
+    }
+    Some(sums)
+}
+
+fn copy_unproven(buckets: &[SnapshotUsageBucket]) -> Option<super::CopyUnprovenCounts> {
+    let mut counts = super::CopyUnprovenCounts {
+        rows: 0,
+        requests: 0,
+    };
+    for row in buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+        .filter(|row| row.copy_unproven)
+    {
+        counts.rows += 1;
+        counts.requests += row.request_count;
+    }
+    (counts.rows > 0).then_some(counts)
+}
+
+/// A usage-only body for one window: its buckets, re-summed top rows and
+/// scalars, the session's creator evidence and provenance. No title,
+/// attribution, curve, activity or lifecycle beyond its own buckets.
+fn segment_body(
+    full: &SnapshotItem,
+    piece: &Piece,
+    sums: &BTreeMap<usize, RowSum>,
+    buckets: Vec<SnapshotUsageBucket>,
+) -> Option<SnapshotItem> {
+    let mut model_usage = Vec::with_capacity(sums.len());
+    let mut totals = [0u64; 8];
+    for (index, sum) in sums {
+        let mut row = full.model_usage[*index].clone();
+        sum.write(&mut row);
+        for (total, value) in totals.iter_mut().zip(sum.counts) {
+            *total = total.checked_add(value)?;
+        }
+        model_usage.push(row);
+    }
+    let cost = match &full.cost {
+        None => None,
+        Some(cost) => {
+            let mut fields = [None, None, None, None, None];
+            for (field, (slot, full_value)) in fields.iter_mut().zip(cost_fields(cost)).enumerate()
+            {
+                if full_value.is_some() {
+                    let mut total = 0u128;
+                    for sum in sums.values() {
+                        total = total.checked_add(sum.costs[field]?)?;
+                    }
+                    *slot = Some(super::usd_picos_string(total));
+                }
+            }
+            let [total, input, output, cache_read, cache_creation] = fields;
+            Some(SnapshotCost {
+                total_cost_usd: total,
+                input_cost_usd: input,
+                output_cost_usd: output,
+                cache_read_cost_usd: cache_read,
+                cache_creation_cost_usd: cache_creation,
+                evidence_source: cost.evidence_source.clone(),
+            })
+        }
+    };
+    let first = buckets
+        .iter()
+        .filter_map(|bucket| bucket.first_activity_at.clone())
+        .min();
+    let last = buckets
+        .iter()
+        .filter_map(|bucket| bucket.last_activity_at.clone())
+        .max();
+    let [input, output, cache_read, cache_5m, cache_1h, reasoning, unattributed, requests] = totals;
+    Some(SnapshotItem {
+        session_account_evidence: full.session_account_evidence.clone(),
+        source_session_id: segment_id(&full.source_session_id, piece.start)?,
+        snapshot_fingerprint: String::new(),
+        status: full.status.clone(),
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache_read,
+        cache_creation_5m_tokens: cache_5m,
+        cache_creation_1h_tokens: cache_1h,
+        reasoning_output_tokens: reasoning,
+        unattributed_total_tokens: unattributed,
+        request_count: requests,
+        usage_accounting_contract: full.usage_accounting_contract.clone(),
+        removed_request_count: None,
+        removed_usage: None,
+        telemetry_owned_complete: full.telemetry_owned_complete,
+        resolver_conflict_count: None,
+        copy_unproven_counts: full
+            .copy_unproven_counts
+            .and_then(|_| copy_unproven(&buckets)),
+        claude_money: None,
+        claude_usage_request_ids: BTreeSet::new(),
+        claude_usage_occurrences: BTreeMap::new(),
+        cache_observations: None,
+        cache_observations_state: None,
+        cache_base_head_etag: None,
+        cache_requests: Vec::new(),
+        cache_requests_complete: false,
+        avg_duration_ms: None,
+        avg_time_to_first_token_ms: None,
+        max_duration_ms: None,
+        max_time_to_first_token_ms: None,
+        peak_context_fill_tokens: None,
+        first_turn_context_tokens: None,
+        last_turn_context_tokens: None,
+        first_turn_context_window_tokens: None,
+        peak_context_fill_window_tokens: None,
+        last_turn_context_window_tokens: None,
+        compaction_count: None,
+        compaction_timestamps: Vec::new(),
+        compaction_events: Vec::new(),
+        local_context_points: Vec::new(),
+        compaction_total_pre_tokens: None,
+        compaction_total_post_tokens: None,
+        compaction_total_cumulative_dropped_tokens: None,
+        compaction_total_duration_ms: None,
+        context_curve: None,
+        claude_context_curve_boundaries: Vec::new(),
+        claude_context_curve_identity_complete: false,
+        claude_context_curve_request_index_complete: false,
+        claude_context_curve_owned_start_proven: false,
+        claude_file_birth: Default::default(),
+        claude_file_birth_verdict: None,
+        first_own_request_at: None,
+        activity_summary: None,
+        tool_usage: None,
+        tool_usage_truncated: false,
+        session_start: None,
+        model_usage,
+        usage_buckets: buckets,
+        cost,
+        session_display_name: None,
+        session_display_name_source: None,
+        source_started_at: first,
+        source_ended_at: None,
+        source_last_activity_at: last,
+        collected_at: full.collected_at.clone(),
+        workspace_hash: None,
+        workspace_display_label: None,
+        workspace_label_source: None,
+        repository_hash: None,
+        repository_label: None,
+        repository_label_source: None,
+        repository_identity_source: None,
+        workspace_kind: None,
+        source_file_fingerprint: full.source_file_fingerprint.clone(),
+        session_artifacts: Vec::new(),
+        provenance: full.provenance.clone(),
+        origin: None,
+        originator: None,
+        attribution_facts: Vec::new(),
+        request_evidence: Vec::new(),
+        request_identity_refusals: 0,
+        claude_org_markers: None,
+        claude_account_withheld_reason: None,
+        claude_account_display: None,
+        history_segment: Some(SnapshotHistorySegment {
+            of: full.source_session_id.clone(),
+            window_start: rfc3339(piece.start)?,
+            window_end: rfc3339(piece.end)?,
+        }),
+        history_segments: None,
+        history_cut: Vec::new(),
+    })
+}
+
+/// Cut `full` by `plan` into segments (oldest first) and the live body.
+/// Bucket rows move unchanged. `None`, with the full body untouched, when
+/// top rows, scalars or money do not conserve exactly.
+pub(crate) fn split(
+    source: SnapshotSource,
+    full: &SnapshotItem,
+    plan: &Plan,
+) -> Option<(Vec<SnapshotItem>, SnapshotItem)> {
+    let result = split_conserving(full, plan);
+    if result.is_none() {
+        alarm(source, Skipped::Unbalanced);
+    }
+    result
+}
+
+fn split_conserving(full: &SnapshotItem, plan: &Plan) -> Option<(Vec<SnapshotItem>, SnapshotItem)> {
+    let full_rows = full
+        .model_usage
+        .iter()
+        .map(RowSum::of)
+        .collect::<Option<Vec<_>>>()?;
+    let moved = plan
+        .segments
+        .iter()
+        .flat_map(|piece| piece.buckets.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut segments = Vec::with_capacity(plan.segments.len());
+    let mut segment_sums = Vec::with_capacity(plan.segments.len());
+    for piece in &plan.segments {
+        let buckets = piece
+            .buckets
+            .iter()
+            .map(|index| full.usage_buckets[*index].clone())
+            .collect::<Vec<_>>();
+        let sums = top_rows(full, &buckets)?;
+        segments.push(segment_body(full, piece, &sums, buckets)?);
+        segment_sums.push(sums);
+    }
+    let live_buckets = full
+        .usage_buckets
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !moved.contains(index))
+        .map(|(_, bucket)| bucket.clone())
+        .collect::<Vec<_>>();
+    let live_sums = top_rows(full, &live_buckets)?;
+    // Every full top row must equal the sum of its pieces, field by field.
+    for (index, full_row) in full_rows.iter().enumerate() {
+        let mut total = RowSum::default();
+        for sums in segment_sums.iter().chain([&live_sums]) {
+            let Some(part) = sums.get(&index) else {
+                continue;
+            };
+            for (sum, value) in total.counts.iter_mut().zip(part.counts) {
+                *sum = sum.checked_add(value)?;
+            }
+            for (sum, value) in total.costs.iter_mut().zip(part.costs) {
+                *sum = match (total.rows == 0, *sum, value) {
+                    (true, _, value) => value,
+                    (false, Some(sum), Some(value)) => Some(sum.checked_add(value)?),
+                    (false, None, None) => None,
+                    _ => return None,
+                };
+            }
+            total.rows += 1;
+        }
+        if total.counts != full_row.counts || total.costs != full_row.costs {
+            return None;
+        }
+    }
+    let mut live = full.clone();
+    live.history_cut = Vec::new();
+    live.usage_buckets = live_buckets;
+    live.model_usage = live_sums
+        .iter()
+        .map(|(index, sum)| {
+            let mut row = full.model_usage[*index].clone();
+            sum.write(&mut row);
+            row
+        })
+        .collect();
+    let mut live_scalars = scalars(full);
+    for segment in &segments {
+        for (live, value) in live_scalars.iter_mut().zip(scalars(segment)) {
+            *live = live.checked_sub(value)?;
+        }
+    }
+    set_scalars(&mut live, live_scalars);
+    if let (Some(cost), Some(full_cost)) = (live.cost.as_mut(), full.cost.as_ref()) {
+        let mut fields = cost_fields(full_cost).map(Clone::clone);
+        for (field, slot) in fields.iter_mut().enumerate() {
+            let Some(text) = slot.as_deref() else {
+                continue;
+            };
+            let mut value = picos(text)?;
+            for segment in &segments {
+                let part = segment
+                    .cost
+                    .as_ref()
+                    .and_then(|cost| cost_fields(cost)[field].as_deref());
+                value = value.checked_sub(picos(part?)?)?;
+            }
+            *slot = Some(super::usd_picos_string(value));
+        }
+        [
+            cost.total_cost_usd,
+            cost.input_cost_usd,
+            cost.output_cost_usd,
+            cost.cache_read_cost_usd,
+            cost.cache_creation_cost_usd,
+        ] = fields;
+    }
+    if full.copy_unproven_counts.is_some() {
+        live.copy_unproven_counts = copy_unproven(&live.usage_buckets);
+    }
+    live.history_segments = Some(SnapshotHistorySegments {
+        through: rfc3339(plan.through)?,
+        count: segments.len() as u64,
+    });
+    Some((segments, live))
+}
+
+/// Whether the generic cut may move this body's rows unchanged: it carries
+/// no contract-5 evidence table or reference. Tagged bodies are cut only by
+/// their tagger, which re-tags each piece.
+fn rows_self_contained(item: &SnapshotItem) -> bool {
+    item.request_evidence.is_empty()
+        && item.provenance.collector != super::claude_request_identity::COLLECTOR
+        && item
+            .model_usage
+            .iter()
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| &bucket.model_usage),
+            )
+            .all(|row| {
+                row.evidence_ref.is_none() && row.identity_parts.is_none() && !row.identity_retained
+            })
+}
+
+/// The shared cut, after policy and the account cutoff and before
+/// finalization: tagger-cut segments join the page ahead of their live body;
+/// other oversized bodies are planned and cut here. `now` is `Some` only
+/// with the capability; off, the page is untouched.
+pub(crate) fn expand_page(
+    source: SnapshotSource,
+    snapshots: &mut Vec<SnapshotItem>,
+    now: Option<i64>,
+    policy: super::SnapshotUploadPolicy,
+) {
+    let Some(now) = now else {
+        return;
+    };
+    let mut page = Vec::with_capacity(snapshots.len());
+    for mut item in std::mem::take(snapshots) {
+        let mut segments = std::mem::take(&mut item.history_cut);
+        if segments.is_empty() && rows_self_contained(&item) {
+            let bytes = super::snapshot_item_wire_size(source, &item, policy);
+            if let Some((cut, live)) = plan(
+                source,
+                &item,
+                bytes,
+                now,
+                super::MAX_SNAPSHOT_ITEM_WIRE_BYTES,
+            )
+            .and_then(|plan| split(source, &item, &plan))
+            {
+                segments = cut;
+                item = live;
+            }
+        }
+        for mut segment in segments {
+            // Creator evidence as the live body finally carries it.
+            segment
+                .session_account_evidence
+                .clone_from(&item.session_account_evidence);
+            segment.collected_at.clone_from(&item.collected_at);
+            page.push(segment);
+        }
+        page.push(item);
+    }
+    *snapshots = page;
+}
+
+#[cfg(test)]
+#[path = "history_segments_tests.rs"]
+mod tests;
