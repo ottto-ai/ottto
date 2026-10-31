@@ -1763,6 +1763,12 @@ pub(super) struct GrowthRetention {
 }
 crate::heap_layout_bound::fields!(GrowthRetention; predecessor_size, uncertain_passes, checked_generation, last_growth_full_unix);
 
+/// Whether this graph generation already revalidated `key` (runtime-only memo).
+pub(super) fn growth_checked(index: &ScanIndex, key: &str) -> bool {
+    let (generation, keys) = &index.v2().growth_checked;
+    *generation == index.generation && keys.contains(key)
+}
+
 pub(super) fn growth_active(index: &ScanIndex) -> bool {
     crate::snapshots::state_v2::state_v2_growth_retention_active(index)
 }
@@ -1896,20 +1902,41 @@ pub(super) fn revalidate_growth(index: &mut ScanIndex, key: &str, roots: &[PathB
         retain_growth(index, key, len);
     }
     let generation = index.generation;
-    let state = index
-        .v2_mut()
-        .growth_retention
-        .entry(key.to_owned())
-        .or_default();
-    if !uncertain {
-        state.uncertain_passes = 0;
-        state.checked_generation = Some(generation);
-    } else if state.checked_generation != Some(generation) {
-        state.checked_generation = Some(generation);
-        state.uncertain_passes = state.uncertain_passes.saturating_add(1);
-        if state.uncertain_passes > 3 {
-            crate::local_resource_diagnostics::v2_growth_uncertain_alarm(state.uncertain_passes);
+    // Restored residue needs a known status, or every page would re-select it.
+    let residue = index
+        .traversal
+        .as_ref()
+        .is_some_and(|walk| walk.residue.index_keys.contains(key));
+    let v2 = index.v2_mut();
+    if v2.growth_checked.0 != generation {
+        v2.growth_checked = (generation, BTreeSet::new());
+    }
+    v2.growth_checked.1.insert(key.to_owned());
+    if uncertain {
+        let state = v2.growth_retention.entry(key.to_owned()).or_default();
+        if state.checked_generation != Some(generation) {
+            state.checked_generation = Some(generation);
+            state.uncertain_passes = state.uncertain_passes.saturating_add(1);
+            if state.uncertain_passes > 3 {
+                crate::local_resource_diagnostics::v2_growth_uncertain_alarm(
+                    state.uncertain_passes,
+                );
+            }
         }
+    } else if let Some(state) = v2.growth_retention.get_mut(key) {
+        // Persist only a status change: no per-generation rewrite.
+        state.uncertain_passes = 0;
+        state.checked_generation.get_or_insert(generation);
+    } else if residue {
+        // Other check-only results (aged or kept-overlap retirement
+        // candidates) persist nothing; the runtime memo bounds the work.
+        v2.growth_retention.insert(
+            key.to_owned(),
+            GrowthRetention {
+                checked_generation: Some(generation),
+                ..GrowthRetention::default()
+            },
+        );
     }
     if !retained {
         return false;
@@ -2753,6 +2780,34 @@ mod growth_tests {
             0
         );
     }
+    /// [regress] N5: retirement revalidation persisted a growth row for every
+    /// unchanged aged candidate and rewrote debt rows every generation.
+    #[test]
+    fn retirement_revalidation_persists_no_check_only_rows() {
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        assert_eq!(
+            index
+                .retire_claude_transcript_records_for_test(40 * 86400)
+                .0,
+            1
+        );
+        assert!(index.files.contains_key(&fixture.key));
+        assert!(!index.v2().growth_retention.contains_key(&fixture.key));
+        // A debt row records its checked status once, not every generation.
+        fixture.grow();
+        let roots = std::slice::from_ref(&fixture.root);
+        assert!(revalidate_growth(&mut index, &fixture.key, roots));
+        let checked = index.v2().growth_retention[&fixture.key].checked_generation;
+        assert!(checked.is_some());
+        index.generation += 1;
+        assert!(revalidate_growth(&mut index, &fixture.key, roots));
+        assert_eq!(
+            index.v2().growth_retention[&fixture.key].checked_generation,
+            checked
+        );
+    }
+
     /// [money] f3 identity causes are not reclassified as retained growth.
     #[test]
     fn f3_identity_causes_are_not_reclassified_as_retained_growth() {

@@ -49750,6 +49750,7 @@ impl ScanIndex {
                     persistence_v2: state.persistence_v2.clone(),
                     growth_claim_context: state.growth_claim_context.clone(),
                     growth_retention: sampled_audit::growth_subset(self, previous, &safe_keys),
+                    growth_checked: Default::default(),
                 })
             }),
             persistence_root: previous.persistence_root.clone(),
