@@ -27426,7 +27426,8 @@ for line in sys.stdin:
     /// Seed the private record directory with codec bytes, so both diagnostic
     /// paths must exclude stored literals rather than merely redact a Debug.
     fn seed_private_literal_canary(support: &Path) -> &'static str {
-        use crate::durable_tail_codec::{Durable, Enc, PlText};
+        use crate::durable_tail_codec::{Durable, Enc};
+        use crate::snapshots::PlText;
         const CANARY: &str = "PRIVATE_LITERAL_DIAGNOSTICS_CANARY_20261030";
         let literal = PlText::<96>::new(CANARY.into()).unwrap();
         let body = Enc::count_write(1024, |e| literal.put(e)).unwrap();

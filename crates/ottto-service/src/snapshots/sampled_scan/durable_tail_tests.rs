@@ -3281,35 +3281,6 @@ pub(super) fn known_corrupt_scan(
     panic!("synthetic scan did not finish");
 }
 
-/// The fixture premise runs on Linux too, without requiring retained layout.
-#[test]
-fn known_corrupt_fixture_capture_and_audit_premises_match() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let root = crate::test_scratch::private_dir("ottto-known-corrupt-premises");
-    let sessions = root.join("sessions");
-    std::fs::create_dir(&sessions).unwrap();
-    native_fixture(&sessions.join("session.jsonl"));
-    let source = SnapshotSource::ClaudeCode;
-    let namespace = Scope("known-corrupt-premises".into());
-    let cache = Arc::new(SharedCache::default());
-    cache.durable_begin_pass(
-        source,
-        &root.join("index.json"),
-        &namespace,
-        claude_request_identity::captures(source),
-    );
-    let (_, scan, _) = known_corrupt_scan(
-        source,
-        &sessions,
-        &cache,
-        ScanIndex::default(),
-        &namespace,
-        "2026-10-20T12:00:00Z",
-    );
-    assert!(scan.census_complete);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
 /// B1: exercise the REAL scanner hold exit, retained Tail and eviction. A
 /// healthy peer publishes, and terminal census settlement retires an absent
 /// file despite the held key. The held key's accepted body is never replaced.

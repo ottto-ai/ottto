@@ -40,10 +40,6 @@ use std::io::Write;
 
 use sha2::{Digest, Sha256};
 
-#[cfg(unix)]
-#[allow(unused_imports)] // Shared API; field activation follows separately.
-pub(crate) use crate::snapshots::PlText;
-
 /// Why a value was not encoded. Carries field paths only, never values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refuse {

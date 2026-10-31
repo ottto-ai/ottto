@@ -2479,7 +2479,7 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
 /// never block the known key's replacement. Restore + Tail an append, save,
 /// restart: the next append Tails again (no Full) and matches the cold Full.
 /// Inventory precision cannot cap new-key persistence; every opaque record
-/// survives byte-for-byte while both keys emit the cold Full's money.
+/// [money] Census overflow retains existing usage and admits new-key money. survives byte-for-byte while both keys emit the cold Full's money.
 #[cfg(unix)]
 #[test]
 fn durable_inventory_overflow_keeps_tail_reuse_and_new_key_money() {
