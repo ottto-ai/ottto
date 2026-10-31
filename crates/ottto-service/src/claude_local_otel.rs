@@ -3666,23 +3666,7 @@ crate::heap_layout_bound::fields!(ClaudeTraceOwnershipEvidence; capture_revision
 crate::heap_layout_bound::fields!(ClaudeTraceOwnershipLoadReport; evidence, missing_files, malformed_lines, unreadable_lines, oversized_files, invalid_session_rows, missing_request_ids, conflicting_request_ids, rows_discarded);
 crate::heap_layout_bound::fields!(ClaudeTraceRowsDiscarded; cap, generation, cap_rows, generation_rows);
 
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeIdentityDisposition {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        match self {
-            Self::Missing | Self::Invalid | Self::Conflict | Self::Complete => counter.add(0),
-        }
-    }
-}
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeIdentityAttributeOrigin {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        match self {
-            Self::Missing | Self::Resource | Self::LogRecord | Self::ResourceAndLogRecord => {
-                counter.add(0)
-            }
-        }
-    }
-}
+crate::heap_layout_bound::no_heap!(true;
+    ClaudeIdentityDisposition: Missing | Invalid | Conflict | Complete,
+    ClaudeIdentityAttributeOrigin: Missing | Resource | LogRecord | ResourceAndLogRecord,
+);
