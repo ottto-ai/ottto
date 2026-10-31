@@ -39,6 +39,7 @@ pub(super) fn refuse_compressed_codex(
 /// Compressed bytes buffered from the File, and decoded bytes buffered for the
 /// line reader. Plain input keeps `BufReader::new`'s default capacity.
 const BUFFER_BYTES: usize = 8 * 1024;
+#[cfg(test)]
 pub(super) const FIRST_READ_DECODED_LIMIT: u64 = 1024 * 1024 * 1024;
 // Independent from the decoded-file limit: a small file may demand a huge window.
 const WINDOW_LOG: u32 = 23;
@@ -81,15 +82,19 @@ impl super::OwnedSourceScan {
         committed: &mut super::ScanIndex,
         path: &Path,
     ) -> anyhow::Result<()> {
-        let Some((key, evidence)) = self.active_file.as_ref().and_then(|active| {
+        let Some((key, hold, evidence)) = self.active_file.as_ref().and_then(|active| {
             let key = super::local_index_key(&active.candidate.path);
-            let evidence = self.index.files.get_mut(&key)?.archive.as_mut()?;
-            (!evidence.reservation_saved).then_some((key, evidence))
+            let entry = self.index.files.get_mut(&key)?;
+            let hold = entry.codex_compressed_hold;
+            let evidence = entry.archive.as_mut()?;
+            (!evidence.reservation_saved).then_some((key, hold, evidence))
         }) else {
             return Ok(());
         };
         let previous = committed.files.get(&key).cloned();
-        committed.files.entry(key.clone()).or_default().archive = Some(evidence.clone());
+        let reserved = committed.files.entry(key.clone()).or_default();
+        reserved.archive = Some(evidence.clone());
+        reserved.codex_compressed_hold = hold;
         if let Err(error) = committed.save(path) {
             if let Some(entry) = previous {
                 committed.files.insert(key, entry);
@@ -295,6 +300,20 @@ impl ArchiveEvidence {
             },
         })
     }
+    /// Rule-8 custody retries spend the existing saved reservation. Keep the
+    /// retry deadline instead of turning revocable debt into a terminal state.
+    pub(super) fn defer_custody(&mut self, cause: CodexZstCause) {
+        let retry_after = match self.disposition {
+            ArchiveDisposition::Pending { retry_after, .. } => retry_after,
+            _ => super::sampled_scan::now_seconds().saturating_add(6 * 3600),
+        };
+        self.disposition = ArchiveDisposition::Pending {
+            attempts: self.decode_attempts,
+            retry_after,
+        };
+        codex_zst_refused(cause);
+    }
+
     pub(super) fn finish(
         &mut self,
         owner: Option<String>,
@@ -536,6 +555,18 @@ impl<R: Read> Drop for BoundedDecoder<R> {
         if self.physical_limit != u64::MAX {
             return;
         }
+        let size_bucket = match self.decoded_bytes {
+            0..=1_048_575 => "lt_1_mib",
+            1_048_576..=16_777_215 => "lt_16_mib",
+            16_777_216..=268_435_455 => "lt_256_mib",
+            268_435_456..=1_073_741_823 => "lt_1_gib",
+            _ => "ge_1_gib",
+        };
+        crate::local_resource_diagnostics::traversal_point(
+            "codex_zst_decoded_size",
+            "codex",
+            &serde_json::json!({"codex_zst_decoded_size": {size_bucket: 1}, "codex_zst_decoded_size_complete": u64::from(self.frame_complete && !self.failed)}),
+        );
         crate::local_resource_diagnostics::traversal_point(
             "codex_zst_input",
             "codex",
@@ -611,7 +642,7 @@ impl OpenedInput {
         };
         let mut input = Self::compressed(
             file,
-            FIRST_READ_DECODED_LIMIT.min(super::max_jsonl_file_bytes(super::SnapshotSource::Codex)),
+            u64::MAX, // Full streams pause in the existing decoded-byte page budget.
             credit,
         );
         if let Ok(Self::Compressed(_, paid)) = &mut input {
@@ -1071,7 +1102,23 @@ impl super::ScanIndex {
                 };
                 let settled = matches(accepted);
                 let terminal = terminal && submitted.map_or(true, matches);
+                let retry_after = match archive.disposition {
+                    ArchiveDisposition::Pending { retry_after, .. } => Some(retry_after),
+                    _ => None,
+                };
                 archive.settle(settled, terminal);
+                if let Some(
+                    cause @ (CodexZstCause::DecodeBudget | CodexZstCause::SettlementStuck),
+                ) = archive.terminal_cause()
+                {
+                    if let Some(retry_after) = retry_after {
+                        archive.disposition = ArchiveDisposition::Pending {
+                            attempts: archive.decode_attempts,
+                            retry_after,
+                        };
+                        entry.codex_compressed_hold = Some(cause);
+                    }
+                }
             }
         }
     }
@@ -1086,8 +1133,11 @@ impl super::ScanIndex {
             .get_mut(&super::local_index_key(path))
             .and_then(|e| e.archive.as_mut());
         if let Some((archive, &cause)) = archive.zip(cause) {
-            archive.disposition = ArchiveDisposition::Refused { cause };
-            codex_zst_refused(cause);
+            archive.defer_custody(cause);
+            let owners = super::codex_session_id_candidates_from_path(path)
+                .into_iter()
+                .collect();
+            self.hold_compressed(path, owners, cause);
         }
     }
 }
@@ -1104,6 +1154,7 @@ pub(in crate::snapshots) mod tests {
     include!("codex_archive_retained_tests.rs");
     include!("codex_archive_correction_tests.rs");
     include!("codex_archive_ru_tests.rs");
+    include!("codex_archive_custody_retry_tests.rs");
     include!("codex_archive_downgrade_tests.rs");
     mod money_equivalence_tests {
         use super::*;

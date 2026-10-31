@@ -48,6 +48,66 @@ impl CachedJsonlReduction {
     pub(super) fn usage_witness(&self) -> u64 {
         self.accumulator.usage_witness()
     }
+    pub(super) fn covers_archive(
+        &self,
+        owner: &str,
+        signatures: &[String],
+        usage: &UsageTotals,
+        budget: usize,
+    ) -> bool {
+        if self.accumulator.source != SnapshotSource::Codex
+            || self.accumulator.source_session_id.as_deref() != Some(owner)
+            || !self.accumulator.codex_session_meta_seen
+            || !self.accumulator.codex_physical_signatures_complete
+            || !loss_free_source_report(
+                &self.report,
+                self.recognized_usage_drop_count,
+                self.accumulator.dropped_usage_record_count,
+            )
+            || !usage.is_monotonic_after(&self.accumulator.accepted_usage_totals)
+            || signatures
+                .len()
+                .checked_mul(std::mem::size_of::<&String>())
+                .map_or(true, |b| b > budget)
+        {
+            return false;
+        }
+        let mut sorted: Vec<_> = signatures.iter().collect();
+        sorted.sort_unstable();
+        self.accumulator
+            .codex_physical_signatures
+            .iter()
+            .all(|s| sorted.binary_search(&s).is_ok())
+    }
+
+    pub(super) fn into_archive_baseline(
+        self,
+        path: &str,
+        entry: &ScanIndexEntry,
+        owner: &str,
+        metadata: &CodexTitleMetadata,
+    ) -> codex_file_join::LegacyBaseline {
+        let mut snapshots = self.accumulator.into_items_with_repository_identity(
+            Path::new(path),
+            "1970-01-01T00:00:00Z",
+            entry.source_file_fingerprint.clone(),
+            None,
+            None,
+        );
+        for item in &mut snapshots {
+            apply_codex_state_evidence(item, metadata, Path::new(path));
+        }
+        codex_file_join::LegacyBaseline {
+            owner: owner.to_owned(),
+            index_key: path.to_owned(),
+            expected: entry
+                .last_snapshot_fingerprint
+                .clone()
+                .expect("accepted carrier"),
+            snapshots,
+        }
+    }
+
     /// The copy's source (M1: a durable record is written per source).
     #[cfg(unix)]
     pub(super) fn source(&self) -> SnapshotSource {

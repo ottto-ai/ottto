@@ -1232,3 +1232,70 @@ fn minted_poison_recovers_and_a_failed_save_keeps_the_incarnation_and_seq() {
     assert!(reloaded.owe_codex_parent_proof("/c/a", OWE_P, cause, OwedOrigin::Child, false));
     assert_eq!(reloaded.codex_parent_proof_seq, 2, "seq never repeats");
 }
+
+/// [money] Parent custody stays held on a bounded failed proof attempt and
+/// clears only at the existing sequence/incarnation-qualified proof finish.
+#[test]
+fn resolved_parent_proof_releases_custody_without_granting_an_ack() {
+    let mut index = ScanIndex::default();
+    let key = "held-child";
+    index.codex_proof_index_incarnation = "a".repeat(64);
+    index.hold_compressed(
+        Path::new(key),
+        BTreeSet::from(["child".into()]),
+        CodexZstCause::ParentLedgerUnbound,
+    );
+    assert!(index.owe_codex_parent_proof(
+        key,
+        "parent",
+        CodexParentUnresolvable::NoLedger.index() as u8,
+        OwedOrigin::Child,
+        false
+    ));
+    let seq = match &index.codex_parent_prefix_proofs[key] {
+        CodexParentProofState::Owed(owed) => owed.seq,
+        _ => panic!("owed"),
+    };
+    let incarnation = index.codex_proof_index_incarnation.clone();
+    assert!(index.finish_codex_parent_proof_entry(
+        key,
+        seq,
+        &incarnation,
+        ProofFinish::Attempt {
+            outcome: ProofOutcome::NoLedger,
+            wake: ProofWake::Backoff
+        },
+        100
+    ));
+    assert_eq!(
+        index.files[key].codex_compressed_hold,
+        Some(CodexZstCause::ParentLedgerUnbound)
+    );
+    let proven = proof(&codex_parent_proof_scope().0, 2, true);
+    assert!(!index.finish_codex_parent_proof_entry(
+        key,
+        seq + 1,
+        &incarnation,
+        ProofFinish::Proven(proven.clone()),
+        101
+    ));
+    assert!(index.files[key].codex_compressed_hold.is_some());
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        assert!(index.finish_codex_parent_proof_entry(
+            key,
+            seq,
+            &incarnation,
+            ProofFinish::Proven(proven),
+            101
+        ))
+    });
+    assert!(index.files[key].codex_compressed_hold.is_none());
+    assert!(!index.codex_state_only_blocked_session_ids.contains("child"));
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+    assert!(rows
+        .iter()
+        .any(
+            |row| row["counts"]["codex_archive_hold_released"]["CompressedParentLedgerUnbound"]
+                == 1
+        ));
+}

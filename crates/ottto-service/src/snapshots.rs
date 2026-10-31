@@ -24413,6 +24413,11 @@ impl ScanIndex {
         match finish {
             ProofFinish::Attempt { outcome, wake } => owed.after_attempt(outcome, wake, now),
             ProofFinish::Proven(proof) => {
+                if self.files.get(key).is_some_and(|entry| {
+                    entry.codex_compressed_hold == Some(CodexZstCause::ParentLedgerUnbound)
+                }) {
+                    self.release_compressed_hold(key);
+                }
                 self.remove_codex_parent_proof(key);
                 self.codex_parent_prefix_proofs
                     .insert(key.to_owned(), CodexParentProofState::Proven(proof));
@@ -27912,10 +27917,14 @@ impl OwnedSourceScan {
                     let selected_count = identified_candidates.len();
                     for _ in 0..selected_count {
                         let candidate = identified_candidates.pop_front().expect("selected count");
-                        if inventory.plain_twin(&candidate.path) {
+                        let custody_retry = index
+                            .files
+                            .get(&local_index_key(&candidate.path))
+                            .is_some_and(|e| e.custody_retry_due(&candidate.path));
+                        if !custody_retry && inventory.plain_twin(&candidate.path) {
                             continue;
                         }
-                        if inventory.member_held(&candidate.path) {
+                        if !custody_retry && inventory.member_held(&candidate.path) {
                             let cause = index
                                 .files
                                 .get(&local_index_key(&candidate.path))
@@ -27960,6 +27969,14 @@ impl OwnedSourceScan {
                     // publication behavior; held archives never enter groups.
                     identified_candidates.retain(|candidate| {
                         let key = local_index_key(&candidate.path);
+                        if inventory.old_carrier(&key)
+                            || index
+                                .files
+                                .get(&key)
+                                .is_some_and(|e| e.custody_retry_due(&candidate.path))
+                        {
+                            return true;
+                        }
                         let Some(twin) = inventory.family_held.get(&key) else {
                             return true;
                         };
@@ -28028,6 +28045,13 @@ impl OwnedSourceScan {
                     identified_candidates.retain(|candidate| {
                         let key = local_index_key(&candidate.path);
                         let owner = inventory.owner_for_path(&candidate.path);
+                        if index
+                            .files
+                            .get(&key)
+                            .is_some_and(|e| e.custody_retry_due(&candidate.path))
+                        {
+                            return true;
+                        }
                         if !inventory.held_archives.contains(&key)
                             && !owner.is_some_and(|o| unresolved.contains(o))
                         {
@@ -30472,6 +30496,7 @@ impl OwnedSourceScan {
                             archive.decode_attempts == 1 && !archive.user_change
                         });
                 let archive_owner = parser.accumulator.codex_creator_header_id.clone();
+                let archive_usage = parser.accumulator.accepted_usage_totals.clone();
                 let parsed_file = parser.finish_with_repository_identity(
                     &candidate.opened_object_identity,
                     &candidate.path,
@@ -30571,8 +30596,66 @@ impl OwnedSourceScan {
                         owners.clone(),
                         CodexZstCause::ParentLedgerUnbound,
                     );
+                    if let Some(parent) = parsed_file.codex_parent_session_ref.as_deref() {
+                        index.owe_codex_parent_proof(
+                            &local_index_key(&candidate.path),
+                            parent,
+                            parsed_file
+                                .codex_parent_unresolvable
+                                .map_or(CodexParentUnresolvable::NoLedger.index() as u8, |c| {
+                                    c.index() as u8
+                                }),
+                            OwedOrigin::Child,
+                            false,
+                        );
+                    }
+                    if let Some(archive) = index
+                        .files
+                        .get_mut(&local_index_key(&candidate.path))
+                        .and_then(|e| e.archive.as_mut())
+                    {
+                        archive.defer_custody(CodexZstCause::ParentLedgerUnbound);
+                    }
                     codex_state_only_blocked_session_ids.extend(owners);
                     pending!();
+                }
+                if codex_archive_path(&candidate.path) && parsed_file.complete() {
+                    let key = local_index_key(&candidate.path);
+                    let replacement = codex_join_inventory
+                        .as_ref()
+                        .zip(sampling.as_ref())
+                        .and_then(|(inventory, context)| {
+                            index.archive_replacement_baselines(
+                                &candidate.path,
+                                &parsed_file,
+                                &archive_usage,
+                                (inventory, &context.cache, &codex_title_metadata),
+                                finish_copy_budget.unwrap_or(0),
+                            )
+                        });
+                    if let Some(baselines) = replacement {
+                        codex_legacy_join_baselines.extend(baselines);
+                        index.release_compressed_hold(&key);
+                    } else {
+                        index.hold_compressed(
+                            &candidate.path,
+                            codex_session_id_candidates_from_path(&candidate.path)
+                                .into_iter()
+                                .collect(),
+                            CodexZstCause::ArchiveEquivalenceUnproven,
+                        );
+                        if let Some(archive) =
+                            index.files.get_mut(&key).and_then(|e| e.archive.as_mut())
+                        {
+                            archive.defer_custody(CodexZstCause::ArchiveEquivalenceUnproven);
+                        }
+                        codex_archive_catchup::retain_residue(
+                            &mut residue_index_keys,
+                            &candidate.path,
+                            CodexZstCause::ArchiveEquivalenceUnproven,
+                        );
+                        pending!();
+                    }
                 }
                 if let Some(evidence) = index
                     .files
@@ -30584,7 +30667,19 @@ impl OwnedSourceScan {
                         .extend(archive_owner.iter().cloned());
                     if !evidence.finish(archive_owner, &candidate.path, &parsed_file) {
                         if let Some(cause) = evidence.terminal_cause() {
-                            census.archive_residue(&candidate.path, Some(evidence), cause);
+                            evidence.defer_custody(cause);
+                            index.hold_compressed(
+                                &candidate.path,
+                                codex_session_id_candidates_from_path(&candidate.path)
+                                    .into_iter()
+                                    .collect(),
+                                cause,
+                            );
+                            codex_archive_catchup::retain_residue(
+                                &mut residue_index_keys,
+                                &candidate.path,
+                                cause,
+                            );
                             pending!();
                         }
                         census.record_unreadable(UnreadableCause::Reduction, 1);
@@ -33424,8 +33519,10 @@ impl OwnedSourceScan {
                 && index
                     .files
                     .get(&local_index_key(&candidate.path))
-                    .and_then(|e| e.archive.as_ref())
-                    .is_some_and(|a| a.quiet(&opened_file))
+                    .is_some_and(|e| {
+                        !e.custody_retry_due(&candidate.path)
+                            && e.archive.as_ref().is_some_and(|a| a.quiet(&opened_file))
+                    })
             {
                 pending!();
             }
@@ -44771,11 +44868,10 @@ fn candidate_from_traversal_path_at(
 ) -> Option<CandidateFile> {
     if source == SnapshotSource::Codex {
         let key = local_index_key(&pending.path);
-        if let Some(entry) = discovery
-            .index
-            .files
-            .get(&key)
-            .filter(|e| e.codex_compressed_hold.is_some())
+        if let Some(entry) =
+            discovery.index.files.get(&key).filter(|e| {
+                e.codex_compressed_hold.is_some() && !e.custody_retry_due(&pending.path)
+            })
         {
             census.observed_index_keys.insert(key);
             if codex_archive_path(&pending.path) {
@@ -45594,8 +45690,9 @@ fn open_and_identify_scan_candidate_with_rescue_at(
     if source == SnapshotSource::Codex
         && files
             .get(&local_index_key(&candidate.path))
-            .and_then(|entry| entry.codex_compressed_hold)
-            .is_some()
+            .is_some_and(|entry| {
+                entry.codex_compressed_hold.is_some() && !entry.custody_retry_due(&candidate.path)
+            })
     {
         return None;
     }
@@ -45682,7 +45779,11 @@ fn open_and_identify_scan_candidate_with_rescue_at(
     if let Some((entry, archive)) = files
         .get(&local_index_key(&candidate.path))
         .and_then(|entry| entry.archive.as_ref().map(|archive| (entry, archive)))
-        .filter(|(_, archive)| source == SnapshotSource::Codex && archive.quiet(&opened_file))
+        .filter(|(entry, archive)| {
+            source == SnapshotSource::Codex
+                && !entry.custody_retry_due(&candidate.path)
+                && archive.quiet(&opened_file)
+        })
     {
         if let Some(cause) = archive
             .terminal_cause()
@@ -52550,13 +52651,16 @@ impl ScanIndex {
         growth_only: bool,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let key = local_index_key(&candidate.path);
-        if self.decode_holds_file(&key)
-            || self
-                .files
-                .get(&key)
-                .is_some_and(|entry| entry.codex_compressed_hold.is_some())
-        {
+        if self.decode_holds_file(&key) {
             return (CandidateDecision::Skip, None);
+        }
+        if let Some(entry) = self.files.get(&key) {
+            if entry.custody_retry_due(&candidate.path) {
+                return (CandidateDecision::Parse, None);
+            }
+            if entry.codex_compressed_hold.is_some() {
+                return (CandidateDecision::Skip, None);
+            }
         }
         if self
             .terminal_jsonl_dispositions

@@ -84,7 +84,63 @@ pub(super) fn deserialize_hold<'de, D: serde::Deserializer<'de>>(
     de.deserialize_any(Hold)
 }
 
+impl ScanIndexEntry {
+    /// Metadata permits only a paced attempt, never publication or an ACK.
+    pub(super) fn custody_retry_due(&self, path: &Path) -> bool {
+        codex_archive_path(path)
+            && !self.archive.as_ref().is_some_and(|a| a.user_change)
+            && (self.codex_compressed_hold.is_some()
+                || self
+                    .archive
+                    .as_ref()
+                    .and_then(|a| a.terminal_cause())
+                    .is_some())
+            && matches!(
+                self.codex_compressed_hold
+                    .or_else(|| self.archive.as_ref().and_then(|a| a.terminal_cause())),
+                Some(
+                    CodexZstCause::FamilyUnproven
+                        | CodexZstCause::ArchiveEquivalenceUnproven
+                        | CodexZstCause::ParentLedgerUnbound
+                        | CodexZstCause::OwnerUnproven
+                        | CodexZstCause::OutputHeld
+                        | CodexZstCause::DecodeFailed
+                        | CodexZstCause::HeaderInvalid
+                        | CodexZstCause::DecodedOverLimit
+                        | CodexZstCause::DecodeBudget
+                        | CodexZstCause::SettlementStuck
+                        | CodexZstCause::CatchupTooLarge
+                        | CodexZstCause::AdmissionRefused
+                )
+            )
+            && self.archive.as_ref().map_or(true, |a| match a.disposition {
+                ArchiveDisposition::Pending { retry_after, .. } => {
+                    sampled_scan::now_seconds() >= retry_after
+                }
+                ArchiveDisposition::Acquired | ArchiveDisposition::Empty => false,
+                _ => true,
+            })
+    }
+}
+
 impl ScanIndex {
+    pub(super) fn release_compressed_hold(&mut self, key: &str) {
+        if let Some(cause) = self
+            .files
+            .get_mut(key)
+            .and_then(|e| e.codex_compressed_hold.take())
+        {
+            self.attribute_codex_blocked(key, BTreeSet::new());
+            crate::local_resource_diagnostics::traversal_point(
+                "codex_archive_hold_released",
+                "codex",
+                &BTreeMap::from([(
+                    "codex_archive_hold_released",
+                    BTreeMap::from([(cause, 1_u64)]),
+                )]),
+            );
+        }
+    }
     pub(super) fn hold_compressed(
         &mut self,
         path: &Path,
@@ -296,9 +352,9 @@ impl codex_file_join::HeaderInventory {
                 continue;
             };
             let Some(
-                cause @ (CodexZstCause::FamilyUnproven
+                CodexZstCause::FamilyUnproven
                 | CodexZstCause::ArchiveEquivalenceUnproven
-                | CodexZstCause::OwnerUnproven),
+                | CodexZstCause::OwnerUnproven,
             ) = entry.codex_compressed_hold
             else {
                 continue;
@@ -317,12 +373,7 @@ impl codex_file_join::HeaderInventory {
             {
                 continue;
             }
-            index
-                .files
-                .get_mut(key)
-                .expect("classified stub")
-                .codex_compressed_hold = None;
-            index.attribute_codex_blocked(key, BTreeSet::new());
+            index.release_compressed_hold(key);
             if let Some(traversal) = index.traversal.as_mut() {
                 if let Some(root) = traversal
                     .scan_roots
@@ -340,14 +391,6 @@ impl codex_file_join::HeaderInventory {
                 }
             }
             index.mark_bounded_sweep_unsettled();
-            crate::local_resource_diagnostics::traversal_point(
-                "codex_archive_hold_released",
-                "codex",
-                &BTreeMap::from([(
-                    "codex_archive_hold_released",
-                    BTreeMap::from([(cause, 1_u64)]),
-                )]),
-            );
             released = true;
         }
         if released {

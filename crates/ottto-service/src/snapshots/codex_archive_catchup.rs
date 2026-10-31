@@ -99,6 +99,91 @@ pub(super) fn retain_residue(keys: &mut BTreeSet<String>, path: &Path, cause: Co
 }
 
 impl ScanIndex {
+    /// The one completed-output gate for a paced custody attempt. The old
+    /// carrier stays accepted until the ordinary exact-body ACK settles the
+    /// replacement; the existing legacy-baseline reconciliation verifies the
+    /// retained plain reduction against its accepted entity-set fingerprint.
+    pub(super) fn archive_replacement_baselines(
+        &self,
+        path: &Path,
+        parsed: &ParsedJsonlFile,
+        usage: &UsageTotals,
+        inputs: (
+            &codex_file_join::HeaderInventory,
+            &sampled_scan::SharedCache,
+            &CodexTitleMetadata,
+        ),
+        mut budget: usize,
+    ) -> Option<Vec<codex_file_join::LegacyBaseline>> {
+        let (inventory, cache, metadata) = inputs;
+        let key = local_index_key(path);
+        if !inventory.old_carrier(&key) {
+            return Some(Vec::new());
+        }
+        let (owner, ledger) = parsed
+            .codex_parent_ownership_ledger
+            .as_ref()
+            .filter(|(_, l)| l.scan_complete)?;
+        if parsed
+            .snapshots
+            .iter()
+            .any(|s| s.source_session_id != *owner)
+        {
+            return None;
+        }
+        let carriers = inventory.carrier_paths(owner).filter(|p| *p != key).count();
+        budget = budget.checked_sub(
+            carriers.checked_mul(std::mem::size_of::<codex_file_join::LegacyBaseline>())?,
+        )?;
+        let mut baselines = Vec::with_capacity(carriers);
+        for carrier in inventory.carrier_paths(owner).filter(|p| *p != key) {
+            if codex_archive_path(Path::new(carrier)) {
+                return None;
+            }
+            let entry = self.files.get(carrier)?;
+            entry.last_snapshot_fingerprint.as_ref()?;
+            entry.last_upload_body_witness.as_ref()?;
+            if !self
+                .file_snapshot_fingerprints
+                .get(carrier)
+                .is_some_and(|fps| {
+                    !fps.is_empty()
+                        && fps
+                            .iter()
+                            .all(|fp| self.accepted_snapshot_fingerprints.contains(fp))
+                })
+            {
+                return None;
+            }
+            let mut retained = cache.retained().ok()?;
+            let prior = retained.peek(carrier)?;
+            if !prior
+                .state
+                .covers_archive(owner, &ledger.signatures, usage, budget)
+            {
+                return None;
+            }
+            let taken = retained.take(carrier)?;
+            drop(retained);
+            // Reuse the baseline output charge already measured on this exact
+            // retained reduction. No accumulator clone or baseline file read.
+            budget = budget.checked_sub(
+                taken
+                    .finalization_charge
+                    .checked_add(carrier.len())?
+                    .checked_add(owner.len())?
+                    .checked_add(entry.last_snapshot_fingerprint.as_ref()?.len())?,
+            )?;
+            baselines.push(
+                taken
+                    .retained
+                    .state
+                    .into_archive_baseline(carrier, entry, owner, metadata),
+            );
+        }
+        (!baselines.is_empty()).then_some(baselines)
+    }
+
     /// Custody is negative scope only; acquisition and ACK remain independent.
     pub(super) fn classify_archive(
         &mut self,
@@ -110,10 +195,15 @@ impl ScanIndex {
     ) -> Result<Admission> {
         let key = local_index_key(&candidate.path);
         let ids = codex_session_id_candidates_from_path(&candidate.path);
+        let custody_retry = self
+            .files
+            .get(&key)
+            .is_some_and(|e| e.custody_retry_due(&candidate.path));
         if let Some(cause) = self
             .files
             .get(&key)
-            .and_then(|entry| entry.codex_compressed_hold)
+            .and_then(|e| e.codex_compressed_hold)
+            .filter(|_| !custody_retry)
         {
             return Ok(Admission::Held(cause));
         }
@@ -122,7 +212,7 @@ impl ScanIndex {
             .get(&key)
             .and_then(|e| e.archive.as_deref())
             .filter(|a| a.matches(file));
-        if prior.is_some_and(|a| a.quiet(file)) {
+        if !custody_retry && prior.is_some_and(|a| a.quiet(file)) {
             return Ok(Admission::Held(
                 prior
                     .and_then(|a| a.terminal_cause())
@@ -137,14 +227,16 @@ impl ScanIndex {
         };
         let family = inventory.archive_class(&key).sibling;
         let old_carrier = inventory.old_carrier(&key);
-        if family || (!retry && old_carrier) {
+        if !custody_retry && (family || (!retry && old_carrier)) {
             let cause = if family {
                 CodexZstCause::FamilyUnproven
             } else {
                 CodexZstCause::ArchiveEquivalenceUnproven
             };
             self.hold_compressed(&candidate.path, ids.iter().cloned().collect(), cause);
-            return Ok(Admission::Held(cause));
+            if !old_carrier {
+                return Ok(Admission::Held(cause));
+            }
         }
         // A partial/old intake census is negative scope only. New archive
         // acquisition waits until every configured root has been inventoried.
@@ -154,39 +246,10 @@ impl ScanIndex {
         if !budget.archive_ready(&self.archive_pass) {
             return Ok(Admission::Deferred(CodexZstCause::AdmissionRefused));
         }
-        // An unchanged pending object already has a validated header. The
-        // retained hit (or bounded lost-copy retry) is resolved by the parser.
-        if retry {
+        // Existing reservation/deadline bounds retries; identity and superset
+        // proof remain mandatory at completed output, including retained resends.
+        if retry || custody_retry || old_carrier {
             return Ok(Admission::Read);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            let mut bytes = [0; 18];
-            let n = file.read_at(&mut bytes, 0)?;
-            crate::local_resource_diagnostics::traversal_point(
-                "codex_zst_frame_header",
-                "codex",
-                &BTreeMap::from([("codex_zst_frame_header_bytes", n as u64)]),
-            );
-            if let Some(length) = zstd::zstd_safe::get_frame_content_size(&bytes[..n])
-                .ok()
-                .flatten()
-            {
-                if length > codex_compressed_input::FIRST_READ_DECODED_LIMIT {
-                    self.hold_compressed(
-                        &candidate.path,
-                        ids.iter().cloned().collect(),
-                        CodexZstCause::CatchupTooLarge,
-                    );
-                    crate::local_resource_diagnostics::traversal_point(
-                        "codex_zst_catchup_too_large",
-                        "codex",
-                        &BTreeMap::from([("codex_zst_held_declared_bytes", length)]),
-                    );
-                    return Ok(Admission::Held(CodexZstCause::CatchupTooLarge));
-                }
-            }
         }
         if budget.singleton_remaining(sampled_scan::codex_cursor::Limits::current())
             < 2 * codex_file_join::MAX_HEADER_BYTES as u64

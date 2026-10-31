@@ -431,6 +431,7 @@ pub(super) struct HeaderInventory {
     /// One compact, funded classification per completed inventory revision.
     archive_classes: Vec<(String, FamilyClass)>,
     family_peak: usize,
+    carriers: Vec<(String, String)>,
     pub(super) reuse_hits: usize,
     pub(super) reuse_misses: usize,
     pub(super) bytes_avoided: usize,
@@ -823,20 +824,35 @@ impl HeaderInventory {
                 index
                     .files
                     .len()
-                    .checked_mul(3 * (std::mem::size_of::<String>() + 64))?,
+                    .checked_mul(3 * (std::mem::size_of::<(String, String)>() + 64))?,
             )?;
             for key in index.files.keys() {
-                cost.add(key.len().checked_mul(2)?)?;
+                cost.add(key.len().checked_mul(5)?)?;
             }
         }
         Some(cost.bytes)
     }
 
     pub(super) fn prepare_archive_classification(&mut self, index: &ScanIndex) {
+        self.carriers = Vec::new();
+        if self.first_read_archives.is_empty()
+            && self.held_archives.is_empty()
+            && self.deferred_archives.is_empty()
+            && !self
+                .headers
+                .iter()
+                .any(|h| codex_archive_path(&h.candidate.path))
+        {
+            self.archive_classes = Vec::new();
+            self.family_peak = 1;
+            return;
+        }
         let Some(peak) = self.family_bound(Some(index)) else {
-            self.refuse_custody();
-            self.complete = false;
-            self.bounded_out = true;
+            // Optional archive preparation cannot turn ordinary plain work
+            // into a custody-scratch failure. Archives retain their queued debt.
+            self.archive_classes = Vec::new();
+            self.family_peak = 0;
+            crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::AdmissionRefused);
             return;
         };
         self.classify_bound_archives();
@@ -849,13 +865,13 @@ impl HeaderInventory {
         let mut carriers = Vec::with_capacity(3 * index.files.len());
         for (path, entry) in &index.files {
             if let Some(owner) = &entry.codex_protected_owner {
-                carriers.push(owner.clone());
+                carriers.push((owner.clone(), path.clone()));
             }
             if !codex_archive_path(Path::new(path)) {
                 for id in codex_session_id_candidates_from_path(Path::new(path)) {
                     let owner = codex_protected_owner(&id);
                     if entry.codex_protected_owner.as_ref() != Some(&owner) {
-                        carriers.push(owner);
+                        carriers.push((owner, path.clone()));
                     }
                 }
             }
@@ -872,13 +888,22 @@ impl HeaderInventory {
                 );
                 index.codex_counting_tombstones.contains_key(&owner)
                     || index.codex_counting_moved_evidence.contains_key(&owner)
-                    || carriers.partition_point(|id| id <= &owner)
-                        - carriers.partition_point(|id| id < &owner)
+                    || carriers.partition_point(|(id, _)| id <= &owner)
+                        - carriers.partition_point(|(id, _)| id < &owner)
                         > own
             }) {
                 class.old_carrier = true;
             }
         }
+        self.carriers = carriers;
+    }
+    pub(super) fn carrier_paths(&self, owner: &str) -> impl Iterator<Item = &str> {
+        let owner = codex_protected_owner(owner);
+        let first = self.carriers.partition_point(|(id, _)| id < &owner);
+        let last = self.carriers.partition_point(|(id, _)| id <= &owner);
+        self.carriers[first..last]
+            .iter()
+            .map(|(_, path)| path.as_str())
     }
 
     /// 0a r3 (Lead B 2026-10-29): a bound archive X with a resolved sibling of
@@ -890,9 +915,7 @@ impl HeaderInventory {
         self.archive_classes = Vec::new();
         self.family_peak = 0;
         let Some(peak) = self.family_bound(None) else {
-            self.refuse_custody();
-            self.complete = false;
-            self.bounded_out = true;
+            crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::AdmissionRefused);
             return;
         };
         let table = self.family_table();
@@ -968,6 +991,14 @@ impl HeaderInventory {
             && !self.decode_unknown
             && !owner.is_some_and(|id| self.decode_held_owners.contains(&codex_protected_owner(id)))
             && !owner.is_some_and(|owner| {
+                !self.classification_ready()
+                    && self
+                        .first_read_archives
+                        .union(&self.held_archives)
+                        .chain(&self.deferred_archives)
+                        .any(|key| archive_owners(key).contains(owner))
+            })
+            && !owner.is_some_and(|owner| {
                 self.held_owners.contains(owner)
                     || self.headers.iter().any(|h| {
                         &h.owner == owner
@@ -1016,6 +1047,7 @@ impl HeaderInventory {
             family_held: BTreeMap::new(),
             archive_classes: Vec::new(),
             family_peak: 0,
+            carriers: Vec::new(),
             reuse_hits: 0,
             reuse_misses: 0,
             bytes_avoided: 0,
@@ -1063,7 +1095,7 @@ impl HeaderInventory {
             if codex_archive_path(Path::new(path)) && index.decode_holds_file(path) {
                 // It still names a negative family member. The former selected
                 // admission roster walk included raw-held paths as well.
-                self.held_archives.insert(path.clone());
+                self.first_read_archives.insert(path.clone());
                 self.pending.push_back(PathBuf::from(path));
                 continue;
             }
@@ -1094,6 +1126,7 @@ impl HeaderInventory {
                 self.pending.push_back(PathBuf::from(path));
             } else if !held {
                 if index.archive_header(Path::new(path)).is_some() {
+                    self.first_read_archives.remove(path);
                     self.pending.push_back(PathBuf::from(path));
                 } else {
                     // An omitted archive is still negative absence scope, even
@@ -1471,7 +1504,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, decode_after, decode_done, decode_unknown, decode_peak, decode_refused_peak, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held, archive_classes, family_peak);
+crate::heap_layout_bound::fields!(HeaderInventory; feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, decode_after, decode_done, decode_unknown, decode_peak, decode_refused_peak, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held, archive_classes, family_peak, carriers);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {

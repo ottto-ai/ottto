@@ -2158,8 +2158,12 @@ pub(super) fn new_source_parser(
         cache,
         archive_scope,
     } = options;
-    // Dedicated custody precedes every cache take, including retained resends.
-    if source == SnapshotSource::Codex {
+    let custody_retry = source == SnapshotSource::Codex
+        && index
+            .files
+            .get(&local_index_key(&candidate.path))
+            .is_some_and(|entry| entry.custody_retry_due(&candidate.path));
+    if source == SnapshotSource::Codex && !custody_retry {
         if let Some(cause) = index
             .files
             .get(&local_index_key(&candidate.path))
@@ -2183,7 +2187,7 @@ pub(super) fn new_source_parser(
                     && !a.user_change
                     && matches!(a.disposition, ArchiveDisposition::Pending { .. })
             });
-        if reuse && archive_scope.is_none() {
+        if reuse && archive_scope.is_none() && !custody_retry {
             traversal_point(
                 "codex_zst_retained_scope_deferred",
                 "codex",
@@ -2256,12 +2260,12 @@ pub(super) fn new_source_parser(
 
         if let Some(archive) = index.files.get_mut(&key).and_then(|e| e.archive.as_mut()) {
             anyhow::ensure!(
-                !archive.quiet(&file),
+                custody_retry || !archive.quiet(&file),
                 "compressed rollout already attempted"
             );
             // The driver MUST call persist_archive_reservation before stepping;
             // only that committed attempt spends the per-stamp decode budget.
-            if archive.matches(&file) && archive.stop_exhausted() {
+            if !custody_retry && archive.matches(&file) && archive.stop_exhausted() {
                 anyhow::bail!("compressed settlement exhausted");
             }
         }
