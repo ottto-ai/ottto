@@ -37,22 +37,32 @@ impl ImmutableRecord {
     }
 }
 
+/// Shared by reference lookup, generation GC and owned-temp cleanup.
+pub(super) fn name_key(name: &str) -> Option<(Digest32, u64)> {
+    let (key, rest) = name.strip_suffix(".rec")?.split_once('.')?;
+    let key = parse_hex_digest(key)?;
+    let (generation, attempt) = rest.split_once('.')?;
+    let generation = generation.parse::<u64>().ok().filter(|g| *g > 0)?;
+    (!attempt.is_empty()
+        && attempt.len() <= 128
+        && attempt
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+    .then_some((key, generation))
+}
+pub(super) fn temp_key(name: &str) -> Option<Digest32> {
+    let (record, _) = name
+        .strip_prefix('.')?
+        .strip_suffix(TEMP_SUFFIX)?
+        .split_once(".rec.")?;
+    name_key(&format!("{record}.rec")).map(|(key, _)| key)
+}
+
 impl DurableTailStore {
     pub(super) fn immutable_path(&self, name: &str, key: &Digest32) -> io::Result<PathBuf> {
-        let prefix = format!("{}.", hex(key));
-        let valid = name
-            .strip_prefix(&prefix)
-            .and_then(|s| s.strip_suffix(".rec"))
-            .and_then(|s| s.split_once('.'))
-            .is_some_and(|(generation, attempt)| {
-                generation.parse::<u64>().is_ok_and(|g| g > 0)
-                    && !attempt.is_empty()
-                    && attempt.len() <= 128
-                    && attempt
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-            });
-        if !valid || self.source != DurableSource::ClaudeCode {
+        if self.source != DurableSource::ClaudeCode
+            || name_key(name).map(|(named, _)| named) != Some(*key)
+        {
             return Err(io::Error::other("immutable record name/source"));
         }
         Ok(self.dir.join(name))
@@ -194,7 +204,7 @@ impl DurableTailStore {
     /// Consent erasure visits all generations of the same key, including
     /// committed records. Refusal retains the existing fail-closed PL marker.
     pub(super) fn immutable_label_names(
-        &self,
+        &mut self,
         keys: &BTreeSet<Digest32>,
     ) -> io::Result<(BTreeMap<Digest32, Vec<String>>, BTreeSet<Digest32>)> {
         let entries = match fs::read_dir(&self.dir) {
@@ -208,10 +218,30 @@ impl DurableTailStore {
         let mut overflow = BTreeSet::new();
         let mut count = 0;
         for entry in entries {
-            let name = entry?.file_name();
+            let entry = entry?;
+            let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
             };
+            if let Some(key) = temp_key(name).filter(|key| keys.contains(key)) {
+                if count == GC_RECORDS_PER_PASS || !dead_temp(name) {
+                    overflow.insert(key);
+                    continue;
+                }
+                let metadata = inspect_path(&entry.path())?;
+                if !metadata.is_file()
+                    || metadata.uid() != our_uid()
+                    || metadata.mode() & 0o777 != 0o600
+                {
+                    overflow.insert(key);
+                    continue;
+                }
+                remove_if_present(&entry.path())?;
+                self.immutable_sync_due = true;
+                self.counters.gc_temps_deleted += 1;
+                count += 1;
+                continue;
+            }
             let Some(key) = name
                 .split_once('.')
                 .and_then(|(key, _)| parse_hex_digest(key))
@@ -441,12 +471,16 @@ mod tests {
         let second = ImmutableRecord::plan(pending, 2, "second");
         store.stage_immutable(writer, &first).unwrap();
         store.stage_immutable(writer, &second).unwrap();
+        let orphan = store.dir.join(format!(".{}.2147483647.1.tmp", second.name));
+        fs::write(&orphan, b"interrupted private-label staging").unwrap();
+        fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600)).unwrap();
         let mut reopened = scratch.store();
         // The existing caller owns the label predicate; the store still
         // verifies each envelope and retains unknown/corrupt generations.
         let report = reopened.purge_private_labels(writer, |_| true).unwrap();
         assert_eq!(report.erased, 2);
         assert_eq!(report.refused, 0);
+        assert!(!orphan.exists());
         assert!(!reopened.dir.join(first.name).exists());
         assert!(!reopened.dir.join(second.name).exists());
         assert_eq!(

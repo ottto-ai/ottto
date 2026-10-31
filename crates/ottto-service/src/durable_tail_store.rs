@@ -2261,13 +2261,18 @@ impl DurableTailStore {
             let name = entry?.file_name();
             if let Some(key) = name
                 .to_str()
-                .and_then(|name| name.strip_suffix(RECORD_SUFFIX))
                 .and_then(|name| {
-                    parse_hex_digest(name).or_else(|| {
-                        name.split_once('.')
-                            .and_then(|(key, _)| parse_hex_digest(key))
-                            .filter(|key| self.immutable_path(&format!("{name}.rec"), key).is_ok())
-                    })
+                    name.strip_suffix(RECORD_SUFFIX)
+                        .and_then(parse_hex_digest)
+                        .or_else(|| {
+                            (self.source == DurableSource::ClaudeCode)
+                                .then(|| {
+                                    immutable::name_key(name)
+                                        .map(|(key, _)| key)
+                                        .or_else(|| immutable::temp_key(name))
+                                })
+                                .flatten()
+                        })
                 })
                 .filter(|key| after.map_or(true, |after| *key > after))
             {
@@ -2863,7 +2868,8 @@ fn dead_temp(name: &str) -> bool {
     let pid = pid.parse::<i32>().ok().filter(|pid| *pid > 0);
     let named = record
         .strip_suffix(RECORD_SUFFIX)
-        .and_then(parse_hex_digest);
+        .and_then(parse_hex_digest)
+        .or_else(|| immutable::name_key(record).map(|(key, _)| key));
     // Owned stages can outlive Stores; a live process's stage is never a GC orphan.
     let ours = !staged && pid.is_some_and(|pid| pid.unsigned_abs() == std::process::id());
     // SAFETY: signal zero probes only, without sending a signal.
