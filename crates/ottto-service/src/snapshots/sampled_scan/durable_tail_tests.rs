@@ -6213,34 +6213,38 @@ fn a1a_scan_at(
     index: ScanIndex,
     at: &str,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-    let mut scan = OwnedSourceScan::new_with_identity_capture(
-        SnapshotSource::ClaudeCode,
-        roots,
-        index,
-        at,
-        183,
-        100,
-        false,
-        Some(support),
-        &[],
-        false,
-        true,
-        false,
-    )
-    .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
-    for _ in 0..100_000 {
-        let context = scan.sampling.as_ref().unwrap();
-        let modes = (
-            context.full_files,
-            context.tail_files,
-            context.unchanged_files,
-        );
-        match scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => scan = next,
-            OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
+    // Model an ordinary file born before its fixed August response timestamps.
+    // The fold is constructed before the driver's per-file birth setter runs.
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            roots,
+            index,
+            at,
+            183,
+            100,
+            false,
+            Some(support),
+            &[],
+            false,
+            true,
+            false,
+        )
+        .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
+        for _ in 0..100_000 {
+            let context = scan.sampling.as_ref().unwrap();
+            let modes = (
+                context.full_files,
+                context.tail_files,
+                context.unchanged_files,
+            );
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
+            }
         }
-    }
-    panic!("native transition did not finish");
+        panic!("native transition did not finish");
+    })
 }
 
 /// [money] a1a 859 and restart with active carry restore tail zero full fresh census.
@@ -7899,7 +7903,9 @@ fn a0h_scan(
     root: &Path,
     index: ScanIndex,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-    owner.scan(roots, root, index, 100, true, &BTreeMap::new(), &[])
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        owner.scan(roots, root, index, 100, true, &BTreeMap::new(), &[])
+    })
 }
 
 /// [money] stale growth gate keeps transient and future floors held and shares pacing.
