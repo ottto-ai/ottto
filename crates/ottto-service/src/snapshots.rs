@@ -26809,6 +26809,7 @@ impl OwnedSourceScan {
         if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
             refresh_terminal_off_discovery(index, roots, audit_now, watcher_overflowed, file_limit);
         }
+        let hinted_paths = changed_watcher_hints(index, hinted_paths);
         let next_generation_hints;
         {
             let traversal = index.traversal.as_mut().expect("traversal initialized");
@@ -26819,12 +26820,8 @@ impl OwnedSourceScan {
                 discovery_retention!(index, &resource_probe.discovery_growth),
             );
             start_due_listing_pass(traversal, collected_at);
-            next_generation_hints = enqueue_watcher_hints(
-                source,
-                traversal,
-                &changed_watcher_hints(&index.files, hinted_paths),
-                watcher_overflowed,
-            );
+            next_generation_hints =
+                enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
         }
         advance_bounded_directory_traversal(
             source,
@@ -26876,8 +26873,10 @@ impl OwnedSourceScan {
                 .iter()
                 .any(|candidate| candidate.census_member && !candidate.watcher_hint);
         let selection_limit = if source == SnapshotSource::Codex
-            && !traversal.pending_directories.is_empty()
-            && traversal.counts.listing_generations == 0
+            && traversal
+                .pending_directories
+                .iter()
+                .any(|directory| directory.census_member)
         {
             0
         } else {
@@ -43508,27 +43507,28 @@ fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at:
         .extend(roots.into_iter().map(|root| ScanTraversalPath {
             scan_root: root.clone(),
             path: root,
-            census_member: true,
+            census_member: false,
             watcher_hint: false,
         }));
 }
 
 /// R4: watcher hints go through the listing's stamp compare. An unchanged
 /// file (ctime-only events included) is dropped; a vanished one is kept for
-/// the exact removal path. Owner re-enqueues (audit retry) bypass this.
-fn changed_watcher_hints(
-    files: &BTreeMap<String, ScanIndexEntry>,
-    hinted_paths: &[PathBuf],
-) -> Vec<PathBuf> {
+/// the exact removal path. Owner requests keep their unchanged files: a
+/// leased reason re-offer here, the audit retry by calling the queue directly.
+fn changed_watcher_hints(index: &ScanIndex, hinted_paths: &[PathBuf]) -> Vec<PathBuf> {
     hinted_paths
         .iter()
         .filter(|path| {
-            !fs::symlink_metadata(path).is_ok_and(|metadata| {
-                metadata.is_file()
-                    && files
-                        .get(&local_index_key(path))
-                        .is_some_and(|entry| entry.same_listing_stamp_as(&metadata))
-            })
+            let key = local_index_key(path);
+            index.reason_reoffer_leased(&key)
+                || !fs::symlink_metadata(path).is_ok_and(|metadata| {
+                    metadata.is_file()
+                        && index
+                            .files
+                            .get(&key)
+                            .is_some_and(|entry| entry.same_listing_stamp_as(&metadata))
+                })
         })
         .cloned()
         .collect()
@@ -43955,11 +43955,6 @@ fn advance_bounded_directory_traversal_with_budget(
         )
     };
     let issues_before = walk_issues(&traversal.counts);
-    // A re-listing pass (R3) only queues stamp changes. Its walk problems
-    // and counts belong to the next generation's first walk, so it can never
-    // turn this generation red or green or move its census counts.
-    let relisting = traversal.counts.listing_generations > 0;
-    let counts_before = relisting.then(|| traversal.counts.clone());
     // Eligibility belongs to the frozen census generation, not to whichever
     // later tick happens to reach a directory. Otherwise a multi-page walk can
     // silently age boundary files out while still publishing the earlier
@@ -43975,10 +43970,24 @@ fn advance_bounded_directory_traversal_with_budget(
         },
     );
     let mut remaining = max_entries;
+    // A re-listing pass (R3, directories without census membership) only
+    // queues stamp changes. Its walk problems and counts belong to the next
+    // generation's first walk: it never turns this generation red or green,
+    // moves its census counts or touches the Codex directory census.
+    let mut relisted_counts = None;
+    let restore = |counts: &mut ScanTraversalCounts, saved: Option<ScanTraversalCounts>| {
+        if let Some(mut saved) = saved {
+            saved.listing_changes_without_hint = counts.listing_changes_without_hint;
+            *counts = saved;
+        }
+    };
     while remaining > 0 {
+        restore(&mut traversal.counts, relisted_counts.take());
         let Some(directory) = traversal.pending_directories.pop_front() else {
             break;
         };
+        let relisting = !directory.census_member;
+        relisted_counts = relisting.then(|| traversal.counts.clone());
         let metadata = match fs::symlink_metadata(&directory.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -44017,12 +44026,12 @@ fn advance_bounded_directory_traversal_with_budget(
         // budget was available, that same extra entry proves the directory is
         // too wide to scan truthfully and turns the generation red.
         let mut entries = entries.take(remaining + 1).collect::<Vec<_>>();
-        if let Some(census) = traversal.codex_join_directory_census.as_mut() {
-            // The roster refresh re-certifies known directories; a re-listing
-            // pass adds only directories the census has not seen.
-            if !relisting || !census.contains(&directory.path) {
-                census.observe(&directory.path, &metadata);
-            }
+        if let Some(census) = traversal
+            .codex_join_directory_census
+            .as_mut()
+            .filter(|_| !relisting)
+        {
+            census.observe(&directory.path, &metadata);
         }
         if entries.len() > remaining {
             if remaining == max_entries {
@@ -44069,7 +44078,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 traversal.pending_directories.push_back(ScanTraversalPath {
                     scan_root: directory.scan_root.clone(),
                     path,
-                    census_member: true,
+                    census_member: directory.census_member,
                     watcher_hint: directory.watcher_hint,
                 });
                 continue;
@@ -44214,10 +44223,8 @@ fn advance_bounded_directory_traversal_with_budget(
             }
         }
     }
-    if let Some(mut counts) = counts_before {
-        counts.listing_changes_without_hint = traversal.counts.listing_changes_without_hint;
-        traversal.counts = counts;
-    } else if walk_issues(&traversal.counts) != issues_before {
+    restore(&mut traversal.counts, relisted_counts);
+    if walk_issues(&traversal.counts) != issues_before {
         if let Some(census) = traversal.codex_join_directory_census.as_mut() {
             census.invalidate_walk();
         }
@@ -48926,14 +48933,23 @@ impl ScanIndex {
             return Vec::new();
         }
         self.file_snapshot_fingerprints
-            .iter()
-            .filter(|(_, fingerprints)| {
-                fingerprints
-                    .iter()
-                    .any(|fingerprint| self.reason_reoffer_retries.contains_key(fingerprint))
-            })
-            .map(|(key, _)| PathBuf::from(key))
+            .keys()
+            .filter(|key| self.reason_reoffer_leased(key))
+            .map(PathBuf::from)
             .collect()
+    }
+
+    /// This cycle leased the file's snapshot for a reason re-offer.
+    fn reason_reoffer_leased(&self, key: &str) -> bool {
+        !self.reason_reoffer_retries.is_empty()
+            && self
+                .file_snapshot_fingerprints
+                .get(key)
+                .is_some_and(|fingerprints| {
+                    fingerprints
+                        .iter()
+                        .any(|fingerprint| self.reason_reoffer_retries.contains_key(fingerprint))
+                })
     }
 
     fn quarantine_requires_retry_body(&self, fingerprint: &str, body_witness: &str) -> bool {
