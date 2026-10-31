@@ -48,6 +48,9 @@ type Absence = (std::time::Instant, u64, Box<sampled_audit::AbsenceParent>);
 #[derive(Debug)]
 struct State {
     entries: Entries,
+    // Q-B2 witnesses for vanished census members below a missing parent. They
+    // share the entries' descriptor budget but are never held population.
+    vanished: BTreeMap<[u8; 32], Absence>,
     origin: std::time::Instant,
     clock: fn(std::time::Instant) -> std::time::Instant,
     // Authoritative population supplied by the durable hold map, independent
@@ -60,6 +63,7 @@ impl State {
     fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
+            vanished: BTreeMap::new(),
             origin: std::time::Instant::now(),
             clock: |_| std::time::Instant::now(),
             held_count: 0,
@@ -86,6 +90,7 @@ impl State {
     fn discard(&mut self) {
         // Replacing, rather than clearing, also frees an empty allocated root.
         self.entries = BTreeMap::new();
+        self.vanished = BTreeMap::new();
         self.unavailable = self.held_count != 0;
         self.refused = false;
     }
@@ -374,6 +379,29 @@ impl Memo {
         })
         .unwrap_or(false)
     }
+
+    /// Q-B2: the same two-observation rule for a vanished census member that
+    /// holds no account. A confirmed witness is released at once.
+    pub(super) fn vanished_absence_eligible(
+        &self,
+        key: &str,
+        parent: Option<sampled_audit::AbsenceParent>,
+        walk_window: u64,
+    ) -> bool {
+        self.with_state(|state| {
+            let key = memo_key(key);
+            let before = state.vanished.remove(&key);
+            let Some(parent) = parent.filter(|_| !state.refused) else {
+                return false;
+            };
+            let (eligible, after) = state.absence_step(before, parent, walk_window);
+            if let Some(after) = after.filter(|_| !eligible) {
+                state.vanished.insert(key, after);
+            }
+            eligible
+        })
+        .unwrap_or(false)
+    }
 }
 impl State {
     /// One rooted observation. A same-parent witness is kept and is eligible
@@ -403,11 +431,12 @@ impl State {
         // eighths of the soft limit for ordinary daemon I/O, and never retain
         // more than 32 pins. The existing memo owns the population accounting.
         let limit = crate::fd_guard::descriptor_limit().map_or(0, |n| (n / 8).min(32));
-        let pinned = self
-            .entries
-            .values()
-            .filter(|entry| entry.absence.is_some())
-            .count();
+        let pinned = self.vanished.len()
+            + self
+                .entries
+                .values()
+                .filter(|entry| entry.absence.is_some())
+                .count();
         if pinned >= limit {
             return (false, None);
         }
@@ -493,13 +522,14 @@ fn charge(entries: usize) -> Option<usize> {
 impl Memo {
     pub(crate) fn retained_bound(&self, limit: usize) -> Option<usize> {
         self.with_state(|state| {
-            if state.entries.is_empty() {
+            if state.entries.is_empty() && state.vanished.is_empty() {
                 // Free any empty retained B-tree root. Shared header bytes are
                 // charged by cache/index handles, never as a phantom tree node.
                 state.entries = BTreeMap::new();
                 return Some(0);
             }
-            let bytes = charge(state.entries.len()).filter(|bytes| *bytes <= limit);
+            let bytes =
+                charge(state.entries.len() + state.vanished.len()).filter(|bytes| *bytes <= limit);
             if bytes.is_none() {
                 state.refused = true;
                 state.unavailable = state.held_count != 0;

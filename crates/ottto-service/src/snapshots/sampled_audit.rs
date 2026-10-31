@@ -1650,6 +1650,27 @@ impl AbsenceParent {
         }
     }
 }
+/// Q-B2: the pinned parent of the first configured root it is proven under,
+/// only when that parent is on the root's device. A mounted-over or replaced
+/// volume is unmount-like and stays loss.
+pub(super) fn absence_parent_on_root_device(
+    path: &Path,
+    roots: &[PathBuf],
+) -> Option<AbsenceParent> {
+    #[cfg(unix)]
+    {
+        roots.iter().find_map(|root| {
+            let parent = absence_parent(path, std::slice::from_ref(root))?;
+            let device = fs::symlink_metadata(root).ok()?.dev();
+            (parent.directory.metadata().ok()?.dev() == device).then_some(parent)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, roots);
+        None
+    }
+}
 impl crate::heap_layout_bound::HeapLayoutBound for AbsenceParent {
     const INLINE_ONLY: bool = true;
     const STABLE_HEAP: bool = true;

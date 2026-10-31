@@ -28,9 +28,45 @@ pub(super) fn enabled() -> bool {
     }
 }
 
+/// Q-B2 opt-in: settle Claude members of deleted directories as removals.
+/// Default OFF, pinned per process like `enabled`; the owner restarts to apply.
+pub(in crate::snapshots) fn vanished_directory_removal() -> bool {
+    #[cfg(test)]
+    {
+        VANISHED_DIRECTORY.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        const NAME: &str = "claude_vanished_directory_removal_enabled";
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| marker_at(&ottto_core::default_support_dir(), NAME))
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static VANISHED_DIRECTORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(in crate::snapshots) struct VanishedDirectoryRemovalForTest(
+    bool,
+    std::marker::PhantomData<std::rc::Rc<()>>,
+);
+#[cfg(test)]
+impl VanishedDirectoryRemovalForTest {
+    pub(in crate::snapshots) fn set(on: bool) -> Self {
+        Self(
+            VANISHED_DIRECTORY.with(|slot| slot.replace(on)),
+            std::marker::PhantomData,
+        )
+    }
+}
+#[cfg(test)]
+impl Drop for VanishedDirectoryRemovalForTest {
+    fn drop(&mut self) {
+        VANISHED_DIRECTORY.with(|slot| slot.set(self.0));
+    }
 }
 #[cfg(test)]
 pub(crate) struct ClaudeTerminalOffForTest {
