@@ -2319,10 +2319,16 @@ impl SharedCache {
     /// Allocate the existing store owner only inside an approved OFF action.
     /// Registration never probes disk. Missing directories need no owner.
     fn off_exception(&self, source: SnapshotSource) -> Result<bool, ()> {
-        if restart_restore::enabled() { return Ok(true); }
-        let Some(ds) = durable_source(source) else { return Ok(false); };
+        if restart_restore::enabled() {
+            return Ok(true);
+        }
+        let Some(ds) = durable_source(source) else {
+            return Ok(false);
+        };
         let mut root = self.durable.lock().map_err(|_| ())?;
-        let Some(pass) = root.passes[ds.slot()].clone() else { return Ok(false); };
+        let Some(pass) = root.passes[ds.slot()].clone() else {
+            return Ok(false);
+        };
         let dir = store::store_dir_for_index(&pass.index_path);
         if let Some(state) = root.state.as_mut() {
             if let Some(old) = state.slot(ds).as_mut().filter(|slot| slot.dir != dir) {
@@ -2333,26 +2339,38 @@ impl SharedCache {
                 old.store.retry_off_v1_unlink(writer).map_err(|_| ())?;
             }
         }
-        if matches!(std::fs::symlink_metadata(&dir), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+        if matches!(std::fs::symlink_metadata(&dir), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
             return Ok(false);
         }
         let state = root.state.get_or_insert_with(Default::default);
         let slot = state.slot(ds);
         if slot.as_ref().map_or(true, |slot| slot.dir != dir) {
-            let mut replacement = Slot::new(ds, pass.index_path, pass.namespace, pass.identity_capture);
+            let mut replacement =
+                Slot::new(ds, pass.index_path, pass.namespace, pass.identity_capture);
             if let Some(previous) = slot.as_ref() {
                 replacement.store.inherit_off_v1_counts(&previous.store);
             }
             *slot = Some(replacement);
             for debt in state.key_debt.values_mut() {
-                if debt.off_v1_failed_since.is_some_and(|(source, _)| source == ds) {
+                if debt
+                    .off_v1_failed_since
+                    .is_some_and(|(source, _)| source == ds)
+                {
                     debt.off_v1_failed_since = None;
                 }
             }
             state.key_debt.retain(|_, debt| !debt.is_empty());
         }
-        state.slot(ds).as_mut().expect("exception slot").skill_labels_enabled = pass.skill_labels_enabled;
-        self.durable_bytes.store(size_of::<Stores>() + std::mem::align_of::<Stores>(), Ordering::Relaxed);
+        state
+            .slot(ds)
+            .as_mut()
+            .expect("exception slot")
+            .skill_labels_enabled = pass.skill_labels_enabled;
+        self.durable_bytes.store(
+            size_of::<Stores>() + std::mem::align_of::<Stores>(),
+            Ordering::Relaxed,
+        );
         Ok(true)
     }
 
@@ -2547,7 +2565,9 @@ impl SharedCache {
         if restart_restore::enabled() {
             return;
         }
-        if self.off_exception(source) != Ok(true) { return; }
+        if self.off_exception(source) != Ok(true) {
+            return;
+        }
         let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) else {
             return;
         };
@@ -5663,17 +5683,21 @@ impl SharedCache {
         keep: Option<&BTreeSet<store::Digest32>>,
     ) {
         let owner = self.off_exception(snapshot_source);
-        if owner == Ok(false) { return; }
+        if owner == Ok(false) {
+            return;
+        }
         let owner_blocked = owner.is_err();
         let Some(source) = durable_source(snapshot_source) else {
             return;
         };
-        let needed = owner_blocked || self.durable().is_some_and(|mut stores| {
-            stores.slot(source).as_ref().is_some_and(|slot| {
-                (keep.is_some() || (!slot.skill_labels_enabled && !slot.skill_label_purge_complete))
-                    && slot.store.private_label_purge_needed(keep)
-            })
-        });
+        let needed = owner_blocked
+            || self.durable().is_some_and(|mut stores| {
+                stores.slot(source).as_ref().is_some_and(|slot| {
+                    (keep.is_some()
+                        || (!slot.skill_labels_enabled && !slot.skill_label_purge_complete))
+                        && slot.store.private_label_purge_needed(keep)
+                })
+            });
         if !needed {
             return;
         }
@@ -5686,14 +5710,16 @@ impl SharedCache {
             if let Some(slot) = stores.slot(source).as_mut() {
                 let result = if owner_blocked {
                     Err(std::io::Error::other("prior OFF unlink barrier"))
-                } else { match keep {
-                    Some(keep) => slot.store.purge_private_labels_kept(writer, keep, |body| {
-                        codec::body_has_skill_labels(body).unwrap_or(true)
-                    }),
-                    None => slot.store.purge_private_labels(writer, |body| {
-                        codec::body_has_skill_labels(body).unwrap_or(true)
-                    }),
-                }};
+                } else {
+                    match keep {
+                        Some(keep) => slot.store.purge_private_labels_kept(writer, keep, |body| {
+                            codec::body_has_skill_labels(body).unwrap_or(true)
+                        }),
+                        None => slot.store.purge_private_labels(writer, |body| {
+                            codec::body_has_skill_labels(body).unwrap_or(true)
+                        }),
+                    }
+                };
                 let (visited, scanned, verified, erased, failed) = result
                     .map_or((0, 0, 0, 0, 1), |r| {
                         (r.visited, r.scanned, r.verified, r.erased, r.refused)
@@ -6144,7 +6170,7 @@ impl SharedCache {
         index: &ScanIndex,
     ) -> std::io::Result<()> {
         match self.off_exception(snapshot_source) {
-            Ok(true) => {},
+            Ok(true) => {}
             Ok(false) => return Ok(()),
             Err(()) => {
                 // Count refusal without touching the old slot under new context.
