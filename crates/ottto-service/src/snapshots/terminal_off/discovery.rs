@@ -22,7 +22,12 @@ impl Stat {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos()),
             identity: physical_identity(metadata),
-            birth: crate::transcript_acquisition::birth_unix_nanos(metadata),
+            birth: metadata
+                .created()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .and_then(|d| u64::try_from(d.as_nanos()).ok())
+                .unwrap_or(0),
         })
     }
 }
@@ -48,19 +53,25 @@ struct Walk {
     oversized: BTreeSet<String>,
     observations: BTreeMap<[u8; 32], Observation>,
 }
-super::process_memo!(per_test_thread fn with_walk_memo,
-    static WALKS: BTreeMap<String, Walk>);
+super::process_memo!(fn with_walk_memo,
+    static WALKS: BTreeMap<String, Walk> = BTreeMap::new());
+// Bound aggregate metadata too: a busy installation cannot multiply a
+// full cohort by all 64 context slots. Eviction permits extra stat work only.
+fn trim(memo: &mut BTreeMap<String, Walk>) {
+    while memo.values().map(|w| w.observations.len()).sum::<usize>() > 4 * OBSERVATIONS_PER_SCOPE {
+        let oldest = memo
+            .iter()
+            .min_by_key(|(_, w)| w.last_walk)
+            .map(|(k, _)| k.clone())
+            .unwrap();
+        memo.remove(&oldest);
+        eprintln!("terminal_off_observation_scope_evicted scopes=1");
+    }
+}
 fn with_walks<T>(f: impl FnOnce(&mut BTreeMap<String, Walk>) -> T) -> T {
     with_walk_memo(|memo| {
         let result = f(memo);
-        // Bound aggregate metadata too: a busy installation cannot multiply a
-        // full cohort by all 64 context slots. Eviction permits extra stat work only.
-        while memo.values().map(|w| w.observations.len()).sum::<usize>()
-            > 4 * OBSERVATIONS_PER_SCOPE
-        {
-            forget_lowest(memo, |w| w.last_walk);
-            eprintln!("terminal_off_observation_scope_evicted scopes=1");
-        }
+        trim(memo);
         result
     })
 }
@@ -230,7 +241,12 @@ pub(super) fn prepare(index: &mut ScanIndex, now: u64, requested: bool) -> bool 
     let (start, new_round, coalesced, ceiling, interval, oldest, metadata_bytes) =
         with_walks(|memo| {
             if !memo.contains_key(&scope) && memo.len() >= TERMINAL_OFF_REDISCOVERY_SCOPES {
-                forget_lowest(memo, |w| w.last_walk);
+                let oldest = memo
+                    .iter()
+                    .min_by_key(|(_, w)| w.last_walk)
+                    .map(|(k, _)| k.clone())
+                    .unwrap();
+                memo.remove(&oldest);
             }
             let walk = memo.entry(scope).or_default();
             walk.now = now;

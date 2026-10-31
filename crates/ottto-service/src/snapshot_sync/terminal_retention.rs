@@ -2,9 +2,12 @@
 use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 const ACK_AGE_MEMO_MAX: usize = 65_536;
-// Keys hash destination, entity and exact body; never raw identifiers/logs.
 #[derive(Default)]
-struct AckAges(crate::snapshots::BoundedMemo<[u8; 32], u64, ACK_AGE_MEMO_MAX>);
+struct AckAges {
+    // Hash of destination, entity and exact body; never raw identifiers/logs.
+    first: BTreeMap<[u8; 32], u64>,
+    order: VecDeque<[u8; 32]>,
+}
 fn key(destination: &str, entity: &str, body: &str) -> [u8; 32] {
     use sha2::Digest;
     let mut digest = sha2::Sha256::new();
@@ -15,11 +18,17 @@ fn key(destination: &str, entity: &str, body: &str) -> [u8; 32] {
     digest.finalize().into()
 }
 impl AckAges {
-    const fn new() -> Self {
-        Self(crate::snapshots::BoundedMemo::new())
-    }
     fn accept(&mut self, key: [u8; 32], now: u64) {
-        self.0.get_or_insert_with(&key, || now);
+        if self.first.contains_key(&key) {
+            return;
+        }
+        if self.first.len() == ACK_AGE_MEMO_MAX {
+            if let Some(oldest) = self.order.pop_front() {
+                self.first.remove(&oldest);
+            }
+        }
+        self.first.insert(key, now);
+        self.order.push_back(key);
         // A newly ACKed exact body always gets its real acceptance time.
         // Eviction makes an older diagnostic age unknown; it never evicts an
         // accepted ledger entry, settles debt or drives an age-based decision.
@@ -27,7 +36,7 @@ impl AckAges {
     fn gauge(&self, keys: impl Iterator<Item = [u8; 32]>, now: u64) -> (Option<u64>, usize) {
         let (mut oldest, mut unknown) = (None, 0usize);
         for key in keys {
-            if let Some(first) = self.0.keys.get(&key) {
+            if let Some(first) = self.first.get(&key) {
                 oldest = Some(oldest.unwrap_or(0).max(now.saturating_sub(*first)));
             } else {
                 unknown = unknown.saturating_add(1);
@@ -36,7 +45,10 @@ impl AckAges {
         (oldest, unknown)
     }
 }
-crate::snapshots::process_memo!(fn with_ack_ages, static ACK_AGES: AckAges);
+fn memo() -> &'static Mutex<AckAges> {
+    static MEMO: std::sync::OnceLock<Mutex<AckAges>> = std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -48,7 +60,9 @@ pub(super) fn accepted(destination: &str, entity: &str, body: &str) {
         return;
     }
 
-    with_ack_ages(|ages| ages.accept(key(destination, entity, body), now()));
+    if let Ok(mut ages) = memo().lock() {
+        ages.accept(key(destination, entity, body), now());
+    }
 }
 pub(super) fn note(index: &ScanIndex, progress: &SnapshotUploadProgress) {
     let keys = progress.accepted_fingerprints.iter().map(|entity| {
@@ -62,7 +76,10 @@ pub(super) fn note(index: &ScanIndex, progress: &SnapshotUploadProgress) {
                 .unwrap_or(""),
         )
     });
-    let (age, unknown) = with_ack_ages(|ages| ages.gauge(keys, now()));
+    let (age, unknown) = memo()
+        .lock()
+        .map(|ages| ages.gauge(keys, now()))
+        .unwrap_or((None, progress.accepted_fingerprints.len()));
     let bytes = crate::snapshots::retained_metadata_bytes(&(
         &progress.accepted_fingerprints,
         &progress.accepted_body_witnesses,
@@ -101,8 +118,8 @@ mod tests {
         }
         let newest = key("D", "after-cap", "body");
         memo.accept(newest, 300);
-        assert_eq!(memo.0.keys.len(), ACK_AGE_MEMO_MAX);
-        assert_eq!(memo.0.order.len(), ACK_AGE_MEMO_MAX);
+        assert_eq!(memo.first.len(), ACK_AGE_MEMO_MAX);
+        assert_eq!(memo.order.len(), ACK_AGE_MEMO_MAX);
         assert_eq!(memo.gauge([newest, new].into_iter(), 310), (Some(10), 1));
     }
 }

@@ -1442,11 +1442,11 @@ fn terminal_off_empty_context_memo_is_bounded_counts_eviction_and_never_grants_c
     assert_eq!(memo.order.len(), TERMINAL_OFF_EMPTY_CONTEXT_KEYS);
     assert_eq!(memo.evictions, 1);
     assert!(
-        !memo.keys.contains_key(&first),
+        !memo.keys.contains(&first),
         "eviction permits another ordinary context read"
     );
     memo.remember(first);
-    assert!(memo.keys.contains_key(&first));
+    assert!(memo.keys.contains(&first));
     assert_eq!(memo.evictions, 2);
     assert_eq!(memo.keys.len(), TERMINAL_OFF_EMPTY_CONTEXT_KEYS);
 }

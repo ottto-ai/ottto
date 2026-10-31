@@ -10,8 +10,9 @@ pub(super) struct Plan {
 // A normal source cycle reloads ScanIndex. Keep scheduling in bounded
 // process-owned memory, scoped to support directory + active context/replay.
 // Eviction/restart only revisits a prefix; neither grants nor drops evidence.
-crate::snapshots::process_memo!(fn with_cursors,
-    static CURSORS: crate::snapshots::BoundedMemo<String, Option<String>, 64>);
+static CURSORS: std::sync::Mutex<VecDeque<(String, Option<String>)>> =
+    std::sync::Mutex::new(VecDeque::new());
+const CURSOR_SCOPES: usize = 64;
 pub(super) fn plan(
     support: &Path,
     roots: Vec<String>,
@@ -30,13 +31,20 @@ pub(super) fn plan(
         "{:x}",
         Sha256::digest(format!("{}:{scope}", support.display()).as_bytes())
     );
-    with_cursors(|cursors| {
-        // Taking the scope's cursor makes its reinsertion the most recent.
-        let mut cursor = cursors.remove(&key).flatten();
-        let result = select(support, roots, page, &mut cursor);
-        cursors.get_or_insert_with(&key, || cursor);
-        result
-    })
+    let mut cursors = CURSORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cursor = cursors
+        .iter()
+        .position(|(saved, _)| saved == &key)
+        .and_then(|at| cursors.remove(at))
+        .and_then(|(_, cursor)| cursor);
+    let result = select(support, roots, page, &mut cursor);
+    if cursors.len() >= CURSOR_SCOPES {
+        cursors.pop_front();
+    }
+    cursors.push_back((key, cursor));
+    result
 }
 fn select(
     support: &Path,
