@@ -3461,21 +3461,14 @@ fn email_session(email_first: bool, flip: bool) -> Vec<Value> {
 }
 
 fn parse_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
-    let project = folder.join("projects").join("-synthetic-repo");
-    fs::create_dir_all(&project).unwrap();
-    let path = project.join(format!("{ROOT}.jsonl"));
-    fs::write(
-        &path,
-        lines
-            .iter()
-            .map(|line| line.to_string() + "\n")
-            .collect::<String>(),
-    )
-    .unwrap();
-    parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "fp".into()).unwrap()
+    parse_session_with_money(folder, lines, false)
 }
 
 fn parse_ordinary_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
+    parse_session_with_money(folder, lines, true)
+}
+
+fn parse_session_with_money(folder: &Path, lines: &[Value], ordinary: bool) -> Vec<SnapshotItem> {
     let project = folder.join("projects").join("-synthetic-repo");
     fs::create_dir_all(&project).unwrap();
     let path = project.join(format!("{ROOT}.jsonl"));
@@ -3487,12 +3480,16 @@ fn parse_ordinary_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
             .collect::<String>(),
     )
     .unwrap();
-    crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
-        &path,
-        "2026-08-02T07:01:00Z",
-        "fp".into(),
-    )
-    .unwrap()
+    if ordinary {
+        crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &path,
+            "2026-08-02T07:01:00Z",
+            "fp".into(),
+        )
+        .unwrap()
+    } else {
+        parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "fp".into()).unwrap()
+    }
 }
 
 #[test]
