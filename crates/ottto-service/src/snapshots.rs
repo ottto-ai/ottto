@@ -8129,9 +8129,15 @@ fn fit_context_curve_to_snapshot_item_budget(
     policy: SnapshotUploadPolicy,
     item_wire_budget: usize,
 ) {
-    if item.context_curve.is_none()
-        || snapshot_item_wire_size(source, item, policy) <= item_wire_budget
-    {
+    fit_context_curve(item, |item| {
+        snapshot_item_wire_size(source, item, policy) <= item_wire_budget
+    });
+}
+
+/// Prune fill points newest first, then fall back to an unavailable curve,
+/// until `fits` holds. The curve is display data: it yields to everything else.
+fn fit_context_curve(item: &mut SnapshotItem, fits: impl Fn(&SnapshotItem) -> bool) {
+    if item.context_curve.is_none() || fits(item) {
         return;
     }
     while item
@@ -8139,7 +8145,7 @@ fn fit_context_curve_to_snapshot_item_budget(
         .as_mut()
         .is_some_and(prune_one_context_curve_fill_point)
     {
-        if snapshot_item_wire_size(source, item, policy) <= item_wire_budget {
+        if fits(item) {
             return;
         }
     }
