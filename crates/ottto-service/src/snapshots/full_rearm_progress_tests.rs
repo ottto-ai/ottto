@@ -466,7 +466,7 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
 /// [regress] A complete census under the recorded cycle contract with no
 /// older-window evidence left clears the identity-contract latch before its
 /// contract re-arm (no re-read, counted). Older valid evidence of an indexed
-/// family still keeps the latch and main's re-arm. Older evidence of a family
+/// family still blocks the clear and takes main's re-arm. Older evidence of a family
 /// held in authority quarantine no longer blocks the clear: it is kept, not
 /// invalidated, and its family is marked `contract_unproven` (counted).
 #[test]
@@ -505,7 +505,6 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
     let mut quarantined = older.clone();
     let latched = rearm.terminal(&mut older, &rearm.items);
     assert!(latched.rearmed_files >= 2, "main's identity contract re-arm: {latched:?}");
-    assert!(older.claude_request_identity_contract_changed);
 
     quarantined.insert_unproven_terminal_claude_authority_for_test(OTHER_ROOT, "rev-other");
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);

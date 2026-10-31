@@ -694,24 +694,21 @@ fn record_hashes(hashes: &BTreeSet<String>) -> Option<Vec<u64>> {
 /// retires (unindexed), or is held in authority quarantine. Quarantine keeps
 /// that pending on purpose and it proves nothing while held, so it does not
 /// block the clear; those families are returned to be marked
-/// `contract_unproven`. A family with owed members counts as this window's
-/// only when its stamp shows the recorded contract (a re-stamp under the
-/// latch); otherwise it blocks. `None`: the latch stays.
+/// `contract_unproven`. Any other family with owed members blocks, even one
+/// re-stamped under the latch: owed evidence never credits the clear. `None`:
+/// the latch stays and the identity-contract re-arm clears it as on main.
 pub(super) fn latch_clearable(
     index: &ScanIndex,
     census_window_end: &str,
     indexed_claude_family_ids: &BTreeSet<String>,
 ) -> Option<BTreeSet<String>> {
     let owed = owed_roots(index);
-    let current = EvidenceContract::current(index);
     let mut exempt = BTreeSet::new();
     for (root, pending) in &index.claude_usage_family_pending {
         if pending.invalid || evidence_free(pending) {
             continue;
         }
-        if pending.census_window_end == census_window_end
-            && (!owed.contains(root) || (current.is_some() && pending.identity_contract == current))
-        {
+        if pending.census_window_end == census_window_end && !owed.contains(root) {
             continue;
         }
         if index.claude_usage_authority_quarantine.contains_key(root) {
