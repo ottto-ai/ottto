@@ -1942,6 +1942,7 @@ fn terminal_off_new_round_observes_targeted_pending_and_floor_blocked_presence()
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     for key in [&pending_key, &held_key] {
         assert!(index

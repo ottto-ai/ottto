@@ -519,7 +519,7 @@ crate::heap_layout_bound::fields!(FinishProof; prior, reason, source_proof, sett
 impl crate::heap_layout_bound::HeapLayoutBound for FinishReason {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
-            Self::IrreversibleTerminal | Self::AuthoritativeRemoval => c.add(0),
+            Self::AuthoritativeRemoval => c.add(0),
         }
     }
 }

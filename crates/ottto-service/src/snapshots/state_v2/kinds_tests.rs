@@ -182,7 +182,7 @@ fn m3_replay_evidence_survives_v2_with_either_restart_policy() {
                 key: &RowKey::record("v1_field.reread_guard", Vec::new(), 0).unwrap(),
                 fixed: &Fixed::None,
                 value_version: 1,
-                value: &codec::Json(&unknown),
+                value: &codec::json(&unknown, MUTABLE_VALUE_BYTES).unwrap(),
             })
             .unwrap();
             assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));

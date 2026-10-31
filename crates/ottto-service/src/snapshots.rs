@@ -27454,11 +27454,11 @@ impl OwnedSourceScan {
                             backfill_window_days,
                             retention: discovery_retention!(
                                 index,
-                                &resource_probe.discovery_growth
+                                &resource_probe.discovery_growth,
+                                durable_cache
                             ),
                             growth: sampled_audit::growth_active(index)
                                 .then_some(&index.v2().growth_retention),
-                            cache: durable_cache,
                         },
                         audit_now,
                     )
@@ -27562,11 +27562,11 @@ impl OwnedSourceScan {
                             backfill_window_days,
                             retention: discovery_retention!(
                                 index,
-                                &resource_probe.discovery_growth
+                                &resource_probe.discovery_growth,
+                                durable_cache
                             ),
                             growth: sampled_audit::growth_active(index)
                                 .then_some(&index.v2().growth_retention),
-                            cache: durable_cache,
                         },
                         audit_now,
                     ) {
@@ -27634,6 +27634,7 @@ impl OwnedSourceScan {
                     index,
                     sources: std::borrow::Cow::Borrowed(&move_sources),
                     growth: Some(&resource_probe.discovery_growth),
+                    cache: durable_cache,
                 };
                 let Some(scan_root) = scan_roots
                     .iter()
@@ -27667,10 +27668,13 @@ impl OwnedSourceScan {
                     CandidateWindow {
                         census_unix_seconds,
                         backfill_window_days,
-                        retention: discovery_retention!(index, &resource_probe.discovery_growth),
+                        retention: discovery_retention!(
+                            index,
+                            &resource_probe.discovery_growth,
+                            durable_cache
+                        ),
                         growth: sampled_audit::growth_active(index)
                             .then_some(&index.v2().growth_retention),
-                        cache: durable_cache,
                     },
                     audit_now,
                 ) {
@@ -33265,7 +33269,6 @@ impl OwnedSourceScan {
                         retention: discovery_retention!(index, &resource_probe.discovery_growth),
                         growth: sampled_audit::growth_active(index)
                             .then_some(&index.v2().growth_retention),
-                        cache: None,
                     },
                     verification_rescue,
                     audit_now,
@@ -46459,7 +46462,6 @@ struct CandidateWindow<'a> {
     backfill_window_days: u64,
     retention: DiscoveryRetention<'a>,
     growth: Option<&'a BTreeMap<String, sampled_audit::GrowthRetention>>,
-    cache: Option<&'a sampled_scan::SharedCache>,
 }
 
 fn candidate_from_traversal_path_at(
@@ -47018,7 +47020,9 @@ impl<'a> DiscoveryRetention<'a> {
         }) {
             return true;
         }
-        grown || self.owes(path)
+        grown
+            || self.owes(path)
+            || sampled_audit::path_requires_recovery(source, self.files, path, current_len)
     }
 
     /// An oversized withheld-account key stays observed without a full parse;
@@ -47286,9 +47290,8 @@ fn open_and_identify_scan_candidate_with_rescue_at(
         backfill_window_days,
         retention,
         growth,
-        cache: recovery_cache,
     } = window;
-    let cache = cache.or(recovery_cache);
+    let cache = cache.or(retention.cache);
     let retention = DiscoveryRetention { cache, ..retention };
     // Common boundary: ordinary discovery, retained retries, forced family
     // preflight and synthetic progress all obey the same failed-open park.
@@ -88255,7 +88258,6 @@ fn open_and_identify_scan_candidate(
             backfill_window_days,
             retention,
             growth: None,
-            cache: None,
         },
         sampled_scan::now_seconds(),
     )

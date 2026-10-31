@@ -413,7 +413,6 @@ impl GroupBoot {
             candidate,
             &mut census,
             CandidateWindow {
-                cache: None,
                 census_unix_seconds: None,
                 backfill_window_days: 0,
                 // The entry's stored ctime lets a ctime-only change keep the

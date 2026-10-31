@@ -1514,6 +1514,7 @@ fn singleton_aggregate_page_budget_defers_via_pending_keeps_hint() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     let traversal = index.traversal.as_mut().unwrap();
 
@@ -2964,6 +2965,7 @@ fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     let walked = index.traversal.as_mut().unwrap();
 
@@ -3252,6 +3254,7 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
         "type": "session_meta", "payload": {"id": SESSION_B}}));
@@ -3313,6 +3316,7 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         SnapshotSource::Codex,
         &mut index,
         BACKFILL_WINDOW_DAYS,
+        None,
         None,
     );
     // SESSION already finished its census read; growth must not re-enroll it.
@@ -3479,6 +3483,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     let flags = |index: &ScanIndex, path: &PathBuf| {
         index
@@ -3529,6 +3534,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     assert!(index
         .traversal
@@ -3578,6 +3584,7 @@ fn new_date_directory_session_bypasses_2800_owed_rereads_within_two_pages() {
         SnapshotSource::Codex,
         &mut index,
         BACKFILL_WINDOW_DAYS,
+        None,
         None,
     );
     let budget = fixture.len(SESSION) * 4;

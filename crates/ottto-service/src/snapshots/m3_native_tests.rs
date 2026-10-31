@@ -160,7 +160,13 @@ fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
             &mut ScanCensus::default(),
             Some(now),
             30,
-            files,
+            &mut CandidateDiscovery::new(
+                &mut ScanIndex {
+                    files: files.clone(),
+                    ..ScanIndex::default()
+                },
+                None,
+            ),
         )
         .is_some()
     };

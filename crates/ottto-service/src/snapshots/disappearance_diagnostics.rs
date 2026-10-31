@@ -435,6 +435,7 @@ mod tests {
                 &mut index,
                 BACKFILL_WINDOW_DAYS,
                 None,
+                None,
             )
         });
         assert_eq!(events, [[0; 4], [0; 4], [1, 0, 0, 0]]);
@@ -1370,6 +1371,7 @@ mod tests {
                 SnapshotSource::ClaudeCode,
                 &mut index,
                 BACKFILL_WINDOW_DAYS,
+                None,
                 None,
             )
         });
