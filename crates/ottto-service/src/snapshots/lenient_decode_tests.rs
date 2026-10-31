@@ -797,6 +797,7 @@ fn repaired_records_can_advance_after_load_but_new_cas_damage_still_requires_rel
     }
 }
 
+/// [money] Held usage preserves file membership without confirming an empty entity.
 #[test]
 fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     let scratch = crate::test_scratch::ScratchDir::new("lenient-pending-membership");
@@ -5021,6 +5022,7 @@ fn o3_ambiguous_negative_evidence_refuses_through_every_reader() {
 /// Pi's restored-behind-accepted count settles at finalization: it follows the
 /// flag and needs either an offer or a smaller committed index selection.
 /// These facts are independent of the native layout a restore needs.
+/// [behaviour] Pi reports a restored predecessor only when finalization offers or regresses it.
 #[test]
 fn restored_behind_accepted_counts_pi_offers_or_index_regressions() {
     use crate::local_resource_diagnostics::capture;

@@ -1234,6 +1234,7 @@ fn u3_repository_identity_peek_is_read_only_and_refuses_a_miss() {
 /// X_out family U3 (c22 amendment 2): the identity the proof measured is the
 /// one the finished item carries; `into_items` resolves nothing (no IO, no
 /// cache insert) when it is supplied.
+/// [behaviour] Finalization preserves the measured repository identity without new IO.
 #[test]
 fn u3_measured_repository_identity_is_the_finished_value() {
     let workspace = "/u3-threading-test/workspace";

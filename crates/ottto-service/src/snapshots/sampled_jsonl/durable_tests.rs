@@ -1397,6 +1397,7 @@ fn hex(digest: [u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// [format] Each registered source retains its reviewed allowlist digest.
 #[test]
 fn allowlist_digests_are_pinned() {
     let actual = ALLOWLIST_PINS.map(|(source, _)| (source, hex(allowlist_digest(source))));
@@ -1593,6 +1594,7 @@ fn h_paths(text: &str) -> BTreeSet<String> {
     out
 }
 
+/// [format] The persisted hash-field inventory matches its reviewed audit table.
 #[test]
 fn h_fields_are_audited() {
     let audited = H_AUDIT
@@ -1662,6 +1664,7 @@ fn fallback_classes_over_the_synthetic_corpus() {
 }
 
 /// Budget receipt (static): the bounds every restore and write is held to.
+/// [format] Persisted bodies and decoded reductions obey the existing budget bounds.
 #[test]
 fn budget_bounds_hold() {
     use crate::durable_tail_store::{INVENTORY_BOUND, MAX_BATCH, MAX_RECORDS, RECORD_BYTES};
@@ -1738,6 +1741,7 @@ fn verified_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
     result
 }
 
+/// [format] Structural verification rejects malformed records without decoding allocations.
 #[test]
 fn structural_verifier_real_records_truncations_tags_lengths_and_mutation_corpus() {
     let scratch = Scratch::new("structural-verifier");
@@ -2574,7 +2578,6 @@ fn bounded_replay_errors_logs_and_panics_are_content_free() {
     );
 }
 
-/// [format] Pi native accounting and restore contract.
 /// Exercise the production codec/acquisition/native-finish/finalizer interface with
 /// actual A < C < B extents and a real complete native body (no hand-built item).
 /// [money] codex pi restored tail race below accepted publishes complete native body.

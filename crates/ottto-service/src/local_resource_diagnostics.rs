@@ -2470,6 +2470,7 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    /// [behaviour] Cache lifecycle diagnostics stay bounded and identify their process scope.
     #[test]
     fn cache_lifecycle_record_is_bounded_and_explicitly_process_global() {
         let (_, records) = capture(|| {

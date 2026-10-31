@@ -200,6 +200,7 @@ fn pi_events<'a>(
 // exactly one counted read + publish (no record, store byte-identical, the
 // source alarm), nothing pruned. A second growth inside 6 h is a counted delay
 // that keeps the old committed size; the next paced read publishes it.
+/// [format] Unfundable Pi growth keeps its predecessor and paces native fallback.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn pi_structural_growth_paced_no_record_publish_and_no_prune() {
@@ -316,6 +317,7 @@ fn pi_structural_growth_paced_no_record_publish_and_no_prune() {
 // key first grows. It fails toward reading: the cache_transit Full runs, the
 // oldest stamp is evicted (`pace_evicted` == 1 on the Pi slot, its own
 // alarm) and the Pi key is stamped, so the window still holds afterwards.
+/// [format] Pi pace overflow permits the read and releases the oldest entry.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn pi_cache_copy_pace_map_overflow_reads_and_evicts_oldest() {

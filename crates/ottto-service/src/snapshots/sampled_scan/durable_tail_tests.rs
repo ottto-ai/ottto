@@ -5136,6 +5136,7 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
 }
 
 /// A Tail or Unchanged read below a known accepted extent is behind it.
+/// [behaviour] Behind-accepted classification requires a continued read below the accepted extent.
 #[test]
 fn tail_behind_accepted_needs_a_continued_read_strictly_below_the_entry() {
     let _on = crate::snapshots::RestartRestoreForTest::enabled();
@@ -12008,6 +12009,7 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
 
 /// Real inventory -> disk restore -> native Tail. The scaled cache keeps the
 /// same admission mechanism; optional facts must lose before a usable record.
+/// [format] Optional header facts yield to an admissible durable restore.
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
@@ -12338,6 +12340,7 @@ fn pi_live_prepare_ledger_cap_counts_entry_cap_refusal_once() {
     lease.release();
 }
 
+/// [behaviour] Pi census and summary diagnostics work before the first durable record.
 #[test]
 fn pi_census_and_summary_work_before_any_native_record() {
     let mut index = ScanIndex::default();

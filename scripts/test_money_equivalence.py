@@ -347,6 +347,7 @@ class MoneyEquivalenceTests(unittest.TestCase):
                 self.assertEqual(diff["changed"], ["/0"])
 
     def test_invalid_receipts_fail_closed_without_values(self):
+        """[format] Malformed receipts refuse without exposing their values."""
         for invalid in (b'[]', b'{}', b'[[true]]', b'[[256]]', b'[[255]]',
                         b'[[123]]',
                         json.dumps([encode([encode(42)])]),

@@ -1612,6 +1612,7 @@ use crate::snapshots::native_publication_tests::{
     NotPersisted as PiNotPersisted, Unprepared as PiUnprepared,
     UnpreparedDisposition as PiUnpreparedDisposition, WriteOutcome as PiWriteOutcome,
 };
+/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1619,6 +1620,7 @@ fn pi_e4_receipted_captures_and_posts() {
     pi_publication_case(crate::snapshots::NativePublication::Receipted, None);
 }
 
+/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1633,6 +1635,7 @@ fn pi_e4_publish_without_record_captures_and_posts() {
     );
 }
 
+/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1645,6 +1648,7 @@ fn pi_e4_failed_published_without_record_captures_and_posts() {
     );
 }
 
+/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1660,6 +1664,7 @@ fn pi_e4_publish_retaining_prior_captures_and_posts() {
     );
 }
 
+/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1674,6 +1679,7 @@ fn pi_e4_publish_store_untouched_captures_and_posts() {
     );
 }
 
+/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1684,6 +1690,7 @@ fn pi_e4_failed_held_refuses_retained_retry() {
     );
 }
 
+/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1694,6 +1701,7 @@ fn pi_e4_receipt_pending_refuses_retained_retry() {
     );
 }
 
+/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -1709,6 +1717,7 @@ fn pi_e4_unprepared_hold_and_strict_rebind_refuse_retained_retry() {
     }
 }
 
+/// [money] Pi publication disposition preserves retained retry and ACK eligibility.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]

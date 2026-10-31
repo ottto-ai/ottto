@@ -1524,6 +1524,7 @@ fn pi_ledger_splits(
     proof.finish(&c, &disk);
 }
 
+/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
 #[test]
 fn pi() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1545,6 +1546,7 @@ fn pi() {
     assert_eq!(scan.snapshots[0].input_tokens, 20);
 }
 
+/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
 #[test]
 fn pi_tool_turn() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1570,6 +1572,7 @@ fn pi_tool_turn() {
     );
 }
 
+/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
 #[test]
 fn pi_summary_usage() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1614,6 +1617,7 @@ fn pi_summary_usage() {
     }
 }
 
+/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
 #[test]
 fn pi_usage_entry_kinds() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1638,6 +1642,7 @@ fn pi_usage_entry_kinds() {
     assert_eq!((row.request_count, row.input_tokens), (2, 40));
 }
 
+/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
 #[test]
 fn pi_ledger_seal_boundaries() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1700,6 +1705,7 @@ fn pi_ledger_seal_boundaries() {
     );
 }
 
+/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
 #[test]
 fn pi_divergent_pair_quarantine() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1767,6 +1773,7 @@ fn pi_no_response_id() {
     pi_usage_case("pi_no_response_id");
 }
 
+/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
 #[test]
 fn pi_selector_across_seal() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1804,6 +1811,7 @@ fn pi_selector_across_seal() {
     );
 }
 
+/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
 #[test]
 fn pi_time_and_invalid_evidence() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -2032,6 +2040,7 @@ fn pi_version_rewrite_after_tail() {
     pi_lifecycle_case("pi_version_rewrite_after_tail");
 }
 
+/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
 #[test]
 fn pi_restart_between_pages() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -2062,6 +2071,7 @@ fn pi_downgrade_then_reupgrade() {
 }
 
 #[cfg(unix)]
+/// [money] Pi native Tail, Full and restart paths preserve canonical money receipts.
 #[test]
 fn pi_acquisition_metadata_changes() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();

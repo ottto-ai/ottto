@@ -436,6 +436,7 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
     }
 }
 
+/// [money] Exact telemetry cannot revive upstream identity proof lost over the cap.
 #[test]
 fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     let dir = temp_dir("e2-identity-telemetry-cap");

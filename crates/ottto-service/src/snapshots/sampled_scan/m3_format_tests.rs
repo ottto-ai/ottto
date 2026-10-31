@@ -289,6 +289,7 @@ fn m3_p4a_scope_formula_uses_canonical_counting_and_distinct_domain() {
     );
 }
 
+/// [format] Pi round-trips format three and refuses unknown historical envelopes.
 #[test]
 fn pi_format_three_store_row_round_trips_and_v1_v2_stay_unknown() {
     let root = crate::test_scratch::ScratchDir::new("pi-format-three");
