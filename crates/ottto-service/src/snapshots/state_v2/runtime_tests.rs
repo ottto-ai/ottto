@@ -286,8 +286,16 @@ fn f7_off_after_publication_saves_natively_and_unmapped_custody_holds() {
 #[test]
 fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     let mut f = Fixture::new();
-    // This API is binding-scoped; isolate this route from parallel fixtures.
-    let parent = f.path.parent().unwrap().with_file_name("c".repeat(64));
+    // This API is binding-scoped (source + namespace dir name), so a shared
+    // literal namespace collides with parallel fixtures: use a unique one.
+    let namespace = {
+        use sha2::Digest;
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(f.support.to_string_lossy().as_bytes())
+        )
+    };
+    let parent = f.path.parent().unwrap().with_file_name(namespace);
     fs::rename(f.path.parent().unwrap(), &parent).unwrap();
     f.path = parent.join(f.path.file_name().unwrap());
     let route_binding = binding(&f.path).unwrap();
