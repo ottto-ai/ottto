@@ -1044,6 +1044,8 @@ impl DurableTailStore {
             self.note_codec(bytes.capacity());
             if let Err(reason) = verify(&bytes, self.source) {
                 if retired
+                    && work == "guard"
+                    && self.rebuilt.get(key) != Some(&Rebuild::Started)
                     && reason == Refusal::Corrupt
                     && stamp_at(&path).ok() == Some(Some(stamp))
                 {
@@ -1071,7 +1073,17 @@ impl DurableTailStore {
             return Ok(None);
         }
         if let Err(reason) = result {
-            self.durable.remove(key);
+            let exact_corrupt = self.durable.get(key).is_some_and(|(content, stamp, _)| {
+                content.is_none() && stamp_at(&self.record_path(key)).ok() == Some(Some(*stamp))
+            });
+            if !(exact_corrupt
+                && (reason == Refusal::Repin
+                    || (work == "overwrite"
+                        && reason == Refusal::Corrupt
+                        && self.rebuilt.get(key) == Some(&Rebuild::Started))))
+            {
+                self.durable.remove(key);
+            }
             if let Some(stamp) = corrupt_retired {
                 // Not verified content: only the exact corrupt predecessor that
                 // the ordinary one-rebuild owner may replace after a Full.

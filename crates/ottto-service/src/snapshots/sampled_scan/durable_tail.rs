@@ -5645,42 +5645,6 @@ impl SharedCache {
                 stores.release_idle_custody(&digest);
             }
         }
-        {
-            let stores = &mut *stores;
-            let mut attempts = 0;
-            for (digest, debt) in stores.key_debt.iter_mut() {
-                if attempts >= store::MAX_BATCH {
-                    break;
-                }
-                if debt.retire_source != Some(source) || offered.contains_key(digest) {
-                    continue;
-                }
-                let Some(custody) = stores.retail_spent.get_mut(digest) else {
-                    continue;
-                };
-                let Some(proof) = custody.original.as_ref() else {
-                    continue;
-                };
-                attempts += 1;
-                let Some(slot) = stores.slots[source.slot()].as_mut() else {
-                    break;
-                };
-                let outcome = slot
-                    .store
-                    .retire_exact(writer, proof, &mut debt.retire_sync);
-                let class = match outcome {
-                    store::RetireOutcome::Retry => "rederive_retire.retry",
-                    store::RetireOutcome::Retired => "rederive_retire.retired",
-                    store::RetireOutcome::Superseded => "rederive_retire.superseded",
-                };
-                Counters::bump(&mut stores.counters.ineligible, class);
-                if !matches!(outcome, store::RetireOutcome::Retry) {
-                    debt.retire_source = None;
-                    custody.original = None;
-                }
-            }
-            stores.retail_spent.retain(|_, c| c.has_authority());
-        }
         let slot = stores.slot(source).as_mut()?;
         if !invalidate.is_empty() {
             let _ = slot.store.remove_keys(writer, &invalidate);
@@ -5729,6 +5693,42 @@ impl SharedCache {
                 return None;
             }
         };
+        {
+            let stores = &mut *stores;
+            let mut attempts = 0;
+            for (digest, debt) in stores.key_debt.iter_mut() {
+                if attempts >= store::MAX_BATCH {
+                    break;
+                }
+                if debt.retire_source != Some(source) || offered.contains_key(digest) {
+                    continue;
+                }
+                let Some(custody) = stores.retail_spent.get_mut(digest) else {
+                    continue;
+                };
+                let Some(proof) = custody.original.as_ref() else {
+                    continue;
+                };
+                attempts += 1;
+                let Some(slot) = stores.slots[source.slot()].as_mut() else {
+                    break;
+                };
+                let outcome = slot
+                    .store
+                    .retire_exact(writer, proof, &mut debt.retire_sync);
+                let class = match outcome {
+                    store::RetireOutcome::Retry => "rederive_retire.retry",
+                    store::RetireOutcome::Retired => "rederive_retire.retired",
+                    store::RetireOutcome::Superseded => "rederive_retire.superseded",
+                };
+                Counters::bump(&mut stores.counters.ineligible, class);
+                if !matches!(outcome, store::RetireOutcome::Retry) {
+                    debt.retire_source = None;
+                    custody.original = None;
+                }
+            }
+            stores.retail_spent.retain(|_, c| c.has_authority());
+        }
         {
             let stores = &mut *stores;
             for digest in offered.keys() {
