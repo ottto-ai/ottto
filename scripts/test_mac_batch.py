@@ -78,11 +78,13 @@ def bump(text, needle, replacement):
 
 
 class FakeRunner(mb.Runner):
-    def __init__(self, cwd, prs, gate_rc=0, allow_dispatch=False):
+    def __init__(self, cwd, prs, gate_rc=0, allow_dispatch=False, run=None, job_log=""):
         super().__init__(cwd)
         self.prs = prs
         self.gate_rc = gate_rc
         self.allow_dispatch = allow_dispatch
+        self.run_view = run
+        self.job_log = job_log
         self.gh_calls = []
         self.gate_calls = []
 
@@ -96,6 +98,9 @@ class FakeRunner(mb.Runner):
             return subprocess.CompletedProcess(args, 0, json.dumps(self.prs[int(args[2])]), "")
         if args[:2] == ("run", "list"):
             return subprocess.CompletedProcess(args, 0, json.dumps([{"databaseId": 7, "url": "u"}]), "")
+        if args[:2] == ("run", "view"):
+            out = self.job_log if "--log" in args else json.dumps(self.run_view)
+            return subprocess.CompletedProcess(args, 0, out, "")
         raise AssertionError(f"unexpected gh call {args}")
 
     def gate(self, path):
@@ -202,27 +207,21 @@ class MacBatchTests(unittest.TestCase):
         self.assertIn("#1 and #2 conflict: a.txt", out)
         self.assertNotIn("integration commit", out)
 
-    def test_dry_run_never_calls_gate_pushes_or_dispatches(self):
+    def test_dispatch_pushes_nothing_without_a_gate_ok(self):
         rc, out, runner = self.run_main(["dispatch", "--dry-run", "--gate", "/nonexistent", "1", "4"])
         self.assertEqual(rc, 0, out)
         self.assertIn("dry run", out)
         self.assertEqual(runner.gate_calls, [])
-        self.assertEqual(self.remote_batches(), "")
-
-    def test_gate_wait_stops_before_push(self):
+        with mock.patch.dict(os.environ, {"OTTTO_MAC_DISPATCH_GATE": ""}):
+            rc, out, _ = self.run_main(["dispatch", "1", "4"])
+        self.assertEqual(rc, mb.EXIT_REFUSED)
+        self.assertIn("no Mac dispatch gate", out)
         with tempfile.NamedTemporaryFile(suffix=".sh") as gate:
             rc, out, runner = self.run_main(["dispatch", "--gate", gate.name, "1", "4"], gate_rc=1)
             self.assertEqual(rc, mb.EXIT_WAIT, out)
             self.assertEqual(runner.gate_calls, [gate.name])
             rc, out, _ = self.run_main(["dispatch", "--gate", gate.name, "1", "4"], gate_rc=3)
             self.assertEqual(rc, mb.EXIT_STALE, out)
-        self.assertEqual(self.remote_batches(), "")
-
-    def test_dispatch_without_gate_is_refused(self):
-        with mock.patch.dict(os.environ, {"OTTTO_MAC_DISPATCH_GATE": ""}):
-            rc, out, _ = self.run_main(["dispatch", "1", "4"])
-        self.assertEqual(rc, mb.EXIT_REFUSED)
-        self.assertIn("no Mac dispatch gate", out)
         self.assertEqual(self.remote_batches(), "")
 
     def test_gate_ok_pushes_branch_and_calls_fake_dispatch_once(self):
@@ -300,6 +299,38 @@ class MacBatchTests(unittest.TestCase):
         seen, missing = mb.ok_by_name(log, {("f.rs", "early_return"), ("f.rs", "ignored_off_mac"), ("f.rs", "gone")})
         self.assertEqual(seen, ["snapshots::tests::early_return ... ok"])
         self.assertEqual(len(missing), 2)
+
+    def test_report_verdicts(self):
+        # #3 changes the macOS-only test ignored_off_mac; #4 touches a.txt only.
+        rc, out, _ = self.run_main(["plan", "3", "4"])
+        self.assertEqual(rc, 0, out)
+        commit = next(l.split(": ")[1] for l in out.splitlines() if l.startswith("integration commit"))
+        branch = "mac-batch/t-3-4"
+        self.repo.git("push", "-q", "origin", f"{commit}:refs/heads/{branch}")
+        moved = self.repo.branch("b4-moved", {"a.txt": ("two\n", "TWO\n")})
+        tests = [{"name": "Runtime tests", "conclusion": "success"}]
+        red_tests = [{"name": "Runtime tests", "conclusion": "failure"}]
+        red_fmt = [{"name": "Rust format", "conclusion": "failure"}]
+        mac_ok = "test tests::ignored_off_mac ... ok"
+        mac_red = "test tests::ignored_off_mac ... FAILED"
+        cases = [
+            # name, job conclusion, steps, log, #4 head, verdicts, exit code
+            ("green", "success", tests, mac_ok, self.heads[4], ("CLEARED", "CLEARED"), 0),
+            ("own test failed", "failure", red_tests, mac_red, self.heads[4], ("SUSPECT", "CLEARED"), 4),
+            ("mac test did not run", "success", tests, "", self.heads[4], ("NO-EVIDENCE", "CLEARED"), 5),
+            ("failed before tests", "failure", red_fmt, "", self.heads[4], ("NO-EVIDENCE", "NO-EVIDENCE"), 5),
+            ("head moved", "success", tests, mac_ok, moved, ("CLEARED", "STALE"), 5),
+        ]
+        for name, conclusion, steps, log, head4, verdicts, code in cases:
+            with self.subTest(name):
+                self.prs[4] = pr(4, head4, "b4")
+                run = {"status": "completed", "conclusion": conclusion, "headSha": commit, "headBranch": branch,
+                       "event": "workflow_dispatch", "url": "u",
+                       "jobs": [{"name": mb.MAC_JOB, "conclusion": conclusion, "databaseId": 9, "steps": steps}]}
+                rc, out, _ = self.run_main(["report", "--run", "5"], run=run, job_log=log)
+                self.assertEqual(rc, code, out)
+                for number, verdict in zip((3, 4), verdicts):
+                    self.assertIn(f"#{number} {verdict} (", out)
 
     def test_attribution_tiers(self):
         r = mb.Runner(str(self.repo.work))

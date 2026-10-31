@@ -927,8 +927,8 @@ fn over_cap_diagnostics_increment_each_reason_and_record_last_size() {
         OverCap::Bytes,
     ]);
     let (_, records) = crate::local_resource_diagnostics::capture(|| {
-        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 700_000);
-        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 800_000);
+        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 700_000, None);
+        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 800_000, None);
     });
     assert_eq!(records.len(), 2);
     let before = &records[0]["counts"]["claude_request_identity_over_cap"];

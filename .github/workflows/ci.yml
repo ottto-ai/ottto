@@ -57,9 +57,8 @@ jobs:
     timeout-minutes: 55
     runs-on: macos-15
     env: &rust-contract-env
-      RUSTUP_TOOLCHAIN: "1.95.0"
       OTTTO_REQUIRE_LAYOUT: "1"
-      # Job-level so "Runtime tests" and "Layout coverage receipt" share one build.
+      # Job-level so every cargo step shares one build profile.
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       # Dispatch-only; the special-purpose dispatch jobs keep their precedence.
       # Queue/schedule runs always execute the original full commands below.
@@ -82,27 +81,18 @@ jobs:
           echo "::warning::Partial Rust pre-check only; a full merge-queue run is still required"
           printf '### Partial Rust pre-check\n\nFilter: %s\n\nOnly matching non-ignored tests run. Layout and peak-memory receipts are omitted. This is not merge evidence; the full merge-queue run is still required.\n' "$OTTTO_CI_TEST_FILTER" >> "$GITHUB_STEP_SUMMARY"
 
-      # Keep layout-sensitive tests on the compiler validated by the runtime.
-      - name: Install validated Rust toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
-
-      # save-if stays refs/heads/main: only the schedule and manual main
-      # dispatches save. merge_group runs restore main's cache, which can be
-      # up to 24 h old. If queue builds slow down, add a second cron; do NOT
-      # save from queue refs. Workspace crates are not cached.
-      - name: Rust cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Cache: save-if stays refs/heads/main: only the schedule and manual
+      # main dispatches save. merge_group runs restore main's cache, which can
+      # be up to 24 h old. If queue builds slow down, add a second cron; do NOT
+      # save from queue refs. Workspace crates are not cached. Partial
+      # pre-checks restore the same "rust" key.
+      - name: Rust setup
+        uses: ./.github/actions/rust-setup
         with:
-          # Same prefix as the existing "rust" job; partial pre-checks restore it.
-          shared-key: rust
-          workspaces: |
-            . -> target
-            crates -> target
-          save-if: ${{ github.ref == 'refs/heads/main' && env.OTTTO_CI_TEST_FILTER == '' }}
+          components: rustfmt clippy
+          cache-key: rust
+          cache-save: ${{ github.ref == 'refs/heads/main' && env.OTTTO_CI_TEST_FILTER == '' }}
           cache-bin: "false"
-
-      - name: Compiler receipt
-        run: rustc -Vv && cargo -V
 
       - name: macOS-native public surface checks
         # Real plutil/codesign/LaunchServices and macOS /bin/bash 3.2; the
@@ -130,7 +120,13 @@ jobs:
         # Branch Mac runs (dispatch) keep going past a failing test binary so
         # scripts/mac_batch.py can map every failure to a PR; merge_group and
         # schedule runs still stop at the first failing binary.
-        run: python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1 ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }}
+        # --require-pass is the layout coverage receipt: with
+        # OTTTO_REQUIRE_LAYOUT=1 that test passes only on a validated layout,
+        # and the step fails unless it printed "... ok" (not ignored, not absent).
+        run: >-
+          python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1
+          --require-pass heap_layout_bound::sampled_scalar_buffer_tests::layout_gate_coverage_receipt
+          ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }}
 
       - name: Filtered Rust tests (partial pre-check)
         if: env.OTTTO_CI_TEST_FILTER != ''
@@ -140,27 +136,16 @@ jobs:
           # still build their test binaries. Pass one quoted positional argument.
           # Dispatch-only job: keep going past a failing test binary, as in
           # "Runtime tests", so every failure is listed.
-          cargo test --workspace --locked ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }} "$OTTTO_CI_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee "$RUNNER_TEMP/filtered-rust-tests.log"
-          cargo test --manifest-path crates/Cargo.toml --workspace --locked ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }} "$OTTTO_CI_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee -a "$RUNNER_TEMP/filtered-rust-tests.log"
+          cargo test --workspace --locked --no-fail-fast "$OTTTO_CI_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee "$RUNNER_TEMP/filtered-rust-tests.log"
+          cargo test --manifest-path crates/Cargo.toml --workspace --locked --no-fail-fast "$OTTTO_CI_TEST_FILTER" -- --nocapture --test-threads=4 2>&1 | tee -a "$RUNNER_TEMP/filtered-rust-tests.log"
           # Cargo succeeds when nothing matches. A typo or ignored-only filter
           # must fail this pre-check, including when the other workspace is empty.
           grep -E '^test result: ok\. [1-9][0-9]* passed;' "$RUNNER_TEMP/filtered-rust-tests.log"
 
-      - name: Layout coverage receipt
-        if: env.OTTTO_CI_TEST_FILTER == ''
-        run: |
-          set -euo pipefail
-          cargo test -p ottto-service --lib --locked heap_layout_bound::sampled_scalar_buffer_tests::layout_gate_coverage_receipt -- --exact --nocapture | tee "$RUNNER_TEMP/layout-coverage-receipt.log"
-          # An exact filter matching zero tests must not count as a receipt.
-          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout-coverage-receipt.log"
-
+      # Includes ottto-connector-testkit's first_party_sources contract tests.
       - name: Connector tests
         if: env.OTTTO_CI_TEST_FILTER == ''
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
-
-      - name: Connector package tests
-        if: env.OTTTO_CI_TEST_FILTER == ''
-        run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
 
   rust-partial:
     # Separate static names also preserve the full check when either job skips.
@@ -204,7 +189,7 @@ jobs:
 
   dependency-review:
     name: Dependency review
-    if: ${{ github.event_name == 'pull_request' && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    if: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
@@ -256,13 +241,11 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.scan_stack_margin && !inputs.money_equivalence
     timeout-minutes: 40
     runs-on: macos-15
-    env:
-      RUSTUP_TOOLCHAIN: "1.95.0"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - uses: ./.github/actions/rust-setup
       - name: Release 2 MiB receipt
         run: |
           set -euo pipefail
@@ -283,7 +266,6 @@ jobs:
     timeout-minutes: 55
     runs-on: macos-15
     env:
-      RUSTUP_TOOLCHAIN: "1.95.0"
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       MONEY_EQUIVALENCE_BASE: ${{ inputs.money_equivalence_base }}
     steps:
@@ -291,7 +273,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - uses: ./.github/actions/rust-setup
       - name: Compare identical synthetic inputs
         env:
           GH_TOKEN: ${{ github.token }}
