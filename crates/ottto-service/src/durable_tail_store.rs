@@ -351,7 +351,7 @@ pub(crate) struct WireIdentity {
 }
 
 /// A record before the store stamps it with a committed generation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PendingRecord {
     pub(crate) binding: Binding,
     pub(crate) certificate: DurableCertificate,
@@ -374,7 +374,7 @@ impl PendingRecord {
 
 /// A record as stored: the pending record plus the generation of the index
 /// save it followed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DurableRecord {
     pub(crate) record: PendingRecord,
     pub(crate) index_generation: u64,
@@ -382,6 +382,25 @@ pub(crate) struct DurableRecord {
     /// Validated v1 compatibility debt; never checkpoint authority.
     pub(crate) envelope_audit_debt: Option<u64>,
     pub(crate) wire: Option<WireIdentity>,
+}
+
+// Encoded bodies may contain private labels. Wrapping Debug implementations
+// inherit this length-only representation; no content-derived identifiers escape.
+impl std::fmt::Debug for PendingRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRecord")
+            .field("format", &self.format())
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+impl std::fmt::Debug for DurableRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableRecord")
+            .field("format", &self.format)
+            .field("body_len", &self.record.body.len())
+            .finish()
+    }
 }
 
 /// Writer-owned retirement distinguishes absence/verified replacement from

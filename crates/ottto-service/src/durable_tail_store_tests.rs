@@ -4609,7 +4609,22 @@ fn private_label_purge_erases_known_labelled_records_without_receipt_or_money_cr
     let mut store = scratch.store();
     let mut item = pending(b.clone(), certificate(&path), 1);
     item.body = crate::snapshots::durable_store_fixture_body_with_skill();
+    let label = "syntheticpurgelabel";
+    let byte_dump = format!("{:?}", label.as_bytes());
+    let pending_debug = [format!("{item:?}"), format!("{item:#?}")];
     store.write_after_save(&lock, 1, 0, vec![item]).unwrap();
+    let found = found(store.read(&b.key));
+    let wrapped: Result<(), ReadOutcome> = Err(ReadOutcome::Found(Box::new(found.clone())));
+    for text in pending_debug.into_iter().chain([
+        format!("{found:?}"),
+        format!("{found:#?}"),
+        format!("{wrapped:?}"),
+        format!("{wrapped:#?}"),
+    ]) {
+        assert!(!text.contains(label));
+        assert!(!text.contains(&byte_dump));
+        assert!(!text.contains(&format!("{:?}", found.record.body)));
+    }
     let before = store.counters();
     // The source-specific caller supplies the no-allocation record predicate.
     let purged = store
