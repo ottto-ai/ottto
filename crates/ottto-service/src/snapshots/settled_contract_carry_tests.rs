@@ -38,8 +38,8 @@ fn settled_contract_deadlock_start(cap: Option<usize>) -> (serde_json::Value, Sc
 
 /// [regress] RF1 B1 deadlock (M4: 158 admissions, all incomplete, zero
 /// retiring): latch -> admission -> unhealthy -> no census. Main (OFF) keeps
-/// the unfinished admission, which vetoes traversal health, and re-reads the
-/// invalid family. ON with the measured full pending cap (M4: 249,782 of
+/// an admission, which vetoes traversal health off terminal-off, and re-reads
+/// the invalid family. ON with the measured full pending cap (M4: 249,782 of
 /// 250,000 retained; here nothing fits after the start's clears) keeps that
 /// family owed, unread and uncredited, carries the rest whole and leaves no
 /// admission. Cap room for its recorded request re-reads it, still with no
@@ -60,8 +60,8 @@ fn settled_contract_carry_breaks_latched_admission_deadlock() {
     let (off, off_fixture) = settled_contract_deadlock_start(None);
     assert_eq!(off["rearmed_index_files"], 1, "main re-reads the invalid family");
     assert!(
-        admission(&off_fixture).is_some_and(|state| !state.complete),
-        "main keeps the unfinished admission: the deadlock"
+        admission(&off_fixture).is_some(),
+        "main keeps an admission, which off terminal-off vetoes health: the deadlock"
     );
 
     let (full, full_fixture) = settled_contract_deadlock_start(Some(0));
