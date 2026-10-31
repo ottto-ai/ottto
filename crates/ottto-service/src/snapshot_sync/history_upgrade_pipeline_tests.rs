@@ -738,6 +738,9 @@ fn only_files_that_grew_after_a_rebuild_emit() {
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
         let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
         assert!(held.uploaded.is_empty());
+        // Repair the unreadable intent with a real list: unchanged history
+        // stays excluded; the grown, unlisted sibling can settle at revision 3.
+        fixture.install_list(&[HISTORY_SESSIONS[0], HISTORY_SESSIONS[2]]);
         fixture.append(HISTORY_SESSIONS[1], "req_1_2");
         let grown = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_CURRENT);
         assert_eq!(grown.scan.scanned_file_count, 1);
@@ -1363,6 +1366,9 @@ fn held_history_never_settles_as_accepted_on_a_deferred_page() {
     let fixture = HistoryFixture::new("history-upgrade-deferred");
     fixture.baseline();
     fixture.corrupt_backfill_state();
+    // Only the unchanged siblings are excluded; a globally paused list
+    // would also deny adoption of the changed sibling's ordinary body.
+    fixture.install_list(&HISTORY_SESSIONS[..2]);
     fixture.append(HISTORY_SESSIONS[2], "req_2_2");
     let changed_context = HistoryCycle {
         upload_context: "history-context-2",
@@ -2071,15 +2077,21 @@ fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
     assert!(latched.uploaded.is_empty());
     crate::snapshots::restart_claude_reemission_stop_for_test();
     let mut sent = Vec::new();
+    let mut uploaded_history = BTreeSet::new();
     crate::snapshots::with_body_witness_adoption_page_budget(1, || {
         for hour in 10..14 {
             let outcome = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_CURRENT);
             assert!(!outcome.uploaded.contains(HISTORY_SESSIONS[0]));
-            assert!(outcome
-                .index
-                .files
-                .values()
-                .all(|entry| { entry.effective_upload_body_witness_revision <= 2 }));
+            uploaded_history.extend(outcome.uploaded.iter().cloned());
+            for session in HISTORY_SESSIONS {
+                let key = HistoryFixture::key(&outcome.index, session);
+                let revision = outcome.index.files[&key].effective_upload_body_witness_revision;
+                if uploaded_history.contains(session) {
+                    assert_eq!(revision, 3, "uploaded history settles: {session}");
+                } else {
+                    assert!(revision < 3, "held or still-paced history must remain owed: {session} revision={revision}");
+                }
+            }
             sent.push(outcome.uploaded.len());
         }
     });

@@ -2328,6 +2328,7 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
 
     // Readable proof: the released body settles.
     write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
+    let release_offers_start = pipeline.server.offered().len();
     let released = pipeline.cycle(t0 + 3_600);
     assert!(released.result.is_ok(), "{:?}", released.result);
     assert_eq!(
@@ -2361,10 +2362,19 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
         usage_of(&baseline),
         "family total == request-owned total, counted once"
     );
-    assert!(released
-        .progress
-        .accepted_fingerprints
-        .contains(&fingerprint_of(current)));
+    // E2's ACK ledger names the rebuilt body uploaded on this page, not
+    // a pre-release item with the same money and identity.
+    let uploaded_on_release = &offered[release_offers_start..];
+    let uploaded_fingerprints = uploaded_on_release
+        .iter()
+        .map(fingerprint_of)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(uploaded_on_release.len(), 1,
+        "U10(c1): exactly one release-page upload; uploaded={uploaded_fingerprints:?} accepted={:?}",
+        released.progress.accepted_fingerprints);
+    assert!(uploaded_fingerprints.is_subset(&released.progress.accepted_fingerprints),
+        "U10(c1): every uploaded body has its exact ACK; uploaded={uploaded_fingerprints:?} accepted={:?}",
+        released.progress.accepted_fingerprints);
     // No Unknown -> account upgrade: a replacement carries exactly the
     // first accepted body's identity, never an account it lacked. With no
     // replacement, the server already holds that exact accepted body.
@@ -2394,7 +2404,9 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
     // Quiet: nothing more is sent and the stamp holds.
     let quiet = pipeline.cycle(t0 + 4_200);
     assert!(quiet.result.is_ok(), "{:?}", quiet.result);
-    assert_eq!(pipeline.server.offered().len(), offered.len());
+    assert_eq!(pipeline.server.offered().len(), offered.len(),
+        "U10(c2): quiet cycle offers nothing; release_uploaded={uploaded_fingerprints:?} release_accepted={:?} quiet_accepted={:?}",
+        released.progress.accepted_fingerprints, quiet.progress.accepted_fingerprints);
     assert_eq!(
         quiet.index.files[&key].effective_upload_body_witness_revision,
         settled_revision

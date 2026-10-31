@@ -558,6 +558,11 @@ impl PipelineFixture {
             &self.support,
         )
         .expect("scan bounded Claude page");
+        let parsed = scan
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone())
+            .collect();
         let (mut disposition, census_withheld, _) =
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
         if let Some(owner_session) = cycle.proven_owner_session {
@@ -813,7 +818,7 @@ impl PipelineFixture {
         )
         .expect("save index and publish manifest");
         PipelinePage {
-            parsed: BTreeSet::new(),
+            parsed,
             scan,
             index: ScanIndex::load(&self.index_path).expect("reload scan index"),
             fully_settled,
@@ -1824,13 +1829,20 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
             .index
             .context_curve_replay_needed(cycle.replay_generation));
         assert_held_bodies_never_delivered(&pages, &last.index, &baseline);
-        // A13 transfer (E2-018): the hold is a non-progressing bound terminal
-        // demotion, not an account deferral; only the missing committed entry
-        // keeps the sweep unsettled.
+        // A13 transfer (E2-018): membership accumulates over bounded pages.
+        // Check the held page after all family members were rediscovered,
+        // preserving the exact full binding as well as no-delivery guards.
         let hold = pages
             .iter()
-            .find(|page| !page.held.is_empty() && page.index.bounded_sweep_had_unsettled_upload())
-            .expect("held page that marks the sweep");
+            .find(|page| {
+                !page.held.is_empty()
+                    && page.index.bounded_sweep_had_unsettled_upload()
+                    && page
+                        .index
+                        .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+                        == Some(bound_before.clone())
+            })
+            .expect("held page with the complete bound family that marks the sweep");
         assert!(
             !hold.scan.census_complete,
             "the hold page cannot publish a census"

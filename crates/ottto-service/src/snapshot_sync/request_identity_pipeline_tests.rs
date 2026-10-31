@@ -346,7 +346,58 @@ fn always_on_emits_contract5_whatever_the_hint_token() {
     std::fs::write(&transcript, unmarked).expect("drop the org marker");
     let mut telemetry_bodies = BTreeSet::new();
     for name in ["telemetry-first", "telemetry-again"] {
-        write_native_bootstrap_sidecars(&fixture, &fixture.base.join(format!("support-{name}")));
+        let telemetry_support = fixture.base.join(format!("support-{name}"));
+        write_native_bootstrap_sidecars(&fixture, &telemetry_support);
+        // Bootstrap rows prove usage, but intentionally contain no login.
+        // This identity guard needs the same paired rows with real typed
+        // login/org evidence, as the deleted unit specimen supplied.
+        let api_path = telemetry_support
+            .join("local-otel/claude-code-effort")
+            .join(format!(
+                "{:x}.jsonl",
+                Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())
+            ));
+        let rows = std::fs::read_to_string(&api_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
+                    serde_json::from_str(line).unwrap();
+                row.account_identifier_hash = Some("a".repeat(64));
+                use crate::claude_local_otel::{
+                    ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin,
+                    ClaudeIdentityDisposition, ClaudeRequestIdentityEvidence,
+                };
+                row.account_identity_checked = true;
+                row.request_identity = Some(ClaudeRequestIdentityEvidence {
+                    identity_hash_scheme: "provider-sha256:v1".into(),
+                    disposition: ClaudeIdentityDisposition::Complete,
+                    account: ClaudeIdentityAttributeEvidence {
+                        disposition: ClaudeIdentityDisposition::Complete,
+                        origin: ClaudeIdentityAttributeOrigin::LogRecord,
+                        log_record_hash: row.account_identifier_hash.clone(),
+                        resource_hash: None,
+                    },
+                    organization: ClaudeIdentityAttributeEvidence {
+                        disposition: ClaudeIdentityDisposition::Complete,
+                        origin: ClaudeIdentityAttributeOrigin::LogRecord,
+                        log_record_hash: ottto_core::billing_identity_hash(
+                            "anthropic",
+                            "organization",
+                            IDENTITY_PIPELINE_ORG,
+                        ),
+                        resource_hash: None,
+                    },
+                });
+                row.fingerprint.clear();
+                row.fingerprint = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(&row).unwrap())
+                );
+                serde_json::to_string(&row).unwrap() + "\n"
+            })
+            .collect::<String>();
+        std::fs::write(api_path, rows).unwrap();
         crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(
             &fixture.base.join(format!("support-{name}")),
             &[IDENTITY_PIPELINE_ROOT],

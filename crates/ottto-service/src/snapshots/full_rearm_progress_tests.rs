@@ -2972,6 +2972,39 @@ fn bound_retry_pending_authority_survives_unrelated_suppression_and_offers_its_o
             .contains_key(OTHER_ROOT),
         "selection never settles the held authority"
     );
+    // E2-077 transfer: exercise the same candidate-selection and reread
+    // model as Rearm::reread, across repeated pages in this window. The
+    // due retry above is a positive control; unrelated suppression must
+    // never turn it into a held-family reread storm.
+    let mut held_reads = 0;
+    for _ in 0..4 {
+        let key = rearm.other_key();
+        if index.files[&key].source_file_fingerprint.is_empty()
+            || index
+                .claude_usage_authority_candidate_requires_family_reparse(&candidate)
+                .is_some()
+        {
+            held_reads += 1;
+            index.files.get_mut(&key).unwrap().source_file_fingerprint = revision.clone();
+        }
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+        fold_reports(
+            &rearm,
+            &mut index,
+            &mut items.clone(),
+            &malformed,
+            &trace,
+            true,
+        );
+    }
+    assert!(
+        held_reads > 0,
+        "the bound includes the family's own due retry"
+    );
+    assert!(
+        held_reads <= 1,
+        "a held family is read at most once per window: {held_reads}"
+    );
 }
 
 fn reidentify_native(item: &mut SnapshotItem, session: &str, prefix: Option<&str>) {

@@ -180,6 +180,8 @@ fn next_full(
     index: ScanIndex,
     reason: usize,
 ) -> (ScanIndex, SourceScanResult) {
+    let mut oracle_index = ScanIndex::default();
+    oracle_index.claude_reemission_exclusions = index.claude_reemission_exclusions.clone();
     let (index, next, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
     assert_eq!(seen.modes, (1, 0, 0), "{id}: the next page reads Full");
     assert_eq!(seen.full_reasons[reason], 1, "{id}: next Full reason");
@@ -190,9 +192,9 @@ fn next_full(
             let (_, full, _) = production_scan(
                 &base.fixture,
                 CLAUDE,
-                crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default()),
+                oracle_index,
                 None,
-                "stage2pre-ordinary-oracle",
+                "stage2pre-full-oracle",
             );
             production_body(CLAUDE, full)
         }),

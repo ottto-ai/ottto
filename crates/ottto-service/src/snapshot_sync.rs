@@ -9896,8 +9896,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         &trace_report,
         index,
     );
-    let mut trace_discard_unfolded = BTreeSet::new();
-    {
+    let trace_discard_unfolded = {
         // Reuse the per-root read verdict before identity consumes it. Missing
         // sidecars are ordinary absence; partial pairs and failed strict reads
         // hold only that root's permitted owed history through the existing seam.
@@ -9908,12 +9907,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // A discarded strict trace read defers the family's bodies through the
         // E2 withhold: the accepted revision stays, delayed one pass, never
         // replaced by an untagged one. Listed families included.
-        (stats.trace_discard_deferred_items, trace_discard_unfolded) =
-            crate::snapshots::claude_request_money::e2::hold_trace_discarded(
-                &mut scan_result.snapshots,
-                &trace_discarded_roots,
-            );
-    }
+        let (deferred, unfolded) = crate::snapshots::claude_request_money::e2::hold_trace_discarded(
+            &mut scan_result.snapshots,
+            &trace_discarded_roots,
+        );
+        stats.trace_discard_deferred_items = deferred;
+        unfolded
+    };
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {

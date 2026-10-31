@@ -917,7 +917,7 @@ fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
         "the first proof re-arms"
     );
     // Positive control for the listed collector below: unlisted, the same
-    // family bodies are request-owned and never carry the V1 collector.
+    // family bodies are request-owned; the identity collector remains V1.
     let unlisted_bodies = c1a_family_bodies(&baseline);
     assert_eq!(unlisted_bodies.len(), family.len());
     for (session, (_, item)) in &unlisted_bodies {
@@ -926,7 +926,10 @@ fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
             Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
             "{session}: unlisted body is request-owned"
         );
-        assert_ne!(item.provenance.collector, V1, "{session}");
+        assert_eq!(
+            item.provenance.collector, V1,
+            "{session}: collector is independent of the money contract"
+        );
     }
     fixture.list_held(&[REARM_ROOT]);
     let closing = with_cycle_contract_for_test(V1, || c1a_generation(&fixture, "v1", (8, 0)));
