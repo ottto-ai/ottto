@@ -190,6 +190,7 @@ pub(crate) fn durable_store_fixture_body(source: SnapshotSource, count: u64, sum
 }
 
 pub(crate) mod sampled_scan;
+mod settled_contract_carry;
 mod stale_carry_diagnostics;
 #[cfg(test)]
 mod transcript_acquisition_tests;
@@ -10311,6 +10312,20 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         let contract = claude_request_identity::cycle_contract(identity.is_some());
         let cutover_terminal = cutover == CLAUDE_CONTRACT_CUTOVER_OWED
             && index.claude_request_identity_contract.as_deref() == Some(contract);
+        // RF1 B1 Q5 (default OFF): a mid-walk contract change records a
+        // placeholder, so a recorded current contract means this window's
+        // evidence was parsed under it. With no older evidence left there is
+        // nothing to mix; the latch clears before its full re-arm. Counted.
+        if settled_contract_carry::enabled()
+            && !claude_terminal_off()
+            && index.claude_request_identity_contract_changed
+            && index.claude_request_identity_contract.as_deref() == Some(contract)
+            && settled_contract_carry::evidence_from_window(index, census_window_end)
+        {
+            claude_contract::note(|counts| counts.identity_contract_latch.cleared += 1);
+            index.claude_request_identity_contract_changed = false;
+            eprintln!("local snapshot census settled-contract carry: latch_cleared=1");
+        }
         let latch_rearms = index.claude_request_identity_contract_changed
             && cutover != CLAUDE_CONTRACT_CUTOVER_SPENT;
         if let Some(record) = (index.claude_full_rearm_progress.structural_record.as_mut())
@@ -10670,13 +10685,31 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             diagnostic.update(|d| d.terminal_rearm = Some(rearm));
         }
 
+        // RF1 B1 GUARD (default OFF): completion retires only families that
+        // may hold valid proof; invalid or evidence-free pending stays owed.
+        let settled_guard = settled_contract_carry::enabled() && !claude_terminal_off();
+        let mut settled_owed = 0_usize;
         index
             .claude_usage_family_pending
-            .retain(|root_session_id, _| {
-                index
+            .retain(|root_session_id, pending| {
+                let owed = settled_guard
+                    && settled_contract_carry::owed_at_completion(
+                        root_session_id,
+                        pending,
+                        &indexed_claude_family_ids,
+                    );
+                settled_owed += usize::from(owed);
+                owed || index
                     .claude_usage_authority_quarantine
                     .contains_key(root_session_id)
             });
+        if settled_guard {
+            eprintln!(
+                "local snapshot census settled-contract carry: completion_kept_owed_families={settled_owed} \
+                 retained_pending_families={}",
+                index.claude_usage_family_pending.len()
+            );
+        }
         let progress = &mut index.claude_full_rearm_progress;
         progress.observed_window = None;
         progress.ignored_vetoes = 0;
@@ -42685,6 +42718,23 @@ fn ensure_bounded_traversal(
             })
             .map(|(root, _)| root.clone())
             .collect::<BTreeSet<_>>();
+        // RF1 B1 Q3 (default OFF): invalid families a re-read cannot change stay
+        // pending beside the carry, unread and uncredited; see the module.
+        let settled_contract = settled_contract_carry::enabled();
+        let (settled_kept, settled_kept_files) = if settled_contract {
+            settled_contract_carry::kept_invalid_roots(index, &stale_pending_roots)
+        } else {
+            (BTreeSet::new(), 0)
+        };
+        let stale_pending_roots = if settled_kept.is_empty() {
+            stale_pending_roots
+        } else {
+            stale_pending_roots
+                .difference(&settled_kept)
+                .cloned()
+                .collect()
+        };
+        let mut settled_admission_dropped = false;
         // Fix 2: when the traversal after a full re-arm needed a clean
         // follow-up, its own window's families are carried under C1b's
         // family checks instead of being re-read whole again, and the
@@ -42752,9 +42802,12 @@ fn ensure_bounded_traversal(
         let carry = if streaming_carry {
             // Existing scheduling debt survives even if the whole set now fits.
             // Re-price its batch, but do not discard unoffered service cursors.
+            // RF1 B1 (default OFF): an unfinished admission no longer forces
+            // the batch path; a whole carry that fits replaces it.
             let whole = if prior_admission
                 .as_ref()
                 .is_some_and(|state| !state.complete)
+                && !settled_contract
             {
                 Err(ClaudeRetryAdmissionRefusal::Structure)
             } else {
@@ -42766,7 +42819,12 @@ fn ensure_bounded_traversal(
                 )
             };
             match whole {
-                Ok(carry) => carry,
+                Ok(carry) => {
+                    settled_admission_dropped = prior_admission
+                        .as_ref()
+                        .is_some_and(|state| !state.complete);
+                    carry
+                }
                 Err(refusal) => {
                     let due = claude_retry_due_family_exists(index, collected_at);
                     if matches!(refusal, ClaudeRetryAdmissionRefusal::Structure)
@@ -42987,6 +43045,17 @@ fn ensure_bounded_traversal(
         transition.rearmed_index_files = rearmed_file_count;
         transition.carried_pending_families = carried_roots.len();
         transition.carried_index_files = carried_file_count;
+        if settled_contract {
+            eprintln!(
+                "local snapshot census settled-contract carry: kept_invalid_families={} \
+                 kept_invalid_files={} prior_admission_dropped={} admission={} latched={}",
+                settled_kept.len(),
+                settled_kept_files,
+                settled_admission_dropped,
+                admission.is_some(),
+                index.claude_request_identity_contract_changed,
+            );
+        }
         index.claude_stale_family_carry = ClaudeStaleFamilyCarry {
             origin: Some(ClaudeStaleFamilyCarryOrigin {
                 context_fingerprint: context_fingerprint.clone(),
