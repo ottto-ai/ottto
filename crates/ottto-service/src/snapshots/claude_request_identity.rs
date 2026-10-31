@@ -1167,6 +1167,8 @@ fn apply_grouped_with_accepted(
         }
         over_cap.insert(OverCap::Bytes);
     }
+    // All cap reasons share one exit after display shedding: bytes, authority
+    // keys, parts, rows and evidence entries preserve the same owed custody.
     if max_item_bytes > MAX_ITEM_BYTES && !over_cap.is_empty() {
         over_cap.insert(OverCap::IdentityHeld);
         crate::local_resource_diagnostics::claude_identity_over_cap(
