@@ -4691,7 +4691,9 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
     *corrupt.last_mut().unwrap() ^= 1;
     put_record(&file, &corrupt);
     // Historical readable records are identified without repairing their mode.
-    let old = binding("old", "scope", ("old", None));
+    // binding() fixes the path key; these must be distinct physical records.
+    let mut old = binding("old", "scope", ("old", None));
+    old.key = key_digest(DurableSource::ClaudeCode, "synthetic-old.jsonl");
     let mut historical = pending(old.clone(), certificate(&path), 1);
     historical.allowlist =
         parse_hex_digest("8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c")
@@ -4702,7 +4704,8 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
     fs::set_permissions(&old_file, fs::Permissions::from_mode(0o640)).unwrap();
     let old_stamp = stamp_at(&old_file).unwrap();
     // An unreadable current record also stays untouched and keeps PL unknown.
-    let denied = binding("denied", "scope", ("denied", None));
+    let mut denied = binding("denied", "scope", ("denied", None));
+    denied.key = key_digest(DurableSource::ClaudeCode, "synthetic-denied.jsonl");
     let denied_file = record_file(&store, &denied.key);
     put_record(&denied_file, &pinned_v1_bytes(&make(denied), 1));
     fs::set_permissions(&denied_file, fs::Permissions::from_mode(0o0)).unwrap();

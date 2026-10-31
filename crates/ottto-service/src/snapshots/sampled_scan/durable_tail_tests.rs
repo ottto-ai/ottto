@@ -2394,7 +2394,9 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         assert_eq!(
             counts.not_persisted,
             BTreeMap::from([
+                ("skill_label_entries_visited", 1),
                 ("skill_label_scanned", 1),
+                ("skill_label_verified", u64::from(!t14)),
                 ("skill_label_purged", 0),
                 ("skill_label_purge_failed", u64::from(t14)),
             ]),
@@ -2439,7 +2441,9 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
             BTreeMap::from([
                 // A corrupt prior leaves the inventory unknown: the retry
                 // scans all three records after the first one-record pass.
+                ("skill_label_entries_visited", 1 + 3 * u64::from(t14)),
                 ("skill_label_scanned", 1 + 3 * u64::from(t14)),
+                ("skill_label_verified", 1 + u64::from(t14)),
                 ("skill_label_purged", 0),
                 ("skill_label_purge_failed", 2 * u64::from(t14)),
             ]),
@@ -3125,7 +3129,16 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
             assert_eq!(counts.durable_held, [0; 9]);
-            assert_eq!(stats.format_hold, [0; 9]);
+            // The read-only privacy retry counts its own refusal even after
+            // ordinary restore disabled the store. It cannot hold native work.
+            let mut privacy_refusals = [0; 9];
+            let reason = if fault == "body" {
+                store::Refusal::Corrupt
+            } else {
+                store::Refusal::Undecodable
+            };
+            privacy_refusals[reason as usize] = 1;
+            assert_eq!(stats.format_hold, privacy_refusals, "{source:?}/{fault}");
             assert_eq!(stats.records_written, 0);
             assert_eq!(stats.gc_records_deleted + stats.gc_temps_deleted, 0);
             assert_eq!(std::fs::read(&record).unwrap(), before);
@@ -4289,76 +4302,98 @@ fn restore_scope_attribution_is_typed_and_preserves_binding_formula() {
     );
 }
 
+/// [format] typed restore misses preserve ON counts and main's no-record decisions OFF.
 #[test]
 fn restore_reports_each_early_exit_without_changing_old_totals() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let root = crate::test_scratch::private_dir("ottto-restore-provenance");
-    let _lock = test_locks::hold(&root);
-    let path = root.join("fixture.jsonl");
-    native_fixture(&path);
-    let key = local_index_key(&path);
-    let source = SnapshotSource::ClaudeCode;
-    let namespace = Scope("restore-outcome".into());
-    let scope = Scope("restore-file".into());
-    let index_path = root.join("index.json");
-    let cache = SharedCache::default();
-    let mut index = ScanIndex::default();
-    let attempt = |index: &ScanIndex| {
-        let interpretation = Interpretation::of(source, &key, index, false, &namespace);
-        cache.durable_restore(
-            source,
-            &key,
-            &path,
-            &scope,
-            &mut File::open(&path).unwrap(),
-            index,
-            &interpretation,
-        )
-    };
-    let label = |outcome: RestoreOutcome| match outcome {
-        RestoreOutcome::Miss(class) => class.label(),
-        _ => panic!("expected a typed miss"),
-    };
-    assert_eq!(label(attempt(&index)), "no_entry");
-    index.files.insert(
-        key.clone(),
-        serde_json::from_value(serde_json::json!({
-            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp",
-            "effective_upload_body_witness_revision":3
-        }))
-        .unwrap(),
-    );
-    index.active_effective_upload_body_witness_revision = 3;
-    assert_eq!(label(attempt(&index)), "unavailable");
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
-    assert_eq!(label(attempt(&index)), "missing");
-    index
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .source_file_fingerprint
-        .clear();
-    // #865 removed the Claude selection-clear veto: absence is a counted Miss.
-    assert_eq!(label(attempt(&index)), "missing");
-    index.files.get_mut(&key).unwrap().source_file_fingerprint = "fp".into();
-    index
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .effective_upload_body_witness_revision = 2;
-    assert_eq!(label(attempt(&index)), "ineligible.history_owed");
-    let (old, disk) = cache.durable_counters(source).unwrap();
-    assert_eq!((old.restore_attempts, old.missing, old.restored), (4, 2, 0));
-    assert!(!old.ineligible.contains_key("selection_cleared"));
-    assert_eq!(old.ineligible["history_owed"], 1);
-    assert_eq!(old.durable_held, [0; 9]);
-    let text = old.summary(source, &disk);
-    assert!(!text.contains("restore_attempts="));
-    assert!(text.contains("disk_records="));
-    assert!(text.contains("not_persisted="));
-    // No new record or recovery operation is performed by these diagnostics.
-    assert_eq!(disk.records_read, 0);
-    let _ = std::fs::remove_dir_all(root);
+    for enabled in [false, true] {
+        let _restart_restore = if enabled {
+            crate::snapshots::RestartRestoreForTest::enabled()
+        } else {
+            store::test_hooks::set_before_access(Some(Box::new(|_, _| panic!("OFF store access"))));
+            crate::snapshots::RestartRestoreForTest::disabled()
+        };
+        let root = crate::test_scratch::private_dir("ottto-restore-provenance");
+        let _lock = test_locks::hold(&root);
+        let path = root.join("fixture.jsonl");
+        native_fixture(&path);
+        let key = local_index_key(&path);
+        let source = SnapshotSource::ClaudeCode;
+        let namespace = Scope("restore-outcome".into());
+        let scope = Scope("restore-file".into());
+        let index_path = root.join("index.json");
+        let cache = SharedCache::default();
+        let mut index = ScanIndex::default();
+        let attempt = |index: &ScanIndex| {
+            let interpretation = Interpretation::of(source, &key, index, false, &namespace);
+            cache.durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                index,
+                &interpretation,
+            )
+        };
+        let label = |outcome: RestoreOutcome| match outcome {
+            RestoreOutcome::Miss(class) => class.label(),
+            _ => panic!("expected a typed miss"),
+        };
+        assert_eq!(label(attempt(&index)), "no_entry");
+        index.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp",
+                "effective_upload_body_witness_revision":3
+            }))
+            .unwrap(),
+        );
+        index.active_effective_upload_body_witness_revision = 3;
+        assert_eq!(label(attempt(&index)), "unavailable");
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        assert_eq!(label(attempt(&index)), "missing");
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        // #865 removed Claude's selection-clear veto ON. OFF retains main's
+        // pre-I/O reparse-debt label without opening a store.
+        assert_eq!(
+            label(attempt(&index)),
+            if enabled {
+                "missing"
+            } else {
+                "ineligible.selection_cleared"
+            }
+        );
+        index.files.get_mut(&key).unwrap().source_file_fingerprint = "fp".into();
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .effective_upload_body_witness_revision = 2;
+        assert_eq!(label(attempt(&index)), "ineligible.history_owed");
+        if enabled {
+            let (old, disk) = cache.durable_counters(source).unwrap();
+            assert_eq!((old.restore_attempts, old.missing, old.restored), (4, 2, 0));
+            assert!(!old.ineligible.contains_key("selection_cleared"));
+            assert_eq!(old.ineligible["history_owed"], 1);
+            assert_eq!(old.durable_held, [0; 9]);
+            let text = old.summary(source, &disk);
+            assert!(!text.contains("restore_attempts="));
+            assert!(text.contains("disk_records="));
+            assert!(text.contains("not_persisted="));
+            // No new record or recovery operation is performed by these diagnostics.
+            assert_eq!(disk.records_read, 0);
+        } else {
+            assert!(cache.durable_counters(source).is_none());
+            assert!(!store::store_dir_for_index(&index_path).exists());
+        }
+        store::test_hooks::set_before_access(None);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[test]
@@ -12524,11 +12559,13 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
         if case == "unreadable" {
             cache.durable_write_after_save(lock, source, &index);
         }
-        let counts = cache.durable_counters(source).unwrap().0;
         if case == "no-marker" {
-            assert_eq!(counts.not_persisted.get("skill_label_scanned"), None);
+            // Ordinary OFF registration allocates no store or counters.
+            assert!(cache.durable_counters(source).is_none());
+            assert!(cache.durable.lock().unwrap().state.is_none());
             assert!(!dir.exists());
         } else {
+            let counts = cache.durable_counters(source).unwrap().0;
             assert_eq!(
                 counts.not_persisted.get("skill_label_scanned"),
                 Some(&if case == "unreadable" {
@@ -13334,6 +13371,7 @@ fn off_no_record_growth_uses_ordinary_full_without_store_io() {
         for stored in [false, true] {
             let _off = crate::snapshots::RestartRestoreForTest::disabled();
             let root = crate::test_scratch::ScratchDir::new("off-no-record");
+            let lock = test_locks::hold(&root);
             let projects = root.join("projects");
             std::fs::create_dir(&projects).unwrap();
             let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
@@ -13374,6 +13412,17 @@ fn off_no_record_growth_uses_ordinary_full_without_store_io() {
                     .map(|s| s.snapshot_fingerprint.clone())
                     .collect(),
             );
+            // The scan/finalizer never performs the daemon's post-save write.
+            prior.save(&index_path).unwrap();
+            let receipt =
+                owner
+                    .cache
+                    .durable_write_after_save(lock, SnapshotSource::ClaudeCode, &prior);
+            if stored {
+                assert_eq!(receipt.unwrap().written, 1);
+            } else {
+                assert!(receipt.is_none());
+            }
             let dir = store::store_dir_for_index(&index_path);
             let digest = store::key_digest(DurableSource::ClaudeCode, &local_index_key(&path));
             let record_path = dir.join(format!(
@@ -13452,6 +13501,7 @@ fn off_publication_invalidates_outgrown_v1() {
     claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
         let _off = RestartRestoreForTest::disabled();
         let root = crate::test_scratch::ScratchDir::new("off-outgrown-v1");
+        let _lock = test_locks::hold(&root);
         let projects = root.join("projects");
         fs::create_dir(&projects).unwrap();
         let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
