@@ -95,7 +95,7 @@ pub(crate) struct RearmCounts {
     pub files: u64,
     pub bytes: u64,
     pub local_bytes: u64,
-    /// Files left owed and re-queued after a split ACK set (Lead B Q1).
+    /// Files left owed after this pass deferred part of their ACK set (Lead B Q1).
     pub context_split_files: u64,
 }
 impl RearmCounts {
@@ -580,8 +580,11 @@ impl ScanIndex {
             .collect()
     }
 
-    /// Called on the final selected index, using only this cycle's exact ACKs.
-    /// No parse/finalize/quarantine/old-context path has this authority.
+    /// Called on the final selected index, using only exact ACKs of the active
+    /// context: this cycle's, or an earlier pass's by its durable stamp of the
+    /// same body (Lead B Q1). Stamps are cleared on every replay-generation
+    /// change, which carries the curve epoch. No parse/finalize/quarantine/
+    /// old-context path has this authority.
     pub(crate) fn accept_file_upload_context_acks(
         &mut self,
         candidates: &[Candidate],
@@ -647,17 +650,28 @@ impl ScanIndex {
                 }
             }
         }
-        // A split file stays owed: no receipt until its last body is ACKed.
+        // A split file stays owed: no receipt until its last body is exact.
+        // Only a file this pass advanced returns to the queue now; one whose
+        // whole tail was deferred waits, as before, so pressure cannot loop.
+        let mut progressed = Vec::new();
         for candidate in candidates.iter().filter(|candidate| candidate.split) {
-            if !self
+            if self
                 .files
                 .get(&candidate.key)
                 .is_some_and(|entry| self.receipt_matches(&candidate.key, entry))
-                && self.requeue_split_context_read(&candidate.key)
             {
-                counts.context_split_files += 1;
+                continue;
+            }
+            counts.context_split_files += 1;
+            if candidate
+                .bodies
+                .iter()
+                .any(|(entity, body)| fresh_acks.get(entity) == Some(body))
+            {
+                progressed.push(candidate.key.as_str());
             }
         }
+        self.requeue_split_context_reads(progressed.into_iter());
         counts
     }
 }

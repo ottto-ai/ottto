@@ -279,3 +279,26 @@ The sampled-acquisition counter alone does not cover those reads. A cold group
 replay provides a positive control for this probe; all three quiet walks require
 it to stay zero. Production read ledgers and the shared-parser contract are
 unchanged.
+
+## 2026-10-31 update: real-size admission, split ACK sets (Lead B Q1)
+
+Evidence (M4, 0.1.205): 3,954 Codex census members pending, one context read per
+census page (6.15/h, about 27 days), because each file reserved 1,969,161 B of
+the 2 MiB pass while real Codex census bodies are 6-16 KB. Lead B ruled
+(2026-10-31) that a file's context ACKs may split across batches. This
+supersedes "Stamps alone never mint receipts", the conservative per-entity
+reservation and the alone-pass oversized exception above:
+
+- Admission charges the real wire bytes of the page's parsed bodies and admits
+  a file while one more legal body still fits. The native page budget is the
+  bound (about 40 census files per page at the 1.4 MB median).
+- A file's receipt still needs every body exact-ACKed under the active context:
+  in this pass, or in an earlier one by its durable context stamp of the same
+  body. Unknown (unstamped) ACKs never count. Stamps are cleared on every replay
+  generation change, which carries the curve epoch.
+- A file whose tail the pass allowance deferred stays owed and is counted as
+  `upload_context_rearm.context_split_files`. If this pass ACKed part of it, it
+  returns to its generation queue and its next read resends only unACKed
+  bodies; if nothing was ACKed it waits for the next generation, as before.
+- An oversized file splits, at most the 2 MiB pass allowance per read, instead
+  of taking one alone pass. Each split pass re-reads the native file.

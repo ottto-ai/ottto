@@ -1686,8 +1686,8 @@ fn real_scan_joined_codex_context_catchup_admits_the_whole_alias_unit() {
 
 /// [behaviour] Lead B Q1: a file whose context bodies exceed the pass
 /// allowance no longer gets a one-off oversized allowance. Each pass sends at
-/// most the allowance, the file stays owed and re-queued, and the next read
-/// resends only the unACKed tail before the receipt.
+/// most the allowance; a pass that ACKed part of the file re-queues it owed,
+/// and the next read resends only the unACKed tail before the receipt.
 #[test]
 fn real_scan_oversized_context_unit_splits_bounded_and_progresses() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -1723,6 +1723,37 @@ fn real_scan_oversized_context_unit_splits_bounded_and_progresses() {
     );
     f.index
         .activate_file_upload_context(f.source, "e".repeat(64));
+    {
+        // Other traffic spent the whole allowance: nothing advances, so the
+        // owed file waits instead of being re-queued (no pressure loop).
+        f.cache = Arc::default();
+        let previous = f.index.clone();
+        let ((mut scan, _), _) =
+            upload_context_read::with_read_limit(fs::metadata(&f.path).unwrap().len(), || {
+                f.walk(false)
+            });
+        scan.snapshots = items.clone();
+        finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+        f.index.traversal = Some(super::claude_family_census_shadow_tests::traversal());
+        f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+        f.uploader.set_byte_allowance(0);
+        let first = f.uploader.posts.len();
+        assert_eq!(
+            f.uploader
+                .send(f.source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(f.uploader.posts.len(), first);
+        assert!(f
+            .index
+            .traversal
+            .take()
+            .unwrap()
+            .pending_candidates
+            .is_empty());
+    }
     let mut sent = Vec::new();
     for pass in 0..2 {
         f.cache = Arc::default();

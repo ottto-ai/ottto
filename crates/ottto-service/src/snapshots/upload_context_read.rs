@@ -5,9 +5,9 @@ use super::*;
 pub(crate) struct LocalCounts {
     pub files: u64,
     pub local_bytes: u64,
-    /// This page's admitted reads with their selection flags (RAM-only), so a
-    /// file whose context ACK set the pass allowance split can be re-queued.
-    read_paths: Vec<ScanTraversalPath>,
+    /// This page's admitted reads by index key, with their selection flags
+    /// (RAM-only), so a file whose context ACK set split can be re-queued.
+    read_paths: BTreeMap<String, ScanTraversalPath>,
 }
 #[derive(Debug)]
 pub(super) struct Budget {
@@ -66,8 +66,8 @@ impl Budget {
         // Lead B Q1 (2026-10-31): a file's context ACKs may split across
         // passes, so reserve real bytes only (this page's parsed bodies). A
         // file's own bodies are unknown before its parse: admit it while one
-        // legal body still fits, so a single-body file does not split; a
-        // longer tail stays owed and is re-queued.
+        // more legal body (sent once) still fits. A tail the pass allowance
+        // defers stays owed.
         if self
             .page_wire(ordinary)
             .saturating_add(MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES.saturating_add(3))
@@ -91,16 +91,20 @@ impl Budget {
             return false;
         }
         self.native_reserved = self.native_reserved.saturating_add(read);
-        index
-            .context_read_counts
-            .read_paths
-            .extend(candidates.iter().map(|candidate| ScanTraversalPath {
-                scan_root: candidate.scan_root.clone(),
-                path: candidate.path.clone(),
-                census_member: true,
-                watcher_hint: false,
-            }));
-        self.admitted.extend(keys);
+        for candidate in candidates {
+            let key = local_index_key(&candidate.path);
+            if self.admitted.insert(key.clone()) {
+                index.context_read_counts.read_paths.insert(
+                    key,
+                    ScanTraversalPath {
+                        scan_root: candidate.scan_root.clone(),
+                        path: candidate.path.clone(),
+                        census_member: true,
+                        watcher_hint: false,
+                    },
+                );
+            }
+        }
         true
     }
     /// Wire bytes of this page's parsed bodies, each with both optional
@@ -133,8 +137,8 @@ impl Budget {
         // One pending-queue walk per page, not one walk per deferred file.
         sampled_scan::codex_cursor::requeue_members(index, flags, &self.deferred);
         self.deferred.clear();
-        for read in &mut index.context_read_counts.read_paths {
-            if let Some(&(census_member, watcher_hint)) = flags.get(&local_index_key(&read.path)) {
+        for (key, read) in &mut index.context_read_counts.read_paths {
+            if let Some(&(census_member, watcher_hint)) = flags.get(key) {
                 read.census_member = census_member;
                 read.watcher_hint = watcher_hint;
             }
@@ -175,29 +179,22 @@ impl Budget {
     }
 }
 impl ScanIndex {
-    /// Lead B Q1: return a split file read on this page to its generation's
-    /// queue; its next read resends only the bodies still unACKed.
-    pub(super) fn requeue_split_context_read(&mut self, key: &str) -> bool {
-        let Some(read) = self
-            .context_read_counts
-            .read_paths
-            .iter()
-            .find(|read| local_index_key(&read.path) == key)
-        else {
-            return false;
-        };
+    /// Lead B Q1: return split files read on this page to their generation's
+    /// queue in one pending pass; each next read resends only unACKed bodies.
+    pub(super) fn requeue_split_context_reads<'a>(&mut self, keys: impl Iterator<Item = &'a str>) {
         let Some(traversal) = self.traversal.as_mut() else {
-            return false;
+            return;
         };
-        if traversal
-            .pending_candidates
-            .iter()
-            .any(|pending| pending.path == read.path)
-        {
-            return false;
+        let mut absent = keys
+            .filter_map(|key| self.context_read_counts.read_paths.get(key))
+            .map(|read| (read.path.as_path(), read))
+            .collect::<BTreeMap<_, _>>();
+        for pending in &traversal.pending_candidates {
+            absent.remove(pending.path.as_path());
         }
-        traversal.pending_candidates.push_back(read.clone());
-        true
+        traversal
+            .pending_candidates
+            .extend(absent.into_values().cloned());
     }
     pub(super) fn context_only_read(&self, candidate: &CandidateFile, audit_now: u64) -> bool {
         if !self.file_upload_context_enabled {
