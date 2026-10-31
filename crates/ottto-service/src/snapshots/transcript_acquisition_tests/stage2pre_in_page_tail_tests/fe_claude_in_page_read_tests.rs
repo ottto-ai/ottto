@@ -180,8 +180,10 @@ fn next_full(
     index: ScanIndex,
     reason: usize,
 ) -> (ScanIndex, SourceScanResult) {
-    let mut oracle_index = ScanIndex::default();
-    oracle_index.claude_reemission_exclusions = index.claude_reemission_exclusions.clone();
+    let oracle_index = ScanIndex {
+        claude_reemission_exclusions: index.claude_reemission_exclusions.clone(),
+        ..ScanIndex::default()
+    };
     let (index, next, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
     assert_eq!(seen.modes, (1, 0, 0), "{id}: the next page reads Full");
     assert_eq!(seen.full_reasons[reason], 1, "{id}: next Full reason");
