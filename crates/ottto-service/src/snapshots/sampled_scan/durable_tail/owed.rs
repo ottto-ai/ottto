@@ -395,8 +395,15 @@ impl SharedCache {
             self.mark_key(source, key, has_candidate);
             return Ok(());
         }
-        // Fund the checkpoint copy on this acquisition's own active lease.
+        // Fund the checkpoint copy and boxed debt layout on this acquisition's
+        // own active lease before either allocation.
         let bytes = checkpoint_bytes(acquisition.checkpoint().ok_or(HeldCause::Incompatible)?)
+            .and_then(|n| {
+                n.checked_add(
+                    (std::mem::size_of::<ReceiptOwed>() + std::mem::align_of::<ReceiptOwed>())
+                        as u64,
+                )
+            })
             .ok_or(HeldCause::CustodyBound)?;
         acquisition
             .custody_mut()

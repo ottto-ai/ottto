@@ -1485,6 +1485,9 @@ fn retail_bytes(source: SnapshotSource, metric: usize) -> u64 {
     })
 }
 
+// One already-funded graph and the lease that follows its transfer.
+type PreparedTransfer = (Box<Taken<CachedJsonlReduction>>, store::ActiveLease);
+
 pub(crate) use crate::snapshots::DurableCustody;
 impl DurableCustody {
     pub(crate) fn take_retail(&mut self) -> Option<RetailAttempt> {
@@ -1546,27 +1549,27 @@ impl DurableCustody {
         }
     }
     pub(crate) fn owed(&self) -> Option<&ReceiptOwed> {
-        self.owed.as_ref()
+        self.owed.as_deref()
     }
     /// While debt exists the chain lives only inside it, never twice.
     pub(crate) fn chain(&self) -> Option<&AcquiredChain> {
-        self.chain.as_ref()
+        self.chain.as_deref()
     }
     pub(crate) fn chain_mut(&mut self) -> Option<&mut AcquiredChain> {
-        self.chain.as_mut()
+        self.chain.as_deref_mut()
     }
     pub(crate) fn take_chain(&mut self) -> Option<AcquiredChain> {
-        self.chain.take()
+        self.chain.take().map(|chain| *chain)
     }
     pub(crate) fn take_owed(&mut self) -> Option<ReceiptOwed> {
-        self.owed.take()
+        self.owed.take().map(|owed| *owed)
     }
     #[allow(clippy::result_large_err)] // Refusal returns the original debt.
     pub(crate) fn put_owed(&mut self, owed: ReceiptOwed) -> Result<(), ReceiptOwed> {
         if self.owed.is_some() || self.chain.is_some() {
             return Err(owed);
         }
-        self.owed = Some(owed);
+        self.owed = Some(Box::new(owed));
         Ok(())
     }
     #[allow(clippy::result_large_err)] // Refusal returns the original chain.
@@ -1574,7 +1577,7 @@ impl DurableCustody {
         if self.owed.is_some() || self.chain.is_some() {
             return Err(chain);
         }
-        self.chain = Some(chain);
+        self.chain = Some(Box::new(chain));
         Ok(())
     }
 }
@@ -5104,11 +5107,14 @@ impl SharedCache {
         }
     }
 
+    // The transfer reservation covers this box before allocation; return only
+    // its pointer, never another large by-value graph in the scan-step frame.
+    #[inline(never)]
     pub(in crate::snapshots) fn take_prepared(
         &self,
         source: SnapshotSource,
         key: &str,
-    ) -> Result<Option<(Taken<CachedJsonlReduction>, store::ActiveLease)>, ()> {
+    ) -> Result<Option<PreparedTransfer>, ()> {
         if self.retained().is_ok_and(|cache| cache.peek(key).is_none()) {
             return Ok(None);
         }
@@ -5118,7 +5124,7 @@ impl SharedCache {
             return Err(());
         };
         match self.take(key) {
-            Some(taken) => Ok(Some((taken, lease))),
+            Some(taken) => Ok(Some((Box::new(taken), lease))),
             None => {
                 lease.release();
                 Ok(None)

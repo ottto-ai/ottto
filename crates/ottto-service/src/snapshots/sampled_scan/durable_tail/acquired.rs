@@ -174,7 +174,8 @@ pub(super) fn capture_chain(
     }
     // Fund fixed metadata and all three owned strings before the first allocation.
     let bytes = std::mem::size_of::<AcquiredChain>()
-        .checked_add(inputs.key.len())
+        .checked_add(std::mem::align_of::<AcquiredChain>())
+        .and_then(|n| n.checked_add(inputs.key.len()))
         .and_then(|n| n.checked_add(inputs.opened_object_identity.len()))
         .and_then(|n| n.checked_add(scope.0.len()))
         .and_then(|n| u64::try_from(n).ok())

@@ -2197,7 +2197,7 @@ pub(super) fn new_source_parser(
     curve: bool,
     identity_capture: bool,
     index: &ScanIndex,
-) -> Result<OwnedJsonlParser> {
+) -> Result<Box<OwnedJsonlParser>> {
     let mut parser = OwnedJsonlParser::new(
         file,
         &candidate.path,
@@ -2218,7 +2218,7 @@ pub(super) fn new_source_parser(
         configure_tier_replay(&mut parser, candidate, index);
         codex_counting_version::configure_singleton(&mut parser, candidate, index);
     }
-    Ok(parser)
+    Ok(Box::new(parser))
 }
 pub(super) fn configure_tier_replay(
     parser: &mut OwnedJsonlParser,

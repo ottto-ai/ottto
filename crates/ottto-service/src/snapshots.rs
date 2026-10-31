@@ -38,9 +38,10 @@ pub(crate) struct DurableCustody {
     #[cfg(unix)]
     active: Option<crate::durable_tail_store::ActiveLease>,
     #[cfg(unix)]
-    chain: Option<sampled_scan::durable_tail::AcquiredChain>,
+    // Keep acquisition metadata out of every parser/cache-transfer stack slot.
+    chain: Option<Box<sampled_scan::durable_tail::AcquiredChain>>,
     #[cfg(unix)]
-    owed: Option<sampled_scan::durable_tail::ReceiptOwed>,
+    owed: Option<Box<sampled_scan::durable_tail::ReceiptOwed>>,
     #[cfg(unix)]
     retail: Option<sampled_scan::durable_tail::RetailAttempt>,
     #[cfg(unix)]
@@ -26108,7 +26109,8 @@ struct OwnedActiveFile {
     previous_upload_body_witness: Option<String>,
     projection_adoption_required: bool,
     source_file_fingerprint: String,
-    parser: OwnedJsonlParser,
+    // Preserve heap ownership when this active file is moved into native finish.
+    parser: Box<OwnedJsonlParser>,
     aliases: Vec<CandidateFile>,
     applied_receipts: BTreeMap<String, Option<codex_file_join::AppliedTierReceipt>>,
     /// Present while this file is read as a paged cursor job.
@@ -30257,34 +30259,11 @@ impl OwnedSourceScan {
                 #[cfg(unix)]
                 let (parsed_file, m3_publication, m3_strict_rebind, m3_staged) = match m3_route {
                     Some((context, active, held)) => {
-                        let request = NativeChainRequest {
-                            source,
-                            key: &active.key,
-                            opened_object_identity: &candidate.opened_object_identity,
-                            mode: active.mode,
-                            held: &held,
-                            index,
-                            counting:
-                                sampled_scan::durable_tail::ImmutableCounting::from_accumulator(
-                                    &parser.accumulator,
-                                )
-                                .ok(),
-                        };
-                        if let Some(completed) = completed_acquisition.as_mut() {
-                            bind_native_chain(&context.cache, completed, &request);
-                        }
-                        let attempt = parser.finish_with_repository_identity_prepared(
+                        let settled = parser.finish_with_repository_identity_prepared(
                             finish_request,
                             completed_acquisition.take(),
-                            |lease, view| context.cache.prepare_live(lease, view),
-                        );
-                        #[cfg(test)]
-                        sampled_scan::test_hooks::fire(
-                            sampled_scan::test_hooks::Point::BeforeNativeSettle,
-                        );
-                        let settled = settle_native_attempt(
                             &context.cache,
-                            attempt,
+                            active.mode,
                             held,
                             NativeFence {
                                 source,
@@ -30304,14 +30283,14 @@ impl OwnedSourceScan {
                         )
                     }
                     None => (
-                        parser.finish_native(finish_request, None),
+                        parser.finish_boxed_native(finish_request),
                         None,
                         false,
                         false,
                     ),
                 };
                 #[cfg(not(unix))]
-                let parsed_file = parser.finish_native(finish_request, None);
+                let parsed_file = parser.finish_boxed_native(finish_request);
                 #[cfg(unix)]
                 if excluded_native_class && parsed_file.is_ok() {
                     if let Some(context) = sampling.as_ref() {
@@ -33683,7 +33662,10 @@ impl OwnedSourceScan {
                         .take_prepared(source, &key)
                         .map(|taken| taken.map(|(taken, lease)| (taken, Some(lease))))
                 } else {
-                    Ok(context.cache.take(&key).map(|taken| (taken, None)))
+                    Ok(context
+                        .cache
+                        .take(&key)
+                        .map(|taken| (Box::new(taken), None)))
                 } {
                     Ok(Some((taken, lease))) => (Some(taken), lease),
                     Ok(None) => (None, None),
@@ -33712,7 +33694,7 @@ impl OwnedSourceScan {
                     }
                 }
                 #[cfg(not(unix))]
-                let taken = context.cache.take(&key);
+                let taken = context.cache.take(&key).map(Box::new);
                 #[cfg(unix)]
                 let taken = if native_edit_proven {
                     // A real edit invalidates the old graph; no Tail spend or
@@ -33807,7 +33789,7 @@ impl OwnedSourceScan {
                 });
                 let e2_held_new_file = source == SnapshotSource::ClaudeCode
                     && taken.as_ref().is_some_and(|taken| taken.e2_held_new_file);
-                let mut retained = taken.map(Box::new);
+                let mut retained = taken;
                 let retained_present = retained.is_some();
                 let reinsertion =
                     crate::local_resource_diagnostics::claude_reread::Reinsertion::new(
@@ -36135,30 +36117,47 @@ impl OwnedJsonlParser {
     /// PRE-finalization seam: after the held FD revalidated the opened object,
     /// before any finalization write. A retained copy is staged from its own
     /// reduction, otherwise from the live parser state; both use the one body
-    /// engine behind `prepare`. The acquisition and staging are returned even
-    /// when the native finish fails, so the caller discards them explicitly.
-    /// Without an acquired chain nothing is staged (`preparation: None`).
+    /// engine behind `prepare`. Bind, finish and settle in this separate frame
+    /// so their large acquisition temporaries never occupy the scan-step frame.
+    /// Native failure still explicitly discards staging and preserves its debt.
     #[cfg(unix)]
     #[inline(never)]
-    fn finish_with_repository_identity_prepared<F>(
-        mut self,
+    fn finish_with_repository_identity_prepared(
+        mut self: Box<Self>,
         request: FinishRequest<'_>,
-        completed: Option<sampled_jsonl::CompletedNativeAcquisition>,
-        prepare: F,
-    ) -> sampled_scan::durable_tail::NativeFinishAttempt
-    where
-        F: for<'v> FnOnce(
-            &mut crate::durable_tail_store::ActiveLease,
-            sampled_scan::durable_tail::LiveFinishView<'v>,
-        ) -> sampled_scan::durable_tail::PrepareOutcome,
-    {
+        mut completed: Option<sampled_jsonl::CompletedNativeAcquisition>,
+        cache: &sampled_scan::SharedCache,
+        mode: crate::transcript_acquisition::ReadMode,
+        held: File,
+        fence: NativeFence<'_>,
+    ) -> NativeSettlement {
+        let chain_request = NativeChainRequest {
+            source: fence.source,
+            key: fence.key,
+            opened_object_identity: fence.expected_opened_object_identity,
+            mode,
+            held: &held,
+            index: fence.committed_index,
+            counting: sampled_scan::durable_tail::ImmutableCounting::from_accumulator(
+                &self.accumulator,
+            )
+            .ok(),
+        };
+        if let Some(completed) = completed.as_mut() {
+            bind_native_chain(cache, completed, &chain_request);
+        }
         use sampled_scan::durable_tail::{FinishAcquisition, NativeFinishAttempt};
         let mut acquisition = match completed {
             Some(completed) => FinishAcquisition::Certified(completed),
             // The read's own custody (lease, chain, debt) moves with it.
             None => FinishAcquisition::Uncertified(self.completed_durable()),
         };
-        let mut prepare = Some(prepare);
+        let mut prepare = Some(
+            |lease: &mut crate::durable_tail_store::ActiveLease,
+             view: sampled_scan::durable_tail::LiveFinishView<'_>| {
+                cache.prepare_live(lease, view)
+            },
+        );
         let mut preparation = None;
         let mut stage = |live: PreFinalization<'_>| {
             if let Some(prepare) = prepare.take() {
@@ -36166,11 +36165,21 @@ impl OwnedJsonlParser {
             }
         };
         let native = self.finish_native(request, Some(&mut stage));
-        NativeFinishAttempt {
+        let attempt = NativeFinishAttempt {
             native,
             acquisition,
             preparation,
-        }
+        };
+        #[cfg(test)]
+        sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeNativeSettle);
+        settle_native_attempt(cache, attempt, held, fence)
+    }
+
+    // Keep the consumed parser off the caller's scan-step frame as well as
+    // while it is retained in OwnedActiveFile. Unboxing belongs to this frame.
+    #[inline(never)]
+    fn finish_boxed_native(self: Box<Self>, request: FinishRequest<'_>) -> Result<ParsedJsonlFile> {
+        self.finish_native(request, None)
     }
 
     /// The one native finish. `pre` runs exactly once, only on the path that
@@ -36556,7 +36565,7 @@ where
     } = custody;
     // While debt exists the chain lives only in it.
     let chain = chain
-        .as_ref()
+        .as_deref()
         .or_else(|| owed.as_ref().map(|owed| owed.chain()))?;
     if certified.is_none()
         && owed.is_none()
@@ -36615,7 +36624,7 @@ where
 fn custody_chain(custody: &DurableCustody) -> Option<&sampled_scan::durable_tail::AcquiredChain> {
     custody
         .chain
-        .as_ref()
+        .as_deref()
         .or_else(|| custody.owed.as_ref().map(|owed| owed.chain()))
 }
 
@@ -36753,7 +36762,7 @@ fn bind_native_chain(
         first_read || real_edit,
         counting,
     ) {
-        custody.chain = Some(chain);
+        custody.chain = Some(Box::new(chain));
     }
 }
 
