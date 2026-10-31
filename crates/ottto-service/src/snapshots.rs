@@ -26903,11 +26903,12 @@ impl OwnedSourceScan {
                 )
             })
             .filter(|candidate| {
-                !state_v2::resume_selection_held(
-                    index,
-                    &local_index_key(&candidate.path),
-                    Some(candidate.size_bytes),
-                )
+                !growth_active
+                    || !state_v2::resume_selection_held(
+                        index,
+                        &local_index_key(&candidate.path),
+                        Some(candidate.size_bytes),
+                    )
             })
             .collect::<Vec<_>>();
 
@@ -27089,7 +27090,9 @@ impl OwnedSourceScan {
                 .unwrap_or_default();
             let missing_family_paths = family_index_keys
                 .into_iter()
-                .filter(|index_key| !state_v2::resume_selection_held(index, index_key, None))
+                .filter(|index_key| {
+                    !growth_active || !state_v2::resume_selection_held(index, index_key, None)
+                })
                 .filter(|index_key| !already_identified.contains(index_key))
                 .filter_map(|index_key| {
                     let path = PathBuf::from(&index_key);
@@ -32115,6 +32118,7 @@ impl OwnedSourceScan {
             let verification_rescue =
                 sampled_audit::progress_debt(index, &rescue_key, audit_now).is_some();
             if source == SnapshotSource::ClaudeCode
+                && sampled_audit::growth_active(index)
                 && !state_v2::save_read_admitted(index, &rescue_key, audit_now).unwrap_or(false)
             {
                 sampled_audit::queue_growth_retry(index, &candidate);
