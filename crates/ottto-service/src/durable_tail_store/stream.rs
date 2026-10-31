@@ -1083,6 +1083,9 @@ pub(super) fn no_space(error: &io::Error) -> bool {
 mod tests {
     use super::*;
     use crate::durable_tail_store::tests::{binding, certificate, Scratch};
+    use crate::snapshots::sampled_scan::transition_fixture::native_cold::{
+        self as fixture, commit,
+    };
 
     fn header(scratch: &Scratch, source: DurableSource, count: u64) -> (PreparedHeader, Vec<u8>) {
         let snapshot = source.properties().snapshot;
@@ -1092,42 +1095,9 @@ mod tests {
         binding.source = source;
         binding.entry = [0; 32];
         (
-            PreparedHeader {
-                binding,
-                certificate: certificate(&path),
-                format: FORMAT_V3,
-                allowlist: source.properties().allowlist(),
-                acquisition: AcquisitionFields {
-                    acquired_revision: 17,
-                    protocol: crate::snapshots::AcquisitionProtocol::WriteAhead,
-                },
-                generation: 9,
-                body_len: body.len(),
-            },
+            fixture::native_header(source, binding, certificate(&path), 17, 9, body.len()),
             body,
         )
-    }
-    fn commit(
-        store: &mut DurableTailStore,
-        writer: &dyn SingleWriter,
-        header: PreparedHeader,
-        body: &[u8],
-    ) -> ReceiptProof {
-        let prepared = store
-            .prepare_stream(writer, header)
-            .unwrap()
-            .write(|out| {
-                out.write_all(body)
-                    .map_err(|_| codec::Refuse::WriteFailed)?;
-                Ok(body.len())
-            })
-            .unwrap();
-        let committed = store
-            .commit_stream(writer, prepared)
-            .unwrap()
-            .commit()
-            .unwrap();
-        store.finish_stream(committed).unwrap()
     }
     /// [money] native population beyond memo bound reverifies and updates without hold.
     #[test]

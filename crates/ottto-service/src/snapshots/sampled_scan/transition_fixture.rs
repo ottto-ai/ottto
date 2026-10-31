@@ -1083,7 +1083,7 @@ fn native_m3_plain_flush_matrix_has_no_file_fsync_boundary() {
 pub(crate) mod native_cold {
     use super::super::{durable_tail, SharedCache};
     use crate::durable_tail_store::{self as store, DurableSource};
-    use crate::locked_state_dir::{test_locks, LockedStateDir};
+    use crate::locked_state_dir::test_locks;
     use crate::snapshots::*;
     use crate::transcript_acquisition::Scope;
     use std::sync::Arc;
@@ -1254,6 +1254,28 @@ pub(crate) mod native_cold {
     pub(crate) fn record_path(dir: &Path, key: &store::Digest32) -> PathBuf {
         let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
         dir.join(format!("{hex}.rec"))
+    }
+
+    pub(crate) fn native_header(
+        source: DurableSource,
+        binding: store::Binding,
+        certificate: crate::transcript_acquisition::DurableCertificate,
+        revision: u32,
+        generation: u64,
+        body_len: usize,
+    ) -> store::PreparedHeader {
+        store::PreparedHeader {
+            binding,
+            certificate,
+            format: store::FORMAT_V3,
+            allowlist: source.properties().allowlist(),
+            acquisition: store::AcquisitionFields {
+                acquired_revision: revision,
+                protocol: AcquisitionProtocol::WriteAhead,
+            },
+            generation,
+            body_len,
+        }
     }
 
     /// Real v3 streaming; no receipt is synthesized and flush stays explicit.

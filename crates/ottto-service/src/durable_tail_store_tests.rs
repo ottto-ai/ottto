@@ -3,6 +3,7 @@
 //! the single-writer seam and the content-free certificate. The record body
 //! is a placeholder; no accumulator field is encoded here.
 use super::*;
+use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::transcript_acquisition::{DurableAdmission, FullReason, ReadPlan, Scope};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -100,10 +101,7 @@ impl Scratch {
         self.root.join("index.json")
     }
     pub(super) fn store(&self) -> DurableTailStore {
-        DurableTailStore::new(
-            store_dir_for_index(&self.index_path()),
-            DurableSource::ClaudeCode,
-        )
+        fixture::store(&self.index_path(), DurableSource::ClaudeCode)
     }
     pub(super) fn transcript(&self, name: &str, bytes: &[u8]) -> PathBuf {
         let path = self.root.join(name);
