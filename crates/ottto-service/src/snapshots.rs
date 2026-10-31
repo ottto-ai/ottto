@@ -36973,18 +36973,14 @@ where
     let chain = chain
         .as_deref()
         .or_else(|| owed.as_ref().map(|owed| owed.chain()))?;
-    if certified.is_none()
-        && owed.is_none()
-        && !sampled_jsonl::loss_free_source_report(
-            live.report,
-            live.recognized_usage_drop_count,
-            live.accumulator.dropped_usage_record_count,
-        )
-    {
-        // A lossy Tail has no certified candidate to receipt. Preserve its
-        // predecessor and let native settlement disclose the loss and keep
-        // main's entity quarantine. Treating it as a failed commit would hide
-        // the dropped-usage counts behind a synthetic receipt hold.
+    if !sampled_jsonl::loss_free_source_report(
+        live.report,
+        live.recognized_usage_drop_count,
+        live.accumulator.dropped_usage_record_count,
+    ) {
+        // A certificate cannot authorize a lossy source. Preserve its
+        // predecessor and let native settlement disclose the loss. Loss
+        // discovered after this seam is checked again before commit.
         return None;
     }
     let Some((checkpoint, reduction, unsealed)) = certified else {
@@ -37223,26 +37219,41 @@ fn settle_native_attempt(
         preparation,
     } = attempt;
     let staged = preparation.is_some();
+    // Certification precedes finalization: conflicts, dropped usage, or an
+    // unresolved ownership boundary can become known only in the final result.
+    // Discard the temporary without renaming or retiring the predecessor, and
+    // leave disclosure to native settlement rather than manufacturing a hold.
+    let finish_loss_free = native.as_ref().is_ok_and(|parsed| {
+        parsed.complete()
+            && !parsed.zero_snapshot_usage_evidence
+            && sampled_jsonl::loss_free_source_report(
+                &parsed.report,
+                parsed.recognized_usage_drop_count,
+                parsed.dropped_usage_record_count,
+            )
+    });
+    let preparation = if finish_loss_free {
+        preparation
+    } else {
+        if let Some(staged) = preparation {
+            discard_staging(cache, staged);
+        }
+        if acquisition.custody().owed.is_some() {
+            cache.retain_owed_discovery(fence.source, fence.key);
+        }
+        None
+    };
     let (publication, strict_rebind) = match preparation {
         // Not staged (no chain or no lease). A Claude key held by D3 still
         // never publishes over its surviving A; the query counts its growth
         // and releases it if the held object itself changed.
-        None if native.is_ok()
+        None if finish_loss_free
             && fence.source == SnapshotSource::ClaudeCode
             && cache.durable_claude_hold(fence.source, fence.key, &held) =>
         {
             (Some(NativePublication::Hold), false)
         }
         None => (None, false),
-        Some(staged) if native.is_err() => {
-            // E4: no candidate becomes canonical; the caller's existing error
-            // exit publishes nothing. Debt keeps its discovery obligation.
-            discard_staging(cache, staged);
-            if acquisition.custody().owed.is_some() {
-                cache.retain_owed_discovery(fence.source, fence.key);
-            }
-            (None, false)
-        }
         Some(staged) => {
             // Bound before the staging is consumed: a pending or held write
             // owes exactly this candidate, never a later one.
@@ -37335,6 +37346,7 @@ fn settle_native_attempt(
     // The process-wide lease ends before any cache admission or effect.
     acquisition.custody_mut().release_active();
     let completed = match acquisition {
+        FinishAcquisition::Certified(_) if !finish_loss_free => None,
         FinishAcquisition::Certified(completed)
             if publication.is_some_and(|completion| !completion.publishes()) =>
         {

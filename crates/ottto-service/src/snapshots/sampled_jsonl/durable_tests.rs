@@ -2475,3 +2475,143 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
         );
     }
 }
+
+/// [money] A certified PRE body cannot replace its predecessor after native
+/// finish reports loss. E5's Pi seal-boundaries fixture supplies the real
+/// cross-shape conflict; this unit seam covers the source-independent decision.
+#[test]
+fn native_finish_loss_keeps_predecessor_and_discloses_without_receipt_hold() {
+    use crate::snapshots::sampled_scan::durable_tail::{
+        FinishAcquisition, NativeFinishAttempt, PrepareOutcome,
+    };
+    let _on = RestartRestoreForTest::enabled();
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = Scratch::new("native-finish-loss");
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let _lock = crate::locked_state_dir::test_locks::hold(&root.0);
+    let source = SnapshotSource::Codex;
+    let path = root.write("source.jsonl", &codex_lines());
+    let key = local_index_key(&path);
+    let index_path = root.0.join("index.json");
+    let cache = sampled_scan::SharedCache::default();
+    let mut index = ScanIndex::default();
+    index.save(&index_path).unwrap();
+    let mut predecessor = None;
+    for loss in [
+        "none",
+        "dropped_usage",
+        "incomplete_parse",
+        "ownership",
+        "zero_snapshot",
+    ] {
+        cache.durable_begin_pass(source, &index_path, &scope(), false);
+        let held = File::open(&path).unwrap();
+        let identity = opened_object_identity(source, &mut held.try_clone().unwrap()).unwrap();
+        let mut live = parser(&path, source);
+        let mode = live.prepare_acquisition(None, &scope(), None, NOW).unwrap();
+        while !live.step().unwrap() {}
+        live.accumulator.first_prompt_material = None;
+        live.accumulator.first_prompt_title = None;
+        let SideCertificate::Certified { mut completed, .. } =
+            live.certify_without_retention(&scope(), NOW).unwrap()
+        else {
+            panic!("loss is unknown at certification")
+        };
+        let counting =
+            sampled_scan::durable_tail::ImmutableCounting::from_accumulator(&live.accumulator)
+                .unwrap();
+        bind_native_chain(
+            &cache,
+            &mut completed,
+            &NativeChainRequest {
+                source,
+                key: &key,
+                opened_object_identity: &identity,
+                mode,
+                counting: Some(counting),
+                held: &held,
+                index: &index,
+            },
+        );
+        let mut acquisition = FinishAcquisition::Certified(completed);
+        let mut preparation = None;
+        let mut native = live
+            .finish_native(
+                FinishRequest {
+                    expected_opened_object_identity: &identity,
+                    path: &path,
+                    collected_at: COLLECTED,
+                    source_file_fingerprint: "finish-loss".into(),
+                    codex_title_metadata: None,
+                    claude_title_metadata: None,
+                    attribution_context: None,
+                    repository_identity: None,
+                    money_context: None,
+                },
+                Some(&mut |view| {
+                    preparation = stage_preparation(&mut acquisition, view, |lease, view| {
+                        cache.prepare_live(lease, view)
+                    });
+                }),
+            )
+            .unwrap();
+        assert!(
+            matches!(preparation, Some(PrepareOutcome::Prepared(_))),
+            "a real successor was staged before finish: {loss}"
+        );
+        // Inject only the final native report at the unit boundary. The
+        // certificate, staged body, predecessor, and commit fences stay real.
+        match loss {
+            "dropped_usage" => {
+                native.recognized_usage_drop_count = 1;
+                native.dropped_usage_record_count = 1;
+            }
+            "incomplete_parse" => native.report.malformed_json_line_count = 1,
+            "ownership" => native.ownership_incomplete_file_count = 1,
+            "zero_snapshot" => native.zero_snapshot_usage_evidence = true,
+            _ => {}
+        }
+        let settled = settle_native_attempt(
+            &cache,
+            NativeFinishAttempt {
+                native: Ok(native),
+                acquisition,
+                preparation,
+            },
+            held,
+            NativeFence {
+                source,
+                key: &key,
+                path: &path,
+                expected_opened_object_identity: &identity,
+                committed_index: &index,
+            },
+        );
+        let native = settled.native.unwrap();
+        let record_path = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "rec"))
+            .unwrap();
+        let bytes = fs::read(record_path).unwrap();
+        if loss == "none" {
+            assert!(settled.publication.is_some_and(|p| p.publishes()));
+            predecessor = Some(bytes);
+        } else {
+            assert_eq!(bytes, *predecessor.as_ref().unwrap(), "{loss}");
+            assert!(settled.publication.is_none(), "native discloses {loss}");
+            assert!(
+                settled.completed.is_none(),
+                "lossy candidate is not retained"
+            );
+            if loss == "dropped_usage" {
+                assert_eq!(native.dropped_usage_record_count, 1);
+            }
+        }
+        // A buggy commit would publish this distinct generation even when
+        // the reduction bytes happen to equal the predecessor's body.
+        index.generation += 1;
+    }
+}
