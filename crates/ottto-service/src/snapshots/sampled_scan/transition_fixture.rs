@@ -858,7 +858,7 @@ pub(crate) mod money_oracle {
                 ("main", main, main_parts),
                 ("side-call", side.clone(), vec![side]),
             ] {
-                snapshots.insert(entity.into(), json!({
+                snapshots.insert(entity.to_string(), json!({
                     "source_session_id": entity,
                     "provenance": {"collector": COLLECTOR},
                     "session_account_evidence": {"account_identifier_hash":"a".repeat(64),
