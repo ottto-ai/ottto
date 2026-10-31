@@ -487,6 +487,7 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
         ] {
             let (mut rig, record) = lossy_shrink_rig();
             let key = rig.key(SESSION_A);
+            let revision = rig.index.files[&key].effective_upload_body_witness_revision;
             let entry = rig.index.files.get_mut(&key).unwrap();
             match control {
                 "verified_extent" => {
