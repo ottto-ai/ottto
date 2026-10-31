@@ -1063,11 +1063,17 @@ fn apply_grouped_with_accepted(
     let attempted_bytes = grouping.item_bytes(item);
     let components = (attempted_bytes > MAX_ITEM_BYTES)
         .then(|| shed_display_leaves(item, &grouping, attempted_bytes));
-    if components
-        .as_ref()
-        .is_some_and(|bytes| bytes.after_shed > MAX_ITEM_BYTES)
-    {
-        over_cap.insert(OverCap::Bytes);
+    if let Some(bytes) = &components {
+        if bytes.after_shed > MAX_ITEM_BYTES {
+            over_cap.insert(OverCap::Bytes);
+        } else if over_cap.is_empty() {
+            // Shedding alone fit: record it, since no strip will.
+            crate::local_resource_diagnostics::claude_identity_over_cap(
+                &over_cap,
+                attempted_bytes,
+                Some(bytes),
+            );
+        }
     }
     let unpriced = over_cap
         .is_empty()
@@ -2005,8 +2011,8 @@ fn set_row(
 }
 
 /// Money identity outranks display data (#909 P0): an over-cap tagged body
-/// first sheds context-curve points, then its newest cache observations, and
-/// only then may the selector strip tags. Returns the pre-shed component bytes
+/// first sheds context-curve points, then cache observations from the end of
+/// the patch, and only then may the selector strip tags. Returns the pre-shed component bytes
 /// (counts only) and the bytes after shedding.
 fn shed_display_leaves(
     item: &mut SnapshotItem,
@@ -2024,7 +2030,13 @@ fn shed_display_leaves(
     let rest = grouping.item_bytes(&probe);
     drop(probe);
     let fits = |item: &SnapshotItem| grouping.item_bytes(item) <= MAX_ITEM_BYTES;
-    super::fit_context_curve(item, fits);
+    if without_curve > MAX_ITEM_BYTES {
+        // No curve can fit: go straight to the unavailable curve without
+        // measuring the whole body once per pruned point.
+        super::fit_context_curve(item, |_| false);
+    } else {
+        super::fit_context_curve(item, fits);
+    }
     while !fits(item) {
         let Some(cache) = item.cache_observations.as_mut() else {
             break;

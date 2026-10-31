@@ -402,11 +402,24 @@ fn sticky_budget_sheds_curve_and_cache_before_stripping_any_tag() {
         identity::item_bytes(&padded) > identity::MAX_ITEM_BYTES,
         "untagged baseline with display leaves is over the cap"
     );
-    assert!(matches!(
-        sticky_apply(&mut padded, &proof, &accepted).unwrap(),
-        Tagged::Sent { .. }
-    ));
+    let (result, records) = crate::local_resource_diagnostics::capture(|| {
+        sticky_apply(&mut padded, &proof, &accepted).unwrap()
+    });
+    assert!(matches!(result, Tagged::Sent { .. }));
     assert!(identity::item_bytes(&padded) <= identity::MAX_ITEM_BYTES);
+    let shed = records
+        .iter()
+        .find_map(|row| row["counts"].get("claude_request_identity_last_over_cap_components"))
+        .expect("a fitting shed is recorded");
+    let bytes = |key: &str| shed[key].as_u64().unwrap();
+    assert!(bytes("after_shed") <= identity::MAX_ITEM_BYTES as u64);
+    assert_eq!(
+        ["context_curve", "cache_observations", "identity", "usage_buckets", "rest"]
+            .map(bytes)
+            .iter()
+            .sum::<u64>(),
+        bytes("item")
+    );
     assert!(padded.context_curve.as_ref().unwrap().retained_point_count < curve_points);
     let cache = padded.cache_observations.take().unwrap();
     assert_eq!(cache.coverage, "partial");
