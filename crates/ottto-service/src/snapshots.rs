@@ -15802,7 +15802,7 @@ pub(crate) fn validate_snapshot_batch_request_with_item_limit(
         item_without_curve.context_curve = None;
         let item_without_curve_size =
             snapshot_item_wire_size(source, &item_without_curve, request.upload_policy);
-        if !(source == SnapshotSource::ClaudeCode && item_size <= item_limit)
+        if item_size > item_limit
             && !snapshot_item_wire_size_is_allowed(
                 item_size,
                 item_without_curve_size,
