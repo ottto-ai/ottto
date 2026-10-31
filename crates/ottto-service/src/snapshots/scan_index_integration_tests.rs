@@ -538,6 +538,7 @@ fn recovery_emission_boundaries(
         index,
         e2::TelemetryRead::Loaded,
         &mut Default::default(),
+        &Default::default(),
     );
     if index.persistence_available() {
         assert_eq!(items.len(), 1, "positive E2 body before finalization");

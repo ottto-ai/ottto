@@ -162,7 +162,15 @@ fn publish(
             index,
         );
     }
-    with_enabled(|| finish_page(&mut items, index, telemetry, &mut Default::default()));
+    with_enabled(|| {
+        finish_page(
+            &mut items,
+            index,
+            telemetry,
+            &mut Default::default(),
+            &Default::default(),
+        )
+    });
     items
 }
 fn rows_of(item: &SnapshotItem) -> impl Iterator<Item = &crate::snapshots::SnapshotModelUsage> {
@@ -817,7 +825,11 @@ fn e2_gate_on_defers_a_root_whose_family_directory_is_queued() {
         .into_iter()
         .map(|path| serde_json::from_value(json!({"scan_root": "/", "path": path})).unwrap())
         .collect::<Vec<ScanTraversalPath>>();
-    defer_roots_of_queued_families(&mut selected, &mut traversal);
+    let deferred = defer_roots_of_queued_families(&mut selected, &mut traversal);
+    assert_eq!(
+        deferred,
+        BTreeSet::from([location_key(&local_index_key(&waiting))])
+    );
     fn paths<'a>(candidates: impl IntoIterator<Item = &'a ScanTraversalPath>) -> Vec<PathBuf> {
         candidates
             .into_iter()
@@ -834,7 +846,7 @@ fn e2_gate_on_defers_a_root_whose_family_directory_is_queued() {
     // Once the walk lists the directory nothing is deferred.
     traversal.pending_directories.clear();
     let mut again = vec![traversal.pending_candidates.pop_front().unwrap()];
-    defer_roots_of_queued_families(&mut again, &mut traversal);
+    assert!(defer_roots_of_queued_families(&mut again, &mut traversal).is_empty());
     assert_eq!(paths(&again), vec![waiting]);
 }
 
@@ -894,8 +906,15 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
     items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
     let before = canonical(&items);
     let mut reasons = BTreeMap::new();
-    let withheld =
-        with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded, &mut reasons));
+    let withheld = with_enabled(|| {
+        finish_page(
+            &mut items,
+            &index,
+            TelemetryRead::Loaded,
+            &mut reasons,
+            &Default::default(),
+        )
+    });
     assert_eq!(reasons, BTreeMap::from([("request_owned_held", 1)]));
     assert_eq!(withheld, BTreeSet::from([ROOT.to_owned()]));
     assert_eq!(items.len(), 2, "no path of a withheld session is dropped");
@@ -911,6 +930,7 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
             &index,
             TelemetryRead::Loaded,
             &mut Default::default(),
+            &Default::default(),
         )
     });
     assert!(withheld.is_empty());
@@ -924,7 +944,8 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
         &mut items,
         &index,
         TelemetryRead::Loaded,
-        &mut Default::default()
+        &mut Default::default(),
+        &Default::default(),
     ))
     .is_empty());
     assert_eq!(canonical(&items), before);
@@ -1389,6 +1410,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
                     &index,
                     TelemetryRead::Loaded,
                     &mut Default::default(),
+                    &Default::default(),
                 )
             })
         } else {
@@ -1398,6 +1420,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
                     &index,
                     TelemetryRead::Loaded,
                     &mut Default::default(),
+                    &Default::default(),
                 )
             })
         };
@@ -1822,6 +1845,7 @@ fn tag_owned_with_fallbacks(
         index,
         TelemetryRead::Loaded,
         &mut Default::default(),
+        &Default::default(),
     );
     assert!(
         withheld.is_empty(),
@@ -2771,7 +2795,8 @@ fn e2_identity_external_billing_keeps_cost_without_subscription_identity() {
                 &mut items,
                 &index,
                 TelemetryRead::Loaded,
-                &mut Default::default()
+                &mut Default::default(),
+                &Default::default(),
             )
             .is_empty());
             assert!(rows_of(&items[0])
@@ -3184,7 +3209,8 @@ fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
             &mut items,
             &index,
             TelemetryRead::Loaded,
-            &mut Default::default()
+            &mut Default::default(),
+            &Default::default(),
         )
         .is_empty());
         let before = serde_json::to_vec(&items).unwrap();
@@ -3220,7 +3246,8 @@ fn e2_identity_failed_tag_restores_activity_and_refusals() {
             &mut items,
             &index,
             TelemetryRead::Loaded,
-            &mut Default::default()
+            &mut Default::default(),
+            &Default::default(),
         )
         .is_empty());
         items[0].source_started_at = Some("2026-08-02T10:00:00+03:00".into());
@@ -4049,6 +4076,8 @@ fn e2_equal_birth_subagent_twins_count_once_in_both_orders() {
     })
 }
 
+/// [behaviour] Absent twins disclose page coverage and exact selection deferrals;
+/// complete twins retain their existing positive-body release.
 #[test]
 fn e2_absent_subagent_twin_holds_its_session() {
     // Publication runs with the gate on, so the parse does too: dark
@@ -4074,19 +4103,101 @@ fn e2_absent_subagent_twin_holds_its_session() {
         // The earlier path is indexed and on disk but not on this page.
         let mut items = vec![page(&index)];
         let mut reasons = BTreeMap::new();
-        let withheld =
-            with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded, &mut reasons));
+        let withheld = with_enabled(|| {
+            finish_page(
+                &mut items,
+                &index,
+                TelemetryRead::Loaded,
+                &mut reasons,
+                &Default::default(),
+            )
+        });
         assert_eq!(withheld, BTreeSet::from([session]));
-        assert_eq!(reasons, BTreeMap::from([("absent_twin", 1)]));
+        assert_eq!(
+            reasons,
+            BTreeMap::from([
+                ("absent_twin", 1),
+                ("known_twin_paths", 2),
+                ("staged_twin_paths", 1),
+                ("queued_family_deferred_families", 0),
+            ])
+        );
         reasons.clear();
         // Both paths on the page: one body, nothing withheld.
         let mut items = vec![first, page(&index)];
-        let withheld =
-            with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded, &mut reasons));
+        let withheld = with_enabled(|| {
+            finish_page(
+                &mut items,
+                &index,
+                TelemetryRead::Loaded,
+                &mut reasons,
+                &Default::default(),
+            )
+        });
         assert!(withheld.is_empty());
         assert!(reasons.is_empty());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].request_count, 2);
+
+        // Two deferred root twins and two held members of ONE family:
+        // count the family once and count all four known native paths.
+        let root_early = root_file("absent-root-early");
+        let root_later = root_file("absent-root-later");
+        let root_first =
+            parse_and_remember(&root_early, t0(), &mut index, &[line("root-a", &at(1), 30)]);
+        let root_second =
+            parse_and_remember(&root_later, t0(), &mut index, &[line("root-b", &at(2), 40)]);
+        let mut traversal = queued_traversal(
+            &[root_early.parent().unwrap().join(ROOT).join("subagents")],
+            &[],
+        )
+        .traversal
+        .unwrap();
+        let mut selected = [&root_early, &root_later]
+            .into_iter()
+            .map(|path| serde_json::from_value(json!({"scan_root":"/", "path":path})).unwrap())
+            .collect();
+        let deferred = defer_roots_of_queued_families(&mut selected, &mut traversal);
+        assert_eq!(deferred.len(), 2);
+        assert!(selected.is_empty());
+        reasons.clear();
+        let mut items = vec![root_second.clone(), page(&index)];
+        let withheld = finish_page(
+            &mut items,
+            &index,
+            TelemetryRead::Loaded,
+            &mut reasons,
+            &deferred,
+        );
+        assert_eq!(withheld.len(), 2);
+        assert_eq!(
+            reasons,
+            BTreeMap::from([
+                ("absent_twin", 2),
+                ("known_twin_paths", 4),
+                ("staged_twin_paths", 2),
+                ("queued_family_deferred_families", 1),
+            ])
+        );
+        assert_eq!(items.iter().map(|i| i.request_count).sum::<u64>(), 2);
+        reasons.clear();
+        let mut items = vec![
+            root_first,
+            root_second,
+            parse(&early, Some(t0()), &index, &[sub_line("a", 1, 10)]),
+            page(&index),
+        ];
+        assert!(finish_page(
+            &mut items,
+            &index,
+            TelemetryRead::Loaded,
+            &mut reasons,
+            &Default::default()
+        )
+        .is_empty());
+        assert!(reasons.is_empty());
+        assert_eq!(items.iter().map(|i| i.request_count).sum::<u64>(), 4);
+        cleanup(&[&root_early, &root_later]);
         remove_agent_scratch(&[&early, &later]);
     })
 }

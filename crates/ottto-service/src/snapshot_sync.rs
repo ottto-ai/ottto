@@ -10008,6 +10008,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
         },
         &mut disposition.request_owned_hold_reasons,
+        &scan_result.claude_queued_family_deferred_paths,
     );
     if !trace_discard_unfolded.is_empty() {
         *disposition
