@@ -1029,11 +1029,9 @@ impl DurableTailStore {
                         }
                     }
                 }
-                Err(e) => return Err(self.read_failure(e, Refusal::Undecodable)),
+                Err(e) => return Err(self.read_failure(e, Refusal::Undecodable, read_only)),
             };
-            let Some(metadata) = self.inspect_file(&file) else {
-                return Ok(None);
-            };
+            let metadata = self.inspect_file(&file, read_only)?;
             if !metadata.is_file() {
                 return Err(Refusal::Undecodable);
             }
@@ -1046,7 +1044,7 @@ impl DurableTailStore {
             }
             #[cfg(test)]
             test_hooks::before_access(&path, "header")
-                .map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
+                .map_err(|e| self.read_failure(e, Refusal::Undecodable, read_only))?;
             let mut header = Vec::with_capacity(HEADER_V3_BYTES);
             let first = Read::by_ref(&mut file)
                 .take(DISPATCH_BYTES as u64)
@@ -1058,7 +1056,7 @@ impl DurableTailStore {
             } else {
                 self.counters.guard_header_bytes += n as u64;
             }
-            first.map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
+            first.map_err(|e| self.read_failure(e, Refusal::Undecodable, read_only))?;
             let (_, _, _, size) = dispatch(&header)?;
             let rest = Read::by_ref(&mut file)
                 .take((size - n) as u64)
@@ -1068,7 +1066,7 @@ impl DurableTailStore {
             } else {
                 self.counters.guard_header_bytes += (header.len() - n) as u64;
             }
-            rest.map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
+            rest.map_err(|e| self.read_failure(e, Refusal::Corrupt, read_only))?;
             n = header.len();
             let mut binding = decode_header(&header, key, self.source)?;
             let retired = retired_pin(self.source, binding.format, &binding.record.allowlist);
@@ -1091,9 +1089,7 @@ impl DurableTailStore {
                 return Ok(None); // Presence is never verification or mutation authority.
             }
             // After any repair: its ctime moved.
-            let Some(metadata) = self.inspect_file(&file) else {
-                return Ok(None);
-            };
+            let metadata = self.inspect_file(&file, read_only)?;
             let stamp = Stamp::of(&metadata);
             binding.stamp = Some(stamp);
             if !metadata.is_file() || metadata.len() > (RECORD_BYTES + size + TRAILER_BYTES) as u64
@@ -1111,12 +1107,12 @@ impl DurableTailStore {
             }
             #[cfg(test)]
             test_hooks::before_access(&path, "body")
-                .map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
+                .map_err(|e| self.read_failure(e, Refusal::Corrupt, read_only))?;
             let mut bytes = header;
             bytes.reserve_exact(INPUT_ENVELOPE - bytes.len());
             file.take((INPUT_ENVELOPE - n) as u64)
                 .read_to_end(&mut bytes)
-                .map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
+                .map_err(|e| self.read_failure(e, Refusal::Corrupt, read_only))?;
             let read = bytes.len().saturating_sub(n) as u64;
             match work {
                 "delete" => self.counters.delete_verify_bytes += read,
@@ -1151,7 +1147,7 @@ impl DurableTailStore {
             }
             Ok(Some(binding))
         })();
-        if self.disabled.is_some() {
+        if !read_only && self.disabled.is_some() {
             return Ok(None);
         }
         if let Err(reason) = result {
@@ -1178,22 +1174,23 @@ impl DurableTailStore {
         result
     }
 
-    fn read_failure(&mut self, error: io::Error, reason: Refusal) -> Refusal {
-        if error.kind() != io::ErrorKind::InvalidData {
+    fn read_failure(&mut self, error: io::Error, reason: Refusal, read_only: bool) -> Refusal {
+        if !read_only && error.kind() != io::ErrorKind::InvalidData {
             self.disable("record_access");
         }
         reason
     }
 
-    fn inspect_file(&mut self, file: &File) -> Option<fs::Metadata> {
+    fn inspect_file(&mut self, file: &File, read_only: bool) -> Result<fs::Metadata, Refusal> {
         #[cfg(test)]
         if test_hooks::before_access(&self.dir, "fstat").is_err() {
-            self.disable("record_metadata");
-            return None;
+            if !read_only { self.disable("record_metadata"); }
+            return Err(Refusal::Undecodable);
         }
-        file.metadata()
-            .inspect_err(|_| self.disable("record_metadata"))
-            .ok()
+        file.metadata().map_err(|_| {
+            if !read_only { self.disable("record_metadata"); }
+            Refusal::Undecodable
+        })
     }
 
     /// U holds. T14 permits one rebuild; the adapter checks RAM before holding.

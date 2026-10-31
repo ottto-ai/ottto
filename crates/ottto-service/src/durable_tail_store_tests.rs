@@ -4666,6 +4666,7 @@ fn private_label_purge_erases_known_labelled_records_without_receipt_or_money_cr
 /// [format] private label purge continues past corruption and reports partial progress.
 #[test]
 fn private_label_purge_continues_past_corruption_and_reports_partial_progress() {
+    let _reset = ResetFaults;
     let scratch = Scratch::new();
     let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let path = scratch.transcript("source.jsonl", b"{}\n");
@@ -4705,6 +4706,13 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
     let denied_file = record_file(&store, &denied.key);
     put_record(&denied_file, &pinned_v1_bytes(&make(denied), 1));
     fs::set_permissions(&denied_file, fs::Permissions::from_mode(0o0)).unwrap();
+    let denied_open = denied_file.clone();
+    test_hooks::set_before_access(Some(Box::new(move |path, phase| {
+        if path == denied_open && phase == "open" {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        Ok(())
+    })));
     // Foreign names consume work too; they cannot all be visited in one save.
     for n in 0..1024 {
         fs::write(store.dir().join(format!("foreign-{n}")), b"untouched").unwrap();
@@ -4722,6 +4730,8 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
             assert!(store.private_label_keys().unwrap().is_none());
         }
     }
+    test_hooks::set_before_access(None);
+    assert_eq!(store.disabled(), None, "one unreadable record cannot disable erasure");
     assert_eq!(visited, 1028);
     assert_eq!(erased, 1);
     assert!(refused >= 1);
