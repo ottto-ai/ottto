@@ -3926,13 +3926,17 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                 assert_eq!(predecessor.eligible(&proof), Ok(()));
                 disk_store.authorize(&predecessor, &proof);
                 let receipt = disk_store
-                    .write_after_save(lock, index.generation, 0, vec![v2])
+                    .write_after_save(lock, index.generation, 0, vec![v2.clone()])
                     .unwrap();
-                assert_eq!(
-                    receipt.written, 1,
-                    "the byte-identical survivor is a reconciled receipt"
-                );
-                assert_eq!(disk_store.counters().receipt_reconciled, 1);
+                assert_eq!(receipt.written, 0, "identical content needs no rename");
+                assert_eq!(receipt.clean, 1, "the verified original remains clean");
+                assert_eq!(disk_store.counters().receipt_reconciled, 0);
+                // A genuinely dirty envelope must reach the injected rename
+                // failure and preserve the authorized predecessor for retry.
+                v2.certificate.verified_unix_seconds += 1;
+                assert!(disk_store
+                    .write_after_save(lock, index.generation, 0, vec![v2])
+                    .is_err());
                 store::test_hooks::set_before_rename(None);
                 cache.durable_note_scope(source, &key, &scope);
                 cache.durable_gc(lock, source, &index).unwrap();
