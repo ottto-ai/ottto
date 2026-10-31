@@ -963,7 +963,11 @@ fn e2_bound_trace_case(
         assert_eq!(stats.trace_discard_deferred_items, 2);
         let line = serde_json::to_value(&stats).unwrap();
         assert_eq!(line["trace_discard_deferred_items"], 2);
-        assert_eq!(line["unhealthy_root_no_fallback_requests"], expected);
+        assert_eq!(
+            line.get("unhealthy_root_no_fallback_requests"),
+            (!listed).then_some(&expected),
+            "absent while empty"
+        );
         assert_eq!(stats.trace_rows_discarded.cap, u64::from(mode == "cap"));
         assert_eq!(stats.trace_rows_discarded.generation, u64::from(mode == "generation"));
     } else {
