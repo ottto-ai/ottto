@@ -2033,20 +2033,18 @@ pub(super) fn growth_active(index: &ScanIndex) -> bool {
     crate::snapshots::state_v2::state_v2_growth_retention_active(index)
 }
 
+/// Owed native growth debt. Fresh growth (`len > size_bytes`) is main's
+/// owes_stamped/codex_fragment::grown, which every age gate checks first.
 pub(super) fn growth_selectable(
     source: SnapshotSource,
-    files: &BTreeMap<String, ScanIndexEntry>,
     path: &Path,
-    len: u64,
     growth: Option<&BTreeMap<String, GrowthRetention>>,
 ) -> bool {
     source == SnapshotSource::ClaudeCode
         && growth.is_some_and(|growth| {
-            let key = local_index_key(path);
             growth
-                .get(&key)
+                .get(&local_index_key(path))
                 .is_some_and(|state| state.predecessor_size.is_some())
-                || files.get(&key).is_some_and(|entry| len > entry.size_bytes)
         })
 }
 
@@ -2097,20 +2095,18 @@ pub(super) fn retain_candidate_growth(
     index: &mut ScanIndex,
     candidate: &CandidateFile,
 ) {
-    if growth_active(index)
-        && growth_selectable(
-            source,
-            &index.files,
-            &candidate.path,
-            candidate.size_bytes,
-            Some(&index.v2().growth_retention),
-        )
-    {
-        retain_growth(
-            index,
-            &local_index_key(&candidate.path),
-            Some(candidate.size_bytes),
-        );
+    if !growth_active(index) {
+        return;
+    }
+    let key = local_index_key(&candidate.path);
+    // Selection, not an age gate: fresh growth starts its debt here.
+    let grown = source == SnapshotSource::ClaudeCode
+        && index
+            .files
+            .get(&key)
+            .is_some_and(|entry| candidate.size_bytes > entry.size_bytes);
+    if grown || growth_selectable(source, &candidate.path, Some(&index.v2().growth_retention)) {
+        retain_growth(index, &key, Some(candidate.size_bytes));
     }
 }
 

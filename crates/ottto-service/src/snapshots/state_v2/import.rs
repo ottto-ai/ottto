@@ -1154,7 +1154,8 @@ mod application_cases {
             let error =
                 super::super::runtime::save_locked(&c.path, &mut current, false, None, true)
                     .unwrap_err();
-            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
+            // Value admission is save pressure: the paced named hold, not DbUnavailable.
+            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
             let reloaded = super::super::runtime::load_locked(&c.path, None, true)
                 .unwrap()
                 .0

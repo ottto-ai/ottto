@@ -43920,9 +43920,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 codex_fragment::Stamp::metadata(&metadata),
             ) && !sampled_audit::growth_selectable(
                 source,
-                retention.files,
                 &path,
-                metadata.len(),
                 growth_retention.then(|| &index.v2().growth_retention),
             ) {
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
@@ -44168,9 +44166,7 @@ fn candidate_from_traversal_path_at(
         )
         && !sampled_audit::growth_selectable(
             source,
-            retention.files,
             &pending.path,
-            metadata.len(),
             sampled_audit::growth_active(discovery.index)
                 .then(|| &discovery.index.v2().growth_retention),
         )
@@ -44954,13 +44950,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
             candidate.size_bytes,
             codex_fragment::Stamp::candidate(&candidate),
         )
-        && !sampled_audit::growth_selectable(
-            source,
-            retention.files,
-            &candidate.path,
-            candidate.size_bytes,
-            growth,
-        )
+        && !sampled_audit::growth_selectable(source, &candidate.path, growth)
     {
         // The path can be atomically replaced after directory/candidate stat
         // but before the no-follow open. Eligibility follows the exact opened

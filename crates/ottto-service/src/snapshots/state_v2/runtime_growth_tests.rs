@@ -436,7 +436,8 @@ fn saves_reclaim_expired_orphan_claims_after_merging_maxima() {
     }
 }
 
-/// [regress] claim-only saves undid page halving and page-one oversize retries stormed.
+/// [regress] claim-only saves undid page halving and page-one oversize retries stormed
+/// (charged ceiling or an over-cap value).
 #[test]
 fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     let f = Fixture::new();
@@ -518,6 +519,45 @@ fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
         previous.files[&f.key].size_bytes
     );
     crate::snapshots::state_v2_side_effect_guard(&f.path, &subset)().unwrap();
+
+    // [money] A native value over its 1 MiB cap at save (not the charged
+    // ceiling) takes the same page-one SaveOversize hold, alarm and pacing.
+    let mut index = f.load();
+    let before = index.clone();
+    with_state(&f.path, |state| {
+        state.page_limit = 1;
+        Ok(())
+    })
+    .unwrap();
+    let held_at = NOW + 3 * INTERVAL;
+    assert!(save_read_admitted(&index, &f.key, held_at).unwrap());
+    index.file_snapshot_fingerprints.insert(
+        f.key.clone(),
+        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
+    );
+    telemetry::event("save_oversize_alarm", &0);
+    let (error, records) =
+        crate::local_resource_diagnostics::capture(|| index.save(&f.path).unwrap_err());
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveOversize));
+    assert!(records
+        .iter()
+        .any(|row| row["counts"]["latest"]["save_oversize_alarm"] == 1));
+    let reopened = f.load();
+    assert_eq!(reopened.generation, before.generation);
+    assert_eq!(
+        serde_json::to_value(&reopened.files).unwrap(),
+        serde_json::to_value(&before.files).unwrap(),
+        "owed progress kept"
+    );
+    assert_eq!(
+        reopened.file_snapshot_fingerprints,
+        before.file_snapshot_fingerprints
+    );
+    assert_eq!(reopened.v2().growth_retention, before.v2().growth_retention);
+    assert!(save_oversize_active(&reopened).unwrap());
+    assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &reopened)().is_err());
+    assert!(!save_read_admitted(&reopened, &f.key, held_at + INTERVAL - 1).unwrap());
+    assert!(save_read_admitted(&reopened, &f.key, held_at + INTERVAL).unwrap());
 }
 
 /// [regress] grown and undiscovered keys kept old Exact proof after lossy/failed parses.
