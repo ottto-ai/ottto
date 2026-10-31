@@ -159,6 +159,7 @@ fn queue(index: &mut ScanIndex, key: &str) {
         .unwrap()
         .pending_candidates
         .push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: PathBuf::from(SCAN_ROOT),
             path: PathBuf::from(key),
             census_member: true,
@@ -463,6 +464,7 @@ fn unknown_enumeration_keeps_every_family_incomplete() {
         .unwrap()
         .pending_directories
         .push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: PathBuf::from(SCAN_ROOT),
             path: PathBuf::from(format!("{SCAN_ROOT}/dir-c")),
             census_member: true,
@@ -576,6 +578,7 @@ fn coverage_needs_an_attestation_of_the_current_revision() {
         .unwrap()
         .pending_candidates
         .push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: PathBuf::from(SCAN_ROOT),
             path: PathBuf::from(&keys[1]),
             census_member: false,
@@ -752,6 +755,7 @@ fn the_skipped_view_is_queue_plus_replay() {
         .claude_stale_family_carry
         .replay
         .push(ScanTraversalPath {
+            order_modified: None,
             scan_root: PathBuf::from(SCAN_ROOT),
             path: PathBuf::from(&keys[1]),
             census_member: false,
@@ -764,6 +768,7 @@ fn the_skipped_view_is_queue_plus_replay() {
         .unwrap()
         .pending_candidates
         .push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: PathBuf::from(SCAN_ROOT),
             path: PathBuf::from(&keys[1]),
             census_member: false,
@@ -1087,6 +1092,7 @@ fn a_restart_between_pages_rederives_identical_counts_with_zero_reads() {
 #[test]
 fn first_pending_at_is_bounded_and_counts_pace_evictions() {
     let path = |n: usize| ScanTraversalPath {
+        order_modified: None,
         scan_root: PathBuf::from(SCAN_ROOT),
         path: PathBuf::from(root_key("dir-p", &root_id(n))),
         census_member: true,
@@ -1905,6 +1911,7 @@ fn same_window_growth_is_incomplete_until_the_new_revision_finalizes() {
         .unwrap()
         .pending_candidates
         .push_front(ScanTraversalPath {
+            order_modified: None,
             scan_root: dir.clone(),
             path,
             census_member: true,

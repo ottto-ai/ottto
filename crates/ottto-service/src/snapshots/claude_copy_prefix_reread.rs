@@ -515,6 +515,7 @@ pub(super) fn select(
                 .iter()
                 .find(|root| path.starts_with(root))?;
             Some(ScanTraversalPath {
+                order_modified: None,
                 scan_root: root.clone(),
                 path: path.clone(),
                 census_member: false,

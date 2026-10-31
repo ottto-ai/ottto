@@ -1509,6 +1509,7 @@ pub(super) fn queue_quiet_retirement(index: &mut ScanIndex, key: &str, scan_root
             .any(|queued| queued.path == path)
         {
             traversal.pending_candidates.push_back(ScanTraversalPath {
+                order_modified: None,
                 scan_root,
                 path: path.to_owned(),
                 census_member: false,
@@ -1539,6 +1540,7 @@ pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) 
             .any(|path| path.path == candidate.path)
         {
             traversal.pending_candidates.push_back(ScanTraversalPath {
+                order_modified: None,
                 scan_root: candidate.scan_root.clone(),
                 path: candidate.path.clone(),
                 census_member: true,

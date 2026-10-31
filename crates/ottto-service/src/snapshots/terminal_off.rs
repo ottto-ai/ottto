@@ -427,6 +427,7 @@ fn claude_terminal_rewind(traversal: &mut ScanTraversalCheckpoint) {
             .any(|p| p.path == *root)
         {
             traversal.pending_directories.push_back(ScanTraversalPath {
+                order_modified: None,
                 scan_root: root.clone(),
                 path: root.clone(),
                 census_member: true,

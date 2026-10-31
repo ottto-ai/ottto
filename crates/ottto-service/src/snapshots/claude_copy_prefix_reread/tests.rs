@@ -310,6 +310,7 @@ fn scoped_recovery_consumes_existing_replay_without_duplicate_native_reads() {
         BACKFILL_WINDOW_DAYS,
     );
     let replay = ScanTraversalPath {
+        order_modified: None,
         scan_root: root.clone(),
         path: pending[0].clone(),
         census_member: false,

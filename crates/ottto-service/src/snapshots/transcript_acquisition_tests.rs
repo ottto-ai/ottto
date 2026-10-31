@@ -5547,6 +5547,7 @@ fn terminal_off_overlapping_root_retry_preserves_native_scope_and_reads_no_full(
     let mut index = scan.index.clone();
     let key = local_index_key(&candidate.path);
     index.claude_full_rearm_progress.terminal_off_admitted = vec![ScanTraversalPath {
+        order_modified: None,
         scan_root: candidate.scan_root.clone(),
         path: candidate.path.clone(),
         census_member: false,
@@ -5710,6 +5711,7 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
         &scan.codex_title_metadata,
         &scan.claude_title_metadata,
         scan.claude_effort_support_dir.as_deref(),
+        None,
     )
     .unwrap();
     assert!(
@@ -5800,7 +5802,7 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
             &mut ScanCensus::default(),
             None,
             183,
-            &index.files,
+            discovery_retention!(index),
         )
         .unwrap();
         let retry_dependencies = sampled_scan::reduction_dependencies(
@@ -5809,6 +5811,7 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
             &scan.codex_title_metadata,
             &scan.claude_title_metadata,
             scan.claude_effort_support_dir.as_deref(),
+            None,
         )
         .unwrap();
         assert_eq!(retry_dependencies, dependencies);

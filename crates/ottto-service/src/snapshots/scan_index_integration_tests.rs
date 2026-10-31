@@ -350,9 +350,9 @@ fn integrated_storage_controls_admission_and_native_heap_layout_keep_entry_pin()
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    // Follows the canonical pin (claude_request_census_tests SCAN_INDEX_ENTRY_BYTES = 560
-    // after #901); #894's storage controls add 0 bytes per entry.
-    assert!(std::mem::size_of::<ScanIndexEntry>() <= 560);
+    // Follows the canonical pin (claude_request_census_tests SCAN_INDEX_ENTRY_BYTES = 568
+    // after #901 and the archive Box); #894's storage controls add 0 bytes per entry.
+    assert!(std::mem::size_of::<ScanIndexEntry>() <= 568);
     let with = crate::heap_layout_bound::completed_bound(&loaded, 8 * 1024 * 1024).unwrap();
     let mut without = loaded.clone();
     without.persistence_root = None;
@@ -641,6 +641,7 @@ fn recovery_emission_boundaries(
     scan.snapshots = items;
     scan.census_complete = true;
     scan.pending_finalization.push(PendingIndexFinalization {
+        archive_first_read: false,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: "synthetic-file".into(),

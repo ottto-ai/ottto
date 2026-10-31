@@ -436,7 +436,7 @@ fn unknown_field_values_hold_but_older_writer_field_loss_is_accepted() {
         index.files[&key].last_snapshot_fingerprint
     );
     if crate::heap_layout_bound::layout_supported() {
-        assert_eq!(std::mem::size_of::<ScanIndexEntry>(), 488);
+        assert_eq!(std::mem::size_of::<ScanIndexEntry>(), 568);
     }
     fs::remove_dir_all(root).unwrap();
 }

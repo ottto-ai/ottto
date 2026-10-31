@@ -367,19 +367,23 @@ impl Checkpoint {
         scope: &Scope,
         bytes_read: &mut usize,
     ) -> io::Result<bool> {
+        // An archive checkpoint has no physical samples: never quiet-retired.
+        let Some(samples) = self.samples.as_ref() else {
+            return Ok(false);
+        };
         if self.audit_debt.is_none()
             || scope != &self.scope
-            || self.samples.sealed_offset != self.stamp.length
-            || !self.samples.valid_for(self.stamp.length)
+            || samples.sealed_offset != self.stamp.length
+            || !samples.valid_for(self.stamp.length)
             || !self.stamp_matches(file)?
         {
             return Ok(false);
         }
-        let head = sample_at(file, 0, &self.samples.head, bytes_read)?;
+        let head = sample_at(file, 0, &samples.head, bytes_read)?;
         let boundary = sample_at(
             file,
-            self.samples.sealed_offset - self.samples.boundary.len() as u64,
-            &self.samples.boundary,
+            samples.sealed_offset - samples.boundary.len() as u64,
+            &samples.boundary,
             bytes_read,
         )?;
         #[cfg(test)]
@@ -2241,7 +2245,7 @@ mod tests {
                     f.replace_bytes(&changed);
                     f.open().set_modified(original_modified).unwrap();
                 }
-                "partial" => cp.samples.sealed_offset -= 1,
+                "partial" => cp.samples.as_mut().unwrap().sealed_offset -= 1,
                 _ => {}
             }
             let checked_scope = if arm == "scope" {
@@ -3422,7 +3426,8 @@ mod tests {
         let horizon = 1000 + AUDIT_INTERVAL_SECONDS;
         assert_eq!(
             prepared(&f, &cp, &scope(), horizon),
-            Ok(cp.samples.head.len() + cp.samples.boundary.len())
+            Ok(cp.samples.as_ref().unwrap().head.len()
+                + cp.samples.as_ref().unwrap().boundary.len())
         );
         assert_eq!(
             late_minted.admits(&mut f.open(), &scope(), horizon, true),

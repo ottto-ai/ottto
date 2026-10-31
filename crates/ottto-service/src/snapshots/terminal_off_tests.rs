@@ -535,6 +535,7 @@ fn terminal_off_delete_defers_all_raw_effects_and_full_rearm() {
         enqueue_terminal_off_retry(
             t,
             &ScanTraversalPath {
+                order_modified: None,
                 scan_root: scratch.to_path_buf(),
                 path: path.clone(),
                 census_member: true,
@@ -700,6 +701,7 @@ fn terminal_off_rediscovery_reauthorizes_only_current_symlink_target() {
         .claude_stale_family_carry
         .replay
         .push(ScanTraversalPath {
+            order_modified: None,
             scan_root: a.clone(),
             path: old_extra.clone(),
             census_member: true,
@@ -987,6 +989,7 @@ fn terminal_off_cancellation_replay_precedes_repeated_held_fifo_on_one_file_page
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
     let path = |name: &str| ScanTraversalPath {
+        order_modified: None,
         scan_root: PathBuf::from("synthetic"),
         path: PathBuf::from(name),
         census_member: true,
@@ -1941,7 +1944,7 @@ fn terminal_off_new_round_observes_targeted_pending_and_floor_blocked_presence()
         SnapshotSource::ClaudeCode,
         index.traversal.as_mut().unwrap(),
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     );
     for key in [&pending_key, &held_key] {
         assert!(index
@@ -2025,6 +2028,7 @@ fn terminal_off_hint_preserves_quarantined_presence_without_forced_family_reads(
             .unwrap()
             .pending_candidates
             .push_back(ScanTraversalPath {
+                order_modified: None,
                 scan_root: scratch.to_path_buf(),
                 path: scratch.join(format!("{root}.jsonl")),
                 census_member: false,

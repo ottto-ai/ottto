@@ -326,6 +326,7 @@ pub(super) fn prepare(index: &mut ScanIndex, now: u64, _at: &str, requested: boo
             traversal
                 .pending_directories
                 .push_front(prior.unwrap_or_else(|| ScanTraversalPath {
+                    order_modified: None,
                     scan_root: root.clone(),
                     path: root.clone(),
                     census_member: true,
@@ -564,6 +565,7 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
             continue;
         };
         selected.push(ScanTraversalPath {
+            order_modified: None,
             scan_root: root,
             path: PathBuf::from(key),
             census_member: false,

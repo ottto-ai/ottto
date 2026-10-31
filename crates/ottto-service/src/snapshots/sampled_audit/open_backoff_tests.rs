@@ -333,6 +333,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
     let candidate = candidate_from_traversal_path(
         SnapshotSource::ClaudeCode,
         ScanTraversalPath {
+            order_modified: None,
             scan_root: root.0.to_path_buf(),
             path: path.clone(),
             census_member: true,
@@ -341,7 +342,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
         &mut ScanCensus::default(),
         None,
         183,
-        &index.files,
+        discovery_retention!(index),
     )
     .unwrap();
     index.held_audit_progress = Some(HeldAuditProgress {
@@ -367,7 +368,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
             &mut ScanCensus::default(),
             None,
             183,
-            &index.files,
+            discovery_retention!(index),
             now
         )
         .is_none());
@@ -377,7 +378,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
             &mut ScanCensus::default(),
             None,
             183,
-            &index.files,
+            discovery_retention!(index),
             true,
             now,
             None
@@ -402,7 +403,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
         &mut ScanCensus::default(),
         None,
         183,
-        &index.files,
+        discovery_retention!(index),
         true,
         now,
         None

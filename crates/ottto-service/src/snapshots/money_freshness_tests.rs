@@ -7,6 +7,7 @@ const NOW: u64 = 1_793_318_400;
 
 fn path(n: usize) -> ScanTraversalPath {
     ScanTraversalPath {
+        order_modified: None,
         scan_root: PathBuf::from("/synthetic"),
         path: PathBuf::from(format!("/synthetic/{n}.jsonl")),
         census_member: true,

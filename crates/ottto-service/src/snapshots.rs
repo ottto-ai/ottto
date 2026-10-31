@@ -27566,6 +27566,7 @@ impl OwnedSourceScan {
             index.claude_full_rearm_progress.terminal_off_admitted = identified_candidates
                 .iter()
                 .map(|candidate| ScanTraversalPath {
+                    order_modified: None,
                     scan_root: candidate.scan_root.clone(),
                     path: candidate.path.clone(),
                     census_member: false,
@@ -32952,6 +32953,7 @@ impl OwnedSourceScan {
                     prior.scan_root.clone_from(&candidate.scan_root);
                 } else {
                     admitted.push(ScanTraversalPath {
+                        order_modified: None,
                         scan_root: candidate.scan_root.clone(),
                         path: candidate.path.clone(),
                         census_member: false,

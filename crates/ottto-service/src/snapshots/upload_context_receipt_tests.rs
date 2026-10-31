@@ -769,7 +769,7 @@ fn upload_context_receipt_current_round_trip_and_size() {
     let decoded: ScanIndexEntry = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(decoded.upload_context_receipt, entry.upload_context_receipt);
     assert_eq!(std::mem::size_of::<upload_context_receipt::Receipt>(), 80);
-    assert_eq!(std::mem::size_of::<ScanIndexEntry>(), 560);
+    assert_eq!(std::mem::size_of::<ScanIndexEntry>(), 568);
 }
 
 #[test]
@@ -1770,7 +1770,7 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
             f.source,
             traversal,
             BACKFILL_WINDOW_DAYS,
-            &f.index.files,
+            discovery_retention!(f.index),
         );
         let a = f.root.join("a.jsonl");
         traversal
@@ -1945,6 +1945,7 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
     // group may never do that. Keep size fixed to exercise normal file slots.
     assert!(!codex_fresh_data_pending(
         &ScanTraversalPath {
+            order_modified: None,
             scan_root: f.root.clone(),
             path: d,
             census_member: true,
@@ -1961,7 +1962,12 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
         BACKFILL_WINDOW_DAYS,
     );
     let traversal = f.index.traversal.as_mut().unwrap();
-    advance_bounded_directory_traversal(f.source, traversal, BACKFILL_WINDOW_DAYS, &f.index.files);
+    advance_bounded_directory_traversal(
+        f.source,
+        traversal,
+        BACKFILL_WINDOW_DAYS,
+        discovery_retention!(f.index),
+    );
     traversal
         .pending_candidates
         .make_contiguous()
