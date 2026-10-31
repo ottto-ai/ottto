@@ -1405,6 +1405,14 @@ fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
         );
         assert_eq!(publications.len(), 1);
         assert!(rig.cache.durable_store_faulted(rig.source));
+        let staged_due = working.files[&key]
+            .unverified_deadline()
+            .expect("the native Tail stages its audit obligation");
+        fs::write(
+            rig.root.join("pre-barrier-audit.json"),
+            serde_json::to_vec(&staged_due).unwrap(),
+        )
+        .unwrap();
         let marker = rig.root.join("point-reached");
         scan_hooks::set(
             if after {
@@ -1474,7 +1482,18 @@ fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
             rig.index.files[&key].source_file_fingerprint.is_empty(),
             after
         );
+        let staged_due: u64 =
+            serde_json::from_slice(&fs::read(scratch.join("pre-barrier-audit.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            rig.index.files[&key].unverified_deadline(),
+            after.then_some(staged_due),
+            "the barrier carries exactly the staged audit debt before ACK"
+        );
         entry["source_file_fingerprint"] = pre["source_file_fingerprint"].clone();
+        // The independently checked audit marker is scheduling metadata;
+        // every accepted fact and all other entry fields must stay PRE.
+        entry["scan_identity_version"] = pre["scan_identity_version"].clone();
         assert_eq!(
             entry, pre,
             "the barrier never fabricates accepted revision/extent/body"
