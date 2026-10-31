@@ -4689,6 +4689,22 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
     let mut corrupt = fs::read(&file).unwrap();
     *corrupt.last_mut().unwrap() ^= 1;
     put_record(&file, &corrupt);
+    // Historical readable records are identified without repairing their mode.
+    let old = binding("old", "scope", ("old", None));
+    let mut historical = pending(old.clone(), certificate(&path), 1);
+    historical.allowlist = parse_hex_digest(
+        "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+    ).unwrap();
+    let old_file = record_file(&store, &old.key);
+    let old_bytes = pinned_v1_bytes(&historical, 1);
+    put_record(&old_file, &old_bytes);
+    fs::set_permissions(&old_file, fs::Permissions::from_mode(0o640)).unwrap();
+    let old_stamp = stamp_at(&old_file).unwrap();
+    // An unreadable current record also stays untouched and keeps PL unknown.
+    let denied = binding("denied", "scope", ("denied", None));
+    let denied_file = record_file(&store, &denied.key);
+    put_record(&denied_file, &pinned_v1_bytes(&make(denied), 1));
+    fs::set_permissions(&denied_file, fs::Permissions::from_mode(0)).unwrap();
     // Foreign names consume work too; they cannot all be visited in one save.
     for n in 0..1024 {
         fs::write(store.dir().join(format!("foreign-{n}")), b"untouched").unwrap();
@@ -4706,10 +4722,15 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
             assert!(store.private_label_keys().unwrap().is_none());
         }
     }
-    assert_eq!(visited, 1026);
+    assert_eq!(visited, 1028);
     assert_eq!(erased, 1);
     assert!(refused >= 1);
     assert!(store.private_label_keys().unwrap().is_none());
+    assert_eq!(stamp_at(&old_file).unwrap(), old_stamp);
+    assert_eq!(fs::read(&old_file).unwrap(), old_bytes);
+    assert_eq!(fs::metadata(&old_file).unwrap().mode() & 0o777, 0o640);
+    assert_eq!(fs::metadata(&denied_file).unwrap().mode() & 0o777, 0);
+    assert_eq!(store.counters().mode_repaired, 0);
     assert!(!record_file(&store, &good.key).exists());
     assert_eq!(
         fs::read(&file).unwrap(),

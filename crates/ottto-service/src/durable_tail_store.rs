@@ -968,12 +968,26 @@ impl DurableTailStore {
         writer: Option<&dyn SingleWriter>,
     ) -> Result<Option<Header>, Refusal> {
         let restoring = matches!(work, "restore" | "privacy_restore");
+        let read_only = matches!(work, "privacy_restore" | "off_invalidate");
         let writable = writer
             .or_else(|| {
                 crate::locked_state_dir::held_for(&self.dir).map(|w| w as &dyn SingleWriter)
             })
             .is_some_and(|w| self.check_writer(w).is_ok());
-        if !self.usable(writer) {
+        if read_only {
+            // Privacy dispatch is not startup/restore: never repair metadata
+            // or run the startup barrier merely to identify unrelated bytes.
+            let metadata = match inspect_path(&self.dir) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(Refusal::Undecodable),
+            };
+            if !metadata.is_dir() || metadata.uid() != our_uid()
+                || metadata.mode() & 0o777 != 0o700
+            {
+                return Err(Refusal::Undecodable);
+            }
+        } else if !self.usable(writer) {
             return Ok(None);
         }
         let path = self.record_path(key);
@@ -990,7 +1004,7 @@ impl DurableTailStore {
             let mut file = match open() {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !read_only => {
                     let repaired = match inspect_path(&path) {
                         Ok(m) => {
                             m.is_file()
@@ -1024,12 +1038,11 @@ impl DurableTailStore {
             if !metadata.is_file() {
                 return Err(Refusal::Undecodable);
             }
-            if !self.repair(
-                &path,
-                &metadata,
-                0o600,
-                writable && work != "off_invalidate",
-            ) {
+            if read_only {
+                if metadata.uid() != our_uid() {
+                    return Err(Refusal::Undecodable);
+                }
+            } else if !self.repair(&path, &metadata, 0o600, writable) {
                 return Ok(None);
             }
             #[cfg(test)]
@@ -1063,11 +1076,17 @@ impl DurableTailStore {
             if work == "off_invalidate" {
                 // Header identity alone is the OFF exception. Never acquire a
                 // body or mutation authority for any other representation.
+                if metadata.mode() & 0o777 != 0o600 {
+                    return Err(Refusal::Undecodable);
+                }
                 binding.stamp = Some(Stamp::of(&metadata));
                 return Ok(retired.then_some(binding));
             }
             if retired && work != "overwrite" && work != "guard" {
                 return Err(Refusal::Repin); // Missing to readers, opaque to current decoders.
+            }
+            if read_only && metadata.mode() & 0o777 != 0o600 {
+                return Err(Refusal::Undecodable);
             }
             if work == "presence" {
                 return Ok(None); // Presence is never verification or mutation authority.
