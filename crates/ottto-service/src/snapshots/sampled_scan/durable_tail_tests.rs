@@ -5146,7 +5146,9 @@ thread_local! {
     static RETAIL_READS: std::cell::RefCell<Vec<(u64, usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 pub(super) fn observe_retail(at: u64, n: usize, old: u64) {
-    RETAIL_READS.with(|reads| reads.borrow_mut().push((at, n, old)));
+    if n != 0 {
+        RETAIL_READS.with(|reads| reads.borrow_mut().push((at, n, old)));
+    }
 }
 fn retail_reads() -> Vec<(u64, usize, u64)> {
     RETAIL_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
