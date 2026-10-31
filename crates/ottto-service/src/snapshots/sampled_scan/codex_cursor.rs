@@ -4152,19 +4152,37 @@ impl SharedCache {
         &self,
         retained: &super::RetainedCache,
         key: &String,
-        incoming: &crate::transcript_cache::Retained<super::CachedJsonlReduction>,
+        incoming: &crate::transcript_cache::Taken<super::CachedJsonlReduction>,
         live: usize,
         rank: (i64, i64),
     ) -> usize {
+        let custody_bytes = incoming
+            .durable
+            .retained_bytes(state_bytes())
+            .unwrap_or(state_bytes());
         self.with_cursor(|cursor| {
             let reservation = |cursor: &CursorState| {
                 live.saturating_add(state_for_main(cursor).unwrap_or(state_bytes()))
                     .saturating_add(super::side_ledger::SIDE_LEDGER_BYTES)
             };
             let needed = !cursor.headers.is_empty()
-                && !retained.insertion_fits(key, incoming, reservation(cursor), rank, false);
+                && !retained.insertion_fits(
+                    key,
+                    &incoming.retained,
+                    custody_bytes,
+                    reservation(cursor),
+                    rank,
+                    false,
+                );
             reclaim_headers(cursor, needed, |cursor| {
-                retained.insertion_fits(key, incoming, reservation(cursor), rank, true)
+                retained.insertion_fits(
+                    key,
+                    &incoming.retained,
+                    custody_bytes,
+                    reservation(cursor),
+                    rank,
+                    true,
+                )
             });
             reservation(cursor)
         })

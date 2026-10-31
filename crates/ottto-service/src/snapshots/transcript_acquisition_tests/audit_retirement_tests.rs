@@ -1539,7 +1539,7 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         for &fault in faults {
             sampled_scan::set_test_now(Some(START));
-            let fixture = ScanFixture::new(source);
+            let fixture = ScanFixture::new(source).without_prompt();
             fixture.file.append(&usage(source, 100, 0, "fixture-model"));
             let scope = Scope(format!("quiet-writer-{fault}"));
             let state = fixture.dir.join("state");
@@ -1552,7 +1552,7 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 cache.durable_begin_pass(source, &index_path, &scope, true);
                 cache
             };
-            let cache = begin();
+            let cache = Arc::new(sampled_scan::SharedCache::default());
             let (mut index, _, _) = production_scan(
                 &fixture,
                 source,
@@ -1560,25 +1560,32 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 Some(cache.clone()),
                 &scope.0,
             );
+            cache.durable_begin_pass(source, &index_path, &scope, true);
+            cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
             index.save(&index_path).unwrap();
             assert_eq!(
                 cache
                     .durable_write_after_save(lock, source, &index)
-                    .unwrap()
-                    .written,
+                    .map(|receipt| receipt.written + receipt.clean)
+                    .unwrap(),
                 1
             );
             fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-            let (mut index, _, modes) =
-                production_scan(&fixture, source, index, Some(cache.clone()), &scope.0);
+            let (mut index, _, modes) = {
+                // Only this compatibility arm reproduces a V1 writer's lost
+                // index marker. V3's verified envelope carries its own debt.
+                let _legacy_writer = (fault == "legacy_index_clear")
+                    .then(crate::snapshots::RestartRestoreForTest::disabled);
+                production_scan(&fixture, source, index, Some(cache.clone()), &scope.0)
+            };
             assert_eq!(modes, (0, 1, 0));
             assert!(index.files[&key].has_unverified_source());
             index.save(&index_path).unwrap();
             assert_eq!(
                 cache
                     .durable_write_after_save(lock, source, &index)
-                    .unwrap()
-                    .written,
+                    .map(|receipt| receipt.written + receipt.clean)
+                    .unwrap(),
                 1
             );
             let record_path = fs::read_dir(store::store_dir_for_index(&index_path))
@@ -1588,7 +1595,25 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 .unwrap()
                 .path();
             let predecessor = fs::read(&record_path).unwrap();
-            assert_eq!(predecessor[311], 1, "#865's envelope carries the debt");
+            let ds = sampled_scan::durable_tail::durable_source(source).unwrap();
+            let mut disk =
+                store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+            let store::ReadOutcome::Found(record) = disk.read(&store::key_digest(ds, &key)) else {
+                panic!("the native predecessor is verified");
+            };
+            assert_eq!(
+                record.format,
+                if fault == "legacy_index_clear" {
+                    store::FORMAT_V1
+                } else {
+                    store::FORMAT_V3
+                },
+                "the legacy fault requires a real V1 predecessor"
+            );
+            assert!(
+                record.envelope_audit_debt.is_some(),
+                "#865's envelope carries the debt"
+            );
             let full_time = cache
                 .retained_checkpoint(&key)
                 .unwrap()
@@ -1664,7 +1689,9 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                             .written,
                         1
                     );
-                    assert_eq!(fs::read(&record_path).unwrap()[311], 0);
+                    assert!(
+                        matches!(disk.read(&store::key_digest(ds, &key)), store::ReadOutcome::Found(record) if record.envelope_audit_debt.is_none())
+                    );
                     if fault == "index_save_error" {
                         assert!(index.files[&key].audit_requires_full(START + 2 * 60 * 60));
                         // Advance the real index CAS without changing its owed
@@ -1719,10 +1746,14 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
             }
             drop(cache);
             let restart = begin();
-            let restart_index = ScanIndex::load(&index_path).unwrap();
+            let mut restart_index = ScanIndex::load(&index_path).unwrap();
             if fault == "index_save_error" {
                 assert_eq!(restart_index.files[&key].unverified_deadline(), owed_due);
                 assert!(restart_index.files[&key].audit_requires_full(START + 2 * 60 * 60));
+            }
+            if source == SnapshotSource::Codex && fault != "legacy_index_clear" {
+                restart_index =
+                    fixture.resume_quiet_on_growth(source, restart_index, &restart, &scope.0, NOW);
             }
             let (mut loaded, _, modes) = production_scan(
                 &fixture,
@@ -1745,10 +1776,9 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                     assert_eq!(restart.durable_counters(source).unwrap().0.restored, 1);
                     assert_eq!(loaded.files[&key].unverified_deadline(), owed_due);
                     assert!(loaded.files[&key].audit_requires_full(START + 2 * 60 * 60));
-                    // None came from the real record, while the original index
-                    // deadline still selected this Unchanged quiet audit. The
-                    // successful reconcile below requires that audit to stage
-                    // a NEW retirement; restore alone cannot stage or clear it.
+                    // The debtless record could not clear the original index
+                    // deadline. An admitted replay and this Unchanged audit
+                    // must stage a NEW retirement before receipt/CAS can clear it.
                     assert_eq!(
                         restart.retained_checkpoint(&key).unwrap().audit_debt(),
                         None
@@ -1790,10 +1820,12 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 usize::from(fault != "legacy_index_clear")
             );
             assert!(!loaded.files[&key].has_unverified_source());
-            assert_eq!(
-                fs::read(&record_path).unwrap()[311],
-                0,
-                "same writer rewrote #865's debt carrier"
+            assert!(
+                matches!(
+                    disk.read(&store::key_digest(ds, &key)),
+                    store::ReadOutcome::Found(record) if record.envelope_audit_debt.is_none()
+                ),
+                "same writer rewrote the verified debt carrier"
             );
             drop(restart);
             let (final_index, _, modes) = production_scan(

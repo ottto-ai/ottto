@@ -1660,6 +1660,22 @@ A later complete native parse still emits its exclusive body for a session with
 an earlier state-only row. An emitted total alone does not prove a server-side
 overwrite; backend authority rules independently govern successor acceptance.
 
+### Retired-pin recovery
+
+An exact retired v1 pin is a missing reduction, never decoded as current.
+Quiet files consume zero transcript bytes. A grown file takes the existing
+missing-record Full path, counted under `resource_full.repin`, and shares the
+six-hour per-key pace. Admission uses the existing history-upgrade page:
+2,000 files / 1 GiB total, at most 512 MiB for one file, with no first-file
+escape. Other history reservations consume the same page, not a second budget.
+No repin custody map, carry/age counters or private per-pass cap remains.
+
+The normal write-ahead path conditionally replaces the old inode. Pending local
+receipts and upload ACKs keep their existing distinct obligations: local receipt
+reconciliation cannot grant a stored upload ACK. Refused, not-stored and partial
+uploads do not settle the body; retries use ordinary discovery/pacing. Unknown
+pins and newer formats remain protected. There is no post-upload-ACK GC gate.
+
 ## Claude request-identity cap priority
 
 `native_collection_page.counts.identity_cap` contains sparse page observations

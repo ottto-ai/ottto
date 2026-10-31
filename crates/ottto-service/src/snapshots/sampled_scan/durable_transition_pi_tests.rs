@@ -247,7 +247,7 @@ impl PiDriver {
     }
 
     /// This route's U holds by store reason, plus restore-side holds.
-    fn holds(&self, mode: Mode) -> ([u64; 8], u64) {
+    fn holds(&self, mode: Mode) -> ([u64; 9], u64) {
         let (counts, store) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
         (store.format_hold, counts.durable_held.iter().sum())
     }
@@ -610,7 +610,7 @@ fn pi_restored_tail_behind_accepted_extent_publishes_the_cold_body() {
     assert_eq!((published.modes, published.restored), ((0, 1, 0), 1));
     assert_eq!(f.restored_behind(Mode::Restart), 1, "the counted event");
     assert_eq!(f.restored_behind(Mode::ColdFull), 0, "a Full never counts");
-    assert_eq!(f.holds(Mode::Restart), ([0; 8], 0), "no hold of any class");
+    assert_eq!(f.holds(Mode::Restart), ([0; 9], 0), "no hold of any class");
     money_oracle::assert_equivalent(&cold, &published);
     whole_body(&cold, &published);
     assert_eq!(published.batches.len(), 1);
@@ -753,7 +753,7 @@ fn pi_ram_resident_same_head_cut_reads_one_real_edit_full() {
     let (_, refused, t14) = f.counters(Mode::Ram);
     let (format_hold, held) = f.holds(Mode::Ram);
     assert_eq!((refused, t14, held), (0, 0, 0));
-    assert_eq!(format_hold, [0; 8]);
+    assert_eq!(format_hold, [0; 9]);
     money_oracle::assert_equivalent(&cold, &edited);
     whole_body(&cold, &edited);
 }
@@ -912,7 +912,7 @@ fn pi_version_rewrite_after_restart_reads_one_real_edit_full() {
         assert_eq!(f.restored_behind(Mode::Restart), 0, "{arm}: not a Tail");
         let (_, refused, t14) = f.counters(Mode::Restart);
         assert_eq!((refused, t14), (0, 0), "{arm}: never T14");
-        assert_eq!(f.holds(Mode::Restart), ([0; 8], 0), "{arm}: never a hold");
+        assert_eq!(f.holds(Mode::Restart), ([0; 9], 0), "{arm}: never a hold");
         assert_eq!(edited.snapshots[&f.entity]["request_count"], json!(2));
         money_oracle::assert_equivalent(&cold, &edited);
         whole_body(&cold, &edited);
@@ -1719,7 +1719,7 @@ fn pi_prompt_beyond_head_bound_uses_counted_growth_full() {
         return;
     }
     let c = corpus("transition-pi-head-bound");
-    let disk = Disk::new(&c);
+    let mut disk = Disk::new(&c);
     let path = c.root.join("session.jsonl");
     let seed = pi_seed();
     let (header, rest) = seed.split_once('\n').unwrap();

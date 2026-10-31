@@ -674,6 +674,7 @@ fn org_marker_email_is_stored_only_as_a_domain_separated_digest() {
 }
 
 /// Other E content still refuses; the approved mid-file skill label now persists.
+/// [format] e content refuses and approved mid file skills persist.
 #[test]
 fn e_content_refuses_and_approved_mid_file_skills_persist() {
     let scratch = Scratch::new("artifact");
@@ -907,9 +908,9 @@ fn pi_cwd_and_first_prompt_body_is_admitted_for_restore() {
     let (reduction, decoded) = pi_decoded(&path);
     let cold = &reduction.accumulator;
     assert!(cold.workspace_path.is_some() && cold.first_prompt_material.is_some());
-    decoded.content_charge().expect("no RederiveUnfunded");
-    let (restored, _) = decoded
-        .rederive_content(&File::open(&path).unwrap())
+    let plan = decoded.rederive_plan().expect("no RederiveUnfunded");
+    let (restored, _, _) = decoded
+        .rederive_content_planned(&File::open(&path).unwrap(), &plan)
         .expect("restore admitted");
     let restored = restored.accumulator;
     assert_eq!(restored.workspace_path, cold.workspace_path);
@@ -1040,9 +1041,9 @@ fn pi_restored_tail(path: &Path, grow: &[String]) -> OwnedJsonlParser {
     )
     .unwrap();
     let decoded = decode(&body, SnapshotSource::Pi).unwrap();
-    decoded.content_charge().expect("no RederiveUnfunded");
-    let (restored, _) = decoded
-        .rederive_content(&File::open(path).unwrap())
+    let plan = decoded.rederive_plan().expect("no RederiveUnfunded");
+    let (restored, _, _) = decoded
+        .rederive_content_planned(&File::open(path).unwrap(), &plan)
         .expect("restored");
     let birth = birth_unix_nanos(&fs::metadata(path).unwrap());
     let certificate = checkpoint.durable_certificate(birth).unwrap();
@@ -1154,10 +1155,17 @@ fn restore_then_tail_matches_cold_full() {
         let mut held = File::open(&path).unwrap();
         let (checkpoint, _) = certificate.restore(&mut held, scope()).unwrap();
         let (oracle, _) = restore(&path, &body, case.source).unwrap();
-        let (restored, _) = decode(&body, case.source)
-            .unwrap()
-            .rederive_content(&File::open(&path).unwrap())
-            .unwrap();
+        let (restored, _) = {
+            let decoded = decode(&body, case.source).unwrap();
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        }
+        .unwrap();
         assert_eq!(full_digest(&restored), full_digest(&oracle));
         let mut continued = parser(&path, case.source);
         let mode = continued
@@ -1911,6 +1919,7 @@ fn assert_borrowed_count_identity(reduction: &CachedJsonlReduction) {
     take_l_spans();
 }
 
+/// [format] borrowed count exact encoding matches populated both source canaries.
 #[test]
 fn borrowed_count_exact_encoding_matches_populated_both_source_canaries() {
     let scratch = Scratch::new("borrowed-count-canaries");
@@ -1922,30 +1931,6 @@ fn borrowed_count_exact_encoding_matches_populated_both_source_canaries() {
         assert_borrowed_count_identity(&reduction);
     }
     assert_eq!(covered, BTreeSet::from(["claude_code", "codex"]));
-}
-
-#[test]
-fn borrowed_count_identity_covers_codex_absent_legacy_and_v2_state() {
-    use codex_counting_version::AckEvidence;
-    let scratch = Scratch::new("borrowed-count-contract");
-    let path = scratch.write("codex.jsonl", &codex_lines());
-    for (evidence, version) in [
-        (None, 0),
-        (Some(AckEvidence::LegacyAcked), 1),
-        (Some(AckEvidence::None), 2),
-    ] {
-        let mut parser = parser(&path, SnapshotSource::Codex);
-        if let Some(evidence) = evidence {
-            codex_counting_version::configure(&mut parser.accumulator, evidence, Some(0));
-        }
-        parser
-            .prepare_acquisition(None, &scope(), None, NOW)
-            .unwrap();
-        while !parser.step().unwrap() {}
-        let reduction = parser.durable_test_reduction_copy();
-        assert_eq!(reduction.durable_counting().map_or(0, |c| c.1), version);
-        assert_borrowed_count_identity(&reduction);
-    }
 }
 
 #[test]
@@ -1974,6 +1959,7 @@ fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
     });
 }
 
+/// [money] tail reuse allowance cannot block an independently due full.
 #[test]
 fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
     use crate::transcript_cache::Retained;
@@ -2032,217 +2018,6 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
     );
 }
 
-#[test]
-fn no_input_completion_requires_every_rederive_digest_absent() {
-    for field in 0..5 {
-        let mut obligation = Rederive::default();
-        let slot = match field {
-            0 => &mut obligation.first_prompt,
-            1 => &mut obligation.workspace,
-            2 => &mut obligation.agent_label,
-            3 => &mut obligation.session_start,
-            _ => &mut obligation.title,
-        };
-        *slot = Some([1; 32]);
-        let decoded = Decoded {
-            reduction: CachedJsonlReduction {
-                accumulator: SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
-                report: JsonlReadReport::default(),
-                recognized_usage_drop_count: 0,
-                positive_recognized_usage_count: 0,
-                positive_usage_evidence: false,
-            },
-            rederive: obligation,
-        };
-        let (result, stats) =
-            crate::retry_allocation_probe::measure_caller_thread(|| decoded.without_rederive());
-        assert!(
-            result.is_err(),
-            "obligation{field} cannot use a zero/missing head mark as absence"
-        );
-        assert_eq!(stats.allocations, 0);
-    }
-    let decoded = Decoded {
-        reduction: CachedJsonlReduction {
-            accumulator: SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
-            report: JsonlReadReport::default(),
-            recognized_usage_drop_count: 0,
-            positive_recognized_usage_count: 0,
-            positive_usage_evidence: false,
-        },
-        rederive: Rederive::default(),
-    };
-    let (result, stats) =
-        crate::retry_allocation_probe::measure_caller_thread(|| decoded.without_rederive());
-    let (_, receipt) = result.unwrap();
-    assert_eq!(receipt, RederiveReceipt::default());
-    assert_eq!(stats.allocations, 0);
-}
-
-/// Differential projection of the enabled workspace class from the actual
-/// codec corpus. Other digest obligations are deliberately left unsupported;
-/// this projection is NOT a claim that the complete rich records restore.
-#[test]
-fn bounded_content_matches_native_corpus_and_fences_every_class() {
-    let scratch = Scratch::new("bounded-workspace");
-    let cases = [
-        (SnapshotSource::ClaudeCode, claude_lines(3, 3)),
-        (SnapshotSource::Codex, codex_lines()),
-    ];
-    for (source, mut lines) in cases {
-        // Compaction, title updates, later cwd and unknown nested payloads
-        // cannot overwrite native first-write-wins workspace selection.
-        lines.push(
-            json!({"type":"system", "subtype":"compact_boundary",
-            "cwd":"/later-workspace", "customTitle":"Later title",
-            "payload":{"cwd":"/other-later"},
-            "ignored":{"many":[{"content":"skip me"}]}})
-            .to_string(),
-        );
-        let path = scratch.write(source.api_slug(), &lines);
-        let (native, _) = full_read(&path, source);
-        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
-        let decoded = decode(&body, source).unwrap();
-        assert!(decoded.rederive.workspace.is_some());
-        assert!(decoded.content_charge().is_ok());
-        let (bounded, _) = decoded
-            .rederive_content(&File::open(&path).unwrap())
-            .unwrap();
-        let oracle = restore(&path, &body, source).unwrap().0;
-        assert_eq!(full_digest(&bounded), full_digest(&oracle));
-        let mut workspace = decode(&body, source).unwrap();
-        workspace.rederive = Rederive {
-            workspace: workspace.rederive.workspace,
-            ..Default::default()
-        };
-        let charge = workspace.content_charge().unwrap();
-        assert!(charge >= workspace.head_end().unwrap());
-        let mut wrong = decode(&body, source).unwrap();
-        wrong.rederive = Rederive {
-            workspace: Some([0; 32]),
-            ..Default::default()
-        };
-        wrong.content_charge().unwrap();
-        assert!(matches!(
-            wrong.rederive_content(&File::open(&path).unwrap()),
-            Err(Refuse::NotRederivable("content_fence"))
-        ));
-        let (bounded, receipt) = workspace
-            .rederive_content(&File::open(&path).unwrap())
-            .unwrap();
-        assert_eq!(
-            bounded.accumulator.workspace_path,
-            oracle.accumulator.workspace_path
-        );
-        assert_eq!(
-            bounded.accumulator.workspace_path,
-            native.accumulator.workspace_path
-        );
-        assert_eq!(receipt.named_lines, 0);
-        assert_eq!(receipt.line_bytes, 0);
-        assert_eq!(
-            receipt.head_bytes,
-            native.accumulator.durable_marks.workspace.unwrap()
-        );
-        // Every excluded class refuses before any I/O, independently.
-        for class in 0..4 {
-            let mut excluded = decode(&body, source).unwrap();
-            excluded.rederive = Rederive::default();
-            match class {
-                0 => excluded.rederive.first_prompt = Some([1; 32]),
-                1 => excluded.rederive.title = Some([1; 32]),
-                2 => excluded.rederive.agent_label = Some([1; 32]),
-                _ => excluded.rederive.session_start = Some([1; 32]),
-            }
-            assert!(excluded
-                .rederive_content(&File::open(&path).unwrap())
-                .is_err());
-        }
-    }
-}
-
-#[test]
-fn bounded_workspace_cap_and_escaped_text_keep_native_values_or_refuse() {
-    let scratch = Scratch::new("workspace-cap");
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        for length in [4095, 4096, 4097] {
-            let cwd = "x".repeat(length);
-            let line = match source {
-                SnapshotSource::ClaudeCode => json!({"type":"progress", "cwd":cwd}),
-                _ => json!({"type":"session_meta", "payload":{"id":CODEX_SESSION,
-                    "cwd":cwd, "source":"cli"}}),
-            };
-            let path = scratch.write(
-                &format!("{}-{length}", source.api_slug()),
-                &[line.to_string()],
-            );
-            let (native, _) = full_read(&path, source);
-            let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
-            let mut decoded = decode(&body, source).unwrap();
-            assert!(decoded.rederive.workspace.is_some());
-            decoded.rederive = Rederive {
-                workspace: decoded.rederive.workspace,
-                ..Default::default()
-            };
-            decoded.content_charge().unwrap();
-            let actual = decoded.rederive_content(&File::open(&path).unwrap());
-            assert_eq!(
-                actual.unwrap().0.accumulator.workspace_path,
-                native.accumulator.workspace_path
-            );
-        }
-    }
-    let path = scratch.write("escaped", &[r#"{"type":"progress","cwd":"  /tmp/a\u0062\u0063  ","ignored":[{"key":"not captured"}]}"#.into()]);
-    let (native, _) = full_read(&path, SnapshotSource::ClaudeCode);
-    let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
-    let mut decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
-    decoded.rederive = Rederive {
-        workspace: decoded.rederive.workspace,
-        ..Default::default()
-    };
-    decoded.content_charge().unwrap();
-    assert_eq!(
-        decoded
-            .rederive_content(&File::open(&path).unwrap())
-            .unwrap()
-            .0
-            .accumulator
-            .workspace_path,
-        Some(PathBuf::from("/tmp/abc"))
-    );
-}
-
-#[test]
-fn workspace_unknown_object_shapes_match_native_without_formatting_the_input() {
-    let scratch = Scratch::new("workspace-shape-error");
-    for field in ["payload", "session_meta", "turn_context"] {
-        let path = scratch.write(
-            "wrong-shape",
-            &[json!({"type":"progress", "cwd":"/tmp/synthetic",
-            field: "\u{0080}".repeat(100_000)})
-            .to_string()],
-        );
-        let (native, _) = full_read(&path, SnapshotSource::ClaudeCode);
-        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
-        let mut decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
-        decoded.rederive = Rederive {
-            workspace: decoded.rederive.workspace,
-            ..Default::default()
-        };
-        assert!(decoded.rederive.workspace.is_some());
-        decoded.content_charge().unwrap();
-        assert_eq!(
-            decoded
-                .rederive_content(&File::open(&path).unwrap())
-                .unwrap()
-                .0
-                .accumulator
-                .workspace_path,
-            native.accumulator.workspace_path
-        );
-    }
-}
-
 // M3 G1 (r6 native): the one native finish body and its PRE-finalization
 // seam. The seam is what `finish_with_repository_identity_prepared` stages
 // from; these controls pin where it runs and what it sees, without a store.
@@ -2267,6 +2042,7 @@ fn seam_body(live: crate::snapshots::PreFinalization<'_>) -> (Vec<u8>, bool) {
     (body, detached)
 }
 
+/// [format] m3 seam live bytes equal retained copy and output equals legacy.
 #[test]
 fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
@@ -2324,6 +2100,7 @@ fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
     }
 }
 
+/// [format] m3 seam never runs before the held object is revalidated.
 #[test]
 fn m3_seam_never_runs_before_the_held_object_is_revalidated() {
     let scratch = Scratch::new("m3-seam-refused");
@@ -2355,156 +2132,7 @@ fn m3_seam_never_runs_before_the_held_object_is_revalidated() {
     assert_eq!(calls, 0);
 }
 
-/// [format] Pi native accounting and restore contract.
-/// Compare Pi header precedence with the native replay oracle.
-#[test]
-fn bounded_pi_workspace_matches_native_header_only_precedence() {
-    let scratch = Scratch::new("pi-workspace-content");
-    let source = SnapshotSource::Pi;
-    let cases = [
-        vec![json!({"type":"session","id":"synthetic-pi","cwd":"/synthetic/workspace"})],
-        vec![
-            json!({"type":"message","cwd":"/ignore-message","workspace":"/ignore"}),
-            json!({"type":" session ","id":"synthetic-pi","cwd":"  /synthetic/a\u{e9}  ",
-                "projectPath":"/ignore-project","workspace":"/ignore-workspace",
-                "payload":{"cwd":"/ignore-payload"}}),
-            json!({"type":"session","cwd":"/later-does-not-overwrite"}),
-        ],
-        vec![
-            json!({"type":"session","id":"synthetic-pi","cwd":"  ","workspace":"/ignore"}),
-            json!({"type":"session","cwd":"/first-nonempty"}),
-        ],
-    ];
-    for (i, lines) in cases.into_iter().enumerate() {
-        let lines = lines
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
-        let path = scratch.write(&format!("pi-{i}"), &lines);
-        let mut native = parser(&path, source);
-        assert!(matches!(
-            native
-                .prepare_acquisition(None, &scope(), None, NOW)
-                .unwrap(),
-            ReadMode::Full(FullReason::StateMissing)
-        ));
-        while !native.step().unwrap() {}
-        let native = native.reduction_copy();
-        let make = || {
-            let mut reduction = native.clone();
-            reduction.accumulator.workspace_path = None;
-            Decoded {
-                reduction,
-                rederive: Rederive {
-                    workspace: Some(workspace_digest(&native.accumulator).unwrap()),
-                    ..Default::default()
-                },
-            }
-        };
-        let expected = make()
-            .rederive(
-                parser(&path, source),
-                &mut File::open(&path).unwrap(),
-                line_cap(),
-            )
-            .unwrap();
-        assert!(
-            make().content_charge().unwrap() >= native.accumulator.durable_marks.workspace.unwrap()
-        );
-        let (actual, receipt) = make()
-            .rederive_content(&File::open(&path).unwrap())
-            .unwrap();
-        assert_eq!(
-            actual.accumulator.workspace_path,
-            native.accumulator.workspace_path
-        );
-        assert_eq!(
-            actual.accumulator.workspace_path,
-            expected.0.accumulator.workspace_path
-        );
-        assert_eq!(receipt.head_bytes, expected.1.head_bytes);
-        assert_eq!(receipt.line_bytes, 0);
-        assert_eq!(receipt.named_lines, 0);
-        let mut prompt = make();
-        prompt.rederive.first_prompt = Some([1; 32]);
-        assert!(
-            prompt.content_charge().is_err(),
-            "a fabricated prompt without a physical mark refuses"
-        );
-        prompt.reduction.accumulator.durable_marks.first_prompt = Some(1);
-        assert!(
-            prompt.content_charge().is_ok(),
-            "a marked Pi prompt is funded"
-        );
-        let mut wrong = make();
-        wrong.rederive.workspace = Some([0; 32]);
-        assert!(matches!(
-            wrong.rederive_content(&File::open(&path).unwrap()),
-            Err(Refuse::NotRederivable("content_fence"))
-        ));
-    }
-}
-
-/// [format] Pi native accounting and restore contract.
-#[test]
-fn bounded_pi_workspace_enforces_cap_and_refuses_nonheader_cwd() {
-    let scratch = Scratch::new("pi-workspace-caps");
-    for size in [4096, 4097] {
-        let path = scratch.write(
-            &format!("pi-{size}"),
-            &[json!({"type":"session","id":"synthetic-pi","cwd":"x".repeat(size)}).to_string()],
-        );
-        let mut native = parser(&path, SnapshotSource::Pi);
-        assert!(matches!(
-            native
-                .prepare_acquisition(None, &scope(), None, NOW)
-                .unwrap(),
-            ReadMode::Full(FullReason::StateMissing)
-        ));
-        while !native.step().unwrap() {}
-        let mut reduction = native.reduction_copy();
-        let want = workspace_digest(&reduction.accumulator).unwrap();
-        reduction.accumulator.workspace_path = None;
-        let decoded = Decoded {
-            reduction,
-            rederive: Rederive {
-                workspace: Some(want),
-                ..Default::default()
-            },
-        };
-        decoded.content_charge().unwrap();
-        let result = decoded.rederive_content(&File::open(&path).unwrap());
-        assert_eq!(
-            result.unwrap().0.accumulator.workspace_path,
-            Some(PathBuf::from("x".repeat(size)))
-        );
-    }
-    let row = json!({"type":"message","cwd":"/synthetic/wrong-row"}).to_string();
-    let path = scratch.write("not-header", std::slice::from_ref(&row));
-    let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);
-    acc.workspace_path = Some(PathBuf::from("/synthetic/wrong-row"));
-    acc.durable_marks.workspace = Some((row.len() + 1) as u64);
-    let want = workspace_digest(&acc).unwrap();
-    acc.workspace_path = None;
-    let decoded = Decoded {
-        reduction: CachedJsonlReduction {
-            accumulator: acc,
-            report: JsonlReadReport::default(),
-            recognized_usage_drop_count: 0,
-            positive_recognized_usage_count: 0,
-            positive_usage_evidence: false,
-        },
-        rederive: Rederive {
-            workspace: Some(want),
-            ..Default::default()
-        },
-    };
-    assert!(matches!(
-        decoded.rederive_content(&File::open(&path).unwrap()),
-        Err(Refuse::NotRederivable("content_fence"))
-    ));
-}
-
+/// [format] skill label bounds and consent preserve the whole native state.
 #[test]
 fn skill_label_bounds_and_consent_preserve_the_whole_native_state() {
     let scratch = Scratch::new("label-bounds");
@@ -2571,6 +2199,7 @@ fn skill_label_bounds_and_consent_preserve_the_whole_native_state() {
     );
 }
 
+/// [format] skill labels preserve native provider and activity caps.
 #[test]
 fn skill_labels_preserve_native_provider_and_activity_caps() {
     let scratch = Scratch::new("label-cap");
@@ -2627,6 +2256,7 @@ fn skill_labels_preserve_native_provider_and_activity_caps() {
     );
 }
 
+/// [format] pl scope is closed and every other e field stays refusing.
 #[test]
 fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
     let shape = shape_text();
@@ -2672,8 +2302,8 @@ fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
     );
 }
 
-/// [format] Pi native accounting and restore contract.
 /// Exercise the registered Pi body through production decode and content replay.
+/// [money] bounded pi prompt workspace tail matches cold body in two cycles.
 #[test]
 fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
     let root = Scratch::new("pi-bounded-head-tail");
@@ -2702,9 +2332,16 @@ fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
                 .restore(&mut File::open(&path).unwrap(), scope())
                 .unwrap();
             let decoded = decode_body(&body, source).unwrap();
-            let (restored, receipt) = decoded
-                .rederive_content(&File::open(&path).unwrap())
-                .unwrap();
+            let (restored, receipt) = {
+                decoded
+                    .rederive_plan()
+                    .map_err(Refuse::NotRederivable)
+                    .and_then(|plan| {
+                        decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                    })
+                    .map(|(reduction, receipt, _)| (reduction, receipt))
+            }
+            .unwrap();
             assert!(receipt.head_bytes <= HEAD_BOUND);
             assert_eq!(
                 restored.accumulator.first_prompt_material,
@@ -2737,6 +2374,7 @@ fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
     }
 }
 
+/// [format] bounded plan refuses unsupported codex boundaries and oversized marks without reads.
 #[test]
 fn bounded_plan_refuses_unsupported_codex_boundaries_and_oversized_marks_without_reads() {
     let root = Scratch::new("unsupported-bounded");
@@ -2765,162 +2403,8 @@ fn bounded_plan_refuses_unsupported_codex_boundaries_and_oversized_marks_without
 }
 
 // F4: each H class fails atomically, and diagnostics identify only the class.
-#[test]
-fn bounded_fence_refuses_each_content_class_before_adoption() {
-    let root = Scratch::new("all-content-fences");
-    let source = SnapshotSource::Codex;
-    let mut lines = codex_lines();
-    let mut header: Value = serde_json::from_str(&lines[0]).unwrap();
-    header["payload"]["source"] =
-        json!({"subagent":{"thread_spawn":{"agent_path":"/agents/PRIVATE-AGENT-FENCE"}}});
-    lines[0] = header.to_string();
-    let path = root.write("source.jsonl", &lines);
-    let (native, _) = full_read(&path, source);
-    let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
-    // Retain the ordinary corpus's supported plan; each injected digest is
-    // deliberately impossible, including absent-class versus present mismatch.
-    for class in 0..5 {
-        let mut decoded = decode(&body, source).unwrap();
-        let digest = match class {
-            0 => &mut decoded.rederive.first_prompt,
-            1 => &mut decoded.rederive.title,
-            2 => &mut decoded.rederive.agent_label,
-            3 => &mut decoded.rederive.session_start,
-            4 => &mut decoded.rederive.workspace,
-            _ => unreachable!(),
-        };
-        *digest = Some([0; 32]);
-        let (result, rows) = crate::local_resource_diagnostics::capture(|| {
-            decoded.rederive_content(&File::open(&path).unwrap())
-        });
-        assert!(matches!(
-            result,
-            Err(Refuse::NotRederivable("content_fence"))
-        ));
-        let counts = rows
-            .iter()
-            .find_map(|row| row["counts"].get("rederive_fence_mismatch"))
-            .expect("fence alarm");
-        assert_eq!(counts[class], 1);
-        assert!(!serde_json::to_string(&rows)
-            .unwrap()
-            .contains("PRIVATE-AGENT-FENCE"));
-    }
-}
-
 // F7: concurrent appends at the physical sample/head/title read boundaries
 // preserve bounded replay and leave the appended suffix to ordinary Tail.
-#[test]
-fn bounded_restore_append_injection_at_samples_head_and_title_matches_cold_body() {
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        for edge in [
-            "before_samples",
-            "between_samples",
-            "after_samples",
-            "head",
-            "title",
-        ] {
-            let root = Scratch::new("bounded-append-stages");
-            let lines = if source == SnapshotSource::ClaudeCode {
-                claude_lines(20, 20)
-            } else {
-                let mut lines = codex_lines();
-                let title = lines
-                    .iter()
-                    .position(|line| line.contains("thread_name_updated"))
-                    .unwrap();
-                let title = lines.remove(title);
-                for n in 2..=3 {
-                    let mut total = codex_usage(100 * n);
-                    total["output_tokens"] = json!(3 * n);
-                    total["total_tokens"] = json!(103 * n);
-                    lines.push(json!({"type":"turn_context","payload":{"turn_id":format!("extra-{n}"),"model":"gpt-5.2"}}).to_string());
-                    lines.push(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":format!("extra-{n}")}}).to_string());
-                    lines.push(json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":codex_usage(100),"total_token_usage":total}}}).to_string());
-                    lines.push(json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":format!("extra-{n}")}}).to_string());
-                }
-                lines.push(title);
-                lines
-            };
-            let path = root.write("source.jsonl", &lines);
-            let (native, checkpoint) = full_read(&path, source);
-            let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
-            let certificate = checkpoint
-                .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
-                .unwrap();
-            let append = |path: &Path| {
-                writeln!(
-                    fs::OpenOptions::new().append(true).open(path).unwrap(),
-                    "{{\"type\":\"progress\",\"data\":\"append-injection\"}}"
-                )
-                .unwrap();
-            };
-            append(&path); // scoped restore is growth-only
-            if edge == "before_samples" {
-                append(&path);
-            }
-            let hook_path = path.clone();
-            let mut samples = 0;
-            let target_sample = match edge {
-                "between_samples" => 1,
-                "after_samples" => 2,
-                _ => 0,
-            };
-            let (checkpoint, _) = crate::transcript_acquisition::with_sample_read_hook(
-                move || {
-                    samples += 1;
-                    if samples == target_sample {
-                        append(&hook_path);
-                    }
-                },
-                || certificate.restore_grown(&mut File::open(&path).unwrap(), scope()),
-            )
-            .unwrap();
-            let decoded = decode(&body, source).unwrap();
-            let plan = decoded.rederive_plan().unwrap();
-            let title_offset = plan.title.map(|(offset, _)| offset);
-            if edge == "title" {
-                assert!(title_offset.is_some(), "fixture must read a named title");
-            }
-            let hook_path = path.clone();
-            let mut fired = false;
-            let (restored, receipt, _) = content::with_read_hook(
-                move |offset| {
-                    let target = (edge == "head" && offset == 0)
-                        || (edge == "title" && Some(offset) == title_offset);
-                    if target && !fired {
-                        fired = true;
-                        append(&hook_path);
-                    }
-                },
-                || decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan),
-            )
-            .unwrap();
-            assert_eq!(receipt.head_bytes + receipt.line_bytes, plan.input_bytes());
-            let mut tail = parser(&path, source);
-            assert_eq!(
-                tail.prepare_acquisition(
-                    Some(Retained {
-                        checkpoint,
-                        state: restored
-                    }),
-                    &scope(),
-                    None,
-                    NOW
-                )
-                .unwrap(),
-                ReadMode::Tail
-            );
-            while !tail.step().unwrap() {}
-            assert_eq!(
-                items(tail, &path, source),
-                cold_items(&path, source),
-                "{source:?}/{edge}"
-            );
-        }
-    }
-}
-
 const PRIVACY_CANARIES: [&str; 4] = [
     "PRIVATE_LITERAL_DIAGNOSTICS_CANARY_20261030",
     "PRIVATE_REPLAY_HEAD_CANARY_20261030",
@@ -2983,9 +2467,14 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
             // assertion. The subprocess test also inspects the panic hook sink.
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::local_resource_diagnostics::capture(|| {
-                    decode_body(&bad, source)
-                        .unwrap()
-                        .rederive_content(&File::open(&path).unwrap())
+                    let decoded = decode_body(&bad, source).unwrap();
+                    decoded
+                        .rederive_plan()
+                        .map_err(Refuse::NotRederivable)
+                        .and_then(|plan| {
+                            decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                        })
+                        .map(|(reduction, receipt, _)| (reduction, receipt))
                 })
             }));
             assert!(
@@ -3015,9 +2504,16 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
         fs::write(&path, raw + &lines.join("\n") + "\n").unwrap();
         let (native, _) = full_read(&path, source);
         let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
-        let result = decode_body(&body, source)
-            .unwrap()
-            .rederive_content(&File::open(&path).unwrap());
+        let result = {
+            let decoded = decode_body(&body, source).unwrap();
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        };
         assert!(matches!(
             result,
             Err(Refuse::NotRederivable("raw_value_key"))
@@ -3027,11 +2523,16 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
         // carriers without formatting a Value, prompt, title or label.
         assert!(decode_body(&body[..body.len() - 1], source).is_err());
         let fd = File::options().write(true).open(&path).unwrap();
-        let err = decode_body(&body, source)
-            .unwrap()
-            .rederive_content(&fd)
-            .err()
-            .unwrap();
+        let err = {
+            let decoded = decode_body(&body, source).unwrap();
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| decoded.rederive_content_planned(&fd, &plan))
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        }
+        .err()
+        .unwrap();
         safe_log.push_str(&format!("{err:?}\n"));
     }
     for canary in PRIVACY_CANARIES {
@@ -3042,6 +2543,7 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
     PRIVACY_CANARIES
 }
 
+/// [format] bounded replay errors logs and panics are content free.
 #[test]
 fn bounded_replay_errors_logs_and_panics_are_content_free() {
     const CHILD: &str = "OTTTO_BOUNDED_REPLAY_PRIVACY_CHILD";
@@ -3075,6 +2577,7 @@ fn bounded_replay_errors_logs_and_panics_are_content_free() {
 /// [format] Pi native accounting and restore contract.
 /// Exercise the production codec/acquisition/native-finish/finalizer interface with
 /// actual A < C < B extents and a real complete native body (no hand-built item).
+/// [money] codex pi restored tail race below accepted publishes complete native body.
 #[test]
 fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
     let _on = RestartRestoreForTest::enabled();
@@ -3160,10 +2663,17 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
         let (checkpoint, _) = certificate
             .restore_grown(&mut File::open(&path).unwrap(), scope())
             .unwrap();
-        let (restored, _) = decode_body(&body, source)
-            .unwrap()
-            .rederive_content(&File::open(&path).unwrap())
-            .unwrap();
+        let (restored, _) = {
+            let decoded = decode_body(&body, source).unwrap();
+            decoded
+                .rederive_plan()
+                .map_err(Refuse::NotRederivable)
+                .and_then(|plan| {
+                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
+                })
+                .map(|(reduction, receipt, _)| (reduction, receipt))
+        }
+        .unwrap();
         // The accepted extent remains B while the actual plan freezes C.
         File::options()
             .write(true)

@@ -11,6 +11,7 @@ fn acquisition() -> FinishAcquisition {
     FinishAcquisition::Uncertified(DurableCustody::default())
 }
 
+/// [money] codex strict rebind keeps the existing publishing class.
 #[test]
 fn codex_strict_rebind_keeps_the_existing_publishing_class() {
     let cache = sampled_scan::SharedCache::default();
@@ -35,6 +36,7 @@ fn codex_strict_rebind_keeps_the_existing_publishing_class() {
     );
 }
 
+/// [money] claude and pi strict rebind are held publication decisions.
 #[test]
 fn claude_and_pi_strict_rebind_are_held_publication_decisions() {
     let cache = sampled_scan::SharedCache::default();
@@ -63,6 +65,7 @@ fn claude_and_pi_strict_rebind_are_held_publication_decisions() {
     }
 }
 
+/// [money] native publication has exactly five publishing and three held classes.
 #[test]
 fn native_publication_has_exactly_five_publishing_and_three_held_classes() {
     let cache = sampled_scan::SharedCache::default();
@@ -117,6 +120,7 @@ fn native_publication_has_exactly_five_publishing_and_three_held_classes() {
     assert!(seen.into_iter().all(|class| class));
 }
 
+/// [money] held decision survives later publishing siblings and empty page transport.
 #[test]
 fn held_decision_survives_later_publishing_siblings_and_empty_page_transport() {
     for held in [

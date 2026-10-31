@@ -2913,6 +2913,9 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
 #[cfg(unix)]
 #[test]
 fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store::{self as store, SingleWriter};
     use std::io::Read;
@@ -3019,7 +3022,8 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
     let (index, result) = next_generation(&root, index, &cache, 1);
     assert!(
         result.census_complete,
-        "a known_corrupt group must not make source census red"
+        "a known_corrupt group must not make source census red: {result:?}; {:?}",
+        cache.durable_counters(source)
     );
     assert_eq!(result.unreadable_path_count, 0);
     assert_eq!(index.files[&key].last_snapshot_fingerprint, accepted);
@@ -3032,7 +3036,7 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
         .iter()
         .any(|item| item.source_session_id == peer_owner));
     let (counts, stats) = cache.durable_counters(source).unwrap();
-    assert_eq!(counts.durable_held, [0; 8]);
+    assert_eq!(counts.durable_held, [0; 9]);
     assert_eq!(counts.not_persisted.get("known_corrupt_held"), Some(&1));
     assert_eq!(stats.t14_rebuild_full_started, 1);
     assert_eq!(fs::read(&record).unwrap(), corrupt);
@@ -3093,7 +3097,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
                 "C9: every refused group member counted, not only the first"
             );
         } else {
-            assert_eq!(durable.durable_held, [0; 8]);
+            assert_eq!(durable.durable_held, [0; 9]);
         }
         scanned.push(result.scanned_file_count);
         fs::remove_dir_all(root).unwrap();
@@ -3356,7 +3360,7 @@ fn grouped_missing_carriers_mark_each_member_until_verified(paged: bool) {
         Some(&2)
     );
     assert_eq!(counts.restored, 0);
-    assert_eq!(counts.durable_held, [0; 8]);
+    assert_eq!(counts.durable_held, [0; 9]);
     // Actual save and post-save GC keep both predecessors while debt is owed.
     index.save(&index_path).unwrap();
     crate::snapshots::durable_after_save(&cache, &root, source, &index);
@@ -3597,6 +3601,7 @@ fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
 }
 
 #[cfg(unix)]
+/// [format] protected group peer does not spend corruption rebuild before input.
 #[test]
 fn protected_group_peer_does_not_spend_corruption_rebuild_before_input() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();

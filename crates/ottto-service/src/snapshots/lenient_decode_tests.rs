@@ -2107,6 +2107,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
 
 #[test]
 fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
+    let _on = RestartRestoreForTest::enabled();
     let index = every_persisted_field_fixture();
     let bytes = serde_json::to_vec_pretty(&index).unwrap();
     let encoded: BTreeMap<String, &serde_json::value::RawValue> =
@@ -2127,6 +2128,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
 
 #[test]
 fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
+    let _on = RestartRestoreForTest::enabled();
     // Main shipped audit progress first. The earlier E2 writer saved a named
     // map with birth storage but no audit progress. Neither may lose custody.
     let seed = every_persisted_field_fixture();
@@ -2313,6 +2315,7 @@ fn duplicate_desktop_inventory_is_not_a_new_refusal() {
 
 #[test]
 fn desktop_inventory_keeps_existing_positional_index_slots() {
+    let _on = RestartRestoreForTest::enabled();
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
     let fields = lenient_decode::FIELDS;
     assert_eq!(fields.last(), Some(&DESKTOP_INVENTORY));
@@ -4688,6 +4691,7 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
 /// only negative evidence; it must never restore a live read permission.
 #[test]
 fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
+    let _on = RestartRestoreForTest::enabled();
     let seed = every_persisted_field_fixture();
     let expected = serde_json::to_vec(&seed).unwrap();
     let census = serde_json::to_vec(&seed.claude_request_census).unwrap();
@@ -4843,6 +4847,7 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
 /// Pin the absent-field downgrade contract while preserving the census bytes.
 #[test]
 fn retired_reread_new_writer_keeps_previous_default_contract() {
+    let _on = RestartRestoreForTest::enabled();
     #[derive(Default, serde::Deserialize)]
     #[serde(default)]
     struct PreviousCounts {
@@ -4943,8 +4948,10 @@ fn quiet_retired_index_loads_under_previous_entry_defaults() {
     );
 }
 
+/// [format] o3 negative spend crosses full positional and named readers.
 #[test]
 fn o3_negative_spend_crosses_full_positional_and_named_readers() {
+    let _on = RestartRestoreForTest::enabled();
     let mut seed = every_persisted_field_fixture();
     seed.o3_replay = upgrade_replay::State::default();
     assert!(!seed.o3_replay.upgrade_missing("old-bound-file", true));
@@ -4971,6 +4978,7 @@ fn o3_negative_spend_crosses_full_positional_and_named_readers() {
     }
 }
 
+/// [format] o3 ambiguous negative evidence refuses through every reader.
 #[test]
 fn o3_ambiguous_negative_evidence_refuses_through_every_reader() {
     let release = format!(

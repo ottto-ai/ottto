@@ -201,9 +201,9 @@ fn receipt(name: &str, bodies: &[ReceiptBody]) {
 
 /// The disk arm's state directory (#806): the committed scan index and,
 /// beside it, the real durable store, under a test-held single-writer lock
-/// (#801). Every arm loads the SAME committed index from here. It is not an
-/// ancestor of the corpus support dir, so the RAM and cold arms hold no
-/// state-directory writer, exactly as before.
+/// (#801). Every arm loads the SAME committed index. A restart forks those
+/// committed bytes before the retained arm can replace its write-ahead record.
+/// Each arm keeps the production single-writer ownership of its own store.
 struct Disk {
     dir: PathBuf,
     index: PathBuf,
@@ -223,7 +223,32 @@ impl Disk {
     }
     /// A new owner: a restarted process with an empty RAM cache, whose pass
     /// begins on the store as the daemon's does.
-    fn owner(&self, source: SnapshotSource) -> E2ScanFixture {
+    fn owner(&mut self, source: SnapshotSource) -> E2ScanFixture {
+        // Native acquisition writes ahead of the index save. Each
+        // counterfactual arm needs the committed predecessor, even after
+        // the retained arm advances its own store on the same transcript.
+        if !self.index.exists() {
+            let owner = E2ScanFixture::default();
+            self.begin(&owner, source);
+            return owner;
+        }
+        let dir = self.dir.join("restart");
+        std::fs::create_dir(&dir).unwrap();
+        crate::locked_state_dir::test_locks::hold(&dir);
+        let index = dir.join("scan-index.json");
+        std::fs::copy(&self.index, &index).unwrap();
+        let old_store = crate::durable_tail_store::store_dir_for_index(&self.index);
+        let new_store = crate::durable_tail_store::store_dir_for_index(&index);
+        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+            .create(&new_store).unwrap();
+        if old_store.exists() {
+            for entry in std::fs::read_dir(old_store).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::copy(entry.path(), new_store.join(entry.file_name())).unwrap();
+            }
+        }
+        self.dir = dir;
+        self.index = index;
         let owner = E2ScanFixture::default();
         self.begin(&owner, source);
         owner
@@ -298,7 +323,7 @@ fn warm_claude(c: &Corpus, disk: &Disk) -> (E2ScanFixture, ScanIndex) {
 fn compare_claude(
     c: &Corpus,
     retained: &E2ScanFixture,
-    disk: &Disk,
+    disk: &mut Disk,
     prior: ScanIndex,
     mode: (usize, usize, usize),
 ) -> ReceiptBody {
@@ -443,7 +468,7 @@ fn claude_case(name: &str) {
             // being suppressed as an unchanged body before real upload.
             c.evidence(&[api("r1", 10, 100)], &[]);
         }
-        let disk = Disk::new(&c);
+        let mut disk = Disk::new(&c);
         let (scanner, prior) = warm_claude(&c, &disk);
         let mut mode = (0, 1, 0);
         match name {
@@ -642,7 +667,7 @@ fn claude_case(name: &str) {
         if mode.1 > 0 {
             input_clock(&path);
         }
-        receipt(name, &[compare_claude(&c, &scanner, &disk, prior, mode)]);
+        receipt(name, &[compare_claude(&c, &scanner, &mut disk, prior, mode)]);
     });
 }
 
@@ -707,21 +732,30 @@ fn other_wire(source: SnapshotSource, scan: &SourceScanResult) -> Vec<u8> {
     validate_snapshot_batch_request(&wire).unwrap();
     canonical(&wire)
 }
-fn codex_case(legacy: bool) {
+fn codex_case(legacy: bool, content: bool) {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let name = if legacy {
-        "codex_legacy_acked_sticky"
-    } else {
-        "codex_v2_sticky"
+    let name = match (legacy, content) {
+        (true, false) => "codex_legacy_acked_sticky",
+        (false, false) => "codex_v2_sticky",
+        (true, true) => "codex_content_legacy",
+        (false, true) => "codex_content_v2",
     };
     if !supported(name) {
         return;
     }
     let c = corpus(name);
-    let disk = Disk::new(&c);
+    let mut disk = Disk::new(&c);
     let path = c.root.join("rollout.jsonl");
     let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z","payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}}).to_string()+"\n";
-    std::fs::write(&path, header + &codex_rows("turn-a", 10)).unwrap();
+    let content_prefix = if content {
+        [
+            json!({"type":"turn_context","timestamp":"2026-10-27T07:00:00Z",
+                "payload":{"turn_id":"turn-a","cwd":"/synthetic/codex","model":"gpt-5.2"}}),
+            json!({"type":"event_msg","timestamp":"2026-10-27T07:00:00Z",
+                "payload":{"type":"user_message","message":"Synthetic content-only replay prompt"}}),
+        ].iter().map(|line| line.to_string()+"\n").collect::<String>()
+    } else { String::new() };
+    std::fs::write(&path, header + &content_prefix + &codex_rows("turn-a", 10)).unwrap();
     input_clock(&path);
     let scanner = E2ScanFixture::default();
     let source = SnapshotSource::Codex;
@@ -758,6 +792,7 @@ fn codex_case(legacy: bool) {
         append(&path, &codex_rows("turn-c", 40));
         input_clock(&path);
     }
+    let restart = disk.owner(source);
     save_inputs(&c);
     let (tail_index, tail, modes) = other_page(&c, &scanner, source, prior.clone());
     assert_eq!(modes, (0, 1, 0), "must reuse retained Codex reduction");
@@ -765,7 +800,6 @@ fn codex_case(legacy: bool) {
     assert_eq!(modes, (1, 0, 0));
     // Disk arm (#806): a new owner restores the last commit's record from
     // the real store and Tails, never flipping the counting choice.
-    let restart = disk.owner(source);
     let (disk_index, restored, modes) = other_page(&c, &restart, source, prior);
     assert_eq!(modes, (0, 1, 0), "must restore the Codex record, then Tail");
     assert_eq!(durable_restores(&restart.cache, source).1, 1);
@@ -787,6 +821,9 @@ fn codex_case(legacy: bool) {
     assert_eq!(d, a, "disk-restored envelope differs from the RAM arm");
     assert_eq!(Sha256::digest(&a), Sha256::digest(&b));
     assert_eq!(Sha256::digest(&d), Sha256::digest(&b));
+    // The existing cross-build exporter has a fixed receipt catalog. This
+    // additional same-build content fence proof emits no catalog entry.
+    if content { return; }
     receipt(
         name,
         &[ReceiptBody {
@@ -799,12 +836,21 @@ fn codex_case(legacy: bool) {
 #[test]
 fn codex_v2_sticky() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    codex_case(false);
+    codex_case(false, false);
 }
 #[test]
 fn codex_legacy_acked_sticky() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    codex_case(true);
+    codex_case(true, false);
+}
+
+/// [money] Content-only Legacy/V2 replay preserves the emitted body and never
+/// adds the restored prefix twice; a cold Full is the independent body oracle.
+#[test]
+fn codex_content_only_caller_matches_cold_full() {
+    for legacy in [false, true] {
+        codex_case(legacy, true);
+    }
 }
 
 /// Disk-only lifecycle fixtures (#806). scripts/money_equivalence.py counts
@@ -856,7 +902,7 @@ fn restart_between_pages() {
         return;
     }
     with_e2(|| {
-        let (c, disk, path, scanner, prior) = disk_corpus(name);
+        let (c, mut disk, path, scanner, prior) = disk_corpus(name);
         let mut priors = [prior.clone(), prior.clone(), prior];
         let mut bodies = Vec::new();
         for (request, tokens) in [("r2", 20), ("r3", 30)] {
@@ -894,7 +940,7 @@ fn upgrade_without_semantic_revision() {
         return;
     }
     with_e2(|| {
-        let (c, disk, path, scanner, prior) = disk_corpus(name);
+        let (c, mut disk, path, scanner, prior) = disk_corpus(name);
         let written = disk.record_bytes();
         assert_eq!(written.len(), 1);
         disk.begin(&scanner, SnapshotSource::ClaudeCode);
@@ -940,7 +986,7 @@ fn downgrade_then_reupgrade() {
         return;
     }
     with_e2(|| {
-        let (c, disk, path, _, prior) = disk_corpus(name);
+        let (c, mut disk, path, _, prior) = disk_corpus(name);
         let downgraded = E2ScanFixture::default();
         grow(&path, "r2", 20);
         let mut down = c.raw(&downgraded, prior, 100, true, &[]);
@@ -991,6 +1037,7 @@ fn downgrade_then_reupgrade() {
 // commits. Do not remove an ignore until its stated production feature exists.
 macro_rules! pending {
     ($name:ident, $reason:literal) => {
+        /// [money] codex admission branches preserve emitted totals.
         #[test]
         #[ignore = $reason]
         fn $name() {
@@ -1117,7 +1164,7 @@ fn pi_disk_corpus(
     let path = c.root.join("session.jsonl");
     std::fs::write(&path, initial).unwrap();
     input_clock(&path);
-    let disk = Disk::new(&c);
+    let mut disk = Disk::new(&c);
     let scanner = disk.owner(SnapshotSource::Pi);
     let (mut index, scan, modes) =
         other_page(&c, &scanner, SnapshotSource::Pi, ScanIndex::default());
@@ -1366,7 +1413,7 @@ fn pi_pages_checked(
 }
 
 fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> SourceScanResult {
-    let (c, disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
+    let (c, mut disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
     let mut priors = [prior.clone(), prior.clone(), prior];
     let mut last = None;
     for value in suffix {
@@ -1403,7 +1450,7 @@ fn pi_ledger_splits(
     suffix: Vec<(Value, PiLedgerStep)>,
     final_totals: (u64, u64),
 ) {
-    let (c, disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
+    let (c, mut disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
     assert!(matches!(initial, PiLedgerStep::Emit(..)));
     let mut accepted = proof.bodies[0].items.clone();
     assert_eq!(pi_ledger_totals(&accepted), initial.totals());
@@ -1793,7 +1840,7 @@ fn pi_cli_fork_preserves_double_count() {
     }
     // M-2 will change these request/input totals when inherited usage is skipped.
     const EXPECTED_FORK_TOTALS: (u64, u64) = (3, 40);
-    let (c, disk, path, scanner, prior, mut proof) =
+    let (c, mut disk, path, scanner, prior, mut proof) =
         pi_disk_corpus("pi_cli_fork_preserves_double_count", &pi_seed());
     let fork = c.root.join("fork.jsonl");
     let copied = pi_seed()
@@ -1870,7 +1917,7 @@ fn pi_lifecycle_case(name: &str) {
     } else {
         pi_seed()
     };
-    let (c, disk, path, mut scanner, prior, mut proof) = pi_disk_corpus(name, &initial);
+    let (c, mut disk, path, mut scanner, prior, mut proof) = pi_disk_corpus(name, &initial);
     let mut priors = if downgrade {
         drop(scanner);
         scanner = E2ScanFixture::default();
@@ -1998,7 +2045,7 @@ fn pi_acquisition_metadata_changes() {
         return;
     }
     use std::os::unix::fs::PermissionsExt;
-    let (c, disk, path, scanner, prior, mut proof) =
+    let (c, mut disk, path, scanner, prior, mut proof) =
         pi_disk_corpus("pi_acquisition_metadata_changes", &pi_seed());
     let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
     let permissions = std::fs::metadata(&path).unwrap().permissions().mode();
@@ -2058,4 +2105,126 @@ fn pi_acquisition_metadata_changes() {
         1,
     );
     proof.finish(&c, &disk);
+}
+
+/// [money] Admission branches omitted by the native-authority sticky fixture. Check
+/// real scanner output against explicit additive totals, without a frozen parser.
+#[test]
+fn codex_admission_branches_preserve_emitted_totals() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("codex_admission_branches") {
+        return;
+    }
+    let usage = |n: u64| json!({"input_tokens":n,"cached_input_tokens":0,
+        "output_tokens":0,"reasoning_output_tokens":0,"total_tokens":n});
+    let ui = |id: u64, last: Option<u64>, total: u64| {
+        let mut row = json!({"type":"event_msg","timestamp":"2026-10-27T07:00:02Z",
+            "fixture_line":id,"payload":{"type":"token_count","info":{
+                "model":"gpt-5.2","total_token_usage":usage(total)}}});
+        if let Some(last) = last {
+            row["payload"]["info"]["last_token_usage"] = usage(last);
+        }
+        row
+    };
+    let event = |kind: &str, turn: &str| json!({"type":"event_msg",
+        "timestamp":"2026-10-27T07:00:01Z","payload":{"type":kind,"turn_id":turn}});
+    let start = || event("task_started", "a");
+    let close = || event("task_complete", "a");
+    let mut fallback = ui(1, Some(1), 1);
+    fallback["payload"]["info"].as_object_mut().unwrap().remove("model");
+    let mut dropped = ui(1, Some(1), 1);
+    dropped["timestamp"] = json!("invalid");
+    let mut explicit = ui(1, Some(1), 1);
+    explicit["payload"]["info"]["last_token_usage"]["request_count"] = json!(3);
+    explicit["payload"]["info"]["total_token_usage"]["request_count"] = json!(3);
+    let mut overflow = vec![start()];
+    overflow.extend((1..=66).map(|i| {
+        let mut row = ui(i, Some(1), i);
+        row["payload"]["info"]["model"] = json!(format!("fixture-model-{i}"));
+        row
+    }));
+    overflow.push(close());
+    let repeated = ui(2, Some(1), 1);
+    for (name, legacy, lines, expected) in [
+        ("unbound", false, vec![fallback.clone(), repeated.clone(), repeated], 2),
+        ("base-reset-zero-repeat", false, vec![start(), ui(1,None,5), ui(2,None,7),
+            ui(3,None,2), ui(4,Some(0),2), ui(5,Some(1),3), ui(6,Some(1),3), close()], 3),
+        ("legacy-reset", true, vec![ui(1,None,5),ui(2,None,7),ui(3,None,2),
+            ui(4,Some(0),2),ui(5,Some(1),3),ui(5,Some(1),3)],10),
+        ("closure-mismatch", false, vec![start(),ui(1,Some(1),1),event("task_started","b"),
+            ui(2,Some(1),2),event("task_complete","other")],2),
+        ("dropped-staging", false, vec![start(),dropped,ui(2,Some(1),2),close()],1),
+        ("pending-overflow", false, overflow,66),
+        ("model-fallback", true, vec![fallback,ui(2,Some(1),2)],2),
+        ("explicit-request-count", false, vec![start(),explicit,close()],1),
+        ("invalid-closure", false, vec![close(),event("task_complete",""),
+            event("task_complete", &"x".repeat(129)), start(),ui(1,Some(1),1),
+            event("task_complete", ""),close()],1),
+    ] {
+        let c = corpus(&format!("codex-admission-{name}"));
+        let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
+            "payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}});
+        let prefix = header.to_string()+"\n";
+        let text = std::iter::once(header).chain(lines).map(|v| v.to_string()+"\n").collect::<String>();
+        let path = c.root.join("rollout.jsonl");
+        if name == "dropped-staging" {
+            // Lead B: main quarantines the whole entity, including its valid
+            // sibling usage. Exercise that policy after a genuine disk restore
+            // and Tail, as well as from RAM and a cold byte-zero read.
+            let source = SnapshotSource::Codex;
+            let _cutover = crate::snapshots::TestCutover::set(0);
+            let mut disk = Disk::new(&c);
+            let scanner = E2ScanFixture::default();
+            disk.begin(&scanner, source);
+            std::fs::write(&path, prefix + &codex_rows("seed", 1)).unwrap();
+            input_clock(&path);
+            let (mut prior, seed, modes) = other_page(&c, &scanner, source, ScanIndex::default());
+            assert_eq!(modes, (1, 0, 0));
+            assert!(!seed.snapshots.is_empty());
+            prior.record_accepted_snapshot_fingerprints(&seed.snapshots.iter()
+                .map(|s| s.snapshot_fingerprint.clone()).collect());
+            let prior = disk.commit(&scanner.cache, source, &mut prior);
+            append(&path, text.split_once('\n').unwrap().1);
+            input_clock(&path);
+            let restart = disk.owner(source);
+            let arms = [
+                other_page(&c, &scanner, source, prior.clone()),
+                other_page(&c, &E2ScanFixture::default(), source, prior.clone()),
+                other_page(&c, &restart, source, prior.clone()),
+            ];
+            assert_eq!(arms[0].2, (0, 1, 0));
+            assert_eq!(arms[1].2, (1, 0, 0));
+            assert_eq!(arms[2].2, (0, 1, 0));
+            assert_eq!(durable_restores(&restart.cache, source).1, 1);
+            for (index, scan, _) in &arms {
+                assert_eq!(scan.dropped_usage_record_count, 1);
+                assert_eq!(scan.recognized_usage_drop_count, 1);
+                assert!(scan.snapshots.is_empty(), "quarantine emits neither money nor a $0 body");
+                let key = prior.files.keys().next().unwrap();
+                assert!(index.files.get(key).map_or(true, |entry|
+                    entry.source_file_fingerprint.is_empty()
+                        || entry.size_bytes < std::fs::metadata(&path).unwrap().len()),
+                    "the lossy extent never settles");
+                // An ordinary next generation still discovers the held file
+                // and counts its dropped usage; no manual re-arm is needed.
+                let (_, retry, _) = other_page(&c, &E2ScanFixture::default(), source, index.clone());
+                assert!(retry.snapshots.is_empty());
+                assert_eq!(retry.dropped_usage_record_count, 1);
+            }
+            let emitted = |scan: &SourceScanResult| serde_json::to_vec(&scan.snapshots).unwrap();
+            assert_eq!(emitted(&arms[0].1), emitted(&arms[1].1));
+            assert_eq!(emitted(&arms[2].1), emitted(&arms[1].1));
+            continue;
+        }
+        std::fs::write(&path, text).unwrap();
+        input_clock(&path);
+        let _cutover = crate::snapshots::TestCutover::set(if legacy { i64::MAX } else { 0 });
+        let (_, scan, _) = other_page(&c, &E2ScanFixture::default(), SnapshotSource::Codex, ScanIndex::default());
+        assert_eq!(scan.snapshots.iter().map(|s| s.input_tokens).sum::<u64>(), expected, "{name}");
+        if name == "explicit-request-count" {
+            assert_eq!(scan.snapshots.iter().map(|s| s.request_count).sum::<u64>(), 3);
+        }
+        let wire = other_wire(SnapshotSource::Codex, &scan);
+        assert!(!wire.is_empty(), "{name}: emitted body must validate");
+    }
 }

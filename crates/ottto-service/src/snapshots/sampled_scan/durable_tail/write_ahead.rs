@@ -385,7 +385,16 @@ impl SharedCache {
                 lease,
             )
             .ok_or(HeldCause::Incompatible)?;
-        self.authorize_predecessor(lease, source, key, index, &binding, checkpoint, &m)?;
+        self.authorize_predecessor(
+            lease,
+            source,
+            key,
+            index,
+            &binding,
+            checkpoint,
+            &m,
+            write_ahead_eligible,
+        )?;
         acquired::capture_chain(
             acquired::ChainInputs {
                 source,
@@ -442,6 +451,7 @@ impl SharedCache {
             &binding,
             checkpoint,
             &m,
+            false,
         )?;
         chain.rebind(
             opened_object_identity,
@@ -465,14 +475,15 @@ impl SharedCache {
         binding: &Binding,
         checkpoint: &Checkpoint,
         held: &std::fs::Metadata,
+        full: bool,
     ) -> Result<(), HeldCause> {
         let ds = durable_source(source).ok_or(HeldCause::Incompatible)?;
         let digest = binding.key;
         if self.durable().is_some_and(|mut stores| {
             stores
                 .slot(ds)
-                .as_ref()
-                .is_some_and(|slot| slot.store.absent(&digest))
+                .as_mut()
+                .is_some_and(|slot| slot.store.missing_cause(&digest).is_some())
         }) {
             return Ok(());
         }
@@ -483,6 +494,59 @@ impl SharedCache {
             })
         }) {
             return Ok(());
+        }
+        if full {
+            let mut stores = self.durable().ok_or(HeldCause::Fence)?;
+            let slot = stores.slot(ds).as_mut().ok_or(HeldCause::Fence)?;
+            match slot
+                .store
+                .read_bounded(&digest, lease)
+                .map_err(|_| HeldCause::CustodyBound)?
+            {
+                ReadOutcome::Found(record) => {
+                    let same_context = record.record.binding.context == binding.context;
+                    let native = record.format == store::FORMAT_V3
+                        && record
+                            .record
+                            .acquisition
+                            .is_some_and(|a| a.acquired_revision == effective_revision(source));
+                    let recovered_carrier = index
+                        .files
+                        .get(key)
+                        .map_or(true, ScanIndexEntry::has_unverified_source)
+                        && record.format == store::FORMAT_V1
+                        && record.envelope_audit_debt.is_some();
+                    if same_context
+                        && (native || recovered_carrier)
+                        && record.record.allowlist == ds.properties().allowlist()
+                    {
+                        // A completed byte-zero read replaces a verified current
+                        // representation; it never reuses the predecessor's body.
+                        // Native commit still checks this read's O, checkpoint and
+                        // PRE index, and the store checks this exact predecessor.
+                        slot.store.authorize(
+                            &record,
+                            &Expected {
+                                binding: record.record.binding.clone(),
+                                committed_generation: record.index_generation,
+                            },
+                        );
+                        return Ok(());
+                    }
+                    if !same_context {
+                        // This namespace cannot mutate the foreign record. Keep
+                        // the ordinary Full publication, without a staged write.
+                        return Err(HeldCause::Incompatible);
+                    }
+                }
+                ReadOutcome::Refused(reason) => return Err(HeldCause::Protected(reason)),
+                ReadOutcome::Missing => return Ok(()),
+            }
+            // The unmatched probe is gone before strict legacy authorization
+            // reads its predecessor. Its allocations no longer own this credit.
+            lease
+                .refund(store::RESTORE_INPUT_BYTES)
+                .map_err(|_| HeldCause::CustodyBound)?;
         }
         // A cold v3 predecessor is read once, then every warm mutation uses
         // the saved stamp. It owes no v1 old-byte witness/custody slot.
@@ -536,8 +600,14 @@ impl SharedCache {
         ) else {
             return Err(HeldCause::Fence);
         };
-        authorize_strict(slot, source, key, index, custody, binding, &certificate);
+        let refused = authorize_strict(slot, source, key, index, custody, binding, &certificate);
         stores.release_idle_custody(&digest);
+        if refused == Some(store::Refusal::Corrupt) {
+            // Known-corrupt disk state may coexist with valid RAM. It cannot
+            // authorize a new native chain: keep the ordinary RAM publication
+            // without staging or receipt debt. Eviction retains the disk hold.
+            return Err(HeldCause::Protected(store::Refusal::Corrupt));
+        }
         Ok(())
     }
 
@@ -745,7 +815,7 @@ impl SharedCache {
                 Err(failure) => return self.resolve_failed_preparation(failure, fences),
             }
         };
-        // Outside Stores: conditional rename and survivor stamp, no fsync per record.
+        // Outside Stores: conditional rename and survivor stamp; pass fsync is unchanged.
         let committed = match pending.commit() {
             Ok(committed) => committed,
             Err(failure) => return self.resolve_failed_preparation(failure, fences),
@@ -978,12 +1048,15 @@ impl SharedCache {
             };
         };
         let stores = &mut *guard;
+        let absent = stores.slots[source.slot()]
+            .as_mut()
+            .is_some_and(|slot| slot.store.absent(&digest));
         let prior = match stores.slots[source.slot()].as_mut() {
             None => PriorRecord::Unobserved(Degraded::Disabled),
             Some(slot) if slot.store.disabled().is_some() => {
                 PriorRecord::Unobserved(Degraded::Disabled)
             }
-            Some(slot) if slot.store.absent(&digest) => PriorRecord::Absent,
+            Some(_) if absent => PriorRecord::Absent,
             // Header-only classification of the survivor, never its body.
             Some(slot) => match slot.store.guard_with_carrier(&digest, true, &[0; 32]).err() {
                 Some(refusal) => PriorRecord::Protected(refusal),

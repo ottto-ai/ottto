@@ -332,7 +332,7 @@ pub(crate) struct Counters {
     pub(crate) upgrade_state_missing: u64,
     pub(crate) migration: [u64; 4], // held, awaiting save, claimed, durably replaced
     pub(crate) refused_record: u64,
-    pub(crate) durable_held: [u64; 8],
+    pub(crate) durable_held: [u64; 9],
     pub(crate) held_census: [u64; 2],
     pub(crate) ineligible: BTreeMap<&'static str, u64>,
     pub(crate) certificate_refused: BTreeMap<&'static str, u64>,
@@ -409,7 +409,7 @@ impl Counters {
              active_bound[claude,codex,pi]={:?} resource_full={{{}}} rederive_head_bytes={} rederive_named_lines={} rederive_line_bytes={} rederive_budget[refused,refused_bytes]={:?} not_persisted={{{}}} ineligible={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
-             bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,retired_upgrade_missing,receipt_pending,behind_accepted]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
+             bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,retired_upgrade_missing,receipt_pending,behind_accepted,repin]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
@@ -1201,7 +1201,7 @@ fn v3_replay_scope(
         } else {
             0
         },
-        source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled(),
+        source == SnapshotSource::ClaudeCode,
     )
 }
 
@@ -1484,6 +1484,9 @@ fn retail_bytes(source: SnapshotSource, metric: usize) -> u64 {
     })
 }
 
+// One already-funded graph and the lease that follows its transfer.
+type PreparedTransfer = (Box<Taken<CachedJsonlReduction>>, store::ActiveLease);
+
 pub(crate) use crate::snapshots::DurableCustody;
 impl DurableCustody {
     pub(crate) fn take_retail(&mut self) -> Option<RetailAttempt> {
@@ -1545,27 +1548,27 @@ impl DurableCustody {
         }
     }
     pub(crate) fn owed(&self) -> Option<&ReceiptOwed> {
-        self.owed.as_ref()
+        self.owed.as_deref()
     }
     /// While debt exists the chain lives only inside it, never twice.
     pub(crate) fn chain(&self) -> Option<&AcquiredChain> {
-        self.chain.as_ref()
+        self.chain.as_deref()
     }
     pub(crate) fn chain_mut(&mut self) -> Option<&mut AcquiredChain> {
-        self.chain.as_mut()
+        self.chain.as_deref_mut()
     }
     pub(crate) fn take_chain(&mut self) -> Option<AcquiredChain> {
-        self.chain.take()
+        self.chain.take().map(|chain| *chain)
     }
     pub(crate) fn take_owed(&mut self) -> Option<ReceiptOwed> {
-        self.owed.take()
+        self.owed.take().map(|owed| *owed)
     }
     #[allow(clippy::result_large_err)] // Refusal returns the original debt.
     pub(crate) fn put_owed(&mut self, owed: ReceiptOwed) -> Result<(), ReceiptOwed> {
         if self.owed.is_some() || self.chain.is_some() {
             return Err(owed);
         }
-        self.owed = Some(owed);
+        self.owed = Some(Box::new(owed));
         Ok(())
     }
     #[allow(clippy::result_large_err)] // Refusal returns the original chain.
@@ -1573,7 +1576,7 @@ impl DurableCustody {
         if self.owed.is_some() || self.chain.is_some() {
             return Err(chain);
         }
-        self.chain = Some(chain);
+        self.chain = Some(Box::new(chain));
         Ok(())
     }
 }
@@ -1704,19 +1707,6 @@ impl RetailAttempt {
         self.range(file, at)?;
         self.accounted(file).read(bytes)
     }
-    #[cfg(test)]
-    pub(crate) fn read_at(
-        &mut self,
-        file: &File,
-        bytes: &mut [u8],
-        offset: u64,
-    ) -> std::io::Result<usize> {
-        use std::os::unix::fs::FileExt;
-        let limit = self.range(file, offset)?.min(bytes.len());
-        let n = file.read_at(&mut bytes[..limit], offset)?;
-        self.count(offset, n);
-        Ok(n)
-    }
     pub(crate) fn finish(self) {}
 }
 
@@ -1728,17 +1718,17 @@ fn authorize_strict(
     custody: &mut KeyCustody,
     replacement: &Binding,
     certificate: &DurableCertificate,
-) {
+) -> Option<store::Refusal> {
     slot.indexed = index.files.len();
     slot.store
         .revoke(&store::key_digest(DurableSource::ClaudeCode, key));
-    let Some(scope) = slot.decided.get(key).and_then(ScopeDecision::scope) else {
-        return;
-    };
+    let scope = slot.decided.get(key).and_then(ScopeDecision::scope)?;
     let source = durable_source(snapshot_source).expect("durable source");
     let digest = store::key_digest(source, key);
-    let ReadOutcome::Found(record) = slot.store.read(&digest) else {
-        return;
+    let record = match slot.store.read(&digest) {
+        ReadOutcome::Found(record) => record,
+        ReadOutcome::Missing => return None,
+        ReadOutcome::Refused(reason) => return Some(reason),
     };
     let interpretation = Interpretation::of(
         snapshot_source,
@@ -1780,6 +1770,7 @@ fn authorize_strict(
             }
         }
     }
+    None
 }
 
 impl SharedCache {
@@ -2636,47 +2627,205 @@ impl SharedCache {
         start: bool,
     ) -> Option<store::Refusal> {
         let source = durable_source(source)?;
-        self.durable()?
+        let mut stores = self.durable()?;
+        stores
             .slot(source)
             .as_mut()?
             .store
             .full_hold(&store::key_digest(source, key), start)
     }
 
-    /// Absent upgrade records are counted Misses, never unreadable holds.
-    /// Repeated growth Fulls share the exact same map as stale/no-match/retail.
+    fn missing_reduction_cause(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+    ) -> Result<Option<&'static str>, store::ActiveOverBudget> {
+        let Some(ds) = durable_source(source) else {
+            return Ok(None);
+        };
+        self.durable_funded_probe(source, |cache| {
+            cache.durable().and_then(|mut stores| {
+                stores
+                    .slot(ds)
+                    .as_mut()?
+                    .store
+                    .missing_cause(&store::key_digest(ds, key))
+            })
+        })
+    }
+
+    /// Preserve discovery of unread retired growth even outside the activity
+    /// window. Reuse the missing classifier; quiet files do not probe the store.
+    pub(in crate::snapshots) fn missing_reduction_growth(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        files: &BTreeMap<String, ScanIndexEntry>,
+        length: u64,
+    ) -> bool {
+        files
+            .get(key)
+            .is_some_and(|entry| length > entry.size_bytes)
+            && self
+                .missing_reduction_cause(source, key)
+                .is_ok_and(|cause| cause == Some("repin"))
+    }
+
     pub(in crate::snapshots) fn upgrade_full_allowed(
         &self,
+        source: SnapshotSource,
         key: &str,
         file: &File,
         index: &ScanIndex,
+        page: &mut HistoryPage,
+    ) -> bool {
+        self.upgrade_full_admission(source, key, file, index, page, true)
+    }
+
+    /// A group reads as one unit. Reserve its existing history page and probe
+    /// every member's existing pace before spending any member's allowance.
+    pub(in crate::snapshots) fn upgrade_group_full_allowed(
+        &self,
+        source: SnapshotSource,
+        members: &[CandidateFile],
+        index: &ScanIndex,
+        page: &mut HistoryPage,
+    ) -> bool {
+        let mut reserved = page.clone();
+        let mut retired = Vec::new();
+        for member in members.iter().filter(|member| {
+            index
+                .files
+                .get(&local_index_key(&member.path))
+                .is_some_and(|entry| member.size_bytes > entry.size_bytes)
+        }) {
+            let key = local_index_key(&member.path);
+            let Ok(file) = File::open(&member.path) else {
+                return false;
+            };
+            if !self.upgrade_full_admission(source, &key, &file, index, &mut reserved, false) {
+                return false;
+            }
+            if self
+                .missing_reduction_cause(source, &key)
+                .is_ok_and(|cause| cause == Some("repin"))
+            {
+                retired.push(key);
+            }
+        }
+        let digests: Vec<_> = retired
+            .iter()
+            .map(|key| full_pace_key(source, key))
+            .collect();
+        if !digests.is_empty()
+            && !self
+                .durable()
+                .is_some_and(|mut stores| stores.fund_debts(&digests))
+        {
+            return false;
+        }
+        // No input, file opens or other fallible admission remains between
+        // the all-member reservation and these ordinary paid-pace spends.
+        if !retired
+            .iter()
+            .all(|key| self.start_missing_full(source, key))
+        {
+            return false;
+        }
+        *page = reserved;
+        true
+    }
+
+    fn start_missing_full(&self, source: SnapshotSource, key: &str) -> bool {
+        if !self
+            .durable()
+            .is_some_and(|mut stores| stores.fund_debt(full_pace_key(source, key)).is_some())
+            || !self.paced_with_cause(
+                source,
+                key,
+                SystemTime::now(),
+                (false, false, true),
+                Some(4),
+            )
+        {
+            return false;
+        }
+        if let Some(mut stores) = self.durable() {
+            stores.counters.upgrade_missing_full += 1;
+            Counters::bump(&mut stores.counters.resource_full, "repin");
+        }
+        true
+    }
+
+    /// Missing reductions share one per-key pace. Retired-pin rebuilds also
+    /// reserve the existing history page before the first native input.
+    fn upgrade_full_admission(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        file: &File,
+        index: &ScanIndex,
+        page: &mut HistoryPage,
+        start: bool,
     ) -> bool {
         let Some(entry) = index.files.get(key).filter(|e| {
             !e.source_file_fingerprint.is_empty() || e.last_upload_body_witness.is_some()
         }) else {
             return true;
         };
-        let absent = self.durable().is_some_and(|mut stores| {
-            stores
-                .slot(DurableSource::ClaudeCode)
-                .as_ref()
-                .is_some_and(|slot| {
-                    slot.store
-                        .absent(&store::key_digest(DurableSource::ClaudeCode, key))
-                })
-        });
-        // Non-growth edits retain their ordinary A2 path. This is only the
-        // repeating, known-absence growth cause, not a new first-read gate.
-        if !absent || !file.metadata().is_ok_and(|m| m.len() > entry.size_bytes) {
+        let Some(_) = durable_source(source) else {
+            return true;
+        };
+        match self.durable_classifier_enabled(source) {
+            Ok(false) => return true, // Disabled/absent stores preserve native Full behavior.
+            Err(_) => return false,
+            Ok(true) => {}
+        }
+        let cause = match self.missing_reduction_cause(source, key) {
+            Ok(cause) => cause,
+            Err(_) => return false,
+        };
+        let Some(cause) = cause else {
+            return true;
+        };
+        if cause != "repin" && (source != SnapshotSource::ClaudeCode || !restart_restore::enabled())
+        {
             return true;
         }
-        self.paced_cause_full(
-            key,
-            file,
-            entry.size_bytes,
-            std::time::SystemTime::now(),
-            Some(4),
-        )
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        if metadata.len() <= entry.size_bytes {
+            return cause != "repin"; // Quiet retired records consume no source input.
+        }
+        if cause == "repin" {
+            if metadata.len() > max_jsonl_file_bytes(SnapshotSource::ClaudeCode)
+                || !page.reserve(key, metadata.len())
+            {
+                return false;
+            }
+            return if start {
+                self.start_missing_full(source, key)
+            } else {
+                self.paced_with_cause(
+                    source,
+                    key,
+                    SystemTime::now(),
+                    (false, false, false),
+                    Some(4),
+                )
+            };
+        }
+        if !start {
+            return self.paced_with_cause(
+                source,
+                key,
+                SystemTime::now(),
+                (false, near_source_cap(source, metadata.len()), false),
+                Some(4),
+            );
+        }
+        self.paced_cause_full(key, file, entry.size_bytes, SystemTime::now(), Some(4))
     }
 
     pub(in crate::snapshots) fn migration_start(
@@ -2811,9 +2960,9 @@ impl SharedCache {
         file: &File,
         index: &ScanIndex,
     ) -> Result<Option<UpgradeRead>, RetailHold> {
-        if self.durable().is_some_and(|s| {
+        if self.durable().is_some_and(|mut s| {
             s.slots[DurableSource::ClaudeCode.slot()]
-                .as_ref()
+                .as_mut()
                 .is_some_and(|c| {
                     c.store
                         .absent(&store::key_digest(DurableSource::ClaudeCode, key))
@@ -2849,7 +2998,7 @@ impl SharedCache {
         };
         let mut stores = self.durable().ok_or(RetailHold::AccountingLost)?;
         if !stores.slots[DurableSource::ClaudeCode.slot()]
-            .as_ref()
+            .as_mut()
             .is_some_and(|s| s.store.absent(&key))
         {
             if !stores
@@ -3055,6 +3204,7 @@ impl SharedCache {
     /// the parser's opened FD for `path`, not yet read; bounded positional
     /// content reads preserve its offset, and the read plan repositions it.
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     pub(crate) fn durable_restore(
         &self,
         snapshot_source: SnapshotSource,
@@ -3386,6 +3536,8 @@ impl SharedCache {
         );
         if full {
             RestoreOutcome::Miss(MissClass::Resource(phase))
+        } else if phase == "rederive_quiet" {
+            RestoreOutcome::QuietPending
         } else {
             RestoreOutcome::Pending
         }
@@ -3399,7 +3551,12 @@ impl SharedCache {
         accepted_end: u64,
         phase: &'static str,
     ) -> bool {
-        let granted = if phase.starts_with("rederive_") || phase == "decode" {
+        let granted = if phase == "rederive_quiet" {
+            // Restore itself read no input. The scanner already selected this
+            // key for an ordinary reparse and checked its history-upgrade gate.
+            // Spend the existing cross-cause pace only at native Full start.
+            self.paced_admission(source, key, SystemTime::now(), false, false, true)
+        } else if phase.starts_with("rederive_") || phase == "decode" {
             self.rederive_full(source, key, file, accepted_end, true)
         } else {
             self.paced_growth_full(source, key, file, accepted_end, SystemTime::now(), phase)
@@ -3529,6 +3686,28 @@ impl SharedCache {
         }
     }
 
+    fn retire_or_hold(
+        &self,
+        original_matches: bool,
+        source: DurableSource,
+        record: &store::DurableRecord,
+        expected: &Expected,
+        edge: RetirementEdge,
+    ) {
+        if original_matches {
+            self.queue_rederive_retirement(source, record, expected, edge);
+        } else if let Some(mut stores) = self.durable() {
+            Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unproven");
+            drop(stores);
+            self.hold_rederive_retirement(
+                source,
+                record.record.binding.key,
+                edge,
+                "native_replacement_receipt",
+            );
+        }
+    }
+
     /// Per-edge original binding must already be eligible. Failure to retain
     /// authority holds safely; it never manufactures a deletion witness.
     fn queue_rederive_retirement(
@@ -3576,9 +3755,8 @@ impl SharedCache {
             .as_ref()
             .is_some_and(|p| p.same_predecessor(&proof))
         {
-            Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unproven");
             drop(stores);
-            self.hold_rederive_retirement(source, key, edge, "native_replacement_receipt");
+            self.retire_or_hold(false, source, record, expected, edge);
             return;
         }
         let debt = stores.fund_debt(key).expect("funded");
@@ -3784,6 +3962,7 @@ impl SharedCache {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn restore_known(
         &self,
         snapshot_source: SnapshotSource,
@@ -3818,13 +3997,12 @@ impl SharedCache {
                 // SOURCE cond. 5: a record surviving behind a cleared selection
                 // (the D3 strict rebind's carrier, no new persisted field) is a
                 // refused stale record. A disabled store cannot prove absence.
-                let Some(slot) = stores
-                    .slot(source)
-                    .as_mut()
-                    .filter(|slot| !slot.store.absent(&store_key))
-                else {
+                let Some(slot) = stores.slot(source).as_mut() else {
                     return Err(MissClass::SelectionCleared.into());
                 };
+                if slot.store.absent(&store_key) {
+                    return Err(MissClass::SelectionCleared.into());
+                }
                 slot.store.note_stale_refusal();
                 drop(stores);
                 return Err(self.stale_selection_full(snapshot_source, key, held));
@@ -3906,6 +4084,7 @@ impl SharedCache {
                     &interpretation.namespace.0,
                     index.active_upload_context_fingerprint.as_deref(),
                 )
+            && record.format != store::FORMAT_V3
             && !audit_carrier_matches(
                 &record,
                 index,
@@ -3995,23 +4174,13 @@ impl SharedCache {
                         "s2_skipped_real_edit.replaced",
                     );
                 }
-                if original_matches {
-                    self.queue_rederive_retirement(
-                        source,
-                        &record,
-                        &original_expected,
-                        RetirementEdge::AcceptedObject,
-                    );
-                } else if let Some(mut stores) = self.durable() {
-                    Counters::bump(&mut stores.counters.ineligible, "rederive_retire_unproven");
-                    drop(stores);
-                    self.hold_rederive_retirement(
-                        source,
-                        store_key,
-                        RetirementEdge::AcceptedObject,
-                        "native_replacement_receipt",
-                    );
-                }
+                self.retire_or_hold(
+                    original_matches,
+                    source,
+                    &record,
+                    &original_expected,
+                    RetirementEdge::AcceptedObject,
+                );
                 return Err(MissClass::RealEdit(FullReason::Replaced).into());
             }
             if a.behind(metadata.len()) {
@@ -4024,12 +4193,36 @@ impl SharedCache {
                 }
                 return Err(MissClass::AcceptedFloor.into());
             }
+            if source == DurableSource::ClaudeCode
+                && record.format == store::FORMAT_V3
+                && a.strict
+                && a.verified_extent
+                && record.record.binding.context == original_expected.binding.context
+                && record.record.certificate.sealed_offset < a.end
+            {
+                // A binary without the store may have accepted a newer Full.
+                // An older record cannot stand in for that accepted prefix;
+                // reacquire from byte zero before replacing its exact stamp.
+                Counters::bump(
+                    &mut self
+                        .durable()
+                        .ok_or(MissClass::Unavailable)?
+                        .counters
+                        .ineligible,
+                    "entry_changed",
+                );
+                return Err(MissClass::Failure(Failure::Ineligible(
+                    store::Ineligible::EntryChanged,
+                ))
+                .into());
+            }
         }
         if record.record.binding.context
             == store::context_digest(
                 &interpretation.namespace.0,
                 index.active_upload_context_fingerprint.as_deref(),
             )
+            && record.format != store::FORMAT_V3
             && !audit_carrier_matches(
                 &record,
                 index,
@@ -4110,26 +4303,13 @@ impl SharedCache {
                                                     full_reason_class(edit),
                                                 );
                                             }
-                                            if original_matches {
-                                                self.queue_rederive_retirement(
-                                                    source,
-                                                    &record,
-                                                    &original_expected,
-                                                    RetirementEdge::IndependentEdit,
-                                                );
-                                            } else if let Some(mut stores) = self.durable() {
-                                                Counters::bump(
-                                                    &mut stores.counters.ineligible,
-                                                    "rederive_retire_unproven",
-                                                );
-                                                drop(stores);
-                                                self.hold_rederive_retirement(
-                                                    source,
-                                                    store_key,
-                                                    RetirementEdge::IndependentEdit,
-                                                    "native_replacement_receipt",
-                                                );
-                                            }
+                                            self.retire_or_hold(
+                                                original_matches,
+                                                source,
+                                                &record,
+                                                &original_expected,
+                                                RetirementEdge::IndependentEdit,
+                                            );
                                             return Err(MissClass::Failure(Failure::Certificate(
                                                 CertificateRefusal::Changed(edit),
                                             ))
@@ -4359,6 +4539,7 @@ impl SharedCache {
     /// protocol. Codex v1 has no unique mapping and gets no chain; nothing is
     /// restamped. O is computed on the held FD, whose position is restored.
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn restored_chain(
         &self,
         snapshot_source: SnapshotSource,
@@ -4505,6 +4686,7 @@ impl SharedCache {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn restore_record_content(
         &self,
         source: SnapshotSource,
@@ -4534,13 +4716,15 @@ impl SharedCache {
                     .map(|e| e.size_bytes)
             })
             .unwrap_or(record.record.certificate.length);
-        if held
+        let quiet = held
             .metadata()
             .map_err(|_| Failure::Certificate(CertificateRefusal::ReadError))?
             .len()
             <= committed
-            && v3.is_some()
-        {
+            && v3.is_some();
+        // An empty body cannot restore anything; preserve the no-input quiet
+        // refusal before allocating a decoder for it.
+        if quiet && record.record.body.is_empty() {
             if let Some(mut stores) = self.durable() {
                 stores.counters.restore_pending_quiet[diagnostic_source_slot(source)] += 1;
             }
@@ -4554,11 +4738,22 @@ impl SharedCache {
         lease
             .charge(scope.0.len() as u64)
             .map_err(|_| Failure::Resource("certificate_scope"))?;
-        let (checkpoint, _) = record
-            .record
-            .certificate
-            .restore_grown(held, scope.clone())
-            .map_err(Failure::Certificate)?;
+        let mut certificate = record.record.certificate.clone();
+        if record.format == store::FORMAT_V3 {
+            // The verified envelope carries scheduling debt across the gap
+            // between a write-ahead replacement and its index save.
+            certificate.audit_debt_unix_seconds = record.envelope_audit_debt;
+        }
+        let checkpoint = if quiet {
+            None
+        } else {
+            Some(
+                certificate
+                    .restore_grown(held, scope.clone())
+                    .map_err(Failure::Certificate)?
+                    .0,
+            )
+        };
         let decoded = codec::decode_bounded(&record.record.body, source, lease).map_err(
             |reason| match reason {
                 crate::durable_tail_codec::DecodeFailure::Budget => Failure::Resource("decode"),
@@ -4600,6 +4795,23 @@ impl SharedCache {
         let digest = record.record.binding.key;
         let extent = record.record.certificate.length;
         let content = decoded.has_content();
+        // Quiet input may restore the content-free reduction. Only replay of
+        // private content needs a growth grant and must precede sample reads.
+        if quiet && content {
+            if let Some(mut stores) = self.durable() {
+                stores.counters.restore_pending_quiet[diagnostic_source_slot(source)] += 1;
+            }
+            return Err(Failure::Resource("rederive_quiet"));
+        }
+        let checkpoint = match checkpoint {
+            Some(checkpoint) => checkpoint,
+            None => {
+                certificate
+                    .restore_grown(held, scope.clone())
+                    .map_err(Failure::Certificate)?
+                    .0
+            }
+        };
         if content {
             self.rederive_gate(source, digest, extent, false, false)?;
         }
@@ -4894,11 +5106,14 @@ impl SharedCache {
         }
     }
 
+    // The transfer reservation covers this box before allocation; return only
+    // its pointer, never another large by-value graph in the scan-step frame.
+    #[inline(never)]
     pub(in crate::snapshots) fn take_prepared(
         &self,
         source: SnapshotSource,
         key: &str,
-    ) -> Result<Option<(Taken<CachedJsonlReduction>, store::ActiveLease)>, ()> {
+    ) -> Result<Option<PreparedTransfer>, ()> {
         if self.retained().is_ok_and(|cache| cache.peek(key).is_none()) {
             return Ok(None);
         }
@@ -4908,7 +5123,7 @@ impl SharedCache {
             return Err(());
         };
         match self.take(key) {
-            Some(taken) => Ok(Some((taken, lease))),
+            Some(taken) => Ok(Some((Box::new(taken), lease))),
             None => {
                 lease.release();
                 Ok(None)
@@ -5114,16 +5329,14 @@ impl SharedCache {
             }) {
                 Ok(report) => {
                     slot.skill_label_purge_complete = report.refused == 0;
-                    *stores
-                        .counters
-                        .not_persisted
-                        .entry("skill_label_purged")
-                        .or_default() += report.erased;
-                    *stores
-                        .counters
-                        .not_persisted
-                        .entry("skill_label_purge_failed")
-                        .or_default() += report.refused;
+                    for (class, count) in [
+                        ("skill_label_purged", report.erased),
+                        ("skill_label_purge_failed", report.refused),
+                    ] {
+                        if count > 0 {
+                            *stores.counters.not_persisted.entry(class).or_default() += count;
+                        }
+                    }
                 }
                 Err(_) => {
                     Counters::bump(
@@ -5234,7 +5447,7 @@ impl SharedCache {
                 let interpretation =
                     Interpretation::of(snapshot_source, &key, index, identity_capture, namespace);
                 // Only entries the save kept bind; a dropped key has no entry.
-                let Some(expected) = expected(
+                let Some(mut expected) = expected(
                     source,
                     snapshot_source,
                     &key,
@@ -5244,6 +5457,39 @@ impl SharedCache {
                     None,
                 ) else {
                     continue;
+                };
+                // A native-settled resident keeps its V3 identity. Post-save
+                // custody may change the carrier, but must never downgrade its
+                // representation or manufacture a different acquisition.
+                let acquisition = if let Some(chain) =
+                    cache.custody(&key).and_then(DurableCustody::chain)
+                {
+                    if chain.acquired_revision() != effective_revision(snapshot_source)
+                        || chain.file_scope() != retained.checkpoint.scope()
+                    {
+                        not_persisted.push("acquisition");
+                        continue;
+                    }
+                    let Ok(counting) = acquired::ImmutableCounting::from_reduction(&retained.state)
+                    else {
+                        not_persisted.push("acquisition");
+                        continue;
+                    };
+                    expected.binding.entry = [0; 32];
+                    expected.binding.scope = v3_replay_scope(
+                        snapshot_source,
+                        retained.checkpoint.scope(),
+                        index,
+                        &interpretation,
+                        chain.acquired_revision(),
+                        &counting,
+                    );
+                    Some(store::AcquisitionFields {
+                        acquired_revision: chain.acquired_revision(),
+                        protocol: chain.write_protocol(),
+                    })
+                } else {
+                    None
                 };
                 let Some(mut certificate) = certificate_at(
                     &key,
@@ -5291,7 +5537,7 @@ impl SharedCache {
                         }
                         offered.insert(expected.binding.key, key);
                         pending.push(PendingRecord {
-                            acquisition: None,
+                            acquisition,
                             binding: expected.binding,
                             certificate,
                             body,
@@ -5326,6 +5572,21 @@ impl SharedCache {
         for class in not_persisted {
             Counters::bump(&mut counters.not_persisted, class);
         }
+        for key in offered.values() {
+            let digest = store::key_digest(source, key);
+            if let Some(replacement) = pending
+                .iter()
+                .find(|r| r.binding.key == digest && r.acquisition.is_some())
+            {
+                stores.slots[source.slot()]
+                    .as_mut()?
+                    .store
+                    .authorize_native(
+                        &replacement.binding,
+                        replacement.acquisition?.acquired_revision,
+                    );
+            }
+        }
         if source == DurableSource::ClaudeCode {
             for key in offered.values() {
                 let digest = store::key_digest(source, key);
@@ -5339,7 +5600,10 @@ impl SharedCache {
                 }
                 let stores = &mut *stores;
                 let replacement = pending.iter().find(|r| r.binding.key == digest)?;
-                authorize_strict(
+                if replacement.acquisition.is_some() {
+                    continue;
+                }
+                let _ = authorize_strict(
                     stores.slots[source.slot()].as_mut()?,
                     snapshot_source,
                     key,
@@ -5477,6 +5741,7 @@ impl SharedCache {
                 stores.touched.insert(key);
             }
         }
+        drop(stores);
         Some(receipt)
     }
 
@@ -5693,6 +5958,8 @@ impl SharedCache {
         struct StoreAlarm {
             #[serde(flatten)]
             store: store::StoreCounters,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            store_bytes_alarm: Option<bool>,
             owed_overflow_discovery_only: bool,
             platform: &'static str,
             native_stage_skipped: StageSkipped,
@@ -5825,6 +6092,8 @@ impl SharedCache {
             crate::local_resource_diagnostics::durable_tail_alarm(
                 snapshot_source.api_slug(),
                 &StoreAlarm {
+                    store_bytes_alarm: restart_restore::enabled()
+                        .then_some(store.disk_bytes > 512 * 1024 * 1024),
                     store,
                     owed_overflow_discovery_only,
                     platform: std::env::consts::OS,
@@ -6062,6 +6331,7 @@ impl MissClass {
                 store::Refusal::Corrupt => "refused_record.corrupt",
                 store::Refusal::BehindAccepted => "refused_record.behind_accepted",
                 store::Refusal::ReceiptPending => "refused_record.receipt_pending",
+                store::Refusal::Repin => "repin",
             },
             Self::Failure(Failure::Corrupt) => "corrupt_body",
             Self::Failure(Failure::Ineligible(reason)) => prefixed!(
@@ -6116,6 +6386,9 @@ pub(crate) enum RestoreOutcome {
     Restored(Box<Taken<CachedJsonlReduction>>, store::ActiveLease),
     M1Restored(Box<Taken<CachedJsonlReduction>>),
     Pending,
+    /// Restore read zero input; an already-selected native reparse may take
+    /// its ordinary Full after history admission and the shared pace check.
+    QuietPending,
     Miss(MissClass),
     /// Known correctness hold, census-neutral; never a Full fallback.
     FloorHeld,
@@ -6224,7 +6497,7 @@ mod restore_test {
                 | Self::StaleUnregistered(_, _)
                 | Self::Degraded
                 | Self::Held(store::Refusal::BehindAccepted) => None,
-                Self::FloorHeld => None,
+                Self::FloorHeld | Self::QuietPending => None,
                 Self::Pending if !crate::heap_layout_bound::layout_supported() => None,
                 Self::Pending => panic!("ordinary restore unexpectedly Pending"),
                 Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),

@@ -49,6 +49,7 @@ fn without_fingerprint(entry: &ScanIndexEntry) -> Value {
     value
 }
 
+/// [money] m3 d3 codex strict rebind keeps entry debt and membership.
 #[test]
 fn m3_d3_codex_strict_rebind_keeps_entry_debt_and_membership() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -91,6 +92,7 @@ fn m3_d3_codex_strict_rebind_keeps_entry_debt_and_membership() {
     }
 }
 
+/// [money] m3 d3 claude is never strictly rebound.
 #[test]
 fn m3_d3_claude_is_never_strictly_rebound() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -116,6 +118,7 @@ fn m3_d3_claude_is_never_strictly_rebound() {
     assert!(!index.files.contains_key(CODEX_KEY));
 }
 
+/// [money] m3 d3 held claude key stays discoverable past the window.
 #[test]
 fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -177,6 +180,7 @@ fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
 /// Exercise the production M3 descriptor boundary with a real decoder, even
 /// when the path looks plain. The remaining route preconditions cannot turn
 /// the archive input into physical prefix authority or candidate-less debt.
+/// [money] m3 compressed archive bypasses staging and finishes without receipt debt.
 #[test]
 fn m3_compressed_archive_bypasses_staging_and_finishes_without_receipt_debt() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();

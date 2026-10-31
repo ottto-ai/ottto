@@ -22849,7 +22849,12 @@ mod tests {
     pub(super) fn run_on_scan_worker_stack<T: Send>(body: impl FnOnce() -> T + Send) -> T {
         std::thread::scope(|scope| {
             std::thread::Builder::new()
-                .name("test-scan-worker".to_string())
+                .name(
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("test-scan-worker")
+                        .to_string(),
+                )
                 .stack_size(SNAPSHOT_SYNC_WORKER_STACK_BYTES)
                 .spawn_scoped(scope, body)
                 .expect("spawn test scan worker")
@@ -23794,6 +23799,7 @@ mod tests {
     // F9/F11: real restored+rederived+Tailed bodies enter the unchanged
     // exact page/ACK machinery. Linux cannot qualify native decode layout.
     #[cfg(target_os = "macos")]
+    /// [money] bounded restored tail exact ack and saved ack skip transport.
     #[test]
     fn bounded_restored_tail_exact_ack_and_saved_ack_skip_transport() {
         if !crate::test_isolation::run_here() {

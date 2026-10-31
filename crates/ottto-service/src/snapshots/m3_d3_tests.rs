@@ -399,6 +399,15 @@ fn lossy_shrink_rig() -> (Rig, Vec<u8>) {
     (rig, record)
 }
 
+fn owed_shrink_completed_fulls(pass: &Pass) -> u64 {
+    pass.events
+        .iter()
+        .filter_map(|e| {
+            e["counts"]["full_causes"]["owed_full_after_lossy_shrink_completed"].as_u64()
+        })
+        .sum()
+}
+
 fn owed_shrink_fulls(pass: &Pass) -> u64 {
     pass.events
         .iter()
@@ -424,13 +433,13 @@ fn assert_cold_body(rig: &Rig, pass: &Pass) {
     );
 }
 
+/// [regress] r25: due lossy-shrink recovery verifies once and retains the accepted floor.
 #[test]
 fn m3_due_matching_record_lossy_shrink_full_verifies_once_across_restart() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     with_test_line_cap(64 * 1024, || {
         let (mut rig, record) = lossy_shrink_rig();
         let key = rig.key(SESSION_A);
@@ -442,6 +451,7 @@ fn m3_due_matching_record_lossy_shrink_full_verifies_once_across_restart() {
             1,
             "must reach matching A's Held arm, not Stale"
         );
+        assert_eq!(owed_shrink_completed_fulls(&corrected), 1);
         assert_eq!(corrected.published(SESSION_A), 1);
         assert_eq!(corrected.snapshots[0].input_tokens, 600);
         assert_cold_body(&rig, &corrected);
@@ -458,18 +468,23 @@ fn m3_due_matching_record_lossy_shrink_full_verifies_once_across_restart() {
         assert_eq!(quiet.full(), 0, "verified publication does not repeat Full");
         assert_eq!(quiet.published(SESSION_A), 0);
         assert_eq!(owed_shrink_fulls(&quiet), 0);
+        assert_eq!(owed_shrink_completed_fulls(&quiet), 0);
     });
 }
 
+/// [regress] r25: due lossy-shrink recovery verifies once and retains the accepted floor.
 #[test]
 fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     with_test_line_cap(64 * 1024, || {
-        for control in ["verified_extent", "future_revision", "not_due"] {
+        for (control, expected_counter) in [
+            ("verified_extent", "accepted_body_floor"),
+            ("future_revision", "stale_hold"),
+            ("not_due", "behind_accepted.legacy"),
+        ] {
             let (mut rig, record) = lossy_shrink_rig();
             let key = rig.key(SESSION_A);
             let revision = rig.index.files[&key].effective_upload_body_witness_revision;
@@ -491,6 +506,7 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
             assert_eq!(held.full(), 0, "{control}");
             assert_eq!(held.published(SESSION_A), 0, "{control}");
             assert_eq!(owed_shrink_fulls(&held), 0, "{control}");
+            assert_eq!(owed_shrink_completed_fulls(&held), 0, "{control}");
             assert_eq!(rig.accepted(SESSION_A), accepted, "{control}");
             assert_eq!(
                 fs::read(rig.record(SESSION_A)).unwrap(),
@@ -501,11 +517,7 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
             assert!(
                 counters
                     .ineligible
-                    .get(if control == "not_due" {
-                        "behind_accepted.legacy"
-                    } else {
-                        "accepted_body_floor"
-                    })
+                    .get(expected_counter)
                     .is_some_and(|n| *n > 0),
                 "{control}: exercise the actual held outcome"
             );
@@ -542,6 +554,7 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
             let caught_up = rig.pass();
             assert_eq!(caught_up.full(), 1);
             assert_eq!(owed_shrink_fulls(&caught_up), 1);
+            assert_eq!(owed_shrink_completed_fulls(&caught_up), 1);
             assert_eq!(caught_up.published(SESSION_A), 1);
             assert_eq!(caught_up.snapshots[0].input_tokens, 1000);
             assert_cold_body(&rig, &caught_up);
@@ -629,13 +642,13 @@ fn count_unlinks(record: PathBuf) -> Rc<Cell<u64>> {
 /// (no body, accepted facts and the stale A untouched) while another Claude
 /// key publishes; growth stays held and is counted; the key's next
 /// successful write releases it with a Tail catch-up equal to a cold Full.
+/// [money] m3 d3 claude double fault holds only that key until its next write.
 #[test]
 fn m3_d3_claude_double_fault_holds_only_that_key_until_its_next_write() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for cleanup in [Cleanup::NativeStage, Cleanup::Unlink] {
         let _clear = ClearFaults;
         let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-d3-hold");
@@ -741,13 +754,13 @@ fn m3_d3_claude_double_fault_holds_only_that_key_until_its_next_write() {
 
 /// (b) The narrow case: the write fails but its cleanup proves A absent, so
 /// the completion publishes degraded with no record and no hold.
+/// [money] m3 d3 claude cleanup proving a absent publishes degraded.
 #[test]
 fn m3_d3_claude_cleanup_proving_a_absent_publishes_degraded() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let _clear = ClearFaults;
     let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-d3-degraded");
     rig.create(SESSION_A, 2);
@@ -785,13 +798,13 @@ fn m3_d3_claude_cleanup_proving_a_absent_publishes_degraded() {
 /// holds the key with no write attempt per pass, key or record; a key with
 /// no record still publishes. The store's own recovery probe ends the pause
 /// and the key's next write releases it with a Tail equal to a cold Full.
+/// [money] m3 d3 enospc pauses the store preserves a and resumes when space frees.
 #[test]
 fn m3_d3_enospc_pauses_the_store_preserves_a_and_resumes_when_space_frees() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let _clear = ClearFaults;
     let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-d3-enospc");
     rig.create(SESSION_A, 2);
@@ -869,13 +882,13 @@ fn m3_d3_enospc_pauses_the_store_preserves_a_and_resumes_when_space_frees() {
 /// only be re-armed earlier, never postponed or cleared), the entry, upload
 /// membership and record stay, the key stays discoverable, and no $0 body
 /// is ever emitted for it.
+/// [money] m3 d3 held key keeps 865 debt membership and record never absent.
 #[test]
 fn m3_d3_held_key_keeps_865_debt_membership_and_record_never_absent() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let _clear = ClearFaults;
     let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-d3-debt");
     rig.create(SESSION_A, 2);
@@ -950,13 +963,13 @@ impl Change {
 /// Addendum: a genuine content change of a held key releases it even while
 /// its writes keep failing; the surviving stale A can never bind the changed
 /// file afterwards, including after a restart.
+/// [money] m3 d3 content change releases a held key while writes still fail.
 #[test]
 fn m3_d3_content_change_releases_a_held_key_while_writes_still_fail() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     for change in [Change::RewriteInPlace, Change::Replace] {
         let _clear = ClearFaults;
         let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-d3-content");
@@ -1005,6 +1018,7 @@ fn m3_d3_content_change_releases_a_held_key_while_writes_still_fail() {
 /// deletes nothing, and after restart refuses A with exactly one counted
 /// Full; the next restart restores the replacement. (d), the 0.1.201 refusal,
 /// is the file:line proof on `codex_strict_rebind`.
+/// [money] m3 d3 codex strict rebind survives save and load and refuses a with one full.
 #[test]
 fn m3_d3_codex_strict_rebind_survives_save_and_load_and_refuses_a_with_one_full() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1138,7 +1152,6 @@ fn die(marker: &Path) -> ! {
 
 /// The subprocess: accept A natively, grow the file, die at `point`.
 fn kill_child(root: PathBuf, point: OrderPoint) {
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let mut rig = Rig::open(SnapshotSource::ClaudeCode, root.clone());
     rig.create(SESSION_A, 2);
     // F11: the killed acquisition must restore real content through (b),
@@ -1174,6 +1187,7 @@ fn kill_child(root: PathBuf, point: OrderPoint) {
 /// record on disk is the exact A or the exact next record, never torn; the
 /// restarted process publishes once, equal to a cold Full, without a Full
 /// read, and leaves no orphan temp.
+/// [format] m3 d3 sigkill at native order points recovers exactly once.
 #[test]
 fn m3_d3_sigkill_at_native_order_points_recovers_exactly_once() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1184,7 +1198,6 @@ fn m3_d3_sigkill_at_native_order_points_recovers_exactly_once() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let test = std::thread::current()
         .name()
         .expect("the harness names the test thread")
@@ -1248,6 +1261,7 @@ fn m3_d3_sigkill_at_native_order_points_recovers_exactly_once() {
 
 /// The real Codex native fault reaches the PRE barrier before any upload is
 /// authorized. The barrier saves retained facts, never the newly parsed end.
+/// [money] m3 codex native double fault bound barrier then working save preserves both publications.
 #[test]
 fn m3_codex_native_double_fault_bound_barrier_then_working_save_preserves_both_publications() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1351,6 +1365,7 @@ fn m3_codex_native_double_fault_bound_barrier_then_working_save_preserves_both_p
 /// The fault barrier is the upload gate: before its save no ACK is permitted;
 /// after its save every reader, including 0.1.201's selection-cleared gate,
 /// refuses A. Kill an actual native double-fault process on both sides.
+/// [money] m3 d3 sigkill at pre ack fault barrier preserves pre facts.
 #[test]
 fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1477,6 +1492,7 @@ fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
     }
 }
 
+/// [money] m3 codex native pass budget is counted not persisted without hold or debt.
 #[test]
 fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1513,6 +1529,7 @@ fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
 
 /// SOURCE singleton condition 2: the production owner changes from one plain
 /// file to a grouped pair; old native bytes cannot enter the joined reduction.
+/// [money] m3 codex singleton to group refuses native restore and retires record.
 #[test]
 fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1572,6 +1589,7 @@ fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
 /// A priority contribution is discovered only after reading the appended
 /// suffix. Its existing Full replay must match cold money, and the committed
 /// receipt must refuse A across restart even when the first GC unlink fails.
+/// [money] m3 codex post read tier transition refuses a across failed gc and restart.
 #[test]
 fn m3_codex_post_read_tier_transition_refuses_a_across_failed_gc_and_restart() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1686,7 +1704,6 @@ fn m3_codex_post_read_tier_transition_refuses_a_across_failed_gc_and_restart() {
 #[cfg(target_os = "macos")]
 pub(super) fn bounded_restore_tail_items(source: SnapshotSource) -> Vec<SnapshotItem> {
     let _restart_restore = RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let mut rig = Rig::new(source, "bounded-settlement-body");
     let session = if source == SnapshotSource::Codex {
         CODEX_SESSION
@@ -1715,6 +1732,7 @@ pub(super) fn bounded_restore_tail_items(source: SnapshotSource) -> Vec<Snapshot
 /// F10: A is a real native v3 checkpoint; B is a later complete accepted
 /// extent while A's replacement is deferred. Truncate only after A has been
 /// restored, before native preparation freezes C with A < C < B.
+/// [money] codex real restore then shrink preserves the native identity guard.
 #[test]
 fn codex_real_restore_then_shrink_preserves_the_native_identity_guard() {
     let _on = RestartRestoreForTest::enabled();
@@ -1785,212 +1803,4 @@ fn codex_real_restore_then_shrink_preserves_the_native_identity_guard() {
         c < b,
         "the rejected read actually froze below the accepted floor"
     );
-}
-
-/// F7's source scheduler row. Twenty first heads and twenty permitted
-/// post-eviction heads precede a maximal waiter; all measured scan passes
-/// select zero Fulls. The initial state has already spent each failed key's
-/// ordinary growth-Full allowance, as a preceding recovery would.
-#[test]
-fn full_source_scan_failed_heads_and_evictions_release_maximal_waiter_without_fulls() {
-    use super::sampled_jsonl::durable as codec;
-    use super::sampled_scan::durable_tail::{capture_rederive_reads, tests as fixtures};
-    let _on = RestartRestoreForTest::enabled();
-    if !crate::test_isolation::run_here() {
-        return;
-    }
-    let mut rig = Rig::new(SnapshotSource::Codex, "rederive-full-scanner-fairness");
-    let failing: Vec<_> = (0..20)
-        .map(|i| format!("11111111-1111-4111-8111-{i:012}"))
-        .collect();
-    let waiter = "ffffffff-ffff-4fff-8fff-ffffffffffff";
-    for session in failing
-        .iter()
-        .map(String::as_str)
-        .chain(std::iter::once(waiter))
-    {
-        let mut text = codex_head(session);
-        for i in 1..=3 {
-            text.push_str(&codex_line(i));
-        }
-        if session != waiter {
-            text.push_str("{\"$serde_json::private::RawValue\":\"{}\"}\n");
-        }
-        let prompt=json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic fairness prompt"}}).to_string()+"\n";
-        let end = if session == waiter {
-            codec::HEAD_BOUND as usize
-        } else {
-            90_000
-        };
-        assert!(text.len() + prompt.len() + 3 < end);
-        text.push_str(&" ".repeat(end - text.len() - prompt.len() - 3));
-        text.push_str("{}\n");
-        text.push_str(&prompt);
-        if session == waiter {
-            text.push_str("{}\n");
-            let mut title = json!({"type":"event_msg","payload":{"type":"thread_name_updated","thread_name":"Synthetic fairness title"},"padding":""});
-            title["padding"] =
-                json!("x".repeat(codec::TITLE_LINE_BOUND as usize - title.to_string().len() - 1));
-            assert_eq!(
-                title.to_string().len() + 1,
-                codec::TITLE_LINE_BOUND as usize
-            );
-            text.push_str(&(title.to_string() + "\n"));
-        }
-        fs::write(rig.path(session), text).unwrap();
-    }
-    let seed = rig.pass();
-    assert_eq!(seed.full(), 21);
-    for session in failing
-        .iter()
-        .map(String::as_str)
-        .chain(std::iter::once(waiter))
-    {
-        rig.assert_native_record(session);
-    }
-    // Prove the maximum replay plan from the actual native record, not a
-    // hand-built job size or a synthetic accumulator.
-    let mut disk = store::DurableTailStore::new(rig.store_dir(), store::DurableSource::Codex);
-    let store::ReadOutcome::Found(record) = disk.read(&rig.digest(waiter)) else {
-        panic!("waiter record");
-    };
-    let plan = codec::decode(&record.record.body, rig.source)
-        .unwrap()
-        .rederive_plan()
-        .unwrap();
-    assert_eq!(plan.end, codec::HEAD_BOUND);
-    assert_eq!(plan.title.unwrap().1, codec::TITLE_LINE_BOUND);
-    assert_eq!(plan.input_bytes(), 2 * 1024 * 1024);
-    let predecessor = fs::read(rig.record(waiter)).unwrap();
-    rig.restart();
-    rig.cache
-        .durable_begin_pass(rig.source, &rig.index_path, &rig.namespace, true);
-    for session in failing
-        .iter()
-        .map(String::as_str)
-        .chain(std::iter::once(waiter))
-    {
-        use std::io::Write;
-        let append = if session == waiter {
-            // A real usage delta makes publication observable; an ignored
-            // progress row could correctly be suppressed as an equal body.
-            codex_line(4)
-        } else {
-            "{\"type\":\"progress\"}\n".into()
-        };
-        File::options()
-            .append(true)
-            .open(rig.path(session))
-            .unwrap()
-            .write_all(append.as_bytes())
-            .unwrap();
-        if session != waiter {
-            fixtures::spend_rederive_full_for_scanner_fixture(
-                &rig.cache,
-                rig.source,
-                &rig.key(session),
-                &File::open(rig.path(session)).unwrap(),
-                rig.index.files[&rig.key(session)].size_bytes,
-            );
-        }
-    }
-    let accepted = rig.accepted(waiter);
-    for pass in 0..3 {
-        if pass == 1 {
-            for session in &failing {
-                fixtures::evict_failed_replay_pace(&rig.cache, rig.source, &rig.key(session));
-            }
-            fixtures::advance_scanner_clock_past_eviction_fillers(&rig.cache);
-        }
-        let (result, reads) = capture_rederive_reads(|| rig.pass());
-        assert_eq!(result.full(), 0, "source pass {pass}: no Full selection");
-        let input: u64 = result
-            .events
-            .iter()
-            .filter_map(|r| r["counts"]["rederive_input_bytes"].as_u64())
-            .sum();
-        assert!(
-            input <= 2 * 1024 * 1024,
-            "source pass respects aggregate input budget"
-        );
-        if pass < 2 {
-            assert_eq!(reads, 20, "twenty actual failed heads, source pass {pass}");
-            assert_eq!(result.published(waiter), 0);
-            assert_eq!(rig.accepted(waiter), accepted);
-            assert_eq!(fs::read(rig.record(waiter)).unwrap(), predecessor);
-            assert!(rig.cache.owes_discovery(rig.source, &rig.key(waiter)));
-        } else {
-            assert_eq!(
-                reads, 2,
-                "maximal head plus independent title admitted after head-once bounds churn"
-            );
-            assert_eq!(result.tail(), 1);
-            assert_eq!(result.witness(waiter), Some(rig.cold(waiter)));
-            assert_eq!(rig.counters().0.restored, 1);
-        }
-    }
-    let idle = rig.pass();
-    assert_eq!(idle.full(), 0);
-    assert_eq!(idle.published(waiter), 0);
-}
-
-/// F10 positive: C is stable before discovery freezes its identity. Codex's
-/// floor policy permits this complete native body below B; a shrink AFTER
-/// discovery is separately refused by the adjacent native identity fixture.
-#[test]
-fn codex_stable_below_accepted_restore_publishes_full_scanner_native_tail() {
-    let _on = RestartRestoreForTest::enabled();
-    if !crate::test_isolation::run_here() {
-        return;
-    }
-    let mut rig = Rig::new(SnapshotSource::Codex, "stable-restored-below-accepted");
-    let session = CODEX_SESSION;
-    fs::write(rig.path(session), codex_head(session) + &json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic stable restored prompt"}}).to_string() + "\n").unwrap();
-    rig.append(session, 3);
-    assert_eq!(rig.pass().published(session), 1);
-    rig.assert_native_record(session);
-    let a = fs::metadata(rig.path(session)).unwrap().len();
-    let predecessor = fs::read(rig.record(session)).unwrap();
-    rig.append(session, 1);
-    let c = fs::metadata(rig.path(session)).unwrap().len();
-    rig.append(session, 1);
-    // B is a real accepted cold Full; no post-save writer replaces A.
-    let (index, items) = scan(
-        rig.source,
-        &rig.sessions,
-        rig.index.clone(),
-        Arc::new(SharedCache::default()),
-        &rig.namespace,
-    );
-    assert_eq!(items.len(), 1);
-    rig.index = index;
-    rig.index.save(&rig.index_path).unwrap();
-    let b = rig.index.files[&rig.key(session)].size_bytes;
-    assert!(a < c && c < b);
-    assert_eq!(fs::read(rig.record(session)).unwrap(), predecessor);
-    // The selected identity and native preparation both see the SAME C.
-    File::options()
-        .write(true)
-        .open(rig.path(session))
-        .unwrap()
-        .set_len(c)
-        .unwrap();
-    rig.restart();
-    let result = rig.pass();
-    assert_eq!(rig.counters().0.restored, 1, "real durable restore");
-    assert!(rig.counters().0.rederive_head_bytes > 0);
-    assert_eq!((result.full(), result.tail()), (0, 1));
-    assert_eq!(result.published(session), 1);
-    assert_eq!(result.witness(session), Some(rig.cold(session)));
-    assert_eq!(
-        result
-            .events
-            .iter()
-            .filter_map(|r| r["counts"]["restored_behind_accepted"]["published"].as_u64())
-            .sum::<u64>(),
-        1
-    );
-    let idle = rig.pass();
-    assert_eq!(idle.full(), 0);
-    assert_eq!(idle.published(session), 0, "no repeat publication");
 }

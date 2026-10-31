@@ -234,9 +234,24 @@ pub(crate) fn scope_digest_v3(
     )
 }
 
+fn retired_pin(source: DurableSource, format: u16, pin: &Digest32) -> bool {
+    let retired = match source {
+        DurableSource::ClaudeCode => {
+            "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c"
+        }
+        DurableSource::Codex => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+        // No shipped build persisted a Pi record, so Pi has no retired v1 pin.
+        DurableSource::Pi => return false,
+    };
+    format == FORMAT_V1 && parse_hex_digest(retired).as_ref() == Some(pin)
+}
+
 fn header_len(format: u16, source: DurableSource, allowlist: &Digest32) -> Result<usize, Refusal> {
     if format > FORMAT_V3 {
         return Err(Refusal::NewerFormat);
+    }
+    if retired_pin(source, format, allowlist) {
+        return Ok(HEADER_BYTES);
     }
     source
         .properties()
@@ -480,6 +495,8 @@ pub(crate) enum Refusal {
     // Slot 5 belongs to the retired UpgradeMissing alarm coordinate.
     ReceiptPending = 6,
     BehindAccepted = 7,
+    /// Exact retired v1 pin: native rebuild only, never current-body decode.
+    Repin = 8,
 }
 
 /// The outcome of reading one key.
@@ -596,7 +613,7 @@ pub(crate) struct StoreCounters {
     /// Bounded verification memo turnover; never removes pending/spent authority.
     pub(crate) memo_evicted: u64,
     pub(crate) missing: u64,
-    pub(crate) format_hold: [u64; 8],
+    pub(crate) format_hold: [u64; 9],
     /// Writes skipped: predecessor unknown, or a new key while record files
     /// exceed `INVENTORY_BOUND` (offered again after the next save).
     pub(crate) store_write_skipped: [u64; 2],
@@ -838,11 +855,21 @@ impl DurableTailStore {
             .map(|h| (h.format, h.record.allowlist))
     }
 
-    /// Metadata-only: Claude observes the native read of a key with no record.
-    pub(crate) fn absent(&self, key: &Digest32) -> bool {
-        self.disabled.is_none()
-            && inspect_path(&self.record_path(key))
-                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+    /// Missing reduction, including an exact retired representation.
+    pub(crate) fn absent(&mut self, key: &Digest32) -> bool {
+        self.missing_cause(key).is_some()
+    }
+
+    /// Cause only: retired envelopes are missing reductions, not restore authority.
+    pub(crate) fn missing_cause(&mut self, key: &Digest32) -> Option<&'static str> {
+        if self.disabled.is_some() || self.receipt_pending(key) {
+            return None;
+        }
+        if inspect_path(&self.record_path(key)).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        {
+            return Some("upgrade_state_missing");
+        }
+        matches!(self.classify(key, "presence", None), Err(Refusal::Repin)).then_some("repin")
     }
 
     pub(crate) fn counters(&self) -> StoreCounters {
@@ -976,6 +1003,13 @@ impl DurableTailStore {
             rest.map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
             n = header.len();
             let mut binding = decode_header(&header, key, self.source)?;
+            let retired = retired_pin(self.source, binding.format, &binding.record.allowlist);
+            if retired && work != "overwrite" {
+                return Err(Refusal::Repin); // Missing to readers, opaque to current decoders.
+            }
+            if work == "presence" {
+                return Ok(None); // Presence is never verification or mutation authority.
+            }
             // After any repair: its ctime moved.
             let Some(metadata) = self.inspect_file(&file) else {
                 return Ok(None);
@@ -1015,7 +1049,7 @@ impl DurableTailStore {
             let allowed = self.durable.get(key).is_some_and(|(old, saved, allowed)| {
                 *allowed && *saved == stamp && *old == Some(content)
             });
-            self.memoize(*key, (Some(content), stamp, allowed));
+            self.memoize(*key, (Some(content), stamp, allowed || retired));
             if restoring {
                 binding.verified = Some(bytes);
             }
@@ -1026,7 +1060,9 @@ impl DurableTailStore {
         }
         if let Err(reason) = result {
             self.durable.remove(key);
-            self.counters.format_hold[reason as usize] += 1;
+            if reason != Refusal::Repin {
+                self.counters.format_hold[reason as usize] += 1;
+            }
         }
         result
     }
@@ -1071,8 +1107,9 @@ impl DurableTailStore {
             return Err(Refusal::ReceiptPending);
         }
         let result = self.classify(key, "guard", None);
-        self.pass[0] += u64::from(!matches!(result, Ok(None)));
+        self.pass[0] += u64::from(!matches!(result, Ok(None) | Err(Refusal::Repin)));
         match result {
+            Err(Refusal::Repin) => Ok(None),
             Err(Refusal::Corrupt) if !self.rebuilt.contains_key(key) => {
                 if self.pass[1] >= T14_BREAKER.max(self.pass[0] / 50) {
                     self.disable("t14_breaker");
@@ -1152,6 +1189,10 @@ impl DurableTailStore {
         match self.read_known(key, None, false) {
             Ok(Some(verified)) => ReadOutcome::Found(verified.record),
             Ok(None) => ReadOutcome::Missing,
+            Err(Refusal::Repin) => {
+                self.counters.missing += 1;
+                ReadOutcome::Missing
+            }
             Err(reason) => ReadOutcome::Refused(reason),
         }
     }
@@ -1634,7 +1675,11 @@ impl DurableTailStore {
             let key = record.binding.key;
             pending.retain(|other| other.binding.key != key);
             if record.binding.source != self.source
-                || header_len(record.format(), self.source, &record.allowlist).is_err()
+                || self
+                    .source
+                    .properties()
+                    .representation(record.format(), &record.allowlist)
+                    .is_none()
                 || record.acquisition.is_some() && record.binding.entry != [0; 32]
             {
                 self.counters.store_write_skipped[0] += 1;
@@ -1851,14 +1896,15 @@ impl DurableTailStore {
             if attempt
                 .as_ref()
                 .is_err_and(|error| !write_cleanup_failed(error))
-                && verified_prior
+                && (verified_prior || self.rebuilt.get(&key) == Some(&Rebuild::Offered))
                 && prior.is_some()
                 && stamp_at(&path)? == prior
             {
                 // The post-save index already refuses A. A failed rename left
-                // that exact verified predecessor untouched: do not retire it
+                // that exact verified or T14 predecessor untouched: do not retire it
                 // or lose the retry offer. The caller requeues this saved key,
-                // and the next selected pass can rewrite it from retained RAM.
+                // and retained RAM stays usable. A failed T14 replacement must
+                // not acquire receipt debt for a candidate that never survived.
                 self.pending.remove(&key);
                 return Err(attempt.err().expect("checked failed write"));
             }
@@ -2751,6 +2797,11 @@ fn verify(bytes: &[u8], source: DurableSource) -> Result<(), Refusal> {
     if end.checked_sub(start) != Some(h.body_len) {
         return Err(bad);
     }
+    if retired_pin(source, h.format, &h.record.allowlist) {
+        // The retired body is opaque. Its checksum proves exact replacement
+        // custody only; no current decoder or restore receives these bytes.
+        return Ok(());
+    }
     crate::snapshots::verify_durable_body(&bytes[start..end], source)
         .then_some(())
         .ok_or(bad)
@@ -3198,6 +3249,11 @@ impl<'a> Cursor<'a> {
 /// The version is checked before the trailer: a newer layout is not ours to
 /// judge. Everything else must pass the trailer and decode exactly.
 fn decode(bytes: &[u8]) -> Result<DurableRecord, Refusal> {
+    let (format, pin, source, _) = dispatch(bytes)?;
+    if retired_pin(source, format, &pin) {
+        return Err(Refusal::Repin);
+    }
+
     let source = bytes
         .get(42)
         .and_then(|tag| DurableSource::from_tag(*tag))

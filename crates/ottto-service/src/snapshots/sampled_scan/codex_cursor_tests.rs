@@ -14761,6 +14761,7 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
     assert_eq!(durable.restored, 0);
 }
 
+/// [money] active bound no record cursor preserves scope resumes and publishes.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native cursor layout")]
 fn active_bound_no_record_cursor_preserves_scope_resumes_and_publishes() {
@@ -14809,6 +14810,7 @@ fn active_bound_no_record_cursor_preserves_scope_resumes_and_publishes() {
     });
 }
 
+/// [money] structural restore page defer does not spend full pace.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native durable layout")]
 fn structural_restore_page_defer_does_not_spend_full_pace() {

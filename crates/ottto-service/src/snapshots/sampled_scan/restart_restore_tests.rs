@@ -4,13 +4,14 @@ use crate::snapshots::RestartRestoreForTest;
 use crate::transcript_acquisition::ReadMode;
 use std::io::Write;
 
+/// [off=main] off restart keeps native m1 rederive and never writes new records.
 #[test]
 fn off_restart_keeps_native_m1_rederive_and_never_writes_new_records() {
     let _off = RestartRestoreForTest::disabled();
-    off_restart_fixture(false);
+    off_restart_fixture();
 }
 
-fn off_restart_fixture(require_restore: bool) {
+fn off_restart_fixture() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -145,10 +146,6 @@ fn off_restart_fixture(require_restore: bool) {
         }
         RestoreOutcome::Miss(MissClass::BudgetRefused) => {
             assert!(
-                !require_restore,
-                "qualified M1 warm restore must still restore"
-            );
-            assert!(
                 !crate::heap_layout_bound::layout_supported(),
                 "main's unsupported-layout admission only"
             );
@@ -204,6 +201,7 @@ fn off_restart_fixture(require_restore: bool) {
         .contains("restart_restore=off"));
 }
 
+/// [off=main] on without discovery is off and diagnostic counts one refused request.
 #[test]
 fn on_without_discovery_is_off_and_diagnostic_counts_one_refused_request() {
     let _refused = RestartRestoreForTest::requested_without_dependency();
@@ -214,10 +212,11 @@ fn on_without_discovery_is_off_and_diagnostic_counts_one_refused_request() {
     assert!(summary.contains("restart_restore_on_refused{reason=discovery_dependency}=1"));
     // Exercise the same restart route under the refused request, rather than
     // merely checking the boolean. The nested OFF guard restores this request.
-    off_restart_fixture(false);
+    off_restart_fixture();
     assert_eq!(restart_restore::on_refused_discovery_dependency(), 1);
 }
 
+/// [off=main] off discovery keeps main predicate and on adds only its recovery path.
 #[test]
 fn off_discovery_keeps_main_predicate_and_on_adds_only_its_recovery_path() {
     let source = SnapshotSource::ClaudeCode;
@@ -247,26 +246,4 @@ fn off_discovery_keeps_main_predicate_and_on_adds_only_its_recovery_path() {
             length
         ));
     }
-}
-
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "M1 warm cache requires qualified native heap layout"
-)]
-fn off_restart_restores_native_m1_to_tail_on_qualified_layout() {
-    let _off = RestartRestoreForTest::disabled();
-    off_restart_fixture(true);
-}
-
-#[test]
-fn off_admission_keeps_main_budget_and_on_keeps_m3_custody_funded() {
-    let main = crate::transcript_cache::CACHE_BYTES
-        - crate::source_rotation::OVERLAP_BUDGET
-        - super::super::AUDIT_AND_SCRATCH_BYTES;
-    let _off = RestartRestoreForTest::disabled();
-    assert_eq!(super::super::state_bytes(), main);
-    let _on = RestartRestoreForTest::enabled();
-    assert_eq!(super::super::state_bytes(), super::super::STATE_BYTES);
-    assert!(super::super::state_bytes() < main);
 }

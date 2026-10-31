@@ -157,6 +157,7 @@ mod tests {
     }
     crate::durable_tail_codec::durable_struct!(Record { PL literal: PlText<4> });
 
+    /// [format] pl decode refuses over cap before allocating and never truncates.
     #[test]
     fn pl_decode_refuses_over_cap_before_allocating_and_never_truncates() {
         let mut encoded = Enc::bytes(100);
@@ -175,6 +176,7 @@ mod tests {
         assert!(PlText::<4>::new("ééé".into()).is_err());
     }
 
+    /// [format] pl roundtrip keeps exact bytes and debug reports only length.
     #[test]
     fn pl_roundtrip_keeps_exact_bytes_and_debug_reports_only_length() {
         let record = Record {
@@ -192,6 +194,7 @@ mod tests {
         assert!(shape.text().contains("PL literal;PlText<4>"));
     }
 
+    /// [format] pl decode charges exact bytes and reports budget refusal.
     #[test]
     fn pl_decode_charges_exact_bytes_and_reports_budget_refusal() {
         let body = [4, b'a', b'b', b'c', b'd'];
@@ -209,6 +212,7 @@ mod tests {
         assert_eq!(requested, 4);
     }
 
+    /// [format] pl decode and verify refuse invalid utf8.
     #[test]
     fn pl_decode_and_verify_refuse_invalid_utf8() {
         let mut body = Enc::bytes(100);

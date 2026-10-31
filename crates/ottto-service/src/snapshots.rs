@@ -38,9 +38,10 @@ pub(crate) struct DurableCustody {
     #[cfg(unix)]
     active: Option<crate::durable_tail_store::ActiveLease>,
     #[cfg(unix)]
-    chain: Option<sampled_scan::durable_tail::AcquiredChain>,
+    // Keep acquisition metadata out of every parser/cache-transfer stack slot.
+    chain: Option<Box<sampled_scan::durable_tail::AcquiredChain>>,
     #[cfg(unix)]
-    owed: Option<sampled_scan::durable_tail::ReceiptOwed>,
+    owed: Option<Box<sampled_scan::durable_tail::ReceiptOwed>>,
     #[cfg(unix)]
     retail: Option<sampled_scan::durable_tail::RetailAttempt>,
     #[cfg(unix)]
@@ -49,6 +50,17 @@ pub(crate) struct DurableCustody {
 crate::heap_layout_bound::fields!(DurableCustody; #[cfg(unix)] active, #[cfg(unix)] chain,
     #[cfg(unix)] owed, #[cfg(unix)] retail, #[cfg(unix)] upgrade);
 impl DurableCustody {
+    /// Heap owned by the optional cache box, including its allocation layout.
+    pub(crate) fn retained_bytes(&self, limit: usize) -> Option<usize> {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        if self.is_empty() {
+            return Some(0);
+        }
+        let mut counter = Counter::new(limit);
+        counter.add(std::mem::size_of::<Self>().checked_add(std::mem::align_of::<Self>())?)?;
+        self.heap_bound(&mut counter)?;
+        Some(counter.bytes)
+    }
     pub(crate) fn is_empty(&self) -> bool {
         #[cfg(unix)]
         {
@@ -26112,7 +26124,8 @@ struct OwnedActiveFile {
     previous_upload_body_witness: Option<String>,
     projection_adoption_required: bool,
     source_file_fingerprint: String,
-    parser: OwnedJsonlParser,
+    // Preserve heap ownership when this active file is moved into native finish.
+    parser: Box<OwnedJsonlParser>,
     aliases: Vec<CandidateFile>,
     applied_receipts: BTreeMap<String, Option<codex_file_join::AppliedTierReceipt>>,
     /// Present while this file is read as a paged cursor job.
@@ -27469,6 +27482,7 @@ impl OwnedSourceScan {
         result
     }
 
+    #[inline(never)]
     fn step_with_capture_credit_inner(
         mut self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
@@ -28202,6 +28216,26 @@ impl OwnedSourceScan {
                         _ => {}
                     }
                 }
+                #[cfg(unix)]
+                if boot.awaits_read() {
+                    if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                        let allowed = cache.upgrade_group_full_allowed(
+                            source,
+                            &boot.group.members,
+                            index,
+                            &mut history_upgrade,
+                        );
+                        if !allowed {
+                            sampled_scan::codex_cursor::requeue_members(
+                                index,
+                                &codex_selected_flags,
+                                &boot.group.members,
+                            );
+                            index.mark_bounded_sweep_unsettled();
+                            pending!();
+                        }
+                    }
+                }
                 boot.allow_probe_bytes(
                     codex_page.singleton_remaining(sampled_scan::codex_cursor::Limits::current()),
                 );
@@ -28211,7 +28245,8 @@ impl OwnedSourceScan {
                     sampling.as_ref().map(|context| context.cache.as_ref()),
                 );
                 // Header and probe bytes are singleton-budget reads (§d.2).
-                codex_page.charge(false, boot.take_charge());
+                let boot_input = boot.take_charge();
+                codex_page.charge(false, boot_input);
                 let members = boot.group.members.len();
                 match outcome {
                     codex_file_join::Boot::Pending => {
@@ -28777,6 +28812,7 @@ impl OwnedSourceScan {
                     #[cfg(unix)]
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                         let mut refused = false;
+                        let mut retry_members = false;
                         // C9: inspect and account for EVERY member before holding
                         // the group; short-circuiting loses refused-member evidence.
                         for member in &group.members {
@@ -28787,6 +28823,8 @@ impl OwnedSourceScan {
                                 Ok(None) => {}
                                 Ok(Some(reason)) => {
                                     refused = true;
+                                    retry_members |= !restart_restore::enabled()
+                                        || reason != crate::durable_tail_store::Refusal::Corrupt;
                                     cache.durable_hold_exit(
                                         source,
                                         reason,
@@ -28800,6 +28838,7 @@ impl OwnedSourceScan {
                                 }
                                 Err(_) => {
                                     refused = true;
+                                    retry_members = true;
                                     cache.durable_custody_hold(
                                         source,
                                         "active_input_pending",
@@ -28810,6 +28849,19 @@ impl OwnedSourceScan {
                             }
                         }
                         if refused {
+                            if retry_members {
+                                sampled_scan::codex_cursor::requeue_members(
+                                    index,
+                                    &codex_selected_flags,
+                                    &group.members,
+                                );
+                            } else {
+                                // A spent corrupt rebuild is terminal for this
+                                // pass, just like the singleton hold exit. Keep
+                                // its accepted state while allowing the census
+                                // and unrelated groups to finish.
+                                sampled_scan::codex_cursor::dequeue_members(index, &group.members);
+                            }
                             pending!();
                         }
                     }
@@ -29195,6 +29247,17 @@ impl OwnedSourceScan {
                 if let Some(context) = sampling.as_mut().filter(|_| active.side_origin.is_none()) {
                     if let Some(plan) = active.parser.reader.acquisition.as_ref() {
                         context.record_input(plan.metrics());
+                        if std::mem::take(&mut active.parser.owed_full_after_lossy_shrink)
+                            && matches!(
+                                plan.mode(),
+                                crate::transcript_acquisition::ReadMode::Full(_)
+                            )
+                        {
+                            let completed = &mut resource_probe
+                                .full_causes
+                                .owed_full_after_lossy_shrink_completed;
+                            *completed = completed.saturating_add(1);
+                        }
                         resource_probe.rearm_full_completed(
                             &local_index_key(&active.candidate.path),
                             plan.mode(),
@@ -29790,10 +29853,12 @@ impl OwnedSourceScan {
                                 // audit waits. A byte-zero Full must instead
                                 // reach normal completion and discharge its
                                 // audit, even when RAM retention is unavailable.
-                                !matches!(
-                                    acquisition.mode,
-                                    crate::transcript_acquisition::ReadMode::Full(_)
-                                ) && acquisition.audit_due.is_some()
+                                (!restart_restore::enabled()
+                                    || !matches!(
+                                        acquisition.mode,
+                                        crate::transcript_acquisition::ReadMode::Full(_)
+                                    ))
+                                    && acquisition.audit_due.is_some()
                                     && sampled_audit::progress_debt(
                                         index,
                                         &acquisition.key,
@@ -30188,7 +30253,7 @@ impl OwnedSourceScan {
                 let m3_route = sampling
                     .as_ref()
                     .zip(file_sampling.as_ref())
-                    .filter(|_| {
+                    .filter(|(_, active)| {
                         restart_restore::enabled()
                             && matches!(
                                 source,
@@ -30196,6 +30261,12 @@ impl OwnedSourceScan {
                                     | SnapshotSource::Codex
                                     | SnapshotSource::Pi
                             )
+                            // No new acquisition is written for an ordinary
+                            // Unchanged read. Receipt-owed retries retain their
+                            // exact native owner; quiet debt changes settle only
+                            // through the post-save writer and index CAS.
+                            && (active.mode != crate::transcript_acquisition::ReadMode::Unchanged
+                                || completed_acquisition.as_ref().is_some_and(|c| c.durable.owed().is_some()))
                             && !comparison_target
                             && side_origin.is_none()
                             && aliases.is_empty()
@@ -30215,34 +30286,11 @@ impl OwnedSourceScan {
                 #[cfg(unix)]
                 let (parsed_file, m3_publication, m3_strict_rebind, m3_staged) = match m3_route {
                     Some((context, active, held)) => {
-                        let request = NativeChainRequest {
-                            source,
-                            key: &active.key,
-                            opened_object_identity: &candidate.opened_object_identity,
-                            mode: active.mode,
-                            held: &held,
-                            index,
-                            counting:
-                                sampled_scan::durable_tail::ImmutableCounting::from_accumulator(
-                                    &parser.accumulator,
-                                )
-                                .ok(),
-                        };
-                        if let Some(completed) = completed_acquisition.as_mut() {
-                            bind_native_chain(&context.cache, completed, &request);
-                        }
-                        let attempt = parser.finish_with_repository_identity_prepared(
+                        let settled = parser.finish_with_repository_identity_prepared(
                             finish_request,
                             completed_acquisition.take(),
-                            |lease, view| context.cache.prepare_live(lease, view),
-                        );
-                        #[cfg(test)]
-                        sampled_scan::test_hooks::fire(
-                            sampled_scan::test_hooks::Point::BeforeNativeSettle,
-                        );
-                        let settled = settle_native_attempt(
                             &context.cache,
-                            attempt,
+                            active.mode,
                             held,
                             NativeFence {
                                 source,
@@ -30262,14 +30310,14 @@ impl OwnedSourceScan {
                         )
                     }
                     None => (
-                        parser.finish_native(finish_request, None),
+                        parser.finish_boxed_native(finish_request),
                         None,
                         false,
                         false,
                     ),
                 };
                 #[cfg(not(unix))]
-                let parsed_file = parser.finish_native(finish_request, None);
+                let parsed_file = parser.finish_boxed_native(finish_request);
                 #[cfg(unix)]
                 if excluded_native_class && parsed_file.is_ok() {
                     if let Some(context) = sampling.as_ref() {
@@ -32686,8 +32734,16 @@ impl OwnedSourceScan {
                 claude_effort_support_dir_ref,
             );
             let rescue_key = local_index_key(&candidate.path);
-            let verification_rescue =
-                sampled_audit::progress_debt(index, &rescue_key, audit_now).is_some();
+            let verification_rescue = sampled_audit::progress_debt(index, &rescue_key, audit_now)
+                .is_some()
+                || sampling.as_ref().is_some_and(|context| {
+                    context.cache.missing_reduction_growth(
+                        source,
+                        &rescue_key,
+                        &index.files,
+                        candidate.size_bytes,
+                    )
+                });
             let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate_with_rescue(
                 source,
                 candidate,
@@ -33633,7 +33689,10 @@ impl OwnedSourceScan {
                         .take_prepared(source, &key)
                         .map(|taken| taken.map(|(taken, lease)| (taken, Some(lease))))
                 } else {
-                    Ok(context.cache.take(&key).map(|taken| (taken, None)))
+                    Ok(context
+                        .cache
+                        .take(&key)
+                        .map(|taken| (Box::new(taken), None)))
                 } {
                     Ok(Some((taken, lease))) => (Some(taken), lease),
                     Ok(None) => (None, None),
@@ -33662,7 +33721,7 @@ impl OwnedSourceScan {
                     }
                 }
                 #[cfg(not(unix))]
-                let taken = context.cache.take(&key);
+                let taken = context.cache.take(&key).map(Box::new);
                 #[cfg(unix)]
                 let taken = if native_edit_proven {
                     // A real edit invalidates the old graph; no Tail spend or
@@ -33757,7 +33816,7 @@ impl OwnedSourceScan {
                 });
                 let e2_held_new_file = source == SnapshotSource::ClaudeCode
                     && taken.as_ref().is_some_and(|taken| taken.e2_held_new_file);
-                let mut retained = taken.map(Box::new);
+                let mut retained = taken;
                 let retained_present = retained.is_some();
                 let reinsertion =
                     crate::local_resource_diagnostics::claude_reread::Reinsertion::new(
@@ -33796,7 +33855,37 @@ impl OwnedSourceScan {
                     .admission
                     .sidecar_census_complete
                     .observe(sidecar_census_complete);
-                if owning_header_is_current && state_census_complete && sidecar_census_complete {
+                // Claude's retained reduction is captured before metadata is
+                // applied in finish. Its exact per-session dependencies still
+                // fence reuse; unrelated inventory coverage cannot force a Full
+                // on growth. Coverage/identity/publication gates below remain
+                // unchanged, and Codex still needs its closed-world sidecars.
+                // Partial Desktop coverage permits continuing a known native
+                // session, not admitting a new cold file to sampled acquisition.
+                // Without an index entry or its own held-new certificate, keep
+                // main's unsampled read and copy-refusal exemption.
+                let scoped_claude_metadata = restart_restore::enabled()
+                    && source == SnapshotSource::ClaudeCode
+                    && !sidecar_census_complete
+                    && (index.files.contains_key(&key) || e2_held_new_file);
+                if !(owning_header_is_current
+                    && state_census_complete
+                    && (sidecar_census_complete || scoped_claude_metadata))
+                {
+                    if let Some(taken) = retained.take() {
+                        if restart_restore::enabled() && source == SnapshotSource::ClaudeCode {
+                            claude_request_census::retain_held(index, &candidate);
+                        }
+                        return_original!(taken, Some("census"));
+                    }
+                }
+                if owning_header_is_current
+                    && state_census_complete
+                    && (sidecar_census_complete || scoped_claude_metadata)
+                {
+                    if scoped_claude_metadata {
+                        crate::local_resource_diagnostics::claude_reread::desktop_scoped_acquisition();
+                    }
                     let reduction_sidecar = sampled_scan::reduction_dependencies(
                         source,
                         &candidate,
@@ -33960,7 +34049,17 @@ impl OwnedSourceScan {
                                         );
                                         pending!();
                                     }
-                                    sampled_scan::durable_tail::RestoreOutcome::Pending => {
+                                    sampled_scan::durable_tail::RestoreOutcome::QuietPending
+                                        if parse_reason.is_some_and(|reason| reason != CandidateParseReason::Audit) =>
+                                    {
+                                        // Restore grants no input. This existing explicit
+                                        // selection may take its ordinary Full after the
+                                        // history gate and shared six-hour pace below.
+                                        resource_full_pending = Some("rederive_quiet");
+                                        (None, taken_admission, debt)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Pending
+                                    | sampled_scan::durable_tail::RestoreOutcome::QuietPending => {
                                         residue_index_keys.insert(key.clone());
                                         context.cache.durable_custody_hold(
                                             source,
@@ -34079,6 +34178,7 @@ impl OwnedSourceScan {
                                         // A marked lossy extent is not a verified prefix.
                                         // Re-read the due body; S2 and the Full-start
                                         // store guard still fence preparation/publication.
+                                        parser.owed_full_after_lossy_shrink = true;
                                         resource_probe.full_causes.owed_full_after_lossy_shrink =
                                             resource_probe.full_causes.owed_full_after_lossy_shrink.saturating_add(1);
                                         (None, taken_admission, debt)
@@ -34692,15 +34792,15 @@ impl OwnedSourceScan {
                 })
             {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if source == SnapshotSource::ClaudeCode
-                        && restart_restore::enabled()
-                        && !paced_full_granted
+                    if !paced_full_granted
                         && !active_bound_degraded
                         && migration_floor.is_none()
                         && !cache.upgrade_full_allowed(
+                            source,
                             &local_index_key(&active.candidate.path),
                             active.parser.reader.reader.get_ref(),
                             index,
+                            &mut history_upgrade,
                         )
                     {
                         cache.durable_stale_hold(source, index, &active.candidate);
@@ -34737,6 +34837,15 @@ impl OwnedSourceScan {
                     }
                 }
             }
+            // There is one shared admission for this actual Full. Earlier
+            // grants and later structural/stale-selection owners take priority.
+            #[cfg(unix)]
+            let resource_full_pending =
+                if paced_full_granted || active_bound_degraded || stale_selection_pending {
+                    None
+                } else {
+                    resource_full_pending
+                };
             if let (Some(phase), Some(context)) = (resource_full_pending, sampling.as_ref()) {
                 let key = local_index_key(&active.candidate.path);
                 if !context.cache.start_resource_full(
@@ -35696,6 +35805,8 @@ type LineSink<'a> = &'a mut dyn FnMut(&Value);
 const RETURN_ADMISSION_ATTEMPTS: u8 = 3;
 
 struct OwnedJsonlParser {
+    // Diagnostic origin only; follows this acquisition across step/page boundaries.
+    owed_full_after_lossy_shrink: bool,
     // Drop the optional original before its funding, including cancellation.
     pending_taken: Option<Box<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>>,
     pending_returns: u8,
@@ -35791,6 +35902,7 @@ impl OwnedJsonlParser {
 
         Ok(Self {
             pending_taken: None,
+            owed_full_after_lossy_shrink: false,
             pending_returns: 0,
             #[cfg(unix)]
             pending_funding: None,
@@ -36038,29 +36150,47 @@ impl OwnedJsonlParser {
     /// PRE-finalization seam: after the held FD revalidated the opened object,
     /// before any finalization write. A retained copy is staged from its own
     /// reduction, otherwise from the live parser state; both use the one body
-    /// engine behind `prepare`. The acquisition and staging are returned even
-    /// when the native finish fails, so the caller discards them explicitly.
-    /// Without an acquired chain nothing is staged (`preparation: None`).
+    /// engine behind `prepare`. Bind, finish and settle in this separate frame
+    /// so their large acquisition temporaries never occupy the scan-step frame.
+    /// Native failure still explicitly discards staging and preserves its debt.
     #[cfg(unix)]
-    fn finish_with_repository_identity_prepared<F>(
-        mut self,
+    #[inline(never)]
+    fn finish_with_repository_identity_prepared(
+        mut self: Box<Self>,
         request: FinishRequest<'_>,
-        completed: Option<sampled_jsonl::CompletedNativeAcquisition>,
-        prepare: F,
-    ) -> sampled_scan::durable_tail::NativeFinishAttempt
-    where
-        F: for<'v> FnOnce(
-            &mut crate::durable_tail_store::ActiveLease,
-            sampled_scan::durable_tail::LiveFinishView<'v>,
-        ) -> sampled_scan::durable_tail::PrepareOutcome,
-    {
+        mut completed: Option<sampled_jsonl::CompletedNativeAcquisition>,
+        cache: &sampled_scan::SharedCache,
+        mode: crate::transcript_acquisition::ReadMode,
+        held: File,
+        fence: NativeFence<'_>,
+    ) -> NativeSettlement {
+        let chain_request = NativeChainRequest {
+            source: fence.source,
+            key: fence.key,
+            opened_object_identity: fence.expected_opened_object_identity,
+            mode,
+            held: &held,
+            index: fence.committed_index,
+            counting: sampled_scan::durable_tail::ImmutableCounting::from_accumulator(
+                &self.accumulator,
+            )
+            .ok(),
+        };
+        if let Some(completed) = completed.as_mut() {
+            bind_native_chain(cache, completed, &chain_request);
+        }
         use sampled_scan::durable_tail::{FinishAcquisition, NativeFinishAttempt};
         let mut acquisition = match completed {
             Some(completed) => FinishAcquisition::Certified(completed),
             // The read's own custody (lease, chain, debt) moves with it.
             None => FinishAcquisition::Uncertified(self.completed_durable()),
         };
-        let mut prepare = Some(prepare);
+        let mut prepare = Some(
+            |lease: &mut crate::durable_tail_store::ActiveLease,
+             view: sampled_scan::durable_tail::LiveFinishView<'_>| {
+                cache.prepare_live(lease, view)
+            },
+        );
         let mut preparation = None;
         let mut stage = |live: PreFinalization<'_>| {
             if let Some(prepare) = prepare.take() {
@@ -36068,11 +36198,21 @@ impl OwnedJsonlParser {
             }
         };
         let native = self.finish_native(request, Some(&mut stage));
-        NativeFinishAttempt {
+        let attempt = NativeFinishAttempt {
             native,
             acquisition,
             preparation,
-        }
+        };
+        #[cfg(test)]
+        sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeNativeSettle);
+        settle_native_attempt(cache, attempt, held, fence)
+    }
+
+    // Keep the consumed parser off the caller's scan-step frame as well as
+    // while it is retained in OwnedActiveFile. Unboxing belongs to this frame.
+    #[inline(never)]
+    fn finish_boxed_native(self: Box<Self>, request: FinishRequest<'_>) -> Result<ParsedJsonlFile> {
+        self.finish_native(request, None)
     }
 
     /// The one native finish. `pre` runs exactly once, only on the path that
@@ -36464,8 +36604,22 @@ where
     } = custody;
     // While debt exists the chain lives only in it.
     let chain = chain
-        .as_ref()
+        .as_deref()
         .or_else(|| owed.as_ref().map(|owed| owed.chain()))?;
+    if certified.is_none()
+        && owed.is_none()
+        && !sampled_jsonl::loss_free_source_report(
+            live.report,
+            live.recognized_usage_drop_count,
+            live.accumulator.dropped_usage_record_count,
+        )
+    {
+        // A lossy Tail has no certified candidate to receipt. Preserve its
+        // predecessor and let native settlement disclose the loss and keep
+        // main's entity quarantine. Treating it as a failed commit would hide
+        // the dropped-usage counts behind a synthetic receipt hold.
+        return None;
+    }
     let Some((checkpoint, reduction, unsealed)) = certified else {
         return Some(PrepareOutcome::NotPersisted(NotPersisted::Certificate));
     };
@@ -36509,7 +36663,7 @@ where
 fn custody_chain(custody: &DurableCustody) -> Option<&sampled_scan::durable_tail::AcquiredChain> {
     custody
         .chain
-        .as_ref()
+        .as_deref()
         .or_else(|| custody.owed.as_ref().map(|owed| owed.chain()))
 }
 
@@ -36647,7 +36801,7 @@ fn bind_native_chain(
         first_read || real_edit,
         counting,
     ) {
-        custody.chain = Some(chain);
+        custody.chain = Some(Box::new(chain));
     }
 }
 
@@ -36685,6 +36839,7 @@ fn discard_staging(
 /// result, the certified completion the caller may still admit, and how the
 /// caller proceeds. A native error publishes nothing and keeps its debt.
 #[cfg(unix)]
+#[inline(never)]
 fn settle_native_attempt(
     cache: &sampled_scan::SharedCache,
     attempt: sampled_scan::durable_tail::NativeFinishAttempt,
@@ -45538,10 +45693,15 @@ impl<'a> From<&'a BTreeMap<String, ScanIndexEntry>> for DiscoveryRecovery<'a> {
 impl DiscoveryRecovery<'_> {
     fn requires(&self, source: SnapshotSource, path: &Path, length: u64) -> bool {
         #[cfg(unix)]
-        if self
-            .cache
-            .is_some_and(|cache| cache.owes_discovery(source, &local_index_key(path)))
-        {
+        if self.cache.is_some_and(|cache| {
+            cache.owes_discovery(source, &local_index_key(path))
+                || cache.missing_reduction_growth(
+                    source,
+                    &local_index_key(path),
+                    self.files,
+                    length,
+                )
+        }) {
             return true;
         }
         sampled_audit::path_requires_recovery(source, self.files, path, length)
@@ -94839,7 +94999,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
-crate::heap_layout_bound::fields!(OwnedJsonlParser; pending_taken, pending_returns, #[cfg(unix)] pending_funding, #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
+crate::heap_layout_bound::fields!(OwnedJsonlParser; owed_full_after_lossy_shrink, pending_taken, pending_returns, #[cfg(unix)] pending_funding, #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_publication, native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; restored_behind_accepted, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);

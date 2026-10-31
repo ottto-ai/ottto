@@ -659,47 +659,6 @@ fn earlier_debt(a: Option<AuditDebt>, b: Option<AuditDebt>) -> Option<AuditDebt>
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    static SAMPLE_READ_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-/// Physical certificate input observer; production reads/credit are unchanged.
-#[cfg(test)]
-pub(crate) fn capture_sample_bytes<T>(run: impl FnOnce() -> T) -> (T, usize) {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            SAMPLE_READ_BYTES.set(None);
-        }
-    }
-    assert!(SAMPLE_READ_BYTES.replace(Some(0)).is_none());
-    let _reset = Reset;
-    let output = run();
-    (output, SAMPLE_READ_BYTES.get().unwrap())
-}
-
-#[cfg(test)]
-thread_local! {
-    static AFTER_SAMPLE_READ: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn with_sample_read_hook<T>(hook: impl FnMut() + 'static, run: impl FnOnce() -> T) -> T {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            AFTER_SAMPLE_READ.with(|slot| slot.borrow_mut().take());
-        }
-    }
-    AFTER_SAMPLE_READ.with(|slot| {
-        assert!(slot.borrow().is_none());
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
-    let _reset = Reset;
-    run()
-}
-
 fn read_sample(file: &mut File, offset: u64, len: usize, count: &mut usize) -> io::Result<Vec<u8>> {
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = vec![0; len];
@@ -719,18 +678,6 @@ fn read_sample(file: &mut File, offset: u64, len: usize, count: &mut usize) -> i
             }
         });
         let n = result?;
-        #[cfg(test)]
-        AFTER_SAMPLE_READ.with(|slot| {
-            if let Some(hook) = slot.borrow_mut().as_mut() {
-                hook();
-            }
-        });
-        #[cfg(test)]
-        SAMPLE_READ_BYTES.with(|bytes| {
-            if let Some(total) = bytes.get() {
-                bytes.set(Some(total + n));
-            }
-        });
         *count += n;
         if n == 0 {
             return Err(io::Error::new(

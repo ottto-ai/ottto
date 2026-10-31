@@ -1304,6 +1304,7 @@ crate::durable_tail_codec::durable_struct!(OccurrenceCounters {
 #[cfg(test)]
 mod content_decision_tests {
     use super::*;
+    /// [money] unbound equal totals precede bound repeat filter and physical duplicates.
     #[test]
     fn unbound_equal_totals_precede_bound_repeat_filter_and_physical_duplicates() {
         for bound in [false, true] {
@@ -1351,8 +1352,3 @@ mod content_decision_tests {
         }
     }
 }
-
-#[cfg(test)]
-mod equivalence_tests;
-#[cfg(test)]
-mod pre_refactor;

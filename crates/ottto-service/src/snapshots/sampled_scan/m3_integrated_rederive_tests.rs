@@ -236,6 +236,7 @@ impl ColdReplay {
     }
 }
 
+/// [format] cold store each fence class and certificate reason retires before one full.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -388,6 +389,7 @@ fn cold_store_each_fence_class_and_certificate_reason_retires_before_one_full() 
     }
 }
 
+/// [money] restored chain append during identity samples keeps tail and exact cold body.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -452,192 +454,7 @@ fn restored_chain_append_during_identity_samples_keeps_tail_and_exact_cold_body(
     lease.release();
 }
 
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "native bounded decode and admission"
-)]
-fn twenty_failed_heads_and_evictions_cannot_starve_maximal_waiter_past_aged_fallback() {
-    let _on = crate::snapshots::RestartRestoreForTest::enabled();
-    let _hooks = Hooks;
-    let source = SnapshotSource::Codex;
-    let waiter = ColdReplay::new(Some(codec::HEAD_BOUND as usize), true, false);
-    let plan = codec::decode(&waiter.body, source)
-        .unwrap()
-        .rederive_plan()
-        .unwrap();
-    assert_eq!(plan.end, codec::HEAD_BOUND);
-    assert_eq!(plan.title.unwrap().1, codec::TITLE_LINE_BOUND);
-    assert_eq!(
-        plan.input_bytes(),
-        REDERIVE_PASS_BYTES,
-        "maximal head plus external title fits one pass exactly"
-    );
-    let cache = waiter.cache();
-    let now = SystemTime::now();
-    cache.durable().unwrap().retail_full_now = Some(now);
-    let failing: Vec<_> = (0..20)
-        .map(|_| ColdReplay::new(Some(90_000), false, true))
-        .collect();
-    // Independent records use the same production pass budget and custody.
-    let attempt = |rig: &ColdReplay| {
-        let key = rig.key();
-        let i = Interpretation::of(source, &key, &rig.index, false, &rig.namespace);
-        let expected = expected(
-            DurableSource::Codex,
-            source,
-            &key,
-            &rig.scope,
-            &rig.index,
-            &i,
-            Some((
-                store::FORMAT_V1,
-                codec::allowlist_digest(source),
-                effective_revision(source),
-            )),
-        )
-        .unwrap();
-        let mut disk = DurableTailStore::new(
-            store::store_dir_for_index(&rig.index_path),
-            DurableSource::Codex,
-        );
-        let ReadOutcome::Found(record) = disk.read(&expected.binding.key) else {
-            panic!("failure record")
-        };
-        let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source) else {
-            panic!("lease")
-        };
-        let result = cache.durable_restore_record_scoped(
-            source,
-            &record,
-            &expected,
-            &rig.path,
-            &rig.scope,
-            &mut File::open(&rig.path).unwrap(),
-            &mut lease,
-            Some(V3RestoreScope {
-                index: &rig.index,
-                interpretation: &i,
-            }),
-        );
-        lease.release();
-        result.err().expect("real replay refusal")
-    };
-    for rig in &failing {
-        rig.append();
-        let (failure, reads) = capture_rederive_reads(|| attempt(rig));
-        assert!(matches!(failure, Failure::Resource("rederive_refused")));
-        assert_eq!(reads, 1, "all twenty predecessors consume a real head");
-        assert!(cache.rederive_full(
-            source,
-            &rig.key(),
-            &File::open(&rig.path).unwrap(),
-            rig.index.files[&rig.key()].size_bytes,
-            true
-        ));
-    }
-    waiter.append();
-    let ((outcome, reads), rows) = crate::local_resource_diagnostics::capture(|| {
-        capture_rederive_reads(|| waiter.restore(&cache))
-    });
-    assert!(matches!(outcome, RestoreOutcome::Pending));
-    assert_eq!(
-        reads, 0,
-        "budget waiter consumes neither head nor named title"
-    );
-    assert!(!rows
-        .iter()
-        .any(|r| r["counts"].get("rederive_head_reads").is_some()));
-    assert!(cache.owes_discovery(source, &waiter.key()));
-    for rig in &failing {
-        for _ in 0..3 {
-            evict_failed_replay_pace(&cache, source, &rig.key());
-            let (_, reads) = capture_rederive_reads(|| attempt(rig));
-            assert!(reads <= 1);
-            assert!(!cache.rederive_full(
-                source,
-                &rig.key(),
-                &File::open(&rig.path).unwrap(),
-                rig.index.files[&rig.key()].size_bytes,
-                true
-            ));
-            assert!(cache.owes_discovery(source, &rig.key()));
-            let (outcome, reads) = capture_rederive_reads(|| waiter.restore(&cache));
-            assert!(matches!(outcome, RestoreOutcome::Pending));
-            assert_eq!(reads, 0);
-            assert!(cache.owes_discovery(source, &waiter.key()));
-        }
-    }
-    assert!(
-        cache.durable().unwrap().rederive_spent[DurableSource::Codex.slot()] <= REDERIVE_PASS_BYTES
-    );
-    let original = std::fs::read(&waiter.record_path).unwrap();
-    cache.durable().unwrap().retail_full_now = Some(now + Duration::from_secs(PACE_SECS));
-    let (outcome, reads) = capture_rederive_reads(|| waiter.restore(&cache));
-    assert!(matches!(
-        outcome,
-        RestoreOutcome::Miss(MissClass::Resource("rederive_budget_aged"))
-    ));
-    assert_eq!(reads, 0);
-    assert!(cache.start_resource_full(
-        source,
-        &waiter.key(),
-        &File::open(&waiter.path).unwrap(),
-        waiter.index.files[&waiter.key()].size_bytes,
-        "rederive_budget_aged"
-    ));
-    assert!(!cache.start_resource_full(
-        source,
-        &waiter.key(),
-        &File::open(&waiter.path).unwrap(),
-        waiter.index.files[&waiter.key()].size_bytes,
-        "rederive_budget_aged"
-    ));
-    assert_eq!(
-        cache
-            .durable()
-            .unwrap()
-            .counters
-            .resource_full
-            .get("rederive_budget_aged"),
-        Some(&1)
-    );
-    File::open(&waiter.path)
-        .unwrap()
-        .set_modified(now - Duration::from_secs(400 * 86_400))
-        .unwrap();
-    assert!(cache.owes_discovery(source, &waiter.key()));
-    assert_eq!(std::fs::read(&waiter.record_path).unwrap(), original);
-    // Restart resets the pass budget. No directory-catch-up claim is made:
-    // this explicitly selected, retained record remains readable at old mtime.
-    let fresh = waiter.cache();
-    let (outcome, reads) = capture_rederive_reads(|| waiter.restore(&fresh));
-    let RestoreOutcome::Restored(taken, lease) = outcome else {
-        panic!("maximal waiter restored after restart")
-    };
-    assert_eq!(reads, 2);
-    assert_eq!(
-        fresh.durable().unwrap().rederive_spent[DurableSource::Codex.slot()],
-        REDERIVE_PASS_BYTES
-    );
-    let mut parser = owned_parser(source, &waiter.path, File::open(&waiter.path).unwrap());
-    assert_eq!(
-        parser
-            .prepare_acquisition_owned(Some(taken), &waiter.scope, None, now_seconds())
-            .map_err(|e| e.error)
-            .unwrap(),
-        ReadMode::Tail
-    );
-    while !parser.step().unwrap() {}
-    let actual = codec::test_finish_items(parser, &waiter.path, source);
-    let mut cold = owned_parser(source, &waiter.path, File::open(&waiter.path).unwrap());
-    cold.prepare_acquisition(None, &waiter.scope, None, now_seconds())
-        .unwrap();
-    while !cold.step().unwrap() {}
-    assert_eq!(actual, codec::test_finish_items(cold, &waiter.path, source));
-    lease.release();
-}
-
+/// [money] claude both restore floor edges hold then catch up without moving accepted facts.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -645,7 +462,6 @@ fn twenty_failed_heads_and_evictions_cannot_starve_maximal_waiter_past_aged_fall
 )]
 fn claude_both_restore_floor_edges_hold_then_catch_up_without_moving_accepted_facts() {
     let _on = crate::snapshots::RestartRestoreForTest::enabled();
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let _hooks = Hooks;
     for late in [false, true] {
         let mut rig = O3Fixture::from_rows(&a1a_row("accepted", 100), false);

@@ -4,6 +4,7 @@ use super::*;
 
 impl SharedCache {
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     pub(super) fn m1_restore(
         &self,
         source: SnapshotSource,
@@ -31,6 +32,7 @@ impl SharedCache {
         }
     }
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn m1_restore_known(
         &self,
         snapshot_source: SnapshotSource,
@@ -204,6 +206,7 @@ impl SharedCache {
         self.take(key).ok_or(MissClass::TakeLost)
     }
 
+    #[inline(never)]
     fn m1_restore_record(
         &self,
         source: SnapshotSource,

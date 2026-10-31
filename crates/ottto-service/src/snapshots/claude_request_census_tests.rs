@@ -463,7 +463,7 @@ fn census_unchanged_preserves_only_matching_verified_records() {
             record_claude_request_census(
                 &mut index,
                 ClaudeRequestCensusParse {
-                    held_index_keys: &Default::default(),
+                    held_index_keys: &BTreeSet::new(),
                     path,
                     index_key: &key,
                     source_file_fingerprint: &fingerprint,
@@ -2724,7 +2724,7 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
         };
         match arm {
             "cold" => {
-                assert_eq!(counts.durable_held, [0; 8]);
+                assert_eq!(counts.durable_held, [0; 9]);
                 assert_eq!(counts.durable_held[6], 0, "no pending receipt");
                 assert_eq!(copy_status, ClaudeCensusMemberStatus::SharesHash);
                 // Money conservation premise: a cold read of the unchanged
@@ -2772,6 +2772,7 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
     );
 }
 
+/// [money] paced restore residue prevents 35 day census retirement until catchup.
 #[test]
 fn paced_restore_residue_prevents_35_day_census_retirement_until_catchup() {
     let scratch = crate::test_scratch::ScratchDir::new("census-paced-retention");
@@ -2828,6 +2829,7 @@ fn paced_restore_residue_prevents_35_day_census_retirement_until_catchup() {
     );
 }
 
+/// [money] native shrink requires exact committed census and opened object.
 #[test]
 #[cfg(unix)]
 fn native_shrink_requires_exact_committed_census_and_opened_object() {

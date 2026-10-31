@@ -95,29 +95,17 @@ enum Sink<'a> {
 pub(crate) struct Enc<'a> {
     sink: Sink<'a>,
     moved_field: Option<&'static str>,
-    #[cfg(test)]
-    include_content_bytes: bool,
 }
 
 impl<'a> Enc<'a> {
     pub(crate) fn bytes(limit: usize) -> Self {
         Self {
             moved_field: None,
-            #[cfg(test)]
-            include_content_bytes: false,
             sink: Sink::Bytes {
                 out: Vec::with_capacity(limit),
                 limit,
             },
         }
-    }
-    /// Differential fixtures need actual X bytes as well as persisted classes.
-    /// This never participates in a production encoder or a shape/hash pin.
-    #[cfg(test)]
-    pub(crate) fn full_bytes(limit: usize) -> Self {
-        let mut out = Self::bytes(limit);
-        out.include_content_bytes = true;
-        out
     }
     /// Count and emit through the same field walk. The body allocation is
     /// exact and only happens after every admission/size check succeeds.
@@ -138,8 +126,6 @@ impl<'a> Enc<'a> {
     pub(crate) fn writer(out: &'a mut dyn Write, exact_len: usize) -> Self {
         Self {
             moved_field: None,
-            #[cfg(test)]
-            include_content_bytes: false,
             sink: Sink::Write {
                 out,
                 len: 0,
@@ -157,8 +143,6 @@ impl<'a> Enc<'a> {
     pub(crate) fn count(limit: usize) -> Self {
         Self {
             moved_field: None,
-            #[cfg(test)]
-            include_content_bytes: false,
             sink: Sink::Count { len: 0, limit },
         }
     }
@@ -174,8 +158,6 @@ impl<'a> Enc<'a> {
         hasher.update(domain.as_bytes());
         Self {
             moved_field: None,
-            #[cfg(test)]
-            include_content_bytes: false,
             sink: Sink::Hash(Box::new(hasher)),
         }
     }
@@ -200,10 +182,7 @@ impl<'a> Enc<'a> {
         self.moved_field == Some(path)
     }
     pub(crate) fn hashing(&self) -> bool {
-        let hashing = matches!(self.sink, Sink::Hash(_));
-        #[cfg(test)]
-        let hashing = hashing || self.include_content_bytes;
-        hashing
+        matches!(self.sink, Sink::Hash(_))
     }
     /// Byte-output position; counting and hashing never record `L` spans.
     #[cfg(test)]
@@ -1882,6 +1861,7 @@ pub(crate) fn trace_verify(f: impl FnOnce()) -> (Vec<(usize, bool)>, usize) {
 #[cfg(test)]
 mod tests {
 
+    /// [format] count write matches bytes and refuses before output.
     #[test]
     fn count_write_matches_bytes_and_refuses_before_output() {
         let put = |e: &mut Enc<'_>| {
@@ -1905,6 +1885,7 @@ mod tests {
         assert_eq!(calls.get(), 1, "count refusal never starts the output pass");
     }
 
+    /// [format] write sink handles short writes limits and io errors.
     #[test]
     fn write_sink_handles_short_writes_limits_and_io_errors() {
         struct Short(Vec<u8>);
@@ -1922,7 +1903,6 @@ mod tests {
         {
             let mut e = Enc {
                 moved_field: None,
-                include_content_bytes: false,
                 sink: Sink::Write {
                     out: &mut out,
                     len: 0,
@@ -1937,7 +1917,6 @@ mod tests {
         let mut empty = &mut [][..];
         let mut e = Enc {
             moved_field: None,
-            include_content_bytes: false,
             sink: Sink::Write {
                 out: &mut empty,
                 len: 0,
@@ -2006,6 +1985,7 @@ mod tests {
         value.put(&mut e).unwrap();
         budget_probe(&e.into_bytes(), T::take);
     }
+    /// [format] bounded decode funds every scalar sequence ordered and owned constructor.
     #[test]
     fn bounded_decode_funds_every_scalar_sequence_ordered_and_owned_constructor() {
         budget_round(String::from("scalar"));
@@ -2048,6 +2028,7 @@ mod tests {
         String::from("path").put(&mut e).unwrap();
         budget_probe(&e.into_bytes(), std::path::PathBuf::take);
     }
+    /// [format] bounded decode keeps integrity distinct and checks budget arithmetic.
     #[test]
     fn bounded_decode_keeps_integrity_distinct_and_checks_budget_arithmetic() {
         let mut deny = |_: u64| false;
