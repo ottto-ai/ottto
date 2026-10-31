@@ -240,13 +240,6 @@ impl E2ScanFixture {
     }
 }
 
-pub(crate) fn without_money_folds(scan: &mut SourceScanResult) {
-    // Publication reference: the legacy caller has no E2 fold carrier.
-    for item in &mut scan.snapshots {
-        item.claude_money = None;
-    }
-}
-
 pub(crate) fn birth_store_bytes(index: &ScanIndex) -> Vec<u8> {
     serde_json::to_vec(&index.claude_money_birth_store).unwrap()
 }
@@ -284,4 +277,83 @@ pub(crate) fn adopt_acked_census_for_test(index: &mut ScanIndex, context: &str) 
 /// Read the actual runtime context for the exact-ACK fixture bridge.
 pub(crate) fn active_upload_context(index: &ScanIndex) -> Option<&str> {
     index.active_upload_context_fingerprint.as_deref()
+}
+
+/// Install the real exclusion input used by ordinary-money fixture families.
+/// An empty slice adopts request-owned money on the next normal source pass.
+pub(crate) fn write_exclusions(support: &Path, sessions: &[&str]) {
+    use sha2::Digest;
+    let path = claude_reemission_exclusions::ReemissionExclusions::path(support);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let lines = sessions
+        .iter()
+        .map(|session| format!("{:x}\n", sha2::Sha256::digest(session.as_bytes())))
+        .collect::<String>();
+    fs::write(path, lines).unwrap();
+}
+
+/// A real fail-closed exclusion-list result, scoped to this fixture index.
+pub(crate) fn ordinary_index(mut index: ScanIndex) -> ScanIndex {
+    index.claude_reemission_exclusions = claude_reemission_exclusions::ReemissionExclusions::parse(
+        b"malformed synthetic exclusion input",
+    );
+    index
+}
+
+/// Ordinary-money parser fixture through the existing native parser and real
+/// paused-adoption input. No alternate resolver or money builder.
+pub(crate) fn parse_ordinary(
+    path: &Path,
+    at: &str,
+    fingerprint: String,
+) -> Result<Vec<SnapshotItem>> {
+    parse_ordinary_with_metadata(path, at, fingerprint, &ClaudeTitleMetadata::default(), true)
+}
+
+pub(super) fn parse_ordinary_with_metadata(
+    path: &Path,
+    at: &str,
+    fingerprint: String,
+    metadata: &ClaudeTitleMetadata,
+    artifacts: bool,
+) -> Result<Vec<SnapshotItem>> {
+    let mut file = File::open(path)?;
+    let opened = opened_object_identity(SnapshotSource::ClaudeCode, &mut file)?;
+    let mut parser = OwnedJsonlParser::new(
+        file,
+        path,
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        None,
+        None,
+        None,
+        artifacts,
+        true,
+    )?;
+    while !parser.step()? {}
+    let index = ordinary_index(ScanIndex::default());
+    parser
+        .finish_with_repository_identity(
+            &opened,
+            path,
+            at,
+            fingerprint,
+            None,
+            Some(metadata),
+            None,
+            None,
+            Some(claude_request_money::e2::ReadContext {
+                index: &index,
+                path,
+                twins: &std::cell::OnceCell::new(),
+            }),
+        )
+        .map(|parsed| parsed.snapshots)
+}
+
+/// Persist a real malformed-list input to exercise fail-closed ordinary money.
+pub(crate) fn pause_adoption(support: &Path) {
+    let path = claude_reemission_exclusions::ReemissionExclusions::path(support);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, b"malformed synthetic exclusion input").unwrap();
 }

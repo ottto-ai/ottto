@@ -156,7 +156,6 @@ fn money_unclocked(mut value: serde_json::Value) -> serde_json::Value {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn e2_real_caller_parity_at_tight_allowances() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }

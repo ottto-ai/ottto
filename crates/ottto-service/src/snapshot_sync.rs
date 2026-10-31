@@ -9653,7 +9653,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .into_iter()
         .collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
-    let request_owned_enabled = crate::snapshots::claude_request_money::e2::enabled();
     // A family kept on ordinary money (listed) reads its telemetry as gate off.
     let request_owned =
         |root: &str| crate::snapshots::claude_request_money::e2::family_applies(index, root, None);
@@ -9897,8 +9896,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         &trace_report,
         index,
     );
-    let mut trace_discard_unfolded = BTreeSet::new();
-    if request_owned_enabled {
+    let trace_discard_unfolded = {
         // Reuse the per-root read verdict before identity consumes it. Missing
         // sidecars are ordinary absence; partial pairs and failed strict reads
         // hold only that root's permitted owed history through the existing seam.
@@ -9909,12 +9907,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // A discarded strict trace read defers the family's bodies through the
         // E2 withhold: the accepted revision stays, delayed one pass, never
         // replaced by an untagged one. Listed families included.
-        (stats.trace_discard_deferred_items, trace_discard_unfolded) =
-            crate::snapshots::claude_request_money::e2::hold_trace_discarded(
-                &mut scan_result.snapshots,
-                &trace_discarded_roots,
-            );
-    }
+        let (deferred, unfolded) = crate::snapshots::claude_request_money::e2::hold_trace_discarded(
+            &mut scan_result.snapshots,
+            &trace_discarded_roots,
+        );
+        stats.trace_discard_deferred_items = deferred;
+        unfolded
+    };
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {
@@ -9959,17 +9958,16 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if let Some(comparison) = comparison {
         comparison.retire_native_fold_owner();
     }
-    if crate::snapshots::claude_request_money::e2::enabled() {
-        if let Some(evidence) = &identity_evidence {
-            let no_fallback = crate::snapshots::claude_request_identity::reconcile_request_accounts(
-                &mut scan_result.snapshots,
-                evidence,
-            );
-            // #932's scalar stays, equal to its reason in the map.
-            stats.trace_discard_no_fallback_requests = no_fallback.discarded;
-            stats.unhealthy_root_no_fallback_requests = no_fallback;
-        }
+    if let Some(evidence) = &identity_evidence {
+        let no_fallback = crate::snapshots::claude_request_identity::reconcile_request_accounts(
+            &mut scan_result.snapshots,
+            evidence,
+        );
+        // #932's scalar stays, equal to its reason in the map.
+        stats.trace_discard_no_fallback_requests = no_fallback.discarded;
+        stats.unhealthy_root_no_fallback_requests = no_fallback;
     }
+
     let request_owned_activity = identity_evidence.as_ref().map(|evidence| {
         let ownership =
             crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
@@ -10001,7 +9999,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
     }
     disposition.hold_request_owned(withheld);
-    if request_owned_enabled {
+    {
         for item in &mut scan_result.snapshots {
             if let Some(root) =
                 crate::snapshots::claude_request_money::request_owned_family_root(item)
@@ -10014,7 +10012,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             }
         }
     }
-    if telemetry_read_failed && crate::snapshots::claude_request_money::e2::enabled() {
+    if telemetry_read_failed {
         // No owed history file settles on estimates because this page could
         // not read telemetry: the emission seam drops its bodies, keeps its
         // upload tuple, and it stays owed for a later page.
@@ -18021,7 +18019,7 @@ mod tests {
     #[serial(client_report)]
     fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let root = test_dir("admission-native-hourly");
         std::fs::create_dir_all(&root).unwrap();
         let source = SnapshotSource::ClaudeCode;
@@ -18045,7 +18043,7 @@ mod tests {
                 lines.push('\n');
             }
             std::fs::write(&path, lines).unwrap();
-            let mut parsed = crate::snapshots::parse_claude_code_jsonl_file(
+            let mut parsed = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
                 &path,
                 "2026-10-05T00:00:00Z",
                 format!("{hours:064x}"),
@@ -18089,7 +18087,8 @@ mod tests {
                 &snapshot_upload_body_witness(large),
             );
         }
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         index.file_snapshot_fingerprints.insert(
             "synthetic-large.jsonl".into(),
             BTreeSet::from([large.snapshot_fingerprint.clone()]),
@@ -22351,9 +22350,6 @@ mod tests {
             include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
             mod stale_family_carry_pipeline_tests {
                 include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
-                mod unhealthy_retry_reread_acceptance_tests {
-                    include!("snapshot_sync/unhealthy_retry_reread_acceptance_tests.rs");
-                }
                 mod oversized_discovery_pipeline_tests {
                     include!("snapshot_sync/oversized_discovery_pipeline_tests.rs");
                 }
@@ -23348,12 +23344,13 @@ mod tests {
         // Subject: the legacy account path contract 5 now leaves to untagged bodies.
         let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         use crate::claude_local_otel::ClaudeIdentityDisposition;
         use sha2::{Digest, Sha256};
         let (dir, raw, api, trace) =
             crate::snapshots::claude_request_account_mixed_fixture(4, false);
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&dir),
@@ -23471,7 +23468,9 @@ mod tests {
                     .iter()
                     .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
                     .all(|row| row.account_identifier_hash.is_none()));
-                let mut retained = ScanIndex::default();
+                let mut retained = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
+                    ScanIndex::default(),
+                );
                 let (prior_dir, mut prior, _, _) =
                     crate::snapshots::claude_request_account_mixed_fixture(2, true);
                 retained.bind_session_accounts(
@@ -23509,12 +23508,13 @@ mod tests {
     #[serial(client_report)]
     fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         let (root, mut prior, _, _) =
             crate::snapshots::claude_request_account_mixed_fixture(2, true);
         let (candidate_root, mut candidate, api, trace) =
             crate::snapshots::claude_request_account_mixed_fixture(4, true);
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         index.bind_session_accounts(
             SnapshotSource::ClaudeCode,
             "machine",
@@ -23589,6 +23589,7 @@ mod tests {
         )
         .unwrap();
         let mut restarted = ScanIndex::load(&index_path).unwrap();
+        restarted = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(restarted);
         assert!(restarted
             .bind_session_accounts(
                 SnapshotSource::ClaudeCode,

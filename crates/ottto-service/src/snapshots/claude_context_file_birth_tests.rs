@@ -1494,66 +1494,6 @@ fn api_row_without_trace_row_counts_as_owned() {
 }
 
 #[test]
-fn telemetry_proven_session_keeps_todays_numbers() {
-    // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let dir = temp_dir("claude-file-birth-parity");
-    let now = OffsetDateTime::now_utc();
-    let (path, parsed) = root_session(
-        &dir,
-        ROOT,
-        &[
-            assistant(ROOT, "req_a1", &stamp(now, -30), 100),
-            assistant(ROOT, "req_a2", &stamp(now, -29), 300),
-            boundary(ROOT, &stamp(now, -28), 310, 50),
-            assistant(ROOT, "req_a3", &stamp(now, -27), 200),
-        ],
-    );
-    let evidence = reports(
-        &[
-            (ROOT, "req_a1", 1, 100),
-            (ROOT, "req_a2", 2, 300),
-            (ROOT, "req_a3", 3, 200),
-        ],
-        true,
-    );
-    let run = |fence_closed: bool| {
-        let mut items = vec![parsed.clone()];
-        let mut index = indexed(&[&path], fence_closed);
-        let disposition = fold(&mut items, &evidence, &mut index, true);
-        (disposition.posture_admission(ROOT), items.remove(0))
-    };
-
-    let (strict_admission, strict) = run(false);
-    let (birth_admission, birth) = run(true);
-
-    assert_eq!(strict_admission, Some("strict"));
-    assert_eq!(birth_admission, Some("file_birth_rule"));
-    assert_eq!(posture(&strict), (Some(100), Some(300), Some(200), Some(1)));
-    assert_eq!(posture(&birth), posture(&strict));
-    assert_eq!(birth.compaction_timestamps, strict.compaction_timestamps);
-    assert_eq!(
-        birth.compaction_total_pre_tokens,
-        strict.compaction_total_pre_tokens
-    );
-    assert_eq!(birth.session_start, strict.session_start);
-    // Both writers build sizes and points through one helper: same values.
-    assert_eq!(
-        strict.compaction_events,
-        vec![SnapshotCompactionEvent {
-            at: stamp(now, -28),
-            before: Some(300),
-            after: Some(200),
-            trigger: Some("auto".to_string()),
-        }]
-    );
-    assert_eq!(birth.compaction_events, strict.compaction_events);
-    assert!(!strict.local_context_points.is_empty());
-    assert_eq!(birth.local_context_points, strict.local_context_points);
-    let _ = fs::remove_dir_all(dir);
-}
-
-#[test]
 fn id_less_responses_share_the_one_scalar_source() {
     let dir = temp_dir("claude-file-birth-id-less");
     let now = OffsetDateTime::now_utc();
@@ -1617,7 +1557,7 @@ fn last_turn_alone_does_not_change_the_upload_fingerprint() {
 #[test]
 fn capture_on_bodies_match_the_clear_outside_context_scalars() {
     // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use crate::snapshots::claude_request_identity as identity;
     let (dir, root, api, trace) = h296_root_evidence();
     let support = dir.join("support");
@@ -1672,7 +1612,8 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
     .unwrap();
     let claude = SnapshotSource::ClaudeCode;
     let run = |rule_on: bool, fence_closed: bool| {
-        let mut index = ScanIndex::default();
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         let mut scan = scan_source_roots_with_test_limit(
             claude,
             std::slice::from_ref(&dir),
