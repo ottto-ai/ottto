@@ -769,13 +769,12 @@ mod hydrate_parity {
         let f = Fixture::new();
         let v1 = f.support.join("v1-index.json");
         fs::write(&v1, bytes).unwrap();
-        let (mut expected, _) = ScanIndex::load_inner_with_support(
-            &v1,
-            Some(s::SnapshotSource::ClaudeCode),
-            None,
-            SystemTime::now(),
-        )
-        .unwrap();
+        // One clock for every load: load-time clamps (e.g. a quarantine
+        // deadline) must not straddle a second boundary between them.
+        let now = SystemTime::now();
+        let (mut expected, _) =
+            ScanIndex::load_inner_with_support(&v1, Some(s::SnapshotSource::ClaudeCode), None, now)
+                .unwrap();
         publish(&f, &mapped);
         expected.generation = 1;
         let fence_bytes = fs::read(&f.path).unwrap();
@@ -784,7 +783,7 @@ mod hydrate_parity {
                 &f.path,
                 Some(s::SnapshotSource::ClaudeCode),
                 None,
-                SystemTime::now(),
+                now,
             )
             .unwrap()
             .0
