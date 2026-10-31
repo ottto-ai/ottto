@@ -166,7 +166,7 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
     let _cutover = codex_counting_version::TestCutover::set(if active {
         0
     } else {
-        codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS.unwrap()
+        codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS
     });
     let root = crate::test_scratch::unique_path("ottto-v2-price");
     fs::create_dir_all(&root).unwrap();
@@ -846,7 +846,7 @@ fn entry(fingerprint: Option<&str>, v2: bool) -> ScanIndexEntry {
 #[test]
 fn codex_counting_version_decision_is_stable() {
     let decide =
-        |record: &Value, evidence| codex_counting_version::decide(record, evidence, Some(CUTOVER));
+        |record: &Value, evidence| codex_counting_version::decide(record, evidence, CUTOVER);
     let post = header(POST);
     assert_eq!(decide(&post, AckEvidence::None), CountingVersion::V2);
     assert_eq!(decide(&post, AckEvidence::V2Marked), CountingVersion::V2);
@@ -857,11 +857,6 @@ fn codex_counting_version_decision_is_stable() {
     assert_eq!(
         decide(&header(PRE), AckEvidence::None),
         CountingVersion::Legacy
-    );
-    assert_eq!(
-        codex_counting_version::decide(&post, AckEvidence::None, None),
-        CountingVersion::Legacy,
-        "no compiled cutover keeps every session Legacy"
     );
     let mut continuation = header(POST);
     continuation["payload"]["history_base"] = json!({"thread_id": SESSION});
@@ -879,15 +874,6 @@ fn codex_counting_version_decision_is_stable() {
     assert_eq!(
         decide(&first_usage, AckEvidence::None),
         CountingVersion::Legacy
-    );
-    // Inactive, a group's member view is never traversed, so the group scan
-    // allocates nothing for counting; active, it reads the members' evidence.
-    let unpolled = std::iter::from_fn(|| -> Option<&'static ScanIndexEntry> {
-        panic!("an inactive group must not read member evidence")
-    });
-    assert_eq!(
-        codex_counting_version::group_evidence(unpolled),
-        AckEvidence::None
     );
     let marked = entry(Some("body"), true);
     let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
@@ -994,7 +980,7 @@ fn codex_counting_destination_loss_rederives_only_from_its_own_index() {
     let post = header(POST);
     let decide = |index: &ScanIndex| {
         let evidence = AckEvidence::of_view(index.files.get("/synthetic/sessions/rollout.jsonl"));
-        codex_counting_version::decide(&post, evidence, Some(CUTOVER))
+        codex_counting_version::decide(&post, evidence, CUTOVER)
     };
     let mut marked = ScanIndex::default();
     marked.files.insert(

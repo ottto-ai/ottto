@@ -266,19 +266,11 @@ fn cutover_equality_and_marked_pre_cutover_root() {
     let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
     for evidence in [AckEvidence::None, AckEvidence::V2Marked] {
         assert_eq!(
-            codex_counting_version::decide(
-                &header("2026-09-21T14:13:20Z"),
-                evidence,
-                Some(CUTOVER)
-            ),
+            codex_counting_version::decide(&header("2026-09-21T14:13:20Z"), evidence, CUTOVER),
             CountingVersion::V2
         );
         assert_eq!(
-            codex_counting_version::decide(
-                &header("2026-09-21T14:13:19.999Z"),
-                evidence,
-                Some(CUTOVER)
-            ),
+            codex_counting_version::decide(&header("2026-09-21T14:13:19.999Z"), evidence, CUTOVER),
             CountingVersion::Legacy
         );
     }
@@ -292,7 +284,7 @@ fn fork_marker_selection_is_separate_from_owned_header_admission() {
     // The selector alone ignores forked_from_id; history_base is its explicit
     // continuation fence. Ownership must first admit a header to reach it.
     assert_eq!(
-        codex_counting_version::decide(&fork, AckEvidence::None, Some(CUTOVER)),
+        codex_counting_version::decide(&fork, AckEvidence::None, CUTOVER),
         CountingVersion::V2
     );
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
@@ -304,7 +296,7 @@ fn fork_marker_selection_is_separate_from_owned_header_admission() {
     );
     fork["payload"]["history_base"] = json!({"id":"parent"});
     assert_eq!(
-        codex_counting_version::decide(&fork, AckEvidence::V2Marked, Some(CUTOVER)),
+        codex_counting_version::decide(&fork, AckEvidence::V2Marked, CUTOVER),
         CountingVersion::Legacy
     );
 }
@@ -737,75 +729,69 @@ fn unavailable_known_root_cannot_collect_retired_owner_before_archive_reload() {
 
 #[test]
 fn tombstone_overflow_prefers_safe_classes_then_oldest_known_creation() {
-    for cutover in [None, Some(CUTOVER)] {
-        let _cutover = cutover.map(codex_counting_version::TestCutover::set);
-        let mut index = ScanIndex::default();
-        retirement_generation(&mut index, "g2");
-        let owner_at = |n: usize| format!("{n:064x}");
-        index.codex_counting_tombstones = (0..codex_counting_version::MAX_COUNTING_TOMBSTONES)
-            .map(|n| {
-                (
-                    owner_at(n),
-                    codex_counting_version::CountingTombstone {
-                        evidence: AckEvidence::LegacyAcked,
-                        retired_in: "g1".into(),
-                        created_unix_ms: None,
-                    },
-                )
-            })
-            .collect();
-        // Lexical order deliberately disagrees with the safety/creation order.
-        let v2_owner = owner_at(900);
+    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let mut index = ScanIndex::default();
+    retirement_generation(&mut index, "g2");
+    let owner_at = |n: usize| format!("{n:064x}");
+    index.codex_counting_tombstones = (0..codex_counting_version::MAX_COUNTING_TOMBSTONES)
+        .map(|n| {
+            (
+                owner_at(n),
+                codex_counting_version::CountingTombstone {
+                    evidence: AckEvidence::LegacyAcked,
+                    retired_in: "g1".into(),
+                    created_unix_ms: None,
+                },
+            )
+        })
+        .collect();
+    // Lexical order deliberately disagrees with the safety/creation order.
+    let v2_owner = owner_at(900);
+    index
+        .codex_counting_tombstones
+        .get_mut(&v2_owner)
+        .unwrap()
+        .evidence = AckEvidence::V2Marked;
+    let pre_owner = owner_at(800);
+    let pre = index.codex_counting_tombstones.get_mut(&pre_owner).unwrap();
+    pre.created_unix_ms = Some(CUTOVER - 1);
+    // A pre-cutover root is safe even in the current generation.
+    pre.retired_in = "g2".into();
+    let post_owner = owner_at(700);
+    index
+        .codex_counting_tombstones
+        .get_mut(&post_owner)
+        .unwrap()
+        .created_unix_ms = Some(CUTOVER);
+    let key = "/synthetic/sessions/current.jsonl";
+    for (n, evicted) in [(2000, v2_owner), (2001, pre_owner), (2002, post_owner)] {
         index
-            .codex_counting_tombstones
-            .get_mut(&v2_owner)
-            .unwrap()
-            .evidence = AckEvidence::V2Marked;
-        let pre_owner = owner_at(800);
-        let pre = index.codex_counting_tombstones.get_mut(&pre_owner).unwrap();
-        pre.created_unix_ms = Some(CUTOVER - 1);
-        // Under an active cutover this is safe even in the current generation.
-        // Inactive current-generation Legacy remains protected.
-        pre.retired_in = if cutover.is_some() { "g2" } else { "g1" }.into();
-        let post_owner = owner_at(700);
-        index
-            .codex_counting_tombstones
-            .get_mut(&post_owner)
-            .unwrap()
-            .created_unix_ms = Some(CUTOVER);
-        let key = "/synthetic/sessions/current.jsonl";
-        for (n, evicted) in [(2000, v2_owner), (2001, pre_owner), (2002, post_owner)] {
-            index
-                .files
-                .insert(key.into(), acked_entry(false, Some(owner_at(n))));
-            assert!(codex_counting_version::tombstone_before_retire(
-                &mut index, key
-            ));
-            assert!(!index.codex_counting_tombstones.contains_key(&evicted));
-            assert_eq!(
-                index.codex_counting_tombstones.len(),
-                codex_counting_version::MAX_COUNTING_TOMBSTONES
-            );
-        }
-        assert!(
-            index.codex_counting_tombstones.contains_key(&owner_at(1)),
-            "unknown creation most protected while inactive"
-        );
-        let receipts = codex_counting_version::take_local_receipts(&mut index, None).unwrap();
-        assert_eq!(receipts.tombstone_evictions_v2_only, 1);
+            .files
+            .insert(key.into(), acked_entry(false, Some(owner_at(n))));
+        assert!(codex_counting_version::tombstone_before_retire(
+            &mut index, key
+        ));
+        assert!(!index.codex_counting_tombstones.contains_key(&evicted));
         assert_eq!(
-            receipts.tombstone_evictions_pre_cutover_legacy,
-            u64::from(cutover.is_some())
-        );
-        assert_eq!(
-            receipts.tombstone_evictions_not_provably_pre_cutover_legacy,
-            if cutover.is_some() { 1 } else { 2 }
-        );
-        assert_eq!(
-            index.codex_counting_evictions, [0; 3],
-            "drained once per scan"
+            index.codex_counting_tombstones.len(),
+            codex_counting_version::MAX_COUNTING_TOMBSTONES
         );
     }
+    assert!(
+        index.codex_counting_tombstones.contains_key(&owner_at(1)),
+        "unknown creation retains Legacy evidence"
+    );
+    let receipts = codex_counting_version::take_local_receipts(&mut index, None).unwrap();
+    assert_eq!(receipts.tombstone_evictions_v2_only, 1);
+    assert_eq!(receipts.tombstone_evictions_pre_cutover_legacy, 1);
+    assert_eq!(
+        receipts.tombstone_evictions_not_provably_pre_cutover_legacy,
+        1
+    );
+    assert_eq!(
+        index.codex_counting_evictions, [0; 3],
+        "drained once per scan"
+    );
 }
 
 #[test]
