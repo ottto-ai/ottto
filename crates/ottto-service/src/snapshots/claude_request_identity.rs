@@ -1489,11 +1489,25 @@ fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::
             // Compare placement using the unmarked pair, so marking an
             // already accepted carry cannot trigger B31's wrong-owner fallback.
             // record()/row_proof() still exclude carried keys from proof.
+            // An ON-first ACK stores a carried slot as None, never an
+            // authority. Preserve that slot on comparison too. A legacy ACK
+            // with a concrete authority still compares the unmarked pair.
+            let placement = |key: &AuthorityKey| {
+                let hash = accepted.authority_hash(key);
+                if key.account_source.is_some()
+                    && prior.contains(&None)
+                    && !prior.contains(&Some(hash))
+                {
+                    None
+                } else {
+                    Some(hash)
+                }
+            };
             let current = group
                 .by_key
                 .iter()
                 .filter(|(_, amount)| amount.counts != [0; 8])
-                .map(|(key, _)| key.as_ref().map(|key| accepted.authority_hash(key)))
+                .map(|(key, _)| key.as_ref().and_then(placement))
                 .collect::<BTreeSet<_>>();
             // Only a row frozen with tagged proof can constrain later proof.
             // New rows and rows previously ACKed untagged remain admissible.
@@ -1511,7 +1525,7 @@ fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::
             grouping.accepted_share_changed.insert(bucket.clone());
             let mut kept = BTreeMap::<Option<AuthorityKey>, Amounts>::new();
             for (key, amount) in std::mem::take(&mut group.by_key) {
-                let key = key.filter(|key| prior.contains(&Some(accepted.authority_hash(key))));
+                let key = key.filter(|key| prior.contains(&placement(key)));
                 // Never reconstruct missing proof from the ledger.
                 kept.entry(key)
                     .or_default()
@@ -2731,6 +2745,8 @@ struct Carry<'o> {
     complete: bool,
     /// An own (non-copy) request was seen: later gaps carry or stay Unknown.
     seen_own: bool,
+    /// Invalid telemetry prevents old markers/start/bindings from crossing it.
+    blocked: bool,
     /// The latest own telemetry account, never a fill-derived key.
     seed: Option<(u64, Arc<AuthorityKey>)>,
     first: Option<Arc<AuthorityKey>>,
@@ -2748,6 +2764,7 @@ impl Carry<'_> {
             on,
             complete,
             seen_own: false,
+            blocked: false,
             seed: None,
             first: None,
             run: 0,
@@ -2788,6 +2805,9 @@ impl Carry<'_> {
         self.seen_own = true;
         let whole = own.basis == TELEMETRY || (own.basis == TELEMETRY_LOGIN && own.org.is_none());
         let next = (self.complete && whole).then(|| Arc::clone(own));
+        if next.is_some() {
+            self.blocked = false;
+        }
         if let (Some((_, previous)), Some(next)) = (&self.seed, &next) {
             if (&previous.login, &previous.org) != (&next.login, &next.org) {
                 self.counts.ambiguous_gap += self.run;
@@ -2805,6 +2825,7 @@ impl Carry<'_> {
     /// Own telemetry naming no valid account: no carry across it.
     fn block(&mut self, requests: u64) {
         self.counts.blocked_no_account += requests;
+        self.blocked = true;
         self.seed = None;
         self.run = 0;
         if !self.seen_own {
@@ -3469,6 +3490,7 @@ pub(crate) fn reconcile_request_accounts(
             } else {
                 let carried = carry.forward(&earlier, gap, &mut keys);
                 let account = match (marker, carried.as_ref()) {
+                    _ if carry.blocked => None,
                     (Some(marker), Some((position, account))) if marker.position < *position => {
                         account.clone()
                     }

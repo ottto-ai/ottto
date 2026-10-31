@@ -475,9 +475,18 @@ fn e2_carry_pages(
     no_account: &[(&str, bool)],
     modes: &[Option<bool>],
     acknowledge: bool,
+    marker: bool,
 ) -> Vec<(SnapshotItem, serde_json::Value)> {
     let (dir, root, _) = claude_account_family_fixture();
     let support = dir.join("support");
+    if marker {
+        let path = dir.join(format!("{root}.jsonl"));
+        let native = fs::read_to_string(&path).unwrap();
+        let start = json!({"type":"attachment", "sessionId":root,
+            "timestamp":"2026-08-02T06:59:59Z", "attachment":{
+                "type":"credential_org", "organizationUuid":"11111111-1111-4111-8111-111111111111"}});
+        fs::write(path, format!("{start}\n{native}")).unwrap();
+    }
     let (mut api, trace) = e2_family_evidence(&root);
     for row in &mut api[2..4] {
         row.account_identifier_hash = Some("b".repeat(64));
@@ -602,7 +611,7 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
             0,
         ),
     ] {
-        let pages = e2_carry_pages(gaps, &[], &[Some(false), Some(true), Some(true)], true);
+        let pages = e2_carry_pages(gaps, &[], &[Some(false), Some(true), Some(true)], true, false);
         let [(off, _), (on, counts), (again, _)] = &pages[..] else {
             unreachable!()
         };
@@ -629,13 +638,26 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
         };
         assert_eq!(totals(on), totals(off), "{gaps:?}: money never changes");
     }
+    // The first ACK is already ON. req_1's native marker and req_4's
+    // carried B share the same native row; record stores {marker, None}.
+    // Its next body must retain carried B without treating it as proof.
+    let pages = e2_carry_pages(&["req_1", "req_4"], &[], &[Some(true), Some(true)], true, true);
+    let [(first, _), (again, _)] = &pages[..] else { unreachable!() };
+    assert_eq!(e2_source_counts(first), e2_source_counts(again));
+    assert_eq!(first.request_identity_refusals, 0);
+    assert_eq!(again.request_identity_refusals, 0);
+    assert_eq!(e2_source_counts(again).get(&(b.clone(), Some(CarriedForward))), Some(&1));
+    assert!(again.usage_buckets.iter().flat_map(|bucket| &bucket.model_usage)
+        .any(|row| row.identity_parts.as_ref().is_some_and(|parts|
+            parts.iter().any(|part| part.account_identifier_hash.is_none())
+            && parts.iter().any(|part| part.account_identifier_hash == b))));
 }
 
 /// [off=main] Without the capability the stage is main's: the same bytes as
 /// the plain evidence stage, no `account_source`, main's unmarked fill.
 #[test]
 fn e2_pipeline_carry_capability_absent_keeps_main_bytes() {
-    let pages = e2_carry_pages(&["req_2", "req_4"], &[], &[None, Some(false), Some(true)], false);
+    let pages = e2_carry_pages(&["req_2", "req_4"], &[], &[None, Some(false), Some(true)], false, false);
     let [(plain, _), (off, _), (on, _)] = &pages[..] else {
         unreachable!()
     };
@@ -656,7 +678,7 @@ fn e2_pipeline_no_account_row_blocks_the_carry() {
     for contradictory in [false, true] {
         // req_3 is a gap AFTER the invalid row; neither it nor req_2 may
         // inherit A. req_4's own B restarts the stream.
-        let pages = e2_carry_pages(&["req_3"], &[("req_2", contradictory)], &[Some(true)], false);
+        let pages = e2_carry_pages(&["req_3"], &[("req_2", contradictory)], &[Some(true)], false, false);
         let [(on, counts)] = &pages[..] else { unreachable!() };
         assert_eq!(
             e2_source_counts(on),
@@ -669,6 +691,15 @@ fn e2_pipeline_no_account_row_blocks_the_carry() {
         assert_eq!(e2_count(counts, "claude_carry_blocked_no_account_requests"), 1);
         assert_eq!(e2_count(counts, "claude_carried_forward_requests"), 0);
         assert_eq!(e2_count(counts, "claude_carry_no_seed_requests"), 1);
+        // A first invalid row also blocks a pre-existing marker. There is
+        // no later own root account; the child's A cannot seed the root.
+        let pages = e2_carry_pages(&["req_2", "req_3", "req_4"], &[("req_1", contradictory)],
+            &[Some(true)], false, true);
+        let [(on, counts)] = &pages[..] else { unreachable!() };
+        assert_eq!(e2_source_counts(on), BTreeMap::from([((None, None), 4)]));
+        assert!(on.request_evidence.is_empty(), "old org marker cannot cross invalid telemetry");
+        assert_eq!(e2_count(counts, "claude_carry_blocked_no_account_requests"), 1);
+        assert_eq!(e2_count(counts, "claude_carry_no_seed_requests"), 3);
     }
 }
 
