@@ -78,6 +78,26 @@ const ARCHIVE_STREAK_KEYS: usize = 256;
 /// Thread CPU an archive pass may spend across its ordinary and
 /// continuation pages.
 const ARCHIVE_PASS_CPU_MICROS: u64 = 30_000_000;
+/// Consecutive passes with unknown thread CPU after which archive work
+/// proceeds under the remaining page, power and work gates, alarmed per pass.
+const ARCHIVE_UNKNOWN_CPU_PASSES: u32 = 12;
+#[cfg(not(test))]
+static UNKNOWN_CPU_PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(test)]
+thread_local! {
+    static UNKNOWN_CPU_PASSES: std::sync::atomic::AtomicU32 =
+        const { std::sync::atomic::AtomicU32::new(0) };
+}
+/// Process-wide RAM streak (the index reloads every pass); a test thread
+/// keeps its own.
+fn unknown_cpu_passes<T>(f: impl FnOnce(&std::sync::atomic::AtomicU32) -> T) -> T {
+    #[cfg(test)]
+    {
+        UNKNOWN_CPU_PASSES.with(f)
+    }
+    #[cfg(not(test))]
+    f(&UNKNOWN_CPU_PASSES)
+}
 /// Bumped when a join or singleton proof rule changes; it is part of every
 /// memo key, so a bump wakes every memoized hold without a timed retry.
 /// U1a-2a (D6(a)): also part of `codex_parent_proof_scope`.
@@ -277,16 +297,19 @@ pub(in crate::snapshots) enum StartRefusal {
 
 /// Archive catch-up pacing for one ordinary page and its continuation
 /// pages: RAM-only on `ScanIndex`, carried by the continuation inputs, never
-/// durable authority. A refusal never resets it; unknown CPU denies.
+/// durable authority. A refusal never resets it; unknown CPU denies until
+/// `ARCHIVE_UNKNOWN_CPU_PASSES` consecutive passes.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ArchivePass {
     pub(crate) started: bool,
     pub(crate) cpu: u64,
     pub(crate) work: u64,
     pub(crate) power: bool,
+    /// A step of this pass had unknown thread CPU.
+    pub(crate) cpu_unknown: bool,
     pub(crate) prep_after: Option<String>,
 }
-crate::heap_layout_bound::fields!(ArchivePass; started, cpu, work, power, prep_after);
+crate::heap_layout_bound::fields!(ArchivePass; started, cpu, work, power, cpu_unknown, prep_after);
 
 impl ArchivePass {
     /// A new ordinary pass: fresh counters and the prepare-time power gate;
@@ -306,15 +329,40 @@ impl ArchivePass {
         self.power
             && crate::snapshot_sync::archive_acquisition_power_ready(self.power)
             && self.cpu < ARCHIVE_PASS_CPU_MICROS
+            && (!self.cpu_unknown
+                || unknown_cpu_passes(|passes| passes.load(std::sync::atomic::Ordering::Relaxed))
+                    >= ARCHIVE_UNKNOWN_CPU_PASSES)
             && remaining > 0
             && crate::snapshot_sync::archive_work_ready(self.work)
     }
 
     /// One step's thread CPU (`None`: unknown) and wall time. CPU counts
-    /// once archive work started; unknown CPU then exhausts the pass.
+    /// once archive work started. Unknown CPU denies the pass; each such pass
+    /// counts once, a known step resets the streak, and passes at or past
+    /// the bound alarm and proceed under the remaining gates.
     pub(crate) fn observe(&mut self, cpu: Option<u64>, wall: u64) {
-        if self.started || cpu.is_none() {
-            self.cpu = cpu.map_or(u64::MAX, |cpu| self.cpu.saturating_add(cpu));
+        match cpu {
+            Some(cpu) => {
+                unknown_cpu_passes(|passes| passes.store(0, std::sync::atomic::Ordering::Relaxed));
+                if self.started {
+                    self.cpu = self.cpu.saturating_add(cpu);
+                }
+            }
+            None if !self.cpu_unknown => {
+                self.cpu_unknown = true;
+                let passes = unknown_cpu_passes(|passes| {
+                    passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                })
+                .saturating_add(1);
+                if passes >= ARCHIVE_UNKNOWN_CPU_PASSES {
+                    crate::local_resource_diagnostics::traversal_point(
+                        "codex_zst_unknown_cpu_fallback",
+                        "codex",
+                        &serde_json::json!({"consecutive_unknown_cpu_passes": passes}),
+                    );
+                }
+            }
+            None => {}
         }
         self.work = self.work.saturating_add(wall);
     }
