@@ -1222,7 +1222,9 @@ canonical digests, not collected content.
 
 Schema 2's existing `native_collection_page` and `native_comparison_decision`
 records can include two sparse, counts-only objects for `source: claude_code`:
-`counts.claude_reread` and `counts.retained_cache_page_events`. Missing keys
+`counts.claude_reread` and `counts.retained_cache_page_events`. A
+`native_collection_page` for any other source can carry
+`counts.retained_cache_page_events` only. Missing keys
 mean zero events in that observation. Counters saturate at `u64::MAX`. They
 add no wire fields, collected data kinds, persisted state or transcript reads.
 No paths, identifiers, fingerprints, bodies or content are emitted.
@@ -1335,7 +1337,7 @@ sites: `take_*`, `insert_*`, `cursor_reservation_entries_evicted`,
 `copy_refusal_*`, `clear_*`, `retention_*`, `prefix_excluded_bodies`, and
 `prefix_tag_clears`. Unlike `process_retained_cache_lifecycle_totals` (which stays
 cumulative, cross-source and labelled `unknown`), these are exact deltas from
-operations executed by the Claude page. Eviction/clear counts describe the
+operations executed by that source's page. Eviction/clear counts describe the
 causing page, **not** the source of each victim in the shared cache. No victim
 identity/history is retained. Existing refusal causes include entry/key/frozen
 charge, layout/disabled, live reservation, missing/invalid plan, incomplete or

@@ -26679,9 +26679,8 @@ impl OwnedSourceScan {
         }
 
         let audit_now = sampled_scan::now_seconds();
-        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
-            source == SnapshotSource::ClaudeCode,
-        );
+        // Every source: a non-Claude page emits only its retained-cache events.
+        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let mut resource_probe = crate::local_resource_diagnostics::Probe::start()
             .with_withheld_memo(owned_index.withheld_memo.clone());
         let index = &mut owned_index;
@@ -27499,9 +27498,7 @@ impl OwnedSourceScan {
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
-        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
-            self.source == SnapshotSource::ClaudeCode,
-        );
+        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let _acquire_window = state_v2::telemetry::acquire_window(&self.index);
         let mut result = self.step_with_capture_credit_inner(attribution_context, capture_credit);
         match &result {
@@ -29268,9 +29265,11 @@ impl OwnedSourceScan {
                 // and an unsampled read keep the step-start budget. Any other
                 // sampled singleton is measured exactly at completion
                 // (P1-RETAIN R0, Q-PR13b; `try_lock`, so contention gives 0).
-                // A Tail/Unchanged singleton (shape F) also decides whether a
-                // release of lower-ranked residents would make its copy
-                // fit; that release is deferred into its retention, after
+                // A Tail/Unchanged singleton, or a Full with an owned finish
+                // bound (`prove_release` refuses a legacy one), also decides,
+                // under blocking locks, whether a release of lower-ranked
+                // residents would make its copy fit; that release is deferred
+                // into its retention, after
                 // every non-budget gate. Nothing is evicted here. Each branch
                 // also returns the walk behind its budget (`copy_measure`, for
                 // `retire_proof_beside_copy`); `copy_budget` is the
@@ -29293,7 +29292,18 @@ impl OwnedSourceScan {
                         None,
                     )
                 } else if active.sampling.is_some() {
-                    if sampled_scan::borrows_only_retained_reduction(&active) {
+                    let full = active.sampling.as_ref().is_some_and(|sampling| {
+                        matches!(
+                            sampling.mode,
+                            crate::transcript_acquisition::ReadMode::Full(_)
+                        )
+                    });
+                    let legacy_full = full
+                        && matches!(
+                            sampled_scan::x_out_for(source, || None),
+                            sampled_scan::XOut::Legacy
+                        );
+                    if sampled_scan::releases_at_completion(&active) && !legacy_full {
                         sampled_scan::tail_completion_budget(sampling.as_ref(), &mut active)
                     } else {
                         let (budget, measure) = sampled_scan::copy_budget_step(
@@ -29853,8 +29863,9 @@ impl OwnedSourceScan {
                             // #667: the decode peak is reserved from the budget the
                             // copy is admitted against: main's `copy_budget` above for
                             // a granted one. M-a (S-a): only now, after main's proof
-                            // retirement and that reservation, may a shape-F release be
-                            // proven; its `budget_after` is peak-reserved the same way.
+                            // retirement and that reservation, may a releasing completion
+                            // (`releases_at_completion`) prove its release; its
+                            // `budget_after` is peak-reserved the same way.
                             // X_out (#665): Claude's finish-output bound, only for a
                             // proof. The repository identity it measured (U3) is the
                             // one `finish` takes below; a miss refuses.
