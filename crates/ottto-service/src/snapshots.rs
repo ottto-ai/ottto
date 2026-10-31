@@ -31862,7 +31862,8 @@ impl OwnedSourceScan {
                             .as_ref()
                             .and_then(|origin| origin.admission.as_ref())
                             .map_or(true, |state| {
-                                state.complete && (evidence_owed::enabled() || claude_terminal_off())
+                                state.complete
+                                    && (evidence_owed::enabled() || claude_terminal_off())
                             }));
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 // E7-8a: count-only per-family completion, from the page's
@@ -52314,7 +52315,10 @@ impl ScanIndex {
                     .get(&key)
                     .and_then(|entry| entry.upload_context_receipt.clone()),
                 // An identity migration reads nothing: owed evidence stays owed.
-                evidence_owed: self.files.get(&key).is_some_and(|entry| entry.evidence_owed),
+                evidence_owed: self
+                    .files
+                    .get(&key)
+                    .is_some_and(|entry| entry.evidence_owed),
             },
         );
     }

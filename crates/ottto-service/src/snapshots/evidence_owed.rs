@@ -337,7 +337,12 @@ pub(super) fn evidence_from_window(
                 || !(index
                     .claude_usage_authority_quarantine
                     .contains_key(root_session_id)
-                    || owed_at_completion(root_session_id, pending, false, indexed_claude_family_ids))
+                    || owed_at_completion(
+                        root_session_id,
+                        pending,
+                        false,
+                        indexed_claude_family_ids,
+                    ))
         })
 }
 
@@ -448,7 +453,11 @@ mod tests {
     fn owed_revision_is_unobserved_for_proof_readers_until_resolved() {
         let _on = EvidenceOwedForTest::on();
         let mut owed = entry();
-        rearm_cause::clear("/k.jsonl", &mut owed, rearm_cause::Cause::NoRetainedTraversal);
+        rearm_cause::clear(
+            "/k.jsonl",
+            &mut owed,
+            rearm_cause::Cause::NoRetainedTraversal,
+        );
         assert_eq!(owed.source_file_fingerprint, "revision");
         assert_eq!(owed.observed_fingerprint(), "");
         let mut main = entry();
