@@ -2195,7 +2195,7 @@ fn harvest_source(
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use crate::claude_spawn_gate::test_support::ProbeFixture;
+    use crate::claude_spawn_gate::test_support::{set_probe_fault, ProbeFault, ProbeFixture};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3237,6 +3237,33 @@ url = "https://unset.test/mcp"
                 Some(v) => std::env::set_var(&self.key, v),
                 None => std::env::remove_var(&self.key),
             }
+        }
+    }
+
+    fn sample_inventory(server: &str, tool: &str) -> McpInventoryIngestRequest {
+        McpInventoryIngestRequest {
+            agent_source: "claude-code".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+            client_version: None,
+            tool_search_auto_pct: None,
+            servers: vec![McpServerInput {
+                server: server.to_string(),
+                transport: Some("stdio".to_string()),
+                reachable: true,
+                disabled: false,
+                loading_mode: "on_demand".to_string(),
+                loading_mode_basis: "client_default".to_string(),
+                loading_mode_inferred: true,
+                instructions_chars: None,
+                tools: vec![McpToolInput {
+                    name: tool.to_string(),
+                    description: String::new(),
+                    input_schema: json!({ "type": "object" }),
+                    always_load: false,
+                }],
+            }],
+            capabilities: Vec::new(),
         }
     }
 
