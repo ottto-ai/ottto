@@ -15,7 +15,9 @@ const ROOT: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const COPY: &str = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const AT: &str = "2026-08-02T07:00:10Z";
 fn with_e2<T>(f: impl FnOnce() -> T) -> T {
-    crate::snapshots::with_max_gated_claude_revision(3, || f())
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    crate::snapshots::with_max_gated_claude_revision(3, f)
 }
 fn nanos(at: &str) -> i128 {
     OffsetDateTime::parse(at, &Rfc3339)

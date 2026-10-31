@@ -87,6 +87,8 @@ fn child_page(
 
 #[test]
 fn e2_body_of_previously_proven_family_is_not_a_demotion() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     for healthy in [true, false] {
         // Today (gate off): an unreconstructable revision is a demotion and
         // is held; a healthy one rebuilds the exclusive body.

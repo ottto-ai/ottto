@@ -653,6 +653,7 @@ fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
 
     let _manifests = SourceManifestTestGuard::new();
     let mut fixture = c1a_fixture("oversized-e2-hold-floor");
+    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&fixture.support, &[]);
     fixture.owned_base_preparation = true;
     fixture.local_holds.insert(REARM_ROOT.to_owned());
     let oversized = oversized_create(&fixture);

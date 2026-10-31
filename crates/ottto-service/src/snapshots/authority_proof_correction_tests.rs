@@ -2023,7 +2023,7 @@ fn binding_family() -> (
     crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
 ) {
     let scratch = crate::test_scratch::ScratchDir::new("authority-binding");
-    let (dir, root, mut items) = claude_account_family_fixture(false);
+    let (dir, root, mut items) = claude_account_family_fixture(true);
     let mut index = ScanIndex::default();
     for (n, item) in items.iter_mut().enumerate() {
         item.source_file_fingerprint = Some(apc_hex(if n == 0 { 'a' } else { 'b' }));

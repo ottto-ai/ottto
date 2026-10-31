@@ -2124,8 +2124,10 @@ const E2_HISTORY_UPGRADE: HistoryCycle<'static> = HistoryCycle {
 };
 
 fn with_e2_history<T>(fixture: &HistoryFixture, f: impl FnOnce() -> T) -> T {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     fixture.install_list(&[]);
-    crate::snapshots::with_max_gated_claude_revision(3, || f())
+    crate::snapshots::with_max_gated_claude_revision(3, f)
 }
 
 fn e2_history_sidecar(support: &Path, root: &str, trace: bool) -> PathBuf {
@@ -2586,6 +2588,8 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
 /// while the list pauses adoption), never the literal and never withheld.
 #[test]
 fn e2_missing_list_pauses_history_and_keeps_changes_on_ordinary_money() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     let fixture = HistoryFixture::new("e2-list-missing-ordinary");
     fixture.baseline();
     fixture.install_list(&[]);
