@@ -13422,14 +13422,25 @@ fn off_no_record_growth_uses_ordinary_full_without_store_io() {
                     .map(|s| s.snapshot_fingerprint.clone())
                     .collect(),
             );
-            // The scan/finalizer never performs the daemon's post-save write.
+            // ON's native settlement already wrote the record before effects;
+            // the daemon still makes its post-save offer.
             prior.save(&index_path).unwrap();
             let receipt =
                 owner
                     .cache
                     .durable_write_after_save(lock, SnapshotSource::ClaudeCode, &prior);
             if stored {
-                assert_eq!(receipt.unwrap().written, 1);
+                receipt.unwrap();
+                assert_eq!(
+                    owner
+                        .cache
+                        .durable_counters(SnapshotSource::ClaudeCode)
+                        .unwrap()
+                        .1
+                        .records_written,
+                    1,
+                    "native settlement wrote the record once before effects"
+                );
             } else {
                 assert!(receipt.is_none());
             }
