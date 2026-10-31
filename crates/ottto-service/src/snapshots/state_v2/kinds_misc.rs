@@ -27,12 +27,10 @@ fn write_field<T: Serialize + ?Sized>(
     Ok(())
 }
 fn read_field<T: serde::de::DeserializeOwned + Serialize>(
-    _: &str,
     kind: &str,
     tx: &mut dyn Transaction,
-    cx: &mut KindCx,
 ) -> Result<T> {
-    mapper::field_read(tx, cx, kind, field_mode(kind))
+    mapper::field_read(tx, kind, field_mode(kind))
 }
 #[derive(Serialize, Deserialize, Default)]
 struct HoldMetadata {
@@ -73,8 +71,8 @@ fn write_holds(index: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
         mapper::Members::Field,
     )
 }
-fn read_holds(index: &mut ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
-    let metadata: HoldMetadata = read_field("decode_holds", "v1_field.repair_provenance", txn, cx)?;
+fn read_holds(index: &mut ScanIndex, txn: &mut dyn Transaction) -> Result<()> {
+    let metadata: HoldMetadata = read_field("v1_field.repair_provenance", txn)?;
     let mut holds = super::super::lenient_decode::Holds::default();
     let mut expected = 0;
     for (field, slots) in metadata.entries {
@@ -109,7 +107,6 @@ fn read_holds(index: &mut ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCx)
                 slot.owner.map(|(a, b)| a..b),
                 slot.charge,
             )?;
-            cx.misc_rows.insert(key, (h, true));
             expected += 1;
         }
     }
@@ -133,7 +130,6 @@ fn read_holds(index: &mut ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCx)
 fn read_control<T: serde::de::DeserializeOwned + Serialize>(
     name: &str,
     txn: &mut dyn Transaction,
-    cx: &mut KindCx,
 ) -> Result<T> {
     let h = txn
         .get(&RowKey::Meta(name.into()))?
@@ -145,7 +141,6 @@ fn read_control<T: serde::de::DeserializeOwned + Serialize>(
     let mut bytes = Vec::new();
     txn.read_value(&h, &mut bytes)?;
     let value = serde_json::from_slice(&bytes)?;
-    cx.misc_rows.insert(h.key.clone(), (h, true));
     Ok(value)
 }
 
@@ -156,23 +151,18 @@ pub(super) fn merge_cas_at(
 ) -> Result<()> {
     use super::super::terminal_contract_retry;
     use serde::de::{DeserializeSeed, MapAccess, Visitor};
-    let mut cx = KindCx::default();
-    let generation: u64 = read_control("generation", tx, &mut cx)?;
-    let schema: u16 = read_control("schema_version", tx, &mut cx)?;
+    let generation: u64 = read_control("generation", tx)?;
+    let schema: u16 = read_control("schema_version", tx)?;
     ensure!(
         generation == expected && schema == working.schema_version,
         "state_v2_concurrent_change"
     );
     let mut custody = ScanIndex::default();
-    read_holds(&mut custody, tx, &mut cx)?;
+    read_holds(&mut custody, tx)?;
     custody.schema_version = schema;
     custody.generation = generation;
-    custody.accepted_snapshot_fingerprint_ledger_version = read_field(
-        "accepted_snapshot_fingerprint_ledger_version",
-        "v1_field.accepted_snapshot_fingerprint_ledger_version",
-        tx,
-        &mut cx,
-    )?;
+    custody.accepted_snapshot_fingerprint_ledger_version =
+        read_field("v1_field.accepted_snapshot_fingerprint_ledger_version", tx)?;
     kinds_census::hydrate_cas_controls(tx, &mut custody)?;
     let raw_quarantines: BTreeSet<_> = custody
         .decode_holds
@@ -346,9 +336,9 @@ pub(super) fn hydrate_txn(
     index: &mut ScanIndex,
     cx: &mut KindCx,
 ) -> Result<()> {
-    index.schema_version = read_control("schema_version", tx, cx)?;
-    index.generation = read_control("generation", tx, cx)?;
-    cx.presence = read_control("field_presence", tx, cx)?;
+    index.schema_version = read_control("schema_version", tx)?;
+    index.generation = read_control("generation", tx)?;
+    cx.presence = read_control("field_presence", tx)?;
     ensure!(
         cx.presence
             .keys()
@@ -360,12 +350,12 @@ pub(super) fn hydrate_txn(
     );
     macro_rules! load {
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = read_field(stringify!($f), $kind, tx, cx)?;
+            index.$f = read_field($kind, tx)?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
-    read_holds(index, tx, cx)
+    read_holds(index, tx)
 }
 pub(super) fn references(
     _: &Header,

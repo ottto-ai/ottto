@@ -437,21 +437,15 @@ pub(super) fn field_write<T: Serialize + ?Sized>(
 }
 pub(super) fn field_read<T: DeserializeOwned + Serialize>(
     tx: &mut dyn Transaction,
-    cx: &mut KindCx,
     kind: &str,
     mode: Members,
 ) -> Result<T> {
     let root = key(kind, "", 0)?;
     let h = tx.get(&root)?.context("state_v2_missing_field")?;
-    cx.misc_rows.insert(root, (h.clone(), true));
     if matches!(mode, Members::Field) {
         return read(tx, &h);
     }
     let entries: BTreeMap<String, Box<serde_json::value::RawValue>> = read_map(tx, kind, None)?;
-    rows(tx, kind, |_, h| {
-        cx.misc_rows.insert(h.key.clone(), (h, true));
-        Ok(())
-    })?;
     let json = match mode {
         Members::Map => serde_json::to_vec(&entries)?,
         Members::Set => serde_json::to_vec(&entries.values().collect::<Vec<_>>())?,

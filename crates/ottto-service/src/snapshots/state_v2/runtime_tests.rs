@@ -1298,6 +1298,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let mut seed: ScanIndex = serde_json::from_value(fixture["logical"].clone()).unwrap();
     seed.generation = 0;
     let mut current = super::super::money_test_support::publish(&seed, &f.path, progress);
+    let committed = current.clone();
     let committed_generation = current.generation;
     let committed_context = current.upload_context_fingerprint.clone();
     current.upload_context_fingerprint = Some("uncommitted-context".into());
@@ -1310,10 +1311,28 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
         published(&f.path).unwrap()
     )
     .is_err());
+    with_state(&f.path, |state| {
+        assert!(state.save_digests.is_none());
+        Ok(())
+    })
+    .unwrap();
     let restored = load_locked(&f.path, None, published(&f.path).unwrap())
         .unwrap()
         .0
         .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&restored).unwrap(),
+        serde_json::to_vec(&committed).unwrap()
+    );
+    assert!(restored.decode_holds.same_as(&committed.decode_holds));
+    assert_eq!(
+        restored.decode_holds.v2_provenance(),
+        committed.decode_holds.v2_provenance()
+    );
+    assert_eq!(
+        restored.v2().growth_retention,
+        committed.v2().growth_retention
+    );
     assert_eq!(restored.generation, committed_generation);
     assert_eq!(restored.upload_context_fingerprint, committed_context);
     assert_eq!(fs::read(&progress_path).unwrap(), progress);

@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 pub(super) struct KindCx {
     pub(super) binding: Option<super::super::scan_index_persistence::Binding>,
     pub(super) ambiguous: bool,
-    pub(super) misc_rows: BTreeMap<RowKey, (Header, bool)>,
     /// Original field presence, obtained before any v1 normalization.
     pub(super) presence: BTreeMap<String, bool>,
     // Hydration scratch, consumed when the normalized baseline is seeded.
@@ -215,17 +214,7 @@ pub(super) fn save_graph(
                 if FAIL_DIGEST_PROMOTION.with(|fail| fail.replace(false)) {
                     bail!(Hold::ReloadRequired);
                 }
-                // The backend owns this control; retain its exact header in
-                // the context before publishing the next resident graph.
                 digests.generation = generation;
-                let key = RowKey::Meta("generation".into());
-                let header = preflight(&RowInput {
-                    key: &key,
-                    fixed: &Fixed::None,
-                    value_version: 1,
-                    value: &control_json(&generation)?,
-                })?;
-                pending.misc_rows.insert(key, (header, true));
                 let mut count = 0_u64;
                 let mut windows = 0_u64;
                 let mut max = 0_u64;

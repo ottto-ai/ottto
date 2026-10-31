@@ -141,7 +141,7 @@ fn all_groups_share_one_snapshot_and_roundtrip_real_v1_without_losing_context_or
         restored.decode_holds.v2_provenance(),
         index.decode_holds.v2_provenance()
     );
-    assert!(cx.valid && !cx.misc_rows.is_empty());
+    assert!(cx.valid && !cx.presence.is_empty());
     // Account hydration must not replace the common context and discard MISC
     // inventory or the source binding while hydrating its own graph.
     assert_eq!(cx.binding, Some(Scratch::binding()));
