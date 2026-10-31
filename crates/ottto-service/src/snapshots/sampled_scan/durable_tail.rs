@@ -420,7 +420,7 @@ fn replay_scope_for(
         } else {
             0
         },
-        source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled(),
+        source == SnapshotSource::ClaudeCode,
     )
 }
 

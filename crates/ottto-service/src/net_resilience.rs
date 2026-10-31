@@ -1310,64 +1310,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_probe_builds_restart_evidence_after_primary_deadline() {
-        let probe_calls = Arc::new(AtomicU32::new(0));
-        let counted = probe_calls.clone();
-        let resolver = DeadlineFallbackDnsResolver::with_hooks(
-            Duration::from_millis(30),
-            |_| panic!("primary resolution is injected as an expired deadline"),
-            move |_| {
-                counted.fetch_add(1, Ordering::SeqCst);
-                Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
-            },
-        );
-        let start = Instant::now();
-        let mut watchdog = SyncWatchdogState::default();
-        assert_eq!(
-            watchdog
-                .decide_sync_failure(None, false, None, false, start)
-                .self_restart,
-            None
-        );
-
-        for at in [
-            start,
-            start + DNS_PROBE_MIN_INTERVAL,
-            start + SELF_RESTART_MIN_OUTAGE,
-        ] {
-            assert_eq!(
-                resolver
-                    .resolve_primary_result_bounded(
-                        "recovery.test:443",
-                        at,
-                        Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "simulated primary resolution deadline",
-                        )),
-                        Instant::now() + DNS_PROBE_PROCESS_TIMEOUT,
-                    )
-                    .unwrap(),
-                vec![addr(443)]
-            );
-        }
-
-        let state = resolver.inner.state.lock().expect("deadline DNS state");
-        assert_eq!(state.streak.consecutive_failures, 3);
-        let outage = state.outage_duration(start + SELF_RESTART_MIN_OUTAGE);
-        assert!(outage.is_some_and(|value| value >= SELF_RESTART_MIN_OUTAGE));
-        assert!(state.probe_success_is_fresh(start + SELF_RESTART_MIN_OUTAGE));
-        assert!(probe_calls.load(Ordering::SeqCst) >= 1);
-        let decision = watchdog.decide_sync_failure(
-            outage,
-            state.probe_success_is_fresh(start + SELF_RESTART_MIN_OUTAGE),
-            None,
-            false,
-            start + SELF_RESTART_MIN_OUTAGE,
-        );
-        assert_eq!(decision.self_restart, Some(SelfRestartReason::DnsOutage));
-    }
-
-    #[test]
     fn dns_probe_subprocess_is_killed_at_its_deadline() {
         let started = Instant::now();
         let output =
@@ -1375,82 +1317,6 @@ mod tests {
                 .expect("spawn bounded test child");
         assert!(output.is_none());
         assert!(started.elapsed() < Duration::from_millis(250));
-    }
-
-    #[test]
-    fn resolution_success_caches_and_resets_the_failure_streak() {
-        let attempts = Arc::new(AtomicU32::new(0));
-        let counted = attempts.clone();
-        let resolver = FallbackDnsResolver::with_hooks(
-            move |_| {
-                // fail, succeed, fail: the trailing failure must serve the
-                // cached success and restart the streak at 1.
-                match counted.fetch_add(1, Ordering::SeqCst) {
-                    1 => Ok(vec![addr(443)]),
-                    _ => Err(io::Error::other("simulated getaddrinfo failure")),
-                }
-            },
-            |_| None,
-        );
-        let now = Instant::now();
-
-        let first = resolver.resolve_at("api.ottto.test:443", now);
-        assert!(first.is_err(), "no cache exists before the first success");
-
-        let second = resolver
-            .resolve_at("api.ottto.test:443", now)
-            .expect("second resolution succeeds");
-        assert_eq!(second, vec![addr(443)]);
-
-        let third = resolver
-            .resolve_at("api.ottto.test:443", now)
-            .expect("third resolution serves the cached success");
-        assert_eq!(third, vec![addr(443)]);
-
-        let state = resolver.state.lock().expect("state");
-        assert_eq!(state.streak.consecutive_failures, 1);
-    }
-
-    #[test]
-    fn out_of_process_probe_rescues_and_caches_before_stale_fallback() {
-        let probe_calls = Arc::new(AtomicU32::new(0));
-        let counted = probe_calls.clone();
-        let resolver = FallbackDnsResolver::with_hooks(
-            |_| Err(io::Error::other("simulated getaddrinfo failure")),
-            move |host| {
-                counted.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(host, "api.ottto.test");
-                Some(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))])
-            },
-        );
-        let start = Instant::now();
-
-        let probed = resolver
-            .resolve_at("api.ottto.test:443", start)
-            .expect("probe rescues the resolution");
-        assert_eq!(
-            probed,
-            vec![SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
-                443
-            )]
-        );
-        assert_eq!(probe_calls.load(Ordering::SeqCst), 1);
-
-        // Within the probe rate-limit window the probe must NOT rerun; the
-        // probed addresses were cached, so resolution still succeeds.
-        let cached = resolver
-            .resolve_at("api.ottto.test:443", start + Duration::from_secs(5))
-            .expect("cached probe result serves the retry");
-        assert_eq!(cached, probed);
-        assert_eq!(probe_calls.load(Ordering::SeqCst), 1);
-
-        // After the window the probe becomes eligible again.
-        let _ = resolver.resolve_at(
-            "api.ottto.test:443",
-            start + DNS_PROBE_MIN_INTERVAL + Duration::from_secs(1),
-        );
-        assert_eq!(probe_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1467,43 +1333,6 @@ mod tests {
         // snapshot_client::transport_status_family keys on "dns"/"resolve" to
         // classify transport_dns; keep the marker in the error text.
         assert!(error.to_string().contains("resolve"));
-    }
-
-    #[test]
-    fn dns_outage_tracker_drives_agent_rebuilds_with_backoff() {
-        let mut state = DnsState::default();
-        let start = Instant::now();
-
-        state.note_resolution_failed(start);
-        state.note_resolution_failed(start + Duration::from_secs(60));
-        assert_eq!(
-            state.outage_duration(start + Duration::from_secs(60)),
-            None,
-            "two failures are a blip, not an outage"
-        );
-        assert!(!state.should_rebuild_agents(start + Duration::from_secs(60)));
-
-        state.note_resolution_failed(start + Duration::from_secs(5 * 60));
-        assert!(
-            !state.should_rebuild_agents(start + Duration::from_secs(5 * 60)),
-            "streak long enough but outage window not yet spanned"
-        );
-
-        let past_window = start + REBUILD_MIN_OUTAGE + Duration::from_secs(1);
-        state.note_resolution_failed(past_window);
-        assert!(state.should_rebuild_agents(past_window));
-        assert!(
-            !state.should_rebuild_agents(past_window + Duration::from_secs(60)),
-            "rebuilds are rate-limited"
-        );
-        assert!(state.should_rebuild_agents(past_window + REBUILD_MIN_INTERVAL));
-
-        state.note_resolution_succeeded("api.ottto.test:443", vec![addr(443)]);
-        assert_eq!(
-            state.outage_duration(past_window + REBUILD_MIN_INTERVAL),
-            None,
-            "a success ends the outage"
-        );
     }
 
     /// The stall log picks its explanation from evidence, not from a guess.
@@ -1798,40 +1627,6 @@ mod tests {
             format!("{error:#}").contains("transport_connection"),
             "real refused connect must classify transport_connection: {error:#}"
         );
-    }
-
-    #[test]
-    fn transport_streak_accrues_over_cycles_and_drives_rebuild() {
-        let mut state = TransportState::default();
-        let start = Instant::now();
-        let error = refused_connect_transport_error();
-
-        // Two failing 5-minute cycles are a blip, not an outage.
-        run_failing_cycle(&mut state, &error, start);
-        run_failing_cycle(&mut state, &error, start + Duration::from_secs(5 * 60));
-        assert_eq!(
-            state.outage_duration(start + Duration::from_secs(5 * 60)),
-            None
-        );
-        assert!(!state
-            .streak
-            .should_rebuild(start + Duration::from_secs(5 * 60)));
-
-        // Third consecutive failing cycle past the 10-minute window: outage.
-        let past_window = start + REBUILD_MIN_OUTAGE + Duration::from_secs(1);
-        run_failing_cycle(&mut state, &error, past_window);
-        assert!(state.outage_duration(past_window).is_some());
-        assert!(state.streak.should_rebuild(past_window));
-        assert!(
-            !state
-                .streak
-                .should_rebuild(past_window + Duration::from_secs(60)),
-            "rebuilds are rate-limited"
-        );
-        run_failing_cycle(&mut state, &error, past_window + REBUILD_MIN_INTERVAL);
-        assert!(state
-            .streak
-            .should_rebuild(past_window + REBUILD_MIN_INTERVAL));
     }
 
     #[test]

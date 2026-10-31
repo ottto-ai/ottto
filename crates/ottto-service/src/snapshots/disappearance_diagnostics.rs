@@ -6,6 +6,16 @@ use super::SnapshotSource;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+// Q-B2 opt-in (default OFF): settle Claude members of deleted directories as
+// removals. Declared beside the NotFound sites it splits so this module's
+// fixtures set it on their own thread; no options seam reaches the candidate
+// and walk sites. The counters below stay diagnostics only.
+super::terminal_off_policy::local_switch!(
+    "claude_vanished_directory_removal_enabled",
+    marker_enables = true,
+    test_default = false
+);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Cause {
     NotFound,
@@ -1028,6 +1038,15 @@ mod tests {
             );
         }
         super::super::sampled_scan::set_test_now(None);
+        // Only a regular-file owner marker enables it; fixtures never read it.
+        let support = crate::test_scratch::ScratchDir::new("vanished-directory-marker");
+        let marker = support.join("claude_vanished_directory_removal_enabled");
+        fs::create_dir(&marker).unwrap();
+        assert!(!enabled_at(&support));
+        fs::remove_dir(&marker).unwrap();
+        fs::write(&marker, b"").unwrap();
+        assert!(enabled_at(&support));
+        assert!(!enabled());
     }
 
     /// [regress] RF1 B2: on the M4 every Claude walk ended red with 47-71
@@ -1042,7 +1061,7 @@ mod tests {
         let dir = crate::test_scratch::ScratchDir::new("absence-deleted-dir-on");
         let root = fs::canonicalize(&dir).unwrap();
         let (mut index, member, directory) = deleted_directory_index(&root);
-        let _on = super::super::terminal_off_policy::VanishedDirectoryRemovalForTest::set(true);
+        let _on = super::super::terminal_off_policy::ThreadSwitchForTest::set(&ENABLED, true);
         let [first, second, third] = WALKS;
         assert_eq!(
             deleted_directory_walk(&mut index, &root, first, &member, Some(&directory)),
@@ -1098,7 +1117,7 @@ mod tests {
             local_index_key(&moved),
             super::super::tests::manifest_index_entry(Some("acked-member-body")),
         );
-        let _on = super::super::terminal_off_policy::VanishedDirectoryRemovalForTest::set(true);
+        let _on = super::super::terminal_off_policy::ThreadSwitchForTest::set(&ENABLED, true);
         for walk in WALKS {
             assert_eq!(
                 deleted_directory_walk(&mut index, &root, walk, &member, None),
@@ -1124,7 +1143,7 @@ mod tests {
             .join("link")
             .join("projects");
         let (mut index, member, _) = deleted_directory_index(&root);
-        let _on = super::super::terminal_off_policy::VanishedDirectoryRemovalForTest::set(true);
+        let _on = super::super::terminal_off_policy::ThreadSwitchForTest::set(&ENABLED, true);
         for walk in WALKS {
             assert_eq!(
                 deleted_directory_walk(&mut index, &root, walk, &member, None),
@@ -1175,7 +1194,7 @@ mod tests {
             .unwrap()
         };
         let before = ledger(&index);
-        let _on = super::super::terminal_off_policy::VanishedDirectoryRemovalForTest::set(true);
+        let _on = super::super::terminal_off_policy::ThreadSwitchForTest::set(&ENABLED, true);
         let mut pages = Vec::new();
         for (at, now) in WALKS {
             super::super::sampled_scan::set_test_now(Some(now));

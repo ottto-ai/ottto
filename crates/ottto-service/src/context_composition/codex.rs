@@ -51,13 +51,10 @@ pub(crate) fn parse_codex_session(
     }
     let session_id = session_id.unwrap_or_else(|| basename_stem(path));
 
+    // A fork whose copied history has no boundary in the file is skipped.
     let Some(copied) = codex_copied_records(&lines) else {
-        report.excluded_not_fresh += 1;
         return Ok(());
     };
-    if copied.iter().any(|copied| *copied) {
-        report.copied_history_sessions += 1;
-    }
 
     let ctx = LineCtx::v1();
 
