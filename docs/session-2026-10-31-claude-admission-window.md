@@ -2,9 +2,10 @@
 
 The optional support-directory marker `claude_admission_reoffer_window_enabled`
 limits admission-triggered widening of the Claude scan window. It defaults OFF.
-Only a regular file enables it; symlinks and directories do not. Its marker is
-statted once per Claude preparation, including OFF; no incidence files are
-statted OFF.
+Only a regular file enables it; symlinks and directories do not. The setting is
+pinned per process at the first Claude preparation, including OFF: one marker
+stat then, a cached boolean thereafter. Restart to apply marker changes.
+No incidence files are statted OFF.
 
 When enabled, every current-limit RetryPending record follows one rule, whether
 ordinary, legacy or armed by admission re-offer: widen only if some incidence

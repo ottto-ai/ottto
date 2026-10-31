@@ -48510,7 +48510,7 @@ impl ScanIndex {
         window_days: u64,
     ) -> bool {
         if source != SnapshotSource::ClaudeCode
-            || !terminal_off_policy::marker_at(support, "claude_admission_reoffer_window_enabled")
+            || !terminal_off_policy::admission_reoffer_window(support)
         {
             return self.snapshot_admission_reoffer_pending();
         }
