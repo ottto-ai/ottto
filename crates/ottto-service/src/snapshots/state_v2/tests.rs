@@ -768,7 +768,9 @@ fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() 
     assert_eq!(stats["erasure_overdue"], true);
     assert_eq!(stats["vacuum_attempts"], attempted);
     drop(db);
-    assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_ok());
+    if let Err(e) = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()) {
+        panic!("reopen after non-clean close: {e:#}");
+    }
 }
 
 /// [format] f6 restart between vacuum and metadata clear keeps pending debt.
@@ -823,7 +825,9 @@ fn f6_overdue_recovery_overrides_a_future_attempt_clock() {
     assert_eq!(stats["erasure_late_completions"], 1);
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
     drop(db);
-    assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_ok());
+    if let Err(e) = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()) {
+        panic!("reopen after non-clean close: {e:#}");
+    }
 }
 
 /// [format] growth retention follows runtime custody through clones subsets and baselines.

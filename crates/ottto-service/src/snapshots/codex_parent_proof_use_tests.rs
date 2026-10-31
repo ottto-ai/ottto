@@ -1065,6 +1065,7 @@ fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
         assert_eq!(used.codex_parent_proof_refusal, None);
     }
     // Undecided under the ledger too: main holds these children.
+    CapCounts::default().drain("codex");
     for path in [&parent_exhausted.0, &child_exhausted.0, &overflow.0] {
         assert!(
             !parse(path, complete_ledger(), None).complete(),
@@ -1072,6 +1073,10 @@ fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
             path.display()
         );
     }
+    // [behaviour] The ordinary overflow is visible through the shared source carrier.
+    let mut caps = CapCounts::default();
+    caps.drain("codex");
+    assert_eq!(caps.boundary_overflow_events, 1);
     let _ = fs::remove_dir_all(root);
 }
 
