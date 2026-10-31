@@ -72,6 +72,19 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
         crate::local_resource_diagnostics::claude_state_v2(&*stats);
     }
 }
+/// Cumulative process-lifetime count, kept in the same inventory as events.
+pub(super) fn count(name: &'static str, n: u64) {
+    if let Ok(mut stats) = stats().lock() {
+        let total = stats
+            .latest
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(n);
+        stats.latest.insert(name, total.into());
+        crate::local_resource_diagnostics::claude_state_v2(&*stats);
+    }
+}
 #[derive(Clone, Copy)]
 pub(super) enum Kind {
     Save,

@@ -514,7 +514,7 @@ impl ProgressRecovery {
     /// Settled-session cache evidence dropped to admit a page. Each pruned
     /// session re-enters through the missing-head bootstrap if it reopens.
     pub(crate) fn custody_pruned(&self, sessions: usize) {
-        telemetry::event("ack_custody_pruned", &sessions);
+        telemetry::count("ack_custody_pruned", sessions as u64);
     }
 
     /// Live custody alone exceeds the bound: hold and alarm this route.

@@ -843,6 +843,7 @@ pub(in super::super) fn hold_ack_custody(path: &Path) {
     .is_ok()
     {
         telemetry::event("hold", &Hold::AckCustody);
+        telemetry::count("ack_custody_hold_alarm", 1);
     }
 }
 
