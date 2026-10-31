@@ -31913,13 +31913,8 @@ impl OwnedSourceScan {
                     })
                     .unwrap_or_default()
                     .saturating_add(index.claude_stale_family_carry.replay.len());
-                let skipped_file_count_due_to_limit = index
-                    .traversal
-                    .iter()
-                    .flat_map(|traversal| traversal.pending_candidates.iter())
-                    .filter(|path| path.census_member)
-                    .count()
-                    + index.claude_stale_family_carry.replay.len();
+                let skipped_file_count_due_to_limit =
+                    claude_family_census_shadow::skipped_view(index).count();
                 let restart_after_hints = terminal_effects_allowed
                     && traversal_discovery_done
                     && traversal_healthy
