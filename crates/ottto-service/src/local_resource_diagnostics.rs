@@ -589,8 +589,6 @@ pub(crate) struct Probe {
     pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
     pub(crate) discovery_growth: crate::snapshots::discovery_growth::Page,
-    #[cfg(feature = "replay-harness")]
-    index_reuse_skips: std::cell::Cell<u64>,
 }
 impl Drop for Probe {
     fn drop(&mut self) {
@@ -635,8 +633,6 @@ impl Probe {
             full_causes: Default::default(),
             line_delivery: None,
             discovery_growth: Default::default(),
-            #[cfg(feature = "replay-harness")]
-            index_reuse_skips: std::cell::Cell::new(0),
         }
     }
     fn stage_observation(&self, footprint: Option<&footprint::Stage>) -> Observation {
@@ -644,11 +640,6 @@ impl Probe {
         observation.footprint =
             footprint.map_or_else(footprint::unavailable, footprint::Stage::finish);
         observation
-    }
-    #[cfg(feature = "replay-harness")]
-    pub(crate) fn index_reuse_skip(&self) {
-        self.index_reuse_skips
-            .set(self.index_reuse_skips.get().saturating_add(1));
     }
     fn observation(&self) -> Observation {
         Observation::between(
@@ -671,8 +662,6 @@ impl Probe {
         struct Counts {
             #[serde(flatten)]
             collection: CollectionCounts,
-            #[cfg(feature = "replay-harness")]
-            index_reuse_skips: u64,
             #[serde(flatten)]
             pending: Option<ClaudeAccountRetainedPending>,
             #[serde(flatten)]
@@ -710,8 +699,6 @@ impl Probe {
         }
         let claude = source == "claude_code";
         let counts = Counts {
-            #[cfg(feature = "replay-harness")]
-            index_reuse_skips: self.index_reuse_skips.replace(0),
             line_delivery: self
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
@@ -1722,7 +1709,7 @@ struct Record<T: Serialize> {
 }
 fn emit(record: &impl Serialize) {
     if let Ok(json) = serde_json::to_string(record) {
-        #[cfg(any(test, feature = "replay-harness"))]
+        #[cfg(test)]
         if TEST_OUTPUT.with(|output| {
             if let Some(output) = output.borrow_mut().as_mut() {
                 output.push(json.clone());
@@ -1742,11 +1729,11 @@ fn write_line(json: &str, writer: &mut impl Write) {
     let _ = writeln!(writer, "ottto-service: local_resources {json}");
 }
 
-#[cfg(any(test, feature = "replay-harness"))]
+#[cfg(test)]
 thread_local! {
     static TEST_OUTPUT: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
 }
-#[cfg(any(test, feature = "replay-harness"))]
+#[cfg(test)]
 pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
     struct Reset;
     impl Drop for Reset {

@@ -32871,8 +32871,6 @@ impl OwnedSourceScan {
             }
             match decision {
                 CandidateDecision::Skip => {
-                    #[cfg(feature = "replay-harness")]
-                    resource_probe.index_reuse_skip();
                     if let Some(phase) = native_comparison.as_mut() {
                         if let Some(credit) = capture_credit.as_deref_mut() {
                             phase.record_actual_skip_paid(
