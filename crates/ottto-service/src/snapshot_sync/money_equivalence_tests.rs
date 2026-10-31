@@ -1488,9 +1488,11 @@ fn pi_ledger_splits(
         }
         let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
         priors = [tail, full, next];
-        // A conflict consumes the retained reduction without reinserting it.
-        // The NEXT append must therefore acquire Full, not Tail.
-        ram_mode = if matches!(step, PiLedgerStep::ConflictDrop(..)) {
+        // A conflict consumes the RAM reduction. R1's stage_preparation
+        // preserves the durable predecessor for an uncertified lossy Tail;
+        // the next append restores it and replays the suffix, like the disk arm.
+        // Without a durable record the next append still needs Full.
+        ram_mode = if matches!(step, PiLedgerStep::ConflictDrop(..)) && !proof.durable {
             (1, 0, 0)
         } else {
             (0, 1, 0)
