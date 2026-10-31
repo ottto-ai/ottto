@@ -199,6 +199,70 @@ fn account_window_unsafe_boundaries_are_untouched() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// [money] Retirement over the archived boundaries the load collapse refuses.
+/// Unparsable, equal-to-current and after-current boundaries refuse: the
+/// family keeps every window and its current. An out-of-order but older
+/// boundary retires; that pins main's retirement behaviour, because refusing
+/// out-of-order archives is the load-time collapse's job. Two archived windows
+/// at one boundary give the historical-only member the first window's
+/// evidence, so a bad account, invalid flag or revision refuses only when it
+/// comes first. The unmodified family is the retiring control.
+#[test]
+fn account_window_boundaries_keep_retirement_outcomes() {
+    let (dir, root, base) = retention_fixture();
+    for (boundary, retires) in [
+        ("control", true),
+        ("unparsable", false),
+        ("2026-08-02T07:20:00Z", false),
+        ("2026-08-02T07:21:00Z", false),
+        ("2026-08-02T07:00:00Z", true),
+        ("tie account first", false),
+        ("tie account second", true),
+        ("tie invalid first", false),
+        ("tie invalid second", true),
+        ("tie revision first", false),
+        ("tie revision second", true),
+    ] {
+        let mut index = base.clone();
+        let pending = index.claude_account_family_pending.get_mut(&root).unwrap();
+        if let Some((change, order)) = boundary
+            .strip_prefix("tie ")
+            .and_then(|tie| tie.split_once(' '))
+        {
+            let member = pending.previous_windows[5]
+                .members
+                .keys()
+                .find(|member| !pending.members.contains_key(*member))
+                .unwrap()
+                .clone();
+            let windows = &mut pending.previous_windows;
+            windows[4].census_window_end = windows[5].census_window_end.clone();
+            let window = &mut windows[if order == "first" { 4 } else { 5 }];
+            match change {
+                "account" => window.account_identifier_hash = "b".repeat(64),
+                "invalid" => window.invalid = true,
+                _ => {
+                    window
+                        .member_requests
+                        .get_mut(&member)
+                        .unwrap()
+                        .identity_revision = Some("c".repeat(64))
+                }
+            }
+        } else if boundary != "control" {
+            pending.previous_windows[2].census_window_end = boundary.into();
+        }
+        let before = pending.clone();
+        index.retire_committed_claude_account_pending_windows();
+        assert_eq!(
+            index.claude_account_family_pending.get(&root),
+            (!retires).then_some(&before),
+            "{boundary}"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn account_window_load_crash_retry_normal_save_and_old_decoder() {
     let (dir, root, mut original) = retention_fixture();
