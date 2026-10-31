@@ -222,6 +222,36 @@ pub(crate) enum Refusal {
     CoverageUnqualified,
 }
 
+/// Why a root's strict sidecar evidence was unhealthy this pass. Local counter
+/// label only; declaration order is precedence when several causes apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum UnhealthyRootReason {
+    /// The strict trace read was discarded (it grew or was replaced mid-read).
+    /// The family is also withheld (`e2::hold_trace_discarded`).
+    Discarded,
+    Oversized,
+    Unreadable,
+    Malformed,
+    /// A missing pair member, failed permissive read, invalid or missing
+    /// request ids, or conflicting ids.
+    Incomplete,
+}
+
+impl UnhealthyRootReason {
+    /// The strongest cause among one read's health counters.
+    pub(crate) fn of(oversized: u64, unreadable: u64, malformed: u64) -> Self {
+        if oversized > 0 {
+            Self::Oversized
+        } else if unreadable > 0 {
+            Self::Unreadable
+        } else if malformed > 0 {
+            Self::Malformed
+        } else {
+            Self::Incomplete
+        }
+    }
+}
+
 /// Owned form of `IdentityRef`, for tests and the W0 builder oracle.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1406,6 +1436,104 @@ fn defer_retained_rows(
     deferred
 }
 
+/// The frozen share set of a row whose current tagged shares differ from it.
+fn changed_shares(
+    accepted: &accepted::AcceptedSession,
+    start: i64,
+    row: &RowKey,
+    group: &RowGroup,
+) -> Option<BTreeSet<Option<[u8; 32]>>> {
+    let prior = accepted.row_shares(start, row);
+    // Only a row frozen with tagged proof can constrain later proof.
+    // New rows and rows previously ACKed untagged remain admissible.
+    if prior.is_empty() {
+        return None;
+    }
+    let current = group
+        .by_key
+        .iter()
+        .filter(|(_, amount)| amount.counts != [0; 8])
+        .map(|(key, _)| key.as_ref().map(|key| accepted.authority_hash(key)))
+        .collect::<BTreeSet<_>>();
+    // Resolving an untagged share to the same surviving tagged set is
+    // new proof, not a retag. Missing prior tagged keys still count changed.
+    let resolved_missing = prior.contains(&None)
+        && current == prior.iter().filter(|key| key.is_some()).copied().collect();
+    (current != prior && !resolved_missing).then_some(prior)
+}
+
+/// One copy-derived accepted row the identity pass treated as never
+/// accepted; the caller tombstones it in the durable ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CopyInvalidation {
+    session: String,
+    bucket: i64,
+    row: RowKey,
+}
+
+/// SOURCE 2026-10-31 (#944 xPR F5): proof a copied marker lent must not keep
+/// placing. A frozen row whose shares change and are only accounts copied
+/// markers lent to that very row's requests (ones the copy-prefix switch
+/// re-derived without them) is copy-derived: it is treated as never accepted
+/// (fresh own tags or untagged, never a refusal or marker). Other changed
+/// rows keep #909's refusal, and rows their own evidence still proves are
+/// unchanged.
+fn copy_derived_rows(
+    item: &SnapshotItem,
+    grouping: &Grouping,
+    accepted: Option<&accepted::AcceptedSession>,
+) -> Vec<(i64, RowKey)> {
+    let Some(accepted) = accepted else {
+        return Vec::new();
+    };
+    // Per row: the accounts copied markers lent, and whether every lent
+    // request's own evidence was positively read this pass.
+    let mut lent = BTreeMap::<(i64, RowKey), (BTreeSet<Option<[u8; 32]>>, bool)>::new();
+    for (bucket, row, slot) in super::claude_request_money::e2::copied_marker_lent_rows(item) {
+        if let Some(start) = accepted::bucket_key(bucket) {
+            let (accounts, read) = lent
+                .entry((start, row_key_from_model_usage(&row)))
+                .or_insert_with(|| (BTreeSet::new(), true));
+            accounts.insert(Some(accepted.authority_hash(&slot.lent)));
+            *read &= slot.read;
+        }
+    }
+    if lent.is_empty() {
+        return Vec::new();
+    }
+    let groups = grouping
+        .groups
+        .iter()
+        .filter_map(|(bucket, rows)| Some((accepted::bucket_key(bucket)?, rows)))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    let mut counts = budget::Counts::default();
+    for ((start, row), (lent, read)) in lent {
+        let group = groups.get(&start).and_then(|rows| rows.get(&row));
+        let Some(prior) = group
+            .and_then(|group| changed_shares(accepted, start, &row, group))
+            .filter(|prior| !prior.is_disjoint(&lent))
+        else {
+            continue;
+        };
+        // Lead B Addendum 4: without per-ACK provenance, a freeze holding any
+        // share copied markers did not lend may be a corrected body's, and
+        // evidence this pass could not read may still prove the latest
+        // proof. Both keep #909's protection, counted.
+        if !prior.is_subset(&lent) {
+            counts.copy_derived_mixed_not_invalidated += 1;
+        } else if !read {
+            counts.copy_derived_skipped_evidence_unavailable += 1;
+        } else {
+            rows.push((start, row));
+        }
+    }
+    if !counts.is_empty() {
+        budget::record(&counts);
+    }
+    rows
+}
+
 fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::AcceptedSession>) {
     let Some(accepted) = accepted else {
         return;
@@ -1421,26 +1549,9 @@ fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::
         // the gate (no money or tagging change).
         grouping.accepted_rows_vanished += accepted.vanished_rows(start, rows.keys());
         for (row, group) in rows {
-            let prior = accepted.row_shares(start, row);
-            let current = group
-                .by_key
-                .iter()
-                .filter(|(_, amount)| amount.counts != [0; 8])
-                .map(|(key, _)| key.as_ref().map(|key| accepted.authority_hash(key)))
-                .collect::<BTreeSet<_>>();
-            // Only a row frozen with tagged proof can constrain later proof.
-            // New rows and rows previously ACKed untagged remain admissible.
-            if prior.is_empty() {
+            let Some(prior) = changed_shares(accepted, start, row, group) else {
                 continue;
-            }
-            // Resolving an untagged share to the same surviving tagged set is
-            // new proof, not a retag. Missing prior tagged keys still count changed.
-            let resolved_missing = prior.contains(&None)
-                && current == prior.iter().filter(|key| key.is_some()).copied().collect();
-            let changed = current != prior && !resolved_missing;
-            if !changed {
-                continue;
-            }
+            };
             grouping.accepted_share_changed.insert(bucket.clone());
             let mut kept = BTreeMap::<Option<AuthorityKey>, Amounts>::new();
             for (key, amount) in std::mem::take(&mut group.by_key) {
@@ -2539,6 +2650,17 @@ impl OrgMarkers {
 // E2 consumes this compact, native-sequence-ordered placement before any
 // requests aggregate. Marker state is bounded independently of request count.
 pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
+/// A counted request's grain slot (live key, origin), the account a copied
+/// marker lent it, and whether this pass positively read its own evidence.
+#[derive(Clone, Debug)]
+pub(crate) struct LentSlot {
+    pub(crate) key: super::claude_request_money::body::ClaudeLiveKey,
+    pub(crate) origin: Option<super::claude_request_money::body::ClaudeRequestUsageOrigin>,
+    pub(crate) lent: Arc<AuthorityKey>,
+    /// Classified tagged or missing, never refused (unreadable, pending).
+    pub(crate) read: bool,
+}
+crate::heap_layout_bound::fields!(LentSlot; key, origin, lent, read);
 
 #[derive(Clone, Debug)]
 struct AccountRun {
@@ -2566,11 +2688,20 @@ pub(crate) struct RequestAccounts {
     reconciled: bool,
     /// Root start known, but the native Unknown grains are not filled yet.
     root_fallback_pending: bool,
-    /// This page discarded the family trace; no account may fill its shares.
-    trace_discard_no_fallback: bool,
+    /// This page could not read the family's strict sidecar evidence; no
+    /// account may fill its shares (SOURCE: unhealthy root is all-Unknown).
+    unhealthy_no_fallback: bool,
+    /// The uniform wire account a non-discard unhealthy read cleared (Lead B
+    /// Addendum 4); the bound owner admits the Unknown body only if it was its own.
+    unhealthy_cleared_account: Option<String>,
+    /// Copy-prefix switch on: per counted request whose account a copied
+    /// marker had lent (the copy decision re-derived it without the marker),
+    /// its grain slot, kept current through telemetry placement, and that
+    /// account (see `copy_derived_rows`).
+    pub(crate) copied_marker_lent: BTreeMap<u64, LentSlot>,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, trace_discard_no_fallback);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, unhealthy_no_fallback, unhealthy_cleared_account, copied_marker_lent);
 
 /// One account policy for E2. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
@@ -2735,7 +2866,7 @@ pub(crate) fn request_accounts(
 
 impl RequestAccounts {
     pub(crate) fn account(&self, sequence: u64) -> AccountPartition {
-        if self.trace_discard_no_fallback {
+        if self.unhealthy_no_fallback {
             return None;
         }
         if self.subagent {
@@ -2922,12 +3053,14 @@ impl RequestAccounts {
 /// Own exact telemetry uses the existing request classifier, with the same
 /// standing as an own credential_org. Only missing evidence inherits an
 /// earlier own request, then the start/binding; every such fill is counted.
+/// A family whose strict sidecar read failed this page inherits nothing: its
+/// requests stay Unknown, counted per reason in the returned totals.
 pub(crate) fn reconcile_request_accounts(
     items: &mut [SnapshotItem],
     evidence: &ScanEvidence<'_>,
-) -> u64 {
+) -> super::ClaudeUnhealthyRootNoFallbackCounts {
     use super::claude_request_money::e2::place_request_identity;
-    let mut no_fallback_requests = 0;
+    let mut no_fallback = super::ClaudeUnhealthyRootNoFallbackCounts::default();
     for item in items {
         let Some(mut fold) = item.claude_money.take() else {
             continue;
@@ -2941,20 +3074,28 @@ pub(crate) fn reconcile_request_accounts(
             item.claude_money = Some(fold);
             continue;
         }
-        if evidence
-            .trace_discarded_roots
-            .contains(super::claude_snapshot_family_root_ref(item))
-        {
-            // API attachment already placed reported money. Collapse accounts
-            // in place so tokens, costs, side calls and id-less shares survive.
-            no_fallback_requests += fold
-                .entity
-                .grains
-                .values()
-                .map(|grain| grain.requests)
-                .sum::<u64>();
+        let root = super::claude_snapshot_family_root_ref(item);
+        if evidence.unhealthy_roots.contains(root) {
+            // The classifier refuses every request here (IncompleteEvidence).
+            // A retained, creator, start or earlier-request account is not
+            // evidence for requests whose own proof could not be read: collapse
+            // the partitions in place so tokens, costs, side calls and id-less
+            // shares survive with no account. Durable bindings are untouched.
+            let reason = evidence.unhealthy_reason(root);
+            no_fallback.add(
+                reason,
+                fold.entity
+                    .grains
+                    .values()
+                    .map(|grain| grain.requests)
+                    .fold(0_u64, u64::saturating_add),
+            );
             fold.entity.repartition(None);
-            accounts.trace_discard_no_fallback = true;
+            accounts.unhealthy_no_fallback = true;
+            // A discard keeps #932's hold: nothing to admit.
+            accounts.unhealthy_cleared_account = (reason != UnhealthyRootReason::Discarded)
+                .then(|| super::exact_session_account_hash(item))
+                .flatten();
             accounts.starting = None;
             accounts.fallback = None;
             accounts.inherited = 0;
@@ -2965,8 +3106,9 @@ pub(crate) fn reconcile_request_accounts(
             }
             fold.accounts = Some(accounts);
             item.claude_money = Some(fold);
-            // Emission preserves a uniform wire account even for billing rows
-            // that bypass final identity grouping. Discard suppresses it too.
+            // Emission carries the account owner's uniform row login to rows
+            // that bypass final identity grouping (non-subscription or mixed
+            // billing). That login came from this unreadable pair too.
             if super::set_claude_account_hash(item, None) {
                 item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
             }
@@ -3040,6 +3182,10 @@ pub(crate) fn reconcile_request_accounts(
                 .and_then(|row| *row);
             let identity = request_occurrence_facts(item, request, occurrence, false)
                 .map(|facts| classify_ref(evidence, &facts));
+            let read = matches!(
+                identity,
+                Some(IdentityRef::Tagged(_) | IdentityRef::Missing)
+            );
             let own = match identity {
                 Some(IdentityRef::Tagged(key)) if telemetry.is_some() && key.login.is_some() => {
                     let found = keys.iter().find(|known| key.matches(known));
@@ -3138,6 +3284,16 @@ pub(crate) fn reconcile_request_accounts(
                 account
             };
             occurrence.e2_inherited = account.as_ref().map(|_| accounts.inherited > before);
+            // Own evidence for the lent account itself ends the loan.
+            if let std::collections::btree_map::Entry::Occupied(mut lent) =
+                accounts.copied_marker_lent.entry(sequence)
+            {
+                if account.as_ref() == Some(&lent.get().lent) {
+                    lent.remove();
+                } else {
+                    lent.get_mut().read = read;
+                }
+            }
             place_request_identity(
                 &mut fold,
                 occurrence,
@@ -3151,7 +3307,19 @@ pub(crate) fn reconcile_request_accounts(
         fold.accounts = Some(accounts);
         item.claude_money = Some(fold);
     }
-    no_fallback_requests
+    no_fallback
+}
+
+/// Lead B Addendum 4 (option 1): the account this page cleared from `item` for
+/// a non-discard unhealthy read. If it was the bound owner's, main would have
+/// uploaded the body, so it uploads Unknown now instead of being held.
+pub(crate) fn unhealthy_cleared_account(item: &SnapshotItem) -> Option<&str> {
+    item.claude_money
+        .as_deref()?
+        .accounts
+        .as_deref()?
+        .unhealthy_cleared_account
+        .as_deref()
 }
 
 /// Read retained creator bindings using the same machine/session key as the
@@ -3226,7 +3394,8 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         else {
             continue;
         };
-        if accounts.subagent || accounts.trace_discard_no_fallback {
+        // An unhealthy family lends no start to its children or twins.
+        if accounts.subagent || accounts.unhealthy_no_fallback {
             continue;
         }
         let first = item
@@ -3299,7 +3468,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         let Some(accounts) = fold.accounts.as_deref_mut() else {
             continue;
         };
-        if accounts.trace_discard_no_fallback {
+        if accounts.unhealthy_no_fallback {
             continue;
         }
         if accounts.subagent {
@@ -3583,8 +3752,9 @@ pub(crate) struct ScanEvidence<'a> {
     request_roots: std::cell::OnceCell<Vec<(&'a str, Option<&'a str>)>>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
-    /// Cap/generation discards only; other unhealthy reads retain their policy.
-    pub(crate) trace_discarded_roots: BTreeSet<String>,
+    /// Why each unhealthy root failed, for its no-fallback counter only.
+    /// A root missing here counts as `Incomplete`.
+    unhealthy_reasons: BTreeMap<String, UnhealthyRootReason>,
     /// Roots with a qualified witness that their telemetry writer is healthy
     /// NOW, the precondition for `Refusal::Pending`. A complete paired-sidecar
     /// load proves only what was already written, not a live writer, and no
@@ -3612,6 +3782,8 @@ pub(crate) struct ScanEvidence<'a> {
     native_originals: Option<&'a BTreeMap<String, super::SessionAccountEvidence>>,
     accepted_buckets: Option<&'a AcceptedBuckets>,
     wire_size_reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
+    /// Copy-derived rows this pass's bodies treat as never accepted.
+    copy_invalidated: std::cell::RefCell<Vec<CopyInvalidation>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -3675,14 +3847,29 @@ impl<'a> ScanEvidence<'a> {
         evidence
     }
 
-    pub(crate) fn with_trace_discarded_roots(mut self, roots: BTreeSet<String>) -> Self {
-        self.trace_discarded_roots = roots;
+    pub(crate) fn with_unhealthy_reasons(
+        mut self,
+        reasons: BTreeMap<String, UnhealthyRootReason>,
+    ) -> Self {
+        self.unhealthy_reasons = reasons;
         self
+    }
+
+    fn unhealthy_reason(&self, root: &str) -> UnhealthyRootReason {
+        self.unhealthy_reasons
+            .get(root)
+            .copied()
+            .unwrap_or(UnhealthyRootReason::Incomplete)
     }
 
     pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {
         self.accepted_buckets = accepted;
         self
+    }
+
+    /// The rows the ledger must tombstone (`AcceptedBuckets::invalidate_copy_derived`).
+    pub(crate) fn take_copy_invalidated(&self) -> Vec<CopyInvalidation> {
+        self.copy_invalidated.take()
     }
 
     pub(crate) fn with_wire_size_reservation(
@@ -4893,9 +5080,7 @@ fn keeps_markerless_account(item: &SnapshotItem) -> bool {
             .as_deref()
             .and_then(|fold| fold.accounts.as_deref())
             .is_some_and(|accounts| {
-                !accounts.trace_discard_no_fallback
-                    && accounts.starting.is_some()
-                    && !accounts.conflict
+                !accounts.unhealthy_no_fallback && accounts.starting.is_some() && !accounts.conflict
             })
 }
 
@@ -4946,13 +5131,35 @@ fn tag_item(
             .wire_size_reservation
             .map_or(0, |reserve| reserve(item));
         grouping.accepted_miss = miss;
-        let tagged = apply_grouped_with_accepted(item, grouping, accepted, retained);
+        let copy_derived = copy_derived_rows(item, &grouping, accepted);
+        let invalidated = accepted
+            .filter(|_| !copy_derived.is_empty())
+            .map(|accepted| accepted.invalidated(&copy_derived));
+        let tagged = apply_grouped_with_accepted(
+            item,
+            grouping,
+            invalidated.as_ref().or(accepted),
+            retained,
+        );
         if tagged.is_err() {
             (
                 item.source_started_at,
                 item.source_ended_at,
                 item.source_last_activity_at,
             ) = lifecycle;
+        } else {
+            evidence
+                .copy_invalidated
+                .borrow_mut()
+                .extend(
+                    copy_derived
+                        .into_iter()
+                        .map(|(bucket, row)| CopyInvalidation {
+                            session: item.source_session_id.clone(),
+                            bucket,
+                            row,
+                        }),
+                );
         }
         // A cap failure cannot authorize a uniform starting-account rewrite.
         // The budget's proved subset or full strip is the final identity body.

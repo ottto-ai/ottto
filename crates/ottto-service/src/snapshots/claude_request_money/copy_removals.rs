@@ -2,9 +2,10 @@
 //! file, the request hashes it once removed as copies on an earlier holder's
 //! CURRENT census proof, grouped by that holder. A later re-read whose holder
 //! proof list has since retired rebuilds the same deduped body instead of
-//! restoring the prefix. A holder no longer indexed proves nothing: its group
-//! is ignored, and dropped at the file's next store. Local state (class L):
-//! never uploaded, never a wire field.
+//! restoring the prefix. A holder no longer indexed cannot disprove anything:
+//! its group stands, counted (`copy_removal_holder_absent_kept`, Lead B F5);
+//! only an indexed holder whose census lacks a hash reverts it. Local state
+//! (class L): never uploaded, never a wire field.
 //!
 //! Bounded by `MAX_BYTES` of charged state: 40 bytes per file, 32 per holder
 //! group and 8 per hash (about 520k hashes when dense; the encoded index text
@@ -60,6 +61,12 @@ impl CopyRemovals {
     pub(crate) fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
+    /// Only an empty undamaged store is omitted from the index: an absent
+    /// field then reads back as exactly that (Lead B F4). Switch off keeps
+    /// the released bytes: an empty store is never written.
+    pub(crate) fn is_unwritten(&self) -> bool {
+        self.is_empty() && (!self.metadata_lost || !super::e2::resumed_prefix_enabled())
+    }
 
     /// The charged bytes held now (at most `MAX_BYTES`).
     #[cfg(test)]
@@ -67,7 +74,8 @@ impl CopyRemovals {
         self.bytes
     }
 
-    /// Absent or damaged metadata is uncertainty, never fresh ownership.
+    /// Damaged metadata is uncertainty, never fresh ownership; it is written
+    /// back even when empty. An absent field is an empty store (Lead B F4).
     pub(crate) fn missing() -> Self {
         Self {
             metadata_lost: true,

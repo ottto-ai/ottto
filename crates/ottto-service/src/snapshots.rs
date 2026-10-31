@@ -4064,10 +4064,12 @@ pub struct ScanIndex {
     /// E2 stored copy removals (copy-family fix): what each Claude file once
     /// removed on an earlier holder's current proof stays removed after that
     /// proof retires. Bounded and local. Appended slot; older daemons ignore
-    /// it; absent/damaged metadata stays uncertain until the current proof decides.
+    /// it. Only an empty undamaged store is never written, so an absent field
+    /// is an empty store (Lead B F4); damaged metadata stays uncertain until
+    /// the current proof decides.
     #[serde(
-        default = "claude_request_money::copy_removals::CopyRemovals::missing",
-        skip_serializing_if = "claude_request_money::copy_removals::CopyRemovals::is_empty",
+        default,
+        skip_serializing_if = "claude_request_money::copy_removals::CopyRemovals::is_unwritten",
         deserialize_with = "claude_request_money::copy_removals::CopyRemovals::deserialize_lenient"
     )]
     pub(crate) claude_copy_removals: claude_request_money::copy_removals::CopyRemovals,
@@ -7466,6 +7468,46 @@ pub struct ClaudeFullRearmSuppressionCounts {
 impl ClaudeFullRearmSuppressionCounts {
     pub(crate) fn is_empty(&self) -> bool {
         self == &Self::default()
+    }
+}
+
+/// E2 requests left Unknown because their family's strict sidecar read was
+/// unhealthy this page (`unhealthy_root_no_fallback_requests{reason}`): no
+/// retained, creator, start or inherited account filled them. Content-free
+/// counts; nothing reads them into a decision. Absent from the line while zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ClaudeUnhealthyRootNoFallbackCounts {
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub discarded: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub oversized: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub unreadable: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub malformed: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub incomplete: u64,
+}
+
+impl ClaudeUnhealthyRootNoFallbackCounts {
+    pub(crate) fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub(crate) fn add(
+        &mut self,
+        reason: claude_request_identity::UnhealthyRootReason,
+        requests: u64,
+    ) {
+        use claude_request_identity::UnhealthyRootReason as Reason;
+        let count = match reason {
+            Reason::Discarded => &mut self.discarded,
+            Reason::Oversized => &mut self.oversized,
+            Reason::Unreadable => &mut self.unreadable,
+            Reason::Malformed => &mut self.malformed,
+            Reason::Incomplete => &mut self.incomplete,
+        };
+        *count = count.saturating_add(requests);
     }
 }
 
@@ -15991,11 +16033,7 @@ impl SelectorHashes {
 // a native selector hash ("base" or hexadecimal).
 const COPY_UNPROVEN_PARTITION: &str = "copy_unproven:";
 fn row_key_with_selector_hash(row: &SnapshotModelUsage, selector_hash: String) -> RowKey {
-    let selector_hash = if row.copy_unproven {
-        format!("{COPY_UNPROVEN_PARTITION}{selector_hash}")
-    } else {
-        selector_hash
-    };
+    let selector_hash = copy_unproven_selector_hash(row.copy_unproven, selector_hash);
     RowKey {
         model: row.model.clone(),
         selector_hash,
@@ -16006,6 +16044,18 @@ fn row_key_with_selector_hash(row: &SnapshotModelUsage, selector_hash: String) -
         gateway_provider: row.gateway_provider.clone(),
         model_provider: row.model_provider.clone(),
         subscription_product: row.subscription_product.clone(),
+    }
+}
+
+/// The RowKey selector partition of a `copy_unproven` row. Every RowKey of a
+/// usage row, local or rebuilt from its wire form (the #909 accepted ledger,
+/// #944 proved rows), must partition through here so a marked row and an
+/// unmarked twin never share a key.
+pub(crate) fn copy_unproven_selector_hash(copy_unproven: bool, selector_hash: String) -> String {
+    if copy_unproven {
+        format!("{COPY_UNPROVEN_PARTITION}{selector_hash}")
+    } else {
+        selector_hash
     }
 }
 
@@ -45819,6 +45869,14 @@ impl ScanIndex {
                             // Eligibility is scan-local and exact-body-bound;
                             // neither marker-only imports nor restart restore it.
                         }
+                        // Lead B Addendum 4 (option 1): a body whose owner
+                        // account this scan cleared for a non-discard unhealthy
+                        // read uploads Unknown now; the owner is never rewritten.
+                        (Some(owner), None)
+                            if mixed.permits_unhealthy_unknown(
+                                item,
+                                &owner.account_identifier_hash,
+                            ) => {}
                         (Some(_), _) => {
                             deferred.insert(session_id.clone());
                         }
