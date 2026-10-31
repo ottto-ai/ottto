@@ -27958,7 +27958,7 @@ impl OwnedSourceScan {
                             continue;
                         }
                         if inventory.member_held(&candidate.path) {
-                            if inventory.feed_member_held(&candidate.path) {
+                            if inventory.feed_member_carrier(&candidate.path) {
                                 index.hold_compressed(
                                     &candidate.path,
                                     codex_session_id_candidates_from_path(&candidate.path)

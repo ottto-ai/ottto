@@ -158,9 +158,15 @@ impl codex_file_join::HeaderInventory {
         false
     }
     pub(super) fn feed_member_held(&self, path: &Path) -> bool {
+        self.feed_member_carrier(path)
+            || (self.custody_unknown && is_compressed_codex_rollout(Some(path), None))
+    }
+    /// GR3 handover: only a known old carrier (or refused custody scratch)
+    /// becomes a lasting hold. Unknown-owner raw custody stays fenced and
+    /// waits under the existing pending retry instead.
+    pub(super) fn feed_member_carrier(&self, path: &Path) -> bool {
         is_compressed_codex_rollout(Some(path), None)
-            && (self.custody_unknown
-                || self.custody_refused
+            && (self.custody_refused
                 || codex_session_id_candidates_from_path(path)
                     .iter()
                     .any(|owner| self.absence_held.contains(&codex_protected_owner(owner))))
@@ -356,6 +362,14 @@ impl codex_file_join::HeaderInventory {
                     BTreeSet::from([header.owner.clone()]),
                     cause,
                 );
+                self.custody_next += 1;
+                return false;
+            }
+            // GR3: unknown-owner raw (archive) custody never mints a lasting
+            // hold; it stays fenced (`member_held`) and waits for a retry.
+            if !self.custody_refused
+                && is_compressed_codex_rollout(Some(&header.candidate.path), None)
+            {
                 self.custody_next += 1;
                 return false;
             }
