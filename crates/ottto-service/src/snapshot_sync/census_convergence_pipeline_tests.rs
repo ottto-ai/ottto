@@ -1831,6 +1831,16 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
             .iter()
             .find(|page| !page.held.is_empty() && page.index.bounded_sweep_had_unsettled_upload())
             .expect("held page that marks the sweep");
+        assert!(
+            !hold.scan.census_complete,
+            "the hold page cannot publish a census"
+        );
+        assert_eq!(
+            hold.index
+                .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT),
+            Some(bound_before.clone()),
+            "the exact bound revisions survive the hold page"
+        );
         assert!(!hold.progress_blocking);
         assert_eq!(hold.index.claude_account_deferred_hold_count(), 0);
         assert!(!hold.fully_settled);

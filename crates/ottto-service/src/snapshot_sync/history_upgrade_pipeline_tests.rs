@@ -893,14 +893,13 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
             overridden.uploaded
         );
         assert_eq!(overridden.corrections, 0);
-        for held_index in [&overridden.index] {
-            assert_eq!(held_index.files.len(), HISTORY_SESSIONS.len());
-            assert!(held_index
-                .files
-                .values()
-                .all(|entry| entry.effective_upload_body_witness_revision == 0
-                    && entry.last_upload_body_witness.is_none()));
-        }
+        assert_eq!(overridden.index.files.len(), HISTORY_SESSIONS.len());
+        assert!(overridden
+            .index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 0
+                && entry.last_upload_body_witness.is_none()));
         // The retained owner survived the rebuild, the scan, the partial
         // settlement and the save: it is still the authority on disk.
         let value = saved(&fixture);
@@ -2620,9 +2619,6 @@ impl HistoryFixture {
     fn list_status(&self, outcome: &HistoryOutcome) -> &'static str {
         let mut index = outcome.index.clone();
         index.load_claude_reemission_exclusions(&self.support);
-        if cycle.seed_legacy && cycle.revision < 3 {
-            index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(index);
-        }
         index.claude_reemission_list_status_for_test()
     }
 }

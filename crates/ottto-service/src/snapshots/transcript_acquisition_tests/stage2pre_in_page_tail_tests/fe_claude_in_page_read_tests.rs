@@ -1876,7 +1876,7 @@ fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
     let due = sampled_scan::now_seconds();
     let before = identity_incomplete_hold_totals();
     let restored_before = restored();
-    let mut hold = erased_hold(due);
+    let hold = erased_hold(due);
     let key = hold.key.clone();
     assert_eq!(identity_incomplete_hold_totals(), (before.0 + 1, before.1));
     assert_eq!(restored(), restored_before, "save/load restores nothing");
@@ -1979,7 +1979,7 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     let _clock = TestClock;
     let due = sampled_scan::now_seconds();
     let restored_before = restored();
-    let hold = erased_hold(due);
+    let mut hold = erased_hold(due);
     let key = hold.key.clone();
     let traversal = || ScanTraversalPath {
         scan_root: hold.fixture.root.clone(),

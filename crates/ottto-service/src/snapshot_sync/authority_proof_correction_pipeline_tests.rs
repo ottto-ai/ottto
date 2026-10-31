@@ -3387,6 +3387,11 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
     }
     let cleared_hour = cleared_hour.expect("the pre-flip correction clears after the flip");
     assert_eq!(
+        cleared_hour,
+        grant.hour + 1,
+        "A01/E2-008: every owed member drains in the first bounded traversal"
+    );
+    assert_eq!(
         acked, grant.owed,
         "every owed member settles on its own request-owned ACK"
     );
