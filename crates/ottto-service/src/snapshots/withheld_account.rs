@@ -318,6 +318,25 @@ pub(super) fn absence_eligible(
                 return now - first >= 600;
             }
         }
+        // Replacing an invalidated witness releases its old descriptor first.
+        entry.absence = None;
+        // Heap admission does not reserve descriptors. Keep at least seven
+        // eighths of the soft limit for ordinary daemon I/O, and never retain
+        // more than 32 pins. The existing memo owns the population accounting.
+        let limit = crate::fd_guard::descriptor_limit().map_or(0, |n| (n / 8).min(32));
+        if state
+            .entries
+            .values()
+            .filter(|entry| entry.absence.is_some())
+            .count()
+            >= limit
+        {
+            return false;
+        }
+        let entry = state
+            .entries
+            .get_mut(&memo_key(key))
+            .expect("admitted memo entry");
         entry.absence = Some((now, Box::new(parent)));
         false
     })

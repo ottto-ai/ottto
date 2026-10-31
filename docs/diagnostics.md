@@ -681,7 +681,10 @@ between probes; inode reuse cannot substitute a different parent. Presence,
 symlink/non-directory ancestors, permission errors, parent replacement,
 missing/unreadable roots or unavailable memo state reset the sequence and keep
 debt. Restart loses the witness and requires two new observations. Descriptor
-open failures also fail closed.
+open failures also fail closed. The memo admits at most 32 retained parent
+descriptors and at most one eighth of the process soft descriptor limit; failure
+to query the limit refuses admission. Unadmitted keys keep their debt and retry
+on later inventory passes as admitted keys retire.
 The inventory probes at most 4,096 recorded holds, including held-new keys,
 outside aggregate terminal authority. Indexed reconciliation and removal hints
 share this eligibility gate; generic file removal preserves account holds.

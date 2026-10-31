@@ -1936,7 +1936,8 @@ fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() 
             assert_eq!(
                 diagnostics
                     .iter()
-                    .filter(|row| row["stage"] == "audit_retired_absent")
+                    .filter(|row| row["stage"] == "native_collection_page"
+                        && row["counts"]["audit_retired_absent"]["events"] == 1)
                     .count(),
                 usize::from(ancestor != "unsafe")
             );
@@ -1988,6 +1989,7 @@ fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() 
     }
 }
 
+/// [behaviour] Protected history keeps custody while its absent audit retires.
 #[test]
 fn protected_codex_absence_retires_only_the_audit_obligation() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2024,7 +2026,10 @@ fn protected_codex_absence_retires_only_the_audit_obligation() {
     traversal.observed_index_keys.clear();
     traversal.reconciliation_upper_bound = Some(key.clone());
     let (done, diagnostics) = crate::local_resource_diagnostics::capture(|| {
-        reconcile_missing_index_entries_with_side(&mut index, 10, None, source)
+        let done = reconcile_missing_index_entries_with_side(&mut index, 10, None, source);
+        crate::local_resource_diagnostics::Probe::start()
+            .collection(source.api_slug(), Default::default());
+        done
     });
     assert!(done);
     assert!(!index.files[&key].has_unverified_source());
@@ -2036,7 +2041,8 @@ fn protected_codex_absence_retires_only_the_audit_obligation() {
     assert_eq!(
         diagnostics
             .iter()
-            .filter(|row| row["stage"] == "audit_retired_absent")
+            .filter(|row| row["stage"] == "native_collection_page"
+                && row["counts"]["audit_retired_absent"]["events"] == 1)
             .count(),
         1
     );
@@ -2165,9 +2171,8 @@ fn hold_only_inventory_requires_two_secure_absence_observations() {
             "one observation keeps custody"
         );
         sampled_scan::set_test_now(Some(1_600));
-        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            index.probe_absent_claude_account_deferred_holds()
-        });
+        crate::local_resource_diagnostics::take_withheld_for_test();
+        index.probe_absent_claude_account_deferred_holds();
         let removed = matches!(ancestor, "present" | "missing");
         assert_eq!(
             !index.claude_account_deferred_holds.contains_key(&key),
@@ -2175,11 +2180,12 @@ fn hold_only_inventory_requires_two_secure_absence_observations() {
             "{ancestor}"
         );
         assert_eq!(
-            rows.iter()
-                .filter(|row| row["stage"] == "withheld_hold_released"
-                    && row["counts"]["withheld_hold_released"]["deleted"] == 1)
-                .count(),
-            usize::from(removed)
+            crate::local_resource_diagnostics::take_withheld_for_test()[0],
+            if removed {
+                BTreeMap::from([("deleted", 1)])
+            } else {
+                BTreeMap::new()
+            }
         );
         assert!(index.files.is_empty(), "no membership invented");
         sampled_scan::set_test_now(None);
@@ -2231,4 +2237,30 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
         index.claude_account_deferred_holds.is_empty(),
         "the next bounded inventory proves eligible absence"
     );
+    // A large missing population must leave some debt unadmitted rather than
+    // pin a descriptor for every key; admitted batches must still make progress.
+    for n in 0..80 {
+        index.claude_account_deferred_holds.insert(
+            local_index_key(&fixture.root.join(format!("missing-{n}.jsonl"))),
+            "held".into(),
+        );
+    }
+    sampled_scan::set_test_now(Some(1_000));
+    index.probe_absent_claude_account_deferred_holds();
+    sampled_scan::set_test_now(Some(1_600));
+    index.probe_absent_claude_account_deferred_holds();
+    let remaining = index.claude_account_deferred_hold_count();
+    assert!(
+        remaining > 0 && remaining < 80,
+        "descriptor admission keeps debt and makes progress"
+    );
+    for step in 2..=80 {
+        sampled_scan::set_test_now(Some(1_000 + step * 600));
+        index.probe_absent_claude_account_deferred_holds();
+        if index.claude_account_deferred_hold_count() == 0 {
+            break;
+        }
+    }
+    assert_eq!(index.claude_account_deferred_hold_count(), 0);
+    sampled_scan::set_test_now(None);
 }

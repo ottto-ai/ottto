@@ -1814,9 +1814,14 @@ fn absent_account_hold_retires_without_money_or_completion_credit() {
     assert_eq!(index.claude_account_deferred_hold_count(), 1);
     fs::remove_file(&path).unwrap();
     crate::local_resource_diagnostics::take_withheld_for_test();
+    let mut releases = Vec::new();
     for (now, held) in [(1_000, 1), (1_599, 1), (1_600, 0), (2_200, 0)] {
         sampled_scan::set_test_now(Some(now));
-        let (next, scan, _) = finish(new_scan(&root.projects(), index));
+        let ((next, scan, _), rows) = capture(|| finish(new_scan(&root.projects(), index)));
+        releases.extend(
+            rows.into_iter()
+                .filter_map(|row| row["counts"]["withheld_hold_released"].as_object().cloned()),
+        );
         index = next;
         assert_eq!(index.claude_account_deferred_hold_count(), held);
         assert_eq!(scan.scanned_file_count, 0);
@@ -1832,8 +1837,11 @@ fn absent_account_hold_retires_without_money_or_completion_credit() {
     }
     sampled_scan::set_test_now(None);
     assert_eq!(
-        crate::local_resource_diagnostics::take_withheld_for_test()[0],
-        BTreeMap::from([("deleted", 1), ("deleted_tokens", 30)])
+        releases,
+        vec![json!({"deleted": 1, "deleted_tokens": 30})
+            .as_object()
+            .unwrap()
+            .clone()]
     );
 }
 
@@ -2931,7 +2939,7 @@ fn codex_live_observer_skips_an_actual_overlong_row_before_terminal_usage() {
     assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
 }
 
-/// Real Completed account settlement carries Tail audit debt onto the committed
+/// [behaviour] Real Completed account settlement carries Tail audit debt onto the committed
 /// subset. Only positively proven deletion may retire both obligations.
 #[test]
 fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
@@ -3021,8 +3029,16 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
         } else {
             Vec::new()
         };
-        let deletion_baseline = held.clone();
-        let (removed, scan, recorder, counts) = page(held, &hints);
+        sampled_scan::set_test_now(Some(1_000));
+        let (first, scan, recorder, _) = page(held, &hints);
+        assert!(first.claude_account_deferred_holds.contains_key(&key));
+        assert!(first.files[&key].has_unverified_source());
+        assert!(recorder.events().is_empty());
+        assert_eq!(scan.scanned_file_count, 0);
+        sampled_scan::set_test_now(Some(1_600));
+        let deletion_baseline = first.clone();
+        let (removed, scan, recorder, counts) = page(first, &hints);
+        sampled_scan::set_test_now(None);
         let removed = crate::snapshot_sync::settle_withheld_for_test(
             &deletion_baseline,
             removed,
@@ -3103,7 +3119,7 @@ fn withheld_missing_parent_keeps_account_and_audit_debt() {
     assert!(!crate::snapshot_sync::withheld_settled_for_test(&kept));
 }
 
-/// Deleting a project beneath a readable root retires both indexed debts,
+/// [behaviour] Deleting a project beneath a readable root retires both indexed debts,
 /// through either a remove hint or the existing bounded reconciliation page.
 #[test]
 fn withheld_removed_project_releases_account_and_audit_debt() {
@@ -3155,6 +3171,16 @@ fn withheld_removed_project_releases_account_and_audit_debt() {
         fs::remove_dir_all(&project).unwrap();
         assert!(sampled_audit::proven_absent(&path, &[root.projects()]));
         let hints = if hinted { vec![path.clone()] } else { vec![] };
+        sampled_scan::set_test_now(Some(1_000));
+        let recorder = Recorder::default();
+        let (held, first, _) = finish(
+            new_scan(&root.projects(), held).with_line_observer("test", Box::new(recorder.clone())),
+        );
+        assert!(held.claude_account_deferred_holds.contains_key(&key));
+        assert!(held.files[&key].has_unverified_source());
+        assert!(recorder.events().is_empty());
+        assert_eq!(first.scanned_file_count, 0);
+        sampled_scan::set_test_now(Some(1_600));
         let recorder = Recorder::default();
         let baseline = held.clone();
         let ((after, scan, _), counts) = capture(|| {
@@ -3175,6 +3201,7 @@ fn withheld_removed_project_releases_account_and_audit_debt() {
                 .with_line_observer("test", Box::new(recorder.clone())),
             )
         });
+        sampled_scan::set_test_now(None);
         assert!(recorder.events().is_empty(), "absence never acquires bytes");
         assert_eq!(scan.scanned_file_count, 0);
         if !hinted {
@@ -3340,7 +3367,7 @@ fn withheld_memo_survives_owner_cycles_and_discloses_budget_refusal() {
     sampled_scan::set_test_now(None);
 }
 
-/// Hold-only checkpoints must use the same positive proof as indexed holds.
+/// [format] Hold-only checkpoints must use the same positive proof as indexed holds.
 /// A missing project beneath a readable root is positive absence; a missing
 /// configured root remains uncertain even after checkpoint reload.
 #[test]
@@ -3367,6 +3394,11 @@ fn withheld_new_completed_checkpoint_requires_positive_absence() {
         } else if missing_root {
             fs::remove_dir_all(root.projects()).unwrap();
         }
+        sampled_scan::set_test_now(Some(1_000));
+        let (held, first, _) = finish(new_scan(&root.projects(), held));
+        assert!(held.claude_account_deferred_holds.contains_key(&key));
+        assert_eq!(first.scanned_file_count, 0);
+        sampled_scan::set_test_now(Some(1_600));
         let recorder = Recorder::default();
         let ((after, _, _), counts) = capture(|| {
             finish(
@@ -3374,6 +3406,7 @@ fn withheld_new_completed_checkpoint_requires_positive_absence() {
                     .with_line_observer("test", Box::new(recorder.clone())),
             )
         });
+        sampled_scan::set_test_now(None);
         assert!(recorder.events().is_empty(), "absence never parses");
         assert_eq!(
             after.claude_account_deferred_holds.contains_key(&key),
