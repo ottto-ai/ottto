@@ -48501,6 +48501,64 @@ impl ScanIndex {
             })
     }
 
+    /// Narrow only Claude's admission-triggered scan widening. The existing
+    /// zero-failures/zero-deadline shape is an unspent admission re-entry (also
+    /// used by legacy settlement reconciliation); ordinary refusals start at 1.
+    pub(crate) fn snapshot_admission_reoffer_pending_for_scan(
+        &self,
+        source: SnapshotSource,
+        support: &Path,
+        window_days: u64,
+    ) -> bool {
+        if source != SnapshotSource::ClaudeCode
+            || !terminal_off_policy::marker_at(support, "claude_admission_reoffer_window_enabled")
+        {
+            return self.snapshot_admission_reoffer_pending();
+        }
+        let Some(now) = unix_seconds(SystemTime::now()) else {
+            return self.snapshot_admission_reoffer_pending();
+        };
+        let (mut armed, mut outside, mut ordinary) = (0, 0, 0);
+        for (fingerprint, record) in &self.quarantined_snapshot_fingerprints {
+            if record.witness.item_wire_byte_limit != MAX_SNAPSHOT_ITEM_WIRE_BYTES
+                || record.disposition != SnapshotQuarantineDisposition::RetryPending
+            {
+                continue;
+            }
+            if record.failed_reconstruction_count == 0 && record.retry_after_unix_seconds == 0 {
+                armed += 1;
+                continue;
+            }
+            // A retry can age out after its refusal. Reuse the scanner's mtime
+            // cutoff and committed incidence; unknown membership/metadata stays
+            // wide. A stale older mtime can only request extra discovery.
+            let mut found = false;
+            let outside_window = self
+                .file_snapshot_fingerprints
+                .iter()
+                .any(|(key, entities)| {
+                    if !entities.contains(fingerprint) {
+                        return false;
+                    }
+                    found = true;
+                    self.files.get(key).map_or(true, |entry| {
+                        !is_recent_enough_at(entry.modified_unix_seconds, now, window_days)
+                    })
+                });
+            if outside_window || !found {
+                outside += 1;
+            } else {
+                ordinary += 1;
+            }
+        }
+        if armed + outside + ordinary > 0 {
+            eprintln!(
+                "ottto-service: Claude admission scan window: armed={armed} outside_or_unknown={outside} ordinary_inside={ordinary}"
+            );
+        }
+        armed + outside > 0
+    }
+
     fn activate_quarantine_witness(&mut self, source: SnapshotSource) {
         self.active_quarantine_witness = Some(
             self.active_upload_context_fingerprint
@@ -53265,6 +53323,9 @@ mod tests {
     }
     mod stale_family_carry_tests {
         include!("snapshots/stale_family_carry_tests.rs");
+    }
+    mod admission_reoffer_window_tests {
+        include!("snapshots/admission_reoffer_window_tests.rs");
     }
     mod terminal_off_tests {
         include!("snapshots/terminal_off_tests.rs");

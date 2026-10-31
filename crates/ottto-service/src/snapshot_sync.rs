@@ -6531,7 +6531,8 @@ fn prepare_sync_source_inner(
         // advance. Existing generation CAS rejects overlapping stale writers.
         index.save(&index_path)?;
     }
-    let admission_reoffer_pending = index.snapshot_admission_reoffer_pending();
+    let admission_reoffer_pending =
+        index.snapshot_admission_reoffer_pending_for_scan(source, support_dir, receipt_window_days);
     let mut legacy_reconciliation_pending = BTreeSet::new();
     if !historical_replay_pending && index.legacy_settlement_ledger_needs_migration() {
         let (armed, changed) = index.prepare_legacy_settlement_reconciliation(
