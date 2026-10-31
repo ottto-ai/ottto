@@ -7660,6 +7660,21 @@ pub struct SnapshotSourceManifest {
     pub rolling_hash: String,
 }
 
+/// RAM-only receipt inputs from existing traversal/admission state. No census
+/// decision, durable field, or scheduling change is made by this projection.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CensusStatus {
+    pub pending_work: bool,
+    pub retryable_problem: bool,
+    pub transport_reservation_refused: bool,
+    pub carry_admission_veto: bool,
+    pub state_loader_failed: bool,
+    pub reconciliation_incomplete: bool,
+    pub retry_attempt: u8,
+    pub retry_not_before_unix_seconds: Option<u64>,
+    pub admission_due_unix_seconds: Option<u64>,
+}
+
 macro_rules! scan_result {
     (pub struct $name:ident { pub source: SnapshotSource,
         $($(#[$attr:meta])* $vis:vis $field:ident: $ty:ty,)*
@@ -7676,6 +7691,7 @@ macro_rules! scan_result {
 scan_result! {
 pub struct SourceScanResult {
     pub source: SnapshotSource,
+    pub(crate) census_status: CensusStatus,
     pub backfill_window_days: u64,
     pub backfill_file_limit: usize,
     pub discovered_file_count: usize,
@@ -32052,6 +32068,47 @@ impl OwnedSourceScan {
                     .saturating_add(usize::from(terminal_unhealthy))
                     .saturating_add(usize::from(needs_clean_followup))
                     .saturating_add(usize::from(parent_resolution_restart));
+                let traversal = index.traversal.as_ref().expect("traversal remains active");
+                let admission = index
+                    .claude_stale_family_carry
+                    .origin
+                    .as_ref()
+                    .filter(|_| source == SnapshotSource::ClaudeCode)
+                    .and_then(|origin| origin.admission.as_ref());
+                let loaders = &codex_title_metadata.local_diagnostics;
+                let census_status = CensusStatus {
+                    pending_work: !traversal.pending_directories.is_empty()
+                        || !traversal.pending_candidates.is_empty()
+                        || !index.claude_stale_family_carry.replay.is_empty(),
+                    retryable_problem: traversal.counts.has_retryable_problems(),
+                    transport_reservation_refused: index
+                        .context_read_counts
+                        .transport_reservation_refused,
+                    carry_admission_veto: admission
+                        .is_some_and(|state| !(claude_terminal_off() && state.complete)),
+                    // Completeness also falls on identity conflicts: require
+                    // an actual failed loader (#985), not just a false gate.
+                    state_loader_failed: source == SnapshotSource::Codex
+                        && (!state_census_complete || !sidecar_census_complete)
+                        && [
+                            loaders.state_titles.failed_roots,
+                            loaders.state_threads.failed_roots,
+                            loaders.spawn_edges.failed_roots,
+                            loaders.rollout_extents.failed_roots,
+                            loaders.session_index.failed_roots,
+                        ]
+                        .into_iter()
+                        .any(|failed| failed > 0),
+                    reconciliation_incomplete: !reconciliation_complete,
+                    retry_attempt: traversal.unhealthy_retry_attempt,
+                    retry_not_before_unix_seconds: traversal
+                        .unhealthy_retry_not_before_unix_seconds,
+                    // Same immediate-due rule as ensure_bounded_traversal.
+                    // due_through is a work cutoff, not a retry deadline.
+                    admission_due_unix_seconds: admission
+                        .filter(|state| !state.complete && state.progressed)
+                        .and_then(|_| rfc3339_unix_seconds(&collected_at)),
+                };
                 if raw_census_complete {
                     index.record_scan_residue_witness(source, &traversal_snapshot);
                 }
@@ -32221,6 +32278,7 @@ impl OwnedSourceScan {
                     );
                 }
                 let scan = SourceScanResult {
+                    census_status,
                     discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                     strict_cohort_deferred_root_count: 0,
                     source,

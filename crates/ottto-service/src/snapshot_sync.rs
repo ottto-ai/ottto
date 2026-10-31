@@ -19,11 +19,11 @@ use crate::local_resource_diagnostics::claude_contract;
 use crate::session_attribution::SessionAttributionContext;
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
-    AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
+    AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected, CensusBlockCause,
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
     RelayTokenAuthorizationRejected, SnapshotAckRejected, SnapshotApiClient,
     SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
-    CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT,
+    CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT, CENSUS_STATUS_CONTRACT,
 };
 use crate::snapshots::{
     apply_upload_policy, collector_version, context_curve_derivation_revision,
@@ -3828,6 +3828,7 @@ fn counted_poison_fingerprints_for_test(scope: &str) -> BTreeSet<String> {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
+    census_status: crate::snapshots::CensusStatus,
     local_codex_diagnostics: Option<CodexScanDiagnostics>,
     backfill_window_days: u64,
     backfill_file_limit: u64,
@@ -3953,6 +3954,7 @@ impl SyncCounts {
             // this field and the manifest describe only the server-negotiated
             // semantic activity window.
             backfill_window_days: receipt_window_days,
+            census_status: scan_result.census_status,
             backfill_file_limit: scan_result.backfill_file_limit as u64,
             discovered_file_count: scan_result.discovered_file_count as u64,
             skipped_file_count_due_to_limit: scan_result.skipped_file_count_due_to_limit as u64,
@@ -11681,15 +11683,19 @@ fn collector_status_request(
     destination_namespace: &str,
     status: CollectorStatus<'_>,
     census_residue_status_admitted: bool,
+    census_status_admitted: bool,
 ) -> Result<SnapshotStatusRequest> {
     let finished_at = current_rfc3339();
     let disclosed_loss = status.counts.disclosed_loss();
+    let census_status_active = census_status_admitted
+        && matches!(&status.state, CollectorState::Success)
+        && !status.counts.census_complete;
     let (
         enabled,
         disabled_reason,
-        last_error_code,
+        mut last_error_code,
         last_error_message,
-        consecutive_failures,
+        mut consecutive_failures,
         terminal_succeeded,
     ) = match status.state {
         // A census that completed and whose every disclosed loss class is
@@ -11735,6 +11741,51 @@ fn collector_status_request(
             false,
         ),
     };
+    let mut block_cause = None;
+    let mut next_retry_at = None;
+    if census_status_active {
+        let census = status.counts.census_status;
+        // First failed gate wins, even if discovery is still progressing.
+        block_cause = if status.counts.unreadable_path_count > 0 {
+            Some(CensusBlockCause::UnreadableEvents)
+        } else if status.counts.disappeared_file_count > 0 {
+            Some(CensusBlockCause::DisappearedFiles)
+        } else if census.carry_admission_veto {
+            Some(CensusBlockCause::CarryAdmission)
+        } else if census.state_loader_failed {
+            Some(CensusBlockCause::StateLoader)
+        } else if census.transport_reservation_refused {
+            Some(CensusBlockCause::TransportReservation)
+        } else if census.reconciliation_incomplete
+            && status.counts.ownership_incomplete_file_count > 0
+        {
+            Some(CensusBlockCause::OwnershipIncomplete)
+        } else if !census.pending_work || census.retryable_problem {
+            Some(CensusBlockCause::Other)
+        } else {
+            None
+        };
+        last_error_code = Some(
+            if block_cause.is_some() {
+                "census_blocked"
+            } else {
+                "census_incomplete"
+            }
+            .to_string(),
+        );
+        consecutive_failures = u64::from(census.retry_attempt);
+        let due = if block_cause == Some(CensusBlockCause::CarryAdmission) {
+            census
+                .admission_due_unix_seconds
+                .or(census.retry_not_before_unix_seconds)
+        } else {
+            census.retry_not_before_unix_seconds
+        };
+        next_retry_at = due
+            .and_then(|seconds| i64::try_from(seconds).ok())
+            .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+            .and_then(|time| time.format(&Rfc3339).ok());
+    }
     let manifest = cached_source_manifest(destination_namespace, status.source);
     if let Some(manifest) = manifest.as_ref() {
         if manifest.window_end != status.scan_started_at {
@@ -11817,8 +11868,11 @@ fn collector_status_request(
         last_census_residue_blocked_session_count: status
             .counts
             .census_residue_blocked_session_count,
+        last_census_pending_file_count: census_status_admitted
+            .then_some(status.counts.skipped_file_count_due_to_limit),
+        last_census_block_cause: block_cause,
         consecutive_failures,
-        next_retry_at: None,
+        next_retry_at,
         collector_version: Some(collector_version()),
         parser_version: Some(status.source.parser_version().to_string()),
         manifest,
@@ -11852,13 +11906,13 @@ fn report_status(
     destination_namespace: &str,
     status: CollectorStatus<'_>,
 ) -> Result<()> {
-    let request = collector_status_request(destination_namespace, status, false)?;
+    let request = collector_status_request(destination_namespace, status, false, false)?;
     client.report_status(relay_token, &request)?;
     Ok(())
 }
 
-/// What the server's activity hint decides for a terminal receipt: the
-/// evidence width, and whether the backend admits the `census_residue` code.
+/// The terminal activity hint owns evidence width and admission of census
+/// status codes; all contracts are read from the same fresh server answer.
 #[derive(Debug, Clone, Copy)]
 struct TerminalReceiptPolicy {
     receipt_window_days: u64,
@@ -11868,6 +11922,7 @@ struct TerminalReceiptPolicy {
     /// its entire terminal receipt rejected by a backend that predates the
     /// admission — whatever order the two are deployed in.
     census_residue_status_admitted: bool,
+    census_status_admitted: bool,
 }
 
 fn current_terminal_receipt_policy(
@@ -11879,6 +11934,8 @@ fn current_terminal_receipt_policy(
         receipt_window_days: validated_receipt_window_days(activity_hint.backfill_window_days)?,
         census_residue_status_admitted: activity_hint.census_residue_status_contract.as_deref()
             == Some(CENSUS_RESIDUE_STATUS_CONTRACT),
+        census_status_admitted: activity_hint.census_status_contract.as_deref()
+            == Some(CENSUS_STATUS_CONTRACT),
     })
 }
 
@@ -12012,11 +12069,12 @@ fn report_status_with_fresh_relay_token(
     // This is the single terminal report boundary. Every terminal outcome
     // reacquires its width here, after scanning/uploading and immediately
     // before deriving both the manifest and status scalar from that same hint
-    // — and reads the residue admission off the same hint, so the receipt
-    // shape and the width are decided by one server answer.
+    // — and reads census status admissions off that hint, so receipt shape
+    // and evidence width are decided by one server answer.
     let TerminalReceiptPolicy {
         receipt_window_days,
         census_residue_status_admitted,
+        census_status_admitted,
     } = current_terminal_receipt_policy(client, &relay_token)?;
     let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
     status.counts.backfill_window_days = receipt_window_days;
@@ -12039,6 +12097,7 @@ fn report_status_with_fresh_relay_token(
         &destination_namespace,
         status,
         census_residue_status_admitted,
+        census_status_admitted,
     )?;
     let journal_path = terminal_status_journal_path(support_dir, &destination_namespace, source);
     // Commit the exact typed receipt before it can reach the backend. A later
@@ -12173,6 +12232,8 @@ fn report_checkin_status(
         last_census_residue_index_key_count: 0,
         last_census_residue_archived_rollout_count: 0,
         last_census_residue_blocked_session_count: 0,
+        last_census_pending_file_count: None,
+        last_census_block_cause: None,
         consecutive_failures: 0,
         next_retry_at: None,
         collector_version: Some(collector_version()),
@@ -19647,6 +19708,7 @@ mod tests {
                 },
             },
             false,
+            false,
         )
         .expect("terminal error receipt");
         assert_eq!(request.report_kind, SnapshotStatusReportKind::ScanStatus);
@@ -19673,6 +19735,243 @@ mod tests {
             http_request_json(&requests[0])["report_kind"],
             "scan_status"
         );
+    }
+
+    /// [off=main] Absent/null/unknown admission preserves the complete legacy
+    /// payload for all three sources, including failures=1 and no retry deadline.
+    #[test]
+    #[serial(source_manifests)]
+    fn census_status_without_exact_token_preserves_legacy_bytes() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let legacy = r#"{
+  "schema_version": 5,
+  "source": "codex",
+  "machine_id": "otm_test",
+  "report_kind": "scan_status",
+  "enabled": true,
+  "disabled_reason": null,
+  "last_scan_started_at": "2026-06-01T10:00:00Z",
+  "last_scan_finished_at": "2026-06-01T10:00:01Z",
+  "last_success_at": null,
+  "last_error_code": "parse_error",
+  "last_error_message": "local usage evidence produced no session snapshot",
+  "last_uploaded_count": 0,
+  "last_scanned_session_count": 0,
+  "last_scanned_file_count": 0,
+  "last_zero_snapshot_confirmed_count": 0,
+  "last_zero_snapshot_usage_evidence_count": 0,
+  "last_dropped_usage_record_count": 0,
+  "last_ownership_incomplete_file_count": 0,
+  "last_snapshot_unproven_terminal_count": 0,
+  "last_snapshot_superseded_terminal_count": 0,
+  "last_backfill_window_days": 183,
+  "last_backfill_file_limit": 10000,
+  "last_discovered_file_count": 0,
+  "last_skipped_file_count_due_to_limit": 7,
+  "last_scan_cap_hit": true,
+  "last_semantic_noop_count": 0,
+  "last_census_complete": false,
+  "last_symlink_rejected_count": 0,
+  "last_unreadable_path_count": 2,
+  "last_oversized_file_count": 0,
+  "last_disappeared_file_count": 3,
+  "last_malformed_json_line_count": 0,
+  "last_invalid_utf8_line_count": 0,
+  "last_over_line_cap_count": 0,
+  "last_recognized_usage_drop_count": 0,
+  "last_terminal_ownership_incomplete_file_count": 0,
+  "last_terminal_zero_snapshot_usage_evidence_count": 0,
+  "last_terminal_recognized_usage_drop_count": 0,
+  "last_terminal_dropped_usage_record_count": 0,
+  "last_terminal_over_line_cap_count": 0,
+  "last_census_residue_settled": false,
+  "last_census_residue_index_key_count": 0,
+  "last_census_residue_archived_rollout_count": 0,
+  "last_census_residue_blocked_session_count": 0,
+  "consecutive_failures": 1,
+  "next_retry_at": null,
+  "collector_version": "fixed",
+  "parser_version": "fixed"
+}"#;
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            for hint in [
+                "",
+                r#","census_status_contract":null"#,
+                r#","census_status_contract":"census_status:v2""#,
+                RESIDUE_ADMITTING_HINT,
+            ] {
+                let mut counts = SyncCounts::for_policy(183);
+                counts.skipped_file_count_due_to_limit = 7;
+                counts.scan_cap_hit = true;
+                counts.unreadable_path_count = 2;
+                counts.disappeared_file_count = 3;
+                counts.census_status = crate::snapshots::CensusStatus {
+                    pending_work: true,
+                    retryable_problem: true,
+                    transport_reservation_refused: true,
+                    carry_admission_veto: true,
+                    state_loader_failed: true,
+                    reconciliation_incomplete: true,
+                    retry_attempt: 4,
+                    retry_not_before_unix_seconds: Some(60),
+                    admission_due_unix_seconds: Some(30),
+                };
+                let mut typed = collector_status_request(
+                    "destination",
+                    CollectorStatus {
+                        source,
+                        machine_id: "otm_test",
+                        scan_started_at: "2026-06-01T10:00:00Z",
+                        counts,
+                        state: CollectorState::Success,
+                    },
+                    false,
+                    false,
+                )
+                .unwrap();
+                typed.last_scan_finished_at = Some("2026-06-01T10:00:01Z".to_string());
+                typed.collector_version = Some("fixed".to_string());
+                typed.parser_version = Some("fixed".to_string());
+                assert_eq!(
+                    serde_json::to_vec_pretty(&typed).unwrap(),
+                    legacy
+                        .replace("\"codex\"", &format!("\"{}\"", source.api_slug()))
+                        .as_bytes()
+                );
+                let mut receipt = captured_terminal_receipt_for_source_under_hint(
+                    source,
+                    counts,
+                    CollectorState::Success,
+                    TerminalManifestSource::Withdraw,
+                    183,
+                    hint,
+                );
+                // Normalize only clocks and build identity, not census evidence.
+                receipt["last_scan_finished_at"] = serde_json::json!("2026-06-01T10:00:01Z");
+                receipt["collector_version"] = serde_json::json!("fixed");
+                receipt["parser_version"] = serde_json::json!("fixed");
+                let mut expected: serde_json::Value = serde_json::from_str(legacy).unwrap();
+                expected["source"] = serde_json::json!(source.api_slug());
+                assert_eq!(
+                    serde_json::to_vec(&receipt).unwrap(),
+                    serde_json::to_vec(&expected).unwrap(),
+                    "{source:?} {hint}"
+                );
+            }
+        }
+    }
+
+    /// [behaviour] The real hint boundary and shared builder emit all seven
+    /// causes plus advancing work, with fixed priority and truthful retries.
+    #[test]
+    #[serial(source_manifests)]
+    fn census_status_contract_reports_first_gate_and_real_retry() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            // One row per cause; each earlier row also fails later gates.
+            for (
+                cause,
+                (
+                    unreadable,
+                    disappeared,
+                    carry,
+                    state,
+                    transport,
+                    reconciliation,
+                    ownership,
+                    pending,
+                    retryable,
+                ),
+            ) in [
+                (
+                    Some("unreadable_events"),
+                    (2, 3, true, true, true, true, 1, true, true),
+                ),
+                (
+                    Some("disappeared_files"),
+                    (0, 3, true, true, true, true, 1, true, true),
+                ),
+                (
+                    Some("carry_admission"),
+                    (0, 0, true, true, true, true, 1, true, true),
+                ),
+                (
+                    Some("state_loader"),
+                    (0, 0, false, true, true, true, 1, true, true),
+                ),
+                (
+                    Some("transport_reservation"),
+                    (0, 0, false, false, true, true, 1, true, true),
+                ),
+                (
+                    Some("ownership_incomplete"),
+                    (0, 0, false, false, false, true, 1, true, true),
+                ),
+                (
+                    Some("other"),
+                    (0, 0, false, false, false, true, 0, true, true),
+                ),
+                (None, (0, 0, false, false, false, false, 1, true, false)),
+            ] {
+                let mut counts = SyncCounts::for_policy(183);
+                counts.skipped_file_count_due_to_limit = 7;
+                counts.scan_cap_hit = true;
+                counts.unreadable_path_count = unreadable;
+                counts.disappeared_file_count = disappeared;
+                counts.ownership_incomplete_file_count = ownership;
+                counts.census_status = crate::snapshots::CensusStatus {
+                    pending_work: pending,
+                    retryable_problem: retryable,
+                    transport_reservation_refused: transport,
+                    carry_admission_veto: carry,
+                    state_loader_failed: state,
+                    reconciliation_incomplete: reconciliation,
+                    retry_attempt: 4,
+                    retry_not_before_unix_seconds: Some(60),
+                    admission_due_unix_seconds: Some(30),
+                };
+                let receipt = captured_terminal_receipt_for_source_under_hint(
+                    source,
+                    counts,
+                    CollectorState::Success,
+                    TerminalManifestSource::Withdraw,
+                    183,
+                    r#","census_status_contract":"census_status:v1""#,
+                );
+                assert_eq!(
+                    receipt["last_error_code"],
+                    if cause.is_some() {
+                        "census_blocked"
+                    } else {
+                        "census_incomplete"
+                    }
+                );
+                assert_eq!(
+                    receipt.get("last_census_block_cause"),
+                    cause.map(|value| serde_json::json!(value)).as_ref()
+                );
+                assert_eq!(receipt["last_census_pending_file_count"], 7);
+                assert_eq!(receipt["consecutive_failures"], 4);
+                assert_eq!(
+                    receipt["next_retry_at"],
+                    if cause == Some("carry_admission") {
+                        "1970-01-01T00:00:30Z"
+                    } else {
+                        "1970-01-01T00:01:00Z"
+                    }
+                );
+                assert_eq!(receipt["last_success_at"], serde_json::Value::Null);
+                assert_eq!(receipt["last_census_complete"], false);
+            }
+        }
     }
 
     /// The M1 codex witness once its residue settles (ottto#399): a COMPLETED
@@ -21016,6 +21315,7 @@ mod tests {
                     message: "local snapshot scan failed",
                 },
             },
+            false,
             false,
         )
         .expect("terminal receipt");
