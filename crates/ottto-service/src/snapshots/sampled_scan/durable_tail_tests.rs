@@ -260,7 +260,9 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
         assert_eq!(first.snapshots[0].input_tokens, 100);
         assert!(cache.retained().unwrap().peek(&key).is_some());
         index.save(&index_path).unwrap();
-        cache.durable_write_after_save(lock, source, &index).unwrap();
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
         assert_eq!(
             cache.durable_counters(source).unwrap().1.records_written,
             1,
@@ -558,7 +560,9 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
         assert_eq!(first.snapshots[0].input_tokens, 100);
         assert!(cache.retained().unwrap().peek(&key).is_some());
         index.save(&index_path).unwrap();
-        cache.durable_write_after_save(lock, source, &index).unwrap();
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
         assert_eq!(
             cache.durable_counters(source).unwrap().1.records_written,
             1,
@@ -5715,8 +5719,11 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                         context.audit_slots = 0;
                     }
                     // The cap funds NEW debt, so this row must be debt-free.
-                    scan.index.files.get_mut(&key).unwrap().scan_identity_version =
-                        Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+                    scan.index
+                        .files
+                        .get_mut(&key)
+                        .unwrap()
+                        .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
                 }
                 if refusal == "census" {
                     scan.state_census_complete = false;
@@ -11301,7 +11308,9 @@ fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
             "genuine Full, no seeded debt"
         );
         index.save(&index_path).unwrap();
-        cache.durable_write_after_save(lock, source, &index).unwrap();
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
         assert_eq!(
             cache.durable_counters(source).unwrap().1.records_written,
             1,
@@ -11990,15 +11999,28 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     let mut file = File::open(&path).unwrap();
     assert!(matches!(
         fresh.durable_restore(
-            source, &key, &path, &scope, &mut file, &loaded, &interpretation,
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut file,
+            &loaded,
+            &interpretation,
         ),
         RestoreOutcome::QuietPending
     ));
-    assert_eq!(fresh.durable_counters(source).unwrap().1.guard_verify_bytes, 0);
+    assert_eq!(
+        fresh.durable_counters(source).unwrap().1.guard_verify_bytes,
+        0
+    );
     std::io::Write::write_all(
-        &mut std::fs::OpenOptions::new().append(true).open(&path).unwrap(),
+        &mut std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap(),
         b"{}\n",
-    ).unwrap();
+    )
+    .unwrap();
     let restored = fresh.durable_restore(
         source,
         &key,

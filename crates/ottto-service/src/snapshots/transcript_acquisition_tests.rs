@@ -4450,7 +4450,9 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
         );
         assert_eq!(modes.0, 1);
         index.save(&index_path).unwrap();
-        first.durable_write_after_save(lock, source, &index).unwrap();
+        first
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
         assert_eq!(
             first.durable_counters(source).unwrap().1.records_written,
             1,
@@ -4691,7 +4693,9 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
         );
         assert_eq!(modes.0, 1);
         index.save(&index_path).unwrap();
-        cache.durable_write_after_save(lock, source, &index).unwrap();
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
         assert_eq!(
             cache.durable_counters(source).unwrap().1.records_written,
             1,

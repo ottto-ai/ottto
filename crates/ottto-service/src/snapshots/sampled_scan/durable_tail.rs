@@ -6187,11 +6187,10 @@ impl SharedCache {
                         layout: unavailable,
                         gc: store.restore_unavailable_layout_gc,
                     },
-                    d3_claude_hold: (claude && (hold_alarm || hold_changed))
-                        .then_some(HoldAlarm {
-                            keys: hold_keys,
-                            oldest_age,
-                        }),
+                    d3_claude_hold: (claude && (hold_alarm || hold_changed)).then_some(HoldAlarm {
+                        keys: hold_keys,
+                        oldest_age,
+                    }),
                 },
             );
         }
