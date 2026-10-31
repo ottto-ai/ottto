@@ -156,15 +156,40 @@ pub(crate) enum UnreadableCause {
 #[serde(default)]
 pub(crate) struct UnreadableCauses {
     counts: [u64; 8],
+    /// E2 B2: which sites and files the counts came from. Additive; omitted
+    /// while empty, so a traversal without unreadable paths keeps its bytes.
+    #[serde(skip_serializing_if = "UnreadableSamples::is_empty")]
+    samples: UnreadableSamples,
 }
 impl UnreadableCauses {
     pub(crate) fn record(&mut self, cause: UnreadableCause, count: u64) {
         let slot = &mut self.counts[cause as usize];
         *slot = slot.saturating_add(count);
     }
+    /// `record`, plus the caller's site and `file` (path, index key) in the
+    /// bounded per-cause sample.
+    #[track_caller]
+    pub(crate) fn record_sampled(
+        &mut self,
+        cause: UnreadableCause,
+        count: u64,
+        file: Option<(&std::path::Path, &str)>,
+    ) {
+        self.record(cause, count);
+        if count > 0 {
+            let site_line = std::panic::Location::caller().line();
+            self.samples
+                .insert(cause as usize, UnreadableSample::new(site_line, file));
+        }
+    }
     pub(crate) fn merge(&mut self, other: Self) {
         for (slot, incoming) in self.counts.iter_mut().zip(other.counts) {
             *slot = slot.saturating_add(incoming);
+        }
+        for (cause, incoming) in other.samples.0.into_iter().enumerate() {
+            for sample in incoming.into_iter().flatten() {
+                self.samples.insert(cause, sample);
+            }
         }
     }
     /// The walk lost namespace: an unlistable path or directory, or an
@@ -195,7 +220,164 @@ pub(crate) struct UnreadableBreakdown {
     unattributed: Option<u64>,
     consistent: bool,
 }
-crate::heap_layout_bound::fields!(UnreadableCauses; counts);
+crate::heap_layout_bound::fields!(UnreadableCauses; counts, samples);
+
+/// Per-cause sample size: the first distinct events of each cause win.
+const UNREADABLE_SAMPLES: usize = 4;
+
+/// The first `UNREADABLE_SAMPLES` distinct events per `UnreadableCause`
+/// ordinal. Fixed size and heap free, like `counts`.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(transparent)]
+struct UnreadableSamples([[Option<UnreadableSample>; UNREADABLE_SAMPLES]; 8]);
+/// Diagnostic only: a sample this build cannot read (another build's shape)
+/// loads as empty and never fails the index load.
+impl<'de> Deserialize<'de> for UnreadableSamples {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(serde_json::from_value(value).map(Self).unwrap_or_default())
+    }
+}
+impl UnreadableSamples {
+    fn insert(&mut self, cause: usize, sample: UnreadableSample) {
+        let Some(slots) = self.0.get_mut(cause) else {
+            return;
+        };
+        if slots.contains(&Some(sample)) {
+            return;
+        }
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(sample);
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.0.iter().flatten().all(Option::is_none)
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for UnreadableSamples {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// One unreadable event: the recording call's line in the producing build
+/// (with the cause it names one call site) and, when the site names a file,
+/// that file's root class, kind and the first 8 bytes of `digest(index key)`
+/// (lineage's `file_key_digest`). Never path text. Written as one short
+/// string, `line` or `line:root:kind:key_hex`, so 32 samples stay well inside
+/// `MAX_LOCAL_DIAGNOSTIC_BYTES`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
+struct UnreadableSample {
+    site_line: u32,
+    file: Option<UnreadableFile>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnreadableFile {
+    root: UnreadableRoot,
+    kind: UnreadableFileKind,
+    key_digest: [u8; 8],
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnreadableRoot {
+    DotCodex,
+    /// A Codex slot home, or another source's root.
+    OtherHome,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnreadableFileKind {
+    Jsonl,
+    JsonlZst,
+    /// A sidecar or any other file.
+    Other,
+}
+impl UnreadableRoot {
+    const ALL: [Self; 2] = [Self::DotCodex, Self::OtherHome];
+    fn name(self) -> &'static str {
+        match self {
+            Self::DotCodex => "dot_codex",
+            Self::OtherHome => "other_home",
+        }
+    }
+}
+impl UnreadableFileKind {
+    const ALL: [Self; 3] = [Self::Jsonl, Self::JsonlZst, Self::Other];
+    fn name(self) -> &'static str {
+        match self {
+            Self::Jsonl => "jsonl",
+            Self::JsonlZst => "jsonl_zst",
+            Self::Other => "other",
+        }
+    }
+}
+impl UnreadableSample {
+    fn new(site_line: u32, file: Option<(&std::path::Path, &str)>) -> Self {
+        let file = file.map(|(path, index_key)| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let key_digest = digest(index_key);
+            UnreadableFile {
+                root: if path.components().any(|part| part.as_os_str() == ".codex") {
+                    UnreadableRoot::DotCodex
+                } else {
+                    UnreadableRoot::OtherHome
+                },
+                kind: if name.ends_with(".jsonl") {
+                    UnreadableFileKind::Jsonl
+                } else if name.ends_with(".jsonl.zst") {
+                    UnreadableFileKind::JsonlZst
+                } else {
+                    UnreadableFileKind::Other
+                },
+                key_digest: std::array::from_fn(|byte| key_digest[byte]),
+            }
+        });
+        Self { site_line, file }
+    }
+}
+impl From<UnreadableSample> for String {
+    fn from(sample: UnreadableSample) -> Self {
+        match sample.file {
+            None => sample.site_line.to_string(),
+            Some(file) => format!(
+                "{}:{}:{}:{:016x}",
+                sample.site_line,
+                file.root.name(),
+                file.kind.name(),
+                u64::from_be_bytes(file.key_digest)
+            ),
+        }
+    }
+}
+impl TryFrom<String> for UnreadableSample {
+    type Error = &'static str;
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        let mut parts = text.split(':');
+        let site_line = parts
+            .next()
+            .and_then(|line| line.parse().ok())
+            .ok_or("unreadable sample site")?;
+        let file = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (None, ..) => None,
+            (Some(root), Some(kind), Some(key), None) => Some(UnreadableFile {
+                root: UnreadableRoot::ALL
+                    .into_iter()
+                    .find(|known| known.name() == root)
+                    .ok_or("unreadable sample root")?,
+                kind: UnreadableFileKind::ALL
+                    .into_iter()
+                    .find(|known| known.name() == kind)
+                    .ok_or("unreadable sample kind")?,
+                key_digest: u64::from_str_radix(key, 16)
+                    .map_err(|_| "unreadable sample key")?
+                    .to_be_bytes(),
+            }),
+            _ => return Err("unreadable sample shape"),
+        };
+        Ok(Self { site_line, file })
+    }
+}
 
 /// PR-P: number of `CodexParentUnresolvable` causes (asserted in `snapshots`).
 pub(crate) const PARENT_UNRESOLVABLE_CAUSES: usize = 12;
@@ -583,11 +765,26 @@ pub(crate) struct LoaderEvidence {
     pub first_failure_stage: Option<LoaderStage>,
     // Same first failure as the root and stage; later failures only aggregate.
     pub sqlite_extended_code: Option<i32>,
+    /// Transient SQLite open retries (CANTOPEN or BUSY) over all roots, and
+    /// the roots that completed only after one.
+    pub transient_retries: u32,
+    pub completed_after_retry: u32,
 }
 impl LoaderEvidence {
-    pub fn observe_root(&mut self, result: &Result<()>, conflict: bool, root_key: &str) {
+    /// `retries`: the root's transient open retries before `result`.
+    pub fn observe_root(
+        &mut self,
+        result: &Result<()>,
+        retries: u32,
+        conflict: bool,
+        root_key: &str,
+    ) {
         if self.failed_roots == 0 && result.is_err() {
             self.first_failure_root_digest = Some(digest(root_key));
+        }
+        self.transient_retries = self.transient_retries.saturating_add(retries);
+        if retries > 0 && result.is_ok() {
+            self.completed_after_retry = self.completed_after_retry.saturating_add(1);
         }
         self.observe(result, conflict);
     }
@@ -792,6 +989,9 @@ pub(crate) struct CodexScanDiagnostics {
     pub spawn_edges: LoaderEvidence,
     pub rollout_extents: LoaderEvidence,
     pub session_index: LoaderEvidence,
+    /// E2 B3b: rollouts kept out of a failing home's created-thread hold
+    /// because their proof comes from exactly one other, complete home.
+    pub created_thread_scoped_rollouts: u32,
     pub identity_conflict_taxonomy: IdentityConflictTaxonomy,
     pub gates: CensusGates,
     pub unreadable_causes: UnreadableCauses,
@@ -874,9 +1074,9 @@ pub(crate) struct CountingV2Receipts {
 
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
-crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, identity_conflict_taxonomy, gates, unreadable_causes, parent_unresolvable, parent_restarts_in_scope, quarantine_count, sample_offset, lineage);
+crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, created_thread_scoped_rollouts, identity_conflict_taxonomy, gates, unreadable_causes, parent_unresolvable, parent_restarts_in_scope, quarantine_count, sample_offset, lineage);
 crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, tombstone_evictions_v2_only, tombstone_evictions_pre_cutover_legacy, tombstone_evictions_not_provably_pre_cutover_legacy, legacy_to_v2_after_tombstone_eviction, tombstone_count, tombstone_cap, native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, closed_filter_hit_unconfirmed, closed_filter_hit_unconfirmed_native_usage, pending_overflow_flushes, open_turn_ui_pending_sessions_this_scan, open_turn_ui_pending_events_this_scan, open_turn_ui_pending_usage_this_scan, open_turn_ui_pending_unsummable_this_scan);
-crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code);
+crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code, transient_retries, completed_after_retry);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
 crate::heap_layout_bound::fields!(IdentityConflictTaxonomy; state_alias_keys, state_intra_root_row_keys, state_cross_root_keys, state_cross_root_progress_only_keys, state_cross_root_identity_field_keys, state_cross_root_field_differs, conflict_keys_total, conflict_keys_state_created, conflict_keys_prior_state_only, conflict_parent_child_edges);
@@ -903,9 +1103,14 @@ mod tests {
             .context("private provider path"))
         };
         let mut evidence = LoaderEvidence::default();
-        evidence.observe_root(&Ok(()), false, "successful root");
-        evidence.observe_root(&fault(26, LoaderStage::Prepare), false, "failed root one");
-        evidence.observe_root(&fault(10, LoaderStage::Row), false, "failed root two");
+        evidence.observe_root(&Ok(()), 0, false, "successful root");
+        evidence.observe_root(
+            &fault(26, LoaderStage::Prepare),
+            0,
+            false,
+            "failed root one",
+        );
+        evidence.observe_root(&fault(10, LoaderStage::Row), 0, false, "failed root two");
         assert_eq!(evidence.completed_roots, 1);
         assert_eq!(evidence.failed_roots, 2);
         assert_eq!(
@@ -918,6 +1123,76 @@ mod tests {
         for forbidden in ["private", "credential", "successful root", "failed root"] {
             assert!(!text.contains(forbidden));
         }
+    }
+    /// [format] E2 B2: the unreadable sample keeps at most
+    /// `UNREADABLE_SAMPLES` distinct events per cause, holds digests and
+    /// enums only, survives the persisted round trip and merge, and an empty
+    /// sample keeps the pre-sample bytes.
+    #[test]
+    fn unreadable_sample_is_bounded_digest_only_and_additive() {
+        let empty = serde_json::to_value(UnreadableCauses::default()).unwrap();
+        assert!(empty.get("samples").is_none());
+        let old: UnreadableCauses =
+            serde_json::from_str(r#"{"counts":[0,0,2,0,1,0,0,0]}"#).unwrap();
+        assert!(old.samples.is_empty());
+        let other_build: UnreadableCauses =
+            serde_json::from_str(r#"{"counts":[0,0,2,0,1,0,0,0],"samples":[["7:moon"]]}"#).unwrap();
+        assert!(other_build.samples.is_empty());
+        assert_eq!(other_build.counts, old.counts);
+
+        let private = std::path::Path::new("/Users/private credential/.codex/sessions");
+        let mut causes = UnreadableCauses::default();
+        for file in [
+            "a.jsonl",
+            "b.jsonl.zst",
+            "c.jsonl",
+            "a.jsonl",
+            "d.json",
+            "e.jsonl",
+        ] {
+            let path = private.join(file);
+            let key = path.to_string_lossy().into_owned();
+            causes.record_sampled(UnreadableCause::OpenRead, 1, Some((&path, &key)));
+        }
+        causes.record_sampled(UnreadableCause::Reduction, 1, None);
+        causes.record_sampled(UnreadableCause::Directory, 0, None);
+        assert_eq!(causes.counts[UnreadableCause::OpenRead as usize], 6);
+        let kept = causes.samples.0[UnreadableCause::OpenRead as usize];
+        // a, b.zst, c, d: the repeated a.jsonl is kept once and e is past the bound.
+        assert!(kept.iter().all(Option::is_some));
+        let first = kept[0].unwrap().file.unwrap();
+        assert_eq!(first.root, UnreadableRoot::DotCodex);
+        assert_eq!(first.kind, UnreadableFileKind::Jsonl);
+        assert_eq!(
+            first.key_digest[..],
+            digest(&private.join("a.jsonl").to_string_lossy())[..8]
+        );
+        assert_eq!(
+            kept[1].unwrap().file.unwrap().kind,
+            UnreadableFileKind::JsonlZst
+        );
+        assert_eq!(
+            kept[3].unwrap().file.unwrap().kind,
+            UnreadableFileKind::Other
+        );
+        let site_only = causes.samples.0[UnreadableCause::Reduction as usize][0].unwrap();
+        assert!(site_only.file.is_none() && site_only.site_line > 0);
+        assert!(causes.samples.0[UnreadableCause::Directory as usize]
+            .iter()
+            .all(Option::is_none));
+
+        let text = serde_json::to_string(&causes).unwrap();
+        for forbidden in ["/Users", "private", "credential", ".codex", "sessions"] {
+            assert!(!text.contains(forbidden), "{forbidden}");
+        }
+        let a_key = u64::from_be_bytes(first.key_digest);
+        assert!(text.contains(&format!(":dot_codex:jsonl:{a_key:016x}\"")));
+        let back: UnreadableCauses = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.samples.0, causes.samples.0);
+        let mut merged = back;
+        merged.merge(causes);
+        assert_eq!(merged.samples.0, causes.samples.0, "merge stays bounded");
+        assert_eq!(merged.counts[UnreadableCause::OpenRead as usize], 12);
     }
     #[test]
     fn reason_classification_never_uses_error_text() {
@@ -986,6 +1261,8 @@ mod tests {
             first_failure_root_digest: Some([255; 32]),
             first_failure_stage: Some(LoaderStage::Prepare),
             sqlite_extended_code: Some(i32::MAX),
+            transient_retries: u32::MAX,
+            completed_after_retry: u32::MAX,
             ..Default::default()
         };
         // PR-P: the two parent fields at their maxima.
@@ -996,6 +1273,7 @@ mod tests {
         diagnostics.spawn_edges = evidence;
         diagnostics.rollout_extents = evidence;
         diagnostics.session_index = evidence;
+        diagnostics.created_thread_scoped_rollouts = u32::MAX;
         let field_differs = StateRowFieldDiffs {
             title: u32::MAX,
             tokens_used: u32::MAX,
@@ -1040,6 +1318,16 @@ mod tests {
         lineage.associated_file_count = u64::MAX;
         lineage.final_body_revision = u64::MAX;
         diagnostics.lineage = [Some(lineage); LINEAGE_SAMPLES];
+        diagnostics.unreadable_causes.samples = UnreadableSamples(
+            [[Some(UnreadableSample {
+                site_line: u32::MAX,
+                file: Some(UnreadableFile {
+                    root: UnreadableRoot::OtherHome,
+                    kind: UnreadableFileKind::JsonlZst,
+                    key_digest: [255; 8],
+                }),
+            }); UNREADABLE_SAMPLES]; 8],
+        );
         let max = [u64::MAX; 6];
         let receipts = CountingV2Receipts {
             v2_sessions: u64::MAX,
@@ -1146,7 +1434,7 @@ mod fenced_census_tests {
 
     #[test]
     fn fenced_census_unreadable_saturation_inconsistency_and_fixed_resource_bound() {
-        assert_eq!(std::mem::size_of::<UnreadableCauses>(), 64);
+        assert_eq!(std::mem::size_of::<UnreadableCauses>(), 576);
         let mut causes = UnreadableCauses::default();
         causes.record(UnreadableCause::Metadata, u64::MAX);
         causes.record(UnreadableCause::Metadata, 1);
@@ -1186,7 +1474,7 @@ mod fenced_census_tests {
         assert_eq!(json["schema"], "local_fenced_codex_census:v3");
         assert_eq!(json["losses"]["terminal_over_line_cap"], u64::MAX);
         assert_eq!(json["losses"]["terminal_ownership_incomplete"], u64::MAX);
-        println!("CENSUS_CAUSES inline_bytes=64 histogram_heap_bytes=0 worst_test_record_bytes={len} encoding_allocations=0");
+        println!("CENSUS_CAUSES inline_bytes=576 histogram_heap_bytes=0 worst_test_record_bytes={len} encoding_allocations=0");
     }
 
     fn sidecar(fixture: &Fixture) -> serde_json::Value {
