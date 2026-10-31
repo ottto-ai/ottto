@@ -13048,7 +13048,7 @@ fn fill_pace(cache: &SharedCache) {
         .unwrap();
 }
 
-/// Condition 4 accounting, each site exactly once:
+/// [behaviour] Condition 4 accounting, each site exactly once:
 /// - cursor feasibility and reservation (`state_for_main`, `cursor_resident`)
 ///   carry the table inside `size_of_val(CursorState)` and never walk it;
 /// - the whole-cache bound carries it inside `size_of::<SharedCache>()` (the
@@ -13100,6 +13100,7 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
     let mut parts = Counter::new(usize::MAX);
     cache.inner.heap_bound(&mut parts).unwrap();
     cache.cursor.heap_bound(&mut parts).unwrap();
+    cache.withheld_memo.heap_bound(&mut parts).unwrap();
     assert_eq!(
         whole.bytes,
         size_of::<SharedCache>()
