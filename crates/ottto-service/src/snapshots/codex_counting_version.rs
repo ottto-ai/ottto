@@ -21,15 +21,21 @@ thread_local! {
 
 /// The compiled cutover.
 #[cfg(not(test))]
-pub(super) fn cutover_unix_ms() -> i64 {
+pub(super) fn active_cutover_unix_ms() -> i64 {
     CODEX_COUNTING_V2_CUTOVER_UNIX_MS
 }
 
 /// Tests may substitute a real epoch on their own thread. Legacy fixtures
 /// must use pre-cutover headers or Legacy ACK evidence, just as production does.
 #[cfg(test)]
-pub(super) fn cutover_unix_ms() -> i64 {
+pub(super) fn active_cutover_unix_ms() -> i64 {
     TEST_CUTOVER_UNIX_MS.with(std::cell::Cell::get)
+}
+
+/// Preserve the optional representation at the pinned durable restore boundary.
+#[cfg(unix)]
+pub(super) fn cutover_unix_ms() -> Option<i64> {
+    Some(active_cutover_unix_ms())
 }
 
 /// Substitutes an epoch for scan-level tests on this thread until dropped.
@@ -302,7 +308,7 @@ pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool 
             // V2-only evidence never selects a different version.
             return true;
         }
-        let cutover = cutover_unix_ms();
+        let cutover = active_cutover_unix_ms();
         // Order by safety class, then retirement generation and owner for
         // deterministic ties. Unknown timestamps sort last. Rewritten owners
         // cannot free a slot.
@@ -661,7 +667,7 @@ pub(super) fn configure_singleton(
     candidate: &CandidateFile,
     index: &ScanIndex,
 ) {
-    let cutover = cutover_unix_ms();
+    let cutover = active_cutover_unix_ms();
     let evidence = candidate_evidence(candidate, index);
     configure(&mut parser.accumulator, evidence, Some(cutover));
 }
@@ -673,7 +679,7 @@ const LEGACY_VIEW: &str = "legacy";
 /// The counting view of a singleton's index entry (cursor K8): what
 /// `configure_singleton` would configure now, as the cursor job records it.
 pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> String {
-    let cutover = cutover_unix_ms();
+    let cutover = active_cutover_unix_ms();
     let evidence = candidate_evidence(candidate, index);
     view(evidence, cutover)
 }
@@ -683,7 +689,7 @@ pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> St
 /// candidate).
 #[cfg(unix)]
 pub(super) fn singleton_view_of_key(key: &str, index: &ScanIndex) -> String {
-    let cutover = cutover_unix_ms();
+    let cutover = active_cutover_unix_ms();
     view(key_evidence(key, index), cutover)
 }
 
@@ -693,7 +699,7 @@ pub(super) fn group_view<'a>(
     members: impl IntoIterator<Item = &'a CandidateFile>,
     index: &ScanIndex,
 ) -> String {
-    let cutover = cutover_unix_ms();
+    let cutover = active_cutover_unix_ms();
     view(members_evidence(members, index), cutover)
 }
 
@@ -750,7 +756,7 @@ pub(super) fn group_evidence<'a>(
 /// on its fresh accumulator. The accumulator carried across members is never
 /// reconfigured, so no member resets V2 state mid-session.
 pub(super) fn configure_group_once(accumulator: &mut SnapshotAccumulator, evidence: AckEvidence) {
-    let cutover = cutover_unix_ms();
+    let cutover = active_cutover_unix_ms();
     if accumulator.codex_counting.is_none() {
         configure(accumulator, evidence, Some(cutover));
     }
