@@ -1145,6 +1145,33 @@ fn sqlite_full_at_row_or_chunk_write_rolls_back_the_complete_save() {
     }
 }
 
+/// [regress] A COMMIT that SQLite refuses (transaction left open) is closed,
+/// reopened and classified from the durable generation: NotPublished, no
+/// reload demand, nothing visible, and the same save is retryable.
+#[test]
+fn refused_commit_reopens_and_classifies_not_published() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = traversal("uncommitted".into());
+    sqlite::fence_commit_writing(&db, "generation");
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"evidence");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
+    assert!(!db.reload_required());
+    assert_eq!(db.save_failure(), None);
+    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(0));
+    assert!(db
+        .begin(TxnMode::Read)
+        .unwrap()
+        .get(&key)
+        .unwrap()
+        .is_none());
+    // The fence was connection-local: the reopened store commits the retry.
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"evidence");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+}
+
 fn traversal(key: String) -> RowKey {
     RowKey::record("scan_state.traversal", key.into_bytes(), 0).unwrap()
 }

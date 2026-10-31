@@ -455,6 +455,42 @@ fn whole_delta_stages_before_begin_and_calls_gc_only_after_commit() {
     );
 }
 
+/// [regress] A refused COMMIT is a definite rollback: save_graph refuses with
+/// ReloadRequired (no save hold), never calls post_commit, keeps the prior
+/// generation and graph, and a fresh save then commits.
+#[test]
+fn refused_commit_refuses_reload_required_without_post_commit() {
+    let (_scratch, mut db) = Scratch::live_store();
+    commit_populate(&mut db, &fixture());
+    let (current, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let mut next = current.clone();
+    next.upload_context_fingerprint = Some("never-committed".into());
+    sqlite::fence_commit_writing(&db, "generation");
+    let mut hooks = SaveHooks::default();
+    let error =
+        save_graph(&mut db, &identity, &current, &mut next, &mut cx, &mut hooks).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
+    assert_eq!(hooks.0, ["plan", "preflight", "stage"]);
+    assert!(!cx.valid && cx.ambiguous);
+    assert_eq!(next.generation, current.generation);
+    assert!(!db.reload_required());
+    let (hydrated, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(hydrated.generation, current.generation);
+    assert_eq!(
+        hydrated.upload_context_fingerprint,
+        current.upload_context_fingerprint
+    );
+    hooks.0.clear();
+    let mut next = hydrated.clone();
+    next.upload_context_fingerprint = Some("committed".into());
+    save_graph(
+        &mut db, &identity, &hydrated, &mut next, &mut cx, &mut hooks,
+    )
+    .unwrap();
+    assert_eq!(hooks.0, ["plan", "preflight", "stage", "post_commit"]);
+}
+
 /// [format] stale generation or future writer refuses before restart side effects.
 #[test]
 fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
