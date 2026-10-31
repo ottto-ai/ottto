@@ -191,6 +191,45 @@ impl DurableTailStore {
         outcome
     }
 
+    /// Consent erasure visits all generations of the same key, including
+    /// committed records. Refusal retains the existing fail-closed PL marker.
+    pub(super) fn immutable_label_names(
+        &self,
+        keys: &BTreeSet<Digest32>,
+    ) -> io::Result<(BTreeMap<Digest32, Vec<String>>, BTreeSet<Digest32>)> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok((BTreeMap::new(), BTreeSet::new()))
+            }
+            Err(e) => return Err(e),
+        };
+        let mut names = BTreeMap::<_, Vec<_>>::new();
+        let mut overflow = BTreeSet::new();
+        let mut count = 0;
+        for entry in entries {
+            let name = entry?.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(key) = name
+                .split_once('.')
+                .and_then(|(key, _)| parse_hex_digest(key))
+            else {
+                continue;
+            };
+            if keys.contains(&key) && self.immutable_path(name, &key).is_ok() {
+                if count == GC_RECORDS_PER_PASS {
+                    overflow.insert(key);
+                    continue;
+                }
+                names.entry(key).or_default().push(name.to_owned());
+                count += 1;
+            }
+        }
+        Ok((names, overflow))
+    }
+
     /// Only known verified generations absent from the complete committed
     /// root may retire. Future names, unknown codecs and canonical v1 backup
     /// records remain held. This cursor shares the existing bounded GC quantum.
@@ -383,6 +422,37 @@ mod tests {
                 assert!(reopened.read_immutable(&next.name, &key).is_ok());
             }
         }
+    }
+
+    /// [format] consent erasure discovers immutable generations on a cold OFF owner.
+    #[test]
+    fn immutable_consent_sweep_discovers_generations_after_reopen() {
+        let _off = crate::snapshots::RestartRestoreForTest::disabled();
+        let scratch = Scratch::new();
+        let writer = crate::locked_state_dir::test_locks::hold(&scratch.root);
+        let transcript = scratch.transcript("source.jsonl", b"{}\n");
+        let pending = pending(
+            binding("account", "scope", ("fp", None)),
+            certificate(&transcript),
+            1,
+        );
+        let mut store = scratch.store();
+        let first = ImmutableRecord::plan(pending.clone(), 1, "first");
+        let second = ImmutableRecord::plan(pending, 2, "second");
+        store.stage_immutable(writer, &first).unwrap();
+        store.stage_immutable(writer, &second).unwrap();
+        let mut reopened = scratch.store();
+        // The existing caller owns the label predicate; the store still
+        // verifies each envelope and retains unknown/corrupt generations.
+        let report = reopened.purge_private_labels(writer, |_| true).unwrap();
+        assert_eq!(report.erased, 2);
+        assert_eq!(report.refused, 0);
+        assert!(!reopened.dir.join(first.name).exists());
+        assert!(!reopened.dir.join(second.name).exists());
+        assert_eq!(
+            reopened.private_label_keys().unwrap(),
+            Some(BTreeSet::new())
+        );
     }
 
     /// [format] capacity refusal keeps committed references and stages nothing.

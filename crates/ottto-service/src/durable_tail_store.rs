@@ -2262,7 +2262,13 @@ impl DurableTailStore {
             if let Some(key) = name
                 .to_str()
                 .and_then(|name| name.strip_suffix(RECORD_SUFFIX))
-                .and_then(parse_hex_digest)
+                .and_then(|name| {
+                    parse_hex_digest(name).or_else(|| {
+                        name.split_once('.')
+                            .and_then(|(key, _)| parse_hex_digest(key))
+                            .filter(|key| self.immutable_path(&format!("{name}.rec"), key).is_ok())
+                    })
+                })
                 .filter(|key| after.map_or(true, |after| *key > after))
             {
                 keys.insert(key);
@@ -2387,46 +2393,38 @@ impl DurableTailStore {
             erased: 0,
             refused: 0,
         };
+        let (mut generations, overflow) = self.immutable_label_names(&keys)?;
         let mut erased = 0;
         for key in &keys {
             if keep.contains(key) {
                 remaining.insert(*key);
                 continue;
             }
-            report.scanned += 1;
-            let path = self.record_path(key);
-            let before = match stamp_at(&path) {
-                Ok(None) => continue,
-                Ok(Some(stamp)) => stamp,
-                Err(_) => {
-                    report.refused += 1;
-                    remaining.insert(*key);
-                    continue;
-                }
-            };
-            let verified = match self.read_known(key, Some(writer), true) {
-                Ok(Some(verified)) => verified,
-                Ok(None) if !path.exists() && self.disabled.is_none() => continue,
-                Err(Refusal::Repin) => continue, // The pre-PL pin cannot contain label literals.
-                _ => {
-                    report.refused += 1;
-                    remaining.insert(*key);
-                    continue;
-                }
-            };
-            if !contains(&verified.record.record.body) {
-                continue;
-            }
-            if stamp_at(&path).ok() != Some(Some(before)) || remove_if_present(&path).is_err() {
+            if overflow.contains(key) {
                 report.refused += 1;
                 remaining.insert(*key);
-                continue;
             }
-            if let Some(pending) = self.pending.get_mut(key) {
-                pending.completed = None;
+            let names = generations.remove(key).unwrap_or_default();
+            for name in std::iter::once(None).chain(names.into_iter().map(Some)) {
+                report.scanned += 1;
+                if let Some(name) = &name {
+                    self.immutable_target = Some((*key, self.dir.join(name)));
+                    self.durable.remove(key);
+                }
+                let outcome = self.purge_label_record(writer, key, &mut contains);
+                self.immutable_target = None;
+                if name.is_some() {
+                    self.durable.remove(key);
+                }
+                match outcome {
+                    Some(true) => erased += 1,
+                    Some(false) => {}
+                    None => {
+                        report.refused += 1;
+                        remaining.insert(*key);
+                    }
+                }
             }
-            self.durable.remove(key);
-            erased += 1;
         }
         // No erase count until unlink AND its directory barrier have succeeded.
         if self.sync_store().is_err() {
@@ -2457,6 +2455,41 @@ impl DurableTailStore {
             report.refused += 1;
         }
         Ok(report)
+    }
+
+    fn purge_label_record<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        key: &Digest32,
+        contains: &mut impl FnMut(&[u8]) -> bool,
+    ) -> Option<bool> {
+        let path = self.record_path(key);
+        let before = match stamp_at(&path) {
+            Ok(None) => return Some(false),
+            Ok(Some(stamp)) => stamp,
+            Err(_) => {
+                return None;
+            }
+        };
+        let verified = match self.read_known(key, Some(writer), true) {
+            Ok(Some(verified)) => verified,
+            Ok(None) if !path.exists() && self.disabled.is_none() => return Some(false),
+            Err(Refusal::Repin) => return Some(false), // The pre-PL pin cannot contain label literals.
+            _ => {
+                return None;
+            }
+        };
+        if !contains(&verified.record.record.body) {
+            return Some(false);
+        }
+        if stamp_at(&path).ok() != Some(Some(before)) || remove_if_present(&path).is_err() {
+            return None;
+        }
+        if let Some(pending) = self.pending.get_mut(key) {
+            pending.completed = None;
+        }
+        self.durable.remove(key);
+        Some(true)
     }
 
     pub(crate) fn purge_private_labels<W: SingleWriter>(
