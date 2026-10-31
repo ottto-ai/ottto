@@ -1931,8 +1931,8 @@ fn erased_hold(due: u64) -> ErasedHold {
 }
 
 /// The restoration a sampled scan's setup runs, dated one interval before
-/// `due`: the candidate clock stays real, so only an earlier restoration can
-/// come due within a test. Real-clock pages prove the scan seam.
+/// `due`. Real-clock pages prove no-read scheduling; the injected scan clock
+/// then advances both slot preparation and candidate selection to the due time.
 fn restore_dated(index: &mut ScanIndex, due: u64) -> usize {
     sampled_audit::restore_held_audit_deadlines(
         index,
@@ -2155,7 +2155,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
     let _clock = TestClock;
     let due = sampled_scan::now_seconds();
     for at_open in [false, true] {
-        let hold = erased_hold(due);
+        let mut hold = erased_hold(due);
         let key = hold.key.clone();
         let pending = || ScanTraversalPath {
             scan_root: hold.fixture.root.clone(),
@@ -2170,7 +2170,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
             &mut census,
             Some(due),
             BACKFILL_WINDOW_DAYS,
-            &hold.index.files,
+            &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None),
         )
         .expect("retained while recent");
         File::open(&hold.fixture.file.0)
@@ -2184,7 +2184,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
                 &mut census,
                 Some(due),
                 BACKFILL_WINDOW_DAYS,
-                &hold.index.files,
+                discovery_retention!(hold.index),
             )
             .is_none());
         } else {
@@ -2194,7 +2194,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
                 &mut census,
                 Some(due),
                 BACKFILL_WINDOW_DAYS,
-                &hold.index.files,
+                &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None),
             )
             .is_none());
         }

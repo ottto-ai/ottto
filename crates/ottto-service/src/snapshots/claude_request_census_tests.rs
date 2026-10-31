@@ -1645,7 +1645,10 @@ fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
     // re-read rule rebuilds the scan fingerprint from the ctime so a
     // ctime-only change never re-reads, and only for the same object
     // generation, bound by its exact birth (owner-approved 464 -> 472 -> 480).
-    // Optional context receipt adds 80 inline bytes; its three H digests are heap-charged.
+    // #876's RAM fragment pointer adds 8; immutable counting-owner Box<str>
+    // recovers 8 from Option<String>, preserving the pre-receipt layout contract.
+    // Main's optional context receipt adds 80 inline bytes; its three H digests
+    // are heap-charged. Keep main's exact combined layout pin.
     const SCAN_INDEX_ENTRY_BYTES: usize = 560;
     assert_eq!(
         std::mem::size_of::<ScanIndexEntry>(),
@@ -2272,7 +2275,7 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
         &mut ScanCensus::default(),
         None,
         365,
-        &BTreeMap::new(),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
     )
     .unwrap();
     candidate.physical_identity = Some([metadata.dev(), metadata.ino()]);

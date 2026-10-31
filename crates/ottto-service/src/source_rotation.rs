@@ -178,6 +178,10 @@ pub(crate) trait Owner {
     /// Drop the whole optional window AND its permit, including tombstones.
     /// Accounting refusal must never forget a revocation and revive a root.
     fn discard_retained(&mut self) {}
+    /// No allowance exists even for independently bounded advisory state.
+    fn retained_budget_unavailable(&mut self) {
+        self.discard_retained();
+    }
     /// One optional turn after all due siblings have been offered. Every
     /// parked source remains busy, so a retry cannot publish beneath its
     /// unfinished native parser. No new thread, timer or parser ownership.
@@ -189,7 +193,7 @@ pub(crate) trait Owner {
 /// and one recheck; persistent unknown runs the same active frame serially.
 fn retained_remainder<O: Owner>(owner: &mut O, available: Option<usize>) -> Option<(usize, usize)> {
     let Some(available) = available else {
-        owner.discard_retained();
+        owner.retained_budget_unavailable();
         return None;
     };
     if let Some(bytes) = owner.retained_bound(available).filter(|b| *b <= available) {

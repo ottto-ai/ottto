@@ -184,6 +184,7 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
         opened_object_identity: identity.clone(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let metadata = CodexTitleMetadata::default();
     let mut parser = sampled_scan::new_source_parser(
@@ -972,6 +973,7 @@ fn codex_counting_ack_bool_survives_twin_alias_and_rekeyed_entries() {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let mut index = ScanIndex::default();
     index

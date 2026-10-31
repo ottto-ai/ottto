@@ -198,6 +198,61 @@ impl CopyRemovals {
         }
     }
 
+    /// A proven physical move preserves removed-copy proofs and retry age.
+    /// Combining two existing entries cannot exceed their already admitted charge.
+    pub(in crate::snapshots) fn rekey(&mut self, from: LocationKey, to: LocationKey) {
+        if from == to {
+            return;
+        }
+        if let Ok(i) = self.files.binary_search_by_key(&from, |f| f.0) {
+            let (_, attempts, groups) = self.files.remove(i);
+            self.bytes -= charge(&groups).max(FILE_BYTES);
+            let mut merged = self
+                .get(to)
+                .iter()
+                .map(|(holder, hashes)| (*holder, hashes.iter().copied().collect::<BTreeSet<_>>()))
+                .collect::<BTreeMap<_, _>>();
+            for (holder, hashes) in &groups {
+                merged
+                    .entry(*holder)
+                    .or_default()
+                    .extend(hashes.iter().copied());
+            }
+            let attempts = self
+                .files
+                .binary_search_by_key(&to, |f| f.0)
+                .map_or(attempts, |j| attempts.max(self.files[j].1));
+            self.replace(
+                to,
+                attempts,
+                merged
+                    .into_iter()
+                    .map(|(holder, hashes)| (holder, hashes.into_iter().collect()))
+                    .collect(),
+            );
+        }
+        // The moved file may also be another copy's holder. Preserve that
+        // proof's indexed owner instead of letting retain_files orphan it.
+        for (_, _, groups) in &mut self.files {
+            if groups.binary_search_by_key(&from, |g| g.0).is_ok() {
+                let before = charge(groups);
+                let mut merged = groups
+                    .iter()
+                    .map(|(holder, hashes)| {
+                        (*holder, hashes.iter().copied().collect::<BTreeSet<_>>())
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let hashes = merged.remove(&from).expect("known holder");
+                merged.entry(to).or_default().extend(hashes);
+                *groups = merged
+                    .into_iter()
+                    .map(|(holder, hashes)| (holder, hashes.into_iter().collect()))
+                    .collect();
+                self.bytes -= before - charge(groups);
+            }
+        }
+    }
+
     /// The file is no longer indexed: its removals go with it.
     pub(crate) fn forget(&mut self, file: LocationKey) {
         if let Ok(i) = self.files.binary_search_by_key(&file, |f| f.0) {
