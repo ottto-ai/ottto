@@ -816,6 +816,9 @@ fn staged(root: &Path, index: ScanIndex, paths: &[PathBuf]) -> OwnedSourceScan {
     let traversal = scan.index.traversal.as_mut().unwrap();
     traversal.scan_roots = vec![root.to_owned()];
     traversal.codex_rollout_paths = paths.iter().map(|p| local_index_key(p)).collect();
+    // Production discovery observes every candidate before identification;
+    // without it census reconciliation prunes in-range plain entries.
+    traversal.observed_index_keys = paths.iter().map(|p| local_index_key(p)).collect();
     traversal.pending_directories.clear();
     scan.codex_parent_identities.census_valid = true;
     scan.census_unix_seconds = None;
@@ -2147,7 +2150,13 @@ fn excluded_archive_priority_receipts_cannot_be_bypassed_by_plain_replacement() 
                 );
                 let mut scan = staged(&root, index, &paths);
                 scan.codex_join_inventory = Some(inv);
-                assert!(scan.codex_turn_traces.is_none(), "live traces expired");
+                // Expired traces are a present, empty, complete map (never None).
+                assert!(
+                    scan.codex_turn_traces
+                        .as_deref()
+                        .is_some_and(|t| t.priority_turns.is_empty() && !t.is_incomplete()),
+                    "live traces expired"
+                );
                 let (mut next, result) = no_open(&archive, || run(scan));
                 assert!(
                     result.snapshots.is_empty(),
