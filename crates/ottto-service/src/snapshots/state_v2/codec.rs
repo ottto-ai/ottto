@@ -204,16 +204,6 @@ fn key_coverage(
     Ok(())
 }
 
-// Fixture Values use the same production JSON codec.
-#[cfg(test)]
-pub(super) struct Json<'a, T: ?Sized>(pub &'a T);
-#[cfg(test)]
-impl<T: Serialize + ?Sized> Value for Json<'_, T> {
-    fn write(&self, out: &mut dyn Write) -> Result<()> {
-        out.write_all(&encode(&json(self.0, VALUE_BYTES)?)?)?;
-        Ok(())
-    }
-}
 #[cfg(test)]
 pub(super) struct Encoder<W> {
     out: W,

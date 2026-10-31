@@ -45,32 +45,15 @@ impl Drop for Scratch {
     }
 }
 
-struct Bytes(Vec<u8>);
-impl Value for Bytes {
-    fn write(&self, out: &mut dyn Write) -> Result<()> {
-        out.write_all(&self.0)?;
-        Ok(())
-    }
-}
-struct Repeat(u64);
-impl Value for Repeat {
-    fn write(&self, out: &mut dyn Write) -> Result<()> {
-        let bytes = [b'x'; 4096];
-        let mut left = self.0;
-        while left != 0 {
-            let count = left.min(bytes.len() as u64) as usize;
-            out.write_all(&bytes[..count])?;
-            left -= count as u64;
-        }
-        Ok(())
-    }
+fn repeat(len: u64) -> Vec<u8> {
+    vec![b'x'; len as usize]
 }
 fn put(tx: &mut impl Transaction, key: &RowKey, bytes: &[u8]) -> Header {
     tx.put(RowInput {
         value_version: 1,
         key,
         fixed: &Fixed::None,
-        value: &Bytes(bytes.into()),
+        value: bytes,
     })
     .unwrap()
 }
@@ -121,7 +104,7 @@ fn f8_64_mib_admission_checks_before_read_allocation() {
         value_version: 1,
         key: &key,
         fixed: &Fixed::None,
-        value: &Repeat(VALUE_BYTES),
+        value: &repeat(VALUE_BYTES),
     })
     .unwrap();
     assert_eq!(admitted.parts, 256);
@@ -130,7 +113,7 @@ fn f8_64_mib_admission_checks_before_read_allocation() {
         value_version: 1,
         key: &key,
         fixed: &Fixed::None,
-        value: &Repeat(VALUE_BYTES + 1)
+        value: &repeat(VALUE_BYTES + 1)
     })
     .is_err());
 }
@@ -205,7 +188,7 @@ fn wrong_fixed_type_and_generation_refuse_without_publishing() {
                     commitment: [1; 32],
                     refs: 1
                 },
-                value: &Bytes(vec![])
+                value: &[]
             })
             .is_err());
     }
@@ -364,7 +347,7 @@ fn f6_passive_complete_can_leave_allocated_wal_and_allows_next_write() {
         value_version: 1,
         key: &key,
         fixed: &fixed,
-        value: &Repeat(WAL_PASSIVE_BYTES + 1),
+        value: &repeat(WAL_PASSIVE_BYTES + 1),
     })
     .unwrap();
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
@@ -421,39 +404,6 @@ fn f9_unknown_plus_malformed_is_a_conversion_refusal_without_writes() {
     assert_eq!(fs::read_dir(&tmp.0).unwrap().count(), 0);
 }
 
-/// [format] failed write cannot be ignored then committed.
-#[test]
-fn failed_write_cannot_be_ignored_then_committed() {
-    use std::cell::Cell;
-    struct Changes(Cell<bool>);
-    impl Value for Changes {
-        fn write(&self, out: &mut dyn Write) -> Result<()> {
-            out.write_all(if self.0.replace(true) {
-                b"changed"
-            } else {
-                b"first"
-            })?;
-            Ok(())
-        }
-    }
-    let tmp = Scratch::new();
-    let mut db = tmp.live_store();
-    let key = traversal("traversal".into());
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    let bad = Changes(Cell::new(false));
-    assert!(tx
-        .put(RowInput {
-            value_version: 1,
-            key: &key,
-            fixed: &Fixed::None,
-            value: &bad
-        })
-        .is_err());
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    assert!(tx.get(&key).unwrap().is_none());
-}
-
 /// [format] aborted journal off import is never finishable.
 #[test]
 fn aborted_journal_off_import_is_never_finishable() {
@@ -485,7 +435,7 @@ fn independent_identity_is_write_once() {
             value_version: 1,
             key: &key,
             fixed: &Fixed::None,
-            value: &ControlJson(&other)
+            value: &control_json(&other).unwrap()
         })
         .is_err());
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
@@ -636,7 +586,7 @@ fn request_set_candidates_allow_collisions_and_compare_complete_evidence() {
     let d = intern_request_set(
         &mut tx,
         &RequestEvidence::Census {
-            hashes: &Bytes(b"same-prefix".to_vec()),
+            hashes: b"same-prefix",
             hash_count: Some(1),
         },
     )
@@ -671,14 +621,14 @@ fn request_set_candidates_allow_collisions_and_compare_complete_evidence() {
             commitment: *commitment,
             refs: 1,
         },
-        value: &Bytes(b"collision".to_vec()),
+        value: b"collision",
     })
     .unwrap();
     tx.put(RowInput {
         value_version: 1,
         key: &RowKey::Meta("next_request_set_id".into()),
         fixed: &Fixed::None,
-        value: &codec::Json(&91_u64),
+        value: b"91",
     })
     .unwrap();
     let candidates = tx
@@ -712,7 +662,7 @@ fn colliding_candidate_before_exact_match_is_not_aliased_or_overwritten() {
         value_version: 1,
         key: &RowKey::RequestSet(2),
         fixed: &fixed,
-        value: &Bytes(stored.clone()),
+        value: &stored,
     })
     .unwrap();
     let mut collision = stored.clone();
@@ -721,14 +671,14 @@ fn colliding_candidate_before_exact_match_is_not_aliased_or_overwritten() {
         value_version: 1,
         key: &RowKey::RequestSet(a),
         fixed: &fixed,
-        value: &Bytes(collision.clone()),
+        value: &collision,
     })
     .unwrap();
     tx.put(RowInput {
         value_version: 1,
         key: &RowKey::Meta("next_request_set_id".into()),
         fixed: &Fixed::None,
-        value: &codec::Json(&3_u64),
+        value: b"3",
     })
     .unwrap();
     assert_eq!(intern_request_set(&mut tx, &base).unwrap(), 2);
@@ -747,7 +697,7 @@ fn f8_set_last_reference_reclaims_parts_without_reusing_ids() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let mut tx = db.begin(TxnMode::Write).unwrap();
-    let hashes = Repeat(PART_BYTES as u64 + 31);
+    let hashes = repeat(PART_BYTES as u64 + 31);
     let evidence = RequestEvidence::Census {
         hashes: &hashes,
         hash_count: None,
@@ -1011,7 +961,7 @@ fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
     let id = intern_request_set(
         &mut tx,
         &RequestEvidence::Census {
-            hashes: &Bytes(vec![7; PART_BYTES + 1]),
+            hashes: &[7; PART_BYTES + 1],
             hash_count: None,
         },
     )
@@ -1089,15 +1039,7 @@ fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
 /// [format] sqlite full at a row or chunk write rolls back the complete save.
 #[test]
 fn sqlite_full_at_row_or_chunk_write_rolls_back_the_complete_save() {
-    struct JsonChunk;
-    impl Value for JsonChunk {
-        fn write(&self, out: &mut dyn Write) -> Result<()> {
-            // serde_json may expose the native FFI error as its source while
-            // skipping both the I/O and rusqlite::Error wrappers.
-            serde_json::to_writer(out, &"x".repeat(PART_BYTES))?;
-            Ok(())
-        }
-    }
+    let chunked = serde_json::to_vec(&"x".repeat(PART_BYTES)).unwrap();
     for chunk_write in [false, true] {
         let tmp = Scratch::new();
         let mut db = tmp.live_store();
@@ -1111,7 +1053,7 @@ fn sqlite_full_at_row_or_chunk_write_rolls_back_the_complete_save() {
                 value_version: 1,
                 key: &traversal("chunked".into()),
                 fixed: &Fixed::None,
-                value: &JsonChunk,
+                value: &chunked,
             })
             .unwrap_err()
         } else {
@@ -1122,7 +1064,7 @@ fn sqlite_full_at_row_or_chunk_write_rolls_back_the_complete_save() {
                         value_version: 1,
                         key: &traversal(format!("row-{n}")),
                         fixed: &Fixed::None,
-                        value: &Bytes(vec![b'x'; 512]),
+                        value: &[b'x'; 512],
                     })
                     .err()
                 })
@@ -1238,7 +1180,7 @@ fn typed_keys_and_json_headers_round_trip_every_physical_owner() {
                 value_version: 1,
                 key: k,
                 fixed: f,
-                value: &Bytes(b"opaque\0bytes".to_vec()),
+                value: b"opaque\0bytes",
             })
             .unwrap();
         assert_eq!(value(&mut tx, &h), b"opaque\0bytes");
@@ -1263,7 +1205,7 @@ fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
             value_version: 1,
             key: &key,
             fixed: &Fixed::None,
-            value: &Bytes(vec![]),
+            value: &[],
         })
         .unwrap();
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
@@ -1324,7 +1266,7 @@ fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
                     value_version: 1,
                     key: &key,
                     fixed: &Fixed::None,
-                    value: &Repeat(size)
+                    value: &repeat(size)
                 })
                 .is_ok(),
                 ok,
@@ -1345,7 +1287,7 @@ fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
                 value_version: 1,
                 key,
                 fixed: &Fixed::None,
-                value: &Repeat(size)
+                value: &repeat(size)
             })
             .is_ok(),
             ok
@@ -1383,7 +1325,7 @@ fn f8_corrupted_refcount_cannot_reclaim_evidence_or_commit_sibling_changes() {
     use interning::{intern_request_set, release_request_set, RequestEvidence};
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let hashes = Repeat(PART_BYTES as u64 + 1);
+    let hashes = repeat(PART_BYTES as u64 + 1);
     let evidence = RequestEvidence::Census {
         hashes: &hashes,
         hash_count: None,
@@ -1417,7 +1359,7 @@ fn private_labels_aliases_and_raw_holds_create_erasure_epochs() {
             value_version: 1,
             key: &key,
             fixed: &fixed,
-            value: &Bytes(text.as_bytes().to_vec()),
+            value: text.as_bytes(),
         })
         .unwrap();
         assert_eq!(tx.commit(g, g + 1), DurableCommitOutcome::Committed(g + 1));
@@ -1439,7 +1381,7 @@ fn positions_and_current_pointer_survive_retirement_without_renumbering() {
             value_version: 1,
             key: &k,
             fixed: &f,
-            value: &Bytes(vec![]),
+            value: &[],
         })
         .unwrap();
     }
@@ -1471,36 +1413,28 @@ fn test_record(key: String) -> RowKey {
     RowKey::record("v1_field.files", key.into_bytes(), 0).unwrap()
 }
 
-/// [format] changing control replay is bounded before capability parse.
+/// [format] an over-cap control refuses before its capability parse, and the
+/// failed write cannot be ignored and then committed with a sibling row.
 #[test]
-fn changing_control_replay_is_bounded_before_capability_parse() {
-    struct Changes(std::cell::Cell<u8>);
-    impl Value for Changes {
-        fn write(&self, out: &mut dyn Write) -> Result<()> {
-            let pass = self.0.get();
-            self.0.set(pass + 1);
-            if pass < 2 {
-                out.write_all(b"1")?;
-                Ok(())
-            } else {
-                Repeat(CONTROL_BYTES + 1).write(out)
-            }
-        }
-    }
+fn oversized_control_refuses_before_parse_and_fails_the_save() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
+    let key = traversal("traversal".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"sibling");
     let error = tx
         .put(RowInput {
             value_version: 1,
             key: &RowKey::Meta("minimum_writer_capability".into()),
             fixed: &Fixed::None,
-            value: &Changes(std::cell::Cell::new(0)),
+            value: &repeat(CONTROL_BYTES + 1),
         })
         .unwrap_err();
     assert_eq!(error.to_string(), "state_v2_value_admission");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
     assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(0));
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    assert!(tx.get(&key).unwrap().is_none());
 }
 /// [format] key admission matches for cached and cold reads.
 #[test]

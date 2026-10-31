@@ -87,7 +87,7 @@ fn put_raw(tx: &mut dyn Transaction, cx: &mut KindCx, key: RowKey, raw: &[u8]) -
             key: &key,
             fixed: &Fixed::None,
             value_version: 1,
-            value: &codec::Bytes(raw),
+            value: raw,
         })?
     };
     cx.misc_rows.insert(key, (h, true));

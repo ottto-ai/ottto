@@ -232,7 +232,7 @@ fn foreign_source_and_registered_but_unmapped_money_kinds_refuse_hydration() {
         key: &RowKey::record("v1_field.census_money_marks", Vec::new(), 0).unwrap(),
         fixed: &Fixed::None,
         value_version: 1,
-        value: &Stored(b"null".to_vec()),
+        value: b"null",
     })
     .unwrap();
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));

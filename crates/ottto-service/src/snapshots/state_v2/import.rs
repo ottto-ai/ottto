@@ -863,9 +863,9 @@ impl Transaction for ReadBack<'_> {
     }
     fn put(&mut self, row: RowInput<'_>) -> Result<Header> {
         let h = self.inner.get(row.key)?.ok_or(Pause::Mismatch)?;
-        let generation = ControlJson(&self.generation);
-        let value = if row.key == &RowKey::Meta("generation".into()) {
-            &generation as &dyn Value
+        let generation = control_json(&self.generation)?;
+        let expected = if row.key == &RowKey::Meta("generation".into()) {
+            generation.as_slice()
         } else {
             row.value
         };
@@ -873,13 +873,12 @@ impl Transaction for ReadBack<'_> {
             h.value_version == row.value_version && &h.fixed == row.fixed && {
                 let mut actual = Vec::new();
                 self.inner.read_value(&h, &mut actual)?;
-                let expected = codec::capture(value, value_cap(row.key))?;
                 if matches!(row.key,RowKey::Record{kind,..} if kind.name().starts_with("raw_hold."))
                 {
                     actual == expected
                 } else {
                     codec::expand(&actual, value_cap(row.key))?
-                        == codec::expand(&expected, value_cap(row.key))?
+                        == codec::expand(expected, value_cap(row.key))?
                 }
             },
             Pause::Mismatch
@@ -1529,7 +1528,7 @@ mod application_cases {
             key: &RowKey::record("file.confirmed_empty", b"orphan", 0).unwrap(),
             fixed: &Fixed::None,
             value_version: 1,
-            value: &ControlJson(&true),
+            value: &control_json(&true).unwrap(),
         })
         .unwrap();
         assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));

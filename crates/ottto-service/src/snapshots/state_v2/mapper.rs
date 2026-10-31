@@ -228,7 +228,7 @@ pub(super) fn put<T: Serialize + ?Sized>(
         key,
         fixed: &Fixed::None,
         value_version: 1,
-        value: &codec::Bytes(&encoded),
+        value: &encoded,
     })
 }
 pub(super) fn remove(tx: &mut dyn Transaction, key: &RowKey) -> Result<()> {

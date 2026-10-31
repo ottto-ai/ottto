@@ -127,7 +127,10 @@ impl Fixture {
             key: &RowKey::record("file.growth_retention", self.key.as_bytes(), 1).unwrap(),
             fixed: &Fixed::None,
             value_version: 1,
-            value: &PackedDebt(&index.v2().growth_retention[&self.key]),
+            value: &codec::encode(
+                &serde_json::to_vec(&index.v2().growth_retention[&self.key]).unwrap(),
+            )
+            .unwrap(),
         })
         .unwrap();
         let next = index.generation + 1;
@@ -165,15 +168,6 @@ fn debt(last: Option<u64>) -> sampled_audit::GrowthRetention {
         "predecessor_size": 4, "last_growth_full_unix": last,
     }))
     .unwrap()
-}
-struct PackedDebt<'a>(&'a sampled_audit::GrowthRetention);
-impl Value for PackedDebt<'_> {
-    fn write(&self, out: &mut dyn Write) -> Result<()> {
-        let mut encoder = codec::Encoder::new(out);
-        serde_json::to_writer(&mut encoder, self.0)?;
-        encoder.finish()?;
-        Ok(())
-    }
 }
 fn admitted(
     index: &mut ScanIndex,
