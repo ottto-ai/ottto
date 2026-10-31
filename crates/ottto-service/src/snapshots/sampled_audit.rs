@@ -2049,10 +2049,7 @@ pub(super) fn revalidate_growth(index: &mut ScanIndex, key: &str, roots: &[PathB
         .as_ref()
         .is_some_and(|walk| walk.residue.index_keys.contains(key));
     let v2 = index.v2_mut();
-    if v2.growth_checked.0 != generation {
-        v2.growth_checked = (generation, BTreeSet::new());
-    }
-    v2.growth_checked.1.insert(key.to_owned());
+    note_growth_checked(v2, generation, key);
     if uncertain {
         let state = v2.growth_retention.entry(key.to_owned()).or_default();
         if state.checked_generation != Some(generation) {
@@ -2136,12 +2133,22 @@ pub(super) fn settle_growth(index: &mut ScanIndex, key: &str) {
     if growth_active(index) {
         let _ = state_v2::save_read_completed(index, key);
         let generation = index.generation;
-        if let Some(state) = index.v2_mut().growth_retention.get_mut(key) {
+        let v2 = index.v2_mut();
+        if let Some(state) = v2.growth_retention.get_mut(key) {
             state.predecessor_size = None;
             state.uncertain_passes = 0;
             state.checked_generation = Some(generation);
+            note_growth_checked(v2, generation, key);
         }
     }
+}
+
+/// Checked this generation: retirement must not revalidate (and re-retain) it.
+fn note_growth_checked(v2: &mut state_v2::IndexState, generation: u64, key: &str) {
+    if v2.growth_checked.0 != generation {
+        v2.growth_checked = (generation, BTreeSet::new());
+    }
+    v2.growth_checked.1.insert(key.to_owned());
 }
 
 pub(super) fn growth_subset(
