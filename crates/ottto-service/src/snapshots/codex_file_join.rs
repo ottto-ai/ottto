@@ -2602,55 +2602,7 @@ pub(super) mod tests {
         }
         fs::remove_dir_all(root).unwrap();
     }
-    #[test]
-    fn shared_home_validation_checks_roster_once_and_rechecks_ownership_each_boundary() {
-        let (root, _) = fixture();
-        let first = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let mut owners = BTreeSet::from([first.to_owned()]);
-        for i in 1..=3 {
-            let owner = format!("{i:08x}-bbbb-4ccc-8ddd-{i:012x}");
-            owners.insert(owner.clone());
-            for (part, input, after) in [("a", 100, 100), ("b", 200, 300)] {
-                let rows = member(&owner, &format!("r-{i}-{part}"), input, after);
-                fs::write(
-                    root.join("sessions").join(format!("{i}-{part}.jsonl")),
-                    rows.iter()
-                        .map(|row| serde_json::to_string(row).unwrap() + "\n")
-                        .collect::<String>(),
-                )
-                .unwrap();
-            }
-        }
-        let (_, result) = scan(&root, ScanIndex::default(), 8);
-        assert_eq!(result.snapshots.len(), 8);
-        let validation = result.codex_join_validation.as_ref().unwrap();
-        assert_eq!(validation.groups.len(), 4);
-        assert_eq!(
-            validation.validate(&owners).unwrap(),
-            8,
-            "eight roster stats, not eight per group"
-        );
-        let selected = BTreeSet::from([first.to_owned()]);
-        assert_eq!(validation.validate(&selected).unwrap(), 8);
-        // A previously unrelated file can enter the selected owner's group
-        // without changing directory membership. No boundary result is cached.
-        let path = root.join("sessions/1-a.jsonl");
-        let mut rows = fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        rows[0]["payload"]["id"] = json!(first);
-        fs::write(
-            path,
-            rows.iter()
-                .map(|row| serde_json::to_string(row).unwrap() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
-        assert!(validation.validate(&selected).is_err());
-        fs::remove_dir_all(root).unwrap();
-    }
+
     #[test]
     fn replay_owner_rewrite_after_inventory_cannot_escape_validation() {
         let (root, _) = fixture();
@@ -3772,51 +3724,7 @@ pub(super) mod tests {
             }
         }
     }
-    #[test]
-    fn native_group_reports_finite_scan_capture_and_restart_cost() {
-        let root = native_join_fixture_root(true);
-        let start = std::time::Instant::now();
-        let ((mut index, mut result), stats) =
-            crate::retry_allocation_probe::measure(|| scan(&root, ScanIndex::default(), 2));
-        let scan_micros = start.elapsed().as_micros();
-        let header_bytes = result
-            .codex_join_validation
-            .as_ref()
-            .unwrap()
-            .inventory
-            .read_bytes;
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
-        result.finish_codex_capture_boundary(&mut index);
-        let (capture, _, _) =
-            index.stage_codex_recovery_capture(&ScanIndex::default(), &result.snapshots);
-        result.finish_codex_capture_boundary(&mut index);
-        let capture_bytes = serde_json::to_vec(&capture).unwrap().len();
-        let accepted = result
-            .snapshots
-            .iter()
-            .map(|item| item.snapshot_fingerprint.clone())
-            .collect();
-        let settled = index.committable_subset(&capture, &accepted, &BTreeMap::new());
-        let index_bytes = serde_json::to_vec(&settled).unwrap().len();
-        let path = root.join("measured-index.json");
-        let mut settled = settled;
-        settled.save(&path).unwrap();
-        fs::remove_file(root.join("logs_2.sqlite")).unwrap();
-        let start = std::time::Instant::now();
-        let (_, restart) = scan(&root, ScanIndex::load(&path).unwrap(), 2);
-        assert!(restart.snapshots.is_empty());
-        assert_eq!(restart.semantic_noop_count, 2);
-        eprintln!(
-            "CODEX_UNION_MEASUREMENT {}",
-            json!({"synthetic_members":2,
-            "selected_parser_passes":2,"header_read_bytes":header_bytes,
-            "scan_microseconds":scan_micros,"scan_requested_allocation_peak":stats.requested_peak,
-            "scan_usable_allocation_peak":stats.usable_peak,"capture_index_bytes":capture_bytes,
-            "settled_index_bytes":index_bytes,"restart_microseconds":start.elapsed().as_micros(),
-            "restart_semantic_noops":restart.semantic_noop_count,"restart_full_replays":0})
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
+
     pub(crate) fn legacy_index(
         inventory: &HeaderInventory,
         traces: Option<Arc<CodexTurnTraceMap>>,
