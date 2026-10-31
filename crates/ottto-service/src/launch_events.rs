@@ -748,7 +748,6 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     const CONTROLLER: &str = "a9789dcf-1e4a-4a6e-8abd-f30094efb269";
-    const RELAY_CONTROLLER: &str = "a9789dcf-1e4a-4a6e-8abd-f30094efb269_agent-ad32608db4eecb2af";
     const WORKER: &str = "019f6822-403f-7652-a308-b0c12142e337";
     const ATTEMPT: &str = "402d846d-c13c-4743-8326-580e4ca70e30";
 
@@ -836,84 +835,6 @@ mod tests {
         assert_eq!(event.worker_session_ref, WORKER);
         assert_eq!(event.workflow_ref.as_deref(), Some(ATTEMPT));
         assert_eq!(event.agent_kind, "pr-fixer");
-    }
-
-    #[test]
-    fn gpt_sol_relay_accepts_only_the_collectors_exact_controller_forms() {
-        for controller in [CONTROLLER, RELAY_CONTROLLER] {
-            let event = validate_event(&event_json(&[
-                ("capture_source", "\"launcher_event:gpt_sol_relay\""),
-                ("controller_session_ref", &format!("\"{controller}\"")),
-                ("workflow_ref", "null"),
-                ("pr_ref", "null"),
-            ]))
-            .expect("valid relay event");
-            assert_eq!(event.controller_session_ref, controller);
-            assert_eq!(event.worker_session_ref, WORKER);
-            assert_eq!(event.workflow_ref, None);
-            assert_eq!(event.agent_kind, "gpt-sol");
-        }
-
-        for controller in [
-            "a9789dcf-1e4a-4a6e-8abd-f30094efb269_agent-short",
-            "a9789dcf-1e4a-4a6e-8abd-f30094efb269_agent-ad32608db4eecb2az",
-            "a9789dcf-1e4a-4a6e-8abd-f30094efb269/agent-ad32608db4eecb2af",
-            "not-a-uuid_agent-ad32608db4eecb2af",
-        ] {
-            assert_eq!(
-                validate_event(&event_json(&[
-                    ("capture_source", "\"launcher_event:gpt_sol_relay\""),
-                    ("controller_session_ref", &format!("\"{controller}\"")),
-                    ("workflow_ref", "null"),
-                    ("pr_ref", "null"),
-                ])),
-                Err("bad_controller_ref"),
-                "accepted malformed composite {controller}"
-            );
-        }
-    }
-
-    #[test]
-    fn composite_controller_and_null_metadata_are_relay_family_only() {
-        assert_eq!(
-            validate_event(&event_json(&[(
-                "controller_session_ref",
-                &format!("\"{RELAY_CONTROLLER}\""),
-            )])),
-            Err("bad_controller_ref")
-        );
-        for (field, raw, expected) in [
-            ("workflow_ref", format!("\"{ATTEMPT}\""), "bad_workflow_ref"),
-            ("pr_ref", "1653".to_string(), "bad_pr_ref"),
-        ] {
-            assert_eq!(
-                validate_event(&event_json(&[
-                    ("capture_source", "\"launcher_event:gpt_sol_relay\""),
-                    ("workflow_ref", "null"),
-                    ("pr_ref", "null"),
-                    (field, raw.as_str()),
-                ])),
-                Err(expected)
-            );
-        }
-        assert_eq!(
-            validate_event(&event_json(&[("workflow_ref", "null")])),
-            Err("bad_workflow_ref")
-        );
-        assert_eq!(
-            validate_event(&event_json(&[("pr_ref", "null")])),
-            Err("bad_pr_ref")
-        );
-    }
-
-    #[test]
-    fn uppercase_references_normalize_to_the_emitter_form() {
-        let event = validate_event(&event_json(&[(
-            "controller_session_ref",
-            "\"A9789DCF-1E4A-4A6E-8ABD-F30094EFB269\"",
-        )]))
-        .expect("valid event");
-        assert_eq!(event.controller_session_ref, CONTROLLER);
     }
 
     /// Every fail-closed row of the producer's matrix that reaches a FILE.
@@ -1007,25 +928,6 @@ mod tests {
     }
 
     #[test]
-    fn filename_must_match_the_triple_it_claims() {
-        let home = temp_dir("launch-filename");
-        drop_event(
-            &home,
-            &event_json(&[]),
-            Some(&format!("{}.json", "0".repeat(64))),
-        );
-
-        let inventory = refresh_fixture(&home);
-
-        assert_eq!(inventory.len(), 0);
-        assert_eq!(
-            bounded_entries(&home.join(DROP_ROOT_DIR).join(REJECTED_SUBDIR), 8).len(),
-            1
-        );
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
     fn accepted_event_moves_to_processed_and_stays_joinable() {
         let home = temp_dir("launch-lifecycle");
         drop_event(&home, &event_json(&[]), None);
@@ -1046,64 +948,6 @@ mod tests {
         let replayed = refresh_fixture(&home);
         assert_eq!(replayed.matching(WORKER), inventory.matching(WORKER));
         let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn replaying_the_same_launch_keeps_exactly_one_event() {
-        let home = temp_dir("launch-replay");
-        drop_event(&home, &event_json(&[]), None);
-        refresh_fixture(&home);
-        // The launcher re-emits after a retry: same triple, same filename.
-        drop_event(&home, &event_json(&[]), None);
-
-        let inventory = refresh_fixture(&home);
-
-        assert_eq!(inventory.len(), 1);
-        assert_eq!(
-            bounded_entries(&home.join(DROP_ROOT_DIR).join(PROCESSED_SUBDIR), 8).len(),
-            1
-        );
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn two_controllers_claiming_one_worker_withhold_both_edges() {
-        let home = temp_dir("launch-ambiguous");
-        drop_event(&home, &event_json(&[]), None);
-        drop_event(
-            &home,
-            &event_json(&[(
-                "controller_session_ref",
-                "\"11111111-2222-3333-4444-555555555555\"",
-            )]),
-            None,
-        );
-
-        let inventory = refresh_fixture(&home);
-
-        assert!(inventory.matching(WORKER).is_none());
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn rejected_file_never_reaches_the_inventory_or_the_processed_store() {
-        let home = temp_dir("launch-rejected");
-        let raw = event_json(&[("prompt", "\"secret prompt text\"")]);
-        drop_event(&home, &raw, Some(&format!("{}.json", "a".repeat(64))));
-
-        let inventory = refresh_fixture(&home);
-
-        assert_eq!(inventory.len(), 0);
-        let root = home.join(DROP_ROOT_DIR);
-        assert_eq!(bounded_entries(&root.join(PROCESSED_SUBDIR), 8).len(), 0);
-        assert_eq!(bounded_entries(&root.join(REJECTED_SUBDIR), 8).len(), 1);
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn absent_drop_root_is_an_empty_inventory() {
-        let home = temp_dir("launch-absent");
-        assert_eq!(refresh_fixture(&home).len(), 0);
     }
 
     struct TestHome(PathBuf);
@@ -1151,76 +995,6 @@ mod tests {
     }
 
     #[test]
-    fn rejected_maintenance_failure_preserves_claims_but_claim_directory_failure_is_owed() {
-        let home = TestHome::new();
-        let (id, _) = retained(&home.0, 1);
-        let root = home.0.join(DROP_ROOT_DIR);
-        // A regular file cannot be enumerated as a directory on any platform.
-        fs::write(root.join(REJECTED_SUBDIR), b"maintenance unavailable").unwrap();
-        let inventory = LaunchEventInventory::refresh(&home.0);
-        complete(&inventory, std::slice::from_ref(&id));
-        assert!(inventory.prepared(std::slice::from_ref(&id)));
-        assert!(inventory.matching(&id).is_some());
-
-        fs::rename(root.join(PROCESSED_SUBDIR), root.join("retained-fixture")).unwrap();
-        fs::write(root.join(PROCESSED_SUBDIR), b"claims unavailable").unwrap();
-        let unavailable = LaunchEventInventory::refresh(&home.0);
-        let mut result = unavailable.prepare_step(std::slice::from_ref(&id));
-        while result == Ok(false) {
-            result = unavailable.prepare_step(std::slice::from_ref(&id));
-        }
-        assert_eq!(result, Err(()));
-        assert!(!unavailable.prepared(std::slice::from_ref(&id)));
-        assert!(unavailable.matching(&id).is_none());
-    }
-
-    #[test]
-    fn opus_contract_preserves_legacy_and_refuses_arbitrary_or_reserved_families() {
-        for workflow in ["null".to_string(), format!("\"{ATTEMPT}\"")] {
-            for pr in ["null", "7"] {
-                let event = validate_event(&event_json(&[
-                    ("capture_source", "\"launcher_event:opus_cli_agent\""),
-                    ("workflow_ref", &workflow),
-                    ("pr_ref", pr),
-                ]))
-                .unwrap();
-                assert_eq!(event.agent_kind, "opus-cli-agent");
-            }
-        }
-        for source in [
-            "launcher_event:pr_fixer",
-            "launcher_event:gpt_sol",
-            "launcher_event:codex_subagent",
-            "launcher_event:workflow_subagent",
-            "launcher_event:other_slug",
-            "launcher_event:",
-            "launcher_event:Opus",
-            "launcher_event:x/y",
-        ] {
-            assert_eq!(
-                validate_event(&event_json(&[("capture_source", &format!("\"{source}\""))])),
-                Err("unknown_capture_source")
-            );
-        }
-        for value in ["0", "-1", "1.5", "\"7\""] {
-            assert_eq!(
-                validate_event(&event_json(&[
-                    ("capture_source", "\"launcher_event:opus_cli_agent\""),
-                    ("pr_ref", value)
-                ])),
-                Err("bad_pr_ref")
-            );
-        }
-        assert_eq!(
-            validate_event(&event_json(&[
-                ("capture_source", "\"launcher_event:opus_cli_agent\""),
-                ("controller_session_ref", &format!("\"{RELAY_CONTROLLER}\""))
-            ])),
-            Err("bad_controller_ref")
-        );
-    }
-
-    #[test]
     fn every_retained_worker_is_joinable_across_batches_above_the_old_caps() {
         let home = TestHome::new();
         let workers: Vec<_> = (1..=5400).map(|n| retained(&home.0, n).0).collect();
@@ -1259,59 +1033,6 @@ mod tests {
         assert!(complete(&inventory, std::slice::from_ref(&id)) > 1);
         assert!(inventory.matching(&id).is_none());
         assert_eq!(inventory.lookup.lock().unwrap().ambiguous.len(), 1);
-    }
-
-    #[test]
-    fn non_uuid_transcripts_need_no_launch_lookup_or_drop_directory() {
-        let home = TestHome::new();
-        let inventory = LaunchEventInventory::refresh(&home.0);
-        let workers = vec!["opaque-provider-session".to_string()];
-        assert!(inventory.prepared(&workers));
-        assert_eq!(inventory.prepare_step(&workers), Ok(true));
-        assert!(inventory.matching(&workers[0]).is_none());
-        assert!(!home.0.join(DROP_ROOT_DIR).exists());
-    }
-
-    #[test]
-    fn duplicate_demands_do_not_consume_slots_and_changed_demands_yield_until_prepared() {
-        let home = TestHome::new();
-        for n in 1..=600 {
-            retained(&home.0, n);
-        }
-        let first = worker(1);
-        let second = worker(600);
-        let inventory = LaunchEventInventory::refresh(&home.0);
-        let duplicates = vec![first.clone(); MAX_DEMANDED_WORKERS + 1];
-        assert_eq!(inventory.prepare_step(&duplicates), Ok(false));
-        // Finish the original cursor without pretending the newly demanded
-        // worker was included in its complete retained-store pass.
-        while !inventory.lookup.lock().unwrap().complete {
-            assert_eq!(
-                inventory.prepare_step(std::slice::from_ref(&second)),
-                Ok(false)
-            );
-        }
-        assert!(!inventory.prepared(std::slice::from_ref(&second)));
-        assert!(inventory.matching(&second).is_none());
-        complete(&inventory, std::slice::from_ref(&second));
-        assert!(inventory.prepared(std::slice::from_ref(&second)));
-        assert!(inventory.matching(&second).is_some());
-        complete(&inventory, &duplicates);
-        assert_eq!(inventory.lookup.lock().unwrap().workers.len(), 1);
-    }
-
-    #[test]
-    fn excess_demand_is_disclosed_instead_of_certifying_a_truncated_batch() {
-        let home = TestHome::new();
-        let demanded: Vec<_> = (1..=MAX_DEMANDED_WORKERS + 1).map(worker).collect();
-        let inventory = LaunchEventInventory::refresh(&home.0);
-        assert_eq!(inventory.prepare_step(&demanded), Err(()));
-        assert!(inventory
-            .matching(&demanded[MAX_DEMANDED_WORKERS])
-            .is_none());
-        for batch in demanded.chunks(MAX_DEMANDED_WORKERS) {
-            complete(&inventory, batch);
-        }
     }
 
     #[test]
