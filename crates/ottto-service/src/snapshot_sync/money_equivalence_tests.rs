@@ -1451,6 +1451,10 @@ fn pi_ledger_splits(
     final_totals: (u64, u64),
 ) {
     let (c, mut disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
+    let retained_disk = Disk {
+        dir: disk.dir.clone(),
+        index: disk.index.clone(),
+    };
     assert!(matches!(initial, PiLedgerStep::Emit(..)));
     let mut accepted = proof.bodies[0].items.clone();
     assert_eq!(pi_ledger_totals(&accepted), initial.totals());
@@ -1466,9 +1470,24 @@ fn pi_ledger_splits(
     }
     let mut priors = [prior.clone(), prior.clone(), prior];
     let mut ram_mode = (0, 1, 0);
+    // R1's stage_preparation preserves the durable predecessor on an uncertified
+    // lossy Tail. Lead B's condition: unchanged pre-conflict record bytes (including
+    // generation), exactly one restore on the next page, and Tail with zero Full.
+    // pi_pages_checked compares the replayed suffix's emitted wire to cold Full.
+    let mut pre_conflict_records = None;
     for (value, step) in suffix {
         pi_grow(&path, value);
         let restart = disk.owner(SnapshotSource::Pi);
+        let restored_before = pre_conflict_records.take().map(|records| {
+            assert_eq!(retained_disk.record_bytes(), records, "pre-conflict record");
+            assert_eq!(ram_mode, (0, 1, 0), "durable conflict resume must Tail");
+            durable_restores(&scanner.cache, SnapshotSource::Pi).1
+        });
+        if proof.durable && matches!(step, PiLedgerStep::ConflictDrop(..)) {
+            let records = retained_disk.record_bytes();
+            assert_eq!(records.len(), 1, "one pre-conflict durable record");
+            pre_conflict_records = Some(records);
+        }
         let ([tail, full, mut restored], scan) = pi_pages_checked(
             &mut proof,
             &c,
@@ -1483,15 +1502,18 @@ fn pi_ledger_splits(
                 accepted: &accepted,
             }),
         );
+        if let Some(before) = restored_before {
+            assert_eq!(
+                durable_restores(&scanner.cache, SnapshotSource::Pi).1,
+                before + 1,
+                "exactly one retained restore after conflict"
+            );
+        }
         if matches!(step, PiLedgerStep::Emit(..)) {
             accepted = scan.snapshots;
         }
         let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
         priors = [tail, full, next];
-        // A conflict consumes the RAM reduction. R1's stage_preparation
-        // preserves the durable predecessor for an uncertified lossy Tail;
-        // the next append restores it and replays the suffix, like the disk arm.
-        // Without a durable record the next append still needs Full.
         ram_mode = if matches!(step, PiLedgerStep::ConflictDrop(..)) && !proof.durable {
             (1, 0, 0)
         } else {
