@@ -87,16 +87,22 @@ traversal's census window is frozen and #920's terminal retirement never runs.
 With ON, the stay-retired guard and the admission release cutoff age against
 the service clock (floored to a day), and the drained-walk withheld-terminal
 block runs the terminal's aged retirement (keep overlap, 90% occupancy release)
-at that clock, without the vanished prune, join or shadow counts. OFF is main.
+at that clock, without the vanished prune, join or shadow counts. Its
+kept-overlap row omits `census_missing_over_budget` (measured only by the
+terminal's join, so not measured, never 0). OFF is main.
 If an ON walk never drains, admission still frees space, in mtime order
 (counted by `census_retire_kept_overflow_admission_total`).
 
-**X3-R (disclosed, pending Lead B's ruling).** Under ON, vanished keys are never
-pruned (the prune stays terminal-only), so the census record count only grows.
-A new key past 65,536 records is refused: unknown, fail-closed, never "no
-holder". Each refusal is counted by `census_record_limit_refused_total`.
-Proposed: ship with disclosure for M4 ON with an alarm when that count exceeds 0;
-the fleet fix goes with E7-8 paging or a terminal-only prune.
+**X3-R (ship with disclosure for M4 ON, Lead B 2026-10-31).** Under ON, vanished
+keys are never pruned (the prune stays terminal-only), so the census record
+count only grows. A new key past 65,536 records is refused: unknown,
+fail-closed, never "no holder". Each refusal is counted by
+`census_record_limit_refused_total`, which the ON offers line
+`ALARM claude_terminal_off offers=… census_record_limit_refused_total=N`
+carries once per withheld terminal; N > 0 is the M4 alarm. Before the M4 ON
+enable, take a counts-only reading of M4's current census record count, so
+the headroom to 65,536 is known. The fleet fix goes with E7-8 paging or a
+terminal-only prune.
 
 OFF retains main's retry-admission completion veto: a retained, storage-deferred
 admission cannot grant a complete census. The unchanged oversized accepted
