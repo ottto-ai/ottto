@@ -2788,9 +2788,10 @@ fn gc_stops_before_orphan_cleanup_when_classification_disables_mid_loop() {
     assert!(!temp.exists());
 }
 
+/// [format] T14 spends one rebuild and preserves ambiguous receipt custody.
 #[test]
 fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
-    for arm in ["success", "write_failure", "budget"] {
+    for arm in ["success", "write_failure", "cleanup_failure", "budget"] {
         let _reset = ResetFaults;
         let scratch = Scratch::new();
         let lock = LockedStateDir::acquire(&scratch.root).unwrap();
@@ -2840,14 +2841,20 @@ fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
         if arm == "budget" {
             replacement.body.resize(RECORD_BYTES, 0);
         }
-        if arm == "write_failure" {
+        if matches!(arm, "write_failure" | "cleanup_failure") {
             test_hooks::set_before_rename(Some(Box::new(|_, _| {
                 Err(io::Error::other("replacement refused"))
+            })));
+        }
+        if arm == "cleanup_failure" {
+            test_hooks::set_before_unlink(Some(Box::new(|_| {
+                Err(io::Error::other("replacement cleanup refused"))
             })));
         }
         let expected_content = content_digest(&replacement);
         let result = cold.write_after_save(&lock, 2, 0, vec![replacement]);
         test_hooks::set_before_rename(None);
+        test_hooks::set_before_unlink(None);
         if arm == "success" {
             assert_eq!(result.unwrap().written, 1);
             assert!(!cold.rebuilt.contains_key(&b.key));
@@ -2864,7 +2871,7 @@ fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
             assert!(restarted.rebuilt.is_empty(), "restart needs no rebuild");
             continue;
         }
-        if arm == "write_failure" {
+        if arm == "cleanup_failure" {
             let receipt = result.unwrap();
             assert_eq!(receipt.written, 0);
             assert_eq!(receipt.deferred_keys, vec![b.key]);
@@ -2916,7 +2923,19 @@ fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
             assert_eq!(restarted.full_hold(&b.key, true), Some(Refusal::Corrupt));
             continue;
         }
-        assert_eq!(result.unwrap().budget_refused, 1);
+        if arm == "write_failure" {
+            assert!(
+                result.is_err(),
+                "the unstarted replacement reports its failure"
+            );
+            assert!(
+                !cold.pending.contains_key(&b.key),
+                "no surviving candidate owes a receipt"
+            );
+            assert_eq!(cold.disabled(), None);
+        } else {
+            assert_eq!(result.unwrap().budget_refused, 1);
+        }
         assert_eq!(cold.rebuilt.get(&b.key), Some(&Rebuild::NotReplaced));
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(cold.counters().t14_rebuild, 1);

@@ -1017,11 +1017,50 @@ struct ScanFixture {
     file: Fixture,
 }
 impl ScanFixture {
-    // Audit/custody fixtures need no private-content replay obligation. Native
-    // identity still comes from assistant rows or the Codex rollout filename.
-    fn without_content(self) -> Self {
-        fs::write(&self.file.0, b"").unwrap();
+    // Claude audit fixtures need no private prompt. Codex discovery requires
+    // its real session_meta header, which also carries a private replay window.
+    fn without_prompt(self) -> Self {
+        let header: Value =
+            serde_json::from_str(&fs::read_to_string(&self.file.0).unwrap()).unwrap();
+        if header["type"] == "user" {
+            fs::write(&self.file.0, b"").unwrap();
+        }
         self
+    }
+
+    // A cold private-content record cannot retire a quiet audit by replaying
+    // input. Prove that Pending is byte-free, then use a real inert append to
+    // restore + Tail before the caller checks ordinary warm quiet retirement.
+    fn resume_quiet_on_growth(
+        &self,
+        source: SnapshotSource,
+        index: ScanIndex,
+        cache: &Arc<sampled_scan::SharedCache>,
+        namespace: &str,
+        at: &str,
+    ) -> ScanIndex {
+        let key = local_index_key(&self.file.0);
+        let due = index.files[&key].unverified_deadline();
+        let restored = cache.durable_counters(source).unwrap().0.restored;
+        let (pending, held, modes, bytes) =
+            production_scan_at(self, source, index, Some(cache.clone()), namespace, at);
+        assert_eq!(modes, (0, 0, 0), "quiet private replay stays Pending");
+        assert_eq!(bytes, (0, 0), "Pending reads no native or sample input");
+        assert!(held.snapshots.is_empty());
+        assert_eq!(pending.files[&key].unverified_deadline(), due);
+        assert!(cache.retained_checkpoint(&key).is_none());
+        let before = self.file.0.metadata().unwrap().len();
+        self.file.append(&json!({"type":"ignored"}));
+        let (resumed, _, modes, bytes) =
+            production_scan_at(self, source, pending, Some(cache.clone()), namespace, at);
+        assert_eq!(modes, (0, 1, 0), "natural growth restores then Tails");
+        assert_eq!(bytes.0, self.file.0.metadata().unwrap().len() - before);
+        assert_eq!(
+            cache.durable_counters(source).unwrap().0.restored,
+            restored + 1
+        );
+        assert_eq!(resumed.files[&key].unverified_deadline(), due);
+        resumed
     }
 
     fn new(source: SnapshotSource) -> Self {
@@ -1733,10 +1772,12 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
         ] {
             let quiet = arm.starts_with("due_quiet");
             let missing = matches!(arm, "restore_miss_debt" | "cleared_selection_debt");
-            let full = arm == "real_edit" || missing;
+            let full = arm == "real_edit"
+                || arm == "restore_miss_debt"
+                || (arm == "cleared_selection_debt" && source == SnapshotSource::Codex);
             let owes = arm.starts_with("due_") || arm == "real_edit" || missing || pending > 0;
             sampled_scan::set_test_now(Some(START));
-            let fixture = ScanFixture::new(source).without_content();
+            let fixture = ScanFixture::new(source).without_prompt();
             fixture.file.append(&usage(source, 100, 0, "fixture-model"));
             let namespace = Scope("r2-audit-gate".into());
             let state = fixture.dir.join("state");
@@ -1809,7 +1850,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 START
             );
             drop(first);
-            let before = fs::metadata(&fixture.file.0).unwrap().len();
+            let mut before = fs::metadata(&fixture.file.0).unwrap().len();
             if arm == "real_edit" {
                 let original = fs::read_to_string(&fixture.file.0).unwrap();
                 let edited = original.replace("\"input_tokens\":100", "\"input_tokens\":900");
@@ -1857,6 +1898,11 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 // The real record passes binding/certificate/decode but RAM
                 // admission refuses it: exercise DT's budget-refused Miss.
                 *second.retained().unwrap() = TranscriptCache::with_byte_limit(0);
+            }
+            let private_quiet = quiet && source == SnapshotSource::Codex;
+            if private_quiet {
+                loaded = fixture.resume_quiet_on_growth(source, loaded, &second, &namespace.0, NOW);
+                before = fs::metadata(&fixture.file.0).unwrap().len();
             }
             sampled_scan::test_hooks::clear();
             let (((mut warm, result, modes, bytes), diagnostics), sample_reads) =
@@ -1917,23 +1963,33 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             assert!(reasons.get("audit_due").is_none());
             assert!(reasons.get("clock_changed").is_none());
             let counts = second.durable_counters(source).unwrap().0;
-            assert_eq!(counts.restore_attempts, 1, "{source:?}/{arm}");
+            assert_eq!(
+                counts.restore_attempts,
+                if private_quiet { 2 } else { 1 },
+                "{source:?}/{arm}"
+            );
             assert_eq!(counts.restored, u64::from(!full), "{source:?}/{arm}");
             if arm == "real_edit" {
                 assert_eq!(counts.certificate_refused.get("same_size_edit"), Some(&1));
             } else if arm == "restore_miss_debt" {
-                assert_eq!(counts.budget_refused, 1);
+                assert_eq!(counts.budget_refused, 0);
+                assert_eq!(counts.resource_full.get("cache_transit"), Some(&1));
                 assert!(counts.ineligible.is_empty());
                 assert!(counts.certificate_refused.is_empty());
             } else if arm == "cleared_selection_debt" {
-                assert_eq!(counts.ineligible.get("selection_cleared"), Some(&1));
+                assert_eq!(
+                    counts.ineligible.get("selection_cleared"),
+                    (source == SnapshotSource::Codex).then_some(&1)
+                );
                 assert_eq!(counts.budget_refused, 0);
             }
             // Actual File::read returns, including the certificate restore's
             // two windows before prepare. Neither totals nor ranges come
             // from the completed context metrics below.
             let window = before.min(crate::transcript_acquisition::SAMPLE_BYTES as u64) as usize;
-            let pairs = if !full {
+            let pairs = if private_quiet {
+                1 // replay was admitted on growth; this visit only validates quiet audit
+            } else if !full {
                 2 // restore + prepare (Tail), or restore + quiet validation
             } else {
                 usize::from(arm == "restore_miss_debt")
@@ -2082,7 +2138,7 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
     sampled_scan::codex_cursor::with_test_limits(PAGE_BYTES, PAGE_BYTES, 128, || {
         for source in [SnapshotSource::Codex, SnapshotSource::ClaudeCode] {
             sampled_scan::set_test_now(Some(START));
-            let fixture = ScanFixture::new(source).without_content();
+            let fixture = ScanFixture::new(source).without_prompt();
             fixture.file.append(&usage(source, 100, 0, "fixture-model"));
             let before = fs::metadata(&fixture.file.0).unwrap().len();
             assert!(before < PAGE_BYTES, "seed is an ordinary read");
@@ -2247,7 +2303,16 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             drop(second);
             let third = Arc::new(sampled_scan::SharedCache::default());
             third.durable_begin_pass(source, &index_path, &namespace, true);
-            let restart_index = ScanIndex::load(&index_path).unwrap();
+            let mut restart_index = ScanIndex::load(&index_path).unwrap();
+            if source == SnapshotSource::Codex {
+                restart_index = fixture.resume_quiet_on_growth(
+                    source,
+                    restart_index,
+                    &third,
+                    &namespace.0,
+                    NOW,
+                );
+            }
             let mut correction_index = restart_index.clone();
             let ((mut next, raw, result, modes, bytes), retirement_diagnostics) =
                 crate::local_resource_diagnostics::capture(|| {

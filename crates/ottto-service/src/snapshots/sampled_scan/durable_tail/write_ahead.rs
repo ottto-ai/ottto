@@ -600,8 +600,14 @@ impl SharedCache {
         ) else {
             return Err(HeldCause::Fence);
         };
-        authorize_strict(slot, source, key, index, custody, binding, &certificate);
+        let refused = authorize_strict(slot, source, key, index, custody, binding, &certificate);
         stores.release_idle_custody(&digest);
+        if refused == Some(store::Refusal::Corrupt) {
+            // Known-corrupt disk state may coexist with valid RAM. It cannot
+            // authorize a new native chain: keep the ordinary RAM publication
+            // without staging or receipt debt. Eviction retains the disk hold.
+            return Err(HeldCause::Protected(store::Refusal::Corrupt));
+        }
         Ok(())
     }
 

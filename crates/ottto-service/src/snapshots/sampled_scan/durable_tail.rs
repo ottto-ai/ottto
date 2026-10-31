@@ -1716,17 +1716,17 @@ fn authorize_strict(
     custody: &mut KeyCustody,
     replacement: &Binding,
     certificate: &DurableCertificate,
-) {
+) -> Option<store::Refusal> {
     slot.indexed = index.files.len();
     slot.store
         .revoke(&store::key_digest(DurableSource::ClaudeCode, key));
-    let Some(scope) = slot.decided.get(key).and_then(ScopeDecision::scope) else {
-        return;
-    };
+    let scope = slot.decided.get(key).and_then(ScopeDecision::scope)?;
     let source = durable_source(snapshot_source).expect("durable source");
     let digest = store::key_digest(source, key);
-    let ReadOutcome::Found(record) = slot.store.read(&digest) else {
-        return;
+    let record = match slot.store.read(&digest) {
+        ReadOutcome::Found(record) => record,
+        ReadOutcome::Missing => return None,
+        ReadOutcome::Refused(reason) => return Some(reason),
     };
     let interpretation = Interpretation::of(
         snapshot_source,
@@ -1768,6 +1768,7 @@ fn authorize_strict(
             }
         }
     }
+    None
 }
 
 impl SharedCache {
@@ -5597,7 +5598,7 @@ impl SharedCache {
                 if replacement.acquisition.is_some() {
                     continue;
                 }
-                authorize_strict(
+                let _ = authorize_strict(
                     stores.slots[source.slot()].as_mut()?,
                     snapshot_source,
                     key,

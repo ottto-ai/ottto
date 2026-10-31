@@ -1539,7 +1539,7 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         for &fault in faults {
             sampled_scan::set_test_now(Some(START));
-            let fixture = ScanFixture::new(source).without_content();
+            let fixture = ScanFixture::new(source).without_prompt();
             fixture.file.append(&usage(source, 100, 0, "fixture-model"));
             let scope = Scope(format!("quiet-writer-{fault}"));
             let state = fixture.dir.join("state");
@@ -1746,10 +1746,14 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
             }
             drop(cache);
             let restart = begin();
-            let restart_index = ScanIndex::load(&index_path).unwrap();
+            let mut restart_index = ScanIndex::load(&index_path).unwrap();
             if fault == "index_save_error" {
                 assert_eq!(restart_index.files[&key].unverified_deadline(), owed_due);
                 assert!(restart_index.files[&key].audit_requires_full(START + 2 * 60 * 60));
+            }
+            if source == SnapshotSource::Codex && fault != "legacy_index_clear" {
+                restart_index =
+                    fixture.resume_quiet_on_growth(source, restart_index, &restart, &scope.0, NOW);
             }
             let (mut loaded, _, modes) = production_scan(
                 &fixture,
@@ -1772,10 +1776,9 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                     assert_eq!(restart.durable_counters(source).unwrap().0.restored, 1);
                     assert_eq!(loaded.files[&key].unverified_deadline(), owed_due);
                     assert!(loaded.files[&key].audit_requires_full(START + 2 * 60 * 60));
-                    // None came from the real record, while the original index
-                    // deadline still selected this Unchanged quiet audit. The
-                    // successful reconcile below requires that audit to stage
-                    // a NEW retirement; restore alone cannot stage or clear it.
+                    // The debtless record could not clear the original index
+                    // deadline. An admitted replay and this Unchanged audit
+                    // must stage a NEW retirement before receipt/CAS can clear it.
                     assert_eq!(
                         restart.retained_checkpoint(&key).unwrap().audit_debt(),
                         None

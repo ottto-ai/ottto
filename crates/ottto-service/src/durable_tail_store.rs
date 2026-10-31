@@ -1893,14 +1893,15 @@ impl DurableTailStore {
             if attempt
                 .as_ref()
                 .is_err_and(|error| !write_cleanup_failed(error))
-                && verified_prior
+                && (verified_prior || self.rebuilt.get(&key) == Some(&Rebuild::Offered))
                 && prior.is_some()
                 && stamp_at(&path)? == prior
             {
                 // The post-save index already refuses A. A failed rename left
-                // that exact verified predecessor untouched: do not retire it
+                // that exact verified or T14 predecessor untouched: do not retire it
                 // or lose the retry offer. The caller requeues this saved key,
-                // and the next selected pass can rewrite it from retained RAM.
+                // and retained RAM stays usable. A failed T14 replacement must
+                // not acquire receipt debt for a candidate that never survived.
                 self.pending.remove(&key);
                 return Err(attempt.err().expect("checked failed write"));
             }
