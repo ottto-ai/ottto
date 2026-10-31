@@ -92,7 +92,7 @@ fn validate_v1_goldens<'a>(
             "runner_arch",
         ]
         .iter()
-        .any(|key| manifest[*key].as_str().is_none_or(str::is_empty))
+        .any(|key| manifest[*key].as_str().map_or(true, str::is_empty))
     {
         return Err(bad());
     }
