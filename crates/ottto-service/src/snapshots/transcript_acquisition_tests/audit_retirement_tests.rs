@@ -1571,13 +1571,8 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 1
             );
             fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-            let (mut index, _, modes) = {
-                // Only this compatibility arm reproduces a V1 writer's lost
-                // index marker. V3's verified envelope carries its own debt.
-                let _legacy_writer = (fault == "legacy_index_clear")
-                    .then(crate::snapshots::RestartRestoreForTest::disabled);
-                production_scan(&fixture, source, index, Some(cache.clone()), &scope.0)
-            };
+            let (mut index, _, modes) =
+                production_scan(&fixture, source, index, Some(cache.clone()), &scope.0);
             assert_eq!(modes, (0, 1, 0));
             assert!(index.files[&key].has_unverified_source());
             index.save(&index_path).unwrap();
@@ -1594,13 +1589,25 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 .unwrap()
                 .unwrap()
                 .path();
-            let predecessor = fs::read(&record_path).unwrap();
             let ds = sampled_scan::durable_tail::durable_source(source).unwrap();
             let mut disk =
                 store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
             let store::ReadOutcome::Found(record) = disk.read(&store::key_digest(ds, &key)) else {
                 panic!("the native predecessor is verified");
             };
+            // Binding OFF ruling: OFF never writes records. Reproduce the
+            // historical V1 writer with the existing checked byte fixture.
+            let record = if fault == "legacy_index_clear" {
+                sampled_scan::durable_tail::tests::seed_pinned_v1(&cache, source, &key, &index);
+                let store::ReadOutcome::Found(record) = disk.read(&store::key_digest(ds, &key))
+                else {
+                    panic!("the legacy predecessor is verified");
+                };
+                record
+            } else {
+                record
+            };
+            let predecessor = fs::read(&record_path).unwrap();
             assert_eq!(
                 record.format,
                 if fault == "legacy_index_clear" {

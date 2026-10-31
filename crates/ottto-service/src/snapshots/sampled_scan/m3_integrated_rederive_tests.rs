@@ -565,7 +565,7 @@ fn native_replacement_finishes_retirement_before_eviction_and_growth() {
                 Err(std::io::Error::other("retirement barrier"))
             })));
             cache.durable_write_after_save(
-                test_locks::hold(&rig.root),
+                crate::locked_state_dir::held_for(&rig.index_path).unwrap(),
                 SnapshotSource::Codex,
                 &rig.index,
             );
@@ -574,7 +574,11 @@ fn native_replacement_finishes_retirement_before_eviction_and_growth() {
         }
         let (next, _, fulls) = rig.scan(cache.clone(), rig.index.clone());
         assert_eq!(fulls, 1);
-        cache.durable_write_after_save(test_locks::hold(&rig.root), SnapshotSource::Codex, &next);
+        cache.durable_write_after_save(
+            crate::locked_state_dir::held_for(&rig.index_path).unwrap(),
+            SnapshotSource::Codex,
+            &next,
+        );
         {
             let stores = cache.durable().unwrap();
             assert!(stores
@@ -640,7 +644,11 @@ fn corrupt_retired_predecessor_rebuilds_once_without_withholding_native_usage() 
     let counts = cache.durable_counters(SnapshotSource::Codex).unwrap().1;
     assert_eq!(counts.t14_rebuild, 1);
     assert_eq!(counts.t14_rebuild_full_started, 1);
-    cache.durable_write_after_save(test_locks::hold(&rig.root), SnapshotSource::Codex, &next);
+    cache.durable_write_after_save(
+        crate::locked_state_dir::held_for(&rig.index_path).unwrap(),
+        SnapshotSource::Codex,
+        &next,
+    );
     cache.retained().unwrap().clear();
     rig.append();
     let (_, _, fulls) = rig.scan(cache.clone(), next);

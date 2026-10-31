@@ -2396,11 +2396,11 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         assert_eq!(disk.disk_records, 3, "{arm}");
         assert_eq!(
             counts.not_persisted,
-            if t14 {
-                BTreeMap::from([("skill_label_purge_failed", 2)])
-            } else {
-                BTreeMap::new()
-            },
+            BTreeMap::from([
+                ("skill_label_scanned", 1),
+                ("skill_label_purged", 0),
+                ("skill_label_purge_failed", 2 * u64::from(t14)),
+            ]),
             "{arm}: no selection refusal"
         );
         assert_eq!(disk.records_invalidated, 0, "{arm}");
@@ -13141,36 +13141,51 @@ fn retired_missing_native_rebuild_then_successor_tails_without_double_count() {
 /// [off=main] No-record growth follows the ordinary Full path with zero store I/O.
 #[test]
 fn off_no_record_growth_uses_ordinary_full_without_store_io() {
-    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
-        let _on = crate::snapshots::RestartRestoreForTest::enabled();
-        let f = O3Fixture::new();
-        std::fs::remove_dir_all(store::store_dir_for_index(&f.index_path)).unwrap();
-        let marker = store::store_dir_for_index(&f.index_path).with_extension("private-labels");
-        if marker.exists() {
-            std::fs::remove_file(marker).unwrap();
-        }
-        let _off = crate::snapshots::RestartRestoreForTest::disabled();
-        let owner = f.owner();
-        let mut prior = f.prior.clone();
-        store::test_hooks::set_before_access(Some(Box::new(|_, _| panic!("OFF store I/O"))));
-        let (_, quiet, modes) = f.scan(&owner, &mut prior);
-        assert!(quiet.snapshots.is_empty());
-        assert_eq!(modes.0 + modes.1, 0);
-        f.append("growth", 200);
-        let (_, grown, modes) = f.scan(&owner, &mut prior);
-        store::test_hooks::set_before_access(None);
-        assert_eq!(modes.0, 1);
-        assert_eq!(modes.1, 0);
-        assert_eq!(grown.snapshots[0].input_tokens, 300);
-        let (counts, store) = owner
-            .cache
-            .durable_counters(SnapshotSource::ClaudeCode)
-            .unwrap();
-        assert_eq!(counts.restore_attempts, 0);
-        assert_eq!(
-            store.guard_header_bytes + store.guard_verify_bytes + store.bytes_read,
-            0
-        );
-        assert_eq!(store.records_written, 0);
-    });
+    let _off = crate::snapshots::RestartRestoreForTest::disabled();
+    let root = crate::test_scratch::ScratchDir::new("off-no-record");
+    let projects = root.join("projects");
+    std::fs::create_dir(&projects).unwrap();
+    let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+    std::fs::write(&path, a1a_row("accepted", 100)).unwrap();
+    let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
+    let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
+    let index_path = root.join("index.json");
+    owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
+    store::test_hooks::set_before_access(Some(Box::new(|_, _| panic!("OFF store I/O"))));
+    let scan = |index| {
+        owner.scan(
+            std::slice::from_ref(&projects),
+            &root,
+            index,
+            100,
+            true,
+            &births,
+            &[],
+        )
+    };
+    let (mut prior, mut first, modes) = scan(ScanIndex::default());
+    assert_eq!(modes.0, 1);
+    a1a_wire(&root, &mut prior, &mut first);
+    let (prior, quiet, modes) = scan(prior);
+    assert!(quiet.snapshots.is_empty());
+    assert_eq!(modes.0 + modes.1, 0);
+    std::io::Write::write_all(
+        &mut std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap(),
+        a1a_row("growth", 200).as_bytes(),
+    )
+    .unwrap();
+    let (mut prior, mut grown, modes) = scan(prior);
+    store::test_hooks::set_before_access(None);
+    assert_eq!(modes.0, 1);
+    assert_eq!(modes.1, 0);
+    a1a_wire(&root, &mut prior, &mut grown);
+    assert_eq!(grown.snapshots[0].input_tokens, 300);
+    assert!(owner
+        .cache
+        .durable_counters(SnapshotSource::ClaudeCode)
+        .is_none());
+    assert!(!store::store_dir_for_index(&index_path).exists());
 }

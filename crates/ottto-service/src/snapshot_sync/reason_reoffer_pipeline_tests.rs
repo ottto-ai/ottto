@@ -1449,6 +1449,15 @@ fn refused_then_conflicted_holding(
 ) -> (ReofferPipeline, String, u64, serde_json::Value) {
     let t0 = current_unix_seconds();
     let mut pipeline = ReofferPipeline::new(name, Answer::Refuse(ORIGINAL_PAIR), t0);
+    // Keep this physical-read fixture larger than its bounded certificate
+    // samples, so total guard + suffix bytes can distinguish restore from Full.
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(pipeline.transcript())
+        .unwrap()
+        .write_all((" ".repeat(32 * 1024) + "{}\n").as_bytes())
+        .unwrap();
     #[cfg(unix)]
     if locked {
         pipeline.hold_state_dir_lock();
