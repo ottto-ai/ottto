@@ -524,7 +524,7 @@ pub(super) struct HeaderInventory {
     /// One compact, funded classification per completed inventory revision.
     archive_classes: Vec<(Arc<String>, FamilyClass)>,
     family_peak: usize,
-    carriers: Vec<(String, String)>,
+    carriers: Vec<(String, Arc<String>)>,
     pub(super) reuse_hits: usize,
     pub(super) reuse_misses: usize,
     pub(super) bytes_avoided: usize,
@@ -1011,13 +1011,14 @@ impl HeaderInventory {
                     index
                         .files
                         .len()
-                        .checked_mul(3 * (std::mem::size_of::<(String, String)>() + 64))?,
+                        .checked_mul(3 * (std::mem::size_of::<(String, Arc<String>)>() + 64))?,
                 )?
+                .checked_add(index.files.len().checked_mul(48)?)?
                 .checked_add(
                     index
                         .files
                         .keys()
-                        .try_fold(0usize, |n, key| n.checked_add(key.len().checked_mul(5)?))?,
+                        .try_fold(0usize, |n, key| n.checked_add(key.len()))?,
                 )?;
             peak = peak.max(self.family_peak).max(carrier_phase);
         }
@@ -1074,14 +1075,15 @@ impl HeaderInventory {
         // scope only. Build once, instead of a full index walk per archive.
         let mut carriers = Vec::with_capacity(3 * index.files.len());
         for (path, entry) in &index.files {
+            let shared_path = Arc::new(path.clone());
             if let Some(owner) = &entry.codex_protected_owner {
-                carriers.push((owner.clone(), path.clone()));
+                carriers.push((owner.clone(), shared_path.clone()));
             }
             if !codex_archive_path(Path::new(path)) {
                 for id in codex_session_id_candidates_from_path(Path::new(path)) {
                     let owner = codex_protected_owner(&id);
                     if entry.codex_protected_owner.as_ref() != Some(&owner) {
-                        carriers.push((owner, path.clone()));
+                        carriers.push((owner, shared_path.clone()));
                     }
                 }
             }
