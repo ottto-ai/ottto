@@ -25,7 +25,6 @@ use crate::snapshot_client::{
     SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
     CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT,
 };
-#[cfg(test)]
 use crate::snapshots::validate_snapshot_batch_request;
 use crate::snapshots::{
     apply_upload_policy, collector_version, context_curve_derivation_revision,

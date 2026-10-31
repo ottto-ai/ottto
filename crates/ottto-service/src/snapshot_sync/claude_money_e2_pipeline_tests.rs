@@ -251,7 +251,7 @@ impl Page {
                     None,
                     Some((&self.cache, &self.committed)),
                     accepted,
-                    None,
+                    Default::default(),
                 )
                 .unwrap()
             });

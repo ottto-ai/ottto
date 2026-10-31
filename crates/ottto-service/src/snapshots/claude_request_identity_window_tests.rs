@@ -2490,7 +2490,7 @@ fn advertised_cap_retags_previously_stripped_accepted_body() {
         &proof,
         &ledger,
         0,
-        Some(3_145_728),
+        Some(2_097_152),
     )
     .unwrap();
     assert_eq!(result, Tagged::Sent { refusals: 0 });
@@ -2505,7 +2505,7 @@ fn advertised_cap_retags_previously_stripped_accepted_body() {
     assert_eq!(ledger.get(&second.source_session_id).unwrap().len(), 400);
     let accepted_bytes = serde_json::to_vec(&ledger).unwrap();
     let mut third = original;
-    identity::apply_with_reserved_bytes_for_test(&mut third, &proof, &ledger, 0, Some(3_145_728))
+    identity::apply_with_reserved_bytes_for_test(&mut third, &proof, &ledger, 0, Some(2_097_152))
         .unwrap();
     assert_eq!(
         serde_json::to_vec(&third).unwrap(),
