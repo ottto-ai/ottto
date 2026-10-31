@@ -298,23 +298,21 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     let parent = f.path.parent().unwrap().with_file_name(namespace);
     fs::rename(f.path.parent().unwrap(), &parent).unwrap();
     f.path = parent.join(f.path.file_name().unwrap());
-    let route_binding = binding(&f.path).unwrap();
     let live = || {
         let _owner = super::super::super::CheckpointLock::acquire(&f.path).unwrap();
-        crate::snapshots::state_v2::live_key_digests(&route_binding).unwrap()
+        crate::snapshots::state_v2::live_key_digests(&f.path).unwrap()
     };
     assert_eq!(live().incomplete_reason, Some(IncompleteReason::Off));
     // Pi has no key mapping: never an empty complete set that a sweep could erase by.
     let pi = crate::snapshots::state_v2::live_key_digests(
-        &crate::snapshots::scan_index_persistence::Binding {
-            source: crate::snapshots::scan_index_persistence::Source::Pi,
-            ..route_binding.clone()
-        },
+        &f.path.with_file_name("pi-test-scan-index.json"),
     )
     .unwrap();
     assert!(!pi.complete && pi.digests.is_empty());
     assert_eq!(pi.incomplete_reason, Some(IncompleteReason::Off));
     f.published();
+    // Published custody before this process's first load: v1 JSON is stale.
+    assert_eq!(live().incomplete_reason, Some(IncompleteReason::Import));
     let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
     let file = serde_json::from_value(serde_json::json!({
         "size_bytes": 4, "modified_unix_seconds": 1,
@@ -354,7 +352,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     fs::write(&f.path, b"invalid-publication-fence").unwrap();
     {
         let _owner = super::super::super::CheckpointLock::acquire(&f.path).unwrap();
-        assert!(crate::snapshots::state_v2::live_key_digests(&route_binding).is_err());
+        assert!(crate::snapshots::state_v2::live_key_digests(&f.path).is_err());
     }
     fs::write(&f.path, fence_bytes).unwrap();
     let mut stale = retry.clone();

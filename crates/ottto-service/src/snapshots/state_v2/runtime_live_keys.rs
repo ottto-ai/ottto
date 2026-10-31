@@ -1,7 +1,7 @@
 //! Committed, content-free membership for R1's restart-record erasure sweep.
 use super::*;
 use crate::durable_tail_store::DurableSource;
-use crate::snapshots::scan_index_persistence::{Binding, Source};
+use crate::snapshots::scan_index_persistence::Source;
 use std::collections::BTreeSet;
 
 #[cfg_attr(
@@ -44,7 +44,12 @@ impl LiveKeys {
         reason = "R1 integrates this committed-membership seam in its sweep"
     )
 )]
-pub(crate) fn live_key_digests(binding: &Binding) -> Result<LiveKeys> {
+pub(crate) fn live_key_digests(index_path: &Path) -> Result<LiveKeys> {
+    let Some(binding) =
+        super::super::super::scan_index_integration::scan_index_storage_binding(index_path)
+    else {
+        return Ok(LiveKeys::incomplete(IncompleteReason::Off));
+    };
     let source = match binding.source {
         Source::Claude => DurableSource::ClaudeCode,
         Source::Codex => DurableSource::Codex,
@@ -56,18 +61,27 @@ pub(crate) fn live_key_digests(binding: &Binding) -> Result<LiveKeys> {
         let states = states().lock().map_err(|_| Hold::DbUnavailable)?;
         let mut matches = states.iter().filter(|(path, _)| {
             super::super::super::scan_index_integration::scan_index_storage_binding(path).as_ref()
-                == Some(binding)
+                == Some(&binding)
         });
-        let Some((path, state)) = matches.next() else {
-            // OFF/unpublished: no store, fence or sentinel is opened.
-            return Ok(LiveKeys::incomplete(IncompleteReason::Off));
-        };
-        if matches.next().is_some() {
+        let route = matches
+            .next()
+            .map(|(path, state)| (path.clone(), state.clone()));
+        if route.is_some() && matches.next().is_some() {
             return Ok(LiveKeys::incomplete(IncompleteReason::Hold));
         }
-        (path.clone(), state.clone())
+        route
     };
-    let (path, state) = route;
+    let Some((path, state)) = route else {
+        // Not loaded yet (daemon start, a sweep before the first load):
+        // published custody makes v1 JSON stale, so S1 can't vouch until its
+        // load imports the route. OFF/unpublished opens no store or sentinel.
+        let reason = if published(index_path)? {
+            IncompleteReason::Import
+        } else {
+            IncompleteReason::Off
+        };
+        return Ok(LiveKeys::incomplete(reason));
+    };
     let state = state.lock().map_err(|_| Hold::DbUnavailable)?;
     if !state.latched {
         return Ok(LiveKeys::incomplete(IncompleteReason::Import));
@@ -109,10 +123,10 @@ pub(crate) fn live_key_digests(binding: &Binding) -> Result<LiveKeys> {
         return Ok(LiveKeys::incomplete(IncompleteReason::Reload));
     }
     ensure!(
-        session.identity.binding == *binding && session.path == path,
+        session.identity.binding == binding && session.path == path,
         Hold::ForeignBinding
     );
-    let pair = fence::reconcile(&path, binding, state.latched)?;
+    let pair = fence::reconcile(&path, &binding, state.latched)?;
     ensure!(
         pair.is_some_and(|(identity, _)| identity == session.identity),
         Hold::FenceLost
