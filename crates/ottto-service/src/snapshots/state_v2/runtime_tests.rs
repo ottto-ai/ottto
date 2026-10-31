@@ -1457,12 +1457,23 @@ fn alarmed_resume_exclusion_backs_off_to_growth_full_interval() {
     let mut excluded = ResumeExclusion::new(G, 0);
     assert!(!excluded.alarmed(now));
     let early = excluded.backoff(now);
-    // Repeated failed passes reach the shared alarm predicate.
-    while !excluded.alarmed(now) {
+    // Repeated failed passes reach the shared alarm predicate (bounded, so a
+    // missing pass trigger fails instead of hanging).
+    for _ in 0..64 {
+        if excluded.alarmed(now) {
+            break;
+        }
         excluded.passes += 1;
     }
+    assert!(excluded.alarmed(now));
     assert_eq!(excluded.backoff(now), growth_full);
     assert!(early < growth_full);
+    // Age alone alarms too: a week after first_seen, with no repeated pass.
+    let aged = ResumeExclusion::new(G, 0);
+    let later = aged.first_seen + Duration::from_secs(7 * 24 * 3600);
+    assert_eq!(aged.passes, 0);
+    assert!(!aged.alarmed(aged.first_seen));
+    assert_eq!(aged.backoff(later), growth_full);
 }
 
 /// [off=main] a bound v1-only source never opens, creates or migrates SQLite custody.
