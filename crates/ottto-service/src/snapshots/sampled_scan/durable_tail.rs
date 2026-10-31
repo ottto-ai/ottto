@@ -527,6 +527,7 @@ struct Slot {
     skill_labels_enabled: bool,
     /// A completed OFF purge stays valid until this slot permits labels again.
     skill_label_purge_complete: bool,
+    skill_label_purge_failures: u8,
     /// Keys held (U) by this source, and the totals the last alarm reported:
     /// [held, t14_rebuild, mode_repaired, disabled, rebuild_full,
     /// upgrade_state_missing, old_binding_no_match, retail_exhausted[3], stale_full[3]].
@@ -2276,9 +2277,6 @@ impl SharedCache {
         namespace: &Scope,
         identity_capture: bool,
     ) {
-        if !restart_restore::enabled() {
-            return;
-        }
         let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) else {
             return;
         };
@@ -2329,6 +2327,7 @@ impl SharedCache {
                 identity_capture,
                 skill_labels_enabled: false,
                 skill_label_purge_complete: false,
+                skill_label_purge_failures: 0,
                 held: 0,
                 old_binding_no_match: 0,
                 reported: [0; 22],
@@ -2337,7 +2336,9 @@ impl SharedCache {
             });
         }
         if let Some(slot) = slot.as_mut() {
-            slot.store.begin_pass();
+            if restart_restore::enabled() {
+                slot.store.begin_pass();
+            }
             // At most one resource probe per pass; the store owns its back-off.
             // Held keys retry through their own next native write.
             if restart_restore::enabled() && slot.store.resource_paused() {
@@ -5308,6 +5309,7 @@ impl SharedCache {
         index: &ScanIndex,
     ) -> Option<store::BatchReceipt> {
         durable_source(snapshot_source)?;
+        self.erase_private_labels(writer, snapshot_source, None);
         if !restart_restore::enabled() {
             return None;
         }
@@ -5328,6 +5330,67 @@ impl SharedCache {
         );
         lease.release();
         result
+    }
+
+    fn erase_private_labels<W: SingleWriter>(
+        &self,
+        writer: &W,
+        snapshot_source: SnapshotSource,
+        keep: Option<&BTreeSet<store::Digest32>>,
+    ) {
+        let Some(source) = durable_source(snapshot_source) else {
+            return;
+        };
+        let needed = self.durable().is_some_and(|mut stores| {
+            stores.slot(source).as_ref().is_some_and(|slot| {
+                (keep.is_some() || (!slot.skill_labels_enabled && !slot.skill_label_purge_complete))
+                    && slot.store.private_label_purge_needed(keep)
+            })
+        });
+        if !needed {
+            return;
+        }
+        let store::LeaseWait::Granted(lease) =
+            self.acquire_active(snapshot_source, store::RESTORE_INPUT_BYTES)
+        else {
+            return;
+        };
+        if let Some(mut stores) = self.durable() {
+            if let Some(slot) = stores.slot(source).as_mut() {
+                let result = match keep {
+                    Some(keep) => slot.store.purge_private_labels_kept(writer, keep, |body| {
+                        codec::body_has_skill_labels(body).unwrap_or(true)
+                    }),
+                    None => slot.store.purge_private_labels(writer, |body| {
+                        codec::body_has_skill_labels(body).unwrap_or(true)
+                    }),
+                };
+                let (scanned, erased, failed) =
+                    result.map_or((0, 0, 1), |r| (r.scanned, r.erased, r.refused));
+                slot.skill_label_purge_complete =
+                    failed == 0 && !slot.store.private_label_purge_needed(None);
+                slot.skill_label_purge_failures = if failed == 0 {
+                    0
+                } else {
+                    slot.skill_label_purge_failures.saturating_add(1)
+                };
+                let alarm = slot.skill_label_purge_failures > 3;
+                for (class, count) in [
+                    ("skill_label_scanned", scanned),
+                    ("skill_label_purged", erased),
+                    ("skill_label_purge_failed", failed),
+                ] {
+                    *stores.counters.not_persisted.entry(class).or_default() += count;
+                }
+                if alarm {
+                    crate::local_resource_diagnostics::durable_tail_alarm(
+                        snapshot_source.api_slug(),
+                        &serde_json::json!({"skill_label_purge_failed_consecutive":4}),
+                    );
+                }
+            }
+        }
+        lease.release();
     }
 
     fn write_after_save_active<W: SingleWriter>(
@@ -5630,6 +5693,17 @@ impl SharedCache {
                 return None;
             }
         };
+        for record in &pending {
+            if codec::body_has_skill_labels(&record.body).unwrap_or(true)
+                && slot
+                    .store
+                    .mark_private_labels(writer, record.binding.key)
+                    .is_err()
+            {
+                stores.retry_offered(offered, index);
+                return None;
+            }
+        }
         let offered_files = pending.len() as u64;
         let before = slot.store.counters().store_write_failed;
         let result = slot
@@ -5717,6 +5791,14 @@ impl SharedCache {
         snapshot_source: SnapshotSource,
         index: &ScanIndex,
     ) -> std::io::Result<()> {
+        if let Some(ds) = durable_source(snapshot_source) {
+            let keep = index
+                .files
+                .keys()
+                .map(|key| store::key_digest(ds, key))
+                .collect();
+            self.erase_private_labels(writer, snapshot_source, Some(&keep));
+        }
         if !restart_restore::enabled() {
             return Ok(());
         }
@@ -5857,6 +5939,7 @@ impl SharedCache {
         writer: &W,
         snapshot_source: SnapshotSource,
     ) -> std::io::Result<()> {
+        self.erase_private_labels(writer, snapshot_source, Some(&BTreeSet::new()));
         if !restart_restore::enabled() {
             return Ok(());
         }
@@ -6202,8 +6285,6 @@ pub(crate) enum MissClass {
     Failure(Failure),
     /// A non-transient resource refusal whose held file grew: ordinary Full.
     Resource(&'static str),
-    BudgetRefused,
-    TakeLost,
     Unregistered(Obligation),
 }
 
@@ -6272,8 +6353,6 @@ impl MissClass {
             Self::StaleSelection => "ineligible.selection_cleared.stale_record",
             Self::HistoryOwed => "ineligible.history_owed",
             Self::Missing => "missing",
-            Self::BudgetRefused => "budget_refused",
-            Self::TakeLost => "restore_take_lost",
             Self::Resource(phase) | Self::Failure(Failure::Resource(phase)) => prefixed!(
                 "resource_full.",
                 phase,

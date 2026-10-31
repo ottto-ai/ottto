@@ -762,6 +762,15 @@ impl SharedCache {
             if !slot.store.check_resources(writer, index_len) {
                 return PrepareOutcome::Degraded(Degraded::Paused);
             }
+            if (!view.accumulator.activity_skills.is_empty()
+                || !view.accumulator.provider_skills.is_empty())
+                && slot
+                    .store
+                    .mark_private_labels(writer, chain.binding().key)
+                    .is_err()
+            {
+                return PrepareOutcome::NotPersisted(NotPersisted::Codec);
+            }
             match slot.store.prepare_stream(writer, header) {
                 Ok(preparation) => preparation,
                 Err(failure) if failure.stage() == "stream_budget" => {

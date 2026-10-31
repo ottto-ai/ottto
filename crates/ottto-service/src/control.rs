@@ -23696,11 +23696,14 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
+    /// [format] OFF forget-installation erases prior private-label artifacts.
     fn forget_installation_clears_identity_scope_credentials_and_receipts_only() {
+        let _off = crate::snapshots::RestartRestoreForTest::disabled();
         let root = telemetry_key_store_root("forget-installation");
         let support_root = root.join("support");
         let secret_root = root.join("secrets");
         fs::create_dir_all(support_root.join("snapshots/destinations/old")).unwrap();
+        seed_private_literal_canary(&support_root.join("snapshots"));
         fs::create_dir_all(&secret_root).unwrap();
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);

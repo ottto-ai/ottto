@@ -747,6 +747,7 @@ const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp, b
 /// Counts erasures and unadjudicated records in one privacy pass. No receipt
 /// or per-key state escapes the store; partial progress is always reported.
 pub(crate) struct PrivateLabelPurge {
+    pub(crate) scanned: u64,
     pub(crate) erased: u64,
     pub(crate) refused: u64,
 }
@@ -2220,94 +2221,174 @@ impl DurableTailStore {
         Ok(keys)
     }
 
-    /// Explicit privacy erasure after the owning cycle's index save. Only
-    /// fully verified records of the current representation are inspected;
-    /// unknown/future records retain their existing protection. This is not
-    /// overwrite authority, a receipt, or settlement of acquisition debt.
-    /// Compact pending receipt metadata stays owed if its record is erased.
-    pub(crate) fn purge_private_labels<W: SingleWriter>(
+    /// Known-empty inventory is the only negative privacy fact. An absent
+    /// store needs no sweep; an existing store with a missing/damaged inventory
+    /// fails closed. The inventory carries key digests only, never labels.
+    fn private_label_keys(&self) -> io::Result<Option<BTreeSet<Digest32>>> {
+        if matches!(fs::symlink_metadata(&self.dir), Err(e) if e.kind() == io::ErrorKind::NotFound)
+        {
+            return Ok(Some(BTreeSet::new()));
+        }
+        let path = self.dir.with_extension("private-labels");
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(_) => return Ok(None),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.uid() != our_uid() || metadata.mode() & 0o777 != 0o600 {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take((4 + 32 * MAX_RECORDS + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if !bytes.starts_with(b"PL01")
+            || (bytes.len() - 4) % 32 != 0
+            || bytes.len() > 4 + 32 * MAX_RECORDS
+        {
+            return Ok(None);
+        }
+        let mut keys = BTreeSet::new();
+        for key in bytes[4..].chunks_exact(32) {
+            if !keys.insert(key.try_into().expect("digest width")) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(keys))
+    }
+
+    pub(crate) fn private_label_purge_needed(&self, keep: Option<&BTreeSet<Digest32>>) -> bool {
+        !matches!(self.private_label_keys(), Ok(Some(keys)) if keys.iter().all(|key| keep.is_some_and(|keep| keep.contains(key))))
+    }
+
+    fn write_private_label_keys<W: SingleWriter>(
         &mut self,
         writer: &W,
+        keys: Option<&BTreeSet<Digest32>>,
+    ) -> io::Result<()> {
+        self.check_writer(writer)?;
+        ensure_private_dir(&self.dir)?;
+        let mut bytes = b"PL??".to_vec();
+        if let Some(keys) = keys.filter(|keys| keys.len() <= MAX_RECORDS) {
+            bytes = b"PL01".to_vec();
+            for key in keys {
+                bytes.extend_from_slice(key);
+            }
+        }
+        let path = self.dir.with_extension("private-labels");
+        write_atomic(
+            writer,
+            &self.dir,
+            &path,
+            &bytes,
+            stamp_at(&path)?,
+            self.cleanup.clone(),
+        )?;
+        self.sync_store()
+    }
+
+    /// Persist the inventory BEFORE any literal can reach a record or temp.
+    pub(crate) fn mark_private_labels<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        key: Digest32,
+    ) -> io::Result<()> {
+        let mut keys = self.private_label_keys().unwrap_or(None);
+        if let Some(keys) = keys.as_mut() {
+            keys.insert(key);
+        }
+        self.write_private_label_keys(writer, keys.as_ref())
+    }
+
+    /// Consent/source erasure uses the existing bounded inventory and verifier.
+    /// `keep` is empty for revoked consent; otherwise it protects live PL keys.
+    pub(crate) fn purge_private_labels_kept<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        keep: &BTreeSet<Digest32>,
         mut contains: impl FnMut(&[u8]) -> bool,
     ) -> io::Result<PrivateLabelPurge> {
         self.check_writer(writer)?;
-        if !self.usable(Some(writer)) {
-            return Err(io::Error::other("privacy erasure store unavailable"));
-        }
-        let entries = match fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Ok(PrivateLabelPurge {
-                    erased: 0,
-                    refused: 0,
-                })
-            }
-            Err(e) => return Err(e),
+        let known = self.private_label_keys().unwrap_or(None);
+        let keys = match known.as_ref() {
+            Some(keys) => keys.clone(),
+            None => self.inventory_after(None)?,
         };
+        let mut remaining = BTreeSet::new();
         let mut report = PrivateLabelPurge {
+            scanned: 0,
             erased: 0,
             refused: 0,
         };
-        // Stream names, holding at most one existing bounded record body.
-        // Consent erasure covers every known record, even after a bad entry.
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    report.refused += 1;
-                    continue;
-                }
-            };
-            let name = entry.file_name();
-            let Some(key) = name
-                .to_str()
-                .and_then(|s| s.strip_suffix(RECORD_SUFFIX))
-                .and_then(parse_hex_digest)
-            else {
+        let mut erased = 0;
+        for key in &keys {
+            if keep.contains(key) {
+                remaining.insert(*key);
                 continue;
-            };
-            let path = self.record_path(&key);
+            }
+            report.scanned += 1;
+            let path = self.record_path(key);
             let before = match stamp_at(&path) {
-                Ok(stamp) => stamp,
+                Ok(None) => continue,
+                Ok(Some(stamp)) => stamp,
                 Err(_) => {
                     report.refused += 1;
+                    remaining.insert(*key);
                     continue;
                 }
             };
-            let verified = match self.read_known(&key, Some(writer), true) {
+            let verified = match self.read_known(key, Some(writer), true) {
                 Ok(Some(verified)) => verified,
-                Ok(None) => continue,
-                Err(Refusal::Unknown | Refusal::NewerFormat) => continue,
-                Err(_) => {
+                Ok(None) if !path.exists() && self.disabled.is_none() => continue,
+                Err(Refusal::Repin) => continue, // The pre-PL pin cannot contain label literals.
+                _ => {
                     report.refused += 1;
+                    remaining.insert(*key);
                     continue;
                 }
             };
             if !contains(&verified.record.record.body) {
                 continue;
             }
-            if before.is_none() || stamp_at(&path).ok() != Some(before) {
+            if stamp_at(&path).ok() != Some(Some(before)) || remove_if_present(&path).is_err() {
                 report.refused += 1;
+                remaining.insert(*key);
                 continue;
             }
-            if remove_if_present(&path).is_err() {
-                report.refused += 1;
-                continue;
-            }
-            // Erasure revokes an undelivered retained completion, not the
-            // candidate's owed work. Reconciliation must subsequently prove
-            // synced absence and return Retired, never deliver that receipt.
-            if let Some(pending) = self.pending.get_mut(&key) {
+            if let Some(pending) = self.pending.get_mut(key) {
                 pending.completed = None;
             }
-            self.durable.remove(&key);
-            report.erased += 1;
+            self.durable.remove(key);
+            erased += 1;
         }
-        // Also sync an empty retry after an earlier failed erasure sync.
+        // No erase count until unlink AND its directory barrier have succeeded.
         if self.sync_store().is_err() {
+            report.refused += erased.max(1);
+            return Ok(report); // Previous inventory still says PL may exist.
+        }
+        report.erased = erased;
+        // The normal store is bounded to MAX_RECORDS. Unexpected oversized
+        // legacy directories stay unknown and counted, never falsely clean.
+        if (known.is_none() && keys.len() >= GC_RECORDS_PER_PASS)
+            || self
+                .write_private_label_keys(writer, Some(&remaining))
+                .is_err()
+        {
             report.refused += 1;
         }
         Ok(report)
+    }
+
+    pub(crate) fn purge_private_labels<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        contains: impl FnMut(&[u8]) -> bool,
+    ) -> io::Result<PrivateLabelPurge> {
+        self.purge_private_labels_kept(writer, &BTreeSet::new(), contains)
     }
 
     /// Retire exactly the verified predecessor. `sync_due` belongs to writer

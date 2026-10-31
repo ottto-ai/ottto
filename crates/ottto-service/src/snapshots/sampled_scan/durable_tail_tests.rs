@@ -12214,68 +12214,98 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// [format] consent off post save purges pl records and on does not force a read or write.
+/// [format] OFF erasure covers prior labels, damaged inventory, failed unlink/retry and no-store zero scans.
 #[test]
 fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let root = crate::test_scratch::private_dir("skill-consent-save");
-    let lock = test_locks::hold(&root);
-    let source = SnapshotSource::ClaudeCode;
-    let path = root.join("synthetic.jsonl");
-    native_fixture(&path);
-    let scope = Scope("skill-consent".into());
-    let index_path = root.join("index.json");
-    let mut index = ScanIndex::default();
-    index.save(&index_path).unwrap();
-    let before_index = std::fs::read(&index_path).unwrap();
-    let key = store::key_digest(DurableSource::ClaudeCode, "synthetic");
-    let mut disk = DurableTailStore::new(
-        store::store_dir_for_index(&index_path),
-        DurableSource::ClaudeCode,
-    );
-    disk.write_after_save(
-        lock,
-        index.generation,
-        0,
-        vec![PendingRecord {
-            acquisition: None,
-            binding: Binding {
-                source: DurableSource::ClaudeCode,
-                key,
-                context: [1; 32],
-                scope: [2; 32],
-                entry: [3; 32],
-            },
-            certificate: certificate(&path, &scope),
-            body: crate::snapshots::durable_store_fixture_body_with_skill(),
-            allowlist: codec::allowlist_digest(source),
-        }],
-    )
-    .unwrap();
-    assert!(matches!(disk.read(&key), ReadOutcome::Found(_)));
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &scope, false);
-    cache.durable_skill_label_permission(source, false);
-    cache.durable_write_after_save(lock, source, &index);
-    assert!(matches!(disk.read(&key), ReadOutcome::Missing));
-    let (counts, _) = cache.durable_counters(source).unwrap();
-    assert_eq!(counts.not_persisted.get("skill_label_purged"), Some(&1));
-    assert_eq!(
-        std::fs::read(&index_path).unwrap(),
-        before_index,
-        "privacy erasure changes no committed money/ACK state"
-    );
-    cache.durable_skill_label_permission(source, true);
-    cache.durable_write_after_save(lock, source, &index);
-    assert!(
-        matches!(disk.read(&key), ReadOutcome::Missing),
-        "consent enablement alone cannot create a record or force a transcript read"
-    );
-    cache.durable_begin_pass(source, &index_path, &scope, false);
-    assert!(
-        !cache.skill_labels_enabled(source),
-        "a new cycle defaults fail-closed until its owner supplies policy"
-    );
+    let _reset = ClearWriteFaults;
+    for case in ["consent", "unreadable", "failure", "no-marker"] {
+        let root = crate::test_scratch::ScratchDir::new("skill-consent-save");
+        let lock = test_locks::hold(&root);
+        let source = SnapshotSource::ClaudeCode;
+        let ds = durable_source(source).unwrap();
+        let path = root.join("synthetic.jsonl");
+        native_fixture(&path);
+        let scope = Scope("skill-consent".into());
+        let index_path = root.join("index.json");
+        let mut index = ScanIndex::default();
+        index.save(&index_path).unwrap();
+        let before_index = std::fs::read(&index_path).unwrap();
+        let key = store::key_digest(ds, "synthetic");
+        let dir = store::store_dir_for_index(&index_path);
+        let marker = dir.with_extension("private-labels");
+        if case != "no-marker" {
+            let _on = crate::snapshots::RestartRestoreForTest::enabled();
+            let mut disk = DurableTailStore::new(dir.clone(), ds);
+            disk.mark_private_labels(lock, key).unwrap();
+            disk.write_after_save(
+                lock,
+                index.generation,
+                0,
+                vec![PendingRecord {
+                    acquisition: None,
+                    binding: Binding {
+                        source: ds,
+                        key,
+                        context: [1; 32],
+                        scope: [2; 32],
+                        entry: [3; 32],
+                    },
+                    certificate: certificate(&path, &scope),
+                    body: crate::snapshots::durable_store_fixture_body_with_skill(),
+                    allowlist: codec::allowlist_digest(source),
+                }],
+            )
+            .unwrap();
+        }
+        let _off = crate::snapshots::RestartRestoreForTest::disabled();
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &scope, false);
+        cache.durable_skill_label_permission(source, true);
+        cache.durable_write_after_save(lock, source, &index);
+        if case == "unreadable" {
+            std::fs::remove_file(&marker).unwrap();
+            std::fs::create_dir(&marker).unwrap();
+        }
+        if case == "failure" {
+            store::test_hooks::set_before_unlink(Some(Box::new(|_| {
+                Err(std::io::Error::other("erase failed"))
+            })));
+        }
+        cache.durable_skill_label_permission(source, false);
+        cache.durable_write_after_save(lock, source, &index);
+        store::test_hooks::set_before_unlink(None);
+        let counts = cache.durable_counters(source).unwrap().0;
+        if case == "no-marker" {
+            assert_eq!(counts.not_persisted.get("skill_label_scanned"), None);
+            assert!(!dir.exists());
+        } else {
+            assert_eq!(counts.not_persisted.get("skill_label_scanned"), Some(&1));
+            if case == "failure" {
+                assert_eq!(counts.not_persisted.get("skill_label_purged"), Some(&0));
+                assert_eq!(
+                    counts.not_persisted.get("skill_label_purge_failed"),
+                    Some(&1)
+                );
+                assert!(marker.exists());
+                cache.durable_write_after_save(lock, source, &index);
+                assert_eq!(
+                    cache
+                        .durable_counters(source)
+                        .unwrap()
+                        .0
+                        .not_persisted
+                        .get("skill_label_purged"),
+                    Some(&1)
+                );
+            }
+            assert!(std::fs::read_dir(&dir).unwrap().all(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "rec")));
+            assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
+        }
+    }
 }
 
 /// [format] quiet restore has no sample or content input before decode on all sources.
@@ -13033,3 +13063,4 @@ fn retired_missing_native_rebuild_then_successor_tails_without_double_count() {
     assert_eq!(modes.1, 1);
     assert_eq!(tail.snapshots[0].input_tokens, 600);
 }
+
