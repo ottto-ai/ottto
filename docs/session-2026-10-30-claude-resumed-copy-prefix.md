@@ -137,6 +137,28 @@ groups, saved copied requests, longest resume chain and charged bytes. The
 4 MiB bound and 2 MiB escalation threshold remain. No such measurement has
 been performed by this implementation task.
 
+## Copy-invalidated wire flag (X-B1)
+
+With the switch ON, a contract-5 bucket row whose accepted proof a copied
+marker lent is tombstoned before upload (SOURCE F5). Lead B's X-B1 ruling
+(2026-10-31) makes that tombstone explicit on the wire. Such a row carries
+`copy_invalidated: true`, so a retaining receiver drops that row's retained
+proof for good. A later refusal-bearing upload can then never re-apply it.
+The flag goes on this pass's copy-derived rows and on rows the option (ii)
+ledger still holds as the `INVALIDATED_PROOF` tombstone. A later witnessed
+proof that replaces the tombstone ends the flag. #909-only mode witnesses no
+proof, so its rows carry the flag only on the invalidation upload.
+
+The flag is one bool per bucket row, omitted when false. OFF bytes are main's,
+and older receivers ignore the member. Its bytes are reserved before the
+identity caps like `identity_retained` markers. Beside a stripped fallback
+body, flags fit before markers, newest buckets first. An unfit flag is
+counted as `copy_invalidated_unfit`; its row stays tombstoned locally.
+`copy_invalidated_rows` counts flags sent. The shared row golden is
+`crates/ottto-service/src/snapshots/fixtures/claude_copy_invalidated_row.jsonl`.
+Ordering gate: copy-prefix ON and option (ii) retention must not coexist until
+COST's receiver honours `copy_invalidated` (PR-B #14454).
+
 ## Scoped re-read and counts-only estimate
 
 `ottto-service claude-copy-prefix-reread --scope SCOPE.json --index INDEX --support-dir SUPPORT --window-days DAYS --estimate`

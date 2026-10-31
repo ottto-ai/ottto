@@ -463,6 +463,9 @@ pub(crate) struct Grouping {
     accepted_rows_vanished: u64,
     /// Why the caller found no accepted state, when it found none.
     accepted_miss: accepted::UnknownCause,
+    /// X-B1 (Lead B 2026-10-31): bucket rows sent with `copy_invalidated`,
+    /// by bucket start. Empty unless the copy-prefix switch is on.
+    copy_invalidated: BTreeMap<String, BTreeSet<RowKey>>,
     failed: Option<Ineligible>,
     /// Requests a `RequestSink` admitted: those the item's transcript holds,
     /// and telemetry-only (auxiliary) ones the reported rebuild added.
@@ -591,6 +594,7 @@ impl Grouping {
             accepted_share_changed: BTreeSet::new(),
             accepted_rows_vanished: 0,
             accepted_miss: accepted::UnknownCause::NoKey,
+            copy_invalidated: BTreeMap::new(),
             failed: None,
             transcript_requests: 0,
             telemetry_only_requests: 0,
@@ -946,11 +950,13 @@ fn apply_grouped_with_accepted(
         }
     }
     let mut deferred = defer_retained_rows(item, &mut grouping, proved);
+    let mut copy_marks = CopyMarks(std::mem::take(&mut grouping.copy_invalidated));
     // Marker bytes are constant across every tag selection; markers go on
     // the item only after measurement, as the last change before hashing.
     grouping.extra_wire_bytes = grouping
         .extra_wire_bytes
-        .saturating_add(deferred.marker_bytes());
+        .saturating_add(deferred.marker_bytes())
+        .saturating_add(copy_marks.bytes());
 
     let evidence = grouping
         .rows()
@@ -1075,6 +1081,7 @@ fn apply_grouped_with_accepted(
             unpriced.count(&mut counts);
             deferred.drop_stripped(item, &unpriced.keys);
             deferred.mark(item);
+            copy_marks.mark(item, &mut counts);
             deferred.count(item, retained, &mut counts);
             budget::record(&counts);
             untag_groups(&mut grouping, &unpriced.keys);
@@ -1123,6 +1130,7 @@ fn apply_grouped_with_accepted(
         unpriced.count(&mut counts);
         deferred.drop_stripped(item, &unpriced.keys);
         deferred.mark(item);
+        copy_marks.mark(item, &mut counts);
         deferred.count(item, retained, &mut counts);
         budget::record(&counts);
         let mut visible = grouping;
@@ -1173,7 +1181,19 @@ fn apply_grouped_with_accepted(
     // Markers must fit beside the stripped body; the newest ones are kept.
     // A dropped marker is a stripped proved row, so it counts as a refusal.
     // Measured at the largest refusal count, so the final digits never grow,
-    // and with a final-length fingerprint.
+    // and with a final-length fingerprint. Tombstone flags fit first: an
+    // unfit one is counted and stays tombstoned in the ledger.
+    if !copy_marks.0.is_empty() {
+        item.request_identity_refusals = refusals.saturating_add(deferred.rows.len() as u64);
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        let flags = copy_marks.bytes();
+        let unflagged = grouping
+            .item_bytes(item)
+            .saturating_sub(deferred.marker_bytes())
+            .saturating_sub(flags);
+        copy_marks.keep_newest(MAX_ITEM_BYTES.saturating_sub(unflagged), &mut counts);
+        grouping.extra_wire_bytes -= flags - copy_marks.bytes();
+    }
     let dropped = if deferred.rows.is_empty() {
         0
     } else {
@@ -1186,6 +1206,7 @@ fn apply_grouped_with_accepted(
     };
     let refusals = refusals.saturating_add(dropped);
     deferred.mark(item);
+    copy_marks.mark(item, &mut counts);
     deferred.count(item, retained, &mut counts);
     budget::record(&counts);
     item.request_identity_refusals = refusals;
@@ -1200,6 +1221,80 @@ fn apply_grouped_with_accepted(
 
 /// Bytes one `identity_retained` member adds to a compact wire row.
 const MARKER_BYTES: usize = r#","identity_retained":true"#.len();
+/// Bytes one `copy_invalidated` member adds to a compact wire row.
+const COPY_INVALIDATED_BYTES: usize = r#","copy_invalidated":true"#.len();
+
+/// X-B1 (Lead B 2026-10-31): bucket rows F5 tombstoned, this pass or earlier
+/// and still tombstoned, flagged so a retaining receiver never re-applies
+/// their retained proof. One bool per bucket row, so bounded by the rows the
+/// item carries; flags are reserved before measurement like markers.
+struct CopyMarks(BTreeMap<String, BTreeSet<RowKey>>);
+
+impl CopyMarks {
+    fn len(&self) -> usize {
+        self.0.values().map(BTreeSet::len).sum()
+    }
+
+    fn bytes(&self) -> usize {
+        self.len() * COPY_INVALIDATED_BYTES
+    }
+
+    /// Keep the newest buckets' flags within `available` bytes; drops count.
+    fn keep_newest(&mut self, available: usize, counts: &mut budget::Counts) {
+        let before = self.len();
+        while self.bytes() > available {
+            self.0.pop_first();
+        }
+        counts.copy_invalidated_unfit += (before - self.len()) as u64;
+    }
+
+    fn mark(&self, item: &mut SnapshotItem, counts: &mut budget::Counts) {
+        if self.0.is_empty() {
+            return;
+        }
+        for bucket in &mut item.usage_buckets {
+            let Some(rows) = self.0.get(&bucket.bucket_start) else {
+                continue;
+            };
+            for row in &mut bucket.model_usage {
+                if rows.contains(&row_key_from_model_usage(row)) {
+                    row.copy_invalidated = true;
+                    counts.copy_invalidated_rows += 1;
+                }
+            }
+        }
+    }
+}
+
+/// The item's bucket rows to flag: this pass's copy-derived rows and rows
+/// the ledger holds as the `INVALIDATED_PROOF` tombstone.
+fn copy_invalidated_rows(
+    item: &SnapshotItem,
+    copy_derived: &[(i64, RowKey)],
+    accepted: Option<&accepted::AcceptedSession>,
+) -> BTreeMap<String, BTreeSet<RowKey>> {
+    let mut flagged = BTreeMap::<String, BTreeSet<RowKey>>::new();
+    let Some(accepted) = accepted else {
+        return flagged;
+    };
+    for bucket in &item.usage_buckets {
+        let Some(start) = accepted::bucket_key(&bucket.bucket_start) else {
+            continue;
+        };
+        for row in &bucket.model_usage {
+            let key = row_key_from_model_usage(row);
+            if copy_derived.iter().any(|(at, derived)| *at == start && *derived == key)
+                || accepted.copy_invalidated(start, &key)
+            {
+                flagged
+                    .entry(bucket.bucket_start.clone())
+                    .or_default()
+                    .insert(key);
+            }
+        }
+    }
+    flagged
+}
 
 /// One marked bucket row with today's identities, restored only for display.
 struct DeferredRow {
@@ -2089,6 +2184,7 @@ fn strip(item: &mut SnapshotItem) {
         row.evidence_ref = None;
         row.identity_parts = None;
         row.identity_retained = false;
+        row.copy_invalidated = false;
     }
 }
 
@@ -5135,6 +5231,10 @@ fn tag_item(
             .map_or(0, |reserve| reserve(item));
         grouping.accepted_miss = miss;
         let copy_derived = copy_derived_rows(item, &grouping, accepted);
+        // Switch off sends no flag, so its bytes stay main's.
+        if super::claude_request_money::e2::resumed_prefix_enabled() {
+            grouping.copy_invalidated = copy_invalidated_rows(item, &copy_derived, accepted);
+        }
         let invalidated = accepted
             .filter(|_| !copy_derived.is_empty())
             .map(|accepted| accepted.invalidated(&copy_derived));

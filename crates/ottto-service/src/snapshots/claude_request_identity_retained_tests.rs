@@ -583,6 +583,55 @@ fn retained_emitted_wire_goldens_for_the_receiver_contract() {
     );
 }
 
+/// [format] X-B1 wire contract (Lead B 2026-10-31; COST PR-B #14454): the
+/// shared golden bucket row with `copy_invalidated=true`, as the canonical
+/// body serializes it, and the same row unflagged. False is omitted, so a
+/// row without the flag keeps today's bytes and an old receiver, which
+/// ignores the unknown member, reads exactly the unflagged row.
+#[test]
+fn copy_invalidated_row_wire_golden_for_the_receiver_contract() {
+    let golden = include_str!("fixtures/claude_copy_invalidated_row.jsonl");
+    let [flagged, plain] = golden.lines().collect::<Vec<_>>().try_into().unwrap();
+    let mut row = crate::snapshots::SnapshotModelUsage {
+        model: "claude-synthetic".into(),
+        copy_unproven: false,
+        input_tokens: 6,
+        output_tokens: 2,
+        cache_read_tokens: 0,
+        cache_creation_5m_tokens: 0,
+        cache_creation_1h_tokens: 0,
+        reasoning_output_tokens: 0,
+        reasoning_effort: None,
+        unattributed_total_tokens: 0,
+        request_count: 2,
+        selector_context: BTreeMap::new(),
+        selector_sources: BTreeMap::new(),
+        auth_mode: None,
+        billing_channel: None,
+        billing_provider: None,
+        gateway_provider: None,
+        model_provider: None,
+        subscription_product: None,
+        account_identifier_hash: None,
+        evidence_ref: None,
+        identity_parts: None,
+        identity_retained: false,
+        copy_invalidated: true,
+        cost_usd: Some("0.000042".into()),
+        input_cost_usd: None,
+        output_cost_usd: None,
+        cache_read_cost_usd: None,
+        cache_creation_cost_usd: None,
+    };
+    assert_eq!(serde_json::to_value(&row).unwrap().to_string(), flagged);
+    row.copy_invalidated = false;
+    let unflagged = serde_json::to_value(&row).unwrap().to_string();
+    assert_eq!(unflagged, plain);
+    assert!(!unflagged.contains("copy_invalidated"), "omitted when false");
+    assert_eq!(flagged.replacen(r#""copy_invalidated":true,"#, "", 1), plain);
+    assert_eq!(flagged.len() - plain.len(), r#","copy_invalidated":true"#.len());
+}
+
 fn retained_login_session() -> (SnapshotItem, Vec<Contribution>) {
     let (item, mut proof) = retained_session(2);
     for c in &mut proof { c.identity = login_key(OWNER_A); }

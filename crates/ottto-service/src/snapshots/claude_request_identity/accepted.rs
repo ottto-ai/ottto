@@ -402,6 +402,14 @@ impl AcceptedSession {
             .map(|index| self.proved[index].proof)
             .filter(|proof| *proof != REPLACED_PROOF && *proof != INVALIDATED_PROOF)
     }
+    /// The row holds the copy-derived `INVALIDATED_PROOF` tombstone: no
+    /// later witnessed proof replaced it (X-B1 `copy_invalidated`).
+    pub(super) fn copy_invalidated(&self, bucket: i64, row: &RowKey) -> bool {
+        let row = proved_row_hash(self.bound_key(), row);
+        self.proved
+            .binary_search_by_key(&(bucket, row), |entry| (entry.bucket, entry.row))
+            .is_ok_and(|index| self.proved[index].proof == INVALIDATED_PROOF)
+    }
     /// A replacement's reply never settled, so the server may hold either
     /// proof. Kept here because the share hints are evicted independently.
     pub(super) fn replacement_unsettled(&self, bucket: i64, row: &RowKey) -> bool {
