@@ -4222,7 +4222,8 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
             let mut account_switch = ClaudeAccountSwitchProbe::default();
             let mut retry = live_snapshot_retry::LiveRetryOwner::production();
             loop {
-                if let Ok(roots) = crate::snapshot_roots::watcher_roots(&home) {
+                let prior = watcher.as_ref().map_or(&[][..], |current| current.roots());
+                if let Ok(roots) = crate::snapshot_roots::watcher_roots(&home, prior) {
                     if watcher.as_ref().map_or(true, |current| !current.matches_roots(&roots)) {
                         watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).ok();
                     }
@@ -4312,7 +4313,7 @@ impl continuation::LoopHost for ContinuationLoop<'_> {
 
 /// Watch every enabled source's transcript roots, if the platform allows it.
 fn watch_snapshot_source_roots(home: &Path) -> Option<crate::snapshot_watcher::SnapshotWatcher> {
-    let roots = crate::snapshot_roots::watcher_roots(home).ok()?;
+    let roots = crate::snapshot_roots::watcher_roots(home, &[]).ok()?;
     crate::snapshot_watcher::watch_snapshot_roots(roots).ok()
 }
 
