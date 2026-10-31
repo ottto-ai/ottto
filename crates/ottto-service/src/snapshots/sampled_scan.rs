@@ -22,6 +22,8 @@ pub(crate) use durable_tail::MissClass;
 #[cfg(unix)]
 pub(crate) use durable_tail::RestoreOutcome;
 pub(super) mod side_ledger;
+#[cfg(all(test, unix))]
+pub(crate) mod transition_fixture;
 
 /// The retained-copy cache behind `SharedCache::retained`.
 pub(super) type RetainedCache = TranscriptCache<CachedJsonlReduction>;
@@ -2030,6 +2032,18 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn set_test_now(now: Option<u64>) {
     TEST_NOW.with(|clock| clock.set(now));
+}
+
+#[cfg(test)]
+pub(super) fn with_test_now<T>(now: u64, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_NOW.with(|clock| clock.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_NOW.with(|clock| clock.replace(Some(now))));
+    f()
 }
 
 pub(super) fn now_seconds() -> u64 {

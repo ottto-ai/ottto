@@ -410,6 +410,7 @@ fn bootstrap_probe_resent_after_server_error_settles_as_conflict() {
                         snapshot_fingerprint: items[0].snapshot_fingerprint.clone(),
                         occurrence_count: 1,
                         unchanged_basis: None,
+                        retained_proof_missing: Vec::new(),
                         body_witness_version: None,
                         body_witness_digest: None,
                         head_etag: None,

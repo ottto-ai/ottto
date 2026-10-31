@@ -42,15 +42,34 @@ _MONEY_DIFF_SCHEMA = {key: {} for key in (
     "request_count", "cost_usd", "input_cost_usd", "output_cost_usd",
     "cache_read_cost_usd", "cache_creation_cost_usd",
 )}
-_MODEL_DIFF_SCHEMA = dict(_MONEY_DIFF_SCHEMA, model={}, reasoning_effort={},
-                          selector_context={}, selector_sources={}, account_identifier_hash={})
+# Wire records: snapshots.rs::{SnapshotModelUsage, SnapshotIdentityPart,
+# SessionAccountEvidence, SnapshotRequestEvidence, SnapshotCost}. Empty child
+# schemas intentionally keep all entries of selector/data maps redacted.
+_IDENTITY_PART_DIFF_SCHEMA = dict(_MONEY_DIFF_SCHEMA, account_identifier_hash={}, evidence_ref={})
+_MODEL_DIFF_SCHEMA = dict(_MONEY_DIFF_SCHEMA, **{key: {} for key in (
+    "model", "reasoning_effort", "selector_context", "selector_sources",
+    "account_identifier_hash", "auth_mode", "billing_channel", "billing_provider",
+    "gateway_provider", "model_provider", "subscription_product", "evidence_ref",
+)})
+_MODEL_DIFF_SCHEMA["identity_parts"] = _IDENTITY_PART_DIFF_SCHEMA
 _SNAPSHOT_DIFF_SCHEMA = dict(_MONEY_DIFF_SCHEMA, **{key: {} for key in (
     "source_session_id", "snapshot_fingerprint", "source_file_fingerprint", "status",
     "account_id", "bucket", "request_id", "refusal", "telemetry_owned_complete",
     "resolver_conflict_count", "usage_accounting_contract", "removed_request_count",
+    "request_identity_refusals",
 )})
 _SNAPSHOT_DIFF_SCHEMA.update(
     usage=_MONEY_DIFF_SCHEMA, removed_usage=_MONEY_DIFF_SCHEMA,
+    model_usage=_MODEL_DIFF_SCHEMA,
+    cost={key: {} for key in (
+        "total_cost_usd", "input_cost_usd", "output_cost_usd", "cache_read_cost_usd",
+        "cache_creation_cost_usd", "evidence_source",
+    )},
+    session_account_evidence={key: {} for key in (
+        "provider", "account_identifier_hash", "provider_workspace_hash",
+        "identity_hash_scheme", "evidence_source", "identity_disposition", "source_created_at",
+    )},
+    request_evidence={"identity_basis": {}, "provider_workspace_hash": {}},
     usage_buckets={"bucket_start": {}, "model_usage": _MODEL_DIFF_SCHEMA,
                    "first_activity_at": {}, "last_activity_at": {}},
     semantic_envelope={key: {} for key in (
@@ -176,6 +195,14 @@ def has_forbidden_diff(diff):
     return any(diff[kind] for kind in ("added", "removed", "changed"))
 
 
+def require_base_scan_fixture(base):
+    """Keep the base's scanner adapter: the head's may require newer runtime APIs."""
+    fixture = base / "crates/ottto-service/src/snapshots/e2_pipeline_scan_fixture.rs"
+    text = fixture.read_text()
+    if any(f"fn {name}(" not in text for name in ("scan", "scan_other", "begin_durable")):
+        raise RuntimeError("base compat: scanner fixture lacks scan/scan_other/begin_durable")
+
+
 def main():
     started = time.monotonic()
     repo = Path.cwd()
@@ -212,8 +239,7 @@ def main():
     try:
         # Only test code is transplanted. No P2a/runtime/limits/lockfile changes.
         sync = Path("crates/ottto-service/src/snapshot_sync")
-        helpers = Path("crates/ottto-service/src/snapshots/e2_pipeline_scan_fixture.rs")
-        shutil.copy2(repo / helpers, base / helpers)
+        require_base_scan_fixture(base)
         shutil.copy2(repo / sync / "money_equivalence_tests.rs", base / sync / "money_equivalence_tests.rs")
         # Bases before #870 have no audit-retirement reconcile: their post-save
         # step is durable_after_save alone. Call the base's own production step.

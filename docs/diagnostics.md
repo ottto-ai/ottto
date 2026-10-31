@@ -496,6 +496,14 @@ after the existing decision, are drained by that source's next completed page,
 and count repeated decisions, not distinct files or bytes. They are recorded
 whether or not an observer is registered.
 
+`counts.source_rotation_serial_fallback` counts failed parking decisions while
+sibling sources wait, drained by that source's next completed page. Closed
+causes are `unsupported_layout` and `bound_refused`. A refused bound (`None`)
+covers both opaque ownership and over-limit frames; it does not distinguish
+their causes. Unavailable shared allowance also uses `bound_refused`.
+Each decision continues the same owned frame serially and counts once; ordinary
+serial turns with no waiting sibling do not count.
+
 ## Context Footprint Discovery
 
 Context footprint opens no transcript. Its workspaces come from the cwds of
@@ -1156,6 +1164,64 @@ Capacity/availability retain their existing degraded behavior. Full-cause
 admission and its other counter projections arrive in subsequent slices.
 
 
+## Claude Family Census Shadow (schema 2 additive)
+
+Each Claude Code scan page emits one `local_resources` record with stage
+`claude_family_census_shadow`, under `counts`. It estimates, per session family
+(a root transcript and its subagents), whether the family would be complete in
+the current census window. It is shadow-only: the record changes no read,
+census bit, manifest, upload, retirement or other decision. Other sources emit
+no such record. The row holds counts, ages, fixed reason names and one order-free
+digest; no paths, ids, account hashes or request hashes.
+
+**Units.** A page evaluates the families its selection touched
+(`touched_families`, with `touched_families_over_cap` beyond the bound of 1,024),
+the families its previous page parsed (`followup_families`), and up to 64 others
+from a rotating cursor (`rotation_families`). Family counts are evaluations on
+this page: a family can repeat across pages, so they are neither distinct
+families nor a stock, and rows must not be summed into one.
+
+**Strict partition.** Every evaluated family (`families_evaluated`) is exactly
+one of `family_census_complete`, `family_complete_deferred.quantum` (complete past
+the limit of 64 per page), or one first-match reason in
+`family_census_incomplete`, tried in this order: `membership_unknown`, `queued`,
+`refused_read`, `refused_read_unattributed`, `held`, `quarantine`, `residue`,
+`evidence`, `evidence/presence_only`, `not_current_window`, `path_not_unique`.
+`singleton_families_evaluated` is included in `families_evaluated`.
+`families_unevaluated_member_budget` counts families left for a later page, which
+are not in `families_evaluated`.
+
+**Freshness.** `pending_census_members` describes the skipped set: `count`
+(queue plus replay entries), `replay`, `replay_repeat`, `oldest_age_s`,
+`over_24h`, `tracked`, `unqueued_unresolved`, `pace_evicted` and `stamped_for_s`.
+`skipped_set` holds `digest` and `retained`, the entries the previous page also
+skipped. `sticky_vetoes` holds `namespace_loss_age_s` and `unattributed_age_s`,
+null when the veto is not latched. These are process-local, and restart, a scope
+change or an eviction (`pace_evicted`) resets them, so every age is a LOWER BOUND
+across a restart and `stamped_for_s` caps it. Attestations reset the same way, so
+after a restart members count `evidence/presence_only` until ordinary work attests
+them again. Attestations and vetoes also reset with each new traversal generation.
+
+**Work counters.** These are approximate units, not exact operations.
+`member_keys_visited` is range advances of the member lookups, at most 16,384.
+Under `cost`: `root_index_keys_processed` is keys the uniqueness pass consumed,
+at most 8,192, plus one check per parse; the merged loop may also peek up to 2
+keys it does not count. `rotation_keys_visited`, `queue_entries_visited` (two
+passes over the queue, not bounded by a constant) and `history_gates_visited`
+count entries. `predicate_cpu_us` is thread CPU, and excludes mutex wait.
+`families_evaluated`, `attested_keys`, `attestations_evicted` and
+`runtime_heap_bytes` (retained shadow state after the page, excluding page
+transients) are gauges. `root_index_restarted`, `root_index_complete`,
+`root_index_overflowed`, `queued_roots_overflowed` and `history_gates_overflowed`
+are flags. At the top level, `shadow_decision_calls`
+and `shadow_attest_micros` measure this page's equality attestation, and
+`attest_capped` counts Skips past the limit of 4,096 per page, not attested.
+
+**Zero and unavailable.** A zero count is a real zero for that page. An absent
+record means the page had no traversal state or was not Claude. Uniqueness is
+unavailable while `cost.root_index_complete` is false, and families then count
+`path_not_unique`.
+
 ## Pi reported-cost parsing
 
 Pi cost fields use checked decimal arithmetic and an inclusive $100,000 ceiling
@@ -1447,3 +1513,115 @@ buckets; already stripped proof cannot be recovered from the hint ledger.
 Upstream authority-key allocation loss remains fail-closed: inherited partitions
 are not reclassified as request proof by budget recovery or a uniform starting-account
 retry. Only an intact current grouping can enter the cap allocator.
+
+### Option (ii): `identity_retained` bucket rows
+
+Off unless the activity hint carries exactly
+`session_request_identity_retained_contract: "session_request_identity_retained:v1"`;
+any other value keeps the bodies above byte-identical. When on, the backend
+retains per-row proof, so the accepted priority is not used: fresh tags take
+the plain newest-first order within the unchanged caps.
+
+A bucket row enters the local proved-row ledger only when a stored-body entity
+ACK (no `unchanged_basis`) covers a body where that row carried a positive tag,
+only while the capability is on, and only when that ACK declares a body witness
+version and its digest equals the local body witness of a body that has a
+public witness version (context curve, session account evidence or cache
+observations), so the ACK validator also checked the exact version. The
+ledger keeps truncated keyed digests of the row key and of that proof
+(authorities plus the eight counts and five costs); later positive proof
+replaces it. Per revision, a proved row whose current proof equals the ACKed
+proof in a closed hour, or whose transcript no longer proves it, is sent
+untagged with full amounts and `identity_retained: true`; it is not a refusal.
+Different proof, the open hour and never-proved rows get fresh tags. A row is
+never both tagged and marked; top-level rows are never marked. If the
+untagged fallback cannot fit every marker beside the stripped body, it keeps
+the newest that fit and counts each dropped proved row as a refusal.
+
+Before any upload, a proved row that the outgoing body freshly tags with a
+different proof becomes a proof-free tombstone, and progress is saved before
+the request, so a lost reply cannot leave a stale proof that a later marker
+would honour. While that tombstone stands, a row the transcript no longer
+proves is a counted refusal; the replacement's ACK replaces it.
+A stored-body ACK's optional `retained_proof_missing` bucket starts remove that
+body's marked rows, so a later revision re-tags them through the same
+allocator. A destination namespace or historical replay generation change
+clears all proved rows, as do key rotation and session eviction (the class L
+last-ACK LRU above). Limits: 1,024 proved rows per session, persisted as
+versioned base64 of 73-byte records, and 64 pending missing buckets (diagnostic
+only). Each proved record also stores the proving revision's optional row-level
+account hash (class H, bounded and erased with the session). Login markers resend
+that ACK-bound hash for grain only; parts markers have no hash. Old records without
+hash provenance fail closed to fresh tags. Markers require contract 6
+(`claude_request_owned_usage:v1`); contract-5-only bodies send fresh tags.
+Rows evicted at the proof cap also send fresh tags through the usual caps. At every cap the progress JSON stays below 8 MiB and the
+requested-layout maximum below 4 MiB.
+
+Sparse `identity_cap` counters, omitted while zero: `retained_marker_rows`,
+`retained_proof_missing_received`, `retained_set_cleared`, `proved_rows_capped`
+(rows not retained at the proof cap), and
+`retained_missing_unfit` (a missing-proof bucket whose fresh proof did not fit
+and kept today's untagged/refused rule). `accepted_share_changed` also counts
+proved rows sent with different proof.
+
+### Money freshness (Claude queue and replay)
+
+The default-ON Claude shadow and freshness gauges share one
+`claude_family_census_shadow` emission. Gauges are flattened into
+`counts.pending_census_members`: the existing `oldest_age_s`, `over_24h`, `tracked`
+and `unqueued_unresolved` describe the bounded pending stamps; no duplicate
+oldest-skipped or skipped-tracked fields or second queue traversal is added.
+`count` includes queue/replay occurrences, while age thresholds count retained
+unique queued files. `tracked` also includes unresolved files no longer queued.
+All ages are process-local LOWER BOUNDS, never inputs to decisions.
+
+A regular file `money_freshness_disabled` in the normal support directory turns
+BOTH the shadow and gauges OFF. Missing marker, directories and symlinks leave
+them ON. Policy is read once per process; restart after adding/removing the
+marker. OFF skips Touched allocation, equality attestation, page observation and
+metadata observation before any tracker mutex, clone or candidate decision. It
+emits neither shadow nor freshness data. The ordinary scan and skipped-file audit
+count continue unchanged. Fixtures use thread-local guards and never consult the
+host marker.
+
+`discovered_unread_tracked_files`, `oldest_discovered_unread_age_seconds` and
+`discovered_unread_over_24h_tracked_files` cover unindexed, non-replay queued work.
+Indexed or replay work is counted separately. No retained index is not proof a
+physical file has never been read. Queue/replay overlaps are deduplicated among
+retained stamps. `skipped_untracked_entries` and
+`discovered_unread_untracked_entries` disclose lost coverage at the existing
+16,384-stamp bound; they are occurrences, not invented distinct-file counts.
+Directories not yet enumerated and files outside the skipped view are uncovered.
+
+`changed_since_scan_files` and `unchanged_since_scan_files` compare metadata
+already observed on the opened candidate with indexed size and second/nanosecond
+mtime. No transcript read or extra candidate stat is added. Missing or stale
+samples and files without an indexed scan count as
+`changed_since_scan_unknown_files`; `changed_since_scan_complete_count` is null
+when coverage is incomplete. The first page may have only unknown coverage.
+These counters are folded into the existing FirstPending traversal and bounded
+stamp work, with no third queue pass or second map.
+
+`changed_over_6h_alarm` is true after observed changed positives on consecutive
+passes span **more than 21,600 seconds**; the same row includes unread count and
+age. There is no second alarm emission. Zero/unknown-only observations, scope
+reset, restart or clock rollback break the episode. Inter-pass continuity is a
+sampled condition, not proof of continuous filesystem state.
+
+The restart proxy is DERIVED server/log-side from this same emission:
+`tracker_initialized && changed_since_scan_files > 0`, correlated with its
+`process_id` and source. `tracker_initialized` is claimed by an independent
+process-wide atomic at completed emission, so it is true AT MOST ONCE per process.
+Tracker resets, index reloads, scope/path changes and kill-switch toggles never
+re-arm it. No per-scope ledger, restart_* payload field or persisted evidence is
+needed. This counts starts with an observed positive condition; it does not prove
+a prior episode. A positive condition cleared before the first completed pass,
+or hidden by unknown initial metadata, is not counted. A disabled process emits
+nothing and does not claim a first observation.
+
+Memory remains bounded by the existing 16,384 stamps (48 bytes each, +512 KiB
+versus the original shadow), accounted by runtime_heap_bytes and its retained
+bound. Classification is transient in the existing bounded heap/vector; there
+is no separate gauge dedup allocation or scope ledger. Enlarged stamp transients
+are conservatively bounded by an additional 4 MiB. No child-finalize eligibility
+measurement, dormant family-consumer API or money/read/census decision is added.

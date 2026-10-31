@@ -2001,10 +2001,17 @@ fn x_out_e2_fold_worst_shapes_stay_within_e() {
             receipt.born,
             receipt.decode_peak,
         );
-        // Exactly the copies came back through `absorb_grains`, disclosed.
+        // Exactly the copies came back through `absorb_grains`, disclosed;
+        // the id-less quarter (every fourth response) under its own reason.
+        let disclosed = |reason| diag.get(reason).copied().unwrap_or(0);
         assert_eq!(
-            diag.get("copy_unproven").copied().unwrap_or(0),
+            disclosed("copy_unproven") + disclosed("copy_idless"),
             restored as u64,
+            "{label}: {diag:?}"
+        );
+        assert_eq!(
+            disclosed("copy_idless"),
+            restored as u64 / 4,
             "{label}: {diag:?}"
         );
         // The worst shape happened: every counted response its own grain.
