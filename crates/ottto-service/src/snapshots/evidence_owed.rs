@@ -319,6 +319,14 @@ fn record_hashes(hashes: &BTreeSet<String>) -> Option<Vec<u64>> {
     Some(prefixes)
 }
 
+/// Q5 (RF1 #992): every stored evidence set is from this census window, or
+/// there is none to mix with the recorded contract.
+pub(super) fn evidence_from_window(index: &ScanIndex, census_window_end: &str) -> bool {
+    index.claude_usage_family_pending.values().all(|pending| {
+        pending.invalid || evidence_free(pending) || pending.census_window_end == census_window_end
+    })
+}
+
 /// The admission drop (RF1 #992 rev F2): an unfinished admission still owes
 /// due paths its existing selector has not offered.
 pub(super) fn due_unoffered(

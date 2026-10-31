@@ -10359,6 +10359,18 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         let contract = claude_request_identity::cycle_contract(identity.is_some());
         let cutover_terminal = cutover == CLAUDE_CONTRACT_CUTOVER_OWED
             && index.claude_request_identity_contract.as_deref() == Some(contract);
+        // RF1 #992 Q5 (evidence owed ON): a mid-walk contract change records
+        // a placeholder, so a recorded current contract means this window's
+        // evidence was parsed under it. With no older evidence left there is
+        // nothing to mix; the latch clears before its full re-arm. Counted.
+        if evidence_owed::enabled()
+            && index.claude_request_identity_contract_changed
+            && index.claude_request_identity_contract.as_deref() == Some(contract)
+            && evidence_owed::evidence_from_window(index, census_window_end)
+        {
+            claude_contract::note(|counts| counts.identity_contract_latch.cleared += 1);
+            index.claude_request_identity_contract_changed = false;
+        }
         let latch_rearms = index.claude_request_identity_contract_changed
             && cutover != CLAUDE_CONTRACT_CUTOVER_SPENT;
         if let Some(record) = (index.claude_full_rearm_progress.structural_record.as_mut())

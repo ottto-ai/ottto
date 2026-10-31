@@ -463,6 +463,43 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
     assert_eq!(scope.finish().contract.identity_contract_latch.cleared, 1);
 }
 
+/// [regress] RF1 #992 Q5, folded under evidence owed: a complete census under
+/// the recorded cycle contract with no older-window evidence left clears the
+/// latch before its identity contract re-arm (no re-read, counted). Older
+/// valid evidence keeps main's re-arm.
+#[test]
+fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
+    let _on = evidence_owed::EvidenceOwedForTest::on();
+    let rearm = Rearm::new();
+    let mut index = rearm.index();
+    rearm.establish(&mut index, &rearm.items);
+    let mut older = index.clone();
+
+    index.claude_request_identity_contract_changed = true;
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let settled = rearm.terminal(&mut index, &rearm.items);
+    assert_eq!(settled.rearmed_files, 0, "{settled:?}");
+    assert!(!index.claude_request_identity_contract_changed);
+    assert_eq!(scope.finish().contract.identity_contract_latch.cleared, 1);
+
+    older.claude_request_identity_contract_changed = true;
+    older.claude_usage_family_pending.insert(
+        OTHER_ROOT.to_string(),
+        ClaudeUsageFamilyPending {
+            census_window_end: "2026-08-01T07:10:00Z".to_string(),
+            member_request_id_hashes: BTreeMap::from([(
+                OTHER_ROOT.to_string(),
+                BTreeSet::from(["a".repeat(64)]),
+            )]),
+            member_occurrences: BTreeMap::new(),
+            invalid: false,
+            idless_revision: None,
+        },
+    );
+    let latched = rearm.terminal(&mut older, &rearm.items);
+    assert_eq!(latched.rearmed_files, 2, "main's identity contract re-arm");
+}
+
 /// A first-proof hold on a dormant owner (C1a) waits on the full re-arm, so
 /// it vetoes the skip until one runs.
 #[test]
