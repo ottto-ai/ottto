@@ -382,18 +382,21 @@ impl SnapshotUploadProgress {
     /// Keeping both predecessor and replacement values bounds mixed ACK and
     /// refusal responses without evicting accepted shares or cache evidence.
     ///
-    /// Over the bound, cache evidence of settled sessions (no pending head
-    /// obligation, not in this page) is pruned first; such a session reopens
-    /// through the missing-head bootstrap. If live custody alone still exceeds
-    /// the bound nothing changes and the route takes a paced, alarmed hold.
-    pub(super) fn admit_ack_custody<'a, T: Serialize + 'a>(
+    /// Over the bound, cache evidence of settled sessions is pruned first:
+    /// no pending head obligation and in neither the frozen logical page nor
+    /// the caller's `page` (every batch/probe of it). Such a session reopens
+    /// through the missing-head bootstrap. Returns true after a prune, which
+    /// the caller persists before its POST. If live custody alone still
+    /// exceeds the bound nothing changes and the route takes a paced hold.
+    pub(super) fn admit_ack_custody<'a, 'p, T: Serialize + 'a>(
         &mut self,
         items: impl IntoIterator<Item = &'a T>,
+        page: impl IntoIterator<Item = &'p str>,
         fingerprint: &impl Fn(&T) -> &str,
         body_witness: &impl Fn(&T) -> String,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(recovery) = self.ack_recovery.clone() else {
-            return Ok(());
+            return Ok(false);
         };
         let items = items.into_iter().collect::<Vec<_>>();
         let refused = |progress: &Self| -> anyhow::Error {
@@ -412,9 +415,10 @@ impl SnapshotUploadProgress {
             .admit_progress_bytes(self.custody_bytes(&items, fingerprint, body_witness)?)
             .is_ok()
         {
-            return Ok(());
+            return Ok(false);
         }
-        let mut live = BTreeSet::new();
+        let mut live = self.custody_page.clone();
+        live.extend(page.into_iter().map(cache_session_key));
         for item in &items {
             if let Some(session) = serde_json::to_value(item)?
                 .get("source_session_id")
@@ -444,7 +448,7 @@ impl SnapshotUploadProgress {
         {
             recovery.custody_pruned(sessions);
             *self = pruned;
-            return Ok(());
+            return Ok(true);
         }
         recovery.hold_custody();
         Err(refused(self))

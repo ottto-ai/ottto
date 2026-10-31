@@ -221,13 +221,14 @@ fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
     progress.ack_recovery = Some(Box::new(recovery));
     let before = progress.clone();
     let item = body();
-    progress
+    assert!(!progress
         .admit_ack_custody(
             std::slice::from_ref(&item),
+            std::iter::empty(),
             &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
             &|_| "d".repeat(64),
         )
-        .unwrap();
+        .unwrap());
     assert_eq!(
         progress, before,
         "admission neither evicts accepted shares nor mutates custody"
