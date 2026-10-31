@@ -19464,8 +19464,6 @@ pub(crate) fn claude_session_registrations() -> crate::claude_session_registrati
 mod tests {
     use super::*;
 
-    mod status_coverage_feed;
-
     /// The account resolution `collect_claude_status` performs, for tests that
     /// exercise the OAuth path directly.
     fn claude_oauth_account_identifier_hash() -> String {
