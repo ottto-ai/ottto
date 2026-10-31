@@ -24818,19 +24818,26 @@ mod tests {
                     .insert(cache_session_key(session), "f".repeat(64));
             }
             // Pending head obligations mark sessions live: one in phase 1, all in 2.
+            // Identifiers are fingerprint-shaped, as the progress loader requires
+            // (snapshot_sync.rs:1572); otherwise a restart quarantines the ledger.
             let live = if phase == 1 {
                 &sessions[..1]
             } else {
                 &sessions[..]
             };
             f.progress.pending_cache_heads.insert(
-                "pending-file".into(),
+                cache_session_key("pending-file"),
                 PendingCacheHeadFile {
-                    source_file_fingerprint: "pending-source".into(),
-                    group_fingerprint: "pending-group".into(),
+                    source_file_fingerprint: cache_session_key("pending-source"),
+                    group_fingerprint: cache_session_key("pending-group"),
                     entities: live
                         .iter()
-                        .map(|session| (format!("entity-{session}"), cache_session_key(session)))
+                        .map(|session| {
+                            (
+                                cache_session_key(&format!("entity-{session}")),
+                                cache_session_key(session),
+                            )
+                        })
                         .collect(),
                     reselected_heads: BTreeMap::new(),
                     settled_entities: BTreeSet::new(),
@@ -24966,6 +24973,8 @@ mod tests {
                 // and saves that index. Run that quiet pass from the saved
                 // checkpoint first: all accepted bodies stay suppressed.
                 let recovery = f.progress.ack_recovery.take();
+                // Every restart below reloads this exact saved ledger.
+                let saved = std::fs::read(&f.progress_path).unwrap();
                 let adopted = |index: &ScanIndex| {
                     serde_json::to_value(index).unwrap()["upload_context_fingerprint"]
                         == "boundary-current-policy"
@@ -25002,6 +25011,7 @@ mod tests {
                 }
                 drop(grown);
                 let scan = f.restart_preparation();
+                assert_eq!(std::fs::read(&f.progress_path).unwrap(), saved);
                 f.progress.ack_recovery = recovery;
                 f.progress.freeze_custody_page(&f.items);
                 assert_eq!(scan.scanned_file_count, 1, "only the grown source is read");
