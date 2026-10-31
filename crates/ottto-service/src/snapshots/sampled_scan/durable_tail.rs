@@ -6339,6 +6339,12 @@ impl SharedCache {
         snapshot_source: SnapshotSource,
     ) -> std::io::Result<()> {
         self.erase_private_labels(writer, snapshot_source, Some(&BTreeSet::new()));
+        // OFF fresh-index cleanup only erases private labels. It cannot
+        // settle v1 failures, especially when an old unlink barrier deferred
+        // that erasure; only verified absence/invalidation clears those ages.
+        if !restart_restore::enabled() {
+            return Ok(());
+        }
         if let (Some(source), Some(mut stores)) = (durable_source(snapshot_source), self.durable())
         {
             for debt in stores.key_debt.values_mut() {
@@ -6350,9 +6356,6 @@ impl SharedCache {
             if let Some(slot) = stores.slot(source).as_mut() {
                 slot.off_v1_failed_age_untracked = false;
             }
-        }
-        if !restart_restore::enabled() {
-            return Ok(());
         }
         let Some(source) = durable_source(snapshot_source) else {
             return Ok(());
