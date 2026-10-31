@@ -242,10 +242,7 @@ fn retired_pin(source: DurableSource, format: u16, pin: &Digest32) -> bool {
         }
         DurableSource::Codex => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
     };
-    format == FORMAT_V1
-        && (parse_hex_digest(retired).as_ref() == Some(pin)
-            || crate::snapshots::restart_restore_enabled()
-                && source.properties().representation(FORMAT_V3, pin).is_some())
+    format == FORMAT_V1 && parse_hex_digest(retired).as_ref() == Some(pin)
 }
 
 fn header_len(format: u16, source: DurableSource, allowlist: &Digest32) -> Result<usize, Refusal> {
@@ -1077,6 +1074,12 @@ impl DurableTailStore {
                     .properties()
                     .representation(FORMAT_V3, &binding.record.allowlist)
                     .is_some();
+            // A current pin on a v1 envelope is not a retired writer. Only
+            // consent erasure may inspect it; it grants no acquisition or
+            // mutation authority, with restart restore either ON or OFF.
+            if binding.format == FORMAT_V1 && !retired && !erasure {
+                return Err(Refusal::Unknown);
+            }
             if retired && !erasure && work != "overwrite" && work != "guard" {
                 return Err(Refusal::Repin); // Missing to readers, opaque to current decoders.
             }
@@ -1119,6 +1122,17 @@ impl DurableTailStore {
             }
             self.note_codec(bytes.capacity());
             if let Err(reason) = verify(&bytes, self.source) {
+                // The one started byte-zero rebuild may replace this exact
+                // corrupt native predecessor. This header is never restore
+                // authority; allows_rebuild_capture checks context and revision.
+                if work == "rebuild"
+                    && reason == Refusal::Corrupt
+                    && binding.format == FORMAT_V3
+                    && self.rebuilt.get(key) == Some(&Rebuild::Started)
+                    && stamp_at(&path).ok() == Some(Some(stamp))
+                {
+                    return Ok(Some(binding));
+                }
                 if retired
                     && work == "guard"
                     && self.rebuilt.get(key) != Some(&Rebuild::Started)
@@ -1132,7 +1146,7 @@ impl DurableTailStore {
             if retired && work == "guard" {
                 return Err(Refusal::Repin);
             }
-            if work == "overwrite" || restoring {
+            if work == "overwrite" || work == "rebuild" || restoring {
                 binding.content = Some(stored_digest(&bytes));
             }
             let content = stored_digest(&bytes);
@@ -1238,6 +1252,10 @@ impl DurableTailStore {
                 .and_then(|header| header.audit_debt)),
             Err(reason) => Err(reason),
         }
+    }
+
+    pub(crate) fn rebuild_started(&self, key: &Digest32) -> bool {
+        self.rebuilt.get(key) == Some(&Rebuild::Started)
     }
 
     pub(crate) fn full_hold(&mut self, key: &Digest32, start: bool) -> Option<Refusal> {
@@ -3554,7 +3572,11 @@ fn decode_for_erasure(bytes: &[u8], erasure: bool) -> Result<DurableRecord, Refu
                 .representation(FORMAT_V3, &pin)
                 .is_some())
     {
-        return Err(Refusal::Repin);
+        return Err(if retired_pin(source, format, &pin) {
+            Refusal::Repin
+        } else {
+            Refusal::Unknown
+        });
     }
 
     let source = bytes

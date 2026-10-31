@@ -238,10 +238,6 @@ mod line_delivery_tests;
 mod pi_retry_inputs;
 mod restart_restore;
 
-pub(crate) fn restart_restore_enabled() -> bool {
-    restart_restore::enabled()
-}
-
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn bounded_restore_tail_items_for_test(source: SnapshotSource) -> Vec<SnapshotItem> {
     m3_d3_tests::bounded_restore_tail_items(source)
@@ -36629,7 +36625,11 @@ impl OwnedJsonlParser {
             },
         );
         let mut preparation = None;
+        let rebuilding = cache.durable_rebuild_started(fence.source, fence.key);
         let mut stage = |live: PreFinalization<'_>| {
+            if rebuilding {
+                return; // The one T14 Full replaces its predecessor after index save.
+            }
             if let Some(prepare) = prepare.take() {
                 preparation = stage_preparation(&mut acquisition, live, prepare);
             }

@@ -1576,7 +1576,10 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
     let pending = keys
         .iter()
         .map(|key| PendingRecord {
-            acquisition: fixture_acquisition(source),
+            acquisition: Some(store::AcquisitionFields {
+                acquired_revision: effective_revision(source),
+                protocol: AcquisitionProtocol::WriteAhead,
+            }),
             binding: Binding {
                 source: DurableSource::Codex,
                 key: store::key_digest(DurableSource::Codex, key),
@@ -1619,6 +1622,72 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
     assert_eq!(stats.gc_records_deleted, 1);
     assert_eq!(stats.disk_records, 3);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// [format] A fresh index has no original-binding proof for either source's v3 record.
+#[test]
+fn fresh_index_cleanup_preserves_unproved_v3_records() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let root = crate::test_scratch::private_dir("ottto-v3-fresh-index");
+        let lock = test_locks::hold(&root);
+        let path = root.join("certificate.jsonl");
+        std::fs::write(&path, b"{}\n").unwrap();
+        let index_path = root.join("index.json");
+        let namespace = Scope("fresh-index-v3".into());
+        let ds = durable_source(source).unwrap();
+        let key = store::key_digest(ds, "/synthetic/absent.jsonl");
+        let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        assert_eq!(
+            disk.write_after_save(
+                lock,
+                1,
+                0,
+                vec![PendingRecord {
+                    acquisition: fixture_acquisition(source),
+                    binding: Binding {
+                        source: ds,
+                        key,
+                        context: [0; 32],
+                        scope: [0; 32],
+                        entry: [0; 32]
+                    },
+                    certificate: certificate(&path, &namespace),
+                    body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+                    allowlist: codec::allowlist_digest(source),
+                }]
+            )
+            .unwrap()
+            .written,
+            1
+        );
+        let record_path = disk.dir().join(format!(
+            "{}.rec",
+            key.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ));
+        let before = std::fs::read(&record_path).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(before[8..10].try_into().unwrap()),
+            store::FORMAT_V3
+        );
+        drop(disk);
+        let cache = SharedCache::default();
+        crate::snapshots::begin_durable_pass(
+            &cache,
+            &root,
+            source,
+            &index_path,
+            true,
+            &namespace,
+            false,
+            true,
+        );
+        assert_eq!(std::fs::read(&record_path).unwrap(), before);
+        let (_, counters) = cache.durable_counters(source).unwrap();
+        assert_eq!(counters.gc_records_deleted, 0);
+        assert_eq!(counters.mutation_unproved, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 /// A real native reduction and certificate, encoded even on layouts where
@@ -2039,7 +2108,6 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 "sidecar_false",
                 "owning_header_false",
                 "dependencies_missing",
-                "fresh_index",
                 "cleared",
                 "owed",
                 "compressed",
@@ -2078,9 +2146,8 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 // Certificate source is irrelevant for preservation; it is never restored.
                 let cert_path = root.join("certificate.jsonl");
                 std::fs::write(&cert_path, b"{}\n").unwrap();
-                // A known record absent from every index. Cold Claude cleanup
-                // has no original-binding mutation proof, so it must preserve
-                // this survivor; Codex retains ordinary selective deletion.
+                // A current record absent from every index. Without original
+                // mutation proof, both sources preserve this v3 survivor.
                 let absent_key = store::key_digest(ds, "/synthetic/absent-known.jsonl");
                 let record = |key| PendingRecord {
                     acquisition: fixture_acquisition(source),
@@ -2131,64 +2198,22 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 drop(disk);
                 let cache = Arc::new(SharedCache::default());
                 let mut index = ScanIndex::default();
-                if bypass == "fresh_index" {
-                    // Production begin with a freshly loaded index runs the
-                    // selective cleanup under the held lock.
-                    crate::snapshots::begin_durable_pass(
-                        &cache,
-                        &root,
-                        source,
-                        &index_path,
-                        true,
-                        &namespace,
-                        false,
-                        true,
-                    );
-                    let claude = source == SnapshotSource::ClaudeCode;
-                    assert_eq!(
-                        absent_path.exists(),
-                        claude,
-                        "cold Claude keeps unproved records; Codex deletes verified absences"
-                    );
-                    let (_, cleanup) = cache.durable_counters(source).unwrap();
-                    let selected_survives = claude || kind != "none";
-                    assert_eq!(record_path.exists(), selected_survives, "{source:?}/{kind}");
-                    assert_eq!(
-                        cleanup.gc_records_deleted,
-                        if claude {
-                            0
-                        } else {
-                            1 + u64::from(kind == "none")
-                        },
-                        "{source:?}/{kind}: exact known absent records collected"
-                    );
-                    assert_eq!(
-                        cleanup.mutation_unproved,
-                        if claude {
-                            1 + u64::from(kind == "none")
-                        } else {
-                            0
-                        },
-                        "every unproved known Claude survivor remains in custody"
-                    );
-                } else {
-                    cache.durable_begin_pass(source, &index_path, &namespace, false);
-                    let fingerprint = if bypass == "cleared" { "" } else { "fp" };
-                    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":fingerprint,"last_snapshot_fingerprint":"accepted-body"})).unwrap();
-                    index.files.insert(key.clone(), entry);
-                    if bypass == "owed" {
-                        index.activate_effective_upload_body_witness_revision(2);
-                    }
-                    // Distinct, asserted M1 veto states.
-                    assert_eq!(
-                        index.effective_upload_body_witness_revision_requires_adoption(&key),
-                        bypass == "owed"
-                    );
-                    assert_eq!(
-                        index.files[&key].source_file_fingerprint.is_empty(),
-                        bypass == "cleared"
-                    );
+                cache.durable_begin_pass(source, &index_path, &namespace, false);
+                let fingerprint = if bypass == "cleared" { "" } else { "fp" };
+                let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":fingerprint,"last_snapshot_fingerprint":"accepted-body"})).unwrap();
+                index.files.insert(key.clone(), entry);
+                if bypass == "owed" {
+                    index.activate_effective_upload_body_witness_revision(2);
                 }
+                // Distinct, asserted M1 veto states.
+                assert_eq!(
+                    index.effective_upload_body_witness_revision_requires_adoption(&key),
+                    bypass == "owed"
+                );
+                assert_eq!(
+                    index.files[&key].source_file_fingerprint.is_empty(),
+                    bypass == "cleared"
+                );
                 if kind != "none" {
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
                 }
@@ -2909,6 +2934,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         std::fs::write(path, text).unwrap();
     }
     let seed = Arc::new(SharedCache::default());
+    seed.durable_begin_pass(source, &index_path, &namespace, capture);
     let (mut index, seeded, _) = known_corrupt_scan(
         source,
         &sessions,
@@ -2925,25 +2951,12 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         store::store_dir_for_index(&index_path),
         DurableSource::ClaudeCode,
     );
-    disk.write_after_save(
-        lock,
-        1,
-        0,
-        vec![PendingRecord {
-            acquisition: fixture_acquisition(source),
-            binding: Binding {
-                source: DurableSource::ClaudeCode,
-                key: digest,
-                context: [0; 32],
-                scope: [0; 32],
-                entry: [0; 32],
-            },
-            certificate: certificate(&held, &namespace),
-            body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
-            allowlist: codec::allowlist_digest(source),
-        }],
-    )
-    .unwrap();
+    index.save(&index_path).unwrap();
+    seed.durable_write_after_save(lock, source, &index).unwrap();
+    assert!(
+        matches!(disk.read(&digest), store::ReadOutcome::Found(ref record) if record.format == store::FORMAT_V3)
+    );
+    drop(seed);
     let record = disk.dir().join(format!(
         "{}.rec",
         digest

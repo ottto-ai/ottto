@@ -3312,7 +3312,7 @@ fn gc_representation_reads_only_bounded_store_headers_and_charges_gc() {
     let before = store.counters();
     assert_eq!(
         store.representation(&binding.key),
-        Some((1, placeholder_allowlist()))
+        Some((FORMAT_V3, placeholder_allowlist()))
     );
     store
         .gc(
@@ -3942,6 +3942,94 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
     }
 }
 
+/// [money] Only the one started, same-context native rebuild may capture fresh custody.
+#[test]
+fn corrupt_v3_rebuild_capture_never_grants_restore_or_mutation_authority() {
+    for arm in [
+        "started",
+        "unstarted",
+        "context",
+        "revision",
+        "unknown",
+        "repaired",
+        "swapped",
+    ] {
+        let _reset = ResetFaults;
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let transcript = scratch.transcript("rebuild.jsonl", b"{}\n");
+        let binding = binding("account", "scope", ("fp", None));
+        let mut writer = scratch.store();
+        writer
+            .write_after_save(
+                &lock,
+                1,
+                0,
+                vec![pending(binding.clone(), certificate(&transcript), 1)],
+            )
+            .unwrap();
+        let path = record_file(&writer, &binding.key);
+        let original = fs::read(&path).unwrap();
+        let mut corrupt = original.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        if arm == "unknown" {
+            corrupt[10] ^= 1;
+            set_version(&mut corrupt, FORMAT_V3);
+        }
+        put_record(&path, &corrupt);
+        let mut cold = scratch.store();
+        assert_eq!(
+            cold.full_hold(&binding.key, arm != "unstarted"),
+            (arm == "unknown").then_some(Refusal::Unknown)
+        );
+        let mut wanted = binding.clone();
+        if arm == "context" {
+            wanted.context[0] ^= 1;
+        }
+        if arm == "repaired" {
+            put_record(&path, &original);
+        }
+        if arm == "swapped" {
+            let path = path.clone();
+            test_hooks::set_before_access(Some(Box::new(move |_, operation| {
+                if operation == "body" {
+                    let replacement = path.with_extension("swap");
+                    put_record(&replacement, &original);
+                    fs::rename(replacement, &path)?;
+                }
+                Ok(())
+            })));
+        }
+        let LeaseWait::Granted(mut lease) = ActiveLease::acquire("claude_code") else {
+            panic!("capture lease")
+        };
+        assert_eq!(
+            cold.allows_rebuild_capture(&wanted, if arm == "revision" { 4 } else { 3 }, &mut lease)
+                .unwrap(),
+            arm == "started",
+            "{arm}"
+        );
+        lease.release();
+        test_hooks::set_before_access(None);
+        assert!(
+            !cold.authorized(&binding.key, FORMAT_V3),
+            "{arm}: corrupt input is never mutation proof"
+        );
+        if arm == "started" {
+            assert!(matches!(
+                cold.read(&binding.key),
+                ReadOutcome::Refused(Refusal::Corrupt)
+            ));
+            assert_eq!(
+                cold.full_hold(&binding.key, true),
+                Some(Refusal::Corrupt),
+                "no second rebuild allowance"
+            );
+            assert_eq!(fs::read(path).unwrap(), corrupt);
+        }
+    }
+}
+
 /// [format] gc rotates past the first page and preserves unknown records.
 #[test]
 fn gc_rotates_past_the_first_page_and_preserves_unknown_records() {
@@ -3958,21 +4046,20 @@ fn gc_rotates_past_the_first_page_and_preserves_unknown_records() {
         binding.key = key_digest(DurableSource::Codex, &format!("gc-page-{n}"));
         let key = binding.key;
         let mut record = pending(binding, certificate.clone(), 1);
+        record.acquisition.as_mut().unwrap().protocol =
+            crate::snapshots::AcquisitionProtocol::WriteAhead;
         record.allowlist = DurableSource::Codex.properties().allowlist();
         record.body = crate::snapshots::durable_store_fixture_body(
             crate::snapshots::SnapshotSource::Codex,
             1,
             1,
         );
-        put_record(
-            &record_file(&store, &key),
-            &encode(&DurableRecord {
-                record,
-                index_generation: 1,
-                format: FORMAT_V1,
-                wire: None,
-                envelope_audit_debt: None,
-            }),
+        assert_eq!(
+            store
+                .write_after_save(&lock, 1, 0, vec![record])
+                .unwrap()
+                .written,
+            1
         );
         keys.push(key);
     }
@@ -3981,13 +4068,25 @@ fn gc_rotates_past_the_first_page_and_preserves_unknown_records() {
     let mut future = fs::read(record_file(&store, &keys[0])).unwrap();
     set_version(&mut future, FORMAT_V3 + 1);
     put_record(&future_path, &future);
-    store.gc(&lock, &[0; 32], &BTreeMap::new()).unwrap();
+    store
+        .gc(
+            &lock,
+            &binding("acct", "scope", ("fp", None)).context,
+            &BTreeMap::new(),
+        )
+        .unwrap();
     assert_eq!(
         store.counters().gc_records_deleted,
         GC_RECORDS_PER_PASS as u64
     );
     assert_eq!(store.counters().gc_records_read, GC_RECORDS_PER_PASS as u64);
-    store.gc(&lock, &[0; 32], &BTreeMap::new()).unwrap();
+    store
+        .gc(
+            &lock,
+            &binding("acct", "scope", ("fp", None)).context,
+            &BTreeMap::new(),
+        )
+        .unwrap();
     assert_eq!(
         store.counters().gc_records_deleted,
         (GC_RECORDS_PER_PASS + 3) as u64

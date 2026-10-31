@@ -444,6 +444,23 @@ impl SharedCache {
         )
     }
 
+    /// T14's single Full keeps its existing post-save replacement owner. Native
+    /// chain capture must not turn that rebuild into pre-publication retirement.
+    pub(in crate::snapshots) fn durable_rebuild_started(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+    ) -> bool {
+        durable_source(source).is_some_and(|ds| {
+            self.durable().is_some_and(|mut stores| {
+                stores
+                    .slot(ds)
+                    .as_ref()
+                    .is_some_and(|slot| slot.store.rebuild_started(&store::key_digest(ds, key)))
+            })
+        })
+    }
+
     /// Root's prepare_stream mutates only an exactly authorized v3 predecessor.
     /// The bounded read is funded before verification.
     fn authorize_predecessor(
@@ -470,6 +487,17 @@ impl SharedCache {
             })
         }) {
             return Ok(());
+        }
+        if full {
+            let mut stores = self.durable().ok_or(HeldCause::Fence)?;
+            let slot = stores.slot(ds).as_mut().ok_or(HeldCause::Fence)?;
+            if slot
+                .store
+                .allows_rebuild_capture(binding, effective_revision(source), lease)
+                .map_err(|_| HeldCause::CustodyBound)?
+            {
+                return Ok(());
+            }
         }
         if full {
             let mut stores = self.durable().ok_or(HeldCause::Fence)?;

@@ -1791,6 +1791,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             let lock = crate::locked_state_dir::test_locks::hold(&state);
             let index_path = state.join("index.json");
             let first = Arc::new(sampled_scan::SharedCache::default());
+            first.durable_begin_pass(source, &index_path, &namespace, true);
             let (mut index, initial, modes) = production_scan(
                 &fixture,
                 source,
@@ -1801,15 +1802,8 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             assert_eq!(modes, (1, 0, 0), "{source:?}/{arm}");
             assert!(!initial.snapshots.is_empty());
             let key = local_index_key(&fixture.file.0);
-            // Seed the post-save v1 predecessor before exercising the native
-            // M3 restart. The audit facts below are fixture input, established
-            // after the read rather than a write-ahead acquisition's facts.
-            first.durable_begin_pass(
-                source,
-                &index_path,
-                &namespace,
-                true, // Match OwnedSourceScan::new outside a sync cycle.
-            );
+            // Native capture supplies the v3 predecessor. Audit facts below
+            // are fixture input established after that acquisition.
             first.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
             if owes {
                 let fingerprint = index.files[&key].source_file_fingerprint.clone();
@@ -2155,6 +2149,7 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             let index_path = state.join("index.json");
             let key = local_index_key(&fixture.file.0);
             let first = Arc::new(sampled_scan::SharedCache::default());
+            first.durable_begin_pass(source, &index_path, &namespace, true);
             let (mut index, seed, modes) = production_scan(
                 &fixture,
                 source,
@@ -2165,7 +2160,6 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             assert_eq!(modes, (1, 0, 0));
             assert!(!seed.snapshots.is_empty());
             let old_fingerprint = index.files[&key].source_file_fingerprint.clone();
-            first.durable_begin_pass(source, &index_path, &namespace, true);
             first.durable_note_selection(&key, &old_fingerprint);
             assert!(index.stage_sampled_audit(
                 &key,

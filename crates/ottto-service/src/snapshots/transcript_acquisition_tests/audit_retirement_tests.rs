@@ -1562,7 +1562,7 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 cache.durable_begin_pass(source, &index_path, &scope, true);
                 cache
             };
-            let cache = Arc::new(sampled_scan::SharedCache::default());
+            let cache = begin();
             let (mut index, _, _) = production_scan(
                 &fixture,
                 source,
@@ -1570,7 +1570,6 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 Some(cache.clone()),
                 &scope.0,
             );
-            cache.durable_begin_pass(source, &index_path, &scope, true);
             cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
             index.save(&index_path).unwrap();
             assert_eq!(

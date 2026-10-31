@@ -548,6 +548,39 @@ impl DurableTailStore {
         checked
     }
 
+    /// Capture permission for the one started native rebuild. Corruption
+    /// supplies no reduction or mutation proof; replacement remains post-save.
+    pub(crate) fn allows_rebuild_capture(
+        &mut self,
+        binding: &Binding,
+        revision: u64,
+        lease: &mut ActiveLease,
+    ) -> Result<bool, ActiveOverBudget> {
+        let key = binding.key;
+        if self.rebuilt.get(&key) != Some(&Rebuild::Started) {
+            return Ok(false);
+        }
+        lease.charge(RESTORE_INPUT_BYTES)?;
+        let Some(header) = self.classify(&key, "rebuild", None).ok().flatten() else {
+            return Ok(false);
+        };
+        let Some(stamp) = header.stamp else {
+            return Ok(false);
+        };
+        if header.format != FORMAT_V3
+            || header.content.is_some()
+            || header.record.binding.context != binding.context
+            || !header
+                .record
+                .acquisition
+                .is_some_and(|a| a.acquired_revision == revision)
+            || stamp_at(&self.record_path(&key)).ok() != Some(Some(stamp))
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     pub(crate) fn prepare_stream(
         &mut self,
         writer: &dyn SingleWriter,

@@ -171,17 +171,29 @@ fn assert_v1_mutation_refused(
     let path = scratch.0.join(format!("{}.rec", hex(key)));
     fs::write(&path, &attack).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    let mut disk = DurableTailStore::new(scratch.0.clone(), ds);
-    assert!(
-        matches!(disk.read(&key), ReadOutcome::Refused(_)),
-        "{}: current-pin attack cannot publish a reduction",
-        golden.case_id
-    );
-    assert_eq!(
-        fs::read(path).unwrap(),
-        attack,
-        "refusal leaves the input immutable"
-    );
+    for enabled in [false, true] {
+        let _policy = if enabled {
+            crate::snapshots::RestartRestoreForTest::enabled()
+        } else {
+            crate::snapshots::RestartRestoreForTest::disabled()
+        };
+        let mut disk = DurableTailStore::new(scratch.0.clone(), ds);
+        assert!(
+            matches!(disk.read(&key), ReadOutcome::Refused(_)),
+            "{}: current-pin attack cannot publish a reduction",
+            golden.case_id
+        );
+        assert_eq!(
+            disk.full_hold(&key, true),
+            Some(crate::durable_tail_store::Refusal::Unknown),
+            "a forged pin cannot authorize a rebuild Full"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            attack,
+            "refusal leaves the input immutable"
+        );
+    }
 }
 
 /// [money] Opaque serializer-header tokens inside an archived payload, even
