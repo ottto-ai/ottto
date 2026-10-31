@@ -2599,10 +2599,12 @@ struct SettledScanResidue {
 }
 
 impl ScanTraversalCounts {
+    #[track_caller]
     fn record_unreadable(&mut self, cause: UnreadableCause, count: usize) {
         // Preserve the existing public count and operational predicates.
         self.unreadable_path_count += count;
-        self.unreadable_causes.record(cause, count as u64);
+        self.unreadable_causes
+            .record_sampled(cause, count as u64, None);
     }
 
     /// Loss that a later traversal can still change: a directory the walk
@@ -6589,7 +6591,6 @@ pub(crate) fn claude_stale_family_carry_refund_uncarries_for_test() -> usize {
 /// its members. Returns false when the walk had passed one, so the caller
 /// starts the traversal again and the uncarry precedes every pass.
 fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
-    rearm_cause::retain(index);
     let suppress = claude_redundant_stale_clear_suppressed(index);
     let carry = &index.claude_stale_family_carry;
     if carry.roots.is_empty() && carry.capped_roots.is_empty() {
@@ -8129,9 +8130,15 @@ fn fit_context_curve_to_snapshot_item_budget(
     policy: SnapshotUploadPolicy,
     item_wire_budget: usize,
 ) {
-    if item.context_curve.is_none()
-        || snapshot_item_wire_size(source, item, policy) <= item_wire_budget
-    {
+    fit_context_curve(item, |item| {
+        snapshot_item_wire_size(source, item, policy) <= item_wire_budget
+    });
+}
+
+/// Prune fill points newest first, then fall back to an unavailable curve,
+/// until `fits` holds. The curve is display data: it yields to everything else.
+fn fit_context_curve(item: &mut SnapshotItem, fits: impl Fn(&SnapshotItem) -> bool) {
+    if item.context_curve.is_none() || fits(item) {
         return;
     }
     while item
@@ -8139,7 +8146,7 @@ fn fit_context_curve_to_snapshot_item_budget(
         .as_mut()
         .is_some_and(prune_one_context_curve_fill_point)
     {
-        if snapshot_item_wire_size(source, item, policy) <= item_wire_budget {
+        if fits(item) {
             return;
         }
     }
@@ -16493,10 +16500,16 @@ struct CodexTitleMetadata {
     /// the separate classification flag below determines source-wide scope.
     state_census_unscoped_incomplete: bool,
     sidecar_census_unscoped_incomplete: bool,
-    /// The created-thread classification query itself failed before it could
-    /// identify a trustworthy key scope. Any rollout could be an omitted
-    /// created row, so this one failure class blocks every Codex candidate.
-    created_thread_census_unscoped_incomplete: bool,
+    /// Homes whose created-thread classification query failed before it
+    /// could identify a trustworthy key scope. Any rollout whose proof could
+    /// depend on such a home could be an omitted created row, so it is held;
+    /// see `created_thread_census_incomplete_for`.
+    created_thread_census_failed_homes: BTreeSet<PathBuf>,
+    /// While a home failed: identity -> rollout path whose created-thread
+    /// proof comes from exactly one other, complete home that locates it
+    /// exactly, with every spawn ancestor scoped too
+    /// (`scope_created_thread_census`).
+    created_thread_scoped: BTreeMap<String, PathBuf>,
     legacy_sidecar_fingerprint: String,
     /// The old index retained only config file stats, not content or affected
     /// session ids. Presence therefore requires one conservative corrective
@@ -18352,7 +18365,7 @@ impl SnapshotAccumulator {
             // trusted state contains created-thread suspects cannot safely be
             // treated as an ordinary file.
             self.codex_sidecar_identity_ambiguous = !metadata.state_created_threads.is_empty()
-                || metadata.created_thread_census_unscoped_incomplete;
+                || metadata.created_thread_census_incomplete_for(path);
             return;
         }
         self.codex_path_sidecar_candidates = identities
@@ -18401,7 +18414,7 @@ impl SnapshotAccumulator {
             })
             .collect();
 
-        if metadata.created_thread_census_unscoped_incomplete {
+        if metadata.created_thread_census_incomplete_for(path) {
             self.codex_sidecar_identity_ambiguous = true;
             return;
         }
@@ -26084,6 +26097,7 @@ struct OwnedActiveFile {
     recovered_audit_due: Option<u64>,
     candidate: CandidateFile,
     decision: CandidateDecision,
+    parse_reason: Option<CandidateParseReason>,
     previous_snapshot_fingerprint: Option<String>,
     previous_upload_body_witness: Option<String>,
     projection_adoption_required: bool,
@@ -26682,6 +26696,7 @@ impl OwnedSourceScan {
         let codex_title_metadata = if source == SnapshotSource::Codex {
             let mut metadata = CodexTitleMetadata::load_from_roots(roots);
             metadata.count_prior_state_only_conflicts(index);
+            metadata.scope_created_thread_census(index, roots);
             metadata
         } else {
             CodexTitleMetadata::default()
@@ -26747,14 +26762,7 @@ impl OwnedSourceScan {
             index.record_started_claude_request_identity_contract(claude_request_identity_capture);
         }
         if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
-            refresh_terminal_off_discovery(
-                index,
-                roots,
-                audit_now,
-                watcher_overflowed,
-                collected_at,
-                file_limit,
-            );
+            refresh_terminal_off_discovery(index, roots, audit_now, watcher_overflowed, file_limit);
         }
         let next_generation_hints;
         {
@@ -28496,7 +28504,13 @@ impl OwnedSourceScan {
                         // than the singleton budget (compressed members > B
                         // keep refusing, named debt).
                         Err(_) => {
-                            census.record_unreadable(UnreadableCause::OpenRead, 1);
+                            match group_members.first() {
+                                Some(member) => census.record_unreadable_file(
+                                    UnreadableCause::OpenRead,
+                                    &member.path,
+                                ),
+                                None => census.record_unreadable(UnreadableCause::OpenRead, 1),
+                            }
                             codex_state_only_blocked_session_ids.insert(owner);
                             pending!();
                         }
@@ -28986,7 +29000,10 @@ impl OwnedSourceScan {
                                 &active.candidate.path,
                             );
                         }
-                        census.record_unreadable(UnreadableCause::OpenRead, 1);
+                        census.record_unreadable_file(
+                            UnreadableCause::OpenRead,
+                            &active.candidate.path,
+                        );
                         pending!();
                     }
                     Ok(true) if codex_page.continuation() => {
@@ -29064,7 +29081,10 @@ impl OwnedSourceScan {
                                     &active.candidate.path,
                                 );
                             }
-                            census.record_unreadable(UnreadableCause::Reduction, 1);
+                            census.record_unreadable_file(
+                                UnreadableCause::Reduction,
+                                &active.candidate.path,
+                            );
                             pending!();
                         }
                         Ok(true) => {}
@@ -29077,6 +29097,12 @@ impl OwnedSourceScan {
                         resource_probe.rearm_full_completed(
                             &local_index_key(&active.candidate.path),
                             plan.mode(),
+                            plan.metrics().native_bytes,
+                        );
+                        resource_probe.full_parse_reason(
+                            plan.mode(),
+                            active.parse_reason,
+                            0,
                             plan.metrics().native_bytes,
                         );
                         #[cfg(unix)]
@@ -29103,7 +29129,10 @@ impl OwnedSourceScan {
                     let reopened =
                         reopen_for_replay(source, &active.candidate, &active.parser.reader.reader);
                     let Ok(file) = reopened else {
-                        census.record_unreadable(UnreadableCause::OpenRead, 1);
+                        census.record_unreadable_file(
+                            UnreadableCause::OpenRead,
+                            &active.candidate.path,
+                        );
                         pending!();
                     };
                     let Ok(mut parser) = sampled_scan::new_source_parser(
@@ -29118,7 +29147,10 @@ impl OwnedSourceScan {
                         claude_request_identity_capture,
                         index,
                     ) else {
-                        census.record_unreadable(UnreadableCause::Reduction, 1);
+                        census.record_unreadable_file(
+                            UnreadableCause::Reduction,
+                            &active.candidate.path,
+                        );
                         pending!();
                     };
                     // U1a-2a (D6(a)): the replacement parser gets the same
@@ -29152,7 +29184,10 @@ impl OwnedSourceScan {
                         debt,
                         sampled_scan::now_seconds(),
                     ) else {
-                        census.record_unreadable(UnreadableCause::Reduction, 1);
+                        census.record_unreadable_file(
+                            UnreadableCause::Reduction,
+                            &active.candidate.path,
+                        );
                         pending!();
                     };
                     acquisition.mode = mode;
@@ -29173,7 +29208,10 @@ impl OwnedSourceScan {
                             lease.release();
                         }
                         sampled_scan::codex_cursor::dequeue(index, &active.candidate);
-                        census.record_unreadable(UnreadableCause::Reduction, 1);
+                        census.record_unreadable_file(
+                            UnreadableCause::Reduction,
+                            &active.candidate.path,
+                        );
                         pending!();
                     }
                     // LD: the replay is a fresh Full delivery from 0.
@@ -29506,6 +29544,7 @@ impl OwnedSourceScan {
                     recovered_audit_due,
                     candidate,
                     decision,
+                    parse_reason: _,
                     previous_snapshot_fingerprint,
                     previous_upload_body_witness,
                     projection_adoption_required,
@@ -29741,7 +29780,7 @@ impl OwnedSourceScan {
                                     }
                                     _ => UnreadableCause::ScopeObject,
                                 };
-                                census.record_unreadable(cause, 1);
+                                census.record_unreadable_file(cause, &candidate.path);
                                 pending!();
                             }
                         }
@@ -29762,7 +29801,7 @@ impl OwnedSourceScan {
                                     &candidate.path,
                                 );
                             }
-                            census.record_unreadable(cause, 1);
+                            census.record_unreadable_file(cause, &candidate.path);
                             pending!();
                         }
                         // #665 second-lander condition: only a retaining,
@@ -29843,7 +29882,10 @@ impl OwnedSourceScan {
                                         &candidate.path,
                                     );
                                 }
-                                census.record_unreadable(UnreadableCause::Reduction, 1);
+                                census.record_unreadable_file(
+                                    UnreadableCause::Reduction,
+                                    &candidate.path,
+                                );
                                 pending!();
                             }
                         }
@@ -30055,7 +30097,7 @@ impl OwnedSourceScan {
                                 &candidate.path,
                             );
                         }
-                        census.record_unreadable(UnreadableCause::Reduction, 1);
+                        census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
                         pending!();
                     }
                 };
@@ -30751,7 +30793,7 @@ impl OwnedSourceScan {
                         context.audit_cap_delay += 1;
                     }
                     sampled_audit::queue_cap_retry(index, &candidate);
-                    census.record_unreadable(UnreadableCause::Reduction, 1);
+                    census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
                     pending!();
                 }
                 // Debt-free after quiet retirement is scheduling state, not
@@ -32271,6 +32313,7 @@ impl OwnedSourceScan {
                         acquisition_admission: context.admission,
                         page_events: crate::local_resource_diagnostics::PageEvents {
                             full_cause: resource_probe.rearm_fulls(),
+                            full_by_parse_reason: resource_probe.full_by_parse_reason(),
                             full_reasons: crate::local_resource_diagnostics::FullReasons(
                                 context.full_reasons,
                             ),
@@ -32399,7 +32442,7 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(()) => {
-                        census.record_unreadable(UnreadableCause::Reduction, 1);
+                        census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
                         pending!();
                     }
                     Ok(true) => {}
@@ -33237,7 +33280,7 @@ impl OwnedSourceScan {
                             &candidate.path,
                         );
                     }
-                    census.record_unreadable(UnreadableCause::Reduction, 1);
+                    census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
                     pending!();
                 }
             };
@@ -33512,7 +33555,10 @@ impl OwnedSourceScan {
                         {
                             if !context.cap_candidate(&key) {
                                 sampled_audit::queue_cap_retry(index, &candidate);
-                                census.record_unreadable(UnreadableCause::Reduction, 1);
+                                census.record_unreadable_file(
+                                    UnreadableCause::Reduction,
+                                    &candidate.path,
+                                );
                                 pending!();
                             }
                             cap_full = true;
@@ -33544,7 +33590,10 @@ impl OwnedSourceScan {
                                         &candidate.path,
                                     );
                                 }
-                                census.record_unreadable(UnreadableCause::Reduction, 1);
+                                census.record_unreadable_file(
+                                    UnreadableCause::Reduction,
+                                    &candidate.path,
+                                );
                                 pending!();
                             }
                         };
@@ -33663,7 +33712,10 @@ impl OwnedSourceScan {
                             Err(_) => {
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
-                                census.record_unreadable(UnreadableCause::Reduction, 1);
+                                census.record_unreadable_file(
+                                    UnreadableCause::Reduction,
+                                    &candidate.path,
+                                );
                                 pending!();
                             }
                         };
@@ -33688,6 +33740,7 @@ impl OwnedSourceScan {
                 recovered_audit_due,
                 candidate,
                 decision,
+                parse_reason: parse_reason.filter(|_| source == SnapshotSource::ClaudeCode),
                 previous_snapshot_fingerprint,
                 previous_upload_body_witness,
                 projection_adoption_required,
@@ -33812,13 +33865,19 @@ impl OwnedSourceScan {
                             // retryable cause, so discovery finishes and the
                             // bounded unhealthy retry starts the next one.
                             Err(sampled_scan::codex_cursor::StartRefusal::InputsUnavailable) => {
-                                census.record_unreadable(UnreadableCause::Reduction, 1);
+                                census.record_unreadable_file(
+                                    UnreadableCause::Reduction,
+                                    &active.candidate.path,
+                                );
                                 pending!();
                             }
                             Err(sampled_scan::codex_cursor::StartRefusal::Unstartable) => {
                                 // Never an unbounded in-page read of a file
                                 // larger than the singleton budget.
-                                census.record_unreadable(UnreadableCause::OpenRead, 1);
+                                census.record_unreadable_file(
+                                    UnreadableCause::OpenRead,
+                                    &active.candidate.path,
+                                );
                                 pending!();
                             }
                         }
@@ -33869,6 +33928,7 @@ impl OwnedSourceScan {
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
                 resource_probe.rearm_full_selected(&local_index_key(&active.candidate.path), mode);
+                resource_probe.full_parse_reason(mode, active.parse_reason, 1, 0);
             }
             if let Some(delivery) = line_delivery.as_mut() {
                 delivery.arm();
@@ -40255,10 +40315,30 @@ impl ScanCensus {
         ))
     }
 
+    #[track_caller]
     fn record_unreadable(&mut self, cause: UnreadableCause, count: usize) {
+        self.record_unreadable_sampled(cause, count, None);
+    }
+
+    /// One unreadable file: its root class, kind and key digest join the
+    /// cause's bounded sample (E2 B2), never its path.
+    #[track_caller]
+    fn record_unreadable_file(&mut self, cause: UnreadableCause, path: &Path) {
+        let key = local_index_key(path);
+        self.record_unreadable_sampled(cause, 1, Some((path, key.as_str())));
+    }
+
+    #[track_caller]
+    fn record_unreadable_sampled(
+        &mut self,
+        cause: UnreadableCause,
+        count: usize,
+        file: Option<(&Path, &str)>,
+    ) {
         // Preserve the existing public count and operational predicates.
         self.unreadable_path_count += count;
-        self.unreadable_causes.record(cause, count as u64);
+        self.unreadable_causes
+            .record_sampled(cause, count as u64, file);
         #[cfg(test)]
         sampled_scan::test_hooks::record_unreadable(cause as usize);
     }
@@ -40598,20 +40678,25 @@ impl CodexTitleMetadata {
             let state_path = codex_dir.join("state_5.sqlite");
             legacy_sidecar_parts.push(sidecar_stat_fingerprint(&state_path));
             let state_conflicts_before = metadata.identity_conflicts.len();
+            let mut retries = 0;
             let title_census = load_codex_sqlite_titles(
                 &state_path,
+                &mut retries,
                 &mut metadata.titles,
                 &mut metadata.identity_conflicts,
             );
             metadata.local_diagnostics.state_titles.observe_root(
                 &title_census,
+                retries,
                 metadata.identity_conflicts.len() != state_conflicts_before,
                 local_index_key(&codex_dir).as_str(),
             );
             let thread_conflicts_before = metadata.identity_conflicts.len();
             let mut root_sidecar = codex_root_copies::RootSidecar::default();
+            let mut retries = 0;
             let state_census = load_codex_sqlite_state_threads(
                 &state_path,
+                &mut retries,
                 &mut root_sidecar.threads,
                 &mut metadata.identity_conflicts,
                 &mut metadata.local_diagnostics.identity_conflict_taxonomy,
@@ -40619,12 +40704,15 @@ impl CodexTitleMetadata {
             codex_root_copies::merge_threads(&mut metadata, &codex_dir, &root_sidecar.threads);
             metadata.local_diagnostics.state_threads.observe_root(
                 &state_census,
+                retries,
                 metadata.identity_conflicts.len() != thread_conflicts_before,
                 local_index_key(&codex_dir).as_str(),
             );
             let spawn_conflicts_before = metadata.identity_conflicts.len();
+            let mut retries = 0;
             let spawn_census = load_codex_sqlite_spawn_edges(
                 &state_path,
+                &mut retries,
                 &mut metadata.state_created_threads,
                 &mut metadata.spawn_parents,
                 &mut metadata.spawn_parent_conflicts,
@@ -40633,6 +40721,7 @@ impl CodexTitleMetadata {
             );
             metadata.local_diagnostics.spawn_edges.observe_root(
                 &spawn_census,
+                retries,
                 metadata.identity_conflicts.len() != spawn_conflicts_before,
                 local_index_key(&codex_dir).as_str(),
             );
@@ -40646,7 +40735,9 @@ impl CodexTitleMetadata {
                 metadata.sidecar_census_unscoped_incomplete = true;
             }
             if spawn_census_incomplete {
-                metadata.created_thread_census_unscoped_incomplete = true;
+                metadata
+                    .created_thread_census_failed_homes
+                    .insert(codex_dir.clone());
             }
             if metadata.identity_conflicts.len() != state_conflicts_before {
                 metadata.state_census_incomplete = true;
@@ -40656,14 +40747,17 @@ impl CodexTitleMetadata {
             let history_path = codex_dir.join("thread_history_1.sqlite");
             legacy_sidecar_parts.push(sidecar_stat_fingerprint(&history_path));
             let history_conflicts_before = metadata.identity_conflicts.len();
+            let mut retries = 0;
             let history_census = load_codex_rollout_extents(
                 &history_path,
+                &mut retries,
                 &mut root_sidecar.extents,
                 &mut metadata.identity_conflicts,
             );
             codex_root_copies::merge_extents(&mut metadata, &root_sidecar.extents);
             metadata.local_diagnostics.rollout_extents.observe_root(
                 &history_census,
+                retries,
                 metadata.identity_conflicts.len() != history_conflicts_before,
                 local_index_key(&codex_dir).as_str(),
             );
@@ -40688,6 +40782,7 @@ impl CodexTitleMetadata {
             );
             metadata.local_diagnostics.session_index.observe_root(
                 &index_census,
+                0,
                 metadata.identity_conflicts.len() != index_conflicts_before,
                 local_index_key(&codex_dir).as_str(),
             );
@@ -40743,6 +40838,112 @@ impl CodexTitleMetadata {
                 .filter(|parent| conflicts.contains(parent.as_str()))
                 .count(),
         );
+    }
+
+    /// E2 B3b (Lead B, 2026-10-31): a failed created-thread census holds only
+    /// rollouts whose proof could depend on a failing home's state database.
+    fn created_thread_census_incomplete_for(&self, path: &Path) -> bool {
+        !self.created_thread_census_failed_homes.is_empty()
+            && !codex_rollout_thread_id(path).is_some_and(|identity| {
+                self.created_thread_scoped
+                    .get(&identity)
+                    .is_some_and(|rollout| rollout == path)
+            })
+    }
+
+    /// E2 B3b: after a home's created-thread census failed, scope a rollout to
+    /// its own home only when the file -> home map is exact. Its one identity
+    /// has a state row in exactly one loaded home, whose created-thread census
+    /// succeeded, which is the only loaded home containing the row's rollout
+    /// path and which locates it exactly (`copy_locator`). Discovery has walked
+    /// every failing root (in its scan roots, none pending, no namespace loss)
+    /// without finding a rollout of that identity there (a copy whose unread
+    /// row could disagree), and every spawn ancestor is scoped too: a spawned
+    /// child's lineage (`family_position`) reads every home's edges. Anything
+    /// else stays held. Counted in `created_thread_scoped_rollouts`.
+    fn scope_created_thread_census(&mut self, index: &ScanIndex, roots: &[PathBuf]) {
+        let failed = &self.created_thread_census_failed_homes;
+        let under_failed = |path: &Path| failed.iter().any(|home| path.starts_with(home));
+        let Some(traversal) = index.traversal.as_ref() else {
+            return;
+        };
+        if failed.is_empty()
+            || roots
+                .iter()
+                .any(|root| under_failed(root) && !traversal.scan_roots.contains(root))
+            || traversal
+                .pending_directories
+                .iter()
+                .any(|directory| under_failed(&directory.path))
+            || claude_family_census_shadow::Vetoes::current(index, traversal).namespace_loss
+        {
+            return;
+        }
+        let in_failed_homes = index
+            .files
+            .keys()
+            .chain(&traversal.observed_index_keys)
+            .chain(&traversal.codex_rollout_paths)
+            .map(Path::new)
+            .chain(
+                traversal
+                    .pending_candidates
+                    .iter()
+                    .map(|candidate| candidate.path.as_path()),
+            )
+            .filter(|path| under_failed(path))
+            .flat_map(codex_session_id_candidates_from_path)
+            .collect::<BTreeSet<_>>();
+        let mut scoped = BTreeMap::new();
+        for (home, sidecar) in &self.root_sidecars {
+            if failed.contains(home) {
+                continue;
+            }
+            for (identity, thread) in &sidecar.threads {
+                let Some(rollout) = thread.rollout_path.as_deref().map(Path::new) else {
+                    continue;
+                };
+                let single_home = self
+                    .root_sidecars
+                    .iter()
+                    .filter(|(other, other_sidecar)| {
+                        rollout.starts_with(other) || other_sidecar.threads.contains_key(identity)
+                    })
+                    .count()
+                    == 1;
+                if single_home
+                    && codex_root_copies::copy_locator(home, identity, thread).is_some()
+                    && !in_failed_homes.contains(identity)
+                    && !self.identity_conflicts.contains(identity)
+                {
+                    scoped.insert(identity.clone(), rollout.to_path_buf());
+                }
+            }
+        }
+        let held_lineage = |identity: &String| {
+            let mut child = resolve_codex_identity(identity);
+            let mut seen = BTreeSet::new();
+            while let Some(parent) = self.spawn_parents.get(child.as_str()) {
+                if self.spawn_parent_conflicts.contains(child.as_str())
+                    || !seen.insert(child)
+                    || !scoped.contains_key(parent)
+                {
+                    return true;
+                }
+                child = parent.clone();
+            }
+            self.spawn_parent_conflicts.contains(child.as_str())
+        };
+        let held = scoped
+            .keys()
+            .filter(|&identity| held_lineage(identity))
+            .cloned()
+            .collect::<Vec<_>>();
+        for identity in held {
+            scoped.remove(&identity);
+        }
+        self.local_diagnostics.created_thread_scoped_rollouts = saturating_count_u32(scoped.len());
+        self.created_thread_scoped = scoped;
     }
 
     /// Diagnostics only: conflict keys the prior scan published as durable
@@ -40966,15 +41167,15 @@ fn load_codex_session_index_titles(
 
 fn load_codex_sqlite_titles(
     path: &Path,
+    retries: &mut u32,
     titles: &mut BTreeMap<String, CodexTitleCandidate>,
     identity_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .context(crate::codex_scan_diagnostics::LoaderStage::Open)
-        .context("open Codex title database")?;
+    let connection =
+        open_codex_sidecar_database(path, retries).context("open Codex title database")?;
     let mut statement = connection
         .prepare("SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''")
         .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
@@ -41006,6 +41207,7 @@ fn load_codex_sqlite_titles(
 
 fn load_codex_sqlite_state_threads(
     path: &Path,
+    retries: &mut u32,
     state_threads: &mut BTreeMap<String, CodexStateThread>,
     identity_conflicts: &mut BTreeSet<String>,
     taxonomy: &mut IdentityConflictTaxonomy,
@@ -41013,9 +41215,8 @@ fn load_codex_sqlite_state_threads(
     if !path.exists() {
         return Ok(());
     }
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .context(crate::codex_scan_diagnostics::LoaderStage::Open)
-        .context("open Codex state database")?;
+    let connection =
+        open_codex_sidecar_database(path, retries).context("open Codex state database")?;
     let columns = sqlite_table_columns(&connection, "threads")?;
     if !columns.contains("id") || !columns.contains("tokens_used") {
         return Err(anyhow::Error::new(IncompleteShape)
@@ -41135,15 +41336,15 @@ fn saturating_count_u32(count: usize) -> u32 {
 
 fn load_codex_rollout_extents(
     path: &Path,
+    retries: &mut u32,
     rollout_extents: &mut BTreeMap<String, CodexRolloutExtent>,
     identity_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .context(crate::codex_scan_diagnostics::LoaderStage::Open)
-        .context("open Codex thread-history database")?;
+    let connection =
+        open_codex_sidecar_database(path, retries).context("open Codex thread-history database")?;
     let columns = sqlite_table_columns(&connection, "thread_history_projection_state")?;
     if columns.is_empty() {
         return Ok(());
@@ -41221,6 +41422,7 @@ fn load_codex_rollout_extents(
 /// no parent, so it can never remove a parent recorded elsewhere.
 fn load_codex_sqlite_spawn_edges(
     path: &Path,
+    retries: &mut u32,
     state_created_threads: &mut BTreeSet<String>,
     spawn_parents: &mut BTreeMap<String, String>,
     spawn_parent_conflicts: &mut BTreeSet<String>,
@@ -41230,9 +41432,8 @@ fn load_codex_sqlite_spawn_edges(
     if !path.exists() {
         return Ok(());
     }
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .context(crate::codex_scan_diagnostics::LoaderStage::Open)
-        .context("open Codex spawn-edge database")?;
+    let connection =
+        open_codex_sidecar_database(path, retries).context("open Codex spawn-edge database")?;
 
     // Newer Codex Desktop builds can create a child task without populating
     // `thread_spawn_edges`. The equivalent provider-native relationship lives
@@ -41420,6 +41621,53 @@ fn record_codex_identity_key(
         .entry(key.clone())
         .or_insert_with(|| raw_id.to_string());
     key
+}
+
+/// Bounded retries of a transient sidecar open: on Ron's M4 (2026-10-31)
+/// `~/.codex/state_5.sqlite` failed SQLITE_CANTOPEN at its first prepare on 11
+/// of 175 Codex pages while Codex itself kept it open. BUSY is not retried:
+/// rusqlite's connection busy timeout already waits for it.
+const CODEX_SIDECAR_OPEN_RETRIES: u32 = 3;
+const CODEX_SIDECAR_OPEN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Open a Codex sidecar database read-only and read its schema, which opens
+/// the WAL and its index for the connection's later statements. A transient
+/// CANTOPEN is retried; `retries` counts the extra attempts.
+fn open_codex_sidecar_database(path: &Path, retries: &mut u32) -> Result<Connection> {
+    retry_transient_sqlite(retries, || {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context(crate::codex_scan_diagnostics::LoaderStage::Open)?;
+        connection
+            .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)?;
+        Ok(connection)
+    })
+}
+
+/// Run `attempt` until it succeeds, fails other than SQLITE_CANTOPEN, or has
+/// been retried `CODEX_SIDECAR_OPEN_RETRIES` times.
+fn retry_transient_sqlite<T>(
+    retries: &mut u32,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut retried = 0;
+    loop {
+        match attempt() {
+            Err(error)
+                if retried < CODEX_SIDECAR_OPEN_RETRIES
+                    && matches!(
+                        error.downcast_ref::<rusqlite::Error>(),
+                        Some(rusqlite::Error::SqliteFailure(failure, _))
+                            if failure.code == rusqlite::ErrorCode::CannotOpen
+                    ) =>
+            {
+                retried += 1;
+                *retries = retries.saturating_add(1);
+                std::thread::sleep(CODEX_SIDECAR_OPEN_BACKOFF * retried);
+            }
+            result => return result,
+        }
+    }
 }
 
 fn sqlite_table_columns(connection: &Connection, table_name: &str) -> Result<BTreeSet<String>> {
@@ -44706,7 +44954,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
         census
             .observed_index_keys
             .insert(local_index_key(&candidate.path));
-        census.record_unreadable(UnreadableCause::OpenRead, 1);
+        census.record_unreadable_file(UnreadableCause::OpenRead, &candidate.path);
         return None;
     }
     let opened = open_candidate_file_stat_retained(
@@ -44764,7 +45012,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
             return None;
         }
         Err(_) => {
-            census.record_unreadable(UnreadableCause::OpenRead, 1);
+            census.record_unreadable_file(UnreadableCause::OpenRead, &candidate.path);
             return None;
         }
     };
@@ -44804,7 +45052,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
         live,
         &mut opened_file,
     ) else {
-        census.record_unreadable(UnreadableCause::OpenRead, 1);
+        census.record_unreadable_file(UnreadableCause::OpenRead, &candidate.path);
         return None;
     };
     let session_sidecar_fingerprint = std::mem::take(&mut candidate.source_file_fingerprint);
@@ -45401,7 +45649,7 @@ enum CandidateDecision {
 
 /// Count-only diagnostic: the first gate that selected a candidate for parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CandidateParseReason {
+pub(crate) enum CandidateParseReason {
     TerminalDisposition,
     NewFile,
     AuthorityQuarantine,
@@ -45419,8 +45667,8 @@ enum CandidateParseReason {
     ForcedFamily,
 }
 
-const CANDIDATE_PARSE_REASON_COUNT: usize = 15;
-const CANDIDATE_PARSE_REASON_NAMES: [&str; CANDIDATE_PARSE_REASON_COUNT] = [
+pub(crate) const CANDIDATE_PARSE_REASON_COUNT: usize = 15;
+pub(crate) const CANDIDATE_PARSE_REASON_NAMES: [&str; CANDIDATE_PARSE_REASON_COUNT] = [
     "terminal_disposition",
     "new_file",
     "authority_quarantine",
@@ -52425,6 +52673,19 @@ fn looks_like_raw_identifier(value: &str, source: &str) -> bool {
         return false;
     }
     !has_space && ascii_token && has_digit && trimmed.len() >= 24
+}
+
+/// The one state-row id a rollout path can name: its only UUID-shaped
+/// filename candidate. Codex state ids are UUIDs, so the timestamped raw
+/// reading of a modern name cannot name a state row (E2 B3b).
+fn codex_rollout_thread_id(path: &Path) -> Option<String> {
+    let mut ids = codex_session_id_candidates_from_path(path)
+        .into_iter()
+        .filter(|identity| codex_identity_is_uuid_shaped(identity));
+    match (ids.next(), ids.next()) {
+        (Some(identity), None) => Some(identity),
+        _ => None,
+    }
 }
 
 fn codex_identity_is_uuid_shaped(value: &str) -> bool {
@@ -77921,7 +78182,7 @@ mod tests {
         .expect("write unscoped census rollout");
 
         let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
-        assert!(metadata.created_thread_census_unscoped_incomplete);
+        assert!(!metadata.created_thread_census_failed_homes.is_empty());
         for context_curve_enabled in [true, false] {
             let (scan, index) =
                 scan_codex_test_root_with_curve(&sessions_dir, context_curve_enabled);
@@ -77939,6 +78200,249 @@ mod tests {
                 .contains(session_id));
         }
         let _ = fs::remove_dir_all(home);
+    }
+
+    fn sqlite_cantopen() -> anyhow::Error {
+        anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(14),
+            None,
+        ))
+        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
+    }
+
+    /// [behaviour] E2 B3: an open that fails once with SQLITE_CANTOPEN and
+    /// then succeeds counts its root complete, with the retry counted; any
+    /// other failure is not retried.
+    #[test]
+    fn codex_sidecar_open_retry_counts_root_complete_after_transient_cantopen() {
+        let mut failures = 1;
+        let mut retries = 0;
+        let result = retry_transient_sqlite(&mut retries, || {
+            if failures > 0 {
+                failures -= 1;
+                return Err(sqlite_cantopen());
+            }
+            Ok(())
+        });
+        let mut evidence = crate::codex_scan_diagnostics::LoaderEvidence::default();
+        evidence.observe_root(&result, retries, false, "codex root");
+        assert_eq!((evidence.completed_roots, evidence.failed_roots), (1, 0));
+        assert_eq!(evidence.transient_retries, 1);
+        assert_eq!(evidence.completed_after_retry, 1);
+
+        let mut attempts = 0;
+        let mut retries = 0;
+        let not_a_database: Result<()> = retry_transient_sqlite(&mut retries, || {
+            attempts += 1;
+            Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(26),
+                None,
+            )))
+        });
+        assert!(not_a_database.is_err());
+        assert_eq!((attempts, retries), (1, 0));
+    }
+
+    /// [behaviour] E2 B3: a state database that keeps failing SQLITE_CANTOPEN
+    /// still fails each state loader's root after the bounded retries, with
+    /// main's stage, native code and created-thread ambiguity.
+    #[cfg(unix)]
+    #[test]
+    fn codex_state_loaders_keep_failing_root_after_bounded_cantopen_retries() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_dir("codex-state-persistent-cantopen");
+        let codex_dir = home.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create state fixture root");
+        let state_path = codex_dir.join("state_5.sqlite");
+        Connection::open(&state_path)
+            .expect("open state fixture")
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT, title TEXT, tokens_used INTEGER, \
+                 thread_source TEXT, first_user_message TEXT);",
+            )
+            .expect("create state fixture schema");
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let diagnostics = metadata.local_diagnostics;
+        for evidence in [
+            diagnostics.state_titles,
+            diagnostics.state_threads,
+            diagnostics.spawn_edges,
+        ] {
+            assert_eq!((evidence.completed_roots, evidence.failed_roots), (0, 1));
+            assert_eq!(evidence.transient_retries, CODEX_SIDECAR_OPEN_RETRIES);
+            assert_eq!(evidence.completed_after_retry, 0);
+            assert_eq!(
+                evidence.first_failure_stage,
+                Some(crate::codex_scan_diagnostics::LoaderStage::Open)
+            );
+            assert_eq!(evidence.sqlite_extended_code, Some(14));
+        }
+        assert!(metadata.state_census_incomplete);
+        assert!(!metadata.created_thread_census_failed_homes.is_empty());
+    }
+
+    /// [money] E2 B3b (Lead B, 2026-10-31): one home's created-thread census
+    /// fails. A rollout whose proof comes only from another, healthy home is
+    /// not held, nor is its spawned child. A rollout that might depend on two
+    /// homes (a copy of its id in the failing home), its spawned descendants, one
+    /// with no own-home row and one inside the failing home stay held, and
+    /// nothing is scoped until discovery has walked the failing home's roots
+    /// without loss.
+    #[test]
+    fn codex_created_thread_census_failure_holds_only_files_of_the_failing_home() {
+        let base = temp_dir("codex-created-thread-scoped-failure");
+        let failing = base.join(".codex");
+        let healthy = base.join("slot").join("home");
+        let [own, copied, rowless, inside, own_child, copied_child, grandchild] = [
+            "01a03e99-49cf-7460-9fd7-f7dbfd2f0a01",
+            "01a03e99-49cf-7460-9fd7-f7dbfd2f0a02",
+            "01a03e99-49cf-7460-9fd7-f7dbfd2f0a03",
+            "01a03e99-49cf-7460-9fd7-f7dbfd2f0a04",
+            "01a03e99-49cf-7460-9fd7-f7dbfd2f0a05",
+            "01a03e99-49cf-7460-9fd7-f7dbfd2f0a06",
+            "01a03e99-49cf-7460-9fd7-f7dbfd2f0a07",
+        ];
+        let rollout = |home: &Path, id: &str| {
+            let path = home
+                .join("sessions")
+                .join(format!("rollout-2026-10-30T10-00-00-{id}.jsonl"));
+            fs::create_dir_all(path.parent().unwrap()).expect("create scoped fixture root");
+            fs::write(&path, b"{}\n").expect("write scoped fixture rollout");
+            path
+        };
+        let [own_path, copied_path, rowless_path] =
+            [own, copied, rowless].map(|id| rollout(&healthy, id));
+        let [own_child_path, copied_child_path, grandchild_path] =
+            [own_child, copied_child, grandchild].map(|id| rollout(&healthy, id));
+        let [inside_path, copy_in_failing] = [inside, copied].map(|id| rollout(&failing, id));
+        fs::write(failing.join("state_5.sqlite"), b"not a sqlite database")
+            .expect("write failing classification census");
+        let state = Connection::open(healthy.join("state_5.sqlite")).expect("open healthy state");
+        state
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT, title TEXT, tokens_used INTEGER, \
+                 thread_source TEXT, first_user_message TEXT, rollout_path TEXT); \
+                 CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT);",
+            )
+            .expect("create healthy state schema");
+        for (parent, child) in [
+            (own, own_child),
+            (copied, copied_child),
+            (copied_child, grandchild),
+        ] {
+            state
+                .execute(
+                    "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+                    rusqlite::params![parent, child],
+                )
+                .expect("insert healthy spawn edge");
+        }
+        for (id, path) in [
+            (own, &own_path),
+            (copied, &copied_path),
+            (own_child, &own_child_path),
+            (copied_child, &copied_child_path),
+            (grandchild, &grandchild_path),
+        ] {
+            state
+                .execute(
+                    "INSERT INTO threads VALUES (?1, NULL, 5, 'user', NULL, ?2)",
+                    rusqlite::params![id, path.to_string_lossy()],
+                )
+                .expect("insert healthy state row");
+        }
+        drop(state);
+        let roots = [failing.join("sessions"), healthy.join("sessions")];
+        let walked = json!({
+            "context_fingerprint": "context",
+            "census_window_end": "2026-10-31T10:00:00Z",
+            "scan_roots": roots,
+            "pending_directories": [],
+            "pending_candidates": [],
+            "observed_index_keys": [],
+            "codex_rollout_paths": [local_index_key(&copy_in_failing)],
+            "reconciliation_upper_bound": null,
+            "reconciliation_after": null,
+            "reconciliation_started": false,
+            "counts": {}
+        });
+        let scoped = |traversal: Option<&Value>| {
+            let index = ScanIndex {
+                traversal: traversal
+                    .map(|traversal| serde_json::from_value(traversal.clone()).unwrap()),
+                ..ScanIndex::default()
+            };
+            let mut metadata = CodexTitleMetadata::load_from_roots(&roots);
+            metadata.scope_created_thread_census(&index, &roots);
+            metadata
+        };
+        let ambiguous = |metadata: &CodexTitleMetadata, path: &Path| {
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+            accumulator.seed_codex_sidecar_parent(
+                path,
+                &fs::metadata(path).expect("fixture metadata"),
+                metadata,
+            );
+            accumulator.codex_sidecar_identity_ambiguous
+        };
+
+        let metadata = scoped(Some(&walked));
+        assert_eq!(
+            metadata.created_thread_census_failed_homes,
+            BTreeSet::from([failing.clone()])
+        );
+        assert!(
+            !ambiguous(&metadata, &own_path),
+            "own-home proof is not held"
+        );
+        assert!(
+            !ambiguous(&metadata, &own_child_path),
+            "child of an own-home parent is not held"
+        );
+        assert!(
+            ambiguous(&metadata, &copied_path),
+            "copy in the failing home"
+        );
+        assert!(
+            ambiguous(&metadata, &copied_child_path),
+            "child of a held parent"
+        );
+        assert!(
+            ambiguous(&metadata, &grandchild_path),
+            "grandchild of a held parent"
+        );
+        assert!(ambiguous(&metadata, &rowless_path), "no own-home row");
+        assert!(
+            ambiguous(&metadata, &inside_path),
+            "inside the failing home"
+        );
+        assert_eq!(metadata.local_diagnostics.created_thread_scoped_rollouts, 2);
+
+        // Until discovery has fully walked the failing home, nothing is scoped.
+        let mut pending = walked.clone();
+        pending["pending_directories"] =
+            json!([{"scan_root": roots[0], "path": failing.join("sessions")}]);
+        let mut lossy = walked.clone();
+        lossy["counts"] = json!({"symlink_rejected_count": 1});
+        let mut unwalked_root = walked.clone();
+        unwalked_root["scan_roots"] = json!([roots[1]]);
+        for (name, traversal) in [
+            ("pending directory", Some(&pending)),
+            ("namespace loss", Some(&lossy)),
+            ("root not walked", Some(&unwalked_root)),
+            ("no traversal", None),
+        ] {
+            let metadata = scoped(traversal);
+            assert!(ambiguous(&metadata, &own_path), "{name}");
+            assert_eq!(
+                metadata.local_diagnostics.created_thread_scoped_rollouts, 0,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -77993,7 +78497,10 @@ mod tests {
             .expect("write schema fixture rollout");
 
             let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
-            assert!(metadata.created_thread_census_unscoped_incomplete, "{name}");
+            assert!(
+                !metadata.created_thread_census_failed_homes.is_empty(),
+                "{name}"
+            );
             for context_curve_enabled in [true, false] {
                 let (scan, index) =
                     scan_codex_test_root_with_curve(&sessions_dir, context_curve_enabled);
@@ -78043,7 +78550,7 @@ mod tests {
         )
         .expect("write additive schema rollout");
         let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
-        assert!(!metadata.created_thread_census_unscoped_incomplete);
+        assert!(metadata.created_thread_census_failed_homes.is_empty());
         for context_curve_enabled in [true, false] {
             let (scan, _) = scan_codex_test_root_with_curve(&sessions_dir, context_curve_enabled);
             assert!(scan.state_census_complete, "{scan:#?}");
@@ -84549,7 +85056,7 @@ crate::durable_tail_codec::durable_struct!(CodexPathSidecarCandidate {
 crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ordinal);
 crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
-crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
+crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_failed_homes, created_thread_scoped, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns, incomplete);
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
     ownership_incomplete_file_count, cause, zero_snapshot_usage_evidence, dropped_usage_record_count,
@@ -84557,7 +85064,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
-crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
+crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, parse_reason, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
@@ -84924,6 +85431,10 @@ impl crate::heap_layout_bound::HeapLayoutBound for fn(&Value, &mut SnapshotAccum
 }
 crate::heap_layout_bound::unit_enum!(true;
     CandidateDecision: Skip | Migrate | Parse | ReconcileLegacy;
+    CandidateParseReason: TerminalDisposition | NewFile | AuthorityQuarantine | Audit
+        | BodyWitnessAdoption | UploadContext | ActivityOrQuarantineRetry | TranscriptChanged
+        | CodexCapture | UnknownOutcome | LegacyActivity | LegacyIdentity | Rearmed
+        | SourceChanged | ForcedFamily;
     ClaudeCompactionKind: LegacySummary | CurrentBoundary;
     SnapshotQuarantineDisposition: RetryPending | UnprovenTerminal | SupersededTerminal;
     ClaudeUsageAuthorityQuarantineDisposition: RetryPending | UnprovenTerminal;
@@ -85179,6 +85690,18 @@ mod census_unreadable_tests {
             )
             .unwrap()["counts"],
             json!([1, 0, 1, 0, 0, 0, 0, 0])
+        );
+        // E2 B2: the OpenRead sample names the file's kind and key digest,
+        // never its path.
+        let sample = serde_json::to_value(census.unreadable_causes).unwrap()["samples"]
+            [UnreadableCause::OpenRead as usize][0]
+            .clone();
+        let key = crate::codex_scan_diagnostics::digest(&local_index_key(&path));
+        let key = u64::from_be_bytes(std::array::from_fn(|byte| key[byte]));
+        assert_eq!(
+            (&sample["root"], &sample["kind"], &sample["key"]),
+            (&json!("other_home"), &json!("jsonl"), &json!(key)),
+            "{sample}"
         );
         fs::set_permissions(&root, fs::Permissions::from_mode(0o100)).unwrap();
         let mut index = ScanIndex::default();

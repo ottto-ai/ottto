@@ -258,21 +258,11 @@ enum Role {
     /// The recorded owner path is gone: this read proves a move from it.
     Moved(LocationKey),
 }
-impl crate::heap_layout_bound::HeapLayoutBound for Role {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; Role);
 /// This root file's own location key (inline digest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Located(LocationKey);
-impl crate::heap_layout_bound::HeapLayoutBound for Located {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; Located);
 
 /// The proof a held copy skip needs; `decide_page_copies` checks it per
 /// request once per page.
@@ -784,29 +774,12 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeEntityBody {
     entity_heap_method!(completed_heap_bound);
 }
 // Existing grain types were inline P1 values; E retains only the aggregate.
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeGrainSide {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        // Exhaustive: every field is an inline token/counter, already paid
-        // by its containing slot. No per-token graph walk is needed.
-        let Self {
-            tokens: _,
-            requests: _,
-            cost_micros: _,
-            unpriced: _,
-            contributions: _,
-            last_own_at: _,
-        } = self;
-        c.add(0)
-    }
-}
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestUsageOrigin {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+// Exhaustive: every field is an inline token/counter, already paid
+// by its containing slot. No per-token graph walk is needed.
+crate::heap_layout_bound::no_heap!(true; ClaudeGrainSide {
+    tokens, requests, cost_micros, unpriced, contributions, last_own_at,
+});
+crate::heap_layout_bound::no_heap!(false; ClaudeRequestUsageOrigin);
 
 /// What this page's telemetry read did for one fold.
 #[derive(Debug, Clone, Default)]
@@ -837,13 +810,7 @@ impl std::fmt::Debug for FoldNanos {
         f.write_str("FoldNanos")
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for FoldNanos {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; FoldNanos);
 
 /// The copied prefix's page outcome (copy-family fix, Lead B Addendum 2),
 /// local diagnostics only until SOURCE/COST consume the flag: requests of
@@ -865,13 +832,7 @@ pub(crate) struct PrefixTally {
     removed_priced_requests: u64,
     removed_cost_micros: u64,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for PrefixTally {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; PrefixTally);
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileFold {
@@ -4069,22 +4030,9 @@ impl Serialize for Counts {
     }
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeMoneyTokens {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        let Self {
-            input: _,
-            output: _,
-            cache_read: _,
-            cache_5m: _,
-            cache_1h: _,
-            unattributed: _,
-            reasoning: _,
-        } = self;
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ClaudeMoneyTokens {
+    input, output, cache_read, cache_5m, cache_1h, unattributed, reasoning,
+});
 
 #[cfg(test)]
 #[path = "e2_tests.rs"]
