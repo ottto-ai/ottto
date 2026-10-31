@@ -2495,7 +2495,7 @@ fn terminal_off_nonblocking_hold_reads_once_per_six_hours_and_never_idles() {
                     .iter()
                     .map(|item| item.snapshot_fingerprint.clone())
                     .collect::<BTreeSet<_>>();
-                *index = index.into_locally_held_keys_reverted(&previous, &held, &held);
+                *index = std::mem::take(index).into_locally_held_keys_reverted(&previous, &held, &held);
             }
             assert!(index.accepted_snapshot_fingerprints.iter().all(|fp| {
                 previous.accepted_snapshot_fingerprints.contains(fp)

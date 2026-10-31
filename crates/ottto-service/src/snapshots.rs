@@ -51106,7 +51106,7 @@ impl ScanIndex {
         if upload_context_adoption
             && self.file_upload_context_requires_adoption(&key)
             && !self.file_upload_context_backoff_holds(candidate)
-            && !(claude_terminal_off() && terminal_off_held_context_seen(self, &key))
+            && (!claude_terminal_off() || !terminal_off_held_context_seen(self, &key))
         {
             return (
                 CandidateDecision::Parse,
