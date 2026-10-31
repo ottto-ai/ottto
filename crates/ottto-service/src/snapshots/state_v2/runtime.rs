@@ -602,6 +602,7 @@ fn save_with_custody<M: Mapper>(
     }
     // This accessor authenticates the owner/session; call before route/session locks.
     let claim_generation = super::super::sampled_audit::own_growth_claim_generation(index, path);
+    let mut stale_graph = false;
     let mut result = held(with_state(path, |state| {
         let pair = fence::reconcile(path, &binding, state.latched)?;
         let Some(runtime) = index.v2().persistence_v2.clone() else {
@@ -618,12 +619,15 @@ fn save_with_custody<M: Mapper>(
         );
         telemetry::baseline(path);
         let _gauge = telemetry::Stage::new(telemetry::Kind::Save);
+        let previous = state.cached.as_ref().ok_or(Hold::ReloadRequired)?;
+        ensure!(previous.generation == session.stamp.0, Hold::ReloadRequired);
+        if claim_generation.unwrap_or(index.generation) != previous.generation {
+            // Refuse this graph without invalidating another graph's healthy
+            // session or its durable claim-only lineage. No save has begun.
+            stale_graph = true;
+            bail!(Hold::ReloadRequired);
+        }
         let previous = state.cached.take().ok_or(Hold::ReloadRequired)?;
-        ensure!(
-            previous.generation == session.stamp.0
-                && claim_generation.unwrap_or(index.generation) == previous.generation,
-            Hold::ReloadRequired
-        );
         if claim_generation.is_some() {
             index.generation = previous.generation;
         }
@@ -706,6 +710,9 @@ fn save_with_custody<M: Mapper>(
         save_result
     }));
     if let Err(error) = &result {
+        if stale_graph {
+            return result;
+        }
         with_state(path, |state| {
             state.cached = None;
             state.save_retry_completed = false;

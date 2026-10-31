@@ -1279,10 +1279,34 @@ fn format_one_physical_columns_match_the_four_table_contract() {
     assert!(RecordKind::parse("not.registered").is_err());
     assert!(RecordKind::parse("raw_hold.unknown").is_err());
 }
-/// [format] mutable values require segmentation and raw holds stay exact.
+/// [format] whole traversal fields have bounded caps and raw holds stay exact.
 #[test]
 fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
-    let mutable = traversal("family".into());
+    for kind in [
+        "scan_state.traversal",
+        "scan_state.scan_residue_witness",
+        "scan_state.claude_stale_family_carry",
+    ] {
+        let key = RowKey::record(kind, b"family".to_vec(), 0).unwrap();
+        for (size, ok) in [
+            (MUTABLE_VALUE_BYTES + 1, true),
+            (16 * 1024 * 1024, true),
+            (16 * 1024 * 1024 + 1, false),
+        ] {
+            assert_eq!(
+                preflight(&RowInput {
+                    value_version: 1,
+                    key: &key,
+                    fixed: &Fixed::None,
+                    value: &Repeat(size)
+                })
+                .is_ok(),
+                ok,
+                "{kind}: {size}"
+            );
+        }
+    }
+    let mutable = file("family".into());
     let raw = raw_hold("family".into());
     for (key, size, ok) in [
         (&mutable, MUTABLE_VALUE_BYTES, true),

@@ -2672,7 +2672,9 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
             );
             let mut working = committed.clone();
             progress.ack_recovery =
-                crate::snapshots::ProgressRecovery::for_index(&committed, &index_path).unwrap().map(Box::new);
+                crate::snapshots::ProgressRecovery::for_index(&committed, &index_path)
+                    .unwrap()
+                    .map(Box::new);
             // Two exact sibling ACKs followed by a real uploader stop. No file
             // publication changes: R1's activation/staging guard stays intact.
             let upload = |items: &[SnapshotItem],
@@ -2709,12 +2711,19 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                 "capacity" => panic!("capacity stop must precede POST"),
                 _ => unreachable!(),
             });
-            assert!(stopped.is_err());
-            if stop == "capacity" {
-                assert!(stopped
-                    .unwrap_err()
-                    .downcast_ref::<ack_retention::AckSettlementRequired>()
-                    .is_some());
+            if stop == "shed" {
+                assert_eq!(
+                    stopped.unwrap(),
+                    ResumableUploadResult::Shed { retry_after: None }
+                );
+            } else {
+                assert!(stopped.is_err());
+                if stop == "capacity" {
+                    assert!(stopped
+                        .unwrap_err()
+                        .downcast_ref::<ack_retention::AckSettlementRequired>()
+                        .is_some());
+                }
             }
             let persisted_progress = std::fs::read(&progress_path).unwrap();
             working.mark_bounded_sweep_unsettled();
@@ -2762,10 +2771,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                 accepted.keys().cloned().collect(),
                 "only saved exact bodies may retire"
             );
-            assert_eq!(
-                std::fs::read(&progress_path).unwrap(),
-                persisted_progress
-            );
+            assert_eq!(std::fs::read(&progress_path).unwrap(), persisted_progress);
             progress
                 .release_acks_after_partial_index_save(
                     &progress_path,

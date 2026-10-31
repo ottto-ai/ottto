@@ -2401,8 +2401,10 @@ mod growth_tests {
     fn restart_lenient(index: &ScanIndex) -> ScanIndex {
         if index.v2.is_some() || index.decode_holds.contains_field("growth_retention") {
             let root = crate::test_scratch::private_dir("growth-row-restart");
-            let mut restored =
-                state_v2::money_test_support::roundtrip_rows(index, &root.join("state.sqlite"));
+            let mut restored = state_v2::money_test_support::roundtrip_rows(
+                index,
+                &root.join("state.v2.sqlite.import"),
+            );
             super::super::lenient_decode::post_decode_hydrated(
                 &mut restored,
                 "fixture",

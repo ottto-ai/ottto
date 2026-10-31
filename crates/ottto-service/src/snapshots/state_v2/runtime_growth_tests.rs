@@ -599,7 +599,7 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
                 &[],
             );
         }
-        let record = index.claude_request_census.get(&f.key).unwrap();
+        let record = index.claude_request_census.record_for_test(&f.key).unwrap();
         assert!(!record.request_hashes_for_test().contains(&7), "{case}");
         if matches!(case, "no_record" | "invalidate") {
             assert!(record.is_birth_stub(), "{case}");

@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Release synthetic custody and its registry slot when a fixture is finished.
 pub(in crate::snapshots) fn erase_published(path: &Path) {
-    let _owner = super::super::super::CheckpointLock::acquire(path).unwrap();
+    // Cleanup also owns deliberately malformed fences; it must not decode them.
+    let _owner =
+        super::super::super::CheckpointLock::acquire_with_custody(path, false, Some(true)).unwrap();
     erase_locked(path, None).unwrap();
     states().lock().unwrap().remove(path);
 }
