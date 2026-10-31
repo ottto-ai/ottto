@@ -199,9 +199,6 @@ impl ScanIndex {
         if baselines.is_empty() {
             return None;
         }
-        if replacement {
-            return Some(ArchiveReplacement::Replace(baselines));
-        }
         // A subset may settle without uploading only when this exact native
         // baseline already reproduces accepted output. A projection mismatch
         // remains unknown; it must never authorize discarding new usage.
@@ -216,6 +213,9 @@ impl ScanIndex {
             })
         {
             return Some(ArchiveReplacement::Dominated);
+        }
+        if replacement && !dominated {
+            return Some(ArchiveReplacement::Replace(baselines));
         }
         None
     }

@@ -27921,22 +27921,11 @@ impl OwnedSourceScan {
                             .files
                             .get(&local_index_key(&candidate.path))
                             .is_some_and(|e| e.custody_retry_due(&candidate.path));
-                        if !custody_retry && inventory.plain_twin(&candidate.path) {
-                            index.hold_compressed(
-                                &candidate.path,
-                                codex_session_id_candidates_from_path(&candidate.path)
-                                    .into_iter()
-                                    .collect(),
-                                CodexZstCause::FamilyUnproven,
-                            );
-                            codex_archive_catchup::retain_residue(
-                                &mut residue_index_keys,
-                                &candidate.path,
-                                CodexZstCause::FamilyUnproven,
-                            );
-                            continue;
-                        }
-                        if !custody_retry && inventory.member_held(&candidate.path) {
+                        // A logical twin still needs the ordinary family proof/retry path.
+                        if !custody_retry
+                            && !inventory.plain_twin(&candidate.path)
+                            && inventory.member_held(&candidate.path)
+                        {
                             let cause = index
                                 .files
                                 .get(&local_index_key(&candidate.path))
@@ -30671,11 +30660,8 @@ impl OwnedSourceScan {
                             Some(archive),
                             CodexZstCause::ArchiveDominated,
                         );
-                        codex_archive_catchup::retain_residue(
-                            &mut residue_index_keys,
-                            &candidate.path,
-                            CodexZstCause::ArchiveDominated,
-                        );
+                        residue_index_keys.remove(&key);
+                        settled_residue_index_keys.insert(key);
                         pending!();
                     } else {
                         index.hold_compressed(

@@ -1968,9 +1968,9 @@ fn validated_plain_archive_twins_count_once_and_plain_body_is_unchanged() {
     let ((index, result), rows) = capture(|| run(scan));
     assert_eq!(result.unreadable_path_count, 0);
     assert_eq!(result.ownership_incomplete_file_count, 0);
-    assert_eq!(result.census_residue_index_key_count, 0);
-    assert_eq!(result.census_residue_archived_rollout_count, 0);
-    assert_eq!(result.census_residue_blocked_session_count, 0);
+    assert_eq!(result.census_residue_index_key_count, 1);
+    assert_eq!(result.census_residue_archived_rollout_count, 1);
+    assert_eq!(result.census_residue_blocked_session_count, 1);
     assert_eq!(codex_zst_refusal_tests::activity().0, decodes);
     assert_eq!(result.scanned_file_count, 1);
     assert_eq!(result.snapshots.len(), 1);
@@ -1980,8 +1980,16 @@ fn validated_plain_archive_twins_count_once_and_plain_body_is_unchanged() {
     );
     assert!(index
         .files
-        .values()
-        .all(|e| e.codex_compressed_hold.is_none()));
+        .get(&local_index_key(&plain))
+        .is_none_or(|entry| entry.codex_compressed_hold.is_none()));
+    assert_eq!(
+        index.files[&local_index_key(&archive)].codex_compressed_hold,
+        Some(CodexZstCause::FamilyUnproven)
+    );
+    assert_eq!(
+        index.codex_state_only_blocked_by_file[&local_index_key(&archive)],
+        BTreeSet::from([OWNER.into()])
+    );
     assert!(!rows
         .iter()
         .any(|r| r["stage"] == "codex_zst_input" || r["stage"] == "codex_zst_inventory"));

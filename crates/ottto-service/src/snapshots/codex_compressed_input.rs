@@ -839,19 +839,22 @@ impl super::ScanCensus {
         archive: Option<&ArchiveEvidence>,
         cause: CodexZstCause,
     ) {
-        let first = self
-            .archive_terminal_index_keys
-            .insert(super::local_index_key(path));
-        self.archive_terminal_sessions
-            .extend(super::codex_session_id_candidates_from_path(
-                &path.with_extension(""),
-            ));
-        if let Some(archive) = archive {
+        // Proven dominated content is counted without retaining unsettled debt.
+        if cause != CodexZstCause::ArchiveDominated {
+            if !self
+                .archive_terminal_index_keys
+                .insert(super::local_index_key(path))
+            {
+                return;
+            }
             self.archive_terminal_sessions
-                .insert(archive.logical_id.clone());
-        }
-        if !first {
-            return;
+                .extend(super::codex_session_id_candidates_from_path(
+                    &path.with_extension(""),
+                ));
+            if let Some(archive) = archive {
+                self.archive_terminal_sessions
+                    .insert(archive.logical_id.clone());
+            }
         }
         crate::local_resource_diagnostics::traversal_point(
             "archive_terminal_residue",

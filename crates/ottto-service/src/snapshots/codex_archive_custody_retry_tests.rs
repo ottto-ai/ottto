@@ -260,12 +260,12 @@ fn accepted_plain_superset_settles_archive_dominated_without_upload() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     use super::super::sampled_scan::transition_fixture::{money_oracle, scan_money, Accepted};
-    for divergent in [false, true] {
+    for (divergent, equal) in [(false, false), (false, true), (true, false)] {
         let bytes = synthetic_rollout();
         let mut archive_rows: Vec<Value> = String::from_utf8(bytes.clone())
             .unwrap()
             .lines()
-            .take(3)
+            .take(if equal { usize::MAX } else { 3 })
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         if divergent {
@@ -456,6 +456,11 @@ fn accepted_plain_superset_settles_archive_dominated_without_upload() {
                     cause: CodexZstCause::ArchiveDominated
                 }
             ));
+        }
+        if !divergent {
+            assert!(index.files[&key].codex_compressed_hold.is_none());
+            assert_eq!(result.census_residue_index_key_count, 0);
+            assert_eq!(result.census_residue_archived_rollout_count, 0);
         }
         assert!(archive.body_witness.is_none());
         assert_eq!(index.files[&plain_key].last_upload_body_witness, prior_body);
