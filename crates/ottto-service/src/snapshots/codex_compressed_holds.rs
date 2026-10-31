@@ -88,7 +88,10 @@ impl ScanIndexEntry {
     /// Metadata permits only a paced attempt, never publication or an ACK.
     pub(super) fn custody_retry_due(&self, path: &Path) -> bool {
         codex_archive_path(path)
-            && !self.archive.as_ref().is_some_and(|a| a.user_change)
+            && self
+                .archive
+                .as_ref()
+                .map_or(true, |a| !a.user_change || a.user_correction_available())
             && (self.codex_compressed_hold.is_some()
                 || self
                     .archive

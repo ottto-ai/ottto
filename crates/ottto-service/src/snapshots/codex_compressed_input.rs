@@ -352,14 +352,18 @@ impl ArchiveEvidence {
             && !matches!(self.disposition, ArchiveDisposition::HeaderValidated)
             && !matches!(self.disposition, ArchiveDisposition::Pending { retry_after, .. } if super::sampled_scan::now_seconds() >= retry_after)
     }
-    pub(super) fn stop_exhausted(&mut self) -> bool {
-        if self.user_change {
-            if self
+    /// The existing independent policy grant, never renewed by custody retry.
+    pub(super) fn user_correction_available(&self) -> bool {
+        self.user_change
+            && self
                 .user_context
                 .as_deref()
                 .is_some_and(valid_archive_context)
-                && self.user_change_spent < self.user_generation
-            {
+            && self.user_change_spent < self.user_generation
+    }
+    pub(super) fn stop_exhausted(&mut self) -> bool {
+        if self.user_change {
+            if self.user_correction_available() {
                 return false; // An independent A3 grant does not spend the A1 budget.
             }
             self.disposition = ArchiveDisposition::Held {
@@ -1461,6 +1465,26 @@ pub(in crate::snapshots) mod tests {
             true,
         )
         .unwrap()
+    }
+
+    /// [regress] Strict Round 4 review: a newline-free compressed record must yield.
+    #[test]
+    fn compressed_overlong_record_yields_before_eof() {
+        let bytes = vec![b'x'; 4 * MAX_JSONL_LINE_BYTES];
+        let f = fixture(
+            &zstd::stream::encode_all(&bytes[..], 1).unwrap(),
+            ".jsonl.zst",
+        );
+        let input = OpenedInput::compressed(
+            File::open(&f.0).unwrap(),
+            u64::MAX,
+            compressed_input_credit().unwrap(),
+        )
+        .unwrap();
+        let mut parser = codex_parser(input, &f.0);
+        assert!(!parser.step().unwrap(), "a page can pause before EOF");
+        assert!(parser.reader.consumed_bytes() < bytes.len() as u64);
+        parser.reader.reader.close();
     }
 
     fn parse(mut parser: OwnedJsonlParser, expected: &str, path: &Path) -> Result<Value> {

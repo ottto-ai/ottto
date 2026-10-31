@@ -5,6 +5,16 @@
 #[test]
 fn archive_replacement_requires_equal_session_and_accepted_identity_superset() {
     let bytes = synthetic_rollout();
+    let metadata = CodexTitleMetadata {
+        titles: BTreeMap::from([(
+            "compressed-fixture".into(),
+            CodexTitleCandidate {
+                title: "Synthetic accepted title".into(),
+                source: "session_index".into(),
+            },
+        )]),
+        ..Default::default()
+    };
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
     let plain = f.0.with_extension("");
     fs::write(&plain, &bytes).unwrap();
@@ -19,13 +29,29 @@ fn archive_replacement_requires_equal_session_and_accepted_identity_superset() {
             &plain,
             NOW,
             "plain-baseline".into(),
-            Some(&CodexTitleMetadata::default()),
+            Some(&metadata),
             None,
             None,
         )
         .unwrap();
     assert_eq!(parsed.snapshots.len(), 1);
     let ack = parsed.snapshots[0].clone();
+    let baseline = retained.clone().into_archive_baseline(
+        &local_index_key(&plain),
+        &ScanIndexEntry {
+            source_file_fingerprint: "plain-baseline".into(),
+            last_snapshot_fingerprint: Some(ack.snapshot_fingerprint.clone()),
+            ..Default::default()
+        },
+        "compressed-fixture",
+        &metadata,
+    );
+    assert_eq!(baseline.snapshots[0].title, ack.title);
+    assert_eq!(
+        baseline.snapshots[0].snapshot_fingerprint,
+        ack.snapshot_fingerprint
+    );
+
     for superset in [true, false] {
         let mut lines: Vec<Value> = String::from_utf8(bytes.clone())
             .unwrap()
@@ -62,7 +88,7 @@ fn archive_replacement_requires_equal_session_and_accepted_identity_superset() {
                 &f.0,
                 NOW,
                 "archive-replacement".into(),
-                Some(&CodexTitleMetadata::default()),
+                Some(&metadata),
                 None,
                 None,
             )

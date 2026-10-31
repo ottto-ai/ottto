@@ -761,7 +761,7 @@ impl HeaderInventory {
             .iter()
             .try_fold(0usize, |n, h| n.checked_add(h.owner.len()))?;
         let mut keys = self.headers.iter().try_fold(0usize, |n, h| {
-            n.checked_add(h.candidate.path.as_os_str().len())
+            n.checked_add(h.candidate.path.to_string_lossy().len())
         })?;
         let mut results = self.headers.len();
         for key in self
@@ -960,7 +960,11 @@ impl HeaderInventory {
         self.family_peak = peak;
         for (key, class) in &self.archive_classes {
             if class.sibling {
-                self.family_held.insert(key.clone(), class.twin);
+                // An already-held physical peer supplies negative evidence;
+                // it does not mint a second family-custody record for itself.
+                if !self.held_archives.contains(key) {
+                    self.family_held.insert(key.clone(), class.twin);
+                }
             } else if class.deferred {
                 self.deferred_archives.insert(key.clone());
             }

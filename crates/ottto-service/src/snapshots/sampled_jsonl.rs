@@ -89,7 +89,10 @@ impl CachedJsonlReduction {
         owner: &str,
         metadata: &CodexTitleMetadata,
     ) -> codex_file_join::LegacyBaseline {
-        let mut snapshots = self.accumulator.into_items_with_repository_identity(
+        let mut accumulator = self.accumulator;
+        accumulator.apply_codex_title_metadata(Path::new(path), metadata);
+        accumulator.apply_first_prompt_fallback();
+        let mut snapshots = accumulator.into_items_with_repository_identity(
             Path::new(path),
             "1970-01-01T00:00:00Z",
             entry.source_file_fingerprint.clone(),

@@ -35636,14 +35636,18 @@ impl OwnedJsonlParser {
             claude_opened_birth = opened.as_ref().and_then(claude_opened_file_birth);
         }
 
+        let compressed = reader.is_compressed();
+        let mut reader =
+            BoundedJsonlReader::new(reader, jsonl_line_cap(), source == SnapshotSource::Codex);
+        if compressed {
+            // Decoded-byte paging must also regain control inside an overlong
+            // record, rather than waiting for a newline or archive EOF.
+            reader.set_chunked_skip(sampled_scan::codex_cursor::Limits::current().skip_chunk());
+        }
         Ok(Self {
             #[cfg(test)]
             source_read_probe: Some(path.to_owned()),
-            reader: BoundedJsonlReader::new(
-                reader,
-                jsonl_line_cap(),
-                source == SnapshotSource::Codex,
-            ),
+            reader,
             accumulator,
             archive_checkpoint: None,
             source,

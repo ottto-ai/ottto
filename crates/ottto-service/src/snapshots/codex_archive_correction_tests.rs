@@ -1113,3 +1113,36 @@ fn missing_only_spent_generation_is_exhausted_until_an_independent_user_change()
     let mut restored: ArchiveEvidence = serde_json::from_value(value).unwrap();
     assert!(restored.stop_exhausted());
 }
+
+/// [regress] Strict Round 4 review: terminal custody cannot strand an independent policy grant.
+#[test]
+fn policy_grant_remains_reachable_through_terminal_custody() {
+    let f = correction_archive();
+    let key = local_index_key(&f.0);
+    for cause in [CodexZstCause::DecodeBudget, CodexZstCause::SettlementStuck] {
+        let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+        evidence.user_context = Some(user_context("A"));
+        evidence.user_change = true;
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            key.clone(),
+            ScanIndexEntry {
+                archive: Some(Box::new(evidence)),
+                codex_compressed_hold: Some(cause),
+                ..Default::default()
+            },
+        );
+        index.activate_archive_user_context(user_context("B"));
+        let entry = index.files.get_mut(&key).unwrap();
+        assert!(
+            entry.custody_retry_due(&f.0),
+            "valid independent grant is reachable"
+        );
+        let archive = entry.archive.as_mut().unwrap();
+        archive.user_change_spent = archive.user_generation;
+        assert!(
+            !entry.custody_retry_due(&f.0),
+            "custody cannot renew a spent grant"
+        );
+    }
+}
