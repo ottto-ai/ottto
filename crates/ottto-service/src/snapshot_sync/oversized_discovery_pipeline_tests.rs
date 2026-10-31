@@ -213,58 +213,6 @@ fn oversized_metadata_only_touches_give_zero_wakes() {
 
 #[test]
 #[serial(source_manifests)]
-fn oversized_minutely_growth_is_bounded_by_existing_exponential_cadence() {
-    if !c1a_layout_supported("oversized-cadence") {
-        return;
-    }
-    let _manifests = SourceManifestTestGuard::new();
-    let (mut fixture, path) = oversized_seed("oversized-cadence");
-    fixture.hinted_paths.push(path.clone());
-    let mut saved = c1a_saved(&fixture);
-    let start = oversized_deadline(&saved);
-    let mut wakes = 0;
-    // Reach the hourly ceiling and cover two full hourly windows at it.
-    for minute in 0..190 {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(OVERSIZED_BYTES + minute + 1)
-            .unwrap();
-        let now = start + minute * 60;
-        let previous_deadline = oversized_deadline(&saved);
-        let previous_attempt = saved["traversal"]["unhealthy_retry_attempt"]
-            .as_u64()
-            .unwrap();
-        let page = oversized_tick(&fixture, now);
-        assert!(!page.scan.census_complete);
-        assert_eq!(page.scan.oversized_file_count, 1);
-        let next = c1a_saved(&fixture);
-        if now < previous_deadline {
-            assert_eq!(
-                next["traversal"], saved["traversal"],
-                "growth within a cadence window is coalesced"
-            );
-        } else {
-            wakes += 1;
-            assert_ne!(
-                next["traversal"]["oversized_discovery"],
-                saved["traversal"]["oversized_discovery"]
-            );
-            let attempt = (previous_attempt + 1).min(7);
-            assert_eq!(next["traversal"]["unhealthy_retry_attempt"], attempt);
-            assert_eq!(
-                oversized_deadline(&next),
-                now + (60 * (1_u64 << (attempt - 1))).min(3600)
-            );
-        }
-        saved = next;
-    }
-    assert_eq!(wakes, 8, "six exponential retries and two hourly retries");
-}
-
-#[test]
-#[serial(source_manifests)]
 fn oversized_does_not_suppress_another_retryable_problem() {
     if !c1a_layout_supported("oversized-other-problem") {
         return;

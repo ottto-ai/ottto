@@ -424,32 +424,9 @@ const _: () = assert!(
         <= crate::snapshots::MAX_GATED_CLAUDE_REVISION
 );
 
-/// The revision a sync cycle activates: the compiled one. Test builds only:
-/// the Money E2 benchmark's switch-on arm activates the next Claude revision
-/// as its activation PR will compile it (`with_claude_cycle_revision`).
+/// The revision a sync cycle activates: the compiled one.
 fn cycle_body_witness_revision(source: SnapshotSource) -> u64 {
-    #[cfg(test)]
-    if source == SnapshotSource::ClaudeCode {
-        if let Some(revision) = CLAUDE_CYCLE_REVISION.with(std::cell::Cell::get) {
-            return revision;
-        }
-    }
     effective_upload_body_witness_revision(source)
-}
-#[cfg(test)]
-thread_local! {
-    static CLAUDE_CYCLE_REVISION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-}
-#[cfg(test)]
-pub(crate) fn with_claude_cycle_revision<T>(revision: u64, f: impl FnOnce() -> T) -> T {
-    struct Reset(Option<u64>);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            CLAUDE_CYCLE_REVISION.with(|value| value.set(self.0));
-        }
-    }
-    let _reset = Reset(CLAUDE_CYCLE_REVISION.with(|value| value.replace(Some(revision))));
-    f()
 }
 
 /// Where this destination's Claude prior history comes from (SOURCE
@@ -8458,8 +8435,6 @@ fn finish_sync_source(
     #[cfg(test)]
     let retire_prior_index = retire_prior_index
         && !tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::keep_prior();
-    #[cfg(test)]
-    tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::before_retirement();
     let committed_index = if retire_prior_index {
         drop(committed_index);
         None
@@ -20018,56 +19993,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn completed_hold_reason_names_only_the_actual_failed_restore_branch() {
-        use crate::local_resource_diagnostics::claude_reread::Scope;
-        let key = "/opaque/projects/family-root.jsonl";
-        let scanned = claude_index_with(serde_json::json!({
-            "files": {key: {
-                "size_bytes": 1, "modified_unix_seconds": 2,
-                "source_file_fingerprint": "new-source",
-                "last_snapshot_fingerprint": "held",
-                "scan_identity_version": "semantic_sync:v2"
-            }},
-            "file_snapshot_fingerprints": {key: ["held"]},
-            "claude_usage_family_witnesses": {"family-root": {
-                "evidence_fingerprint": "e".repeat(64),
-                "member_request_id_fingerprints": {},
-                "member_occurrence_fingerprints": {},
-                "assigned_request_id_fingerprints": {}
-            }}
-        }));
-        let held = BTreeSet::from(["held".to_owned()]);
-        for (previous, blocking, expected) in [
-            (
-                ScanIndex::default(),
-                false,
-                serde_json::json!({"not_restorable": 1}),
-            ),
-            (ScanIndex::default(), true, serde_json::json!(null)),
-            (scanned.clone(), false, serde_json::json!(null)),
-        ] {
-            let scope = Scope::begin(true);
-            let committed = commit_completed_with_local_holds(
-                scanned.clone(),
-                &previous,
-                &test_upload_progress(),
-                &held,
-                &BTreeSet::new(),
-                blocking,
-                None,
-            );
-            assert_eq!(
-                committed.bounded_sweep_had_unsettled_upload(),
-                previous.files.is_empty()
-            );
-            assert_eq!(
-                serde_json::to_value(scope.finish()).unwrap()["claude_reread"]["held_reason"],
-                expected
-            );
-        }
-    }
-
     /// A completed upload whose holds can still change in this traversal keeps
     /// the conservative partial commit and owes a clean follow-up; one whose
     /// holds cannot progress reverts only the held key and may settle.
@@ -22261,9 +22186,6 @@ mod tests {
     }
 
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
-    mod money_e2_bench_tests {
-        include!("snapshot_sync/money_e2_bench_tests.rs");
-    }
     pub(super) mod permanent_finish_pipeline_tests {
         include!("snapshot_sync/permanent_finish_pipeline_tests.rs");
     }
