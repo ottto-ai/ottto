@@ -1,8 +1,8 @@
 //! AR1 R1 (Lead B ruling 1, 2026-10-31): a Claude census re-arm keeps the
 //! file's fingerprint and marks its request evidence owed
 //! (`ScanIndexEntry::evidence_owed`) instead of clearing the fingerprint.
-//! Machine-local opt-in marker; absent marker = main (the re-arm clears).
-//! Switch -> `terminal_off::policy::local_switch!` once #977/#1004 is on main.
+//! Machine-local opt-in marker `claude_evidence_owed_enabled` (#977
+//! `local_switch!`); absent marker = main (the re-arm clears).
 //!
 //! The traversal resolves an owed, unchanged member at selection:
 //! - (a) its stored occurrences are bound to this revision: re-stamp them into
@@ -19,48 +19,21 @@
 //! cap delay, an unACKed head re-offer and every non-re-arm clear site.
 use super::*;
 
-pub(super) const NAME: &str = "claude_evidence_owed_enabled";
-
-pub(crate) fn enabled() -> bool {
-    #[cfg(test)]
-    {
-        // A test must opt in on its own thread, never read the host setting.
-        ENABLED.with(std::cell::Cell::get)
-    }
-    #[cfg(not(test))]
-    {
-        // Pin policy for this process, including worker threads and yields.
-        // Ron changes the marker himself and restarts the daemon to apply it.
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
-    }
-}
-
-fn enabled_at(support: &Path) -> bool {
-    // The owner's local marker is the setting. Refuse symlinks and non-files.
-    std::fs::symlink_metadata(support.join(NAME))
-        .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
-}
-
+super::terminal_off_policy::local_switch!(
+    "claude_evidence_owed_enabled",
+    marker_enables = true,
+    test_default = false
+);
 #[cfg(test)]
-thread_local! {
-    static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+pub(super) struct EvidenceOwedForTest {
+    _switch: super::terminal_off_policy::ThreadSwitchForTest,
 }
-#[cfg(test)]
-pub(crate) struct EvidenceOwedForTest(bool, std::marker::PhantomData<std::rc::Rc<()>>);
 #[cfg(test)]
 impl EvidenceOwedForTest {
-    pub(crate) fn on() -> Self {
-        Self(
-            ENABLED.with(|slot| slot.replace(true)),
-            std::marker::PhantomData,
-        )
-    }
-}
-#[cfg(test)]
-impl Drop for EvidenceOwedForTest {
-    fn drop(&mut self) {
-        ENABLED.with(|slot| slot.set(self.0));
+    pub(super) fn on() -> Self {
+        Self {
+            _switch: super::terminal_off_policy::ThreadSwitchForTest::set(&ENABLED, true),
+        }
     }
 }
 
@@ -358,11 +331,12 @@ mod tests {
     #[test]
     fn switch_defaults_off_and_off_rearm_clears_like_main() {
         let scratch = crate::test_scratch::ScratchDir::new("evidence-owed-policy");
+        let marker = scratch.join("claude_evidence_owed_enabled");
         assert!(!enabled_at(&scratch));
-        std::fs::write(scratch.join(NAME), b"").unwrap();
+        std::fs::write(&marker, b"").unwrap();
         assert!(enabled_at(&scratch));
-        std::fs::remove_file(scratch.join(NAME)).unwrap();
-        std::fs::create_dir(scratch.join(NAME)).unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
         assert!(!enabled_at(&scratch));
         assert!(!enabled(), "fixture process never consults host marker");
         for cause in [
