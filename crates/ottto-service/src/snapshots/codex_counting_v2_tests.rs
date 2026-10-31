@@ -161,9 +161,13 @@ fn legacy(values: &[Value]) -> Run {
 }
 
 /// Exercise the production source factory and physical JSONL reader, with the
-/// compiled cutover unchanged. Legacy uses the same factory without a test cutover.
+/// fixture header predating the frozen cutover for the Legacy price control.
 fn run_price_source(values: &[Value], active: bool) -> Run {
-    let _cutover = active.then(|| codex_counting_version::TestCutover::set(0));
+    let _cutover = codex_counting_version::TestCutover::set(if active {
+        0
+    } else {
+        codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS.unwrap()
+    });
     let root = crate::test_scratch::unique_path("ottto-v2-price");
     fs::create_dir_all(&root).unwrap();
     let path = root.join(format!("rollout-2026-08-31T23-00-00-{SESSION}.jsonl"));

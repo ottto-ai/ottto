@@ -74,12 +74,15 @@ fn acked_original(v2: bool, old_binding: bool) -> Acked {
         .join(format!("rollout-2026-10-01T10-00-00-{SESSION}.jsonl"));
     write(&original, &rows(100));
     let mut previous = ScanIndex::default();
-    let mut result = if v2 {
-        let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
-        scan(&root, &mut previous)
-    } else {
-        scan(&root, &mut previous)
-    };
+    // A post-cutover root stays Legacy when an earlier writer ACKed it.
+    if !v2 {
+        previous.files.insert(
+            local_index_key(&original),
+            acked_entry(false, Some(codex_protected_owner(SESSION))),
+        );
+    }
+    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let mut result = scan(&root, &mut previous);
     assert_eq!(result.snapshots.len(), 1);
     finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut previous);
     let old_key = local_index_key(&original);
@@ -88,7 +91,7 @@ fn acked_original(v2: bool, old_binding: bool) -> Acked {
     assert!(entry.last_snapshot_fingerprint.is_some());
     assert!(entry.last_upload_body_witness.is_some());
     assert!(!entry.codex_history_is_protected(), "an ordinary singleton");
-    // This build binds even while inactive: the realistic Legacy move.
+    // Both counting decisions bind the owner for a realistic archive move.
     assert_eq!(
         entry.codex_counting_owner,
         Some(codex_protected_owner(SESSION).into_boxed_str())
