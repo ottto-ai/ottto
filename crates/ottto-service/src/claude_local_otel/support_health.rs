@@ -769,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn support_store_and_selection_limits_are_explicit_and_strict_cap_stays_refused() {
+    fn support_store_and_selection_limits_are_explicit_and_malformed_padding_is_refused() {
         let dir = scratch();
         let row = api("one");
         append_evidence(&dir, &row).unwrap();
@@ -792,7 +792,8 @@ mod tests {
         }
         let strict = load_claude_api_request_evidence_report(&dir, [row.session_id.clone()]);
         assert_eq!(strict.health.oversized_files, 1);
-        assert!(strict.evidence.is_empty());
+        assert_eq!(strict.evidence[&row.session_id], vec![row.clone()]);
+        assert!(strict.health.malformed_lines > 0);
         assert!(!strict.health.is_complete());
         assert_eq!(
             BufReader::new(File::open(&path).unwrap())
