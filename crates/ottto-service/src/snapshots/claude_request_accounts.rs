@@ -37,8 +37,8 @@ pub(crate) struct MixedUploads {
     /// Contract-5 bodies tagged in this scan, bound the same way.
     request_identity: BTreeMap<String, (String, String)>,
     /// Bodies left with no account by a non-discard unhealthy read this scan
-    /// (Lead B Addendum 4): they upload Unknown, bound the same way.
-    unhealthy_unknown: BTreeMap<String, (String, String)>,
+    /// (Lead B Addendum 4), bound the same way, with the account it cleared.
+    unhealthy_unknown: BTreeMap<String, ((String, String), String)>,
 }
 
 /// This scan's exact semantic and upload body for `item`.
@@ -72,11 +72,13 @@ impl MixedUploads {
 
     /// Call before the E2 fold is released: it names the unhealthy reason.
     pub(crate) fn admit_unhealthy_unknown(&mut self, item: &SnapshotItem) {
-        if super::claude_request_identity::uploads_unhealthy_unknown(item)
-            && super::exact_session_account_hash(item).is_none()
-        {
-            self.unhealthy_unknown
-                .insert(item.source_session_id.clone(), bound_body(item));
+        if let Some(cleared) = super::claude_request_identity::unhealthy_cleared_account(item) {
+            if super::exact_session_account_hash(item).is_none() {
+                self.unhealthy_unknown.insert(
+                    item.source_session_id.clone(),
+                    (bound_body(item), cleared.to_owned()),
+                );
+            }
         }
     }
 
@@ -89,8 +91,12 @@ impl MixedUploads {
             && is_bound_body(self.request_identity.get(&item.source_session_id), item)
     }
 
-    pub(super) fn permits_unhealthy_unknown(&self, item: &SnapshotItem) -> bool {
-        is_bound_body(self.unhealthy_unknown.get(&item.source_session_id), item)
+    /// Only the hold the clear itself created: main uploads a body whose
+    /// account is the owner's, and keeps holding any other (Lead B Addendum 4).
+    pub(super) fn permits_unhealthy_unknown(&self, item: &SnapshotItem, owner: &str) -> bool {
+        self.unhealthy_unknown
+            .get(&item.source_session_id)
+            .is_some_and(|(bound, cleared)| cleared == owner && is_bound_body(Some(bound), item))
     }
 
     pub(super) fn permits(&self, item: &SnapshotItem) -> bool {

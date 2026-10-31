@@ -818,8 +818,11 @@ fn e2_bound_trace_case(
     e2_set_billing(&dir, &root, billing);
     let support = dir.join("support");
     let (mut api, trace) = e2_family_evidence(&root);
+    // Own login B, except the mixed arm: own A == the bound owner, which main
+    // uploads and only #947's clear would hold (Lead B Addendum 4).
+    let own = if billing == "mixed" { "a" } else { "b" };
     for row in &mut api {
-        row.account_identifier_hash = Some("b".repeat(64));
+        row.account_identifier_hash = Some(own.repeat(64));
         e2_resign(row);
     }
     if split_logins {
@@ -852,8 +855,8 @@ fn e2_bound_trace_case(
     let discarded = matches!(mode, "cap" | "generation");
     let mut index = bound_index();
     let (clean, _, stats) = e2_bound_trace_page(&dir, &support, &root, &mut index, false, None);
-    let b = Some("b".repeat(64));
-    let child_login = Some(if split_logins { "c" } else { "b" }.repeat(64));
+    let b = Some(own.repeat(64));
+    let child_login = Some(if split_logins { "c" } else { own }.repeat(64));
     if listed {
         assert!(clean.iter().all(|item| item.claude_money.is_none()), "listed: no E2 fold");
     } else {
@@ -987,10 +990,14 @@ fn e2_bound_trace_case(
     } else {
         // Never A, never B/C: every request share is Unknown, uploaded now.
         e2_bound_trace_assert_logins(&items, &root, None, None);
-        if billing != "subscription" {
-            // Lead B Addendum 4 (option 1): no account hold; still Unknown.
+        if billing == "mixed" {
+            // Lead B Addendum 4 (option 1): the cleared owner login A is not
+            // held; the body uploads Unknown on this page.
             assert!(held.is_empty(), "0 holds: {held:?}");
             e2_bound_trace_assert_logins(&bound, &root, None, None);
+        } else if billing == "external" {
+            // Main's hold for a login other than A (B) stays.
+            assert_eq!(held, BTreeSet::from([root.clone()]), "main's B != A hold");
         }
         assert_eq!(disposition.quarantined_entity_count(), 0, "Unknown, not deferred");
         assert_eq!(stats.trace_discard_deferred_items, 0);
@@ -1113,16 +1120,17 @@ fn e2_pipeline_external_billing_generation_discard_clears_wire_account_then_reco
 
 /// [money] Lead B C2: the uniform wire account is cleared for every
 /// unhealthy reason, not only discards. One family login B: with two, the
-/// account owner already withholds a D1-shaped body.
+/// account owner already withholds a D1-shaped body. B != bound A: main's
+/// account hold stays (Lead B Addendum 4).
 #[test]
 fn e2_pipeline_external_billing_malformed_trace_clears_wire_account() {
     e2_bound_trace_case("malformed", false, "external", false, false);
 }
 
 /// [money] Lead B C2 + Addendum 4 (option 1), mixed billing (only req_3/req_4
-/// API-key billed): the bound session uploads Unknown on the same page with
-/// 0 account holds, decision-2 refusals (none: such a body never enters the
-/// #909 ledger) and unchanged totals.
+/// API-key billed), own login A == bound owner: the body uploads Unknown on
+/// the same page with 0 account holds, decision-2 refusals (none here: this
+/// body never enters the #909 ledger) and unchanged totals.
 #[test]
 fn e2_pipeline_mixed_billing_malformed_trace_clears_wire_account() {
     e2_bound_trace_case("malformed", false, "mixed", false, false);

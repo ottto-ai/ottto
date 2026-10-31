@@ -45552,10 +45552,14 @@ impl ScanIndex {
                             // Eligibility is scan-local and exact-body-bound;
                             // neither marker-only imports nor restart restore it.
                         }
-                        // Lead B Addendum 4 (option 1): a body whose account
-                        // this scan cleared for a non-discard unhealthy read
-                        // uploads Unknown now; the owner is never rewritten.
-                        (Some(_), None) if mixed.permits_unhealthy_unknown(item) => {}
+                        // Lead B Addendum 4 (option 1): a body whose owner
+                        // account this scan cleared for a non-discard unhealthy
+                        // read uploads Unknown now; the owner is never rewritten.
+                        (Some(owner), None)
+                            if mixed.permits_unhealthy_unknown(
+                                item,
+                                &owner.account_identifier_hash,
+                            ) => {}
                         (Some(_), _) => {
                             deferred.insert(session_id.clone());
                         }
