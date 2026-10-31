@@ -2522,15 +2522,38 @@ fn terminal_off_held_context_memo_forgets_changes_and_nonheld_parse_without_cred
             "{case}: no ACK credit"
         );
         if case == "nonheld" {
-            // Independent semantic re-arm returns before the context-memo
-            // lookup. Revision 1 makes this a non-history parse, so only the
-            // production finalization forget can remove the prior hold.
-            index.activate_effective_upload_body_witness_revision(1);
-            for entry in index.files.values_mut() {
-                entry.source_file_fingerprint.clear();
+            // A real transcript change selects independent local work. The
+            // stored fingerprint/context still matches the held observation
+            // during selection, and a listed change is not history-held.
+            let originals = index
+                .files
+                .keys()
+                .map(|key| {
+                    let path = PathBuf::from(key);
+                    let bytes = fs::read(&path).unwrap();
+                    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+                    (path, bytes, modified)
+                })
+                .collect::<Vec<_>>();
+            for (path, bytes, _) in &originals {
+                let mut changed = bytes.clone();
+                changed.extend_from_slice(b"\n{\"type\":\"summary\"}\n");
+                fs::write(path, changed).unwrap();
             }
             index.traversal = None;
             assert_eq!(run(&mut index).1, 2, "nonheld: real successful parse");
+            // Restore the observed object and old checkpoint: only the
+            // successful finalization forget, not a changed memo key, can
+            // explain another read in the original held interpretation.
+            for (path, bytes, modified) in originals {
+                fs::write(&path, bytes).unwrap();
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+            }
             // No upload was ACKed: settlement may still retain this checkpoint.
             index = ScanIndex::load(&checkpoint).unwrap();
             configure(&mut index);
