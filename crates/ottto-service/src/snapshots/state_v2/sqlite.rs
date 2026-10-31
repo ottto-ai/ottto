@@ -374,10 +374,18 @@ fn lock_owner(path: &Path) -> Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&path)?;
     private_file(&path)?;
-    ensure!(
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "state_v2_exclusive_owner_busy"
-    );
+    // A flock belongs to the open file description, which a concurrent fork
+    // shares until the child execs. A just-released owner can therefore look
+    // busy for a moment; wait up to BUSY before reporting it.
+    let started = Instant::now();
+    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        ensure!(
+            io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
+                && started.elapsed() < BUSY,
+            "state_v2_exclusive_owner_busy"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
     let owned = file.metadata()?;
     let named = fs::symlink_metadata(&path)?;
     ensure!(
