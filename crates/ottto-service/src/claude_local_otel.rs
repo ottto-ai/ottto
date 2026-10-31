@@ -2312,58 +2312,6 @@ mod tests {
         .unwrap()
     }
 
-    fn clock_test_protobuf(event: u64, observed: u64) -> Vec<ClaudeLocalOtelEvidence> {
-        let payload = otlp_proto::ExportLogsServiceRequest {
-            resource_logs: vec![otlp_proto::ResourceLogs {
-                resource: Some(otlp_proto::Resource { attributes: vec![] }),
-                scope_logs: vec![otlp_proto::ScopeLogs {
-                    log_records: vec![otlp_proto::LogRecord {
-                        time_unix_nano: event,
-                        observed_time_unix_nano: observed,
-                        body: proto_string("body", "claude_code.api_request").value,
-                        attributes: vec![
-                            proto_string("session.id", "identity-session"),
-                            proto_string("request_id", "identity-request"),
-                            proto_string("model", "claude-test"),
-                            proto_string("input_tokens", "12"),
-                            proto_string("output_tokens", "3"),
-                            proto_string("user.account_uuid", ACCOUNT),
-                            proto_string("organization.id", ORGANIZATION),
-                        ],
-                    }],
-                }],
-            }],
-        };
-        api_evidence_from_protobuf(&payload.encode_to_vec()).unwrap()
-    }
-
-    fn clock_test_json(
-        event: Option<Value>,
-        observed: Option<Value>,
-    ) -> Vec<ClaudeLocalOtelEvidence> {
-        let mut payload: Value = serde_json::from_slice(&identity_json(
-            &[],
-            &[
-                ("user.account_uuid", ACCOUNT),
-                ("organization.id", ORGANIZATION),
-            ],
-        ))
-        .unwrap();
-        let record = payload
-            .pointer_mut("/resourceLogs/0/scopeLogs/0/logRecords/0")
-            .unwrap()
-            .as_object_mut()
-            .unwrap();
-        record.remove("timeUnixNano");
-        if let Some(value) = event {
-            record.insert("timeUnixNano".into(), value);
-        }
-        if let Some(value) = observed {
-            record.insert("observedTimeUnixNano".into(), value);
-        }
-        api_evidence_from_json(&serde_json::to_vec(&payload).unwrap()).unwrap()
-    }
-
     #[test]
     fn request_pair_malformed_protobuf_identity_preserves_presence_both_origins() {
         use otlp_proto::any_value::Value as ProtoValue;
