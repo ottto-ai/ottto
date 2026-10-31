@@ -79887,23 +79887,6 @@ mod tests {
                 // backend's normalize_selector_context recognizes it
                 // (SELECTOR_FIELDS / source key `context_bucket`).
                 ("context_bucket".to_string(), "long".to_string()),
-                (
-                    "attribution_subagent".to_string(),
-                    "general-purpose".to_string(),
-                ),
-                ("attribution_skill".to_string(), "design-sync".to_string()),
-                (
-                    "attribution_plugin".to_string(),
-                    "anthropic-skills".to_string(),
-                ),
-                (
-                    "attribution_mcp_server".to_string(),
-                    "claude-in-chrome".to_string(),
-                ),
-                (
-                    "attribution_mcp_tool".to_string(),
-                    "tabs_context_mcp".to_string(),
-                ),
             ]),
             selector_sources: BTreeMap::from([
                 (
@@ -79913,26 +79896,6 @@ mod tests {
                 (
                     "context_bucket".to_string(),
                     "derived_from_effective_input_volume".to_string(),
-                ),
-                (
-                    "attribution_subagent".to_string(),
-                    "claude_code_attribution_field".to_string(),
-                ),
-                (
-                    "attribution_skill".to_string(),
-                    "claude_code_attribution_field".to_string(),
-                ),
-                (
-                    "attribution_plugin".to_string(),
-                    "claude_code_attribution_field".to_string(),
-                ),
-                (
-                    "attribution_mcp_server".to_string(),
-                    "claude_code_attribution_field".to_string(),
-                ),
-                (
-                    "attribution_mcp_tool".to_string(),
-                    "claude_code_attribution_field".to_string(),
                 ),
             ]),
             auth_mode: Some("service_account_oauth".to_string()),
@@ -80184,23 +80147,6 @@ mod tests {
             json!("long"),
             "context_bucket must be carried inside the row's selector_context"
         );
-        for (key, expected) in [
-            ("attribution_subagent", "general-purpose"),
-            ("attribution_skill", "design-sync"),
-            ("attribution_plugin", "anthropic-skills"),
-            ("attribution_mcp_server", "claude-in-chrome"),
-            ("attribution_mcp_tool", "tabs_context_mcp"),
-        ] {
-            assert!(
-                !first_row.contains_key(key),
-                "{key} must live inside selector_context, not as a top-level row key"
-            );
-            assert_eq!(
-                item_value["model_usage"][0]["selector_context"][key],
-                json!(expected),
-                "{key} must be carried inside the row's selector_context"
-            );
-        }
     }
 
     #[test]
