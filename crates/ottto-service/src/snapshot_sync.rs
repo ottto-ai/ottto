@@ -4885,6 +4885,16 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     type Source = SnapshotSource;
     type Frame = SourcePreparation;
     type Completed = (SourcePreparation, ScanIndex, SourceScanResult);
+    fn serial_fallback(
+        &mut self,
+        source: SnapshotSource,
+        cause: crate::local_resource_diagnostics::SerialFallbackCause,
+    ) {
+        crate::local_resource_diagnostics::source_rotation_serial_fallback(
+            source.api_slug(),
+            cause,
+        );
+    }
     fn prepare(
         &mut self,
         source: SnapshotSource,
