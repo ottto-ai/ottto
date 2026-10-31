@@ -149,6 +149,15 @@ jobs:
           # An exact filter matching zero tests must not count as a receipt.
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout-coverage-receipt.log"
 
+      - name: Synthetic Codex counting peak memory
+        if: env.OTTTO_CI_TEST_FILTER == ''
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cargo test -p ottto-service --lib --locked snapshots::codex_counting_rss_tests::codex_v2_synthetic_peak_rss -- --exact --ignored --nocapture --test-threads=1 | tee "$RUNNER_TEMP/codex-rss-receipt.log"
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/codex-rss-receipt.log"
+          test "$(grep -c '^codex_v2_rss_receipt: ' "$RUNNER_TEMP/codex-rss-receipt.log")" -eq 2
+
       - name: Connector tests
         if: env.OTTTO_CI_TEST_FILTER == ''
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
