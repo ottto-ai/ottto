@@ -500,6 +500,7 @@ fn side_maps(index: &ScanIndex) -> Option<u64> {
     bytes = bytes.checked_add(heap(&index.held_audit_progress)?)?;
     bytes = bytes.checked_add(heap(&index.claude_money_birth_store)?)?;
     bytes = bytes.checked_add(heap(&index.claude_desktop_store_inventory)?)?;
+    bytes = bytes.checked_add(heap(&index.claude_copy_removals)?)?;
     Some(bytes)
 }
 

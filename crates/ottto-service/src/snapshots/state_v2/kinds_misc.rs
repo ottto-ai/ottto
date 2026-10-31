@@ -74,6 +74,7 @@ catalogue! {
     held_audit_progress => ("scan_state.held_audit_progress",Field),
     claude_money_birth_store => ("v1_field.birth_store",Field),
     claude_desktop_store_inventory => ("v1_field.claude_desktop_store_inventory",Field),
+    claude_copy_removals => ("v1_field.claude_copy_removals",Field),
 }
 pub(super) const CONTROLS: &[&str] = &["schema_version", "generation"];
 

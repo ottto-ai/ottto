@@ -745,3 +745,52 @@ fn census_evidence_larger_than_the_projected_row_cap_roundtrips() {
         serde_json::to_vec(&index).unwrap()
     );
 }
+
+/// [format] #938 copy removals map losslessly between checked v1 bytes and v2.
+/// Goldens are CCR2 of #938's persisted-field fixture plus one prefix-hold
+/// debt file, with definite and lost metadata; an absent slot stays lost.
+#[test]
+fn copy_removals_roundtrip_checked_v1_bytes_through_v2() {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    const DEFINITE: &str = "Q0NSMgACAAAAEhWSo6RMxEDjJVe1q0p5xwAAAAAAAAAAAQAAAAhTn1hKY1r1cpjByPzdpVwCAAAAAQAAAAAAAAACAAAAAAAAAJGPX3TzuiqIHEpSPndxZkoBAAAAAAAAAAAAAAA";
+    const LOST: &str = "Q0NSMgECAAAAEhWSo6RMxEDjJVe1q0p5xwAAAAAAAAAAAQAAAAhTn1hKY1r1cpjByPzdpVwCAAAAAQAAAAAAAAACAAAAAAAAAJGPX3TzuiqIHEpSPndxZkoBAAAAAAAAAAAAAAA";
+    let (copy, held) = (
+        location_key("/synthetic/copy.jsonl"),
+        location_key("/synthetic/held.jsonl"),
+    );
+    for (golden, metadata_lost) in [(Some(DEFINITE), false), (Some(LOST), true), (None, true)] {
+        let mut v1 = serde_json::to_value(fixture()).unwrap();
+        let object = v1.as_object_mut().unwrap();
+        object.remove("claude_copy_removals");
+        if let Some(golden) = golden {
+            object.insert("claude_copy_removals".into(), golden.into());
+        }
+        let mut index: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&v1).unwrap()).unwrap();
+        let removals = &index.claude_copy_removals;
+        assert_eq!(removals.metadata_lost(), metadata_lost);
+        if golden.is_some() {
+            let holder = location_key("/synthetic/original.jsonl");
+            assert_eq!(removals.get(copy), &[(holder, Box::<[u64]>::from([1_u64, 2]))]);
+            assert!(removals.get(held).is_empty() && removals.pending(held));
+            assert!(!removals.pending(copy));
+        } else {
+            assert!(removals.is_empty());
+        }
+        let (_scratch, mut db) = Scratch::store();
+        commit_populate(&mut db, &index);
+        index.generation = 1;
+        let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+        assert_eq!(restored.claude_copy_removals, index.claude_copy_removals);
+        // The restored v1 slot writes the exact checked bytes back (or stays absent).
+        let written = serde_json::to_value(&restored).unwrap();
+        assert_eq!(
+            written.get("claude_copy_removals").and_then(|v| v.as_str()),
+            golden
+        );
+        assert_eq!(
+            serde_json::to_vec(&restored).unwrap(),
+            serde_json::to_vec(&index).unwrap()
+        );
+    }
+}

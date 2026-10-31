@@ -127,6 +127,7 @@ coverage! {
     claude_history_emission => ("MISC", "runtime"),
     claude_money_birth_store => ("MISC", "v1_field.birth_store"),
     claude_desktop_store_inventory => ("MISC", "v1_field.claude_desktop_store_inventory"),
+    claude_copy_removals => ("MISC", "v1_field.claude_copy_removals"),
     copy_unproven_enabled => ("MISC", "runtime"),
     copy_prefix_base_upload_context => ("MISC", "runtime"),
 }
