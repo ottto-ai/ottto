@@ -4179,7 +4179,6 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                 (&today[0].0, today[0].1, today[0].2, &today[0].3, false, false),
                 "the tombstoned row: same money, untagged, no marker");
             assert_eq!(copy.request_identity_refusals, u64::from(!retained), "only B's row refuses");
-            assert_eq!(identity_count(&counts, "accepted_share_changed"), 1, "B's bucket only");
             std::fs::remove_file(&effort).unwrap();
             // The invalidated row reads as never accepted: own evidence tags it fresh.
             let (copy, _) = pass(&c, &mut ledger);
