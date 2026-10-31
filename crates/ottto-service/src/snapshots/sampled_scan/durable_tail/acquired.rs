@@ -194,8 +194,7 @@ pub(super) fn capture_chain(
         committed_generation: inputs.committed_generation,
     })
 }
-/// Restored provenance: the caller proved the original v1 adapter revision or
-/// the verified v3 acquisition fields. A format rewrite never grants eligibility.
+/// Restored provenance uses verified v3 acquisition fields.
 pub(super) fn restore_chain(
     inputs: ChainInputs<'_>,
     protocol: AcquisitionProtocol,

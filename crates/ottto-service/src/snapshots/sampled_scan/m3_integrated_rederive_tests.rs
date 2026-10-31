@@ -98,7 +98,7 @@ impl ColdReplay {
         index.save(&index_path).unwrap();
         let key = local_index_key(&path);
         let i = Interpretation::of(SnapshotSource::Codex, &key, &index, false, &namespace);
-        let expected = expected(
+        let mut expected = expected(
             DurableSource::Codex,
             SnapshotSource::Codex,
             &key,
@@ -106,12 +106,20 @@ impl ColdReplay {
             &index,
             &i,
             Some((
-                store::FORMAT_V1,
+                store::FORMAT_V3,
                 codec::allowlist_digest(SnapshotSource::Codex),
                 effective_revision(SnapshotSource::Codex),
             )),
         )
         .unwrap();
+        expected.binding.scope = v3_replay_scope(
+            SnapshotSource::Codex,
+            &scope,
+            &index,
+            &i,
+            effective_revision(SnapshotSource::Codex),
+            &acquired::ImmutableCounting::from_reduction(&reduction).unwrap(),
+        );
         let mut disk = DurableTailStore::new(
             store::store_dir_for_index(&index_path),
             DurableSource::Codex,
@@ -122,7 +130,7 @@ impl ColdReplay {
                 index.generation,
                 0,
                 vec![PendingRecord {
-                    acquisition: None,
+                    acquisition: fixture_acquisition(SnapshotSource::Codex),
                     binding: expected.binding,
                     certificate: checkpoint
                         .durable_certificate(birth_unix_nanos(&std::fs::metadata(&path).unwrap()))
@@ -181,11 +189,7 @@ impl ColdReplay {
             panic!("seed record")
         };
         record.record.body = body;
-        std::fs::write(
-            &self.record_path,
-            store::tests::pinned_v1_bytes(&record.record, record.index_generation),
-        )
-        .unwrap();
+        std::fs::write(&self.record_path, store::tests::current_bytes(&record)).unwrap();
     }
     fn scan(
         &self,
@@ -313,7 +317,7 @@ fn cold_store_each_fence_class_and_certificate_reason_retires_before_one_full() 
         let original_record = std::fs::read(&rig.record_path).unwrap();
         let (outcome, rows) = crate::local_resource_diagnostics::capture(|| rig.restore(&cache));
         assert!(
-            matches!(outcome, RestoreOutcome::Miss(MissClass::RealEdit(got) | MissClass::Failure(Failure::Certificate(CertificateRefusal::Changed(got)))) if got == reason),
+            matches!(outcome, RestoreOutcome::Miss(MissClass::Failure(Failure::Certificate(CertificateRefusal::Changed(got)))) if got == reason),
             "row {row}: {reason:?}"
         );
         if row < 5 {
@@ -608,13 +612,20 @@ fn corrupt_retired_predecessor_rebuilds_once_without_withholding_native_usage() 
         return;
     }
     let rig = ColdReplay::new(None, false, false);
-    let mut bytes = std::fs::read(&rig.record_path).unwrap();
-    bytes[10..42].copy_from_slice(
-        &store::parse_hex_digest(
-            "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
-        )
-        .unwrap(),
+    let mut disk = DurableTailStore::new(
+        store::store_dir_for_index(&rig.index_path),
+        DurableSource::Codex,
     );
+    let ReadOutcome::Found(mut record) =
+        disk.read(&full_pace_key(SnapshotSource::Codex, &rig.key()))
+    else {
+        panic!("native fixture record");
+    };
+    record.record.allowlist =
+        store::parse_hex_digest("02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1")
+            .unwrap();
+    let mut bytes = store::tests::pinned_v1_bytes(&record.record, record.index_generation);
+    *bytes.last_mut().unwrap() ^= 1;
     // Preserve the recognized header and damage its checksum, never decode it.
     std::fs::write(&rig.record_path, bytes).unwrap();
     rig.append();

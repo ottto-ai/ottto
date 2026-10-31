@@ -58,6 +58,7 @@ pub(crate) use stream::{
 pub(crate) const FORMAT_V1: u16 = 1;
 pub(crate) const FORMAT_V3: u16 = 3;
 // Historical fixture/writer pin; never reinterpret v1 as the current writer.
+#[cfg(test)]
 pub(crate) const FORMAT_VERSION: u16 = FORMAT_V1;
 const MAGIC: [u8; 8] = *b"ottto-dt";
 /// One record never exceeds the RAM cache's per-entry bound
@@ -195,6 +196,7 @@ pub(crate) fn scope_digest(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn scope_digest_for(
     format: u16,
     file_scope: &str,
@@ -240,14 +242,24 @@ fn retired_pin(source: DurableSource, format: u16, pin: &Digest32) -> bool {
         }
         DurableSource::Codex => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
     };
-    format == FORMAT_V1 && parse_hex_digest(retired).as_ref() == Some(pin)
+    format == FORMAT_V1
+        && (parse_hex_digest(retired).as_ref() == Some(pin)
+            || crate::snapshots::restart_restore_enabled()
+                && source.properties().representation(FORMAT_V3, pin).is_some())
 }
 
 fn header_len(format: u16, source: DurableSource, allowlist: &Digest32) -> Result<usize, Refusal> {
     if format > FORMAT_V3 {
         return Err(Refusal::NewerFormat);
     }
-    if retired_pin(source, format, allowlist) {
+    // Header-only compatibility remains for OFF invalidation and consent erasure.
+    if retired_pin(source, format, allowlist)
+        || format == FORMAT_V1
+            && source
+                .properties()
+                .representation(FORMAT_V3, allowlist)
+                .is_some()
+    {
         return Ok(HEADER_BYTES);
     }
     source
@@ -279,23 +291,6 @@ pub(crate) fn replay_scope_digest(
     )
 }
 
-/// Per-file applied revision and money replay marks committed with the entry.
-/// An old reduction cannot inherit a new applied-rule/obligation marker.
-pub(crate) fn replay_entry_digest(
-    entry: &Digest32,
-    applied_revision: u64,
-    money_marks: u8,
-) -> Digest32 {
-    digest(
-        "ottto-dt-replay-entry:v1",
-        &[
-            entry.as_slice(),
-            &applied_revision.to_le_bytes(),
-            &[money_marks],
-        ],
-    )
-}
-
 /// The garbage-collection unit: the destination namespace and the account
 /// (upload context) in force. A record from another context is unreachable.
 pub(crate) fn context_digest(namespace: &str, upload_context: Option<&str>) -> Digest32 {
@@ -311,6 +306,7 @@ pub(crate) fn context_digest(namespace: &str, upload_context: Option<&str>) -> D
 /// The committed index selection a record was written for: the entry's
 /// source fingerprint and upload body witness, as the index save committed
 /// them.
+#[cfg(test)]
 pub(crate) fn entry_digest(source_file_fingerprint: &str, body_witness: Option<&str>) -> Digest32 {
     digest(
         "ottto-dt-entry:v1",
@@ -542,7 +538,6 @@ pub(crate) enum ReadOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Expected {
     pub(crate) binding: Binding,
-    pub(crate) committed_generation: u64,
 }
 
 /// Why a well-formed record does not bind to the committed index.
@@ -555,9 +550,6 @@ pub(crate) enum Ineligible {
     /// Another interpretation scope, format, allowlist, identity contract or
     /// counting view.
     Scope,
-    /// Written after a save the loaded index does not contain (index old,
-    /// checkpoint new).
-    GenerationAhead,
     /// The committed entry is not the one this record was written for: a
     /// later save recorded another selection (an append, truncate, replace
     /// or edit) and no record followed it.
@@ -576,18 +568,8 @@ impl DurableRecord {
             Err(Ineligible::Key)
         } else if have.context != want.context {
             Err(Ineligible::Context)
-        } else if have.scope != want.scope {
+        } else if have.scope != want.scope || self.format != FORMAT_V3 {
             Err(Ineligible::Scope)
-        } else if self.format == FORMAT_V1
-            && have.source == DurableSource::Codex
-            && self.index_generation > expected.committed_generation
-        {
-            Err(Ineligible::GenerationAhead)
-        } else if self.format == FORMAT_V1
-            && have.source == DurableSource::Codex
-            && have.entry != want.entry
-        {
-            Err(Ineligible::EntryChanged)
         } else {
             Ok(())
         }
@@ -1088,7 +1070,14 @@ impl DurableTailStore {
                 binding.stamp = Some(Stamp::of(&metadata));
                 return Ok(Some(binding));
             }
-            if retired && work != "overwrite" && work != "guard" {
+            let erasure = work == "privacy_restore"
+                && binding.format == FORMAT_V1
+                && self
+                    .source
+                    .properties()
+                    .representation(FORMAT_V3, &binding.record.allowlist)
+                    .is_some();
+            if retired && !erasure && work != "overwrite" && work != "guard" {
                 return Err(Refusal::Repin); // Missing to readers, opaque to current decoders.
             }
             if read_only && metadata.mode() & 0o777 != 0o600 {
@@ -1337,7 +1326,11 @@ impl DurableTailStore {
         self.counters.max_record_bytes = self.counters.max_record_bytes.max(bytes.len() as u64);
         let size = dispatch(&bytes).map_or(HEADER_V3_BYTES, |(_, _, _, size)| size);
         self.note_codec(bytes.capacity() + bytes.len().saturating_sub(size));
-        match decode(&bytes) {
+        match if privacy_erasure {
+            decode_for_erasure(&bytes, true)
+        } else {
+            decode(&bytes)
+        } {
             Ok(record) => {
                 if let Some((content, _, _)) = self.durable.get_mut(key) {
                     *content = Some(stored_digest(&bytes));
@@ -1484,9 +1477,7 @@ impl DurableTailStore {
                     }
                     file.sync_all()?;
                     true
-                } else if prior.is_some()
-                    && before == prior
-                    && verified.record.format == FORMAT_VERSION
+                } else if prior.is_some() && before == prior && verified.record.format == FORMAT_V3
                 {
                     if stamp_at(&path)? != before {
                         return Err(io::Error::other("predecessor changed"));
@@ -1547,11 +1538,7 @@ impl DurableTailStore {
         record: &DurableRecord,
         expected: &Expected,
     ) -> Option<MutationWitness> {
-        if record.eligible(expected).is_err()
-            || record.format == FORMAT_V1
-                && (record.record.binding.entry != expected.binding.entry
-                    || record.index_generation > expected.committed_generation)
-        {
+        if record.eligible(expected).is_err() {
             return None;
         }
         let key = record.record.binding.key;
@@ -1614,9 +1601,6 @@ impl DurableTailStore {
         self.revoke(&record.record.binding.key);
         let content = record_digest(record);
         if record.eligible(expected).is_err()
-            || record.format == FORMAT_V1
-                && (record.record.binding.entry != expected.binding.entry
-                    || record.index_generation > expected.committed_generation)
             || proof.key != record.record.binding.key
             || proof.original != identity
             || proof.content != content
@@ -1648,12 +1632,11 @@ impl DurableTailStore {
         self.durable.insert(key, value);
     }
 
-    fn authorized(&mut self, key: &Digest32, format: u16) -> bool {
-        let allowed = format == FORMAT_V1 && self.source != DurableSource::ClaudeCode
-            || self.durable.get(key).is_some_and(|(_, stamp, yes)| {
-                *yes && fs::symlink_metadata(self.record_path(key))
-                    .is_ok_and(|m| Stamp::of(&m) == *stamp)
-            });
+    fn authorized(&mut self, key: &Digest32, _format: u16) -> bool {
+        let allowed = self.durable.get(key).is_some_and(|(_, stamp, yes)| {
+            *yes && fs::symlink_metadata(self.record_path(key))
+                .is_ok_and(|m| Stamp::of(&m) == *stamp)
+        });
         self.counters.mutation_unproved += u64::from(!allowed);
         allowed
     }
@@ -3105,7 +3088,7 @@ fn verify(bytes: &[u8], source: DurableSource) -> Result<(), Refusal> {
     if end.checked_sub(start) != Some(h.body_len) {
         return Err(bad);
     }
-    if retired_pin(source, h.format, &h.record.allowlist) {
+    if h.format == FORMAT_V1 {
         // The retired body is opaque. Its checksum proves exact replacement
         // custody only; no current decoder or restore receives these bytes.
         return Ok(());
@@ -3557,8 +3540,20 @@ impl<'a> Cursor<'a> {
 /// The version is checked before the trailer: a newer layout is not ours to
 /// judge. Everything else must pass the trailer and decode exactly.
 fn decode(bytes: &[u8]) -> Result<DurableRecord, Refusal> {
+    decode_for_erasure(bytes, false)
+}
+
+// Only consent erasure may inspect an admitted, label-capable v1 body.
+// The returned envelope is never admitted to restore or native provenance.
+fn decode_for_erasure(bytes: &[u8], erasure: bool) -> Result<DurableRecord, Refusal> {
     let (format, pin, source, _) = dispatch(bytes)?;
-    if retired_pin(source, format, &pin) {
+    if format == FORMAT_V1
+        && !(erasure
+            && source
+                .properties()
+                .representation(FORMAT_V3, &pin)
+                .is_some())
+    {
         return Err(Refusal::Repin);
     }
 

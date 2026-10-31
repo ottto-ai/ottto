@@ -443,13 +443,15 @@ impl Decoded {
         Ok((self.reduction, RederiveReceipt::default()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
+        self.reduction.durable_counting()
+    }
+
     pub(in crate::snapshots) fn immutable_counting(
         &self,
     ) -> Result<crate::snapshots::ImmutableCounting, crate::durable_tail_store::Refusal> {
         crate::snapshots::ImmutableCounting::from_reduction(&self.reduction)
-    }
-    pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
-        self.reduction.durable_counting()
     }
 
     /// How far the head re-parse must read: the latest mark of a field to

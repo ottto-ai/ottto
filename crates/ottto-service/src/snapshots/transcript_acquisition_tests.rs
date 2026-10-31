@@ -4135,136 +4135,6 @@ fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
     }
 }
 
-/// V1 bootstrap uses the golden-checked old serializer and production
-/// expected/scope/restore/write seams. Each restart has zero Fulls.
-#[cfg(unix)]
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
-fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    use crate::durable_tail_store as store;
-    assert!(crate::heap_layout_bound::layout_supported());
-    // Match OwnedSourceScan::new capture mode for both sources.
-    let identity_capture = true;
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        let fixture = ScanFixture::new(source);
-        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-        let namespace = Scope("v1-upgrade-production".into());
-        let state = fixture.dir.join("state");
-        fs::create_dir_all(&state).unwrap();
-        let lock = crate::locked_state_dir::test_locks::hold(&state);
-        let index_path = state.join("index.json");
-        let first = Arc::new(sampled_scan::SharedCache::default());
-        first.durable_begin_pass(source, &index_path, &namespace, identity_capture);
-        let (mut index, _, modes) = production_scan(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            Some(first.clone()),
-            &namespace.0,
-        );
-        assert_eq!(modes.0, 1);
-        index.save(&index_path).unwrap();
-        first
-            .durable_write_after_save(lock, source, &index)
-            .unwrap();
-        assert_eq!(
-            first.durable_counters(source).unwrap().1.records_written,
-            1,
-            "native settlement wrote each record once before effects"
-        );
-        let key = local_index_key(&fixture.file.0);
-        let old = sampled_scan::durable_tail::seed_pinned_v1(&first, source, &key, &index);
-        let record_path = fs::read_dir(store::store_dir_for_index(&index_path))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        assert_eq!(u16::from_le_bytes(old[8..10].try_into().unwrap()), 1);
-        drop(first);
-        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-        let second = Arc::new(sampled_scan::SharedCache::default());
-        second.durable_begin_pass(source, &index_path, &namespace, identity_capture);
-        let loaded = ScanIndex::load(&index_path).unwrap();
-        let (mut warm, scan, modes) = production_scan(
-            &fixture,
-            source,
-            loaded.clone(),
-            Some(second.clone()),
-            &namespace.0,
-        );
-        let (cold, full, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
-        assert_eq!(modes, (0, 1, 0), "{source:?}");
-        assert_eq!(second.durable_counters(source).unwrap().0.restored, 1);
-        assert_eq!(production_body(source, scan), production_body(source, full));
-        assert_eq!(
-            warm.files[&key].codex_counting_v2,
-            cold.files[&key].codex_counting_v2
-        );
-        let successor = fs::read(&record_path).unwrap();
-        assert_ne!(successor, old, "growth settled the native successor");
-        assert_eq!(
-            u16::from_le_bytes(successor[8..10].try_into().unwrap()),
-            store::FORMAT_V3
-        );
-        let due = unix_seconds(SystemTime::now()).unwrap() + 120;
-        let fingerprint = warm.files[&key].source_file_fingerprint.clone();
-        assert!(warm.stage_sampled_audit(
-            &key,
-            &fingerprint,
-            crate::transcript_acquisition::AuditDebt {
-                due_unix_seconds: due
-            }
-        ));
-        let written_due = sampled_audit::debt_for_key(&warm, &key, due - 120)
-            .unwrap()
-            .due_unix_seconds;
-        warm.save(&index_path).unwrap();
-        assert_eq!(
-            second
-                .durable_write_after_save(lock, source, &warm)
-                .unwrap()
-                .written,
-            1
-        );
-        let before_gc = second.durable_counters(source).unwrap().1;
-        second.durable_gc(lock, source, &warm).unwrap();
-        let after_gc = second.durable_counters(source).unwrap().1;
-        assert_eq!(after_gc.guard_header_bytes, before_gc.guard_header_bytes);
-        assert_eq!(after_gc.guard_verify_bytes, before_gc.guard_verify_bytes);
-        assert!(after_gc.gc_bytes_read > before_gc.gc_bytes_read);
-        let mut disk = store::DurableTailStore::new(
-            store::store_dir_for_index(&index_path),
-            sampled_scan::durable_tail::durable_source(source).unwrap(),
-        );
-        let record = match disk.read(&store::key_digest(
-            sampled_scan::durable_tail::durable_source(source).unwrap(),
-            &key,
-        )) {
-            store::ReadOutcome::Found(r) => r,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(
-            record.envelope_audit_debt,
-            Some(written_due),
-            "actual post-save adapter takes CURRENT index debt"
-        );
-        assert_eq!(record.record.certificate.audit_debt_unix_seconds, None);
-        assert_eq!(record.format, crate::durable_tail_store::FORMAT_VERSION);
-        drop(second);
-        fixture.file.append(&usage(source, 160, 2, "fixture-model"));
-        let third = Arc::new(sampled_scan::SharedCache::default());
-        third.durable_begin_pass(source, &index_path, &namespace, identity_capture);
-        let loaded = ScanIndex::load(&index_path).unwrap();
-        let (_, scan, modes) =
-            production_scan(&fixture, source, loaded.clone(), Some(third), &namespace.0);
-        let (_, full, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
-        assert_eq!(modes, (0, 1, 0), "second restart {source:?}");
-        assert_eq!(production_body(source, scan), production_body(source, full));
-    }
-}
-
 fn codex_cache_break_lines(index: usize) -> [Value; 2] {
     let timestamp = format!("2026-10-07T10:{:02}:{:02}Z", index / 60, index % 60);
     let read = if index % 2 == 0 { 90_000 } else { 0 };
@@ -4568,7 +4438,12 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
         certificate.audit_debt_unix_seconds = Some(now + 60);
         let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
         let pending = store::PendingRecord {
-            acquisition: None,
+            acquisition: Some(store::AcquisitionFields {
+                acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
+                    source,
+                ),
+                protocol: AcquisitionProtocol::Legacy,
+            }),
             binding: store::Binding {
                 source: ds,
                 key: record_key,
@@ -4838,7 +4713,12 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
         certificate.audit_debt_unix_seconds = Some(now);
         let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
         let pending = store::PendingRecord {
-            acquisition: None,
+            acquisition: Some(store::AcquisitionFields {
+                acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
+                    source,
+                ),
+                protocol: AcquisitionProtocol::Legacy,
+            }),
             binding: store::Binding {
                 source: ds,
                 key: record_key,
@@ -5078,7 +4958,12 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
             let mut disk =
                 store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
             let pending = store::PendingRecord {
-                acquisition: None,
+                acquisition: Some(store::AcquisitionFields {
+                    acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
+                        source,
+                    ),
+                    protocol: AcquisitionProtocol::Legacy,
+                }),
                 binding: store::Binding {
                     source: ds,
                     key: record_key,
@@ -5650,4 +5535,137 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
         .unwrap()
         .pending_candidates
         .is_empty());
+}
+
+/// V1 bootstrap uses the golden-checked old serializer and production
+/// expected/scope/restore/write seams. Each restart has zero Fulls.
+#[cfg(unix)]
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn native_v3_ordinary_save_then_second_restart_tails_without_a_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    use crate::durable_tail_store as store;
+    assert!(crate::heap_layout_bound::layout_supported());
+    // Match OwnedSourceScan::new capture mode for both sources.
+    let identity_capture = true;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let namespace = Scope("v1-upgrade-production".into());
+        let state = fixture.dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let lock = crate::locked_state_dir::test_locks::hold(&state);
+        let index_path = state.join("index.json");
+        let first = Arc::new(sampled_scan::SharedCache::default());
+        first.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+        let (mut index, _, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(first.clone()),
+            &namespace.0,
+        );
+        assert_eq!(modes.0, 1);
+        index.save(&index_path).unwrap();
+        first
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
+        assert_eq!(
+            first.durable_counters(source).unwrap().1.records_written,
+            1,
+            "native settlement wrote each record once before effects"
+        );
+        let key = local_index_key(&fixture.file.0);
+        let record_path = fs::read_dir(store::store_dir_for_index(&index_path))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let old = fs::read(&record_path).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(old[8..10].try_into().unwrap()),
+            store::FORMAT_V3
+        );
+        drop(first);
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let second = Arc::new(sampled_scan::SharedCache::default());
+        second.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        let (mut warm, scan, modes) = production_scan(
+            &fixture,
+            source,
+            loaded.clone(),
+            Some(second.clone()),
+            &namespace.0,
+        );
+        let (cold, full, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
+        assert_eq!(modes, (0, 1, 0), "{source:?}");
+        assert_eq!(second.durable_counters(source).unwrap().0.restored, 1);
+        assert_eq!(production_body(source, scan), production_body(source, full));
+        assert_eq!(
+            warm.files[&key].codex_counting_v2,
+            cold.files[&key].codex_counting_v2
+        );
+        let successor = fs::read(&record_path).unwrap();
+        assert_ne!(successor, old, "growth settled the native successor");
+        assert_eq!(
+            u16::from_le_bytes(successor[8..10].try_into().unwrap()),
+            store::FORMAT_V3
+        );
+        let due = unix_seconds(SystemTime::now()).unwrap() + 120;
+        let fingerprint = warm.files[&key].source_file_fingerprint.clone();
+        assert!(warm.stage_sampled_audit(
+            &key,
+            &fingerprint,
+            crate::transcript_acquisition::AuditDebt {
+                due_unix_seconds: due
+            }
+        ));
+        let written_due = sampled_audit::debt_for_key(&warm, &key, due - 120)
+            .unwrap()
+            .due_unix_seconds;
+        warm.save(&index_path).unwrap();
+        assert_eq!(
+            second
+                .durable_write_after_save(lock, source, &warm)
+                .unwrap()
+                .written,
+            1
+        );
+        let before_gc = second.durable_counters(source).unwrap().1;
+        second.durable_gc(lock, source, &warm).unwrap();
+        let after_gc = second.durable_counters(source).unwrap().1;
+        assert_eq!(after_gc.guard_header_bytes, before_gc.guard_header_bytes);
+        assert_eq!(after_gc.guard_verify_bytes, before_gc.guard_verify_bytes);
+        assert!(after_gc.gc_bytes_read > before_gc.gc_bytes_read);
+        let mut disk = store::DurableTailStore::new(
+            store::store_dir_for_index(&index_path),
+            sampled_scan::durable_tail::durable_source(source).unwrap(),
+        );
+        let record = match disk.read(&store::key_digest(
+            sampled_scan::durable_tail::durable_source(source).unwrap(),
+            &key,
+        )) {
+            store::ReadOutcome::Found(r) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            record.envelope_audit_debt,
+            Some(written_due),
+            "actual post-save adapter takes CURRENT index debt"
+        );
+        assert_eq!(record.record.certificate.audit_debt_unix_seconds, None);
+        assert_eq!(record.format, crate::durable_tail_store::FORMAT_V3);
+        drop(second);
+        fixture.file.append(&usage(source, 160, 2, "fixture-model"));
+        let third = Arc::new(sampled_scan::SharedCache::default());
+        third.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        let (_, scan, modes) =
+            production_scan(&fixture, source, loaded.clone(), Some(third), &namespace.0);
+        let (_, full, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
+        assert_eq!(modes, (0, 1, 0), "second restart {source:?}");
+        assert_eq!(production_body(source, scan), production_body(source, full));
+    }
 }

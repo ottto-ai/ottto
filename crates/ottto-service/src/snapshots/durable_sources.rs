@@ -1,4 +1,4 @@
-//! One dispatch table for admitted durable sources. Each source admits exact v1/v3 representations.
+//! One dispatch table for admitted durable sources. ON admits v3 reductions only.
 use super::sampled_jsonl::durable;
 #[cfg(test)]
 use super::sampled_jsonl::CachedJsonlReduction;
@@ -14,19 +14,12 @@ pub(crate) struct Representation {
     pub(crate) header_bytes: usize,
 }
 
-const fn representations(pin: &'static str) -> [Representation; 2] {
-    [
-        Representation {
-            format: 1,
-            allowlist_pin: pin,
-            header_bytes: crate::durable_tail_store::HEADER_BYTES,
-        },
-        Representation {
-            format: 3,
-            allowlist_pin: pin,
-            header_bytes: crate::durable_tail_store::HEADER_V3_BYTES,
-        },
-    ]
+const fn representations(pin: &'static str) -> [Representation; 1] {
+    [Representation {
+        format: 3,
+        allowlist_pin: pin,
+        header_bytes: crate::durable_tail_store::HEADER_V3_BYTES,
+    }]
 }
 
 pub(crate) struct Properties {
@@ -52,15 +45,14 @@ pub(crate) struct Properties {
 }
 
 // Current PL-retained schema only. Historical pins refuse at dispatch; there is
-// no reader-first dual-pin path. Both admitted envelope versions use this body.
+// no reader-first dual-pin path. Only v3 uses this body.
 // Enum ordinals index this table and Stores' slots; tags remain independent wire IDs.
 pub(crate) const SOURCES: &[Properties] = &[
     Properties {
         source: DurableSource::ClaudeCode,
         snapshot: SnapshotSource::ClaudeCode,
         tag: 1,
-        // Advance only with the atomic native write-ahead activation.
-        write_format: 1,
+        write_format: 3,
         representations: &representations(
             "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2",
         ),
@@ -78,8 +70,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::Codex,
         snapshot: SnapshotSource::Codex,
         tag: 2,
-        // Advance only with the atomic native write-ahead activation.
-        write_format: 1,
+        write_format: 3,
         representations: &representations(
             "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
         ),

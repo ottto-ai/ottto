@@ -2006,13 +2006,16 @@ mod tests {
                 std::array::from_fn(|i| u8::from_str_radix(&pin[2 * i..2 * i + 2], 16).unwrap());
             let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
             let saved = store::PendingRecord {
-                acquisition: None,
+                acquisition: Some(store::AcquisitionFields {
+                    acquired_revision: 3,
+                    protocol: crate::snapshots::AcquisitionProtocol::Legacy,
+                }),
                 binding: store::Binding {
                     source,
                     key,
                     context: store::context_digest("certificate-fixture", None),
                     scope: store::scope_digest(&scope().0, &allowlist, "", ""),
-                    entry: store::entry_digest("certificate-fixture", None),
+                    entry: [0; 32],
                 },
                 certificate: cp.durable_certificate(0).unwrap(),
                 body: crate::snapshots::durable_store_fixture_body(

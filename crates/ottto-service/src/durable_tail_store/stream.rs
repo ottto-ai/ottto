@@ -1132,7 +1132,6 @@ mod tests {
             &record,
             &Expected {
                 binding: record.record.binding.clone(),
-                committed_generation: next.generation,
             },
         );
         assert!(

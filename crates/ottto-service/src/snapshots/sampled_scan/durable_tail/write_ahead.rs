@@ -385,16 +385,7 @@ impl SharedCache {
                 lease,
             )
             .ok_or(HeldCause::Incompatible)?;
-        self.authorize_predecessor(
-            lease,
-            source,
-            key,
-            index,
-            &binding,
-            checkpoint,
-            &m,
-            write_ahead_eligible,
-        )?;
+        self.authorize_predecessor(lease, source, &binding, write_ahead_eligible)?;
         acquired::capture_chain(
             acquired::ChainInputs {
                 source,
@@ -443,16 +434,7 @@ impl SharedCache {
                 lease,
             )
             .ok_or(HeldCause::Incompatible)?;
-        self.authorize_predecessor(
-            lease,
-            chain.source(),
-            chain.key(),
-            index,
-            &binding,
-            checkpoint,
-            &m,
-            false,
-        )?;
+        self.authorize_predecessor(lease, chain.source(), &binding, false)?;
         chain.rebind(
             opened_object_identity,
             (m.dev(), m.ino(), birth_unix_nanos(&m)),
@@ -462,19 +444,13 @@ impl SharedCache {
         )
     }
 
-    /// Root's prepare_stream mutates only an exactly authorized Claude
-    /// predecessor. Reuse the strict M1 witness path (it also captures the P2
-    /// original witness the exact replacement ACK consumes), funded first.
-    #[allow(clippy::too_many_arguments)] // One proved native fact per input.
+    /// Root's prepare_stream mutates only an exactly authorized v3 predecessor.
+    /// The bounded read is funded before verification.
     fn authorize_predecessor(
         &self,
         lease: &mut store::ActiveLease,
         source: SnapshotSource,
-        key: &str,
-        index: &ScanIndex,
         binding: &Binding,
-        checkpoint: &Checkpoint,
-        held: &std::fs::Metadata,
         full: bool,
     ) -> Result<(), HeldCause> {
         let ds = durable_source(source).ok_or(HeldCause::Incompatible)?;
@@ -510,14 +486,8 @@ impl SharedCache {
                             .record
                             .acquisition
                             .is_some_and(|a| a.acquired_revision == effective_revision(source));
-                    let recovered_carrier = index
-                        .files
-                        .get(key)
-                        .map_or(true, ScanIndexEntry::has_unverified_source)
-                        && record.format == store::FORMAT_V1
-                        && record.envelope_audit_debt.is_some();
                     if same_context
-                        && (native || recovered_carrier)
+                        && native
                         && record.record.allowlist == ds.properties().allowlist()
                     {
                         // A completed byte-zero read replaces a verified current
@@ -528,7 +498,6 @@ impl SharedCache {
                             &record,
                             &Expected {
                                 binding: record.record.binding.clone(),
-                                committed_generation: record.index_generation,
                             },
                         );
                         return Ok(());
@@ -550,63 +519,26 @@ impl SharedCache {
         }
         // A cold v3 predecessor is read once, then every warm mutation uses
         // the saved stamp. It owes no v1 old-byte witness/custody slot.
-        let native = self
-            .durable()
-            .and_then(|mut stores| {
-                stores
-                    .slot(ds)
-                    .as_mut()
-                    .and_then(|slot| slot.store.representation(&digest))
-            })
-            .is_some_and(|(format, _)| format == store::FORMAT_V3);
-        if source == SnapshotSource::Codex || native {
-            lease
-                .charge(store::RESTORE_INPUT_BYTES)
-                .map_err(|_| HeldCause::CustodyBound)?;
-            let mut stores = self.durable().ok_or(HeldCause::Fence)?;
-            let slot = stores.slot(ds).as_mut().ok_or(HeldCause::Fence)?;
-            match slot
-                .store
-                .read_bounded(&digest, lease)
-                .map_err(|_| HeldCause::CustodyBound)?
-            {
-                ReadOutcome::Found(record) if record.format == store::FORMAT_V3 => {
-                    let expected = Expected {
-                        binding: binding.clone(),
-                        committed_generation: index.generation,
-                    };
-                    slot.store.authorize(&record, &expected);
-                }
-                ReadOutcome::Refused(reason) => return Err(HeldCause::Protected(reason)),
-                _ => {}
-            }
-            return Ok(());
-        }
-        let _certificate = checkpoint
-            .durable_certificate(birth_unix_nanos(held))
-            .ok_or(HeldCause::Incompatible)?;
         lease
             .charge(store::RESTORE_INPUT_BYTES)
             .map_err(|_| HeldCause::CustodyBound)?;
-        let digest = binding.key;
-        let mut guard = self.durable().ok_or(HeldCause::Fence)?;
-        let stores = &mut *guard;
-        if !stores.fund_key(digest) {
-            return Err(HeldCause::CustodyBound);
-        }
-        let (Some(slot), Some(custody)) = (
-            stores.slots[DurableSource::ClaudeCode.slot()].as_mut(),
-            stores.retail_spent.get_mut(&digest),
-        ) else {
-            return Err(HeldCause::Fence);
-        };
-        let refused = authorize_strict(slot, source, key, index, custody);
-        stores.release_idle_custody(&digest);
-        if refused == Some(store::Refusal::Corrupt) {
-            // Known-corrupt disk state may coexist with valid RAM. It cannot
-            // authorize a new native chain: keep the ordinary RAM publication
-            // without staging or receipt debt. Eviction retains the disk hold.
-            return Err(HeldCause::Protected(store::Refusal::Corrupt));
+        let mut stores = self.durable().ok_or(HeldCause::Fence)?;
+        let slot = stores.slot(ds).as_mut().ok_or(HeldCause::Fence)?;
+        match slot
+            .store
+            .read_bounded(&digest, lease)
+            .map_err(|_| HeldCause::CustodyBound)?
+        {
+            ReadOutcome::Found(record) => {
+                slot.store.authorize(
+                    &record,
+                    &Expected {
+                        binding: binding.clone(),
+                    },
+                );
+            }
+            ReadOutcome::Refused(reason) => return Err(HeldCause::Protected(reason)),
+            ReadOutcome::Missing => {}
         }
         Ok(())
     }

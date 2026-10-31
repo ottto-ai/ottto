@@ -75,7 +75,7 @@ pub(in crate::snapshots) fn set_test_write_bytes(bytes: Option<usize>) {
 ///   (full `RecordIdentity`, boxed in `ReceiptProof`) is NOT pending: it is
 ///   charged on the acquisition's active lease inside `stream_reserve_bytes`
 ///   with the funded 64 KiB stream scratch;
-/// - A0-h custody (spent, P2 witness, upgrade marker) and Full-pacing nodes,
+/// - A0-h custody (spent, P2 witness) and Full-pacing nodes,
 ///   2*513 nodes of <=1024 bytes = 1,050,624 bytes (`RETAIL_RESERVE_BYTES`);
 /// - M3 per-key debt/D3-hold and P1-1 restore-pending maps, 2*257 nodes of
 ///   <=1024 bytes = 526,336 bytes (`KEY_RESERVE_BYTES`).
@@ -269,16 +269,16 @@ pub(in crate::snapshots) fn record_rederive_fence(source: SnapshotSource, classe
 }
 #[derive(Clone, Copy)]
 enum RetirementEdge {
+    #[cfg(test)]
     Metadata,
-    AcceptedObject,
     IndependentEdit,
     ScopedCertificate,
 }
 impl RetirementEdge {
     fn label(self) -> &'static str {
         match self {
+            #[cfg(test)]
             Self::Metadata => "metadata",
-            Self::AcceptedObject => "accepted_object",
             Self::IndependentEdit => "independent_edit",
             Self::ScopedCertificate => "scoped_certificate",
         }
@@ -312,10 +312,7 @@ pub(crate) struct Counters {
     rederive_first_attempt_tracking_closed: bool,
     restore_pending_quiet: [u64; 3],
     pub(crate) restored: u64,
-    pub(crate) original_v1_mapped: u64,
     pub(crate) durable_restore_after_selection_clear: u64,
-    pub(crate) objects: [u64; 3],
-    pub(crate) s2_skipped_object_changed: u64,
     pub(crate) retail_attempts: u64,
     pub(crate) retail_keys: u64,
     pub(crate) retail_full: [u64; 3],
@@ -403,7 +400,7 @@ impl Counters {
         };
         let on_refused = restart_restore::on_refused_discovery_dependency();
         format!(
-            "ottto-service: durable_tail source={} restart_restore={switch} restart_restore_on_refused{{reason=discovery_dependency}}={on_refused} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} \
+            "ottto-service: durable_tail source={} restart_restore={switch} restart_restore_on_refused{{reason=discovery_dependency}}={on_refused} durable_restore_after_selection_clear={} \
              retail_attempts={} retail_keys={} near_cap={} pace_anomaly={} upgrade_missing_full={} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} retail_physical_bytes[process,daily]={:?} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} \
              active_bound[claude,codex,pi]={:?} resource_full={{{}}} rederive_head_bytes={} rederive_named_lines={} rederive_line_bytes={} rederive_budget[refused,refused_bytes]={:?} not_persisted={{{}}} ineligible={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
@@ -419,10 +416,7 @@ impl Counters {
              rederive_refused[first_prompt,title,agent_label,session_start,workspace]={rederive_refused:?} rederive_head_reads={head_reads} rederive_line_peak_bytes={line_peak} rederive_fence_mismatch={fence:?} \
              native_input_bytes[head,tail,full]=[{input_head},{},{}]",
             source.api_slug(),
-            self.original_v1_mapped,
             self.durable_restore_after_selection_clear,
-            self.objects,
-            self.s2_skipped_object_changed,
             self.retail_attempts,
             self.retail_keys,
             self.near_cap,
@@ -932,9 +926,6 @@ pub(crate) fn durable_source(source: SnapshotSource) -> Option<DurableSource> {
 pub(crate) struct AcceptedFloor {
     pub(crate) end: u64,
     revision: u64,
-    birth: u64,
-    generation: u64,
-    entry: store::Digest32,
     strict: bool,
     /// A lossy read's raw extent is not a verified accepted-body prefix.
     verified_extent: bool,
@@ -945,20 +936,8 @@ impl AcceptedFloor {
         Some(Self {
             end: e.size_bytes,
             revision: e.effective_upload_body_witness_revision,
-            birth: e.opened_birth_nanos,
-            generation: index.generation,
             strict: !e.source_file_fingerprint.is_empty(),
             verified_extent: !e.has_unverified_source(),
-            entry: store::replay_entry_digest(
-                &store::entry_digest(
-                    &e.source_file_fingerprint,
-                    e.last_upload_body_witness.as_deref(),
-                ),
-                e.effective_upload_body_witness_revision,
-                index
-                    .claude_money_birth_store
-                    .money_marks(claude_money_birth_store::location_key(key)),
-            ),
         })
     }
     pub(crate) fn behind(self, length: u64) -> bool {
@@ -967,27 +946,6 @@ impl AcceptedFloor {
     pub(crate) fn permits_real_edit(self) -> bool {
         effective_revision(SnapshotSource::ClaudeCode) >= self.revision
     }
-}
-
-/// A different inode alone is ambiguous (copies/hard links/reuse). Births
-/// must independently disagree, and the original must bind the frozen entry.
-fn accepted_object_changed(
-    record: &store::DurableRecord,
-    a: AcceptedFloor,
-    device: u64,
-    inode: u64,
-    birth: u64,
-) -> bool {
-    let c = &record.record.certificate;
-    record.format == 1
-        && a.strict
-        && record.record.binding.entry == a.entry
-        && record.index_generation <= a.generation
-        && a.birth != 0
-        && a.birth == c.birth_nanos
-        && birth != 0
-        && birth != a.birth
-        && (c.device, c.inode) != (device, inode)
 }
 
 /// The interpretation inputs a record binds to beyond the file scope.
@@ -1044,7 +1002,7 @@ fn expected(
     interpretation: &Interpretation<'_>,
     representation: Option<(u16, store::Digest32, u64)>,
 ) -> Option<Expected> {
-    let entry = index.files.get(key)?;
+    index.files.get(key)?;
     Some(Expected {
         binding: Binding {
             source,
@@ -1061,22 +1019,8 @@ fn expected(
                 None,
                 representation,
             ),
-            entry: store::replay_entry_digest(
-                &store::entry_digest(
-                    &entry.source_file_fingerprint,
-                    entry.last_upload_body_witness.as_deref(),
-                ),
-                entry.effective_upload_body_witness_revision,
-                if source == DurableSource::ClaudeCode {
-                    index
-                        .claude_money_birth_store
-                        .money_marks(claude_money_birth_store::location_key(key))
-                } else {
-                    0
-                },
-            ),
+            entry: [0; 32],
         },
-        committed_generation: index.generation,
     })
 }
 
@@ -1129,7 +1073,7 @@ fn replay_scope_for(
     replay: Option<Obligation>,
     representation: Option<(u16, store::Digest32, u64)>,
 ) -> store::Digest32 {
-    let (format, allowlist, revision) = representation.unwrap_or_else(|| {
+    let (_format, allowlist, revision) = representation.unwrap_or_else(|| {
         (
             durable_source(source)
                 .expect("admitted source")
@@ -1145,26 +1089,14 @@ fn replay_scope_for(
     let body_revision = replay.filter(|row| row.kind == ObligationKind::BodyWitness);
     let money_rule = replay.filter(|row| row.kind == ObligationKind::MoneyRule);
     store::replay_scope_digest(
-        &if format == store::FORMAT_V3 {
-            // Claude is explicitly absent. Codex's body-derived C is checked
-            // by v3_replay_scope after decode, before content input or reuse.
-            let absent =
-                acquired::ImmutableCounting::canonical(source, None).expect("admitted source");
-            store::scope_digest_v3(
-                &scope.0,
-                &allowlist,
-                &interpretation.identity_contract,
-                absent.bytes(),
-            )
-        } else {
-            store::scope_digest_for(
-                format,
-                &scope.0,
-                &allowlist,
-                &interpretation.identity_contract,
-                &interpretation.counting_view,
-            )
-        },
+        &store::scope_digest_v3(
+            &scope.0,
+            &allowlist,
+            &interpretation.identity_contract,
+            acquired::ImmutableCounting::canonical(source, None)
+                .expect("admitted source")
+                .bytes(),
+        ),
         body_revision.map_or(revision, |row| row.revision),
         body_revision.map_or(index.active_effective_upload_body_witness_revision, |row| {
             row.revision
@@ -1256,60 +1188,17 @@ fn claude_expected(
     if record.record.allowlist != codec::allowlist_digest(SnapshotSource::ClaudeCode) {
         return Err("old_binding_representation");
     }
-    let current = effective_revision(SnapshotSource::ClaudeCode);
-    if record.format == store::FORMAT_V3 {
-        return claude_expected_v3(key, scope, index, interpretation, record, current);
-    }
-    if record.format != 1 {
+    if record.format != store::FORMAT_V3 {
         return Err("old_binding_representation");
     }
-    // NAMED_REVISION_CANDIDATES: record/entry applied, current code, explicitly retained active.
-    let applied = index
-        .files
-        .get(key)
-        .ok_or("accepted_floor_missing")?
-        .effective_upload_body_witness_revision;
-    let revisions = [
-        applied,
-        current,
-        index.active_effective_upload_body_witness_revision,
-    ];
-    let candidates: BTreeSet<_> = revisions.into_iter().collect();
-    let mut matched = None;
-    for revision in candidates {
-        let expected = expected(
-            DurableSource::ClaudeCode,
-            SnapshotSource::ClaudeCode,
-            key,
-            scope,
-            index,
-            interpretation,
-            Some((record.format, record.record.allowlist, revision)),
-        )
-        .ok_or("accepted_floor_missing")?;
-        if expected.binding.context != record.record.binding.context {
-            return Err("context");
-        }
-        if expected.binding.scope != record.record.binding.scope {
-            continue;
-        }
-        if matched.is_some() {
-            return Err("old_binding_ambiguous");
-        }
-        matched = Some((expected, revision));
-    }
-    let mut proof = matched.ok_or("old_binding_no_match")?;
-    if proof.1 != current {
-        return Err(if proof.1 > current {
-            "revision_downgrade"
-        } else {
-            "revision_adoption_required"
-        });
-    }
-    // Historical entry/generation are not acquisition gates; mutation binds to this exact R.
-    proof.0.binding.entry = record.record.binding.entry;
-    proof.0.committed_generation = record.index_generation;
-    Ok(proof)
+    claude_expected_v3(
+        key,
+        scope,
+        index,
+        interpretation,
+        record,
+        effective_revision(SnapshotSource::ClaudeCode),
+    )
 }
 
 /// A v3 record names its finite acquired revision r_a; there is no candidate
@@ -1351,7 +1240,6 @@ fn claude_expected_v3(
         });
     }
     expected.binding.entry = record.record.binding.entry;
-    expected.committed_generation = record.index_generation;
     Ok((expected, acquired))
 }
 
@@ -1361,7 +1249,6 @@ fn ineligible_class(reason: store::Ineligible) -> &'static str {
         store::Ineligible::Key => "key",
         store::Ineligible::Context => "context",
         store::Ineligible::Scope => "scope",
-        store::Ineligible::GenerationAhead => "generation_ahead",
         store::Ineligible::EntryChanged => "entry_changed",
     }
 }
@@ -1402,18 +1289,6 @@ fn certificate_at(
     certificate.audit_debt_unix_seconds =
         sampled_audit::debt_for_key(index, key, now).map(|debt| debt.due_unix_seconds);
     Some(certificate)
-}
-
-fn audit_carrier_matches(
-    record: &store::DurableRecord,
-    index: &ScanIndex,
-    key: &str,
-    now: u64,
-) -> bool {
-    record.envelope_audit_debt.map_or(true, |due| {
-        sampled_audit::debt_for_key(index, key, now)
-            .is_some_and(|debt| debt.due_unix_seconds <= due)
-    })
 }
 
 fn refuse_class(refuse: Refuse) -> &'static str {
@@ -1668,53 +1543,6 @@ impl RetailAttempt {
         self.accounted(file).read(bytes)
     }
     pub(crate) fn finish(self) {}
-}
-
-fn authorize_strict(
-    slot: &mut Slot,
-    snapshot_source: SnapshotSource,
-    key: &str,
-    index: &ScanIndex,
-    custody: &mut KeyCustody,
-) -> Option<store::Refusal> {
-    slot.indexed = index.files.len();
-    slot.store
-        .revoke(&store::key_digest(DurableSource::ClaudeCode, key));
-    let scope = slot.decided.get(key).and_then(ScopeDecision::scope)?;
-    let source = durable_source(snapshot_source).expect("durable source");
-    let digest = store::key_digest(source, key);
-    let record = match slot.store.read(&digest) {
-        ReadOutcome::Found(record) => record,
-        ReadOutcome::Missing => return None,
-        ReadOutcome::Refused(reason) => return Some(reason),
-    };
-    let interpretation = Interpretation::of(
-        snapshot_source,
-        key,
-        index,
-        slot.identity_capture,
-        &slot.namespace,
-    );
-    if let Ok((expected, _)) = claude_expected(key, scope, index, &interpretation, &record) {
-        if custody.original.is_none() {
-            custody.original = slot.store.mutation_witness(&record, &expected);
-        }
-        // An ambiguous prior receipt still owns its unresolved custody. It is
-        // not permission for the freshly verified current record: prove that
-        // record independently so later dirty writes can make progress.
-        if let Some(proof) = custody
-            .original
-            .as_ref()
-            .filter(|p| slot.store.witness_current(p))
-        {
-            // A current predecessor witness also survives verification-memo
-            // turnover; rebuilding permission must not require a memo slot.
-            slot.store.authorize_witness(&record, &expected, proof);
-        } else {
-            slot.store.authorize(&record, &expected);
-        }
-    }
-    None
 }
 
 impl SharedCache {
@@ -3242,10 +3070,6 @@ impl SharedCache {
                 lease.release();
                 RestoreOutcome::FloorHeld
             }
-            Err(RestoreOutcome::Miss(class @ MissClass::RealEdit(_))) => {
-                lease.release();
-                RestoreOutcome::Miss(class)
-            }
             Err(RestoreOutcome::Miss(class @ MissClass::LayoutUnavailable(_))) => {
                 // Absence for this already-selected acquisition, not a new
                 // Full permission. Native preparation keeps its usual S2 checks.
@@ -3255,10 +3079,6 @@ impl SharedCache {
             Err(_) if floor_behind => {
                 lease.release();
                 RestoreOutcome::FloorHeld
-            }
-            Err(RestoreOutcome::Miss(class @ MissClass::AuditCarrier)) => {
-                lease.release();
-                RestoreOutcome::Miss(class)
             }
             Err(RestoreOutcome::Miss(class)) => {
                 let result = self
@@ -3928,33 +3748,6 @@ impl SharedCache {
             .flatten();
             return Err(MissClass::LayoutUnavailable(audit_debt).into());
         }
-        // Missing membership is itself missing audit custody. Check the verified
-        // same-context carrier before the entry-dependent binding; indexed keys
-        // retain their existing real-edit and accepted-floor precedence below.
-        if !index.files.contains_key(key)
-            && record.record.binding.context
-                == store::context_digest(
-                    &interpretation.namespace.0,
-                    index.active_upload_context_fingerprint.as_deref(),
-                )
-            && record.format != store::FORMAT_V3
-            && !audit_carrier_matches(
-                &record,
-                index,
-                key,
-                unix_seconds(SystemTime::now()).unwrap_or(0),
-            )
-        {
-            Counters::bump(
-                &mut self
-                    .durable()
-                    .ok_or(MissClass::Unavailable)?
-                    .counters
-                    .ineligible,
-                "audit_carrier",
-            );
-            return Err(MissClass::AuditCarrier.into());
-        }
         let original_expected = expected(
             source,
             snapshot_source,
@@ -3976,66 +3769,8 @@ impl SharedCache {
         {
             return Err(MissClass::AcceptedFloor.into());
         }
-        let original_matches = record.eligible(&original_expected).is_ok()
-            && interpretation.accepted.map_or(true, |a| {
-                a.strict
-                    && a.entry == record.record.binding.entry
-                    && record.record.certificate.length == a.end
-                    && record.index_generation <= a.generation
-            });
-        if original_matches {
-            if let Err(CertificateRefusal::Changed(
-                reason @ (FullReason::Shrunk | FullReason::SameSizeEdit),
-            )) = record.record.certificate.check_metadata(held)
-            {
-                if let Some(mut stores) = self.durable() {
-                    Counters::bump(
-                        &mut stores.counters.certificate_refused,
-                        full_reason_class(reason),
-                    );
-                }
-                self.queue_rederive_retirement(
-                    source,
-                    &record,
-                    &original_expected,
-                    RetirementEdge::Metadata,
-                );
-                return Err(MissClass::RealEdit(reason).into());
-            }
-        }
         if let Some(a) = interpretation.accepted {
             let metadata = held.metadata().map_err(|_| MissClass::AcceptedFloor)?;
-            if a.revision <= effective_revision(SnapshotSource::ClaudeCode)
-                && record.record.binding.source == source
-                && record.record.binding.key == store_key
-                && record.record.binding.context
-                    == store::context_digest(
-                        &interpretation.namespace.0,
-                        index.active_upload_context_fingerprint.as_deref(),
-                    )
-                && accepted_object_changed(
-                    &record,
-                    a,
-                    metadata.dev(),
-                    metadata.ino(),
-                    birth_unix_nanos(&metadata),
-                )
-            {
-                if let Some(mut stores) = self.durable() {
-                    Counters::bump(
-                        &mut stores.counters.ineligible,
-                        "s2_skipped_real_edit.replaced",
-                    );
-                }
-                self.retire_or_hold(
-                    original_matches,
-                    source,
-                    &record,
-                    &original_expected,
-                    RetirementEdge::AcceptedObject,
-                );
-                return Err(MissClass::RealEdit(FullReason::Replaced).into());
-            }
             if a.behind(metadata.len()) {
                 if let Some(mut stores) = self.durable() {
                     Counters::bump(&mut stores.counters.ineligible, "accepted_body_floor");
@@ -4070,29 +3805,6 @@ impl SharedCache {
                 .into());
             }
         }
-        if record.record.binding.context
-            == store::context_digest(
-                &interpretation.namespace.0,
-                index.active_upload_context_fingerprint.as_deref(),
-            )
-            && record.format != store::FORMAT_V3
-            && !audit_carrier_matches(
-                &record,
-                index,
-                key,
-                unix_seconds(SystemTime::now()).unwrap_or(0),
-            )
-        {
-            Counters::bump(
-                &mut self
-                    .durable()
-                    .ok_or(MissClass::Unavailable)?
-                    .counters
-                    .ineligible,
-                "audit_carrier",
-            );
-            return Err(MissClass::AuditCarrier.into());
-        }
         index.files.get(key).ok_or(MissClass::NoEntry)?;
         if source == DurableSource::ClaudeCode && interpretation.accepted.is_none() {
             return Err(self.stale("accepted_floor_missing"));
@@ -4111,100 +3823,65 @@ impl SharedCache {
             )),
         )
         .ok_or(MissClass::NoEntry)?;
-        let mut adapter_revision = None;
         if source == DurableSource::ClaudeCode {
-            let (original, revision) =
-                match claude_expected(key, scope, index, interpretation, &record) {
-                    Ok(proof) => proof,
-                    Err(reason) => {
-                        // Probe before the early stale return, outside Stores.
-                        let owed = unregistered_scope(
-                            snapshot_source,
-                            scope,
-                            index,
-                            interpretation,
-                            record.record.binding.scope,
-                        );
-                        if matches!(
-                            reason,
-                            "context"
-                                | "old_binding_no_match"
-                                | "restore_semantics"
-                                | "revision_adoption_required"
-                        ) {
-                            if let Some(a) = interpretation
-                                .accepted
-                                .filter(|a| a.revision <= effective_revision(snapshot_source))
-                            {
-                                if let Ok(metadata) = held.metadata() {
-                                    let object = accepted_object(
-                                        &record,
-                                        &a,
-                                        metadata.dev(),
-                                        metadata.ino(),
-                                        birth_unix_nanos(&metadata),
-                                    );
-                                    // Same/Unknown accepted objects must retain the
-                                    // accepted prefix. A proved replacement is A2.
-                                    if metadata.len() >= a.end || object == ObjectVerdict::Changed {
-                                        if let Ok(Some(edit)) =
-                                            record.record.certificate.independent_edit(held)
-                                        {
-                                            if let Some(mut stores) = self.durable() {
-                                                Counters::bump(
-                                                    &mut stores.counters.certificate_refused,
-                                                    full_reason_class(edit),
-                                                );
-                                            }
-                                            self.retire_or_hold(
-                                                original_matches,
-                                                source,
-                                                &record,
-                                                &original_expected,
-                                                RetirementEdge::IndependentEdit,
+            let (original, _) = match claude_expected(key, scope, index, interpretation, &record) {
+                Ok(proof) => proof,
+                Err(reason) => {
+                    // Probe before the early stale return, outside Stores.
+                    let owed = unregistered_scope(
+                        snapshot_source,
+                        scope,
+                        index,
+                        interpretation,
+                        record.record.binding.scope,
+                    );
+                    if matches!(
+                        reason,
+                        "context"
+                            | "old_binding_no_match"
+                            | "restore_semantics"
+                            | "revision_adoption_required"
+                    ) {
+                        if let Some(a) = interpretation
+                            .accepted
+                            .filter(|a| a.revision <= effective_revision(snapshot_source))
+                        {
+                            if let Ok(metadata) = held.metadata() {
+                                if metadata.len() >= a.end {
+                                    if let Ok(Some(edit)) =
+                                        record.record.certificate.independent_edit(held)
+                                    {
+                                        if let Some(mut stores) = self.durable() {
+                                            Counters::bump(
+                                                &mut stores.counters.certificate_refused,
+                                                full_reason_class(edit),
                                             );
-                                            return Err(MissClass::Failure(Failure::Certificate(
-                                                CertificateRefusal::Changed(edit),
-                                            ))
-                                            .into());
                                         }
+                                        self.retire_or_hold(
+                                            false,
+                                            source,
+                                            &record,
+                                            &original_expected,
+                                            RetirementEdge::IndependentEdit,
+                                        );
+                                        return Err(MissClass::Failure(Failure::Certificate(
+                                            CertificateRefusal::Changed(edit),
+                                        ))
+                                        .into());
                                     }
                                 }
                             }
                         }
-                        return Err(match (self.stale(reason), owed) {
-                            (RestoreOutcome::Stale(reason), Some(owed)) => {
-                                RestoreOutcome::StaleUnregistered(reason, owed)
-                            }
-                            (outcome, _) => outcome,
-                        });
                     }
-                };
-            let Some(a) = interpretation.accepted else {
-                return Err(self.stale("accepted_floor_missing"));
+                    return Err(match (self.stale(reason), owed) {
+                        (RestoreOutcome::Stale(reason), Some(owed)) => {
+                            RestoreOutcome::StaleUnregistered(reason, owed)
+                        }
+                        (outcome, _) => outcome,
+                    });
+                }
             };
-            let Ok(current) = held.metadata() else {
-                return Err(self.stale("accepted_floor_metadata"));
-            };
-            let verdict = accepted_object(
-                &record,
-                &a,
-                current.dev(),
-                current.ino(),
-                birth_unix_nanos(&current),
-            );
-            let behind = revision < a.revision || current.len() < a.end;
-            if let Some(mut stores) = self.durable() {
-                stores.counters.original_v1_mapped += 1;
-                stores.counters.objects[verdict as usize] += 1;
-                stores.counters.s2_skipped_object_changed +=
-                    u64::from(behind && verdict == ObjectVerdict::Changed);
-            }
-            if behind && verdict != ObjectVerdict::Changed {
-                return Err(self.stale("behind_accepted.legacy"));
-            }
             expected = original;
-            adapter_revision = Some(revision);
         }
         if record.format == store::FORMAT_V3 {
             let acquisition = record.record.acquisition.ok_or(MissClass::NoEntry)?;
@@ -4302,14 +3979,6 @@ impl SharedCache {
                 if let Some(owed) = owed {
                     return Err(MissClass::Unregistered(owed).into());
                 }
-                if original_matches {
-                    if let Failure::Certificate(CertificateRefusal::Changed(
-                        reason @ (FullReason::HeadChanged | FullReason::BoundaryChanged),
-                    )) = class
-                    {
-                        return Err(MissClass::RealEdit(reason).into());
-                    }
-                }
                 return Err(MissClass::Failure(class).into());
             }
         };
@@ -4329,10 +3998,9 @@ impl SharedCache {
         if let Some(slot) = stores.slot(source).as_mut() {
             slot.store.authorize(&record, &expected);
         }
-        let needs_original = record.format == store::FORMAT_V1
-            || interpretation
-                .accepted
-                .is_some_and(|floor| floor.end > record.record.certificate.sealed_offset);
+        let needs_original = interpretation
+            .accepted
+            .is_some_and(|floor| floor.end > record.record.certificate.sealed_offset);
         if source == DurableSource::ClaudeCode && needs_original && stores.fund_key(store_key) {
             let proof = stores
                 .slot(source)
@@ -4365,7 +4033,6 @@ impl SharedCache {
             snapshot_source,
             key,
             &record,
-            adapter_revision,
             &checkpoint,
             held,
             index,
@@ -4387,10 +4054,8 @@ impl SharedCache {
         }))
     }
 
-    /// The restored chain inherits the original proof: a Claude v1 record's
-    /// unique adapter revision (Legacy), or a v3 record's verified r_a and
-    /// protocol. Codex v1 has no unique mapping and gets no chain; nothing is
-    /// restamped. O is computed on the held FD, whose position is restored.
+    /// Restored chains inherit the verified v3 acquisition fields. O is
+    /// computed on the held FD, whose position is restored.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     fn restored_chain(
@@ -4398,7 +4063,6 @@ impl SharedCache {
         snapshot_source: SnapshotSource,
         key: &str,
         record: &store::DurableRecord,
-        adapter_revision: Option<u64>,
         checkpoint: &Checkpoint,
         held: &mut File,
         index: &ScanIndex,
@@ -4407,56 +4071,8 @@ impl SharedCache {
     ) -> Option<AcquiredChain> {
         use std::io::{Seek, SeekFrom};
         let ds = durable_source(snapshot_source)?;
-        let (revision, protocol) = match (record.format, record.record.acquisition) {
-            (store::FORMAT_V3, Some(acquisition)) => {
-                (acquisition.acquired_revision, acquisition.protocol)
-            }
-            (store::FORMAT_V1, None) => {
-                let revision = match adapter_revision {
-                    Some(revision) => revision,
-                    None if snapshot_source == SnapshotSource::Codex => {
-                        let mut stores = self.durable()?;
-                        let slot = stores.slot(ds).as_ref()?;
-                        let interpretation = Interpretation::of(
-                            snapshot_source,
-                            key,
-                            index,
-                            slot.identity_capture,
-                            &slot.namespace,
-                        );
-                        let entry = index.files.get(key)?;
-                        let candidates = std::collections::BTreeSet::from([
-                            entry.effective_upload_body_witness_revision,
-                            effective_revision(snapshot_source),
-                            index.active_effective_upload_body_witness_revision,
-                        ]);
-                        let mut matched = None;
-                        for revision in candidates {
-                            let expected = expected(
-                                ds,
-                                snapshot_source,
-                                key,
-                                checkpoint.scope(),
-                                index,
-                                &interpretation,
-                                Some((store::FORMAT_V1, record.record.allowlist, revision)),
-                            )?;
-                            if record.eligible(&expected).is_ok() {
-                                if matched.is_some() {
-                                    return None;
-                                }
-                                matched = Some(revision);
-                            }
-                        }
-                        matched
-                            .filter(|revision| *revision == effective_revision(snapshot_source))?
-                    }
-                    None => return None,
-                };
-                (revision, AcquisitionProtocol::Legacy)
-            }
-            _ => return None,
-        };
+        let acquisition = record.record.acquisition?;
+        let (revision, protocol) = (acquisition.acquired_revision, acquisition.protocol);
         let binding = self.live_binding(
             ds,
             snapshot_source,
@@ -4555,6 +4171,9 @@ impl SharedCache {
             refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
                 .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("compressed")))?;
         }
+        if record.format != store::FORMAT_V3 {
+            return Err(Failure::Ineligible(store::Ineligible::Scope));
+        }
         record.eligible(expected).map_err(Failure::Ineligible)?;
         record
             .record
@@ -4591,7 +4210,7 @@ impl SharedCache {
             .charge(scope.0.len() as u64)
             .map_err(|_| Failure::Resource("certificate_scope"))?;
         let mut certificate = record.record.certificate.clone();
-        if record.format == store::FORMAT_V3 {
+        {
             // The verified envelope carries scheduling debt across the gap
             // between a write-ahead replacement and its index save.
             certificate.audit_debt_unix_seconds = record.envelope_audit_debt;
@@ -4858,8 +4477,7 @@ impl SharedCache {
             );
             if let Some(due) = slot.store.carrier_debt(&digest, &context) {
                 let now = super::now_seconds();
-                let _ =
-                    MissClass::LayoutUnavailable(Some(due.min(now))).rearm_audit(index, key, now);
+                let _ = MissClass::LayoutUnavailable(Some(due.min(now))).rearm_audit(index, key);
             }
         }
         slot.decided.insert(
@@ -5457,7 +5075,8 @@ impl SharedCache {
                         protocol: chain.write_protocol(),
                     })
                 } else {
-                    None
+                    not_persisted.push("acquisition");
+                    continue;
                 };
                 let Some(mut certificate) = certificate_at(
                     &key,
@@ -5553,32 +5172,6 @@ impl SharedCache {
                         &replacement.binding,
                         replacement.acquisition?.acquired_revision,
                     );
-            }
-        }
-        if source == DurableSource::ClaudeCode {
-            for key in offered.values() {
-                let digest = store::key_digest(source, key);
-                if !stores.fund_key(digest) {
-                    stores
-                        .slot(DurableSource::ClaudeCode)
-                        .as_mut()?
-                        .store
-                        .revoke(&digest);
-                    continue;
-                }
-                let stores = &mut *stores;
-                let replacement = pending.iter().find(|r| r.binding.key == digest)?;
-                if replacement.acquisition.is_some() {
-                    continue;
-                }
-                let _ = authorize_strict(
-                    stores.slots[source.slot()].as_mut()?,
-                    snapshot_source,
-                    key,
-                    index,
-                    stores.retail_spent.get_mut(&digest)?,
-                );
-                stores.release_idle_custody(&digest);
             }
         }
         let slot = stores.slot(source).as_mut()?;
@@ -5865,27 +5458,7 @@ impl SharedCache {
                             slot.store.authorize(&record, &original);
                             return Some(original.binding.scope);
                         }
-                        let (format, allowlist) = slot.store.representation(&digest)?;
-                        if format == store::FORMAT_V3 {
-                            return None;
-                        }
-                        expected(
-                            source,
-                            snapshot_source,
-                            key,
-                            scope,
-                            index,
-                            &interpretation,
-                            Some((format, allowlist, effective_revision(snapshot_source))),
-                        )
-                        .map(|expected| {
-                            if source == DurableSource::ClaudeCode {
-                                if let ReadOutcome::Found(record) = slot.store.read(&digest) {
-                                    slot.store.authorize(&record, &expected);
-                                }
-                            }
-                            expected.binding.scope
-                        })
+                        None
                     });
                 keep.insert(
                     digest,
@@ -6269,10 +5842,8 @@ pub(crate) enum MissClass {
     ExcludedClass,
     /// Known v3, but this binary's bounded restore layout is unavailable.
     LayoutUnavailable(Option<u64>),
-    RealEdit(FullReason),
     Unavailable,
     NoEntry,
-    AuditCarrier,
     SelectionCleared,
     /// A Codex record survived a cleared selection: refused, paced Full.
     StaleSelection,
@@ -6293,27 +5864,18 @@ impl MissClass {
         self,
         index: &mut ScanIndex,
         key: &str,
-        now: u64,
     ) -> Option<crate::transcript_acquisition::AuditDebt> {
         let envelope_due = match self {
-            Self::AuditCarrier => None,
-            Self::LayoutUnavailable(Some(due)) => Some(due),
+            Self::LayoutUnavailable(Some(due)) => due,
             _ => return None,
         };
         let entry = index.files.get_mut(key)?;
         let due = entry
             .unverified_deadline()
             .filter(|due| *due > 0)
-            .map_or(envelope_due.unwrap_or(now), |due| {
-                due.min(envelope_due.unwrap_or(now))
-            });
+            .map_or(envelope_due, |due| due.min(envelope_due));
         // Layout unavailability cannot turn the existing selection into a
         // due-audit read. Preserve a valid future deadline until settlement.
-        let due = if matches!(self, Self::AuditCarrier) {
-            due.min(now)
-        } else {
-            due
-        };
         entry.set_unverified_deadline(due);
         Some(crate::transcript_acquisition::AuditDebt {
             due_unix_seconds: due,
@@ -6335,17 +5897,8 @@ impl MissClass {
             Self::ExcludedClass => "class_excluded",
             Self::LayoutUnavailable(_) => "restore_unavailable.layout",
             Self::AcceptedFloor => "accepted_body_floor",
-            Self::RealEdit(reason) => match reason {
-                FullReason::Replaced => "s2_skipped_real_edit.replaced",
-                FullReason::Shrunk => "s2_skipped_real_edit.shrunk",
-                FullReason::SameSizeEdit => "s2_skipped_real_edit.same_size_edit",
-                FullReason::HeadChanged => "s2_skipped_real_edit.head_changed",
-                FullReason::BoundaryChanged => "s2_skipped_real_edit.boundary_changed",
-                _ => "s2_skipped_real_edit.invalid_checkpoint",
-            },
             Self::Unavailable => "unavailable",
             Self::NoEntry => "no_entry",
-            Self::AuditCarrier => "ineligible.audit_carrier",
             Self::SelectionCleared => "ineligible.selection_cleared",
             Self::StaleSelection => "ineligible.selection_cleared.stale_record",
             Self::HistoryOwed => "ineligible.history_owed",
@@ -6446,42 +5999,6 @@ impl From<MissClass> for RestoreOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ObjectVerdict {
-    Same,
-    Unknown,
-    Changed,
-}
-fn accepted_object(
-    record: &store::DurableRecord,
-    a: &AcceptedFloor,
-    device: u64,
-    inode: u64,
-    birth: u64,
-) -> ObjectVerdict {
-    let r = &record.record.certificate;
-    let bridge = record.format == 1
-        && a.strict
-        && record.record.binding.entry == a.entry
-        && record.index_generation <= a.generation
-        && a.birth != 0
-        && a.birth == r.birth_nanos;
-    if !bridge || birth == 0 {
-        return ObjectVerdict::Unknown;
-    }
-    if (r.device, r.inode) != (device, inode) {
-        if birth != a.birth {
-            ObjectVerdict::Changed
-        } else {
-            ObjectVerdict::Unknown
-        }
-    } else if birth == a.birth {
-        ObjectVerdict::Same
-    } else {
-        ObjectVerdict::Unknown
-    } // Equal inode/different birth is reuse ambiguity.
-}
-
 #[cfg(test)]
 mod restore_test {
     use super::*;
@@ -6561,13 +6078,6 @@ pub(crate) mod tests;
 #[path = "transition_seed.rs"]
 pub(crate) mod transition_seed;
 
-#[cfg(test)]
-#[path = "durable_tail_store_write_tests.rs"]
-mod store_write_tests;
-
-#[cfg(test)]
-pub(crate) use tests::seed_pinned_v1;
-
 #[cfg(all(test, unix))]
 #[path = "m3_owed_tests.rs"]
 mod m3_owed_tests;
@@ -6578,3 +6088,7 @@ mod resources_tests;
 #[cfg(test)]
 #[path = "restart_restore_tests.rs"]
 mod restart_restore_tests;
+
+#[cfg(test)]
+#[path = "durable_tail_store_write_tests.rs"]
+mod store_write_tests;

@@ -238,6 +238,10 @@ mod line_delivery_tests;
 mod pi_retry_inputs;
 mod restart_restore;
 
+pub(crate) fn restart_restore_enabled() -> bool {
+    restart_restore::enabled()
+}
+
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn bounded_restore_tail_items_for_test(source: SnapshotSource) -> Vec<SnapshotItem> {
     m3_d3_tests::bounded_restore_tail_items(source)
@@ -34585,16 +34589,9 @@ impl OwnedSourceScan {
                                             stale_selection_pending = matches!(class,
                                                 sampled_scan::durable_tail::MissClass::StaleSelection);
                                         }
-                                        if matches!(
-                                            class,
-                                            sampled_scan::durable_tail::MissClass::RealEdit(_)
-                                        ) {
-                                            restore_floor = None;
-                                        }
                                         let rearmed = class.rearm_audit(
                                             index,
                                             &key,
-                                            sampled_scan::now_seconds(),
                                         );
                                         if rearmed.is_some() && debt.is_none() {
                                             context.audit_slots =
