@@ -42731,20 +42731,21 @@ fn ensure_bounded_traversal(
             })
             .map(|(root, _)| root.clone())
             .collect::<BTreeSet<_>>();
-        // RF1 B1 Q3 (default OFF): invalid families a re-read cannot change stay
-        // pending beside the carry, unread and uncredited; see the module.
-        let settled_contract = settled_contract_carry::enabled();
-        let (settled_kept, settled_kept_files) = if settled_contract {
-            settled_contract_carry::kept_invalid_roots(index, &stale_pending_roots)
+        // RF1 B1 Q3 (default OFF): KeepOwedNoCredit families stay pending
+        // beside every carry route, unread, unpriced and uncredited.
+        let settled_policy = settled_contract_carry::policy();
+        let settled_contract = settled_policy.is_some();
+        let mut settled_kept = if settled_contract {
+            settled_contract_carry::kept_owed(index, &stale_pending_roots)
         } else {
-            (BTreeSet::new(), 0)
+            BTreeMap::new()
         };
         let stale_pending_roots = if settled_kept.is_empty() {
             stale_pending_roots
         } else {
             stale_pending_roots
-                .difference(&settled_kept)
-                .cloned()
+                .into_iter()
+                .filter(|root| !settled_kept.contains_key(root))
                 .collect()
         };
         // Lead B Q2: counts-only alarm at >=80% of the whole carry's priced
@@ -42974,6 +42975,13 @@ fn ensure_bounded_traversal(
                     .for_each(BTreeSet::clear);
             }
         }
+        // Lead B Q1 (rev F3): after these clears, a kept family whose recorded
+        // requests fit the pending occurrence cap is Reobserve.
+        let settled_reobserve = settled_policy
+            .map(|cap| {
+                settled_contract_carry::reobserve_with_cap_room(index, &mut settled_kept, cap)
+            })
+            .unwrap_or_default();
         let window_root_digests = full_rearm_window_roots
             .iter()
             .map(|root| claude_full_rearm_root_digest(root))
@@ -42995,15 +43003,17 @@ fn ensure_bounded_traversal(
         let mut capped_file_count = 0_usize;
         let mut window_rearmed_file_count = 0_usize;
         for (index_key, entry) in &mut index.files {
-            let Some((root, _)) = claude_index_path_family_member(Path::new(index_key))
-                .filter(|(root, _)| stale_pending_roots.contains(root))
+            let Some((root, _)) =
+                claude_index_path_family_member(Path::new(index_key)).filter(|(root, _)| {
+                    stale_pending_roots.contains(root) || settled_reobserve.contains(root)
+                })
             else {
                 continue;
             };
             if entry.source_file_fingerprint.is_empty()
-                || covered_roots
-                    .as_ref()
-                    .is_some_and(|covered| !covered.contains(&root))
+                || covered_roots.as_ref().is_some_and(|covered| {
+                    !covered.contains(&root) && !settled_reobserve.contains(&root)
+                })
             {
                 continue;
             }
@@ -43018,26 +43028,6 @@ fn ensure_bounded_traversal(
                     window_rearmed_file_count += 1;
                 }
             }
-        }
-        // Lead B Q1 (rev F3): a kept-invalid family whose recorded requests
-        // fit the pending occurrence cap after this start's clears re-arms.
-        let settled_cap_rearmed = if settled_kept.is_empty() {
-            BTreeSet::new()
-        } else {
-            settled_contract_carry::cap_room_roots(index, &settled_kept)
-        };
-        let mut settled_cap_rearmed_files = 0_usize;
-        if !settled_cap_rearmed.is_empty() {
-            for (index_key, entry) in &mut index.files {
-                if !entry.source_file_fingerprint.is_empty()
-                    && claude_index_path_member_ref(Path::new(index_key))
-                        .is_some_and(|member| settled_cap_rearmed.contains(member.root))
-                {
-                    rearm_cause::clear(index_key, entry, transition.rearm_cause());
-                    settled_cap_rearmed_files += 1;
-                }
-            }
-            rearmed_file_count += settled_cap_rearmed_files;
         }
         if window_rearmed_file_count > 0 {
             claude_full_rearm_window_note_stale_rearm(index, collected_at, window_member_digests);
@@ -43099,9 +43089,9 @@ fn ensure_bounded_traversal(
                  kept_invalid_files={} kept_invalid_cap_room_rearmed_families={} \
                  prior_admission_dropped={} prior_admission_due_retained={} admission={} \
                  latched={} priced_roots={} priced_bytes={} headroom_alarm={}",
-                settled_kept.len() - settled_cap_rearmed.len(),
-                settled_kept_files.saturating_sub(settled_cap_rearmed_files),
-                settled_cap_rearmed.len(),
+                settled_kept.len(),
+                settled_kept.values().map(|(_, files)| files).sum::<usize>(),
+                settled_reobserve.len(),
                 settled_admission_dropped,
                 settled_due_retained,
                 admission.is_some(),

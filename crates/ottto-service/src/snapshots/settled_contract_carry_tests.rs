@@ -4,10 +4,9 @@
 
 /// The M4 shape: settled sweep, contract latch, a cap-invalid family with no
 /// stored evidence, and a prior admission that never completes off terminal-off.
-/// `on` with a saturated pending occurrence cap, as on M4.
-fn settled_contract_deadlock_start(on: bool) -> (serde_json::Value, ScopedRetryFixture) {
-    let _on = on.then(settled_contract_carry::SettledContractCarryForTest::enabled);
-    let _cap = on.then(|| settled_contract_carry::OccurrenceCapForTest::set(0));
+/// `cap`: ON with that pending occurrence cap; None is main.
+fn settled_contract_deadlock_start(cap: Option<usize>) -> (serde_json::Value, ScopedRetryFixture) {
+    let _on = cap.map(settled_contract_carry::SettledContractCarryForTest::on);
     let mut fixture = contract_debt_fixture(3);
     let invalid = fixture.roots[2].clone();
     let pending = fixture
@@ -37,73 +36,57 @@ fn settled_contract_deadlock_start(on: bool) -> (serde_json::Value, ScopedRetryF
     (row, fixture)
 }
 
-// The health conjunct of the traversal terminal (S: traversal_healthy).
-fn settled_contract_admission_vetoes_health(index: &ScanIndex) -> bool {
-    !index
-        .claude_stale_family_carry
-        .origin
-        .as_ref()
-        .and_then(|origin| origin.admission.as_ref())
-        .map_or(true, |state| claude_terminal_off() && state.complete)
-}
-
-/// [regress] RF1 B1 deadlock: latch -> admission -> unhealthy -> no census.
-/// Main keeps the unfinished admission (health vetoed) and re-reads the
-/// invalid family; ON keeps that family unread and uncredited, carries the
-/// rest whole and drops the admission (no unoffered due work), so the walk can
-/// retire healthy. Cap room for its recorded requests, or a changed member,
-/// ends the keep.
+/// [regress] RF1 B1 deadlock (M4: 158 admissions, all incomplete, zero
+/// retiring): latch -> admission -> unhealthy -> no census. Main (OFF) keeps
+/// the unfinished admission, which vetoes traversal health, and re-reads the
+/// invalid family. ON with the measured full pending cap (M4: 249,782 of
+/// 250,000 retained; here nothing fits after the start's clears) keeps that
+/// family owed, unread and uncredited, carries the rest whole and leaves no
+/// admission. Cap room for its recorded request re-reads it, still with no
+/// admission; a changed member ends the keep.
 #[test]
 fn settled_contract_carry_breaks_latched_admission_deadlock() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let (off, off_fixture) = settled_contract_deadlock_start(false);
+    let admission = |fixture: &ScopedRetryFixture| {
+        fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.admission.clone())
+    };
+    let (off, off_fixture) = settled_contract_deadlock_start(None);
     assert_eq!(off["rearmed_index_files"], 1, "main re-reads the invalid family");
     assert!(
-        settled_contract_admission_vetoes_health(&off_fixture.index),
+        admission(&off_fixture).is_some_and(|state| !state.complete),
         "main keeps the unfinished admission: the deadlock"
     );
 
-    let (on, on_fixture) = settled_contract_deadlock_start(true);
-    let index = &on_fixture.index;
-    assert_eq!(on["rearmed_index_files"], 0, "no Full re-read");
-    assert_eq!(on["carried_pending_families"], 2);
-    assert!(
-        !settled_contract_admission_vetoes_health(index),
-        "the whole carry replaced the admission"
-    );
-    let kept = &index.claude_usage_family_pending[&on_fixture.roots[2]];
+    let (full, full_fixture) = settled_contract_deadlock_start(Some(0));
+    let index = &full_fixture.index;
+    assert_eq!(full["rearmed_index_files"], 0, "no Full re-read");
+    assert_eq!(full["carried_pending_families"], 2);
+    assert!(admission(&full_fixture).is_none(), "the whole carry settled it");
+    let kept = &index.claude_usage_family_pending[&full_fixture.roots[2]];
     assert!(kept.invalid && kept.member_occurrences.is_empty());
     assert_eq!(kept.census_window_end, CARRY_FAILED, "kept, never credited");
     assert!(index.claude_duplicate_request_witness_overflowed, "fence stays closed");
-    assert_eq!(
-        scoped_retry_full_reads(index, &on_fixture.candidates),
-        0
-    );
-    let invalid_key = local_index_key(&on_fixture.candidates[2].path);
-    assert!(
-        !index.claude_request_census.retry_carry_record(&invalid_key).unwrap().request_hashes().is_empty(),
-        "the kept family has recorded requests the saturated cap cannot take"
-    );
-    // Cap room for its recorded requests ends the keep (Lead B Q1).
-    let _on = settled_contract_carry::SettledContractCarryForTest::enabled();
-    let stale = on_fixture.roots.iter().cloned().collect();
-    let (kept, _) = settled_contract_carry::kept_invalid_roots(index, &stale);
-    assert_eq!(kept, BTreeSet::from([on_fixture.roots[2].clone()]));
-    assert_eq!(settled_contract_carry::cap_room_roots(index, &kept), kept);
-    {
-        let _cap = settled_contract_carry::OccurrenceCapForTest::set(0);
-        assert!(settled_contract_carry::cap_room_roots(index, &kept).is_empty());
-    }
+    assert_eq!(scoped_retry_full_reads(index, &full_fixture.candidates), 0);
+
+    let (room, room_fixture) =
+        settled_contract_deadlock_start(Some(MAX_CLAUDE_PENDING_USAGE_OCCURRENCES));
+    assert_eq!(room["rearmed_index_files"], 1, "cap room re-reads the kept family");
+    assert_eq!(room["carried_pending_families"], 2);
+    assert!(admission(&room_fixture).is_none());
+
     // A changed member ends the keep: the family re-arms as on main.
-    let mut changed = on_fixture;
+    let mut changed = full_fixture;
+    let stale = changed.roots.iter().cloned().collect();
     let key = local_index_key(&changed.candidates[2].path);
     changed.index.files.get_mut(&key).unwrap().source_file_fingerprint = "f".repeat(64);
-    let stale = changed.roots.iter().cloned().collect();
-    assert!(settled_contract_carry::kept_invalid_roots(&changed.index, &stale)
-        .0
-        .is_empty());
+    assert!(settled_contract_carry::kept_owed(&changed.index, &stale).is_empty());
 }
 
 /// [money] GUARD: a complete census retires only a completed family proof.
@@ -116,7 +99,9 @@ fn settled_contract_completion_keeps_invalid_and_evidence_free_pending_owed() {
     const EMPTY: &str = "f6666666-6666-4666-8666-666666666666";
     const PARTIAL: &str = "d4444444-4444-4444-8444-444444444444";
     for on in [false, true] {
-        let _on = on.then(settled_contract_carry::SettledContractCarryForTest::enabled);
+        let _on = on.then(|| {
+            settled_contract_carry::SettledContractCarryForTest::on(MAX_CLAUDE_PENDING_USAGE_OCCURRENCES)
+        });
         let mut index = carry_index();
         carry_family(&mut index, INVALID, &[None], true);
         carry_family(&mut index, EMPTY, &[None], true);

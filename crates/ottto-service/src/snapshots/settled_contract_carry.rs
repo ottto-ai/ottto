@@ -1,18 +1,18 @@
 //! RF1 B1, Lead B ruling Q-B1 (b) (2026-10-31): the Claude stale start under a
-//! settled contract. Machine-local opt-in using the support-directory sentinel
-//! pattern of `claude_terminal_off_enabled`; absent marker means main policy.
-//! No ScanIndex field, upload field or remote setting. Counts only.
+//! settled contract. Machine-local opt-in through `pinned_marker`; absent
+//! marker means main policy. No ScanIndex field, upload field or remote
+//! setting. Counts only.
 //!
-//! - Q3: an invalid family with no stored evidence whose every member is the
-//!   exact revision its census record was parsed from in that family's window,
-//!   with an ACKed head, behind a closed fence, is kept beside the carry: not
-//!   re-read, credits nothing, stays invalid. A changed member or an open
-//!   fence ends the keep; so does pending occurrence-cap room for its recorded
-//!   requests after the start's clears.
+//! - Q3 classifies each stale family once: Carry (the route's own carry),
+//!   KeepOwedNoCredit or Reobserve. Kept: invalid, no stored evidence, closed
+//!   fence, every member the exact revision its census record reproduces in
+//!   the family's window with an ACKed head. Kept pending stays as it is:
+//!   not re-read, not priced, credits nothing. A changed member or an open
+//!   fence ends the keep; so does pending occurrence-cap room for its
+//!   recorded requests after the start's clears (Lead B Q1).
 //! - Sticky admission: an unfinished retry admission no longer forces the
-//!   batch path; the whole carry is tried first and, when it fits, settles the
-//!   admission's root walk (every uncarried stale family is re-armed as on
-//!   main). Unoffered due service keeps the admission until it is served.
+//!   batch path; a whole carry that fits settles its root walk. Unoffered due
+//!   service keeps the admission's due cursor until its owner serves it.
 //! - Q5: a complete census whose stored evidence is all from its own window,
 //!   or empty/invalid, under the recorded contract clears the latch before the
 //!   latch's full re-arm.
@@ -20,35 +20,46 @@
 //!   proof; every other indexed family's pending stays owed.
 use super::*;
 
-pub(super) const NAME: &str = "claude_settled_contract_carry_enabled";
+const NAME: &str = "claude_settled_contract_carry_enabled";
+
+/// ON: the pending occurrence cap a kept family's re-read must fit.
+pub(super) fn policy() -> Option<usize> {
+    injected().unwrap_or_else(|| {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        terminal_off_policy::pinned_marker(&ENABLED, NAME)
+            .then_some(MAX_CLAUDE_PENDING_USAGE_OCCURRENCES)
+    })
+}
 
 pub(super) fn enabled() -> bool {
-    #[cfg(test)]
-    {
-        // A test opts in on its own thread, never reading the host setting.
-        ENABLED.with(std::cell::Cell::get)
-    }
-    #[cfg(not(test))]
-    {
-        // Pinned per process; the owner changes the marker and restarts.
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            terminal_off_policy::marker_at(&ottto_core::default_support_dir(), NAME)
-        })
-    }
+    policy().is_some()
 }
 
+// No existing options seam reaches both the traversal start and the census
+// fold, so a fixture injects the policy (ON and its cap) on its own thread.
 #[cfg(test)]
 thread_local! {
-    static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static POLICY: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+/// A fixture's injected policy, never the host marker.
+#[cfg(test)]
+fn injected() -> Option<Option<usize>> {
+    Some(POLICY.with(std::cell::Cell::get))
+}
+#[cfg(not(test))]
+fn injected() -> Option<Option<usize>> {
+    None
 }
 #[cfg(test)]
-pub(super) struct SettledContractCarryForTest(bool, std::marker::PhantomData<std::rc::Rc<()>>);
+pub(super) struct SettledContractCarryForTest(
+    Option<usize>,
+    std::marker::PhantomData<std::rc::Rc<()>>,
+);
 #[cfg(test)]
 impl SettledContractCarryForTest {
-    pub(super) fn enabled() -> Self {
+    pub(super) fn on(cap: usize) -> Self {
         Self(
-            ENABLED.with(|slot| slot.replace(true)),
+            POLICY.with(|slot| slot.replace(Some(cap))),
             std::marker::PhantomData,
         )
     }
@@ -56,7 +67,7 @@ impl SettledContractCarryForTest {
 #[cfg(test)]
 impl Drop for SettledContractCarryForTest {
     fn drop(&mut self) {
-        ENABLED.with(|slot| slot.set(self.0));
+        POLICY.with(|slot| slot.set(self.0));
     }
 }
 
@@ -68,14 +79,14 @@ fn evidence_free(pending: &ClaudeUsageFamilyPending) -> bool {
             .all(BTreeSet::is_empty)
 }
 
-/// Q3: stale invalid families a re-read cannot change. Returns the kept roots
-/// and their indexed member count. Borrowed keys only; no proof is granted.
-pub(super) fn kept_invalid_roots(
+/// KeepOwedNoCredit per stale family, with (recorded requests, indexed
+/// files). One pass over the index; borrowed keys; no proof is granted.
+pub(super) fn kept_owed(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
-) -> (BTreeSet<String>, usize) {
+) -> BTreeMap<String, (usize, usize)> {
     if !index.persistence_available() || !index.claude_duplicate_request_witness_overflowed {
-        return (BTreeSet::new(), 0);
+        return BTreeMap::new();
     }
     let mut families = stale
         .iter()
@@ -86,108 +97,57 @@ pub(super) fn kept_invalid_roots(
                 && evidence_free(pending)
                 && !index.claude_usage_authority_quarantine.contains_key(root)
                 && !index.decode_holds_family(root))
-            .then_some((root.as_str(), (window, 0_usize, true)))
+            .then_some((root.as_str(), (window, 0_usize, 0_usize, true)))
         })
         .collect::<BTreeMap<_, _>>();
-    if families.is_empty() {
-        return (BTreeSet::new(), 0);
-    }
     for (key, entry) in &index.files {
-        let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
+        let Some((window, requests, files, kept)) = claude_index_path_member_ref(Path::new(key))
+            .and_then(|member| families.get_mut(member.root))
+        else {
             continue;
         };
-        let Some((window, members, kept)) = families.get_mut(member.root) else {
-            continue;
-        };
-        *members += 1;
+        let record = index.claude_request_census.retry_carry_record(key);
+        *files += 1;
+        *requests = requests.saturating_add(record.map_or(0, |r| r.request_hashes().len()));
         *kept = *kept
             && !entry.source_file_fingerprint.is_empty()
             && !index.claude_account_deferred_holds.contains_key(key)
             && !index.effective_upload_body_witness_revision_requires_adoption(key)
             && claude_stale_member_independently_accepted(index, key, entry)
-            && index
-                .claude_request_census
-                .retry_carry_record(key)
-                .is_some_and(|record| record.reproduces(&entry.source_file_fingerprint, *window));
+            && record.is_some_and(|r| r.reproduces(&entry.source_file_fingerprint, *window));
     }
-    let mut files = 0_usize;
-    let roots = families
+    families
         .into_iter()
-        .filter(|(_, (_, members, kept))| *kept && *members > 0)
-        .map(|(root, (_, members, _))| {
-            files = files.saturating_add(members);
-            root.to_owned()
-        })
-        .collect();
-    (roots, files)
+        .filter(|(_, (_, _, files, kept))| *kept && *files > 0)
+        .map(|(root, (_, requests, files, _))| (root.to_owned(), (requests, files)))
+        .collect()
 }
 
-/// Lead B Q1 (rev F3): kept families whose recorded requests (their census
-/// records' request hashes) fit the pending occurrence cap, counted as the
-/// accumulation counts it, after this start's clears. Admitted in root order,
-/// each taking its room; a re-read of these may reach a proof, so they re-arm.
-pub(super) fn cap_room_roots(index: &ScanIndex, kept: &BTreeSet<String>) -> BTreeSet<String> {
-    let mut requests = BTreeMap::<&str, usize>::new();
-    for key in index.files.keys() {
-        let Some(root) =
-            claude_index_path_member_ref(Path::new(key)).and_then(|member| kept.get(member.root))
-        else {
-            continue;
-        };
-        let count = index
-            .claude_request_census
-            .retry_carry_record(key)
-            .map_or(0, |record| record.request_hashes().len());
-        let slot = requests.entry(root.as_str()).or_default();
-        *slot = slot.saturating_add(count);
-    }
+/// Lead B Q1 (rev F3): after this start's clears, kept families whose recorded
+/// requests fit `cap` under the accumulation's own count become Reobserve,
+/// admitted in root order. Returns them; the rest stay kept.
+pub(super) fn reobserve_with_cap_room(
+    index: &ScanIndex,
+    kept: &mut BTreeMap<String, (usize, usize)>,
+    cap: usize,
+) -> BTreeSet<String> {
     let mut retained = index
         .claude_usage_family_pending
         .values()
         .flat_map(|pending| pending.member_occurrences.values())
         .map(BTreeMap::len)
         .fold(0_usize, usize::saturating_add);
-    let cap = occurrence_cap();
-    requests
-        .into_iter()
-        .filter_map(|(root, incoming)| {
-            retained = claude_pending_occurrence_count_after_replace(retained, 0, incoming, cap)?;
-            Some(root.to_owned())
-        })
-        .collect()
-}
-
-fn occurrence_cap() -> usize {
-    #[cfg(test)]
-    {
-        CAP.with(std::cell::Cell::get)
-    }
-    #[cfg(not(test))]
-    {
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static CAP: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(MAX_CLAUDE_PENDING_USAGE_OCCURRENCES) };
-}
-/// A fixture saturates the pending cap on its own thread (M4: 249,782 of
-/// 250,000 retained) without building that many occurrences.
-#[cfg(test)]
-pub(super) struct OccurrenceCapForTest(usize, std::marker::PhantomData<std::rc::Rc<()>>);
-#[cfg(test)]
-impl OccurrenceCapForTest {
-    pub(super) fn set(cap: usize) -> Self {
-        Self(CAP.with(|slot| slot.replace(cap)), std::marker::PhantomData)
-    }
-}
-#[cfg(test)]
-impl Drop for OccurrenceCapForTest {
-    fn drop(&mut self) {
-        CAP.with(|slot| slot.set(self.0));
-    }
+    let mut reobserve = BTreeSet::new();
+    kept.retain(|root, (requests, _)| {
+        let Some(next) = claude_pending_occurrence_count_after_replace(retained, 0, *requests, cap)
+        else {
+            return true;
+        };
+        retained = next;
+        reobserve.insert(root.clone());
+        false
+    });
+    reobserve
 }
 
 /// Rev F2: the admission still owes due paths its existing selector has not
@@ -241,23 +201,4 @@ pub(super) fn owed_at_completion(
                 .keys()
                 .chain(pending.member_occurrences.keys())
                 .any(|member| indexed_claude_family_ids.contains(member)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    /// [off=main] Default OFF; only a local regular marker enables.
-    #[test]
-    fn settled_contract_carry_defaults_off_and_only_local_regular_marker_enables() {
-        let scratch = crate::test_scratch::ScratchDir::new("settled-contract-carry-policy");
-        assert!(!terminal_off_policy::marker_at(&scratch, NAME));
-        std::fs::write(scratch.join(NAME), b"").unwrap();
-        assert!(terminal_off_policy::marker_at(&scratch, NAME));
-        assert!(!enabled(), "fixture process never consults host marker");
-        let guard = SettledContractCarryForTest::enabled();
-        assert!(enabled());
-        assert!(!std::thread::spawn(enabled).join().unwrap());
-        drop(guard);
-        assert!(!enabled());
-    }
 }
