@@ -3,6 +3,7 @@
 // in the parent. Measurements report observations, never establish a budget.
 use super::*;
 
+const MIB: u64 = 1024 * 1024;
 const SESSION: &str = "019e2700-5555-7000-9000-555555555555";
 const AT: &str = "2026-10-27T08:00:00Z";
 
@@ -119,3 +120,84 @@ fn oversized_claude_shrink_then_grow_keeps_unread_content_unproven() {
         .unwrap();
     assert_native(&fixture.scan(SnapshotSource::ClaudeCode, &mut index, 15), 1);
 }
+
+#[test]
+fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
+    for (source, limit) in [
+        (SnapshotSource::ClaudeCode, 512 * MIB),
+        (SnapshotSource::Pi, 256 * MIB),
+        (SnapshotSource::Codex, 2048 * MIB),
+    ] {
+        let fixture = Fixture::new();
+        let file = File::create(fixture.path()).unwrap();
+        for (bytes, admitted) in [(limit, true), (limit + 1, false)] {
+            file.set_len(bytes).unwrap();
+            let opened =
+                opened_object_identity_and_stat(source, &mut File::open(fixture.path()).unwrap());
+            assert_eq!(opened.is_ok(), admitted, "opened {source:?} at {bytes}");
+            let mut census = ScanCensus::default();
+            let candidate = candidate_from_traversal_path(
+                source,
+                ScanTraversalPath {
+                    scan_root: fixture.0.clone(),
+                    path: fixture.path(),
+                    census_member: true,
+                    watcher_hint: false,
+                },
+                &mut census,
+                None,
+                BACKFILL_WINDOW_DAYS,
+                &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
+            );
+            assert_eq!(candidate.is_some(), admitted, "{source:?} at {bytes}");
+            assert_eq!(census.oversized_file_count, usize::from(!admitted));
+            if let Some(candidate) = candidate {
+                assert_eq!(candidate.size_bytes, limit);
+            }
+        }
+    }
+    assert_eq!(MAX_JSONL_LINE_BYTES, 16 * 1024 * 1024);
+}
+
+#[test]
+fn three_hundred_mib_admission_is_claude_only() {
+    let fixture = Fixture::new();
+    File::create(fixture.path())
+        .unwrap()
+        .set_len(300 * MIB)
+        .unwrap();
+    for (source, admitted) in [
+        (SnapshotSource::ClaudeCode, true),
+        (SnapshotSource::Pi, false),
+    ] {
+        let mut census = ScanCensus::default();
+        let candidate = candidate_from_traversal_path(
+            source,
+            ScanTraversalPath {
+                scan_root: fixture.0.clone(),
+                path: fixture.path(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            None,
+            BACKFILL_WINDOW_DAYS,
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
+        );
+        assert_eq!(candidate.is_some(), admitted);
+        assert_eq!(census.oversized_file_count, usize::from(!admitted));
+        assert_eq!(
+            opened_object_identity_and_stat(source, &mut File::open(fixture.path()).unwrap())
+                .is_ok(),
+            admitted
+        );
+    }
+    let mut index = ScanIndex::default();
+    let scan = fixture.scan(SnapshotSource::Pi, &mut index, 9);
+    assert_eq!(scan.oversized_file_count, 1);
+    assert_eq!(scan.scanned_file_count, 0);
+    assert!(scan.snapshots.is_empty());
+    assert!(!scan.census_complete);
+    assert!(index.files.is_empty());
+}
+
