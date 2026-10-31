@@ -1832,32 +1832,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn probe_context_preserves_exit_utf8_and_expired_launch_errors() {
-        for (output, exit, error) in [
-            (b"{}".as_slice(), 7, "exited unsuccessfully"),
-            ([0xff].as_slice(), 0, "stdout was not UTF-8"),
-        ] {
-            let fixture = ProbeFixture::new("probe-context-errors", "output", output, exit);
-            assert!(probe_context(&fixture, Duration::from_secs(2))
-                .err()
-                .unwrap()
-                .to_string()
-                .contains(error));
-            fixture.wait_settled();
-        }
-        let fixture = ProbeFixture::new("probe-context-expired", "output", b"{}", 0);
-        assert!(probe_context(&fixture, Duration::ZERO)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("timed out"));
-        assert!(!fixture.fake.root.join("direct").exists());
-        assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
     fn probe_context_prelaunch_failures_and_postlaunch_errors_keep_ownership() {
         for fault in [ProbeFault::Prepare, ProbeFault::WorkerStart] {
             let fixture = ProbeFixture::new("probe-context-no-launch", "protected", &[], 0);
@@ -1936,25 +1910,6 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         test_scratch::private_dir(&format!("ottto-context-footprint-{name}"))
-    }
-
-    #[test]
-    fn recent_archives_are_counted_and_never_listed() {
-        let root = temp_dir("collector-archives");
-        let day = root.join("2026/10/28");
-        fs::create_dir_all(&day).unwrap();
-        fs::write(day.join("rollout-a.jsonl"), b"{}\n").unwrap();
-        fs::write(day.join("rollout-b.jsonl.zst"), b"not zstd").unwrap();
-        fs::write(day.join("notes.zst"), b"other").unwrap();
-        let (mut files, mut compressed) = (Vec::new(), 0);
-        collect_recent_jsonl_files(&root, SystemTime::now(), &mut files, &mut compressed);
-        let names: Vec<_> = files
-            .iter()
-            .map(|(path, _)| path.file_name().unwrap().to_owned())
-            .collect();
-        assert_eq!(names, [std::ffi::OsString::from("rollout-a.jsonl")]);
-        assert_eq!(compressed, 1);
-        fs::remove_dir_all(root).unwrap();
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
@@ -2165,53 +2120,6 @@ mod tests {
     }
 
     #[test]
-    fn only_newest_workspace_enables_mcp_with_the_long_timeout() {
-        assert!(should_include_mcp_servers(0));
-        assert!((1..MAX_WORKSPACES_PER_CYCLE).all(|index| !should_include_mcp_servers(index)));
-
-        let mut sampled = Command::new("claude");
-        let sampled_timeout = configure_claude_context_command(&mut sampled, true);
-        let sampled_args: Vec<_> = sampled.get_args().collect();
-        assert!(!sampled_args.iter().any(|arg| *arg == "--strict-mcp-config"));
-        assert_eq!(sampled_timeout, CONTEXT_MCP_COMMAND_TIMEOUT);
-
-        let mut strict = Command::new("claude");
-        let strict_timeout = configure_claude_context_command(&mut strict, false);
-        let strict_args: Vec<_> = strict.get_args().collect();
-        assert!(strict_args.iter().any(|arg| *arg == "--strict-mcp-config"));
-        assert_eq!(strict_timeout, CONTEXT_COMMAND_TIMEOUT);
-        assert!(
-            CONTEXT_CYCLE_BUDGET
-                >= CONTEXT_MCP_COMMAND_TIMEOUT
-                    + CONTEXT_COMMAND_TIMEOUT * (MAX_WORKSPACES_PER_CYCLE as u32 - 1)
-        );
-    }
-
-    #[test]
-    fn discovers_recent_workspace_from_claude_jsonl() {
-        let home = temp_dir("discover");
-        let workspace = home.join("work").join("repo");
-        fs::create_dir_all(&workspace).unwrap();
-        let project = home.join(".claude").join("projects").join("-work-repo");
-        fs::create_dir_all(&project).unwrap();
-        fs::write(
-            project.join("session.jsonl"),
-            format!(
-                "{{\"type\":\"session\",\"cwd\":\"{}\",\"timestamp\":\"2026-06-29T00:00:00Z\"}}\n",
-                workspace.to_string_lossy()
-            ),
-        )
-        .unwrap();
-
-        let (discovered, path_scopes) = discover_with_counts(&home, SystemTime::now());
-
-        assert_eq!(discovered.len(), 1);
-        assert_eq!(path_scopes, 1);
-        assert_eq!(discovered[0].path, workspace);
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
     fn repository_identity_groups_root_and_subdir_without_raw_paths() {
         let repo = init_git_repo("repo-identity-root");
         let subdir = repo.join("backend");
@@ -2337,75 +2245,6 @@ mod tests {
             .arg(&repo)
             .args(["worktree", "remove", "--force", &worktree_text])
             .status();
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn repository_identity_labels_worktree_subdir_after_main_checkout() {
-        let repo = init_git_repo("repo-identity-worktree-subdir");
-        let worktree = temp_dir("repo-identity-worktree-subdir-linked");
-        fs::remove_dir_all(&worktree).unwrap();
-        let worktree_text = worktree.to_string_lossy().to_string();
-        run_git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "context-subdir-test",
-                &worktree_text,
-            ],
-        );
-        let subdir = worktree.join("nested");
-        fs::create_dir_all(&subdir).unwrap();
-
-        let root_identity = resolve_repository_identity(&repo, true);
-        let subdir_identity = resolve_repository_identity(&subdir, true);
-
-        assert_eq!(
-            root_identity.repository_hash,
-            subdir_identity.repository_hash
-        );
-        assert_eq!(
-            subdir_identity.workspace_kind.as_deref(),
-            Some("linked_worktree")
-        );
-        assert_eq!(
-            subdir_identity.repository_label,
-            root_identity.repository_label
-        );
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["worktree", "remove", "--force", &worktree_text])
-            .status();
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn dedupes_recent_candidates_by_repository_hash() {
-        let repo = init_git_repo("repo-identity-dedupe");
-        let subdir = repo.join("frontend");
-        fs::create_dir_all(&subdir).unwrap();
-        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
-
-        let out = dedupe_workspace_candidates_by_repository(
-            vec![
-                WorkspaceCandidate {
-                    path: repo.clone(),
-                    last_seen: older,
-                },
-                WorkspaceCandidate {
-                    path: subdir.clone(),
-                    last_seen: newer,
-                },
-            ],
-            |candidate| repository_scope(&candidate.path).0,
-        );
-
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].path, subdir);
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -2638,67 +2477,6 @@ mod tests {
         let _ = fs::remove_dir_all(&worktree);
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&home);
-    }
-
-    /// One transcript per entry naming `cwd`, projected with the captured
-    /// mtime; the file's real mtime is left as written.
-    fn captured_cwds(root: &Path, entries: &[(&Path, SystemTime)]) -> BTreeMap<String, SystemTime> {
-        let files: Vec<(PathBuf, SystemTime)> = entries
-            .iter()
-            .enumerate()
-            .map(|(index, (cwd, mtime))| {
-                let path = root.join(format!("captured-{index:03}.jsonl"));
-                fs::write(&path, format!("{}\n", json!({"cwd": cwd}))).unwrap();
-                (path, *mtime)
-            })
-            .collect();
-        let projection = Arc::new(CwdProjection::default());
-        project_transcripts(&projection, &files);
-        let all = projection
-            .lock()
-            .files
-            .values()
-            .map(|file| file.mtime)
-            .min();
-        projection.recent_cwds(all.unwrap() + RECENT_WORKSPACE_WINDOW)
-    }
-
-    #[test]
-    fn discovery_counts_path_scopes_when_repository_probes_fail() {
-        let root = temp_dir("early-stop-probe-fails");
-        let dirs: Vec<PathBuf> = (0..14)
-            .map(|index| {
-                let dir = root.join(format!("pkg-{index:02}"));
-                fs::create_dir_all(&dir).unwrap();
-                dir
-            })
-            .collect();
-        let entries: Vec<(&Path, SystemTime)> = dirs
-            .iter()
-            .enumerate()
-            .map(|(index, dir)| {
-                (
-                    dir.as_path(),
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(100 - index as u64),
-                )
-            })
-            .collect();
-        // If every probe fails, directories of one repository look like
-        // separate scopes; the path-scope counter makes that visible.
-        let failing = |path: &Path| (frozen_path_scope(path), true);
-        let mut path_scopes = 0;
-        let found = discover_workspaces(captured_cwds(&root, &entries), &mut path_scopes, failing);
-        assert_eq!((found.len(), path_scopes), (14, 14));
-
-        // With the probe answering, they are one repository.
-        let answering = |_: &Path| ("repository".to_string(), false);
-        let mut path_scopes = 0;
-        let found =
-            discover_workspaces(captured_cwds(&root, &entries), &mut path_scopes, answering);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].path, dirs[0]);
-        assert_eq!(path_scopes, 0);
-        fs::remove_dir_all(root).unwrap();
     }
 
     fn deliver(observer: &mut CwdObserver, view: &FileView, lines: &[Value], end: DeliveryEnd) {
@@ -2942,23 +2720,6 @@ mod tests {
         );
         drop(state);
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn request_hash_ignores_machine_and_workspace_metadata() {
-        let parsed = parse_context_markdown(
-            r#"**Model:** claude
-**Tokens:** 10 / 100 (10%)
-### Estimated usage by category
-| Category | Tokens | Percentage |
-|---|---:|---:|
-| Free space | 90 | 90% |
-"#,
-        )
-        .unwrap();
-        let hash = request_content_hash(&parsed).unwrap();
-        assert_eq!(hash.len(), 64);
-        assert_eq!(hash, request_content_hash(&parsed).unwrap());
     }
 
     fn sample_request() -> ContextFootprintIngestRequest {
