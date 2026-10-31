@@ -1437,9 +1437,8 @@ impl ProviderDailyUsageReader for ChatGptDailyUsageReader {
 
 /// Read the customer's own Codex credential.
 ///
-/// This mirrors the credential mechanics of the existing `wham/usage` read: the
-/// already-issued access token and account id from `~/.codex/auth.json`. The
-/// token is used for exactly one request and is never persisted or logged.
+/// The already-issued access token and account id from `~/.codex/auth.json`.
+/// The token is used for exactly one request and is never persisted or logged.
 pub fn read_codex_credential() -> Option<CodexCredential> {
     let path = std::env::var("HOME")
         .map(PathBuf::from)
