@@ -119,6 +119,20 @@ impl ResumeExclusion {
             had_ref: false,
         }
     }
+    /// Repeated (3 passes) or long (6 h) exclusions alarm.
+    fn alarmed(&self, now: Instant) -> bool {
+        self.passes >= 3
+            || now.saturating_duration_since(self.first_seen) > Duration::from_secs(6 * 3600)
+    }
+    /// A short retry until the alarm; then the growth-full pace, so a key whose
+    /// staging fails deterministically cannot abort a page every minute.
+    fn backoff(&self, now: Instant) -> Duration {
+        Duration::from_secs(if self.alarmed(now) {
+            super::super::sampled_audit::GROWTH_FULL_INTERVAL
+        } else {
+            60
+        })
+    }
 }
 struct RouteState {
     pace: Pace,
@@ -667,7 +681,7 @@ fn save_with_custody(
                         )
                     });
                     entry.had_ref |= excluded.2.contains(key);
-                    entry.retry_at = now + Duration::from_secs(60);
+                    entry.retry_at = now + entry.backoff(now);
                 }
             }
             if let Some(hold) = session.db.save_failure() {

@@ -1428,6 +1428,21 @@ fn excluded_key_age_growth_alarm_and_retry_keep_owed_debt() {
     );
 }
 
+/// [regress] N2: after the 3-pass / 6 h alarm, a deterministically failing
+/// staging key retries at the growth-full pace instead of every minute.
+#[test]
+fn alarmed_resume_exclusion_backs_off_to_growth_full_interval() {
+    let now = Instant::now();
+    let growth_full = Duration::from_secs(super::super::super::sampled_audit::GROWTH_FULL_INTERVAL);
+    let mut excluded = ResumeExclusion::new(G, 0);
+    assert_eq!(excluded.backoff(now), Duration::from_secs(60));
+    excluded.passes = 3;
+    assert_eq!(excluded.backoff(now), growth_full);
+    let mut aged = ResumeExclusion::new(G, 0);
+    aged.first_seen = now - Duration::from_secs(6 * 3600 + 1);
+    assert_eq!(aged.backoff(now), growth_full);
+}
+
 /// [off=main] a bound v1-only source never opens, creates or migrates SQLite custody.
 #[test]
 fn off_bound_v1_load_and_save_leave_all_database_paths_absent() {

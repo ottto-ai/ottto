@@ -72,10 +72,7 @@ pub(in super::super::super) fn retain_resume_exclusions(index: &mut ScanIndex, r
             let now = Instant::now();
             for excluded in state.resume_excluded.values_mut() {
                 excluded.passes = excluded.passes.saturating_add(1);
-                if excluded.passes >= 3
-                    || now.saturating_duration_since(excluded.first_seen)
-                        > Duration::from_secs(6 * 3600)
-                {
+                if excluded.alarmed(now) {
                     telemetry::event("v2_resume_stage_excluded_alarm", &1);
                 }
             }
