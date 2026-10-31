@@ -96,6 +96,7 @@ pub(crate) mod claude_request_identity;
 pub(crate) mod claude_request_money;
 mod scan_index_integration;
 pub(crate) mod scan_index_persistence;
+pub(crate) mod state_v2;
 use scan_index_integration::read_scan_index_representation;
 mod idless_retry_marker;
 mod oversized_discovery;
@@ -3455,6 +3456,9 @@ pub(crate) struct UploadAckRetirementHandoff {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScanIndex {
+    /// V2-only custody and growth debt; absent on ordinary v1 paths.
+    #[serde(skip)]
+    v2: Option<Box<state_v2::IndexState>>,
     #[serde(skip)]
     persistence_root: Option<(
         scan_index_persistence::Binding,
@@ -4217,6 +4221,7 @@ fn deserialize_unsettled_causes<'de, D: serde::Deserializer<'de>>(
 impl Default for ScanIndex {
     fn default() -> Self {
         Self {
+            v2: None,
             claude_money_birth_store: Default::default(),
             persistence_root: None,
             persistence_unavailable: [None; 3],
@@ -25900,6 +25905,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     context_curve_enabled: bool,
 ) -> Result<SourceScanResult> {
     index.require_persistence_available()?;
+    state_v2::before_collection(index)?;
 
     let mut state = OwnedSourceScan::new(
         source,
@@ -25915,6 +25921,12 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         context_curve_enabled,
     );
     loop {
+        // A refusal is terminal for this attempt, not cooperative progress.
+        // Restore the resident graph before returning through the Result API.
+        if let Err(error) = state_v2::before_collection(&state.index) {
+            *index = state.index;
+            return Err(error);
+        }
         match state.step(attribution_context) {
             OwnedSourceScanStep::Pending(next) => state = next,
             OwnedSourceScanStep::Complete {
@@ -26659,6 +26671,10 @@ impl OwnedSourceScan {
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
     ) -> Self {
+        let _select_window = state_v2::state_v2_growth_retention_active(&owned_index)
+            .then(|| state_v2::telemetry::Window::begin("select"))
+            .flatten();
+        let file_limit = state_v2::collection_page_limit(&owned_index, file_limit);
         if !owned_index.persistence_available() {
             // No inventory, selection or provider I/O for an unavailable index.
             let mut blocked = Self::new_continuation(
@@ -26760,6 +26776,11 @@ impl OwnedSourceScan {
             ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
         if source == SnapshotSource::ClaudeCode && progress == TraversalProgress::Started {
             index.record_started_claude_request_identity_contract(claude_request_identity_capture);
+        }
+        let growth_active =
+            source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(index);
+        if growth_active {
+            sampled_audit::prune_growth_retention(index, sampled_scan::now_seconds());
         }
         if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
             refresh_terminal_off_discovery(index, roots, audit_now, watcher_overflowed, file_limit);
@@ -27102,6 +27123,9 @@ impl OwnedSourceScan {
             })
             .collect::<Vec<_>>();
 
+        for candidate in &files {
+            sampled_audit::retain_candidate_growth(source, index, candidate);
+        }
         let prepare_candidate_context = |candidate: &mut CandidateFile| {
             prepare_owned_scan_candidate(
                 source,
@@ -27134,9 +27158,16 @@ impl OwnedSourceScan {
                         source,
                         candidate,
                         &mut census,
-                        census_unix_seconds,
-                        backfill_window_days,
-                        discovery_retention!(index, &resource_probe.discovery_growth),
+                        CandidateWindow {
+                            census_unix_seconds,
+                            backfill_window_days,
+                            retention: discovery_retention!(
+                                index,
+                                &resource_probe.discovery_growth
+                            ),
+                            growth: sampled_audit::growth_active(index)
+                                .then_some(&index.v2().growth_retention),
+                        },
                         audit_now,
                     )
                     .map(|(candidate, _)| candidate)
@@ -27234,9 +27265,16 @@ impl OwnedSourceScan {
                         source,
                         twin,
                         &mut ScanCensus::default(),
-                        census_unix_seconds,
-                        backfill_window_days,
-                        discovery_retention!(index, &resource_probe.discovery_growth),
+                        CandidateWindow {
+                            census_unix_seconds,
+                            backfill_window_days,
+                            retention: discovery_retention!(
+                                index,
+                                &resource_probe.discovery_growth
+                            ),
+                            growth: sampled_audit::growth_active(index)
+                                .then_some(&index.v2().growth_retention),
+                        },
                         audit_now,
                     ) {
                         Some((twin, _)) => {
@@ -27329,9 +27367,13 @@ impl OwnedSourceScan {
                     source,
                     candidate,
                     &mut census,
-                    census_unix_seconds,
-                    backfill_window_days,
-                    discovery_retention!(index, &resource_probe.discovery_growth),
+                    CandidateWindow {
+                        census_unix_seconds,
+                        backfill_window_days,
+                        retention: discovery_retention!(index, &resource_probe.discovery_growth),
+                        growth: sampled_audit::growth_active(index)
+                            .then_some(&index.v2().growth_retention),
+                    },
                     audit_now,
                 ) {
                     identified_candidates.push(opened.0);
@@ -27455,6 +27497,9 @@ impl OwnedSourceScan {
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         credit: &mut Option<crate::source_rotation::PaidReservation>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
+        state_v2::before_collection(&self.index).map_err(|_| {
+            crate::source_rotation::LocalRefusal("state_v2_maintenance_before_collection")
+        })?;
         self.step_with_capture_credit(attribution_context, Some(credit))
     }
 
@@ -27466,7 +27511,13 @@ impl OwnedSourceScan {
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             self.source == SnapshotSource::ClaudeCode,
         );
+        let _acquire_window = state_v2::telemetry::acquire_window(&self.index);
         let mut result = self.step_with_capture_credit_inner(attribution_context, capture_credit);
+        match &result {
+            Ok(OwnedSourceScanStep::Pending(scan)) => state_v2::telemetry::acquired(&scan.index),
+            Ok(OwnedSourceScanStep::Complete { index, .. }) => state_v2::telemetry::acquired(index),
+            Err(_) => {}
+        }
         let counts = diagnostics.finish();
         if let Ok(OwnedSourceScanStep::Pending(scan)) = &mut result {
             scan.resource_probe.page_events.merge(counts);
@@ -31132,6 +31183,9 @@ impl OwnedSourceScan {
                     // retry instead of cloning it or guessing a nested root.
                     let quiet_scan_root =
                         quiet_audit_checked.then(|| std::mem::take(&mut recorded.scan_root));
+                    if parse_complete && !non_progressing_residue {
+                        sampled_audit::settle_growth(index, &index_key);
+                    }
                     index.record(recorded, last_snapshot_fingerprint, outcome);
                     // The counting version travels in the same entry as the
                     // fingerprint it describes; no separate save can split them.
@@ -31656,6 +31710,12 @@ impl OwnedSourceScan {
                     .iter()
                     .filter(|_| terminal_effects_allowed)
                 {
+                    if source == SnapshotSource::ClaudeCode
+                        && !census.claude_vanished_index_keys.contains(index_key)
+                        && sampled_audit::revalidate_growth(index, index_key, &roots)
+                    {
+                        continue;
+                    }
                     if source == SnapshotSource::ClaudeCode
                         && index.claude_account_deferred_holds.contains_key(index_key)
                     {
@@ -32458,21 +32518,33 @@ impl OwnedSourceScan {
                 claude_effort_support_dir_ref,
             );
             let rescue_key = local_index_key(&candidate.path);
+            let verification_rescue_debt =
+                sampled_audit::progress_debt(index, &rescue_key, audit_now).is_some();
+            if source == SnapshotSource::ClaudeCode
+                && sampled_audit::growth_active(index)
+                && !state_v2::save_read_admitted(index, &rescue_key, audit_now).unwrap_or(false)
+            {
+                sampled_audit::queue_growth_retry(index, &candidate);
+                census.record_unreadable(UnreadableCause::Reduction, 1);
+                pending!();
+            }
             let open_parked = source == SnapshotSource::ClaudeCode
                 && sampled_audit::candidate_open_blocked(&rescue_key, audit_now);
             let failed_open_retry =
                 sampled_audit::failed_open_debt(&rescue_key, audit_now).is_some();
-            let verification_rescue = sampled_audit::progress_debt(index, &rescue_key, audit_now)
-                .is_some()
-                || failed_open_retry;
+            let verification_rescue = verification_rescue_debt || failed_open_retry;
             let Some((mut candidate, opened_file)) =
                 open_and_identify_scan_candidate_with_rescue_at(
                     source,
                     candidate,
                     &mut census,
-                    census_unix_seconds,
-                    backfill_window_days,
-                    discovery_retention!(index, &resource_probe.discovery_growth),
+                    CandidateWindow {
+                        census_unix_seconds,
+                        backfill_window_days,
+                        retention: discovery_retention!(index, &resource_probe.discovery_growth),
+                        growth: sampled_audit::growth_active(index)
+                            .then_some(&index.v2().growth_retention),
+                    },
                     verification_rescue,
                     audit_now,
                     sampling.as_ref().map(|context| context.cache.as_ref()),
@@ -33597,6 +33669,11 @@ impl OwnedSourceScan {
                                 pending!();
                             }
                         };
+                        if !sampled_audit::growth_read_admitted(index, &candidate, mode) {
+                            sampled_audit::queue_growth_retry(index, &candidate);
+                            census.record_unreadable(UnreadableCause::Reduction, 1);
+                            pending!();
+                        }
                         // H1c: the plan uses absolute offsets; the reader's
                         // extent is relative to its Full/Tail start.
                         if source == SnapshotSource::ClaudeCode
@@ -33733,6 +33810,20 @@ impl OwnedSourceScan {
                         });
                     }
                 }
+            }
+            if source == SnapshotSource::ClaudeCode
+                && file_sampling.is_none()
+                && !sampled_audit::growth_read_admitted(
+                    index,
+                    &candidate,
+                    crate::transcript_acquisition::ReadMode::Full(
+                        crate::transcript_acquisition::FullReason::StateMissing,
+                    ),
+                )
+            {
+                sampled_audit::queue_growth_retry(index, &candidate);
+                census.record_unreadable(UnreadableCause::Reduction, 1);
+                pending!();
             }
             let mut active = Box::new(OwnedActiveFile {
                 comparison_target,
@@ -43852,6 +43943,7 @@ fn advance_bounded_directory_traversal_with_budget(
     // silently age boundary files out while still publishing the earlier
     // `census_window_end` as its agreement scope.
     let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
+    let growth_retention = sampled_audit::growth_active(index);
     let move_sources = index.held_move_sources();
     let mut pending = traversal.pending_candidates.iter().enumerate().fold(
         BTreeMap::new(),
@@ -44017,6 +44109,10 @@ fn advance_bounded_directory_traversal_with_budget(
                 &path,
                 metadata.len(),
                 codex_fragment::Stamp::metadata(&metadata),
+            ) && !sampled_audit::growth_selectable(
+                source,
+                &path,
+                growth_retention.then(|| &index.v2().growth_retention),
             ) {
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
@@ -44144,6 +44240,16 @@ fn candidate_from_traversal_path(
     )
 }
 
+/// Open-admission inputs: census clock, backfill window, main's owed-key
+/// retention and v2 growth debt (None when OFF).
+#[derive(Clone, Copy)]
+struct CandidateWindow<'a> {
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    retention: DiscoveryRetention<'a>,
+    growth: Option<&'a BTreeMap<String, sampled_audit::GrowthRetention>>,
+}
+
 fn candidate_from_traversal_path_at(
     source: SnapshotSource,
     site: disappearance_diagnostics::Site,
@@ -44249,6 +44355,12 @@ fn candidate_from_traversal_path_at(
             metadata.len(),
             codex_fragment::Stamp::metadata(&metadata),
         )
+        && !sampled_audit::growth_selectable(
+            source,
+            &pending.path,
+            sampled_audit::growth_active(discovery.index)
+                .then(|| &discovery.index.v2().growth_retention),
+        )
     {
         // Watcher hints must not widen the configured activity window. The
         // same revalidation also handles an ordinary candidate whose mtime was
@@ -44318,22 +44430,66 @@ fn reconcile_missing_index_entries_with_side(
         return true;
     };
     let after = snapshot.reconciliation_after.clone();
-    let lower_bound = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-    let page = index
+    let lower_bound = after
+        .clone()
+        .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+    let growth_roots = (source == SnapshotSource::ClaudeCode
+        && sampled_audit::growth_active(index))
+    .then(|| snapshot.scan_roots.clone());
+    // Restored residue whose status is unknown shares this page's limit.
+    // It can lie behind a saved cursor; no separate metadata sweep runs.
+    let mut page = if growth_roots.is_some() {
+        snapshot
+            .residue
+            .index_keys
+            .iter()
+            .filter(|key| {
+                index.files.contains_key(*key)
+                    && index
+                        .v2()
+                        .growth_retention
+                        .get(*key)
+                        .map_or(true, |state| state.checked_generation.is_none())
+            })
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let residue_count = page.len();
+    let regular = index
         .files
         .range((lower_bound, std::ops::Bound::Included(upper_bound.clone())))
-        .take(limit)
+        .filter(|(key, _)| page.binary_search(key).is_err())
+        .take(limit.saturating_sub(residue_count))
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
+    let regular_after = regular.last().cloned().or(after.clone());
+    let regular_done =
+        regular.last() == Some(&upper_bound) || regular.len() < limit.saturating_sub(residue_count);
+    page.extend(regular);
     if page.is_empty() {
-        return true;
+        return growth_roots.is_none()
+            || !index.traversal.as_ref().is_some_and(|walk| {
+                walk.pending_candidates
+                    .iter()
+                    .any(|path| path.census_member)
+            });
     }
+    let mut growth_queued = false;
     let account_members = index.observed_account_members();
     for key in &page {
         let observed = index
             .traversal
             .as_ref()
             .is_some_and(|traversal| traversal.observed_index_keys.contains(key));
+        if let Some(roots) = growth_roots.as_ref() {
+            if sampled_audit::revalidate_growth(index, key, roots) {
+                growth_queued = true;
+                continue;
+            }
+        }
         // The existing reconciliation page bounds these index-driven absence
         // probes. Missing roots or unsafe ancestors keep the hold; a missing
         // intermediate component beneath the validated root proves absence.
@@ -44393,12 +44549,12 @@ fn reconcile_missing_index_entries_with_side(
             index.drop_codex_proof_items(key, codex_side_drop);
         }
     }
-    let done = page.last() == Some(&upper_bound) || page.len() < limit;
+    let done = regular_done && residue_count < limit;
     if let Some(traversal) = index.traversal.as_mut() {
         traversal.reconciliation_started = true;
-        traversal.reconciliation_after = page.last().cloned();
+        traversal.reconciliation_after = regular_after;
     }
-    done
+    done && !growth_queued
 }
 
 #[cfg(test)]
@@ -44862,86 +45018,33 @@ fn open_candidate_file_stat_retained(
     Ok((file, stat))
 }
 
-// Standalone readers (including Codex join preparation) have no retained
-// Claude page clock. The selecting/continuation path calls the explicit _at
-// variants, preserving one clock without changing existing helper contracts.
-#[cfg(test)]
-fn open_and_identify_scan_candidate(
-    source: SnapshotSource,
-    candidate: CandidateFile,
-    census: &mut ScanCensus,
-    census_unix_seconds: Option<u64>,
-    backfill_window_days: u64,
-    retention: DiscoveryRetention<'_>,
-) -> Option<(CandidateFile, File)> {
-    open_and_identify_scan_candidate_at(
-        source,
-        candidate,
-        census,
-        census_unix_seconds,
-        backfill_window_days,
-        retention,
-        sampled_scan::now_seconds(),
-    )
-}
-#[allow(clippy::too_many_arguments)]
-fn open_and_identify_scan_candidate_with_rescue(
-    source: SnapshotSource,
-    candidate: CandidateFile,
-    census: &mut ScanCensus,
-    census_unix_seconds: Option<u64>,
-    backfill_window_days: u64,
-    retention: DiscoveryRetention<'_>,
-    verification_rescue: bool,
-    cache: Option<&sampled_scan::SharedCache>,
-) -> Option<(CandidateFile, File)> {
-    open_and_identify_scan_candidate_with_rescue_at(
-        source,
-        candidate,
-        census,
-        census_unix_seconds,
-        backfill_window_days,
-        retention,
-        verification_rescue,
-        sampled_scan::now_seconds(),
-        cache,
-    )
-}
-
 fn open_and_identify_scan_candidate_at(
     source: SnapshotSource,
     candidate: CandidateFile,
     census: &mut ScanCensus,
-    census_unix_seconds: Option<u64>,
-    backfill_window_days: u64,
-    retention: DiscoveryRetention<'_>,
+    window: CandidateWindow<'_>,
     audit_now: u64,
 ) -> Option<(CandidateFile, File)> {
     open_and_identify_scan_candidate_with_rescue_at(
-        source,
-        candidate,
-        census,
-        census_unix_seconds,
-        backfill_window_days,
-        retention,
-        false,
-        audit_now,
-        None,
+        source, candidate, census, window, false, audit_now, None,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn open_and_identify_scan_candidate_with_rescue_at(
     source: SnapshotSource,
     mut candidate: CandidateFile,
     census: &mut ScanCensus,
-    census_unix_seconds: Option<u64>,
-    backfill_window_days: u64,
-    retention: DiscoveryRetention<'_>,
+    window: CandidateWindow<'_>,
     verification_rescue: bool,
     audit_now: u64,
     cache: Option<&sampled_scan::SharedCache>,
 ) -> Option<(CandidateFile, File)> {
+    let CandidateWindow {
+        census_unix_seconds,
+        backfill_window_days,
+        retention,
+        growth,
+    } = window;
     // Common boundary: ordinary discovery, retained retries, forced family
     // preflight and synthetic progress all obey the same failed-open park.
     // Stat change/overflow/restart still fail toward trying the real open.
@@ -45034,6 +45137,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
             candidate.size_bytes,
             codex_fragment::Stamp::candidate(&candidate),
         )
+        && !sampled_audit::growth_selectable(source, &candidate.path, growth)
     {
         // The path can be atomically replaced after directory/candidate stat
         // but before the no-follow open. Eligibility follows the exact opened
@@ -45725,10 +45829,19 @@ fn census_count_fields(names: &[&str], counts: &[usize]) -> String {
 
 struct CheckpointLock {
     file: File,
+    priority_path: Option<PathBuf>,
+    maintenance: bool,
+    custody: bool,
 }
 
 impl CheckpointLock {
     fn acquire(path: &Path) -> Result<Self> {
+        Self::acquire_mode(path, false)
+    }
+    fn acquire_mode(path: &Path, maintenance: bool) -> Result<Self> {
+        Self::acquire_with_custody(path, maintenance, None)
+    }
+    fn acquire_with_custody(path: &Path, maintenance: bool, custody: Option<bool>) -> Result<Self> {
         let lock_path = path.with_extension("lock");
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent)
@@ -45741,6 +45854,33 @@ impl CheckpointLock {
             .truncate(false)
             .open(&lock_path)
             .context("open local snapshot checkpoint lock")?;
+        // Custody is the single authority for Claude v2 maintenance priority.
+        // Legacy Claude, Codex and Pi retain main's nonblocking flock behavior,
+        // including when the v2 checkpoint-owner registry is poisoned.
+        // Maintenance already owns a reservation even if its runtime was
+        // invalidated while it waited for the previous checkpoint owner.
+        let custody = match custody {
+            Some(value) => value,
+            None => state_v2::published(path)?,
+        };
+        let priority = maintenance || custody;
+        let mut owners = if priority {
+            Some(
+                checkpoint_owners()
+                    .0
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("checkpoint_owner_registry"))?,
+            )
+        } else {
+            None
+        };
+        if !maintenance
+            && owners
+                .as_ref()
+                .is_some_and(|o| o.maintenance.contains(path))
+        {
+            anyhow::bail!("state_v2_maintenance_pause");
+        }
         #[cfg(unix)]
         {
             let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -45749,15 +45889,34 @@ impl CheckpointLock {
                     .context("local snapshot checkpoint is owned by another daemon");
             }
         }
-        Ok(Self { file })
+        if let Some(owners) = owners.as_mut() {
+            owners.owned.insert(path.to_owned());
+        }
+        Ok(Self {
+            file,
+            priority_path: priority.then(|| path.to_owned()),
+            maintenance,
+            custody,
+        })
     }
 }
 
 impl Drop for CheckpointLock {
     fn drop(&mut self) {
+        let mut owners = self
+            .priority_path
+            .as_ref()
+            .and_then(|_| checkpoint_owners().0.lock().ok());
         #[cfg(unix)]
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+        if let (Some(owners), Some(path)) = (owners.as_mut(), self.priority_path.as_ref()) {
+            owners.owned.remove(path);
+            if self.maintenance {
+                owners.maintenance.remove(path);
+            }
+            checkpoint_owners().1.notify_all();
         }
     }
 }
@@ -48926,8 +49085,29 @@ impl ScanIndex {
         source: SnapshotSource,
         support_dir: &Path,
     ) -> Result<(Self, ScanIndexLoadOrigin)> {
-        let loaded =
-            Self::load_inner_with_support(path, Some(source), Some(support_dir), SystemTime::now());
+        Self::load_source_with_probe(path, source, support_dir, None)
+    }
+    pub(crate) fn load_for_snapshot_source_with_custody(
+        path: &Path,
+        source: SnapshotSource,
+        support_dir: &Path,
+        custody: bool,
+    ) -> Result<(Self, ScanIndexLoadOrigin)> {
+        Self::load_source_with_probe(path, source, support_dir, Some(custody))
+    }
+    fn load_source_with_probe(
+        path: &Path,
+        source: SnapshotSource,
+        support_dir: &Path,
+        custody: Option<bool>,
+    ) -> Result<(Self, ScanIndexLoadOrigin)> {
+        let loaded = Self::load_inner_with_probe(
+            path,
+            Some(source),
+            Some(support_dir),
+            SystemTime::now(),
+            custody,
+        );
         scan_index_health::observe(source, &loaded);
         let (mut index, origin) = match loaded {
             Ok(loaded) => {
@@ -48944,6 +49124,9 @@ impl ScanIndex {
         };
         let load_origin = ScanIndexLoadOrigin::from(&origin);
         index.settle_claude_index_load(path, load_origin);
+        if source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(&index) {
+            sampled_audit::bind_growth_claims(&mut index, path);
+        }
         index.mint_or_reuse_codex_proof_incarnation(path, origin);
         if source == SnapshotSource::ClaudeCode
             && load_origin.is_fresh(&index)
@@ -48973,6 +49156,9 @@ impl ScanIndex {
     fn load_attributed(path: &Path, source: Option<SnapshotSource>) -> Result<Self> {
         let (mut index, origin) = Self::load_inner(path, source)?;
         index.settle_claude_index_load(path, ScanIndexLoadOrigin::from(&origin));
+        if sampled_audit::growth_active(&index) {
+            sampled_audit::bind_growth_claims(&mut index, path);
+        }
         index.mint_or_reuse_codex_proof_incarnation(path, origin);
         Ok(index)
     }
@@ -49016,9 +49202,22 @@ impl ScanIndex {
         support_dir: Option<&Path>,
         now: SystemTime,
     ) -> Result<(Self, LoadOrigin)> {
+        Self::load_inner_with_probe(path, source, support_dir, now, None)
+    }
+    fn load_inner_with_probe(
+        path: &Path,
+        source: Option<SnapshotSource>,
+        support_dir: Option<&Path>,
+        now: SystemTime,
+        custody: Option<bool>,
+    ) -> Result<(Self, LoadOrigin)> {
         if !path.exists() {
-            let persistence_root =
-                scan_index_integration::check_missing(path, scan_index_source_label(source))?;
+            let persistence_root = scan_index_integration::check_missing(
+                path,
+                scan_index_source_label(source),
+                support_dir,
+                custody,
+            )?;
             return Ok((
                 Self {
                     persistence_root,
@@ -49027,7 +49226,19 @@ impl ScanIndex {
                 LoadOrigin::Missing,
             ));
         }
-        let _lock = CheckpointLock::acquire(path)?;
+        let _lock = CheckpointLock::acquire_with_custody(path, false, custody)?;
+        let (v2_index, sample_v1) = state_v2::load_locked(path, support_dir, _lock.custody)?;
+        if let Some(mut index) = v2_index {
+            let file = File::open(path)?;
+            let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
+            if !index.finish_decoded_load(source) {
+                return Err(anyhow::anyhow!(
+                    "scan_index_storage_generation_requires_repair"
+                ));
+            }
+            return Ok((index, LoadOrigin::Loaded(opened)));
+        }
+        let v1_gauge = state_v2::telemetry::Stage::v1(path, sample_v1);
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
         let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)
@@ -49065,7 +49276,7 @@ impl ScanIndex {
                 ))
             }
             Ok(mut index) => {
-                if !index.canonicalize_codex_identity_keys() {
+                if !index.finish_decoded_load(source) {
                     if index
                         .persistence_root
                         .as_ref()
@@ -49086,17 +49297,11 @@ impl ScanIndex {
                     )
                     .map(|index| (index, LoadOrigin::Quarantined));
                 }
-                let active_witness = source.map(snapshot_quarantine_witness);
-                if index.persistence_available() {
-                    terminal_contract_retry::rearm(
-                        &mut index.quarantined_snapshot_fingerprints,
-                        active_witness.as_ref(),
-                    );
+                if let Some(gauge) = v1_gauge {
+                    gauge.finish();
                 }
-                index.codex_parent_proof_parents_live =
-                    codex_parent_proof_parents_live(&index.codex_parent_prefix_proofs);
-                if index.persistence_available() {
-                    index.collapse_account_pending_windows();
+                if sample_v1 {
+                    state_v2::after_v1_locked(path, &mut index)?;
                 }
                 Ok((index, LoadOrigin::Loaded(opened)))
             }
@@ -49114,6 +49319,27 @@ impl ScanIndex {
                 Err(error).with_context(|| format!("parse scan index {}", path.display()))
             }
         }
+    }
+
+    // Shared by v1 and v2 after the raw-dependent decoder tail. A collision is
+    // handled by the caller: v1 may quarantine; published v2 custody must hold.
+    fn finish_decoded_load(&mut self, source: Option<SnapshotSource>) -> bool {
+        if !self.canonicalize_codex_identity_keys() {
+            return false;
+        }
+        let active_witness = source.map(snapshot_quarantine_witness);
+        if self.persistence_available() {
+            terminal_contract_retry::rearm(
+                &mut self.quarantined_snapshot_fingerprints,
+                active_witness.as_ref(),
+            );
+        }
+        self.codex_parent_proof_parents_live =
+            codex_parent_proof_parents_live(&self.codex_parent_prefix_proofs);
+        if self.persistence_available() {
+            self.collapse_account_pending_windows();
+        }
+        true
     }
 
     fn claude_account_pending_file_is_empty(&self, key: &str, entry: &ScanIndexEntry) -> bool {
@@ -49360,22 +49586,51 @@ impl ScanIndex {
     }
 
     pub fn save(&mut self, path: &Path) -> Result<()> {
-        self.save_internal(path, None)
+        self.save_internal(path, None, false, None)
     }
     pub(crate) fn save_with_read_limit(&mut self, path: &Path, cap: usize) -> Result<()> {
-        self.save_internal(path, Some(cap))
+        self.save_internal(path, Some(cap), false, None)
     }
-    fn save_internal(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
+    pub(crate) fn save_with_progress_owner(
+        &mut self,
+        path: &Path,
+        read_limit: Option<usize>,
+        owner: &crate::snapshot_sync::SnapshotProgressLock,
+    ) -> Result<()> {
+        if !state_v2::state_v2_growth_retention_active(self) {
+            return match read_limit {
+                Some(cap) => self.save_with_read_limit(path, cap),
+                None => self.save(path),
+            };
+        }
+        self.save_internal(path, read_limit, false, Some(owner))
+    }
+    fn save_growth_claim(&mut self, path: &Path) -> Result<()> {
+        self.save_internal(path, None, true, None)
+    }
+    fn save_internal(
+        &mut self,
+        path: &Path,
+        read_limit: Option<usize>,
+        claim_only: bool,
+        progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
+    ) -> Result<()> {
+        let _save_window = state_v2::state_v2_growth_retention_active(self)
+            .then(|| state_v2::telemetry::Window::begin("save"))
+            .flatten();
         self.require_persistence_available()?;
         lenient_decode::retain_persistence_claims(self);
-        self.prune_claude_money_births(sampled_scan::now_seconds());
+        if !claim_only {
+            self.prune_claude_money_births(sampled_scan::now_seconds());
+        }
         lenient_decode::controls(self, scan_index_source_label(None))?;
-        // Every save writes the tombstone map under its marker (Round 13).
-        self.claude_retired_family_tombstones_initialized = true;
-        // Fails closed for the one record, in debug and release; never the save.
-        self.drop_unbound_claude_authority_records("save");
-        let drops = self.drop_invalid_index_records();
-        note_scan_index_record_drops("save", scan_index_source_label(None), drops);
+        if !claim_only {
+            // Every ordinary save writes tombstones under their marker.
+            self.claude_retired_family_tombstones_initialized = true;
+            self.drop_unbound_claude_authority_records("save");
+            let drops = self.drop_invalid_index_records();
+            note_scan_index_record_drops("save", scan_index_source_label(None), drops);
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create scan index directory {}", parent.display()))?;
@@ -49383,6 +49638,9 @@ impl ScanIndex {
         let _lock = CheckpointLock::acquire(path)?;
         #[cfg(test)]
         pause_scan_index_cas_if_requested_for_test();
+        if state_v2::save_locked(path, self, claim_only, progress_owner, _lock.custody)? {
+            return Ok(());
+        }
         if path.exists() {
             if let Some((binding, root)) = &self.persistence_root {
                 scan_index_persistence::LockedStore::new(
@@ -49429,7 +49687,9 @@ impl ScanIndex {
                 "local snapshot scan index disappeared concurrently"
             ));
         }
-        self.retire_committed_claude_account_pending_windows();
+        if !claim_only {
+            self.retire_committed_claude_account_pending_windows();
+        }
         let previous_generation = self.generation;
         self.schema_version = SCAN_INDEX_SCHEMA_VERSION;
         self.generation = self
@@ -51029,6 +51289,14 @@ impl ScanIndex {
             codex_counting_tombstones: self.codex_counting_tombstones.clone(),
             codex_counting_evicted_legacy: self.codex_counting_evicted_legacy.clone(),
             codex_counting_evictions: self.codex_counting_evictions,
+            v2: previous.v2.as_ref().map(|state| {
+                Box::new(state_v2::IndexState {
+                    persistence_v2: state.persistence_v2.clone(),
+                    growth_claim_context: state.growth_claim_context.clone(),
+                    growth_retention: sampled_audit::growth_subset(self, previous, &safe_keys),
+                    growth_checked: Default::default(),
+                })
+            }),
             persistence_root: previous.persistence_root.clone(),
             persistence_controls: previous.persistence_controls.clone(),
             persistence_legacy_recovery: self
@@ -85084,7 +85352,6 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U subscription_product: Option<String>,
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; withheld_memo, persistence_legacy_recovery, persistence_root, persistence_unavailable, persistence_controls, decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, file_upload_context_enabled, mixed_context_view, context_read_counts, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory, claude_copy_removals, copy_unproven_enabled, copy_prefix_base_upload_context);
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
@@ -85758,6 +86025,13 @@ crate::heap_layout_bound::fields!(UploadAckRetirementHandoff; destination_namesp
 
 impl ScanIndex {
     pub(crate) fn retain_persistence_baseline_from(&mut self, committed: &Self) {
+        if let Some(state) = &committed.v2 {
+            let own = self.v2_mut();
+            own.persistence_v2 = state.persistence_v2.clone();
+            own.growth_claim_context = state.growth_claim_context.clone();
+        } else {
+            self.v2 = None;
+        }
         self.persistence_root = committed.persistence_root.clone();
         self.persistence_controls = committed.persistence_controls.clone();
         // A published baseline has consumed its shared recovery grant. Adopt
@@ -85772,4 +86046,249 @@ impl ScanIndex {
             }
         }
     }
+}
+
+/// Explicit privacy erasure hooks. Source-disable and Repair must not call this.
+pub(crate) fn erase_claude_state_v2_artifacts(support: &Path) -> Result<()> {
+    state_v2::erase_tree(support)
+}
+pub(crate) fn maintain_state_v2_idle(path: &Path, index: &ScanIndex, quiet: bool) -> Result<()> {
+    let result = state_v2::idle(path, index, quiet);
+    state_v2::telemetry::retained_pass_end(index);
+    result
+}
+/// Hold for the whole collection cycle: releases a committed-page baseline on
+/// every exit, including the error exits that skip maintain_state_v2_idle.
+pub(crate) fn state_v2_baseline_release(path: &Path, index: &ScanIndex) -> impl Drop {
+    state_v2::BaselineRelease::new(path, index)
+}
+pub(crate) fn state_v2_side_effect_guard(
+    path: &Path,
+    index: &ScanIndex,
+) -> impl Fn() -> Result<()> {
+    let runtime = index.v2().persistence_v2.clone();
+    // This guard belongs to this graph, not to the mutable shared connection.
+    // After adopting a successful save, construct a new guard for further IO.
+    let graph_generation =
+        sampled_audit::own_growth_claim_generation(index, path).unwrap_or(index.generation);
+    let path = runtime.as_ref().map(|_| path.to_owned());
+    move || match path.as_deref() {
+        Some(path) => state_v2::guard_external(path, runtime.as_ref(), graph_generation),
+        None => Ok(()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn invalidate_claude_state_v2_sessions(support: &Path) -> Result<()> {
+    state_v2::invalidate_tree(support)
+}
+
+// Standalone readers (including Codex join preparation) have no retained
+// Claude page clock. The selecting/continuation path calls the explicit _at
+// variants, preserving one clock without changing existing helper contracts.
+#[cfg(test)]
+fn open_and_identify_scan_candidate(
+    source: SnapshotSource,
+    candidate: CandidateFile,
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    retention: DiscoveryRetention<'_>,
+) -> Option<(CandidateFile, File)> {
+    open_and_identify_scan_candidate_at(
+        source,
+        candidate,
+        census,
+        CandidateWindow {
+            census_unix_seconds,
+            backfill_window_days,
+            retention,
+            growth: None,
+        },
+        sampled_scan::now_seconds(),
+    )
+}
+
+// Opaque v2-only companion for the unchanged upload-progress store.
+pub(crate) use state_v2::ack::ProgressRecovery;
+// OPS diagnostics bridges; the private storage module stays private.
+pub(crate) use state_v2::state_v2_growth_retention_active;
+pub(crate) fn state_v2_pass_start() {
+    state_v2::telemetry::pass_start();
+}
+pub(crate) fn state_v2_prepare_observed() {
+    state_v2::telemetry::phase("prepare");
+}
+pub(crate) fn state_v2_finish_window() -> Option<impl Drop> {
+    state_v2::telemetry::Window::begin("finish")
+}
+pub(crate) fn state_v2_post_pass_observed() {
+    state_v2::telemetry::plateau();
+}
+
+pub(crate) fn state_v2_custody_published(path: &Path) -> Result<bool> {
+    state_v2::published(path)
+}
+
+pub(crate) fn state_v2_before_collection(index: &ScanIndex) -> Result<()> {
+    state_v2::before_collection(index)
+}
+
+#[derive(Default)]
+struct CheckpointOwners {
+    owned: BTreeSet<PathBuf>,
+    maintenance: BTreeSet<PathBuf>,
+}
+fn checkpoint_owners() -> &'static (Mutex<CheckpointOwners>, std::sync::Condvar) {
+    static OWNERS: std::sync::OnceLock<(Mutex<CheckpointOwners>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    OWNERS.get_or_init(|| {
+        (
+            Mutex::new(CheckpointOwners::default()),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+impl CheckpointLock {
+    /// Reserve the next lock turn before waiting for this process's owner.
+    /// New normal work yields; another process's flock is a counted failure.
+    fn acquire_for_maintenance(path: &Path) -> Result<Self> {
+        anyhow::ensure!(state_v2::published(path)?, "state_v2_runtime_inactive");
+        let registry = checkpoint_owners();
+        let mut owners = registry
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint_owner_registry"))?;
+        anyhow::ensure!(
+            owners.maintenance.insert(path.to_owned()),
+            "state_v2_own_maintenance_busy"
+        );
+        registry.1.notify_all();
+        struct Reservation<'a>(&'a Path);
+        impl Drop for Reservation<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut owners) = checkpoint_owners().0.lock() {
+                    owners.maintenance.remove(self.0);
+                    checkpoint_owners().1.notify_all();
+                }
+            }
+        }
+        let reservation = Reservation(path);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while owners.owned.contains(path) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                drop(owners);
+                anyhow::bail!("state_v2_own_lock_busy");
+            }
+            owners = registry
+                .1
+                .wait_timeout(owners, remaining)
+                .map_err(|_| anyhow::anyhow!("checkpoint_owner_registry"))?
+                .0;
+        }
+        drop(owners);
+        let lock = Self::acquire_mode(path, true)?;
+        // The lock's Drop now owns the reservation.
+        std::mem::forget(reservation);
+        Ok(lock)
+    }
+}
+
+#[cfg(test)]
+mod state_v2_maintenance_lock_tests {
+    use super::*;
+
+    /// [off=main] ordinary sources retain nonblocking checkpoint contention.
+    #[test]
+    fn off_sources_keep_nonblocking_checkpoint_contention() {
+        let root = crate::test_scratch::private_dir("off-checkpoint");
+        let parent = root.join("b".repeat(64));
+        for source in ["claude_code-test", "codex-test", "pi-test"] {
+            let path = parent.join(format!("{source}-scan-index.json"));
+            assert!(!state_v2::published(&path).unwrap());
+            let lock = CheckpointLock::acquire(&path).unwrap();
+            let error = CheckpointLock::acquire(&path).err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "local snapshot checkpoint is owned by another daemon"
+            );
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(lock);
+            drop(CheckpointLock::acquire(&path).unwrap());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// [behaviour] maintenance reserves the next turn ahead of our normal work.
+    #[test]
+    fn maintenance_reserves_the_next_turn_ahead_of_our_normal_work() {
+        let root = crate::test_scratch::canonical_private_dir("ops-lock");
+        let parent = root.join("snapshots/destinations").join("a".repeat(64));
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("claude_code-test-scan-index.json");
+        let progress = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "destination_namespace_hash": "a".repeat(64),
+        }))
+        .unwrap();
+        // Native published custody: a live route with an open session.
+        let index = state_v2::money_test_support::publish(&ScanIndex::default(), &path, &progress);
+        assert!(state_v2::published(&path).unwrap());
+        let normal = CheckpointLock::acquire(&path).unwrap();
+        let (entered, acquired) = std::sync::mpsc::channel();
+        let (release, finish) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let maintenance = CheckpointLock::acquire_for_maintenance(&worker_path).unwrap();
+            entered.send(()).unwrap();
+            finish
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            drop(maintenance);
+        });
+        let (owners, _) = checkpoint_owners()
+            .1
+            .wait_timeout_while(
+                checkpoint_owners().0.lock().unwrap(),
+                std::time::Duration::from_secs(1),
+                |owners| !owners.maintenance.contains(&path),
+            )
+            .unwrap();
+        assert!(owners.maintenance.contains(&path));
+        drop(owners);
+        assert!(CheckpointLock::acquire(&path).is_err());
+        // Custody keeps its latch; releasing the normal owner hands the turn
+        // to the reserved maintenance and new normal work still yields.
+        drop(normal);
+        acquired
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(state_v2::published(&path).unwrap());
+        assert!(CheckpointLock::acquire(&path).is_err());
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        drop(CheckpointLock::acquire(&path).unwrap());
+        drop(index);
+        state_v2::money_test_support::erase_published(&path);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+pub(crate) use state_v2::money_test_support::roundtrip as state_v2_money_roundtrip;
+
+#[cfg(test)]
+pub(crate) use state_v2::money_test_support::publish as publish_state_v2_for_test;
+
+/// Local-only recovery bypasses a save-pressure hold, never custody fencing.
+/// OFF returns before allocating a guard or consulting any route state.
+pub(crate) fn state_v2_recovery_save_guard(
+    path: &Path,
+    index: &ScanIndex,
+) -> Result<Option<impl Fn() -> Result<()>>> {
+    state_v2::recovery_save_guard(path, index)
 }
