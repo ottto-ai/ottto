@@ -5418,7 +5418,8 @@ impl SharedCache {
             let retiring = self.durable()?.retiring;
             let mut ready = BTreeSet::new();
             if let Ok(cache) = self.retained() {
-                for (key, entry) in &index.files {
+                for key in cache.keys() {
+                    let Some(entry) = index.files.get(key) else { continue; };
                     let digest = store::key_digest(source, key);
                     if retiring.iter().flatten().any(|pending| {
                         pending.key == digest

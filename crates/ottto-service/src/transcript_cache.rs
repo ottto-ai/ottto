@@ -403,6 +403,10 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     pub(crate) fn custody(&self, key: &str) -> Option<&crate::snapshots::DurableCustody> {
         self.custody.as_ref()?.get(key).map(Box::as_ref)
     }
+    /// Borrow resident keys under the existing retained lock (at most CACHE_ENTRIES).
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
+        self.entries.keys()
+    }
     pub(crate) fn peek(&self, key: &str) -> Option<&Retained<S>> {
         self.entries.get(key).map(|entry| &entry.retained)
     }
