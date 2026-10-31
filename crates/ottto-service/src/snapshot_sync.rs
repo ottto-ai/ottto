@@ -1127,7 +1127,7 @@ fn settle_upload_corrections_after_selection(
 /// pipeline harness so its regressions guard this order: correction settle,
 /// native paid restore, account-audit release (which can clear a drained
 /// entry's revision), then the body-drain restore. Returns whether the page
-/// is fully settled and how many members owe again.
+/// is fully settled.
 #[expect(
     clippy::too_many_arguments,
     reason = "the settle inputs plus the finish's optional paid restore and audit release"
@@ -1143,7 +1143,7 @@ fn finish_selected_settlement(
     mut body_drains: crate::snapshots::ClaudeProofBodyDrains,
     comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     audit_release: Option<AccountAuditRelease<'_>>,
-) -> Result<(bool, usize), crate::source_rotation::LocalRefusal> {
+) -> Result<bool, crate::source_rotation::LocalRefusal> {
     let mut fully_settled = settle_upload_corrections_after_selection(
         index,
         scan,
@@ -1171,11 +1171,10 @@ fn finish_selected_settlement(
     // After every selected-entry restore and the account-audit release, which
     // can clear a drained entry's revision: a drain (pre-selection, D1, D2 or
     // M2) whose entry this save does not keep stays owed.
-    let reowed = index.restore_unselected_claude_proof_body_drains(body_drains);
-    if reowed > 0 {
+    if index.restore_unselected_claude_proof_body_drains(body_drains) {
         fully_settled = false;
     }
-    Ok((fully_settled, reowed))
+    Ok(fully_settled)
 }
 
 fn apply_backfill_cutoff_with_claude_corrections(
@@ -8473,7 +8472,7 @@ fn finish_sync_source(
     settle_index_after_upload(&mut index, &committed_index, &upload_progress);
     // Completed/checkpointed outcomes have now selected their retained file
     // facts. No-body completion must share that exact durable checkpoint.
-    (upload_fully_settled, _) = finish_selected_settlement(
+    upload_fully_settled = finish_selected_settlement(
         &mut index,
         &scan_result,
         &committed_index,

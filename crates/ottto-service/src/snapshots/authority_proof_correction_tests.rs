@@ -2788,7 +2788,7 @@ fn r2_a_no_op_drain_whose_revision_the_partial_save_does_not_select_stays_owed()
             "{label}: nothing settled, so the save keeps the committed entry"
         );
         assert!(
-            subset.restore_unselected_claude_proof_body_drains(drains) > 0,
+            subset.restore_unselected_claude_proof_body_drains(drains),
             "{label}: the member owes again"
         );
         assert!(apc_owed(&subset).unwrap().contains(&root), "{label}");
@@ -2837,18 +2837,16 @@ fn r2_a_drain_at_the_selected_revision_settles_exactly_as_before() {
         let (committed, working, drains) = apc_r2_page(last_owed, &unmoved);
         let mut subset = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
         let selected = serde_json::to_vec(&subset).unwrap();
-        assert_eq!(
-            subset.restore_unselected_claude_proof_body_drains(drains),
-            0,
+        assert!(
+            !subset.restore_unselected_claude_proof_body_drains(drains),
             "{label}: an unmoved revision is selected"
         );
         assert_eq!(serde_json::to_vec(&subset).unwrap(), selected, "{label}");
 
         let (_, mut working, drains) = apc_r2_page(last_owed, &apc_hex('5'));
         let carried = serde_json::to_vec(&working).unwrap();
-        assert_eq!(
-            working.restore_unselected_claude_proof_body_drains(drains),
-            0,
+        assert!(
+            !working.restore_unselected_claude_proof_body_drains(drains),
             "{label}: the carried working entry is the drained revision"
         );
         assert_eq!(serde_json::to_vec(&working).unwrap(), carried, "{label}");
