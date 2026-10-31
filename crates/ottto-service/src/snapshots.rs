@@ -31528,7 +31528,8 @@ impl OwnedSourceScan {
                     ) {
                         eprintln!("{line}");
                         #[cfg(test)]
-                        CODEX_PARSE_REASON_LINES.with(|lines| lines.borrow_mut().push(line));
+                        SOURCE_PARSE_REASON_LINES
+                            .with(|lines| lines.borrow_mut().push((source, line)));
                     }
                 }
                 if source == SnapshotSource::ClaudeCode
@@ -31544,6 +31545,16 @@ impl OwnedSourceScan {
                     );
                     let held_audit_open_failed =
                         sampled_audit::held_audit_open_failed(terminal_off_decision_now(audit_now));
+                    #[cfg(test)]
+                    SOURCE_PARSE_REASON_LINES.with(|lines| {
+                        lines.borrow_mut().push((
+                            source,
+                            census_count_fields(
+                                &CANDIDATE_PARSE_REASON_NAMES,
+                                &census.parse_reasons,
+                            ),
+                        ));
+                    });
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
@@ -45204,13 +45215,24 @@ fn census_count_fields(names: &[&str], counts: &[usize]) -> String {
 
 #[cfg(test)]
 thread_local! {
-    static CODEX_PARSE_REASON_LINES: std::cell::RefCell<Vec<String>> =
+    static SOURCE_PARSE_REASON_LINES: std::cell::RefCell<Vec<(SnapshotSource, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
+pub(crate) fn take_parse_reason_lines_for_test(source: SnapshotSource) -> Vec<String> {
+    SOURCE_PARSE_REASON_LINES.with(|lines| {
+        let (selected, retained): (Vec<_>, Vec<_>) = std::mem::take(&mut *lines.borrow_mut())
+            .into_iter()
+            .partition(|(kind, _)| *kind == source);
+        *lines.borrow_mut() = retained;
+        selected.into_iter().map(|(_, line)| line).collect()
+    })
+}
+
+#[cfg(test)]
 fn take_codex_parse_reason_lines_for_test() -> Vec<String> {
-    CODEX_PARSE_REASON_LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+    take_parse_reason_lines_for_test(SnapshotSource::Codex)
 }
 
 struct CheckpointLock {
