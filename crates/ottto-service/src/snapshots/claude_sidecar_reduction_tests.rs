@@ -77,6 +77,7 @@ impl Fixture {
         candidate_from_traversal_path(
             SOURCE,
             ScanTraversalPath {
+                order_modified: None,
                 scan_root: self.dir.clone(),
                 path: path.to_owned(),
                 census_member: true,
@@ -85,7 +86,7 @@ impl Fixture {
             &mut ScanCensus::default(),
             None,
             BACKFILL_WINDOW_DAYS,
-            &BTreeMap::new(),
+            crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
         )
         .unwrap()
     }
@@ -104,6 +105,7 @@ impl Fixture {
             &CodexTitleMetadata::default(),
             metadata,
             Some(&self.support),
+            None,
         )
         .unwrap();
         (candidate.source_file_fingerprint, reduction)

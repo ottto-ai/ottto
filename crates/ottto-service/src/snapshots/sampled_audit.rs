@@ -126,7 +126,10 @@ impl ScanIndexEntry {
             .is_some_and(|debt| now >= debt.due_unix_seconds)
     }
     pub(super) fn retain_history_evidence(&self) -> bool {
-        self.codex_history_is_protected() || self.has_unverified_source()
+        self.archive.is_some()
+            || self.codex_compressed_hold.is_some()
+            || self.codex_history_is_protected()
+            || self.has_unverified_source()
     }
 }
 impl ScanIndex {
@@ -826,6 +829,7 @@ impl OwnedSourceScan {
             let candidate = self.identified_candidates.pop_back().unwrap();
             if let Some(traversal) = self.index.traversal.as_mut() {
                 traversal.pending_candidates.push_front(ScanTraversalPath {
+                    order_modified: None,
                     scan_root: candidate.scan_root,
                     path: candidate.path,
                     census_member: true,

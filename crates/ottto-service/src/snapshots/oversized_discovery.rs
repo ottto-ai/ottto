@@ -179,6 +179,7 @@ pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_a
                 .oversized_file_count
                 .saturating_sub(debt.observations);
             traversal.pending_candidates.push_back(ScanTraversalPath {
+                order_modified: None,
                 scan_root,
                 path: path.to_path_buf(),
                 census_member: true,

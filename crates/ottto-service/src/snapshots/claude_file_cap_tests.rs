@@ -175,6 +175,7 @@ fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
             let candidate = candidate_from_traversal_path(
                 source,
                 ScanTraversalPath {
+                    order_modified: None,
                     scan_root: fixture.0.clone(),
                     path: fixture.path(),
                     census_member: true,
@@ -183,7 +184,7 @@ fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
-                &BTreeMap::new(),
+                DiscoveryRetention::unverified(&BTreeMap::new()),
             );
             assert_eq!(candidate.is_some(), admitted, "{source:?} at {bytes}");
             assert_eq!(census.oversized_file_count, usize::from(!admitted));
@@ -210,6 +211,7 @@ fn three_hundred_mib_admission_is_claude_only() {
         let candidate = candidate_from_traversal_path(
             source,
             ScanTraversalPath {
+                order_modified: None,
                 scan_root: fixture.0.clone(),
                 path: fixture.path(),
                 census_member: true,
@@ -218,7 +220,7 @@ fn three_hundred_mib_admission_is_claude_only() {
             &mut census,
             None,
             BACKFILL_WINDOW_DAYS,
-            &BTreeMap::new(),
+            DiscoveryRetention::unverified(&BTreeMap::new()),
         );
         assert_eq!(candidate.is_some(), admitted);
         assert_eq!(census.oversized_file_count, usize::from(!admitted));

@@ -1127,6 +1127,8 @@ mod tests {
             codex_captured_uncommitted: false,
             codex_counting_v2: false,
             codex_counting_owner: None,
+            archive: None,
+            codex_compressed_hold: None,
             opened_changed_nanos: 0,
             opened_birth_nanos: 0,
             upload_context_receipt: None,

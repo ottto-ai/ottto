@@ -423,6 +423,7 @@ fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
             );
         } else {
             seed.push_back(ScanTraversalPath {
+                order_modified: None,
                 scan_root: root.clone(),
                 path: PathBuf::from(key),
                 census_member: true,

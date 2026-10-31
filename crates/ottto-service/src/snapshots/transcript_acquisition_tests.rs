@@ -2551,6 +2551,47 @@ fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value 
     serde_json::to_value(scan.snapshots).unwrap()
 }
 
+/// A funded archive must leave plain native Tail selection and bodies intact.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_active_preserves_plain_codex_and_claude_tail() {
+    let _lock = codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (index, _, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "decoder-tail",
+        );
+        assert_eq!(modes, (1, 0, 0));
+        let archive = Fixture::new(SnapshotSource::Codex);
+        fs::write(
+            &archive.0,
+            zstd::stream::encode_all(&b"synthetic archive"[..], 1).unwrap(),
+        )
+        .unwrap();
+        let mut input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+            .unwrap()
+            .unwrap();
+        input.read_exact(&mut [0; 1]).unwrap();
+        fixture.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, tail, modes) =
+            production_scan(&fixture, source, index, Some(cache.clone()), "decoder-tail");
+        assert_eq!(modes, (0, 1, 0), "{source:?} remains Tail during decode");
+        let (_, full, _) =
+            production_scan(&fixture, source, ScanIndex::default(), None, "decoder-tail");
+        assert_eq!(production_body(source, tail), production_body(source, full));
+        input.close();
+        assert_eq!(cache.cursor_reserved(), 0);
+    }
+}
+
 /// The shipped release compiler must exercise this path rather than silently
 /// passing the rest of the sampled suite through unsupported-layout skips.
 #[test]

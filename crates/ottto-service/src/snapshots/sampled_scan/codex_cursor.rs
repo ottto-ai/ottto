@@ -1015,6 +1015,8 @@ pub(in crate::snapshots) struct JobMeta {
     pages: u32,
     /// Consecutive resume pages whose evidence was unavailable (E2).
     unavailable_resumes: u32,
+    /// First observation and resume count of a deferred correctness latch.
+    custody_deferred: Option<(u64, u64)>,
     /// The last walked copy-budget charge, the reader position and the
     /// reader buffer capacity it was taken at (E3; see `charge_estimate`).
     charge: Option<(usize, u64, usize)>,
@@ -1025,7 +1027,7 @@ pub(in crate::snapshots) struct JobMeta {
     pace: JobPace,
 }
 crate::heap_layout_bound::fields!(JobMeta; key, namespace, stamp_open, started, dependencies,
-    owner, counting, fence, census_trusted, pages, unavailable_resumes, charge, eof_applied,
+    owner, counting, fence, census_trusted, pages, unavailable_resumes, custody_deferred, charge, eof_applied,
     pace);
 
 /// Stage 1 guard (`stage1/c14c15-answer.md` §6): one cursor attempt's
@@ -2248,6 +2250,111 @@ fn exact_copy(value: &str) -> String {
 
 static NEXT_CURSOR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Existing cursor write intent, not a read receipt or a second store.
+/// `entry` only escrows an existing allocation when no attributed key exists.
+/// Only negative fields are overlaid on committed state.
+// OS pathname bound, inline: binding is copied before optional funding,
+// without allocating or inventing a digest/identity for the destination.
+struct CustodyOrigin {
+    bytes: [u8; 4096],
+    len: usize,
+}
+impl CustodyOrigin {
+    fn new(path: &Path) -> Self {
+        let value = path.as_os_str().as_encoded_bytes();
+        let mut origin = Self {
+            bytes: [0; 4096],
+            len: value.len(),
+        };
+        if value.len() <= origin.bytes.len() {
+            origin.bytes[..value.len()].copy_from_slice(value);
+        }
+        origin
+    }
+    fn matches(&self, path: &Path) -> bool {
+        self.len <= self.bytes.len()
+            && self.bytes[..self.len] == *path.as_os_str().as_encoded_bytes()
+    }
+}
+pub(in crate::snapshots) struct CustodyDecision {
+    origin: CustodyOrigin,
+    pub(in crate::snapshots) key: String,
+    pub(in crate::snapshots) cause: crate::local_resource_diagnostics::CodexZstCause,
+    pub(in crate::snapshots) owners: BTreeSet<String>,
+    pub(in crate::snapshots) veto: BTreeSet<String>,
+    pub(in crate::snapshots) entry: Option<ScanIndexEntry>,
+}
+impl HeapLayoutBound for CustodyDecision {
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        self.key.heap_bound(c)?;
+        self.owners.heap_bound(c)?;
+        self.veto.heap_bound(c)?;
+        self.entry.heap_bound(c)
+    }
+}
+struct CustodyWrite {
+    pending: Option<CustodyDecision>,
+}
+impl HeapLayoutBound for CustodyWrite {
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        self.pending.heap_bound(c)
+    }
+}
+/// Owns refusal across allocation and disk I/O, with no cursor lock held.
+pub(in crate::snapshots) struct CustodySave {
+    cache: Arc<SharedCache>,
+    pub(in crate::snapshots) decision: Option<CustodyDecision>,
+}
+impl CustodySave {
+    pub(in crate::snapshots) fn fund(&self, bytes: usize) -> Option<CustodyFunding> {
+        self.cache
+            .cursor_claim(bytes, true)
+            .map(|credit| CustodyFunding(Some(credit)))
+    }
+    pub(in crate::snapshots) fn complete(mut self, index: &mut ScanIndex) {
+        let d = self.decision.take().expect("owned decision");
+        let entry = index
+            .files
+            .entry(d.key.clone())
+            .or_insert_with(|| d.entry.unwrap_or_default());
+        entry.codex_compressed_hold = Some(d.cause);
+        index.codex_state_only_blocked_session_ids.extend(d.veto);
+        index
+            .codex_state_only_blocked_session_ids
+            .extend(d.owners.iter().cloned());
+        if !d.owners.is_empty() {
+            index
+                .codex_state_only_blocked_by_file
+                .entry(d.key)
+                .or_default()
+                .extend(d.owners);
+        }
+        self.cache
+            .with_cursor(|cursor| cursor.custody_unsaved = None);
+    }
+}
+/// Existing cursor credit held across staging and disk save; refunded outside
+/// the cursor lock on every outcome. No decoder admission is involved.
+pub(in crate::snapshots) struct CustodyFunding(Option<CursorCredit>);
+impl Drop for CustodyFunding {
+    fn drop(&mut self) {
+        if let Some(credit) = self.0.take() {
+            credit.refund();
+        }
+    }
+}
+impl Drop for CustodySave {
+    fn drop(&mut self) {
+        if let Some(decision) = self.decision.take() {
+            self.cache.with_cursor(|cursor| {
+                cursor.custody_unsaved = Some(CustodyWrite {
+                    pending: Some(decision),
+                })
+            });
+        }
+    }
+}
+
 pub(in crate::snapshots) struct CursorState {
     pub(in crate::snapshots) headers: codex_file_join::HeaderCache,
     slot: Slot,
@@ -2277,6 +2384,9 @@ pub(in crate::snapshots) struct CursorState {
     memo: SingletonMemo,
     wake: WakeIdentities,
     invalidations: BTreeMap<String, (u32, u64)>,
+    /// One serialized negative write intent; survives job loss/save refusal.
+    /// No read permission or consumed-progress receipt.
+    custody_unsaved: Option<CustodyWrite>,
     parked: BTreeMap<String, Parked>,
     rotation: Rotation,
     counters: Counters,
@@ -2317,6 +2427,7 @@ impl Default for CursorState {
             memo: SingletonMemo::default(),
             wake: WakeIdentities::default(),
             invalidations: BTreeMap::new(),
+            custody_unsaved: None,
             parked: BTreeMap::new(),
             rotation: Rotation::default(),
             counters: Counters::default(),
@@ -2348,6 +2459,7 @@ impl HeapLayoutBound for CursorState {
             memo,
             wake,
             invalidations,
+            custody_unsaved,
             parked,
             rotation,
             counters,
@@ -2385,6 +2497,7 @@ impl HeapLayoutBound for CursorState {
         memo.heap_bound(c)?;
         wake.heap_bound(c)?;
         invalidations.heap_bound(c)?;
+        custody_unsaved.heap_bound(c)?;
         parked.heap_bound(c)?;
         rotation.heap_bound(c)?;
         counters.heap_bound(c)?;
@@ -3661,6 +3774,18 @@ pub(in crate::snapshots) fn group_dependencies(
     sha256_hex_owned(&parts)
 }
 
+/// No temporary roster allocation for a custody check on a live job.
+pub(in crate::snapshots) fn job_has_custody(job: &OwnedActiveFile, index: &ScanIndex) -> bool {
+    std::iter::once(&job.candidate)
+        .chain(job.group.iter().flat_map(|group| group.members.iter()))
+        .any(|file| {
+            index
+                .files
+                .get(&local_index_key(&file.path))
+                .is_some_and(|entry| entry.codex_compressed_hold.is_some())
+        })
+}
+
 /// Every file a job holds: a group's members, else the singleton's file.
 pub(in crate::snapshots) fn job_files(job: &OwnedActiveFile) -> Vec<&CandidateFile> {
     match job.group.as_ref() {
@@ -4576,6 +4701,125 @@ impl SharedCache {
             .unwrap_or(false)
     }
 
+    /// Move existing negative state into the serialized write holder BEFORE
+    /// funding. Refusal must own the attribution as well as the cause. Moving
+    /// already resident allocations allocates nothing; replay cannot read.
+    pub(in crate::snapshots) fn custody_decision_to_save(
+        self: &Arc<Self>,
+        namespace: &Scope,
+        index: &mut ScanIndex,
+        committed: &ScanIndex,
+        path: &Path,
+    ) -> anyhow::Result<Option<CustodySave>> {
+        let mut first = false;
+        let decision = self
+            .with_cursor(|cursor| {
+                if cursor.custody_unsaved.is_none() {
+                    let Slot::Paused(job) = &mut cursor.slot else {
+                        return Ok(None);
+                    };
+                    if !job
+                        .cursor
+                        .as_ref()
+                        .is_some_and(|m| m.namespace == namespace.0)
+                    {
+                        return Ok(None);
+                    }
+                    for key in cursor.slot_key.iter().chain(&cursor.slot_members) {
+                        let Some(cause) =
+                            index.files.get(key).and_then(|e| e.codex_compressed_hold)
+                        else {
+                            continue;
+                        };
+                        let owners = index.codex_state_only_blocked_by_file.get(key);
+                        if committed
+                            .files
+                            .get(key)
+                            .is_some_and(|e| e.codex_compressed_hold == Some(cause))
+                            && owners.into_iter().flatten().all(|owner| {
+                                committed
+                                    .codex_state_only_blocked_by_file
+                                    .get(key)
+                                    .is_some_and(|s| s.contains(owner))
+                                    && committed
+                                        .codex_state_only_blocked_session_ids
+                                        .contains(owner)
+                            })
+                            && index
+                                .codex_state_only_blocked_session_ids
+                                .is_subset(&committed.codex_state_only_blocked_session_ids)
+                        {
+                            continue;
+                        }
+                        // Reuse an existing key allocation. With no attribution,
+                        // escrow the entry too; it is returned unchanged, never
+                        // copied into the committed index as accepted authority.
+                        let (key, owners, entry) =
+                            match index.codex_state_only_blocked_by_file.remove_entry(key) {
+                                Some((key, owners)) => (key, owners, None),
+                                None => {
+                                    let (key, entry) =
+                                        index.files.remove_entry(key).expect("held entry");
+                                    (key, BTreeSet::new(), Some(entry))
+                                }
+                            };
+                        cursor.custody_unsaved = Some(CustodyWrite {
+                            pending: Some(CustodyDecision {
+                                origin: CustodyOrigin::new(path),
+                                key,
+                                cause,
+                                owners,
+                                veto: std::mem::take(
+                                    &mut index.codex_state_only_blocked_session_ids,
+                                ),
+                                entry,
+                            }),
+                        });
+                        if let Some(meta) = job.cursor.as_mut() {
+                            first = meta.custody_deferred.is_none();
+                            meta.custody_deferred
+                                .get_or_insert((super::now_seconds(), 0));
+                        }
+                        break;
+                    }
+                }
+                match cursor.custody_unsaved.take() {
+                    Some(CustodyWrite {
+                        pending: Some(decision),
+                    }) => {
+                        if !decision.origin.matches(path) {
+                            cursor.custody_unsaved = Some(CustodyWrite {
+                                pending: Some(decision),
+                            });
+                            anyhow::bail!("custody transaction belongs to another index");
+                        }
+                        cursor.custody_unsaved = Some(CustodyWrite { pending: None });
+                        Ok(Some(decision))
+                    }
+                    Some(CustodyWrite { pending: None }) => {
+                        cursor.custody_unsaved = Some(CustodyWrite { pending: None });
+                        anyhow::bail!("custody transaction already saving")
+                    }
+                    None => Ok(None),
+                }
+            })
+            .unwrap_or_else(|| anyhow::bail!("custody decision holder unavailable"))?;
+        if first {
+            crate::local_resource_diagnostics::custody_latch_deferred(1, 0, 0);
+        }
+        Ok(decision.map(|decision| CustodySave {
+            cache: Arc::clone(self),
+            decision: Some(decision),
+        }))
+    }
+
+    /// Yield BEFORE inventory/acquisition until the COMPLETE pending payload
+    /// has been funded and saved. No cause-only replay or allocation here.
+    pub(in crate::snapshots) fn replay_custody_decision(&self) -> bool {
+        self.with_cursor(|cursor| cursor.custody_unsaved.is_some())
+            .unwrap_or(true)
+    }
+
     /// The key of the paused or active job (tests; selection uses
     /// `cursor_job_owns`).
     #[cfg(test)]
@@ -5411,6 +5655,7 @@ impl SharedCache {
             census_trusted,
             pages: 1,
             unavailable_resumes: 0,
+            custody_deferred: None,
             charge: None,
             eof_applied: false,
             pace: JobPace::new(pace_key, now, accelerate),
@@ -5504,6 +5749,7 @@ impl SharedCache {
             census_trusted,
             pages: 1,
             unavailable_resumes: 0,
+            custody_deferred: None,
             charge: None,
             eof_applied: false,
             // Stage 1: a group is never paced or accelerated (no slot).
@@ -5713,6 +5959,7 @@ pub(in crate::snapshots) fn requeue(
         .copied()
         .unwrap_or((true, false));
     traversal.pending_candidates.push_back(ScanTraversalPath {
+        order_modified: None,
         scan_root: candidate.scan_root.clone(),
         path: candidate.path.clone(),
         census_member,
@@ -5764,6 +6011,7 @@ pub(in crate::snapshots) fn requeue_members<'a>(
             .copied()
             .unwrap_or((true, false));
         traversal.pending_candidates.push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: candidate.scan_root.clone(),
             path: candidate.path.clone(),
             census_member,
@@ -5825,6 +6073,7 @@ pub(in crate::snapshots) fn release_path(
     });
     if !kept {
         traversal.pending_candidates.push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: candidate.scan_root.clone(),
             path: candidate.path.clone(),
             census_member,
@@ -5869,6 +6118,7 @@ pub(in crate::snapshots) struct ResumeInputs<'a> {
     pub(in crate::snapshots) group_scope: String,
     /// The state and sidecar census are complete now (R1-M1).
     pub(in crate::snapshots) census_complete: bool,
+    pub(in crate::snapshots) custody: Option<&'a ScanIndex>,
 }
 
 /// What the resuming scan supplies to `resume_paused_job`.
@@ -5934,6 +6184,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             context.codex,
             context.claude,
             context.support,
+            None,
         )
         .map(|dependency| {
             sampling.file_scope(
@@ -5948,6 +6199,20 @@ pub(in crate::snapshots) fn resume_paused_job(
     });
     // A group's counting view is built over every member (R1-M2).
     let counting = job_counting_view(&job, index);
+    if context.source == SnapshotSource::Codex && job_has_custody(&job, index) {
+        if let Some(meta) = job.cursor.as_mut() {
+            let first = meta.custody_deferred.is_none();
+            let state = meta
+                .custody_deferred
+                .get_or_insert((super::now_seconds(), 0));
+            state.1 = state.1.saturating_add(1);
+            crate::local_resource_diagnostics::custody_latch_deferred(
+                u64::from(first),
+                state.1,
+                super::now_seconds().saturating_sub(state.0),
+            );
+        }
+    }
     let verdict = revalidate(
         &mut job,
         ResumeInputs {
@@ -5961,6 +6226,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             counting,
             group_scope: group_scope(index),
             census_complete: context.census_complete,
+            custody: Some(index),
         },
     );
     let debt = match verdict {
@@ -6110,6 +6376,7 @@ pub(in crate::snapshots) fn revalidate(
         inputs.codex,
         inputs.claude,
         inputs.support,
+        None,
     ) else {
         return Resume::Unavailable;
     };
@@ -6130,19 +6397,64 @@ pub(in crate::snapshots) fn revalidate(
     if job.sampling.as_ref().map(|active| &active.scope) != Some(scope) {
         return changed;
     }
-    let Some(inventory) = inputs.inventory.filter(|inventory| inventory.complete) else {
+    let Some(inventory) = inputs.inventory.filter(|inventory| {
+        inventory.resumable_for(meta.owner.as_ref(), meta.custody_deferred.is_some())
+    }) else {
         return Resume::Unavailable;
     };
-    let members = inventory
-        .headers
-        .iter()
-        .filter(|header| Some(&header.owner) == meta.owner.as_ref())
-        .count();
-    if meta.owner.is_some() && members > 1 {
-        // A continuation appeared: the owner is now a group, never a singleton.
-        return Resume::Changed;
+    if let Some(owner) = meta.owner.as_ref() {
+        if inventory.headers.iter().any(|header| {
+            &header.owner == owner
+                && header.candidate.path != job.candidate.path
+                && !codex_archive_path(&header.candidate.path)
+        }) {
+            return Resume::Changed;
+        }
+        match held_roster_has_extra(inputs.custody, owner, None, |key| key == meta.key) {
+            Some(true) => return Resume::Changed,
+            None => return Resume::Unavailable,
+            Some(false) => {}
+        }
     }
     revalidate_decisions(job, inputs.traces, inputs.parents)
+}
+
+/// Negative membership evidence, independent of read/selection eligibility.
+/// One capped roster pass, borrowed keys/owners only; exhaustion grants no resume.
+fn held_roster_has_extra(
+    index: Option<&ScanIndex>,
+    owner: &str,
+    home: Option<&Path>,
+    is_boot: impl Fn(&str) -> bool,
+) -> Option<bool> {
+    let Some((index, traversal)) = index.and_then(|i| i.traversal.as_ref().map(|t| (i, t))) else {
+        return Some(false);
+    };
+    for (at, key) in traversal.codex_rollout_paths.iter().enumerate() {
+        if at == codex_file_join::MAX_HEADER_FILES {
+            return None;
+        }
+        // Archives are outside plain continuation groups, just as in groups().
+        if !codex_archive_path(Path::new(key))
+            && !is_boot(key)
+            && index
+                .files
+                .get(key)
+                .is_some_and(|e| e.codex_compressed_hold.is_some())
+            && index
+                .codex_state_only_blocked_by_file
+                .get(key)
+                .is_some_and(|owners| owners.contains(owner))
+            && home.map_or(true, |home| {
+                traversal
+                    .owning_scan_root(Path::new(key))
+                    .is_some_and(|root| codex_file_join::member_home_ref(root) == home)
+            })
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// The group subset of the revalidation checklist (P2): the member being
@@ -6197,20 +6509,47 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
     {
         return changed;
     }
-    let Some(inventory) = inputs.inventory.filter(|inventory| inventory.complete) else {
+    let Some(inventory) = inputs.inventory.filter(|inventory| {
+        inventory.resumable_for(Some(&group.owner), meta.custody_deferred.is_some())
+    }) else {
         return Resume::Unavailable;
     };
-    let current = inventory
+    let mut current = inventory
         .headers
         .iter()
-        .filter(|header| header.owner == group.owner && header.home == group.home)
+        .filter(|header| {
+            header.owner == group.owner
+                && header.home == group.home
+                && !codex_archive_path(&header.candidate.path)
+        })
         .map(|header| local_index_key(&header.candidate.path))
         .collect::<BTreeSet<_>>();
     let members = group
         .members
         .iter()
-        .map(|member| local_index_key(&member.path))
+        .map(|m| local_index_key(&m.path))
         .collect::<BTreeSet<_>>();
+    if current.iter().any(|key| !members.contains(key)) {
+        return Resume::Changed;
+    }
+    match held_roster_has_extra(inputs.custody, &group.owner, Some(&group.home), |key| {
+        members.contains(key)
+    }) {
+        Some(true) => return Resume::Changed,
+        None => return Resume::Unavailable,
+        Some(false) => {}
+    }
+    // Restore omitted boot headers only after ruling out held newcomers.
+    if let Some(index) = inputs.custody {
+        current.extend(group.members.iter().filter_map(|member| {
+            let key = local_index_key(&member.path);
+            index
+                .files
+                .get(&key)
+                .is_some_and(|e| e.codex_compressed_hold.is_some())
+                .then_some(key)
+        }));
+    }
     if current != members {
         // A member appeared or vanished: another job.
         return Resume::Changed;
@@ -6931,6 +7270,7 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
         index.extend_codex_blocked_attribution(&index_key, blocked);
     }
     targets.pending_finalization.push(PendingIndexFinalization {
+        archive_first_read: false,
         sampled_audit_verified: false,
         codex_pending_recovery: index
             .files

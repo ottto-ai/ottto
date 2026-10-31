@@ -31,6 +31,7 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
     let mut candidate = candidate_from_traversal_path(
         source,
         ScanTraversalPath {
+            order_modified: None,
             scan_root: f.root.clone(),
             path: f.file.0.clone(),
             census_member: true,
@@ -39,7 +40,7 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
         &mut census,
         None,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     )
     .unwrap();
     prepare_owned_scan_candidate(
@@ -55,7 +56,7 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
         &mut census,
         None,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     )
     .unwrap()
     .0

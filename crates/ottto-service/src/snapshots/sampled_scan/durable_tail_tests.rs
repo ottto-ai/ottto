@@ -995,6 +995,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     let candidate = candidate_from_traversal_path(
                         source,
                         ScanTraversalPath {
+                            order_modified: None,
                             scan_root: transcripts.clone(),
                             path: path.clone(),
                             census_member: true,
@@ -1003,7 +1004,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         &mut ScanCensus::default(),
                         None,
                         365,
-                        &BTreeMap::new(),
+                        crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
                     )
                     .unwrap();
                     assert!(sampled_scan::reduction_dependencies(
@@ -1011,6 +1012,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         &candidate,
                         &scan.codex_title_metadata,
                         &scan.claude_title_metadata,
+                        None,
                         None
                     )
                     .is_none());
@@ -1864,6 +1866,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     let candidate = candidate_from_traversal_path(
         source,
         ScanTraversalPath {
+            order_modified: None,
             scan_root: sessions.clone(),
             path: held.clone(),
             census_member: true,
@@ -1872,7 +1875,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         &mut census,
         None,
         365,
-        &BTreeMap::new(),
+        DiscoveryRetention::unverified(&BTreeMap::new()),
     )
     .unwrap();
     cache.durable_hold_exit(

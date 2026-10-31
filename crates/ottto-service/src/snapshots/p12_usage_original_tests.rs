@@ -163,6 +163,7 @@ impl Family {
                     .expect("exact parsed member key");
                 let old = &previous.files[key];
                 PendingIndexFinalization {
+                    archive_first_read: false,
                     sampled_audit_verified: false,
                     codex_pending_recovery: false,
                     index_key: key.clone(),

@@ -2160,10 +2160,12 @@ fn production_finish_closure_mints_a_paused_accelerated_page_with_evidence() {
             Arc::clone(&cache),
             crate::transcript_acquisition::Scope("mint-fixture".into()),
         );
-        let mut scan = loop {
+        let (mut scan, mut index) = loop {
             match owned.step(None) {
                 crate::snapshots::OwnedSourceScanStep::Pending(next) => owned = next,
-                crate::snapshots::OwnedSourceScanStep::Complete { scan, .. } => break scan,
+                crate::snapshots::OwnedSourceScanStep::Complete { scan, index, .. } => {
+                    break (scan, index)
+                }
             }
         };
         assert!(scan.snapshots.is_empty());
@@ -2188,10 +2190,14 @@ fn production_finish_closure_mints_a_paused_accelerated_page_with_evidence() {
             Some((world.now.get(), world.now.get() + LIFETIME)),
         )
         .unwrap();
+        index.archive_pass.power = true;
+        index.archive_pass.started = true;
+        index.archive_pass.observe(Some(30_000_001), 1);
         let (ticket, records) = crate::local_resource_diagnostics::capture(|| {
             super::super::continuation_finish_inputs(
                 &mut preparation,
                 &mut scan,
+                &index,
                 Some(8 * 1024 * 1024),
                 &Arc::default(),
                 Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
@@ -2208,6 +2214,11 @@ fn production_finish_closure_mints_a_paused_accelerated_page_with_evidence() {
                 let inputs = page.inputs.as_ref().unwrap();
                 assert!(inputs.evidence.as_ref().unwrap().content_unchanged());
                 assert!(inputs.holds_attribution());
+                assert_eq!(inputs.archive_pass.cpu, 30_000_001);
+                assert!(
+                    !inputs.archive_pass.ready(u64::MAX),
+                    "ticket cannot renew archive CPU credit"
+                );
             }
             _ => panic!("a production Codex ticket"),
         }

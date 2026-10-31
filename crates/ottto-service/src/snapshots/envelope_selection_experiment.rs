@@ -274,6 +274,7 @@ pub(crate) fn after_selected_restore(index: &mut ScanIndex, previous: &ScanIndex
                         .cloned()
                     {
                         first.push_back(ScanTraversalPath {
+                            order_modified: None,
                             scan_root,
                             path: path.clone(),
                             census_member: true,

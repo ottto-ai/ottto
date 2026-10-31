@@ -1352,6 +1352,7 @@ impl SelectedFallback {
                 .max_by_key(|root| root.components().count())
                 .ok_or("native comparison recovery path left its roots")?;
             priority.push_back(ScanTraversalPath {
+                order_modified: None,
                 scan_root: root.clone(),
                 path: path.to_path_buf(),
                 census_member: true,

@@ -314,6 +314,7 @@ fn fence_filters_watcher_hint_after_attempt() {
     let traversal = index.traversal.as_mut().expect("the generation continues");
     let scan_root = traversal.scan_roots[0].clone();
     traversal.pending_candidates.push_back(ScanTraversalPath {
+        order_modified: None,
         path: scan_root.join("b.jsonl"),
         scan_root,
         census_member: false,

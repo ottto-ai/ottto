@@ -295,6 +295,7 @@ impl ContinuationFixture {
         let mut minted = self.preparation(true);
         let mut inputs = take_continuation_inputs(
             &mut minted,
+            &ScanIndex::default(),
             &std::sync::Arc::default(),
             std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
         );
@@ -321,6 +322,7 @@ pub(super) fn continuation_inputs_for_test(
     let mut preparation = fixture.preparation(attribution);
     let inputs = take_continuation_inputs(
         &mut preparation,
+        &ScanIndex::default(),
         &std::sync::Arc::default(),
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
@@ -340,6 +342,7 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
         .is_some());
     let inputs = take_continuation_inputs(
         &mut preparation,
+        &ScanIndex::default(),
         &std::sync::Arc::default(),
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
@@ -372,6 +375,7 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     let mut minted = fixture.preparation(true);
     let mut inputs = take_continuation_inputs(
         &mut minted,
+        &ScanIndex::default(),
         &std::sync::Arc::default(),
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
@@ -495,6 +499,7 @@ fn a_pending_historical_replay_refuses_the_continuation_prepare() {
     let mut minted = fixture.preparation(true);
     let mut inputs = take_continuation_inputs(
         &mut minted,
+        &ScanIndex::default(),
         &std::sync::Arc::default(),
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
@@ -613,6 +618,7 @@ fn no_continuation_output_serializes_the_attribution_key() {
     let mut minted = fixture.preparation(true);
     let mut inputs = take_continuation_inputs(
         &mut minted,
+        &ScanIndex::default(),
         &std::sync::Arc::default(),
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
@@ -799,6 +805,7 @@ fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
         let mut minted = fixture.preparation(true);
         let mut inputs = take_continuation_inputs(
             &mut minted,
+            &ScanIndex::default(),
             &std::sync::Arc::default(),
             std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
         );
@@ -813,5 +820,27 @@ fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
             ordinary_saved,
             "the next ordinary pass"
         );
+    }
+}
+
+#[test]
+fn archive_power_policy_uses_the_native_continuation_answers() {
+    use continuation::{PlatformGates, PlatformState};
+    struct Signals(PlatformState);
+    impl PlatformGates for Signals {
+        fn power(&mut self) -> PlatformState {
+            self.0
+        }
+        fn enter_background_qos(&mut self) -> PlatformState {
+            PlatformState::Allowed
+        }
+        fn restore_qos(&mut self) {}
+    }
+    for (state, expected) in [
+        (PlatformState::Allowed, true),
+        (PlatformState::Unknown, false),
+        (PlatformState::Refused, false),
+    ] {
+        assert_eq!(archive_power_ready_with(&mut Signals(state)), expected);
     }
 }

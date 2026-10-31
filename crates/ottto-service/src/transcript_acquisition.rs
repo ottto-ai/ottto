@@ -64,6 +64,15 @@ impl FileStamp {
         })
     }
 
+    /// Archive completion keeps only the same_content witness, never ctime.
+    pub(crate) fn content_only(mut self) -> Self {
+        #[cfg(unix)]
+        {
+            self.changed = (0, 0);
+        }
+        self
+    }
+
     pub(crate) fn same_object(&self, other: &Self) -> bool {
         #[cfg(unix)]
         {
@@ -243,16 +252,79 @@ impl LossyPrefixIdentity {
     }
 }
 
+// The Vec niche carries this RAM-only domain without growing plain witnesses.
+// Delegate physical heap traversal directly, preserving its visit and byte cost.
+#[derive(Clone, Debug)]
+enum CheckpointSamples {
+    Physical(Samples),
+    Archive,
+}
+impl CheckpointSamples {
+    fn as_ref(&self) -> Option<&Samples> {
+        match self {
+            Self::Physical(samples) => Some(samples),
+            Self::Archive => None,
+        }
+    }
+    #[cfg(all(test, unix))]
+    fn as_mut(&mut self) -> Option<&mut Samples> {
+        match self {
+            Self::Physical(samples) => Some(samples),
+            Self::Archive => None,
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for CheckpointSamples {
+    fn stable_heap(&self) -> bool {
+        self.as_ref()
+            .map_or(true, crate::heap_layout_bound::HeapLayoutBound::stable_heap)
+    }
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self.as_ref() {
+            Some(samples) => crate::heap_layout_bound::HeapLayoutBound::heap_bound(samples, c),
+            None => c.add(0),
+        }
+    }
+    fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self.as_ref() {
+            Some(samples) => {
+                crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(samples, c)
+            }
+            None => c.add(0),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Checkpoint {
     stamp: FileStamp,
     scope: Scope,
-    samples: Samples,
+    // The archive domain carries no physical sample or offset authority.
+    samples: CheckpointSamples,
     last_full_verified_unix_seconds: u64,
     audit_debt: Option<AuditDebt>,
 }
 
+// Vec's non-null representation supplies the archive discriminant without
+// growing ordinary checkpoints or changing their frozen cache charge.
+const _: () = assert!(std::mem::size_of::<CheckpointSamples>() == std::mem::size_of::<Samples>());
+
 impl Checkpoint {
+    /// RAM-only archive reduction witness. It certifies no physical prefix or
+    /// samples: archives are replace-only and never enter durable restoration.
+    /// The caller supplies a complete validated decode before cache admission.
+    pub(crate) fn completed_archive(file: &File, scope: &Scope, now: u64) -> io::Result<Self> {
+        Ok(Self {
+            stamp: FileStamp::capture(file.metadata()?)?.content_only(),
+            scope: scope.clone(),
+            samples: CheckpointSamples::Archive,
+            last_full_verified_unix_seconds: now,
+            audit_debt: None,
+        })
+    }
+    pub(crate) fn is_compressed(&self) -> bool {
+        matches!(self.samples, CheckpointSamples::Archive)
+    }
     /// A cache admission hint only. Source validation still uses the complete
     /// stamp, scope, samples and independent audit obligation.
     pub(crate) fn modified_hint(&self) -> (i64, i64) {
@@ -266,7 +338,9 @@ impl Checkpoint {
         }
     }
     pub(crate) fn sealed_offset(&self) -> u64 {
-        self.samples.sealed_offset
+        self.samples
+            .as_ref()
+            .map_or(0, |samples| samples.sealed_offset)
     }
     /// Whether the opened object `file` still has the content this
     /// checkpoint committed (`FileStamp::same_content`): no append,
@@ -332,8 +406,11 @@ impl Checkpoint {
             stamp: &self.stamp,
             exact_stamp: Self::EXACT_STAMP,
             scope: &self.scope.0,
-            sealed_offset: self.samples.sealed_offset,
-            samples_valid: self.samples.valid_for(self.stamp.length),
+            sealed_offset: self.sealed_offset(),
+            samples_valid: self
+                .samples
+                .as_ref()
+                .is_some_and(|samples| samples.valid_for(self.stamp.length)),
             verified: self.last_full_verified_unix_seconds,
         }
     }
@@ -359,12 +436,14 @@ impl Checkpoint {
     /// growth to the seal and is not refused (see `PrefixSeal::admits`).
     /// `commit_sealed_prefix` checkpoints already store `length = s`.
     pub(crate) fn seal_as(&self, now: u64, scope: &Scope) -> PrefixSeal {
+        let empty = Samples::default();
+        let samples = self.samples.as_ref().unwrap_or(&empty);
         let mut stamp = self.stamp.clone();
-        stamp.length = self.samples.sealed_offset;
+        stamp.length = samples.sealed_offset;
         // Unequal windows can never be valid: `admits` then refuses the seal
         // as `InvalidCheckpoint`, exactly as `prepare` refuses the checkpoint.
-        let sample_len = if self.samples.head.len() == self.samples.boundary.len() {
-            u32::try_from(self.samples.head.len()).unwrap_or(u32::MAX)
+        let sample_len = if !self.is_compressed() && samples.head.len() == samples.boundary.len() {
+            u32::try_from(samples.head.len()).unwrap_or(u32::MAX)
         } else {
             u32::MAX
         };
@@ -372,8 +451,8 @@ impl Checkpoint {
             stamp,
             scope: scope.0.clone(),
             sample_len,
-            head_sha256: sha256_hex(&self.samples.head),
-            boundary_sha256: sha256_hex(&self.samples.boundary),
+            head_sha256: sha256_hex(&samples.head),
+            boundary_sha256: sha256_hex(&samples.boundary),
             verified_unix_seconds: self.last_full_verified_unix_seconds,
             sealed_unix_seconds: now,
             audit_debt_unix_seconds: self.audit_debt.map(|debt| debt.due_unix_seconds),
@@ -847,12 +926,16 @@ impl ReadPlan {
             now,
             |at| {
                 let old = checkpoint.expect("samples are compared only with a checkpoint");
+                let samples = old
+                    .samples
+                    .as_ref()
+                    .expect("only physical checkpoints compare samples");
                 match at {
-                    SampleAt::Head => sample_at(file, 0, &old.samples.head, &mut guard_bytes_read),
+                    SampleAt::Head => sample_at(file, 0, &samples.head, &mut guard_bytes_read),
                     SampleAt::Boundary => sample_at(
                         file,
-                        old.samples.sealed_offset - old.samples.boundary.len() as u64,
-                        &old.samples.boundary,
+                        samples.sealed_offset - samples.boundary.len() as u64,
+                        &samples.boundary,
                         &mut guard_bytes_read,
                     ),
                 }
@@ -891,6 +974,8 @@ impl ReadPlan {
             checkpoint
                 .expect("reusable mode requires checkpoint")
                 .samples
+                .as_ref()
+                .expect("reusable mode requires physical samples")
                 .clone()
         };
         let start_offset = samples.sealed_offset;
@@ -1040,7 +1125,7 @@ impl ReadPlan {
         Ok(Checkpoint {
             stamp: self.stamp,
             scope: self.scope,
-            samples: self.samples,
+            samples: CheckpointSamples::Physical(self.samples),
             last_full_verified_unix_seconds: verified,
             audit_debt,
         })
@@ -1194,7 +1279,7 @@ impl ReadPlan {
         Ok(Checkpoint {
             stamp,
             scope: self.scope,
-            samples: self.samples,
+            samples: CheckpointSamples::Physical(self.samples),
             last_full_verified_unix_seconds: verified,
             audit_debt,
         })
@@ -1525,9 +1610,8 @@ impl Checkpoint {
     /// This checkpoint as a content-free durable certificate. `None` when its
     /// samples are not valid for its stamp (such a checkpoint never admits).
     pub(crate) fn durable_certificate(&self, birth_nanos: u64) -> Option<DurableCertificate> {
-        if !self.samples.valid_for(self.stamp.length)
-            || self.samples.head.len() != self.samples.boundary.len()
-        {
+        let samples = self.samples.as_ref()?;
+        if !samples.valid_for(self.stamp.length) || samples.head.len() != samples.boundary.len() {
             return None;
         }
         Some(DurableCertificate {
@@ -1536,10 +1620,10 @@ impl Checkpoint {
             length: self.stamp.length,
             modified: self.stamp.modified,
             birth_nanos,
-            sealed_offset: self.samples.sealed_offset,
-            sample_len: u32::try_from(self.samples.head.len()).ok()?,
-            head_sha256: durable_sample_digest(&self.samples.head),
-            boundary_sha256: durable_sample_digest(&self.samples.boundary),
+            sealed_offset: samples.sealed_offset,
+            sample_len: u32::try_from(samples.head.len()).ok()?,
+            head_sha256: durable_sample_digest(&samples.head),
+            boundary_sha256: durable_sample_digest(&samples.boundary),
             verified_unix_seconds: self.last_full_verified_unix_seconds,
             audit_debt_unix_seconds: self.audit_debt.map(|debt| debt.due_unix_seconds),
         })
@@ -1604,17 +1688,22 @@ impl DurableCertificate {
                 changed: current.changed,
             },
             scope,
-            samples: Samples {
+            samples: CheckpointSamples::Physical(Samples {
                 sealed_offset: self.sealed_offset,
                 head,
                 boundary,
-            },
+            }),
             last_full_verified_unix_seconds: self.verified_unix_seconds,
             audit_debt: self
                 .audit_debt_unix_seconds
                 .map(|due_unix_seconds| AuditDebt { due_unix_seconds }),
         };
-        if !checkpoint.samples.valid_for(checkpoint.stamp.length) {
+        if !checkpoint
+            .samples
+            .as_ref()
+            .expect("restored physical samples")
+            .valid_for(checkpoint.stamp.length)
+        {
             return Err(CertificateRefusal::Changed(FullReason::InvalidCheckpoint));
         }
         Ok((checkpoint, admission))
@@ -1851,6 +1940,64 @@ mod tests {
                 .unwrap(),
             read,
         )
+    }
+
+    #[test]
+    fn archive_domain_preserves_plain_checkpoint_layout_and_charge() {
+        // The pre-archive RAM shape, not a persisted representation.
+        struct PlainCheckpoint {
+            stamp: FileStamp,
+            scope: Scope,
+            samples: Samples,
+            last_full_verified_unix_seconds: u64,
+            audit_debt: Option<AuditDebt>,
+        }
+        crate::heap_layout_bound::fields!(PlainCheckpoint; stamp, scope, samples,
+            last_full_verified_unix_seconds, audit_debt);
+        assert_eq!(
+            std::mem::size_of::<Checkpoint>(),
+            std::mem::size_of::<PlainCheckpoint>()
+        );
+        let f = Fixture::new(b"one\n");
+        let native = initial(&f, 100);
+        let baseline = PlainCheckpoint {
+            stamp: native.stamp.clone(),
+            scope: native.scope.clone(),
+            samples: native.samples.as_ref().unwrap().clone(),
+            last_full_verified_unix_seconds: native.last_full_verified_unix_seconds,
+            audit_debt: native.audit_debt,
+        };
+        let plain = Checkpoint {
+            stamp: baseline.stamp.clone(),
+            scope: baseline.scope.clone(),
+            samples: CheckpointSamples::Physical(baseline.samples.clone()),
+            last_full_verified_unix_seconds: baseline.last_full_verified_unix_seconds,
+            audit_debt: baseline.audit_debt,
+        };
+        assert_eq!(
+            crate::heap_layout_bound::bound(&plain, usize::MAX),
+            crate::heap_layout_bound::bound(&baseline, usize::MAX)
+        );
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let mut before = Counter::new(usize::MAX);
+        baseline.heap_bound(&mut before).unwrap();
+        let mut after = Counter::new(usize::MAX);
+        plain.heap_bound(&mut after).unwrap();
+        assert_eq!(before.bytes, after.bytes);
+        assert_eq!(before.visits_for_test(), after.visits_for_test());
+        let mut before = Counter::new(usize::MAX);
+        baseline.completed_heap_bound(&mut before).unwrap();
+        let mut after = Counter::new(usize::MAX);
+        plain.completed_heap_bound(&mut after).unwrap();
+        assert_eq!(before.bytes, after.bytes);
+        assert_eq!(before.visits_for_test(), after.visits_for_test());
+        let mut file = f.open();
+        let archive = Checkpoint::completed_archive(&file, &scope(), 100).unwrap();
+        assert!(archive.is_compressed());
+        let plan = ReadPlan::prepare(&mut file, Some(&archive), &scope(), None, 101).unwrap();
+        assert_eq!(plan.mode(), ReadMode::Full(FullReason::InvalidCheckpoint));
+        #[cfg(unix)]
+        assert!(archive.durable_certificate(0).is_none());
     }
 
     #[test]
@@ -2320,8 +2467,11 @@ mod tests {
         framed.push(b'\n');
         let f = Fixture::new(&framed);
         let cp = initial(&f, 0);
-        assert_eq!(cp.samples.head, framed[..SAMPLE_BYTES]);
-        assert_eq!(cp.samples.boundary, framed[framed.len() - SAMPLE_BYTES..]);
+        assert_eq!(cp.samples.as_ref().unwrap().head, framed[..SAMPLE_BYTES]);
+        assert_eq!(
+            cp.samples.as_ref().unwrap().boundary,
+            framed[framed.len() - SAMPLE_BYTES..]
+        );
         assert_eq!(run(&f, Some(&cp), None, 1).2, 0);
         f.append(b"tail\n");
         let (_, cp, read) = run(&f, Some(&cp), None, 2);
@@ -2329,7 +2479,7 @@ mod tests {
         let mut expected = framed;
         expected.extend_from_slice(b"tail\n");
         assert_eq!(
-            cp.samples.boundary,
+            cp.samples.as_ref().unwrap().boundary,
             expected[expected.len() - SAMPLE_BYTES..]
         );
     }
@@ -2338,13 +2488,13 @@ mod tests {
     fn invalid_offsets_and_samples_full_reset_instead_of_panicking() {
         let f = Fixture::new(b"one\n");
         let mut cp = initial(&f, 0);
-        cp.samples.sealed_offset = 99;
+        cp.samples.as_mut().unwrap().sealed_offset = 99;
         assert_eq!(
             run(&f, Some(&cp), None, 1).0,
             ReadMode::Full(FullReason::InvalidCheckpoint)
         );
         let mut cp = initial(&f, 0);
-        cp.samples.head.clear();
+        cp.samples.as_mut().unwrap().head.clear();
         assert_eq!(
             run(&f, Some(&cp), None, 1).0,
             ReadMode::Full(FullReason::InvalidCheckpoint)
@@ -2469,7 +2619,7 @@ mod tests {
             .commit_after_native_completion(&file, &scope(), 100)
             .unwrap();
         assert_eq!(cp.sealed_offset(), 12);
-        assert_eq!(cp.samples.boundary, b"abcdefghijk\n");
+        assert_eq!(cp.samples.as_ref().unwrap().boundary, b"abcdefghijk\n");
         f.append(b"\n");
         let (mode, cp, _) = run(&f, Some(&cp), None, 101);
         assert_eq!(mode, ReadMode::Tail);
@@ -3114,7 +3264,7 @@ mod tests {
         );
         // Unequal windows: `seal_as` marks them, both refuse.
         let mut unequal = cp.clone();
-        unequal.samples.head.pop();
+        unequal.samples.as_mut().unwrap().head.pop();
         assert_eq!(
             prepared(&f, &unequal, &scope(), 1100),
             Err(FullReason::InvalidCheckpoint)
@@ -3824,11 +3974,11 @@ mod tests {
         let checkpoint = Checkpoint {
             stamp,
             scope: scope(),
-            samples: Samples {
+            samples: CheckpointSamples::Physical(Samples {
                 sealed_offset: sealed,
                 head,
                 boundary: boundary.clone(),
-            },
+            }),
             last_full_verified_unix_seconds: now,
             audit_debt: None,
         };

@@ -196,7 +196,8 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
         false,
         false,
         false,
-        &ScanIndex::default(),
+        &mut ScanIndex::default(),
+        None,
     )
     .unwrap();
     while !parser.step().unwrap() {}

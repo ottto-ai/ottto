@@ -1612,6 +1612,7 @@ fn drain_fence_at_clean_terminal(
 fn absence_retirement_keeps_every_family_after_any_traversal_problem() {
     restart_claude_reemission_stop_for_test();
     let pending_path = || ScanTraversalPath {
+        order_modified: None,
         scan_root: PathBuf::from("/synthetic/projects"),
         path: PathBuf::from("/synthetic/projects/elsewhere"),
         census_member: true,

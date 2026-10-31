@@ -409,6 +409,13 @@ fn codex_proof_job_still_valid(
     readers: &CodexProofReaders,
 ) -> bool {
     let compatible = |reader: &CodexProofReader| {
+        if index
+            .files
+            .get(&reader.key)
+            .is_some_and(|e| e.codex_compressed_hold.is_some())
+        {
+            return false;
+        }
         held_stamp(reader).is_some_and(|now| reader.stamp_open.append_compatible(&now))
     };
     if !compatible(&readers.parent)
@@ -490,6 +497,12 @@ fn start_codex_proof_job(
             .filter(|root| path.starts_with(root))
             .max_by_key(|root| root.components().count())
             .cloned()
+            .filter(|_| {
+                !index
+                    .files
+                    .get(&key)
+                    .is_some_and(|e| e.codex_compressed_hold.is_some())
+            })
             .and_then(|scan_root| {
                 open_candidate_beneath_root(&CandidateFile {
                     physical_identity: None,

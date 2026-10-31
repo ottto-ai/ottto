@@ -3,6 +3,7 @@
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
+use crate::local_resource_diagnostics::{codex_zst_refused, traversal_point};
 use crate::transcript_acquisition::{ReadMode, Scope};
 use crate::transcript_cache::{Release, TranscriptCache, CACHE_BYTES, CACHE_ENTRIES, ENTRY_BYTES};
 use sampled_jsonl::CachedJsonlReduction;
@@ -305,8 +306,30 @@ impl SharedCache {
         &self,
         key: &str,
     ) -> Option<crate::transcript_cache::Taken<CachedJsonlReduction>> {
+        self.take_domain(key, false)
+    }
+    // Only the Pending archive re-emission path may consume this domain.
+    fn take_archive(
+        &self,
+        key: &str,
+    ) -> Option<crate::transcript_cache::Taken<CachedJsonlReduction>> {
+        self.take_domain(key, true)
+    }
+    fn take_domain(
+        &self,
+        key: &str,
+        compressed: bool,
+    ) -> Option<crate::transcript_cache::Taken<CachedJsonlReduction>> {
         match self.retained() {
-            Ok(mut cache) => cache.take(key),
+            Ok(mut cache) => {
+                if cache
+                    .peek(key)
+                    .is_some_and(|old| old.checkpoint.is_compressed() != compressed)
+                {
+                    return None;
+                }
+                cache.take(key)
+            }
             Err(_) => {
                 record(Event::TakePoisonedLock);
                 None
@@ -385,6 +408,10 @@ impl SharedCache {
             assert!(poisoner.join().is_err());
         });
     }
+    #[cfg(all(unix, test))]
+    pub(super) fn durable_touch_for_test(&self, key: &str) {
+        self.durable_touch(key);
+    }
     #[cfg(test)]
     pub(super) fn retained_checkpoint(
         &self,
@@ -428,7 +455,7 @@ impl SharedCache {
                 // ranked residents against.
                 let live_bytes_in = live_bytes;
                 #[cfg(unix)]
-                let touched = key.clone();
+                let touched = (!completed.checkpoint.is_compressed()).then(|| key.clone());
                 let retained = crate::transcript_cache::Retained {
                     checkpoint: completed.checkpoint,
                     state,
@@ -442,11 +469,12 @@ impl SharedCache {
                 let reserved = self.retained_reservation(&cache, &key, &retained, live_bytes, rank);
                 let admitted =
                     cache.insert_reserving_at_rank(key, retained, reserved, live_bytes, Some(rank));
+
                 self.drop_suspended_proof_if_over(&cache, live_bytes_in);
                 // M1: an admitted copy is a durable write candidate after the
                 // next successful index save (the durable lock is a leaf).
                 #[cfg(unix)]
-                if admitted {
+                if let Some(touched) = touched.filter(|_| admitted) {
                     self.durable_touch(&touched);
                 }
                 return admitted;
@@ -2097,10 +2125,186 @@ pub(super) fn new_source_parser(
     artifacts: bool,
     curve: bool,
     identity_capture: bool,
-    index: &ScanIndex,
+    index: &mut ScanIndex,
+    cache: Option<&Arc<SharedCache>>,
 ) -> Result<OwnedJsonlParser> {
-    let mut parser = OwnedJsonlParser::new(
+    new_source_parser_with_archive_scope(
         file,
+        candidate,
+        source,
+        metadata,
+        traces,
+        parents,
+        artifacts,
+        curve,
+        identity_capture,
+        index,
+        cache,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn new_source_parser_with_archive_scope(
+    file: File,
+    candidate: &CandidateFile,
+    source: SnapshotSource,
+    metadata: &CodexTitleMetadata,
+    traces: Option<Arc<CodexTurnTraceMap>>,
+    parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    artifacts: bool,
+    curve: bool,
+    identity_capture: bool,
+    index: &mut ScanIndex,
+    cache: Option<&Arc<SharedCache>>,
+    archive_scope: Option<&Scope>,
+) -> Result<OwnedJsonlParser> {
+    // Dedicated custody precedes every cache take, including retained resends.
+    if source == SnapshotSource::Codex {
+        if let Some(cause) = index
+            .files
+            .get(&local_index_key(&candidate.path))
+            .and_then(|entry| entry.codex_compressed_hold)
+        {
+            codex_zst_refused(cause);
+            anyhow::bail!(cause);
+        }
+    }
+    let input = if source == SnapshotSource::Codex
+        && is_compressed_codex_rollout(Some(&candidate.path), None)
+    {
+        let key = local_index_key(&candidate.path);
+        let reuse = index
+            .files
+            .get(&key)
+            .and_then(|e| e.archive.as_deref())
+            .is_some_and(|a| {
+                a.matches(&file)
+                    && !a.quiet(&file)
+                    && !a.user_change
+                    && matches!(a.disposition, ArchiveDisposition::Pending { .. })
+            });
+        if reuse && archive_scope.is_none() {
+            traversal_point(
+                "codex_zst_retained_scope_deferred",
+                "codex",
+                &serde_json::json!({"codex_zst_retained_scope_deferred":1}),
+            );
+            anyhow::bail!(codex_compressed_input::ArchiveScopeDeferred);
+        }
+        if reuse {
+            if let Some((cache, scope)) = cache.zip(archive_scope) {
+                if let Some(taken) = cache.take_archive(&key) {
+                    if taken.retained.checkpoint.stamp_matches(&file)?
+                        && taken.retained.checkpoint.scope() != scope
+                    {
+                        index
+                            .files
+                            .get_mut(&key)
+                            .and_then(|e| e.archive.as_mut())
+                            .expect("matching archive")
+                            .disposition = ArchiveDisposition::Held {
+                            cause: CodexZstCause::CorrectionUnapplied,
+                        };
+                        codex_zst_refused(CodexZstCause::CorrectionUnapplied);
+                        anyhow::bail!(CodexZstCause::CorrectionUnapplied);
+                    }
+                    if taken.retained.checkpoint.stamp_matches(&file)?
+                        && taken.retained.checkpoint.scope() == scope
+                    {
+                        let mut parser = OwnedJsonlParser::new_opened(
+                            OpenedInput::RetainedArchive(file),
+                            &candidate.path,
+                            source,
+                            apply_codex_line,
+                            Some(metadata),
+                            traces,
+                            parents,
+                            artifacts,
+                            curve,
+                        )?;
+                        configure_tier_replay(&mut parser, candidate, index);
+                        codex_counting_version::configure_singleton(&mut parser, candidate, index);
+                        parser
+                            .restore_archive_reduction(taken.retained)
+                            .inspect_err(|_| {
+                                if let Some(archive) =
+                                    index.files.get_mut(&key).and_then(|e| e.archive.as_mut())
+                                {
+                                    archive.disposition = ArchiveDisposition::Held {
+                                        cause: CodexZstCause::CorrectionUnapplied,
+                                    };
+                                }
+                                codex_zst_refused(CodexZstCause::CorrectionUnapplied);
+                            })?;
+                        codex_compressed_input::admission_streak(&key, false);
+                        index
+                            .files
+                            .get_mut(&key)
+                            .and_then(|e| e.archive.as_mut())
+                            .expect("matching archive")
+                            .reservation_saved = true;
+                        traversal_point(
+                            "codex_zst_retained_resend",
+                            "codex",
+                            &serde_json::json!({"codex_zst_retained_resend":1,"codex_zst_decoded_bytes":0}),
+                        );
+                        return Ok(parser);
+                    }
+                }
+            }
+        }
+
+        if let Some(archive) = index.files.get_mut(&key).and_then(|e| e.archive.as_mut()) {
+            anyhow::ensure!(
+                !archive.quiet(&file),
+                "compressed rollout already attempted"
+            );
+            // The driver MUST call persist_archive_reservation before stepping;
+            // only that committed attempt spends the per-stamp decode budget.
+            if archive.matches(&file) && archive.stop_exhausted() {
+                anyhow::bail!("compressed settlement exhausted");
+            }
+        }
+        index
+            .codex_state_only_blocked_session_ids
+            .extend(codex_session_id_candidates_from_path(
+                &candidate.path.with_extension(""),
+            ));
+        let input = match cache {
+            Some(cache) => OpenedInput::funded(file, cache)?,
+            None => {
+                codex_zst_refused(CodexZstCause::AdmissionRefused);
+                None
+            }
+        };
+        let Some(input) = input else {
+            codex_compressed_input::record_admission_yield(&key);
+            anyhow::bail!(codex_compressed_input::ArchiveAdmissionYield);
+        };
+        codex_compressed_input::admission_streak(&key, false);
+        let mut evidence = match codex_compressed_input::ArchiveEvidence::begin(
+            input.get_ref(),
+            &candidate.path,
+            index.files.get(&key).and_then(|e| e.archive.as_deref()),
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                input.close();
+                return Err(e.into());
+            }
+        };
+        evidence.user_context = index
+            .active_archive_user_context
+            .clone()
+            .or(evidence.user_context);
+        index.files.entry(key).or_default().archive = Some(Box::new(evidence));
+        input
+    } else {
+        OpenedInput::plain(file)
+    };
+    let mut parser = OwnedJsonlParser::new_opened(
+        input,
         &candidate.path,
         source,
         match source {
@@ -2114,6 +2318,21 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
     )?;
+    parser.reader.capture_header = parser.reader.reader.is_compressed();
+    if parser.reader.reader.is_compressed() {
+        parser.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
+        parser.archive_checkpoint = archive_scope
+            .map(|scope| {
+                crate::transcript_acquisition::Checkpoint::completed_archive(
+                    parser.reader.reader.get_ref(),
+                    scope,
+                    now_seconds(),
+                )
+            })
+            .transpose()?;
+    }
+
+    // S2: route archive decodes through the single Full gate.
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
         configure_tier_replay(&mut parser, candidate, index);
@@ -2149,6 +2368,7 @@ pub(super) fn reduction_dependencies(
     codex: &CodexTitleMetadata,
     claude: &ClaudeTitleMetadata,
     support: Option<&Path>,
+    archive_header: Option<&codex_compressed_input::ValidatedHeader>,
 ) -> Option<String> {
     #[cfg(test)]
     if TEST_REFUSE_REDUCTION_DEPENDENCIES.with(std::cell::Cell::get) {
@@ -2158,7 +2378,7 @@ pub(super) fn reduction_dependencies(
         Some(sha256_hex(&[
             "codex_reduction_dependencies:v1",
             &codex.path_reduction_fingerprint(&candidate.path),
-            &codex_file_join::header_reduction_witness(candidate).ok()?,
+            &codex_file_join::header_reduction_witness(candidate, archive_header).ok()?,
         ]))
     } else {
         let mut scoped = candidate.clone();

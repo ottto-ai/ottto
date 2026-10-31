@@ -3751,6 +3751,8 @@ impl SyncCounts {
         self.ownership_incomplete_file_count > 0
             || self.zero_snapshot_usage_evidence_count > 0
             || self.dropped_usage_record_count > 0
+            || self.census_residue_blocked_session_count > 0
+            || self.census_residue_index_key_count > 0
     }
 
     fn disclosed_loss(&self) -> DisclosedLoss {
@@ -4982,6 +4984,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             .and_then(continuation_finish_inputs(
                 &mut completed.0,
                 &mut completed.2,
+                &completed.1,
                 remaining,
                 &self.daemon.codex_preludes,
                 self.daemon.codex_versions.clone(),
@@ -5562,6 +5565,7 @@ impl SourcePreparation {
     }
 
     fn step(self) -> SourcePreparationStep {
+        let _held_counts = crate::local_resource_diagnostics::CodexHeldScope;
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             self.source == SnapshotSource::ClaudeCode,
         );
@@ -5795,7 +5799,20 @@ impl SourcePreparation {
                 }
                 SourcePreparationStep::Refused(self, reason)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
+                if next
+                    .persist_archive_reservation(&mut self.committed_index, &self.index_path)
+                    .and_then(|()| {
+                        next.persist_custody_decisions(&mut self.committed_index, &self.index_path)
+                    })
+                    .is_err()
+                {
+                    self.scan = Some(next);
+                    return SourcePreparationStep::Refused(
+                        self,
+                        crate::source_rotation::LocalRefusal("read reservation save refused"),
+                    );
+                }
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -6032,6 +6049,55 @@ pub(crate) fn copy_unproven_upload_context(context: String, enabled: bool) -> St
     }
 }
 
+// A3 binds user choices only: backend capability and HMAC-key epochs are A4 debt.
+fn archive_user_context(mut policy: SnapshotUploadPolicy) -> String {
+    policy.session_attribution_labels_enabled = false;
+    format!(
+        "{:x}",
+        Sha256::new()
+            .chain_update(b"ottto:codex-archive-user-context:v1\0")
+            .chain_update(snapshot_upload_context_fingerprint(policy, None))
+            .finalize()
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn archive_a3_context_ignores_capability_and_key_epoch_but_tracks_user_choices() {
+    let policy = SnapshotUploadPolicy::default();
+    let baseline = archive_user_context(policy);
+    let capability = SnapshotUploadPolicy {
+        session_attribution_labels_enabled: !policy.session_attribution_labels_enabled,
+        ..policy
+    };
+    assert_eq!(archive_user_context(capability), baseline);
+    assert_ne!(
+        snapshot_upload_context_fingerprint(policy, Some("key-old")),
+        snapshot_upload_context_fingerprint(policy, Some("key-new"))
+    );
+    assert_eq!(archive_user_context(policy), baseline); // archive context has no key-epoch input
+    for changed in [
+        SnapshotUploadPolicy {
+            session_titles_enabled: !policy.session_titles_enabled,
+            ..policy
+        },
+        SnapshotUploadPolicy {
+            workspace_labels_enabled: !policy.workspace_labels_enabled,
+            ..policy
+        },
+        SnapshotUploadPolicy {
+            session_artifacts_enabled: !policy.session_artifacts_enabled,
+            ..policy
+        },
+        SnapshotUploadPolicy {
+            session_attribution_enabled: !policy.session_attribution_enabled,
+            ..policy
+        },
+    ] {
+        assert_ne!(archive_user_context(changed), baseline);
+    }
+}
+
 /// The replay generation of a cycle over `index` (pure; shared as above).
 fn cycle_replay_generation(
     source: SnapshotSource,
@@ -6098,6 +6164,7 @@ fn prepare_sync_source(
     account_witness: [u8; 32],
     retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
+    let _held_counts = crate::local_resource_diagnostics::CodexHeldScope;
     // The gate is fixed for this synchronous preparation. A lease reports
     // errors while unwinding; without one, the wrapper must emit the counts.
     let report_without_lease = source == SnapshotSource::ClaudeCode
@@ -6435,6 +6502,7 @@ fn prepare_sync_source_inner(
             cache_observations_enabled,
         );
     }
+    index.activate_archive_user_context(archive_user_context(upload_policy));
     continuation::observe(source, &upload_context, upload_policy);
     activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
     index.copy_unproven_enabled = copy_unproven_enabled;
@@ -6728,6 +6796,7 @@ fn prepare_sync_source_inner(
 struct ContinuationInputs {
     codex_preludes: std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
     codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
+    archive_pass: crate::snapshots::codex_archive_catchup::Pass,
     account_witness: [u8; 32],
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
@@ -6744,7 +6813,7 @@ struct ContinuationInputs {
     runtime_context: continuation::RuntimeContext,
 }
 
-crate::heap_layout_bound::fields!(ContinuationInputs; codex_preludes, account_witness, activity_hint,
+crate::heap_layout_bound::fields!(ContinuationInputs; archive_pass, codex_preludes, account_witness, activity_hint,
     receipt_window_days, context_curve_enabled, cache_observations_enabled,
     scan_agent_status_collection, attribution_context, upload_policy,
     upload_destination_namespace, receipt_client, index_path, upload_progress_path, evidence, runtime_context; shared codex_versions);
@@ -6761,6 +6830,7 @@ impl ContinuationInputs {
 fn continuation_finish_inputs<'a>(
     preparation: &'a mut SourcePreparation,
     scan: &'a mut SourceScanResult,
+    index: &'a ScanIndex,
     remaining: Option<usize>,
     codex_preludes: &'a std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
     codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
@@ -6768,7 +6838,8 @@ fn continuation_finish_inputs<'a>(
 {
     move |ticket| {
         let evidence = scan.take_continuation_evidence()?;
-        let mut inputs = take_continuation_inputs(preparation, codex_preludes, codex_versions);
+        let mut inputs =
+            take_continuation_inputs(preparation, index, codex_preludes, codex_versions);
         inputs.evidence = Some(evidence);
         let refusal = remaining.map_or("no_remaining", |_| "over_bound");
         let ticket = remaining.and_then(|limit| ticket.with_inputs(inputs, limit));
@@ -6784,6 +6855,7 @@ fn continuation_finish_inputs<'a>(
 /// Called only while continuation pages are enabled and a ticket was minted.
 fn take_continuation_inputs(
     preparation: &mut SourcePreparation,
+    index: &ScanIndex,
     codex_preludes: &std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
     codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
 ) -> ContinuationInputs {
@@ -6797,6 +6869,7 @@ fn take_continuation_inputs(
         codex_versions,
         evidence: None,
         runtime_context: continuation::runtime_context(),
+        archive_pass: index.archive_pass.clone(),
         account_witness: preparation.account_witness,
         activity_hint,
         receipt_window_days: preparation.receipt_window_days,
@@ -6927,14 +7000,16 @@ fn run_continuation_scan(
             SourcePreparationStep::Pending(next) => preparation = next,
             SourcePreparationStep::Refused(mut refused, _) => {
                 crate::local_resource_diagnostics::codex_continuation(Some("other"));
+                inputs.archive_pass.cpu = u64::MAX; // Lost step accounting cannot grant a new budget.
                 inputs.attribution_context = refused.attribution_context.take();
                 return Ok(ContinuationScan::StepRefused);
             }
             SourcePreparationStep::Complete {
                 mut preparation,
-                index: _,
+                index,
                 mut scan,
             } => {
+                inputs.archive_pass = index.archive_pass.clone();
                 inputs.evidence = scan.take_continuation_evidence();
                 inputs.attribution_context = preparation.attribution_context.take();
                 return Ok(ContinuationScan::Uncommitted {
@@ -6985,6 +7060,7 @@ fn prepare_continuation_source(
     let (mut index, _) =
         ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
     index.require_persistence_available()?;
+    index.archive_pass = inputs.archive_pass.clone();
     upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
     let replay_generation = cycle_replay_generation(
@@ -7031,6 +7107,7 @@ fn prepare_continuation_source(
     // except that the outage gate is read, never reset (C-1).
     let codex_side_pass =
         crate::snapshots::begin_codex_continuation_side_pass(cache, &inputs.index_path, &mut index);
+    index.activate_archive_user_context(archive_user_context(inputs.upload_policy));
     activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
     // The ordinary selection's in-memory effects, on this page's own copy;
     // the probe above found no claim, so there is nothing to save.
@@ -8018,6 +8095,28 @@ fn finish_sync_source(
     // obligations this full scan references before any selection (#794 F1).
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
+    // Plain-only cycles have no archive settlement obligation or witness work.
+    if index.files.values().any(|entry| entry.archive.is_some()) {
+        // Settle exact current bodies before selection can restore older file facts.
+        let submitted = scan_result
+            .snapshots
+            .iter()
+            .map(|s| {
+                (
+                    s.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(s),
+                )
+            })
+            .collect();
+        index.settle_archive_outcome(
+            &upload_progress.accepted_body_witnesses,
+            matches!(
+                &upload_result,
+                Ok(ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. })
+            ),
+            Some(&submitted),
+        );
+    }
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
@@ -12624,6 +12723,8 @@ mod tests {
                 codex_counting_v2: false,
                 codex_counting_owner: None,
                 effective_upload_body_witness_revision: 0,
+                archive: None,
+                codex_compressed_hold: None,
                 opened_changed_nanos: 0,
                 opened_birth_nanos: 0,
                 upload_context_receipt: None,
@@ -25059,4 +25160,77 @@ mod ownership_census_tests {
                 .contains("ownership_incomplete_contributions{bucket="));
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn archive_residue_receipt_discloses_terminal_loss_without_retryable_error() {
+    for (keys, sessions) in [(0, 1), (1, 0)] {
+        let counts = SyncCounts {
+            census_complete: true,
+            census_residue_index_key_count: keys,
+            census_residue_blocked_session_count: sessions,
+            ..SyncCounts::default()
+        };
+        assert_eq!(counts.disclosed_loss(), DisclosedLoss::Terminal);
+        assert!(!counts.has_retryable_problems());
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ARCHIVE_POWER_TEST: std::cell::RefCell<Option<std::collections::VecDeque<Option<bool>>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn with_archive_power<T>(states: &[Option<bool>], run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<std::collections::VecDeque<Option<bool>>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ARCHIVE_POWER_TEST.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    assert!(!states.is_empty());
+    let _reset =
+        Reset(ARCHIVE_POWER_TEST.with(|slot| slot.replace(Some(states.iter().copied().collect()))));
+    run()
+}
+#[cfg(test)]
+fn archive_test_power() -> Option<bool> {
+    ARCHIVE_POWER_TEST.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let states = slot.as_mut()?;
+        let state = if states.len() > 1 {
+            states.pop_front()?
+        } else {
+            *states.front()?
+        };
+        Some(state.unwrap_or(false))
+    })
+}
+/// Re-query native power at acquisition boundaries. Existing unit fixtures may
+/// supply a fixed pass permission; transition fixtures override the producer.
+pub(crate) fn archive_acquisition_power_ready(_fixture_permission: bool) -> bool {
+    #[cfg(test)]
+    {
+        archive_test_power().unwrap_or(_fixture_permission)
+    }
+    #[cfg(not(test))]
+    archive_power_ready()
+}
+/// Use the same native power policy as continuation pages; unknown denies work.
+pub(crate) fn archive_power_ready() -> bool {
+    #[cfg(test)]
+    if let Some(allowed) = archive_test_power() {
+        return allowed;
+    }
+    archive_power_ready_with(&mut continuation::MacPlatformSignals::default())
+}
+
+/// Share continuation's work threshold with archive admission.
+pub(crate) fn archive_work_ready(micros: u64) -> bool {
+    std::time::Duration::from_micros(micros) <= continuation::CONTENTION_WORK
+}
+
+fn archive_power_ready_with(signals: &mut impl continuation::PlatformGates) -> bool {
+    signals.power() == continuation::PlatformState::Allowed
 }

@@ -1333,7 +1333,18 @@ impl<R: BufRead + Seek> Decoder<R> {
     // span before Serde sees it: from_reader buffers malformed strings and map
     // keys even when a visitor discards them. Damage to this optional field
     // removes only carry eligibility, never the surrounding negative record.
-    fn damaged_idless_marker(&mut self, record: Span) -> std::result::Result<Option<Span>, Error> {
+    fn damaged_idless_marker(
+        &mut self,
+        record: Span,
+        custody: bool,
+    ) -> std::result::Result<Option<Span>, Error> {
+        // Custody is a closed optional scalar at ScanIndexEntry position21.
+        //512 wire bytes includes escaped supported labels without buffering damage.
+        let (name, slot, limit) = if custody {
+            ("codex_compressed_hold", 21, 512)
+        } else {
+            ("idless_revision", 4, 4096)
+        };
         self.reader.seek(SeekFrom::Start(record.start))?;
         let close = match self.ws()? {
             Some(b'{') => b'}',
@@ -1346,11 +1357,11 @@ impl<R: BufRead + Seek> Decoder<R> {
         while self.ws()? != Some(close) {
             let marker = if close == b']' {
                 // Derive accepts the struct's positional representation too.
-                position == 4
+                position == slot
             } else {
                 let key = self.span()?;
-                let marker = if key.len <= ("idless_revision".len() * 6 + 2) as u64 {
-                    self.typed::<String>(key)? == "idless_revision"
+                let marker = if key.len <= (name.len() * 6 + 2) as u64 {
+                    self.typed::<String>(key)? == name
                 } else {
                     false
                 };
@@ -1362,7 +1373,8 @@ impl<R: BufRead + Seek> Decoder<R> {
             // Includes ample space for our pretty-printed fixed array. Wider
             // spellings are damage, never permission to allocate a token.
             if marker
-                && (value.len > 4096 || self.typed::<Option<[u8; 32]>>(value).is_err())
+                && (value.len > limit
+                    || (!custody && self.typed::<Option<[u8; 32]>>(value).is_err()))
                 && damaged.replace(value).is_some()
             {
                 return Err(Error::Refused("duplicate idless marker"));
@@ -1380,8 +1392,9 @@ impl<R: BufRead + Seek> Decoder<R> {
     fn pending_typed<T: serde::de::DeserializeOwned>(
         &mut self,
         record: Span,
+        custody: bool,
     ) -> std::result::Result<T, Error> {
-        let Some(marker) = self.damaged_idless_marker(record)? else {
+        let Some(marker) = self.damaged_idless_marker(record, custody)? else {
             return self.typed(record);
         };
         if self.persistence_map {
@@ -1393,9 +1406,16 @@ impl<R: BufRead + Seek> Decoder<R> {
             prefix: marker.start - record.start,
             marker_end: marker.start + marker.len,
             suffix: record.start + record.len - marker.start - marker.len,
-            replacement: b"null",
+            replacement: if custody {
+                b"\"CompressedOwnerUnproven\""
+            } else {
+                b"null"
+            },
             skipped: false,
         };
+        if custody {
+            crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::OwnerUnproven);
+        }
         let result = serde_json::from_reader(masked).map_err(|_| Error::Refused("record type"));
         self.reader
             .seek(SeekFrom::Start(record.start + record.len))?;
@@ -1432,8 +1452,8 @@ impl<R: BufRead + Seek> Decoder<R> {
             let value = self.span()?;
             // Decode the value first: only actual opaque debt spends hold
             // admission. Its full charge is checked before allocating the key.
-            let decoded = if field == "claude_usage_family_pending" {
-                self.pending_typed(value)
+            let decoded = if field == "claude_usage_family_pending" || field == "files" {
+                self.pending_typed(value, field == "files")
             } else {
                 self.typed(value)
             };
@@ -2330,6 +2350,16 @@ impl ScanIndex {
             || claude_index_path_member_ref(Path::new(key))
                 .is_some_and(|member| self.decode_holds_family(member.root))
     }
+    /// One bounded raw slot per inventory continuation, independent of roster.
+    pub(super) fn decode_held_file_after(&self, after: Option<&str>) -> Option<&str> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.decode_holds
+            .0
+            .get("files")?
+            .range::<str, _>((after.map_or(Unbounded, Excluded), Unbounded))
+            .next()
+            .map(|(key, _)| key.as_str())
+    }
     pub(crate) fn decode_held_file_keys(&self) -> impl Iterator<Item = &str> {
         self.decode_holds.file_keys()
     }
@@ -2371,6 +2401,57 @@ impl ScanIndex {
     pub(super) fn decode_holds_indexed_entity(&self, key: &str, fingerprint: &str) -> bool {
         self.decode_holds_file(key) || self.decode_holds_entity(fingerprint)
     }
+    /// Negative scope only. A damaged file record remains raw; neither this
+    /// projection nor its owner can authorize a read, membership or settlement.
+    pub(super) fn decode_held_codex_owner(&self, key: &str) -> Option<String> {
+        let raw = self.decode_holds.0.get("files")?.get(key)?;
+        if let Some(owner) = raw.owner() {
+            return Some(owner.to_owned());
+        }
+        let path = Path::new(key);
+        if !codex_archive_path(path) {
+            return None;
+        }
+        // Borrow only the existing header/owner and fixed-size stamp from the
+        // already admitted raw slot. Do not decode an archive to learn scope,
+        // rebuild a typed file entry, or consult the plain header fact cache.
+        #[derive(Deserialize)]
+        struct Header<'a> {
+            #[serde(borrow)]
+            owner: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Archive<'a> {
+            stamp: crate::transcript_acquisition::FileStamp,
+            #[serde(default, borrow)]
+            owner: Option<&'a str>,
+            #[serde(borrow)]
+            header_validated: Header<'a>,
+        }
+        #[derive(Deserialize)]
+        struct Entry<'a> {
+            #[serde(borrow)]
+            archive: Archive<'a>,
+        }
+        let entry: Entry<'_> = serde_json::from_str(raw.get()).ok()?;
+        let archive = entry.archive;
+        let owner = archive.header_validated.owner;
+        if archive.owner.is_some_and(|accepted| accepted != owner)
+            || !codex_session_id_candidates_from_path(&path.with_extension(""))
+                .iter()
+                .any(|id| id == owner)
+        {
+            return None;
+        }
+        let metadata = fs::symlink_metadata(path).ok()?;
+        if metadata.file_type().is_symlink() {
+            return None;
+        }
+        let current = crate::transcript_acquisition::FileStamp::capture(metadata).ok()?;
+        (archive.stamp.same_object(&current) && archive.stamp.same_content(&current))
+            .then(|| codex_protected_owner(owner))
+    }
+    #[cfg(test)]
     pub(super) fn decode_held_codex_owners(&self) -> impl Iterator<Item = Option<&str>> {
         self.decode_holds
             .0

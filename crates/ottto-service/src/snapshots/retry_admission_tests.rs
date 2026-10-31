@@ -555,6 +555,7 @@ fn retry_due_cursor_rotates_portably_across_reload_without_consuming_gaps() {
         fixture.index = retry_test_reload(&mut fixture.index, &path);
         let traversal = fixture.index.traversal.as_mut().unwrap();
         traversal.pending_candidates.push_front(ScanTraversalPath {
+            order_modified: None,
             scan_root: root.clone(),
             path: audit.clone(),
             census_member: true,
@@ -744,6 +745,7 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
         let mut candidate = candidate_from_traversal_path(
             SnapshotSource::ClaudeCode,
             ScanTraversalPath {
+                order_modified: None,
                 scan_root: root.clone(),
                 path: PathBuf::from(key),
                 census_member: true,
@@ -752,7 +754,7 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
             &mut census,
             rfc3339_unix_seconds(CARRY_RETRY),
             BACKFILL_WINDOW_DAYS,
-            &fixture.index.files,
+            discovery_retention!(fixture.index),
         )
         .unwrap();
         prepare_owned_scan_candidate(
@@ -768,7 +770,7 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
             &mut census,
             rfc3339_unix_seconds(CARRY_RETRY),
             BACKFILL_WINDOW_DAYS,
-            &fixture.index.files,
+            discovery_retention!(fixture.index),
         )
         .unwrap();
         let entry = fixture.index.files.get_mut(key).unwrap();
@@ -851,6 +853,7 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
         // Even explicitly offering a healthy root follows the real unchanged
         // path. Without the fix the fallback seeds/clears healthy members here.
         traversal.pending_candidates.push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: root.clone(),
             path: PathBuf::from(&real),
             census_member: true,

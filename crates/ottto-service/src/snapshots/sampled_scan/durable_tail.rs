@@ -309,6 +309,10 @@ fn expected(
     interpretation: &Interpretation<'_>,
     representation: Option<(u16, store::Digest32)>,
 ) -> Option<Expected> {
+    // Archive reductions belong exclusively to the RAM replace-only domain.
+    if codex_archive_path(Path::new(key)) {
+        return None;
+    }
     let entry = index.files.get(key)?;
     Some(Expected {
         binding: Binding {
@@ -1038,6 +1042,9 @@ impl SharedCache {
 
     /// Notes the file scope `key` is decided under this pass, for GC.
     pub(crate) fn durable_note_scope(&self, source: SnapshotSource, key: &str, scope: &Scope) {
+        if codex_archive_path(Path::new(key)) {
+            return;
+        }
         let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) else {
             return;
         };
@@ -1051,6 +1058,10 @@ impl SharedCache {
     /// Records the selection `key`'s admitted reduction was acquired for:
     /// the scanned source-file fingerprint the scan wrote into its entry.
     pub(crate) fn durable_note_selection(&self, key: &str, source_file_fingerprint: &str) {
+        // RAM-only archives cannot spend the bounded plain selection quota.
+        if codex_archive_path(Path::new(key)) {
+            return;
+        }
         if let Some(mut stores) = self.durable() {
             if stores.selected.len() < store::MAX_RECORDS * 2 || stores.selected.contains_key(key) {
                 stores
@@ -1058,6 +1069,11 @@ impl SharedCache {
                     .insert(key.to_string(), source_file_fingerprint.to_string());
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::snapshots) fn durable_selected_count_for_test(&self) -> usize {
+        self.durable().map_or(0, |stores| stores.selected.len())
     }
 
     /// Marks `key` admitted this pass: a write candidate after the next save.
@@ -1237,6 +1253,14 @@ impl SharedCache {
                     selected.remove(&key);
                     continue;
                 };
+                // Explicit post-save domain fence, even if another caller
+                // touched or selected this RAM-only reduction.
+                if retained.checkpoint.is_compressed() || codex_archive_path(Path::new(&key)) {
+                    selected.remove(&key);
+                    invalidate.insert(store::key_digest(source, &key));
+                    not_persisted.push("compressed");
+                    continue;
+                }
                 if retained.state.source() != snapshot_source {
                     later.insert(key);
                     continue;
@@ -1427,6 +1451,10 @@ impl SharedCache {
         let mut keep = BTreeMap::new();
         if !inventory.is_empty() {
             for key in index.files.keys() {
+                // An archive key cannot keep even a legacy/misbound record.
+                if codex_archive_path(Path::new(key)) {
+                    continue;
+                }
                 let digest = store::key_digest(source, key);
                 if !inventory.contains(&digest) {
                     continue;
