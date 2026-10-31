@@ -1439,6 +1439,10 @@ struct SnapshotUploadProgress {
     fresh_context_body_acks: BTreeMap<String, String>,
     #[serde(skip)]
     context_receipt_candidates: Vec<crate::snapshots::UploadContextReceiptCandidate>,
+    /// Cache-session keys of the frozen logical page (v2 only, else empty).
+    /// ACK-custody pruning never removes their evidence in any batch.
+    #[serde(skip)]
+    custody_page: BTreeSet<String>,
 }
 
 impl SnapshotUploadProgress {
@@ -1486,6 +1490,7 @@ impl SnapshotUploadProgress {
             terminal_contract_retry_pending_save: false,
             fresh_context_body_acks: BTreeMap::new(),
             context_receipt_candidates: Vec::new(),
+            custody_page: BTreeSet::new(),
         }
     }
 
@@ -3309,6 +3314,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     durable.retained_stale_ack_count = progress.retained_stale_ack_count;
     durable.fresh_context_body_acks = progress.fresh_context_body_acks.clone();
     durable.context_receipt_candidates = progress.context_receipt_candidates.clone();
+    durable.custody_page = progress.custody_page.clone();
     durable.context_resend = progress.context_resend.clone();
     durable
         .accepted_identity_buckets
@@ -7946,6 +7952,7 @@ fn finish_sync_source(
     upload_progress
         .context_resend
         .retain_candidates(&upload_progress.context_receipt_candidates);
+    upload_progress.freeze_custody_page(&scan_result.snapshots);
     let probes = scan_result
         .snapshots
         .iter()
@@ -25504,7 +25511,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates, custody_page);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

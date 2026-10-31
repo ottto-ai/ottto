@@ -450,6 +450,17 @@ impl SnapshotUploadProgress {
         Err(refused(self))
     }
 
+    /// Freeze the logical page's sessions before its bootstrap and batches.
+    /// OFF (no ACK custody) does no work.
+    pub(super) fn freeze_custody_page(&mut self, items: &[SnapshotItem]) {
+        if self.ack_recovery.is_some() {
+            self.custody_page = items
+                .iter()
+                .map(|item| cache_session_key(&item.source_session_id))
+                .collect();
+        }
+    }
+
     /// Conservative serialized size of this ledger after any response to items.
     fn custody_bytes<T: Serialize>(
         &self,
