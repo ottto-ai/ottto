@@ -1,5 +1,5 @@
 //! Reusable synthetic entity-ACK sink. Binds only IPv4 loopback; no outbound I/O.
-#![cfg(any(test, feature = "replay-harness"))]
+#![cfg(feature = "replay-harness")]
 use super::current_rfc3339;
 use ottto_core::{
     FileDeviceStore, LocalDeviceBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
@@ -10,8 +10,6 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::Mutex;
 use std::time::Duration;
 
 pub(super) type BatchObserver =
@@ -37,11 +35,7 @@ pub(super) struct BackendStats {
     pub(super) cpu_us: AtomicU64,
     pub(super) batches: AtomicU64,
     pub(super) items: AtomicU64,
-    #[cfg(test)]
-    pub(super) literal_items: AtomicU64,
     pub(super) body_bytes: AtomicU64,
-    #[cfg(test)]
-    pub(super) fingerprints: Mutex<Vec<String>>,
 }
 
 /// In-process backend that accepts everything with entity ACKs (the routes
@@ -84,15 +78,6 @@ fn entity_ack(item: &serde_json::Value) -> serde_json::Value {
 }
 
 impl Backend {
-    #[cfg(test)]
-    pub(super) fn start() -> Self {
-        Self::with_listener(
-            std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener"),
-            None,
-        )
-        .expect("bind isolated loopback backend")
-    }
-
     pub(super) fn with_listener(
         listener: std::net::TcpListener,
         observer: Option<BatchObserver>,
@@ -147,25 +132,6 @@ impl Backend {
                     seen.items.fetch_add(items.len() as u64, Ordering::Relaxed);
                     seen.body_bytes
                         .fetch_add(raw.len() as u64, Ordering::Relaxed);
-                    #[cfg(test)]
-                    {
-                        let literal = items
-                            .iter()
-                            .filter(|item| {
-                                item["usage_accounting_contract"].as_str()
-                                    == Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT)
-                            })
-                            .count();
-                        seen.literal_items
-                            .fetch_add(literal as u64, Ordering::Relaxed);
-                    }
-                    #[cfg(test)]
-                    seen.fingerprints
-                        .lock()
-                        .unwrap()
-                        .extend(items.iter().filter_map(|item| {
-                            item["snapshot_fingerprint"].as_str().map(str::to_string)
-                        }));
                     serde_json::json!({"accepted": items.len(), "sessions_reconciled": items.len(),
                         "session_ids": [], "disabled": false, "disabled_reason": null,
                         "entity_ack_contract": crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,

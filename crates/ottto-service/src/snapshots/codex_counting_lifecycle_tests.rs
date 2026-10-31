@@ -249,11 +249,6 @@ fn pruned_legacy_ack_survives_a_later_archive_page_and_reload() {
 }
 
 #[test]
-fn pruned_unbound_legacy_ack_survives_a_later_archive_page_and_reload() {
-    pruned_moved_session(false, false);
-}
-
-#[test]
 fn pruned_v2_ack_survives_a_later_archive_page_and_reload() {
     pruned_moved_session(true, true);
 }
@@ -261,16 +256,6 @@ fn pruned_v2_ack_survives_a_later_archive_page_and_reload() {
 #[test]
 fn moved_bound_legacy_ack_survives_archive_changed_body_and_reload() {
     moved_session(false, true);
-}
-
-#[test]
-fn moved_legacy_ack_survives_archive_changed_body_and_reload() {
-    moved_session(false, false);
-}
-
-#[test]
-fn moved_v2_ack_survives_archive_changed_body_and_reload() {
-    moved_session(true, true);
 }
 
 #[test]

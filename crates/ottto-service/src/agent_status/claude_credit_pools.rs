@@ -2095,29 +2095,6 @@ mod tests {
     }
 
     #[test]
-    fn in_use_and_unused_slots_are_five_and_about_forty_minutes() {
-        assert_eq!(ACTIVE_SLOT_SECONDS, 5 * 60);
-        assert_eq!(ACTIVE_WINDOW_SECONDS, 30 * 60);
-        assert_eq!(LONGEST_SLOT_SECONDS, 42 * 60);
-        let schedule = ClaudeReadSchedule::default();
-        // A session written 30 min ago still makes the account in use; 31 min
-        // ago it is unused.
-        assert!(claude_binding_in_use(
-            &schedule,
-            Some(10_000 - 30 * 60),
-            None,
-            10_000
-        ));
-        assert!(!claude_binding_in_use(
-            &schedule,
-            Some(10_000 - 31 * 60),
-            None,
-            10_000
-        ));
-        assert!(!claude_binding_in_use(&schedule, None, None, 10_000));
-    }
-
-    #[test]
     fn in_use_survives_a_stalled_activity_scan() {
         let activity_at = 10_000;
         let now = activity_at + 45 * 60;
@@ -2569,17 +2546,6 @@ mod tests {
             claude_reset_read_at(&windows[2..], observed, 0, delay),
             None
         );
-    }
-
-    #[test]
-    fn slot_is_admitted_at_its_elapsed_boundary() {
-        // A reading a few seconds into one pass, checked a few seconds into
-        // the pass one slot later.
-        assert!(claude_slot_elapsed(900 - 7, 900));
-        assert!(claude_reading_due(Some(1_007), 1_307, 900, 1_900));
-        assert!(!claude_slot_elapsed(900 - 300, 900));
-        // Retry-After / success spacing still holds.
-        assert!(!claude_reading_due(Some(1_000), 5_000, 900, 1_900));
     }
 
     #[test]

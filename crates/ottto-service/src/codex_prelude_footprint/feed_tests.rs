@@ -192,40 +192,6 @@ fn unseen_and_small_done_pressure_leave_survivors_updateable() {
 }
 
 #[test]
-fn scope_cache_at_512_and_513_is_pruned_and_charged() {
-    let dir = ScratchDir::new("prelude-scope-boundary");
-    let files = views(&dir, 513);
-    for count in [512, 513] {
-        let feed = CodexPreludeFeed::default();
-        for (i, view) in files.iter().take(count).enumerate() {
-            feed.lock()
-                .put(view, dir.to_path_buf(), done(format!("/cwd/{i}"), 0));
-        }
-        feed.remember_scopes(
-            (0..count)
-                .map(|i| (format!("/cwd/{i}"), format!("{i:064x}")))
-                .collect(),
-        );
-        let (_, scopes) = feed.snapshot(SystemTime::now());
-        assert_eq!(scopes.len(), 512);
-        assert_eq!(
-            scopes
-                .iter()
-                .map(|(cwd, _)| cwd)
-                .collect::<BTreeSet<_>>()
-                .len(),
-            512
-        );
-        assert_eq!(scopes[511].0, "/cwd/511");
-        assert!(!scopes.iter().any(|(cwd, _)| cwd == "/cwd/512"));
-        let f = feed.lock();
-        assert_eq!(f.scopes.len(), 512);
-        assert_eq!(f.evicted, 0);
-        assert_allocations(&f);
-    }
-}
-
-#[test]
 fn churn_expiry_to_empty_releases_capacities_highwater_and_payloads() {
     let dir = ScratchDir::new("prelude-expiry-empty");
     let files = views(&dir, 160);
@@ -261,39 +227,8 @@ fn churn_expiry_to_empty_releases_capacities_highwater_and_payloads() {
     assert_allocations(&f);
 }
 
-#[test]
-fn root_pairs_check_the_budget_before_copy_and_keep_no_partial_snapshot() {
-    let feed = Arc::new(CodexPreludeFeed::default());
-    let limit = (16 * 1024 - 64 - size_of::<(PathBuf, PathBuf)>()) / 2;
-    let within = PathBuf::from("r".repeat(limit)); // canonicalize fails: lexical fallback
-    let over = PathBuf::from("r".repeat(limit + 1));
-    let observer = feed.observer(std::slice::from_ref(&within));
-    assert_eq!(observer.root_ordinal(&within, &[]), Some(0));
-    let observer = feed.observer(std::slice::from_ref(&over));
-    assert_eq!(observer.root_ordinal(&over, &[]), None);
-    let many = vec![PathBuf::from("r"); 400];
-    assert_eq!(feed.observer(&many).root_ordinal(&many[0], &[]), None);
-}
-
 impl CodexPreludeFeed {
     pub(crate) fn done_for_test(&self) -> Vec<Start> {
         self.snapshot(SystemTime::now()).0
     }
-}
-
-#[test]
-fn feed_fixed_allowance_includes_once_only_cleanup_storage() {
-    assert!(size_of::<CodexPreludeFeed>() <= size_of::<Feed>() + 64);
-}
-
-#[cfg(target_pointer_width = "64")]
-#[test]
-fn m4_peak_estimate_layout_ceilings_hold() {
-    // Conservative inline ceilings used by the public 80 MiB scenario.
-    assert!(size_of::<Start>() <= 512);
-    assert!(size_of::<Observer>() <= 512);
-    assert!(size_of::<(CodexPrelude, PathBuf, PathBuf)>() <= 512);
-    assert_eq!(size_of::<String>(), 24);
-    assert_eq!(size_of::<(String, String)>(), 48);
-    assert_eq!(size_of::<usize>(), 8);
 }

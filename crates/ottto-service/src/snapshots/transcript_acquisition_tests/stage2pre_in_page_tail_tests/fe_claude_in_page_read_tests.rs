@@ -1023,25 +1023,6 @@ fn fe_claude_census_control_exact_api_rows_mint_v1() {
     assert!(index.claude_usage_family_witnesses.contains_key(SESSION));
 }
 
-/// Proof diagnostic (GREEN, main's behavior, not a requirement): the fold
-/// accepts trace-owned API rows the transcript does not carry as auxiliary
-/// calls (`transcript ⊆ assigned`), so a body missing requests the API
-/// reports still mints v1. FE's "proof fails closed" therefore cannot rest
-/// on unequal request sets; the SOURCE rows below need an explicit guard.
-#[test]
-fn fe_claude_census_diag_main_folds_extra_api_rows_as_auxiliary() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let (_fixture, mut index, result) = quiescent();
-    assert!(
-        mints_v1(&mut index, &result, 0..9),
-        "diagnostic: main folds the three extra rows and mints v1"
-    );
-}
-
 /// SOURCE, proof (RED): a prefix body never mints v1 or a family witness,
 /// even when the API evidence matches the prefix exactly.
 ///
