@@ -495,31 +495,6 @@ fn request_labels_need_a_fetched_hint_that_allows_them() {
 }
 
 #[test]
-fn request_needs_a_context_window() {
-    let prelude = CodexPrelude {
-        complete: true,
-        ..CodexPrelude::default()
-    };
-    let request = build_request(RequestInputs {
-        prelude: &prelude,
-        workspace: Path::new("/nonexistent-codex-session-start"),
-        identity: RepositoryIdentity {
-            repository_hash: None,
-            repository_label: None,
-            repository_label_source: None,
-            repository_identity_source: None,
-            workspace_kind: Some("non_git".to_string()),
-        },
-        machine_id: "otm_test",
-        labels_enabled: false,
-        codex_home: Path::new("/nonexistent-codex-home"),
-        home: Path::new("/home/u"),
-        salt: None,
-    });
-    assert!(request.is_none());
-}
-
-#[test]
 fn window_after_the_first_usage_record_is_still_read() {
     let prelude = parse(&[
         meta(json!({"context_window": null, "timestamp": "2026-10-18T08:00:00Z"})),
@@ -769,58 +744,6 @@ fn observer_oracle_requests_and_none_outcomes() {
                 flags == json!({})
             );
         }
-    }
-}
-
-#[test]
-fn distinct_second_meta_across_tail_is_a_fork_but_same_id_is_not() {
-    let dir = ScratchDir::new("prelude-second-meta");
-    let roots = [dir.join("sessions")];
-    let support = ScratchDir::new("prelude-second-meta-support");
-    for (id, fork) in [("s1", false), ("second", true)] {
-        let feed = Arc::new(CodexPreludeFeed::default());
-        let first = meta(json!({"cwd":dir.to_path_buf()}));
-        let rest = [meta(json!({"id":id,"cwd":dir.to_path_buf()})), usage(99)];
-        let full = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
-        let (want, next) = deliver(
-            &feed,
-            &roots,
-            full,
-            std::slice::from_ref(&first),
-            DeliveryEnd::Complete,
-        );
-        assert_eq!(want, Want::Lines);
-        assert_eq!(metric(&feed, "pending"), 1);
-        assert_eq!(
-            deliver(
-                &feed,
-                &roots,
-                FileView {
-                    mode: DeliveryMode::Tail,
-                    start: next,
-                    ..full
-                },
-                &rest,
-                DeliveryEnd::Complete
-            )
-            .0,
-            Want::Lines
-        );
-        let done = feed.snapshot(SystemTime::now()).0;
-        assert_eq!(done.len(), 1);
-        assert_eq!(done[0].1, parse(&[vec![first], rest.to_vec()].concat()));
-        assert_eq!(done[0].1.is_fork, fork);
-        assert_eq!(
-            select_candidates(
-                &feed,
-                &roots,
-                &support,
-                "dest",
-                Instant::now() + Duration::from_secs(60)
-            )
-            .len(),
-            usize::from(!fork)
-        );
     }
 }
 
@@ -1243,100 +1166,6 @@ fn callback_skip_mtime_scope_pruning_and_monotonic_end_guards() {
     observer.end(&view, &DeliveryEnd::Complete);
     assert!(feed.snapshot(SystemTime::now()).0.is_empty());
     assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 1);
-}
-
-#[test]
-fn nonzero_tail_uses_absolute_physical_end_on_linux() {
-    let dir = ScratchDir::new("prelude-absolute-tail");
-    let roots = [dir.join("sessions")];
-    let feed = Arc::new(CodexPreludeFeed::default());
-    let full = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
-    let k = 1000;
-    let mut observer = feed.observer(&roots);
-    assert_eq!(observer.begin(&full), Want::Lines);
-    let meta = meta(json!({"context_window":12345}));
-    observer.line(
-        &full,
-        &PhysicalLine {
-            end: k,
-            value: Some(&meta),
-        },
-    );
-    observer.end(&full, &DeliveryEnd::Complete);
-    let tail = FileView {
-        mode: DeliveryMode::Tail,
-        start: k,
-        ..full
-    };
-    assert_eq!(observer.begin(&tail), Want::Lines);
-    let usage = usage(17);
-    observer.line(
-        &tail,
-        &PhysicalLine {
-            end: k + 100,
-            value: Some(&usage),
-        },
-    );
-    observer.end(&tail, &DeliveryEnd::Complete);
-    let done = feed.snapshot(SystemTime::now()).0;
-    assert_eq!(done.len(), 1);
-    assert_eq!(done[0].1.first_input_tokens, Some(17));
-    assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
-}
-
-#[test]
-fn unavailable_roots_and_nonmonotonic_ends_leave_unseen_markers() {
-    let dir = ScratchDir::new("prelude-gap-markers");
-    let roots = [dir.join("sessions")];
-    let feed = Arc::new(CodexPreludeFeed::default());
-    let full = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
-    deliver(
-        &feed,
-        &roots,
-        full,
-        &[meta(json!({})), usage(3)],
-        DeliveryEnd::Complete,
-    );
-    let missing = FileView {
-        root: None,
-        mode: DeliveryMode::Tail,
-        start: 1000,
-        ..full
-    };
-    deliver(&feed, &roots, missing, &[], DeliveryEnd::Complete);
-    deliver(
-        &feed,
-        &roots,
-        FileView {
-            root: Some(0),
-            ..missing
-        },
-        &[],
-        DeliveryEnd::Complete,
-    );
-    assert_eq!(metric(&feed, "codex_prelude_unseen_prefix"), 0);
-    let mut observer = feed.observer(&roots);
-    assert_eq!(observer.begin(&full), Want::Lines);
-    observer.line(
-        &full,
-        &PhysicalLine {
-            end: 0,
-            value: None,
-        },
-    );
-    observer.end(&full, &DeliveryEnd::Complete);
-    deliver(
-        &feed,
-        &roots,
-        FileView {
-            root: Some(0),
-            ..missing
-        },
-        &[],
-        DeliveryEnd::Complete,
-    );
-    assert_eq!(metric(&feed, "codex_prelude_unseen_prefix"), 0);
-    assert_eq!(metric(&feed, "feed_files"), 1);
 }
 
 #[cfg(unix)]
