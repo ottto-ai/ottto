@@ -3,7 +3,9 @@
 use super::*;
 use crate::durable_tail_store::{self as store, DurableSource};
 use crate::heap_layout_bound::with_unsupported_layout_for_test;
-use crate::locked_state_dir::test_locks;
+use crate::snapshots::sampled_scan::transition_fixture::native_cold::{
+    self as fixture, NativeColdStore,
+};
 use crate::snapshots::sampled_scan::SharedCache;
 use crate::transcript_acquisition::Scope;
 use std::sync::Arc;
@@ -12,11 +14,15 @@ const SOURCE: SnapshotSource = SnapshotSource::ClaudeCode;
 const SESSION: &str = "11111111-2222-4333-8444-555555555555";
 
 struct Fixture {
-    root: crate::test_scratch::ScratchDir,
+    cold: NativeColdStore,
     writer: &'static crate::locked_state_dir::LockedStateDir,
-    sessions: PathBuf,
     path: PathBuf,
-    namespace: Scope,
+}
+impl std::ops::Deref for Fixture {
+    type Target = NativeColdStore;
+    fn deref(&self) -> &Self::Target {
+        &self.cold
+    }
 }
 struct Read {
     index: ScanIndex,
@@ -26,20 +32,13 @@ struct Read {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = crate::test_scratch::ScratchDir::new("m3-layout-selection");
-        let writer = test_locks::hold(&root);
-        write_claude_reemission_list_for_test(&root, &[SESSION]);
-        let sessions = root.join("sessions");
-        fs::create_dir(&sessions).unwrap();
-        let path = sessions.join(format!("{SESSION}.jsonl"));
+        let cold =
+            NativeColdStore::with_scope(SOURCE, "m3-layout-selection", Scope("m3-layout".into()));
+        let writer = cold.writer;
+        write_claude_reemission_list_for_test(&cold.root, &[SESSION]);
+        let path = cold.path(SESSION);
         fs::write(&path, Self::line(1)).unwrap();
-        Self {
-            root,
-            writer,
-            sessions,
-            path,
-            namespace: Scope("m3-layout".into()),
-        }
+        Self { cold, writer, path }
     }
     fn line(n: u64) -> String {
         json!({"type":"assistant","sessionId":SESSION,"timestamp":"2026-10-07T10:00:00Z",
@@ -56,10 +55,14 @@ impl Fixture {
         self.root.join("index.json")
     }
     fn cache(&self) -> Arc<SharedCache> {
-        let cache = Arc::new(SharedCache::default());
-        cache.durable_begin_pass(SOURCE, &self.index_path(), &self.namespace, false);
-        cache
+        Arc::new(fixture::cache(
+            SOURCE,
+            &self.index_path(),
+            &self.namespace,
+            false,
+        ))
     }
+
     fn scan(&self, index: ScanIndex, cache: Option<Arc<SharedCache>>) -> Read {
         let mut scan = OwnedSourceScan::new(
             SOURCE,
@@ -77,27 +80,15 @@ impl Fixture {
         if let Some(cache) = cache {
             scan = scan.with_sampled_acquisition(cache, self.namespace.clone());
         }
-        for _ in 0..1000 {
-            let (modes, bytes) = scan.sampling.as_ref().map_or(((0, 0, 0), 0), |s| {
-                (
-                    (s.full_files, s.tail_files, s.unchanged_files),
-                    s.native_bytes,
-                )
-            });
-            match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => scan = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => {
-                    return Read {
-                        index,
-                        scan,
-                        modes,
-                        bytes,
-                    }
-                }
-            }
+        let (index, scan, modes, bytes) = fixture::scan(scan, 1000);
+        Read {
+            index,
+            scan,
+            modes,
+            bytes,
         }
-        panic!("layout fixture did not finish");
     }
+
     fn settle(&self, cache: &SharedCache, read: &mut Read) {
         // The daemon finalizes the post-policy body tuple before saving.
         // Saving the raw scan leaves adoption owed and selects a quiet file.
@@ -107,7 +98,7 @@ impl Fixture {
             &mut read.index,
             snapshot_upload_body_witness,
         );
-        read.index.save(&self.index_path()).unwrap();
+        fixture::save(&self.index_path(), &mut read.index);
         cache.durable_write_after_save(self.writer, SOURCE, &read.index);
         cache.durable_gc(self.writer, SOURCE, &read.index).unwrap();
     }
@@ -145,21 +136,7 @@ impl Fixture {
             generation: index.generation,
             body_len: body.len(),
         };
-        let prepared = disk
-            .prepare_stream(self.writer, header)
-            .unwrap()
-            .write(|out| {
-                out.write_all(&body)
-                    .map_err(|_| crate::durable_tail_codec::Refuse::WriteFailed)?;
-                Ok(body.len())
-            })
-            .unwrap();
-        let commit = disk
-            .commit_stream(self.writer, prepared)
-            .unwrap()
-            .commit()
-            .unwrap();
-        disk.finish_stream(commit).unwrap();
+        fixture::commit(&mut disk, self.writer, header, &body);
         fs::read_dir(store::store_dir_for_index(&self.index_path()))
             .unwrap()
             .map(|entry| entry.unwrap().path())

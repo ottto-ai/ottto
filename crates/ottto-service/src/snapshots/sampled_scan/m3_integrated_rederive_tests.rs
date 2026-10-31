@@ -2,6 +2,7 @@
 use super::*;
 use crate::snapshots::sampled_scan::now_seconds;
 use crate::snapshots::sampled_scan::test_hooks::{self, Point};
+use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::transcript_acquisition::ReadMode;
 use std::cell::Cell;
 use std::io::{Seek, SeekFrom, Write};
@@ -43,7 +44,7 @@ impl ColdReplay {
         lines[0]["payload"]["source"] = serde_json::json!({
             "subagent":{"thread_spawn":{"agent_path":"/root/private_label_m3"}}
         });
-        let mut text: String = lines.iter().map(|line| line.to_string() + "\n").collect();
+        let mut text: String = fixture::jsonl(lines);
         if raw_value {
             text.push_str("{\"$serde_json::private::RawValue\":\"{}\"}\n");
         }
@@ -95,7 +96,7 @@ impl ColdReplay {
             }))
             .unwrap(),
         );
-        index.save(&index_path).unwrap();
+        fixture::save(&index_path, &mut index);
         let key = local_index_key(&path);
         let i = Interpretation::of(SnapshotSource::Codex, &key, &index, false, &namespace);
         let mut expected = expected(
@@ -120,10 +121,7 @@ impl ColdReplay {
             effective_revision(SnapshotSource::Codex),
             &acquired::ImmutableCounting::from_reduction(&reduction).unwrap(),
         );
-        let mut disk = DurableTailStore::new(
-            store::store_dir_for_index(&index_path),
-            DurableSource::Codex,
-        );
+        let mut disk = fixture::store(&index_path, DurableSource::Codex);
         let receipt = disk
             .write_after_save(
                 test_locks::hold(&root),
@@ -162,8 +160,7 @@ impl ColdReplay {
         local_index_key(&self.path)
     }
     fn cache(&self) -> SharedCache {
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(
+        let cache = fixture::cache(
             SnapshotSource::Codex,
             &self.index_path,
             &self.namespace,
@@ -179,10 +176,7 @@ impl ColdReplay {
         .unwrap();
     }
     fn replace_body(&self, body: Vec<u8>) {
-        let mut disk = DurableTailStore::new(
-            store::store_dir_for_index(&self.index_path),
-            DurableSource::Codex,
-        );
+        let mut disk = fixture::store(&self.index_path, DurableSource::Codex);
         let ReadOutcome::Found(mut record) =
             disk.read(&full_pace_key(SnapshotSource::Codex, &self.key()))
         else {
@@ -196,7 +190,7 @@ impl ColdReplay {
         cache: Arc<SharedCache>,
         index: ScanIndex,
     ) -> (ScanIndex, SourceScanResult, usize) {
-        let mut owned = OwnedSourceScan::new_with_identity_capture(
+        let owned = OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::Codex,
             &[self.root.to_path_buf()],
             index,
@@ -211,23 +205,12 @@ impl ColdReplay {
             false,
         )
         .with_sampled_acquisition(cache, self.namespace.clone());
-        for _ in 0..100_000 {
-            let fulls = owned.sampling.as_ref().unwrap().full_files;
-            match owned.step(None) {
-                OwnedSourceScanStep::Pending(next) => owned = next,
-                OwnedSourceScanStep::Complete {
-                    mut index,
-                    mut scan,
-                    ..
-                } => {
-                    finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
-                    scan.finish_codex_capture_boundary(&mut index);
-                    return (index, scan, fulls);
-                }
-            }
-        }
-        panic!("scan did not complete");
+        let (mut index, mut scan, modes, _) = fixture::scan(owned, 100_000);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        scan.finish_codex_capture_boundary(&mut index);
+        (index, scan, modes.0)
     }
+
     fn restore(&self, cache: &SharedCache) -> RestoreOutcome {
         let i = Interpretation::of(
             SnapshotSource::Codex,
@@ -620,10 +603,7 @@ fn corrupt_retired_predecessor_rebuilds_once_without_withholding_native_usage() 
         return;
     }
     let rig = ColdReplay::new(None, false, false);
-    let mut disk = DurableTailStore::new(
-        store::store_dir_for_index(&rig.index_path),
-        DurableSource::Codex,
-    );
+    let mut disk = fixture::store(&rig.index_path, DurableSource::Codex);
     let ReadOutcome::Found(mut record) =
         disk.read(&full_pace_key(SnapshotSource::Codex, &rig.key()))
     else {
