@@ -4704,7 +4704,7 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
     let denied = binding("denied", "scope", ("denied", None));
     let denied_file = record_file(&store, &denied.key);
     put_record(&denied_file, &pinned_v1_bytes(&make(denied), 1));
-    fs::set_permissions(&denied_file, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&denied_file, fs::Permissions::from_mode(0o0)).unwrap();
     // Foreign names consume work too; they cannot all be visited in one save.
     for n in 0..1024 {
         fs::write(store.dir().join(format!("foreign-{n}")), b"untouched").unwrap();
