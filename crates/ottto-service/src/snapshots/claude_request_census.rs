@@ -3372,7 +3372,7 @@ fn retire_claude_transcript_records(
     if retirement.kept_overlap_records > 0
         && !within_keep_occupancy(census.hash_total, census.serialized_total)
     {
-        let held = |key: &str| held.contains(key);
+        let held = |key: &str| super::restart_restore::enabled() && held.contains(key);
         let (records, hashes) =
             census.release_aged(files, cutoff, &held, &within_keep_occupancy, false);
         retirement.overflow_occupancy = records;
