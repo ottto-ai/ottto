@@ -461,12 +461,6 @@ impl PipelineFixture {
             &mut Default::default(),
         );
         let census_complete = scan.census_complete;
-        settle_context_curve_replay_state(
-            &mut index,
-            true,
-            census_complete && fully_settled,
-            cycle.replay_generation,
-        );
         index.accept_file_upload_context_acks(
             &progress.context_receipt_candidates,
             &progress.fresh_context_body_acks,
@@ -769,12 +763,6 @@ impl PipelineFixture {
             &mut Default::default(),
         );
         let census_complete = scan.census_complete;
-        settle_context_curve_replay_state(
-            &mut index,
-            true,
-            census_complete && fully_settled,
-            cycle.replay_generation,
-        );
         let (window_start, window_end) =
             snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");
         save_index_and_publish_manifest(
@@ -1107,7 +1095,6 @@ fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
     assert_eq!(counts.disclosed_loss(), DisclosedLoss::Unsettled);
     assert!(!last.fully_settled);
     assert!(!last.backfill_succeeded);
-    assert!(settled.context_curve_replay_needed(PIPELINE_HOLD_CYCLE.replay_generation));
     assert_eq!(settled.claude_account_deferred_hold_count(), 1);
 
     // R14: the real Completed/save/reload path preserves the content memo.
@@ -1409,9 +1396,6 @@ fn replay_reset_terminal_authority_hold_keeps_the_claude_traversal_incomplete() 
             .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
         Some(revision)
     );
-    assert!(last
-        .index
-        .context_curve_replay_needed(cycle.replay_generation));
     assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
     let held_body = first.held.iter().next().expect("held body");
     assert!(!last.uploaded.contains(held_body));
@@ -1842,9 +1826,6 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
             .index
             .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
             .is_some());
-        assert!(last
-            .index
-            .context_curve_replay_needed(cycle.replay_generation));
         assert_held_bodies_never_delivered(&pages, &last.index, &baseline);
         // Every save withdraws the cached manifest; only a complete census
         // publishes one.
@@ -2275,9 +2256,6 @@ fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_gener
             ..
         }
     ));
-    assert!(last
-        .index
-        .context_curve_replay_needed(PIPELINE_HOLD_CYCLE.replay_generation));
     assert_eq!(
         terminal_hold_settlement_count(),
         before,
@@ -2399,9 +2377,6 @@ fn assert_real_rejected_hold(
             );
             assert!(!page.fully_settled);
             assert!(!page.backfill_succeeded);
-            assert!(page
-                .index
-                .context_curve_replay_needed(cycle.replay_generation));
         }
         assert!(
             counts.ownership_incomplete_file_count
@@ -4216,9 +4191,6 @@ fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause(
     );
     assert!(!last.backfill_succeeded);
     assert!(!last.fully_settled);
-    assert!(last
-        .index
-        .context_curve_replay_needed(cycle.replay_generation));
     assert!(!last.index.bounded_sweep_had_unsettled_upload());
     assert!(last.index.bounded_sweep_unsettled_cause_names().is_empty());
     assert!(!last.uploaded.contains(&held_body));

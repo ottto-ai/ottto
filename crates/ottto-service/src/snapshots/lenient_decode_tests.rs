@@ -1836,7 +1836,16 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
         lenient_decode::FIELDS
             .iter()
             .copied()
-            .filter(|name| !matches!(*name, "reread_guard" | "claude_desktop_store_inventory"))
+            .filter(|name| {
+                !matches!(
+                    *name,
+                    "reread_guard"
+                        | "claude_desktop_store_inventory"
+                        | "context_curve_capability_enabled"
+                        | "context_curve_replay_epoch"
+                        | "completed_context_curve_replay_generation"
+                )
+            })
             .collect()
     );
     let decoded =
@@ -2214,7 +2223,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 None,
                 &[],
                 false,
-                true,
             );
             if source == SnapshotSource::ClaudeCode {
                 // An owed family reparse bypasses the ordinary candidate
@@ -2259,7 +2267,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                     None,
                     &[],
                     false,
-                    true,
                 );
                 let mut reached_queue = false;
                 for _ in 0..1000 {
@@ -2354,7 +2361,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                         None,
                         &[],
                         false,
-                        true,
                     );
                     restarted.traversal = context.index.traversal.take();
                     let traversal = restarted.traversal.as_mut().unwrap();
@@ -2642,11 +2648,8 @@ fn override_identity_seed(session: &str, latch: bool) -> ScanIndex {
     ))
     .unwrap();
     index.claude_duplicate_request_witness_overflowed = true;
-    // A replay and a curve replay this index had already completed.
+    // A replay this index had already completed.
     index.historical_replay_generation = Some("replay-generation".into());
-    index.context_curve_capability_enabled = true;
-    index.context_curve_replay_epoch = 3;
-    index.completed_context_curve_replay_generation = Some("curve-generation".into());
     assert!(!index.accepted_snapshot_fingerprints.is_empty());
     index
 }
@@ -2698,14 +2701,8 @@ fn assert_identity_carried(index: &ScanIndex, seed: &ScanIndex, context: &str) {
         index.historical_replay_generation, seed.historical_replay_generation,
         "{context}"
     );
-    assert!(index.context_curve_capability_enabled, "{context}");
-    assert_eq!(index.context_curve_replay_epoch, 3, "{context}");
-    // The completed replays stay complete: no spurious replay preparation
+    // The completed replay stays complete: no spurious replay preparation
     // clears the carried acknowledgements or owned-start census.
-    assert!(
-        !index.context_curve_replay_needed("curve-generation"),
-        "{context}"
-    );
     let mut replayed = index.clone();
     assert!(
         !replayed.prepare_historical_replay("replay-generation".into()),

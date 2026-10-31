@@ -234,15 +234,10 @@ impl HistoryFixture {
             &index_path,
             &self.support,
         );
-        // Production's replay decision: an unreadable state arms no Claude
-        // replay. A due replay generation stands in for a needed curve replay.
-        let replay_pending = ReplayArming::decide(
-            SnapshotSource::ClaudeCode,
-            &backfill,
-            destination,
-            cycle.replay_generation.is_some(),
-        )
-        .curve_replay_pending;
+        // Production's replay rule: an unreadable state arms no Claude
+        // replay. A due replay generation stands in for a pending replay.
+        let replay_pending = cycle.replay_generation.is_some()
+            && !claude_replay_suppressed(SnapshotSource::ClaudeCode, &backfill);
         let replay_dropped = replay_pending
             && cycle
                 .replay_generation
