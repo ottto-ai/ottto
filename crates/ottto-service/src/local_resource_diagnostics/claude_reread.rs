@@ -5,6 +5,42 @@ use super::cache_lifecycle;
 use serde::Serialize;
 use std::cell::Cell;
 
+/// Full selections and completed native bytes, keyed only by the existing
+/// CandidateParseReason labels. Stored in the existing per-probe page registry.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FullByParseReason(
+    [super::rearm_cause::Total; crate::snapshots::CANDIDATE_PARSE_REASON_COUNT],
+);
+impl FullByParseReason {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0
+            .iter()
+            .all(|n| n.count == 0 && n.completed_native_bytes == 0)
+    }
+    pub(super) fn record(
+        &mut self,
+        reason: crate::snapshots::CandidateParseReason,
+        count: u64,
+        completed_native_bytes: u64,
+    ) {
+        let total = &mut self.0[reason as usize];
+        total.count = total.count.saturating_add(count);
+        total.completed_native_bytes = total
+            .completed_native_bytes
+            .saturating_add(completed_native_bytes);
+    }
+}
+impl Serialize for FullByParseReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            crate::snapshots::CANDIDATE_PARSE_REASON_NAMES
+                .iter()
+                .zip(&self.0)
+                .filter(|(_, n)| n.count != 0 || n.completed_native_bytes != 0),
+        )
+    }
+}
+
 /// Closed labels for the existing progress-blocking / restore branches.
 #[derive(Clone, Copy)]
 pub(crate) enum HeldReason {
@@ -571,12 +607,7 @@ impl Drop for Reinsertion {
         }
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for Reinsertion {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; Reinsertion);
 
 #[cfg(test)]
 mod tests {

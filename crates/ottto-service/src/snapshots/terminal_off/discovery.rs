@@ -53,10 +53,8 @@ struct Walk {
     oversized: BTreeSet<String>,
     observations: BTreeMap<[u8; 32], Observation>,
 }
-#[cfg(test)]
-thread_local! {
-    static WALKS: std::cell::RefCell<BTreeMap<String, Walk>> = const { std::cell::RefCell::new(BTreeMap::new()) };
-}
+super::process_memo!(fn with_walk_memo,
+    static WALKS: BTreeMap<String, Walk> = BTreeMap::new());
 // Bound aggregate metadata too: a busy installation cannot multiply a
 // full cohort by all 64 context slots. Eviction permits extra stat work only.
 fn trim(memo: &mut BTreeMap<String, Walk>) {
@@ -71,27 +69,11 @@ fn trim(memo: &mut BTreeMap<String, Walk>) {
     }
 }
 fn with_walks<T>(f: impl FnOnce(&mut BTreeMap<String, Walk>) -> T) -> T {
-    #[cfg(test)]
-    {
-        WALKS.with(|v| {
-            let mut memo = v.borrow_mut();
-            let result = f(&mut memo);
-            trim(&mut memo);
-            result
-        })
-    }
-    #[cfg(not(test))]
-    {
-        static WALKS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Walk>>> =
-            std::sync::OnceLock::new();
-        let mut memo = WALKS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = f(&mut memo);
-        trim(&mut memo);
+    with_walk_memo(|memo| {
+        let result = f(memo);
+        trim(memo);
         result
-    }
+    })
 }
 fn digest(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
@@ -134,7 +116,7 @@ fn blocked(walk: &Walk, key: &str, stat: Option<Stat>, token: Option<[u8; 32]>) 
                 })
         })
 }
-fn revision(index: &ScanIndex, key: &str) -> [u8; 32] {
+fn revision(index: &ScanIndex) -> [u8; 32] {
     let mut h = Sha256::new();
     for value in [
         index
@@ -151,7 +133,6 @@ fn revision(index: &ScanIndex, key: &str) -> [u8; 32] {
             .active_effective_upload_body_witness_revision
             .to_be_bytes(),
     );
-    let _ = key;
     update_length_prefixed(&mut h, LOCAL_SCAN_INDEX_IDENTITY_VERSION.as_bytes());
     update_length_prefixed(
         &mut h,
@@ -243,7 +224,7 @@ pub(super) fn hint_allowed(traversal: &ScanTraversalCheckpoint, path: &Path) -> 
 
 /// `false`: coalesce a requested walk; `true`: start it. Targeted work is
 /// independent. Unknown/restarted RAM state permits one walk without proof.
-pub(super) fn prepare(index: &mut ScanIndex, now: u64, _at: &str, requested: bool) -> bool {
+pub(super) fn prepare(index: &mut ScanIndex, now: u64, requested: bool) -> bool {
     if !claude_terminal_off() {
         return false;
     }
@@ -420,7 +401,7 @@ pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile, now: u64) {
         return;
     };
     let key = local_index_key(&candidate.path);
-    let token = revision(index, &key);
+    let token = revision(index);
     let stat = Some(Stat {
         length: candidate.size_bytes,
         modified: Some(candidate.modified_unix_nanos as u128),
@@ -508,7 +489,7 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
         let Some(cause) = cause(index, key, now) else {
             continue;
         };
-        let token = revision(index, key);
+        let token = revision(index);
         stats += 1;
         let stat = fs::symlink_metadata(key)
             .ok()
@@ -603,7 +584,7 @@ pub(super) fn retry_blocked(index: &ScanIndex, key: &str) -> bool {
     let stat = fs::symlink_metadata(key)
         .ok()
         .and_then(|m| Stat::capture(&m));
-    let token = revision(index, key);
+    let token = revision(index);
     with_walks(|m| {
         m.get(&scope).is_some_and(|w| {
             blocked(w, key, stat, Some(token)) || sampled_audit::candidate_open_blocked(key, w.now)

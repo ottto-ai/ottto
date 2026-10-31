@@ -737,7 +737,7 @@ enum Rebuild {
 /// memo precision bound; existing-key updates remain possible beyond it; any
 /// file past it is left untouched and counted.
 const GC_RECORDS_PER_PASS: usize = 512;
-#[cfg(any(test, feature = "replay-harness"))]
+#[cfg(test)]
 pub(crate) const INVENTORY_BOUND: usize = GC_RECORDS_PER_PASS;
 /// T14 rebuilds one pass allows before the store is disabled: more than
 /// `max(T14_BREAKER, 2% of the records loaded)`.

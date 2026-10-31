@@ -696,9 +696,9 @@ fn e2_bound_trace_page(
                     support, &mut scan, index, accepted,
                 )
             });
-        if unhealthy && stats.trace_rows_discarded.is_empty() {
-            assert_eq!(counts["claude_inherited_org_requests"], 5,
-                "non-discard E2 fallback still fills every request from retained A");
+        if unhealthy {
+            assert_eq!(counts.get("claude_inherited_org_requests"), None,
+                "no request is filled from the retained, start or root account: {counts}");
         }
         for gated in index.claude_history_emission.files.values() {
             assert!(gated.permitted, "owed permission is retained");
@@ -764,35 +764,65 @@ fn e2_bound_trace_totals(items: &[SnapshotItem]) -> BTreeMap<String, serde_json:
         .collect()
 }
 
-fn e2_bound_trace_regression(mode: &str, split_logins: bool) {
-    e2_bound_trace_billing_regression(mode, split_logins, false);
+/// Mark transcript lines API-key billed: `external` marks root and child,
+/// `mixed` only the root's req_3 and req_4. Either way the item leaves final
+/// identity grouping and keeps the emission's uniform row account.
+fn e2_set_billing(dir: &Path, root: &str, billing: &str) {
+    if billing == "subscription" {
+        return;
+    }
+    for path in [
+        dir.join(format!("{root}.jsonl")),
+        dir.join(root).join("subagents").join(format!("agent-{E2_CHILD}.jsonl")),
+    ] {
+        let lines = fs::read_to_string(&path).unwrap().lines().map(|line| {
+            let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+            if billing == "external" || matches!(row["requestId"].as_str(), Some("req_3" | "req_4")) {
+                row["auth_mode"] = json!("api_key");
+            }
+            format!("{row}\n")
+        }).collect::<String>();
+        fs::write(path, lines).unwrap();
+    }
 }
 
-fn e2_bound_trace_billing_regression(mode: &str, split_logins: bool, external: bool) {
-    e2_bound_trace_case(mode, split_logins, external, false);
+/// Rows of `item`'s buckets that carry at least one tagged share.
+fn e2_tagged_bucket_rows(item: &SnapshotItem) -> u64 {
+    item.usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+        .filter(|row| match &row.identity_parts {
+            Some(parts) => parts.iter().any(|part| part.account_identifier_hash.is_some()),
+            None => row.account_identifier_hash.is_some(),
+        })
+        .count() as u64
 }
 
+/// Bound A, own B (child C when `split_logins`), then one unhealthy page and
+/// one clean page. `mode` is a discard (`cap`, `generation`) or another
+/// unhealthy read (`malformed`, `unreadable`, `oversized` at open, or
+/// `incomplete`: the trace member is missing). SOURCE: no unhealthy request
+/// takes an account; a discard also withholds the family.
+/// `billing`: `subscription`, `external` or `mixed` (see `e2_set_billing`).
 /// `accepted_ledger`: the clean page's bodies enter the accepted-identity
 /// ledger exactly as a stored ACK records them, and every later page reads it.
-fn e2_bound_trace_case(mode: &str, split_logins: bool, external: bool, accepted_ledger: bool) {
+/// `listed`: the family is on the re-emission list (no E2 fold).
+fn e2_bound_trace_case(
+    mode: &str,
+    split_logins: bool,
+    billing: &str,
+    accepted_ledger: bool,
+    listed: bool,
+) {
     let (dir, root, _) = claude_account_family_fixture();
-    if external {
-        for path in [
-            dir.join(format!("{root}.jsonl")),
-            dir.join(&root).join("subagents").join(format!("agent-{E2_CHILD}.jsonl")),
-        ] {
-            let lines = fs::read_to_string(&path).unwrap().lines().map(|line| {
-                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
-                row["auth_mode"] = json!("api_key");
-                format!("{row}\n")
-            }).collect::<String>();
-            fs::write(path, lines).unwrap();
-        }
-    }
+    e2_set_billing(&dir, &root, billing);
     let support = dir.join("support");
     let (mut api, trace) = e2_family_evidence(&root);
+    // Own login B, except the mixed arm: own A == the bound owner, which main
+    // uploads and only #947's clear would hold (Lead B Addendum 4).
+    let own = if billing == "mixed" { "a" } else { "b" };
     for row in &mut api {
-        row.account_identifier_hash = Some("b".repeat(64));
+        row.account_identifier_hash = Some(own.repeat(64));
         e2_resign(row);
     }
     if split_logins {
@@ -804,187 +834,336 @@ fn e2_bound_trace_case(mode: &str, split_logins: bool, external: bool, accepted_
     let path = support
         .join("local-otel/claude-code-trace-ownership")
         .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
-    let mut index = ScanIndex::default();
-    index.session_account_bindings.insert(
-        sha256_hex(&["session_owner:v1", "e2-identity-machine", &root]),
-        SessionAccountBinding {
-            account_identifier_hash: e2_account(),
-            workspace_identifier_hash: None,
-        },
-    );
+    if listed {
+        let list = crate::snapshots::claude_reemission_exclusions::ReemissionExclusions::path(&support);
+        fs::create_dir_all(list.parent().unwrap()).unwrap();
+        fs::write(list, format!("{:x}\n", Sha256::digest(root.as_bytes()))).unwrap();
+    }
+    // Only the durable creator binding A (and the real list) carries over.
+    let bound_index = || {
+        let mut index = ScanIndex::default();
+        index.session_account_bindings.insert(
+            sha256_hex(&["session_owner:v1", "e2-identity-machine", &root]),
+            SessionAccountBinding {
+                account_identifier_hash: e2_account(),
+                workspace_identifier_hash: None,
+            },
+        );
+        index.load_claude_reemission_exclusions(&support);
+        index
+    };
+    let discarded = matches!(mode, "cap" | "generation");
+    let mut index = bound_index();
     let (clean, _, stats) = e2_bound_trace_page(&dir, &support, &root, &mut index, false, None);
-    let child_login = if split_logins { "c" } else { "b" }.repeat(64);
-    e2_bound_trace_assert_logins(&clean, &root, Some("b".repeat(64)), Some(child_login.clone()));
+    let b = Some(own.repeat(64));
+    let child_login = Some(if split_logins { "c" } else { own }.repeat(64));
+    if listed {
+        assert!(clean.iter().all(|item| item.claude_money.is_none()), "listed: no E2 fold");
+    } else {
+        e2_bound_trace_assert_logins(&clean, &root, b.clone(), child_login.clone());
+    }
     let mut accepted = claude_request_identity::AcceptedBuckets::for_test();
+    // Refusals each item owes once its accepted shares change: one per row.
+    let mut refusals = BTreeMap::<String, u64>::new();
     if accepted_ledger {
         // The same ledger write `record_cache_state` makes for a stored ACK.
         for item in &clean {
             accepted.record(&serde_json::to_value(item).unwrap());
-        }
-        assert!(
-            clean.iter().any(|item| accepted.get(&item.source_session_id).is_some()),
-            "a tagged contract-5 body was accepted"
-        );
-    }
-    let accepted = accepted_ledger.then_some(&accepted);
-    if external {
-        for item in &clean {
-            for row in e2_rows(item) {
-                assert_eq!(row.auth_mode.as_deref(), Some("api_key"));
-                assert!(!claude_request_accounts::local_subscription(row),
-                    "this fixture bypasses contract-5 identity grouping");
+            if accepted.get(&item.source_session_id).is_some() {
+                refusals.insert(item.source_session_id.clone(), e2_tagged_bucket_rows(item));
             }
         }
+        assert!(refusals.values().any(|rows| *rows > 0), "a tagged body was accepted: {refusals:?}");
+    }
+    let accepted = accepted_ledger.then_some(&accepted);
+    if billing != "subscription" {
+        let root_item = clean.iter().find(|item| item.source_session_id == root).unwrap();
+        assert!(
+            e2_rows(root_item).any(|row| !claude_request_accounts::local_subscription(row)),
+            "this arm bypasses contract-5 identity grouping"
+        );
     }
     assert_eq!(stats.trace_discard_no_fallback_requests, 0);
     assert_eq!(stats.trace_discard_deferred_items, 0);
+    assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
     let line = serde_json::to_value(&stats).unwrap();
-    assert!(line.get("trace_discard_no_fallback_requests").is_none());
-    assert!(line.get("trace_discard_deferred_items").is_none());
+    for key in [
+        "trace_discard_no_fallback_requests",
+        "trace_discard_deferred_items",
+        "unhealthy_root_no_fallback_requests",
+    ] {
+        assert!(line.get(key).is_none(), "{key} is absent while zero");
+    }
     let totals = e2_bound_trace_totals(&clean);
     let fired = std::rc::Rc::new(std::cell::Cell::new(false));
-    if mode == "malformed" {
-        fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"malformed\n").unwrap();
-        // Stable malformed input is truly unhealthy, even with all valid rows
-        // retained. The reader's frozen-main equality test covers this state.
-        let report = crate::claude_local_otel::load_claude_trace_ownership_evidence(
-            &support, [root.clone()],
-        );
-        assert_eq!(report.malformed_lines, 1);
-        assert!(!report.is_complete(), "the control must take the unhealthy path");
-        assert_eq!(report.evidence[&root], trace);
-        assert!(report.rows_discarded.is_empty());
-    } else {
-        let expected = path.clone();
-        let duplicate = serde_json::to_string(&trace[0]).unwrap();
-        let fired = fired.clone();
-        let generation = mode == "generation";
-        crate::claude_local_otel::before_next_trace_read_for_test(move |path| {
-            assert_eq!(path, expected);
-            if generation {
-                let replacement = path.with_extension("replacement");
-                fs::copy(path, &replacement).unwrap();
-                fs::rename(replacement, path).unwrap();
-            } else {
-                fs::OpenOptions::new().append(true).open(path).unwrap()
-                    .write_all(format!("{duplicate}\n").as_bytes()).unwrap();
-            }
-            fired.set(true);
-        });
+    match mode {
+        "malformed" => {
+            fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"malformed\n").unwrap();
+            // Stable malformed input is truly unhealthy, even with all valid
+            // rows retained.
+            let report = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+                &support, [root.clone()],
+            );
+            assert_eq!(report.malformed_lines, 1);
+            assert!(!report.is_complete(), "the case must take the unhealthy path");
+            assert_eq!(report.evidence[&root], trace);
+            assert!(report.rows_discarded.is_empty());
+        }
+        "unreadable" => {
+            fs::remove_file(&path).unwrap();
+            fs::create_dir_all(&path).unwrap();
+        }
+        // The API sidecar stays: a missing pair member is failed evidence.
+        "incomplete" => fs::remove_file(&path).unwrap(),
+        // Sparse: the strict reader refuses at open from metadata alone.
+        "oversized" => fs::OpenOptions::new().write(true).open(&path).unwrap()
+            .set_len(64 * 1024 * 1024).unwrap(),
+        "cap" | "generation" => {
+            let expected = path.clone();
+            let duplicate = serde_json::to_string(&trace[0]).unwrap();
+            let fired = fired.clone();
+            let generation = mode == "generation";
+            crate::claude_local_otel::before_next_trace_read_for_test(move |path| {
+                assert_eq!(path, expected);
+                if generation {
+                    let replacement = path.with_extension("replacement");
+                    fs::copy(path, &replacement).unwrap();
+                    fs::rename(replacement, path).unwrap();
+                } else {
+                    fs::OpenOptions::new().append(true).open(path).unwrap()
+                        .write_all(format!("{duplicate}\n").as_bytes()).unwrap();
+                }
+                fired.set(true);
+            });
+        }
+        other => panic!("unknown mode {other}"),
+    }
+    // A family the page did not withhold is selected again only by a fresh
+    // index: the scanner's own change detection is not under test here.
+    if !discarded {
+        index = bound_index();
     }
     let (items, disposition, stats) =
         e2_bound_trace_page(&dir, &support, &root, &mut index, true, accepted);
-    assert_eq!(fired.get(), mode != "malformed");
-    assert_eq!(stats.trace_incomplete_root_count, 1);
-    let discarded = mode != "malformed";
-    assert_eq!(stats.trace_discard_no_fallback_requests, if discarded { 5 } else { 0 });
+    assert_eq!(fired.get(), discarded);
+    assert_eq!(
+        stats.trace_incomplete_root_count,
+        usize::from(discarded || mode == "malformed"),
+        "unreadable, oversized and incomplete pairs never reach the strict read"
+    );
+    // Root 4 + child 1 requests, under this cause only; a listed family has
+    // no E2 fold to count.
+    let reason = if discarded { "discarded" } else { mode };
+    let requests = if listed { 0 } else { 5 };
+    let expected = if listed { json!({}) } else { json!({ reason: requests }) };
+    assert_eq!(serde_json::to_value(stats.unhealthy_root_no_fallback_requests).unwrap(), expected);
+    assert_eq!(stats.trace_discard_no_fallback_requests, if discarded { requests } else { 0 },
+        "#932's scalar equals the discarded reason");
+    // The production account owner after this page: a body with no login on
+    // the session bound to A is held unless this scan admitted it.
+    let mut bound = items.clone();
+    let held = index.bind_session_accounts_with_mixed(
+        SnapshotSource::ClaudeCode,
+        "e2-identity-machine",
+        &mut bound,
+        &[],
+        &disposition.mixed_uploads,
+    );
     if discarded {
         // Deferred: no revision replaces the accepted body, so the server
         // keeps its tags and no other account (A or None) receives this hour.
         e2_assert_family_deferred(&items, &disposition);
+        if billing != "subscription" {
+            // Only the root is bound (to A).
+            assert_eq!(held, BTreeSet::from([root.clone()]), "#932's discard keeps main's account hold");
+        }
         assert_eq!(stats.trace_discard_deferred_items, 2);
         let line = serde_json::to_value(&stats).unwrap();
-        assert_eq!(line["trace_discard_no_fallback_requests"], 5);
         assert_eq!(line["trace_discard_deferred_items"], 2);
+        assert_eq!(
+            line.get("unhealthy_root_no_fallback_requests"),
+            (!listed).then_some(&expected),
+            "absent while empty"
+        );
         assert_eq!(stats.trace_rows_discarded.cap, u64::from(mode == "cap"));
         assert_eq!(stats.trace_rows_discarded.generation, u64::from(mode == "generation"));
     } else {
-        assert_eq!(e2_bound_trace_totals(&items), totals, "per-session money is unchanged");
-        // Main preserves uniform API-qualified B on markerless wire rows despite
-        // internal A partitions. Split B/C evidence cannot take that shortcut:
-        // the non-discard control then emits the retained A partitions instead.
-        let control_login = if split_logins { e2_account() } else { "b".repeat(64) };
-        e2_bound_trace_assert_logins(&items, &root, Some(control_login.clone()), Some(control_login));
+        // Never A, never B/C: every request share is Unknown, uploaded now.
+        e2_bound_trace_assert_logins(&items, &root, None, None);
+        if billing == "mixed" {
+            // Lead B Addendum 4 (option 1): the cleared owner login A is not
+            // held; the body uploads Unknown on this page.
+            assert!(held.is_empty(), "0 holds: {held:?}");
+            e2_bound_trace_assert_logins(&bound, &root, None, None);
+        } else if billing == "external" {
+            // Main's hold for a login other than A (B) stays.
+            assert_eq!(held, BTreeSet::from([root.clone()]), "main's B != A hold");
+        }
+        assert_eq!(disposition.quarantined_entity_count(), 0, "Unknown, not deferred");
         assert_eq!(stats.trace_discard_deferred_items, 0);
-        assert!(stats.trace_rows_discarded.is_empty(), "malformed is not a discard");
+        assert!(stats.trace_rows_discarded.is_empty(), "{mode} is not a discard");
         let line = serde_json::to_value(&stats).unwrap();
-        assert!(line.get("trace_discard_no_fallback_requests").is_none());
-        assert!(line.get("trace_discard_deferred_items").is_none());
-        assert_eq!(stats.complete_sidecar_root_count, 0);
-        assert_eq!(stats.api_incomplete_root_count, 0);
-        assert_eq!(stats.api_evidence_row_count, 0);
-        assert_eq!(stats.trace_evidence_row_count, 0);
+        assert_eq!(line["unhealthy_root_no_fallback_requests"], expected);
+        if mode == "malformed" {
+            // The same paired read: money is unchanged, only the account moves.
+            assert_eq!(e2_bound_trace_totals(&items), totals, "per-session money is unchanged");
+        }
         for item in &items {
             assert_eq!(item.telemetry_owned_complete, Some(false));
+            // #909: one refusal per changed accepted row; none if never accepted.
+            assert_eq!(
+                item.request_identity_refusals,
+                refusals.get(&item.source_session_id).copied().unwrap_or(0),
+                "{}", item.source_session_id
+            );
         }
     }
-    // Settle the sidecar; the next page must use B despite the retained A.
-    // Only a discard owes this recovery. The malformed control stops at
-    // main's unhealthy page: re-selection after its repair is main's scanner.
-    if discarded {
-        e2_write_rows(&support, "local-otel/claude-code-trace-ownership", &root, &trace);
-        let (recovered, _, stats) =
-            e2_bound_trace_page(&dir, &support, &root, &mut index, false, accepted);
-        e2_bound_trace_assert_logins(&recovered, &root, Some("b".repeat(64)), Some(child_login));
-        assert_eq!(e2_bound_trace_totals(&recovered), totals, "the deferred usage is not dropped");
-        assert_eq!(stats.trace_discard_no_fallback_requests, 0);
-        assert_eq!(stats.trace_discard_deferred_items, 0);
-        assert!(stats.trace_rows_discarded.is_empty());
+    // The sidecar reads clean again: the family's own proof returns.
+    if mode == "unreadable" {
+        fs::remove_dir(&path).unwrap();
     }
+    e2_write_rows(&support, "local-otel/claude-code-trace-ownership", &root, &trace);
+    if !discarded {
+        index = bound_index();
+    }
+    let (recovered, _, stats) =
+        e2_bound_trace_page(&dir, &support, &root, &mut index, false, accepted);
+    if listed {
+        // Addendum 3: the accepted tags are kept, nothing is refused.
+        for item in &recovered {
+            let logins = e2_login_counts(item);
+            assert!(logins.keys().all(|login| login.is_some() && *login != Some(e2_account())),
+                "{logins:?}");
+            assert_eq!(item.request_identity_refusals, 0);
+        }
+    } else {
+        e2_bound_trace_assert_logins(&recovered, &root, b, child_login);
+        assert!(recovered.iter().all(|item| item.request_identity_refusals == 0));
+    }
+    assert_eq!(e2_bound_trace_totals(&recovered), totals, "no usage is dropped");
+    assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
+    assert_eq!(stats.trace_discard_deferred_items, 0);
+    assert!(stats.trace_rows_discarded.is_empty());
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// [money] #932: a discard withholds, never another account.
 #[test]
 fn e2_pipeline_bound_a_own_b_cap_discard_has_no_fallback_then_recovers() {
-    e2_bound_trace_regression("cap", false);
+    e2_bound_trace_case("cap", false, "subscription", false, false);
 }
 
+/// [money] #932: a replaced trace is a discard too.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_bound_a_own_b_generation_discard_has_no_fallback_then_recovers() {
-    e2_bound_trace_regression("generation", false);
+    e2_bound_trace_case("generation", false, "subscription", false, false);
 }
 
+/// [money] Uniform B on a malformed trace is Unknown until a clean read,
+/// never B through the D1 shortcut.
+/// guard: unseen on M4 (0 of 3,614 evidence pages); code-derived from #932 review P2-1
 #[test]
-fn e2_pipeline_bound_a_malformed_trace_keeps_main_fallback() {
-    e2_bound_trace_regression("malformed", false);
+fn e2_pipeline_bound_a_uniform_b_malformed_trace_is_unknown_not_a() {
+    e2_bound_trace_case("malformed", false, "subscription", false, false);
 }
 
-// With no uniform API account, main's markerless shortcut cannot preserve B.
-// The malformed control takes the same unhealthy/no-accepted-rows path as a
-// discard with the new rule disabled, and actually emits retained A.
+/// [money] Split B/C on a malformed trace is Unknown, never retained A.
+/// Never accepted, so no refusal.
+/// guard: unseen on M4 (0 of 3,614 evidence pages); code-derived from #932 review P2-1
 #[test]
-fn e2_pipeline_bound_a_split_logins_malformed_trace_matches_main_a() {
-    e2_bound_trace_regression("malformed", true);
+fn e2_pipeline_bound_a_split_logins_malformed_trace_is_unknown_not_a() {
+    e2_bound_trace_case("malformed", true, "subscription", false, false);
 }
 
+/// [money] SOURCE reason counts: split B/C on every other unhealthy read is
+/// Unknown, never retained A, and counted under its own reason.
+/// guard: unseen on M4 (0 of 3,614 evidence pages)
+#[test]
+fn e2_pipeline_bound_a_split_logins_unhealthy_trace_reasons_are_unknown_not_a() {
+    for (case, mode) in [
+        ("unreadable: the trace path is a directory", "unreadable"),
+        ("oversized: refused at open from metadata", "oversized"),
+        ("incomplete: the trace pair member is missing", "incomplete"),
+    ] {
+        let row = std::panic::catch_unwind(|| {
+            e2_bound_trace_case(mode, true, "subscription", false, false)
+        });
+        assert!(row.is_ok(), "{case}");
+    }
+}
+
+/// [money] #932: the discard withholds the split family too.
 #[test]
 fn e2_pipeline_bound_a_split_logins_cap_discard_blocks_retained_a() {
-    e2_bound_trace_regression("cap", true);
+    e2_bound_trace_case("cap", true, "subscription", false, false);
 }
 
+/// [money] #932: the same for a replaced trace.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_bound_a_split_logins_generation_discard_blocks_retained_a() {
-    e2_bound_trace_regression("generation", true);
+    e2_bound_trace_case("generation", true, "subscription", false, false);
 }
 
+/// [money] #932: external billing bypasses grouping; the discard clears it.
 #[test]
 fn e2_pipeline_external_billing_cap_discard_clears_wire_account_then_recovers() {
-    e2_bound_trace_billing_regression("cap", false, true);
+    e2_bound_trace_case("cap", false, "external", false, false);
 }
 
+/// [money] #932: the same for a replaced trace.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_external_billing_generation_discard_clears_wire_account_then_recovers() {
-    e2_bound_trace_billing_regression("generation", false, true);
+    e2_bound_trace_case("generation", false, "external", false, false);
 }
 
+/// [money] Lead B C2: the uniform wire account is cleared for every
+/// unhealthy reason, not only discards. One family login B: with two, the
+/// account owner already withholds a D1-shaped body. B != bound A: main's
+/// account hold stays (Lead B Addendum 4).
 #[test]
-fn e2_pipeline_external_billing_malformed_trace_keeps_main_account() {
-    e2_bound_trace_billing_regression("malformed", false, true);
+fn e2_pipeline_external_billing_malformed_trace_clears_wire_account() {
+    e2_bound_trace_case("malformed", false, "external", false, false);
 }
 
-// A bucket already accepted tagged (B root, C child) is never replaced by an
-// untagged revision: the discard page uploads nothing for the family, and the
-// next clean page uploads B/C again with unchanged totals.
+/// [money] Lead B C2 + Addendum 4 (option 1), mixed billing (only req_3/req_4
+/// API-key billed), own login A == bound owner: the body uploads Unknown on
+/// the same page with 0 account holds, decision-2 refusals (none here: this
+/// body never enters the #909 ledger) and unchanged totals.
+#[test]
+fn e2_pipeline_mixed_billing_malformed_trace_clears_wire_account() {
+    e2_bound_trace_case("malformed", false, "mixed", false, false);
+}
+
+/// [money] #932 x #909: a bucket already accepted tagged (B root, C child) is
+/// never replaced by an untagged revision: the discard page uploads nothing
+/// for the family, and the next clean page uploads B/C again.
 #[test]
 fn e2_pipeline_accepted_b_cap_discard_defers_upload_then_recovers() {
-    e2_bound_trace_case("cap", true, false, true);
+    e2_bound_trace_case("cap", true, "subscription", true, false);
 }
 
+/// [money] #932 x #909: the same for a replaced trace.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_accepted_b_generation_discard_defers_upload_then_recovers() {
-    e2_bound_trace_case("generation", true, false, true);
+    e2_bound_trace_case("generation", true, "subscription", true, false);
+}
+
+/// [money] #947 x #909 (Lead B Q2): an accepted bucket made Unknown by a
+/// malformed trace keeps #909's refusal, one per changed accepted row.
+#[test]
+fn e2_pipeline_accepted_bucket_unhealthy_root_keeps_909_refusal() {
+    e2_bound_trace_case("malformed", true, "subscription", true, false);
+}
+
+/// [money] Lead B Addendum 3 (#932 x #909 F2): a listed family (real
+/// re-emission list, no E2 fold) whose accepted trace grows mid-read is held
+/// like a folded one: nothing untagged or refused uploads, its history stays
+/// owed, and the next clean read keeps the tags.
+#[test]
+fn e2_pipeline_listed_family_accepted_cap_discard_is_held_then_keeps_tags() {
+    e2_bound_trace_case("cap", true, "subscription", true, true);
 }

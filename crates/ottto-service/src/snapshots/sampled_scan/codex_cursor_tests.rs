@@ -6906,7 +6906,11 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
     context.active_upload_context_fingerprint = Some("another-upload-context".into());
     assert_ne!(reference, digest(&context, &codex, 1), "upload context");
     let flags: [fn(&mut CodexTitleMetadata); 3] = [
-        |codex| codex.created_thread_census_unscoped_incomplete = true,
+        |codex| {
+            codex
+                .created_thread_census_failed_homes
+                .insert(PathBuf::from("/failed-home"));
+        },
         |codex| codex.state_census_unscoped_incomplete = true,
         |codex| codex.sidecar_census_unscoped_incomplete = true,
     ];

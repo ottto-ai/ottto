@@ -296,14 +296,8 @@ impl ClaudeRequestKey {
     }
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestKey {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    // 32 inline bytes: no heap, one walker visit like the key it replaced.
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+// 32 inline bytes: no heap, one walker visit like the key it replaced.
+crate::heap_layout_bound::no_heap!(true; ClaudeRequestKey);
 
 /// An opening call's provider call or tool-use id, apart from the tool name
 /// its `OpeningCall` holds, so a record's `L` span is the id alone (M1,
