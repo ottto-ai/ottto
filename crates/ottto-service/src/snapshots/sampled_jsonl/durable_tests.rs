@@ -1999,7 +1999,6 @@ fn structural_verifier_real_records_truncations_tags_lengths_and_mutation_corpus
         let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
         assert_eq!(verified_without_allocation(&body), Ok(()));
         assert!(decode(&body, source).is_ok());
-        // Byte/hash stability: re-encoding the same retained value is exact.
         for end in 0..body.len() {
             assert_eq!(
                 verified_without_allocation(&body[..end]),
@@ -2179,8 +2178,6 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
         .unwrap()
         .write_all(b"{}\n")
         .unwrap();
-    // Since #870, audit debt alone never forces a Full on a checkpoint; an
-    // independently owed Full (here a scope change) must not touch the gate.
     let mut due = parser(&path, source);
     // Since #870, audit debt alone never forces a Full on a checkpoint; an
     // independently owed Full (here a scope change) must not touch the gate.

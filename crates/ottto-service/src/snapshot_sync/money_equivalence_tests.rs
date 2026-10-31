@@ -1885,7 +1885,8 @@ fn pi_cli_fork_preserves_double_count() {
     if !supported("pi_cli_fork_preserves_double_count") {
         return;
     }
-    // M-2 will change these request/input totals when inherited usage is skipped.
+    // M-2 skips only copies stamped before the fork header; these copies are
+    // stamped at or after it, so they stay counted.
     const EXPECTED_FORK_TOTALS: (u64, u64) = (3, 40);
     let (c, mut disk, path, scanner, prior, mut proof) =
         pi_disk_corpus("pi_cli_fork_preserves_double_count", &pi_seed());
