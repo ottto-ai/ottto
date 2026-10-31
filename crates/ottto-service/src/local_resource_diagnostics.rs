@@ -3114,3 +3114,6 @@ pub(crate) fn scan_index_repair_required(
         }),
     );
 }
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use footprint::memory_harness_current;
