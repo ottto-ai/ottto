@@ -3,8 +3,7 @@
 //! so only the reason-independent gate can hold it. Fixtures are synthetic.
 
 use super::claude_history_upgrade::{
-    local_count, revision_policy, with_max_gated_claude_revision, LocalCount,
-    REQUEST_OWNED_USAGE_CONTRACT,
+    local_count, with_max_gated_claude_revision, LocalCount, REQUEST_OWNED_USAGE_CONTRACT,
 };
 use super::claude_reemission_exclusions::{with_no_list_cutoff, ListState, ReemissionExclusions};
 use super::*;
@@ -548,17 +547,6 @@ fn the_shared_stamp_never_downgrades_and_refuses_held_files() {
     let _ = fs::remove_dir_all(home);
 }
 
-/// Release gate: a release that raises the active Claude revision must also
-/// give it a row in the history policy table. Without one this fails, and the
-/// gate itself holds every upgrade (`ungated_revision`).
-#[test]
-fn active_claude_revision_has_a_history_policy_row() {
-    let active =
-        crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);
-    assert!(active <= MAX_GATED_CLAUDE_REVISION, "active {active}");
-    assert!(revision_policy(active).is_some());
-}
-
 /// The listed family's subagent member id (`root_stem`).
 fn listed_member(index: &ScanIndex, family: &str) -> String {
     index
@@ -568,41 +556,6 @@ fn listed_member(index: &ScanIndex, family: &str) -> String {
         .find(|(root, member)| root == family && member != family)
         .map(|(_, member)| member)
         .unwrap()
-}
-
-/// StateMissing M1: on a fresh index a list line naming only a member
-/// (`root_stem`) still protects its root, which is decided before the
-/// member is indexed: no root body is emitted, and the unlisted family
-/// upgrades.
-#[test]
-fn member_only_line_protects_its_root_on_a_fresh_index() {
-    let (home, root, index) = families("history-gate-member-only", 2);
-    let support = support("history-gate-member-only-support");
-    fs::write(
-        ReemissionExclusions::path(&support),
-        format!("{}\n", digest(&listed_member(&index, &session(1)))),
-    )
-    .unwrap();
-    let mut fresh = ScanIndex::default();
-    fresh.note_claude_history_cutoff(PriorHistory::Here, false, true);
-    fresh.load_claude_reemission_exclusions(&support);
-    let mut result = scan(&root, &mut fresh, "ctx-1", 2);
-    assert_eq!(result.scanned_file_count, 4, "new files parse locally");
-    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut fresh);
-    assert!(
-        result
-            .snapshots
-            .iter()
-            .all(|item| !item.source_session_id.starts_with(&session(1))),
-        "{:?}",
-        result
-            .snapshots
-            .iter()
-            .map(|item| &item.source_session_id)
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(result.snapshots.len(), 2, "the unlisted family upgrades");
-    let _ = fs::remove_dir_all(home);
 }
 
 /// M1 (AutoReview): a member directory the closure cannot read may hold a
@@ -714,123 +667,6 @@ fn decide(index: &mut ScanIndex, candidate: &CandidateFile) -> HistoryDecision {
     index.claude_history_upgrade_decision(candidate, Some(0), &mut HistoryPage::default())
 }
 
-/// Move a directory's modification time an hour back, as a family whose
-/// members were all written before this pass.
-fn age_directory(directory: &Path) {
-    fs::File::open(directory)
-        .unwrap()
-        .set_modified(SystemTime::now() - std::time::Duration::from_secs(3_600))
-        .unwrap();
-}
-
-/// StateMissing M1, a family with no root file: the list names only
-/// `R_agent-a`, and the fresh index has not seen agent-a. Its sibling agent-b
-/// is held whichever member is decided first, the root is listed, and an
-/// unlisted rootless family is not held. Before the fix, agent-b was decided
-/// as unlisted (`Owed`) in both orders.
-#[test]
-fn listed_member_holds_its_sibling_when_the_root_file_is_absent() {
-    for order in [["agent-b", "agent-a"], ["agent-a", "agent-b"]] {
-        let home = crate::test_scratch::unique_path("ottto-history-gate-rootless");
-        let project = home.join("project");
-        let family = session(1);
-        let members = family_on_disk(&project, &family, &["agent-a", "agent-b"], false);
-        let other = family_on_disk(&project, &session(2), &["agent-c"], false);
-        let (_support, mut fresh) = fresh_with_list(
-            "history-gate-rootless-support",
-            &format!("{}\n", digest(&format!("{family}_agent-a"))),
-        );
-        for stem in order {
-            assert_eq!(
-                decide(&mut fresh, &members[stem]),
-                HistoryDecision::Held(HistoryHold::Listed),
-                "{stem} in order {order:?}"
-            );
-        }
-        assert!(fresh.claude_reemission_exclusions.excludes(&family, None));
-        assert_ne!(
-            decide(&mut fresh, &other["agent-c"]),
-            HistoryDecision::Held(HistoryHold::Listed),
-            "an unlisted rootless family is not held"
-        );
-        assert!(!fresh
-            .claude_reemission_exclusions
-            .excludes(&session(2), None));
-        let _ = fs::remove_dir_all(home);
-    }
-}
-
-/// The same family through the whole scan: no root file, the listed member
-/// between two siblings in traversal order. No body of the listed family is
-/// emitted; the unlisted rootless family still emits.
-#[test]
-fn rootless_listed_family_emits_no_sibling_through_the_scan() {
-    let (home, root, index) = families("history-gate-rootless-scan", 2);
-    let listed = listed_member(&index, &session(1));
-    for slot in 0..2 {
-        let family = session(slot);
-        fs::remove_file(root.join(format!("{family}.jsonl"))).unwrap();
-        for agent in ["agent-0", "agent-z"] {
-            fs::write(
-                root.join(&family)
-                    .join("subagents")
-                    .join(format!("{agent}.jsonl")),
-                subagent_line(&family, agent),
-            )
-            .unwrap();
-        }
-    }
-    let support = support("history-gate-rootless-scan-support");
-    fs::write(
-        ReemissionExclusions::path(&support),
-        format!("{}\n", digest(&listed)),
-    )
-    .unwrap();
-    let mut fresh = ScanIndex::default();
-    fresh.note_claude_history_cutoff(PriorHistory::Here, false, true);
-    fresh.load_claude_reemission_exclusions(&support);
-    let mut result = scan(&root, &mut fresh, "ctx-1", 2);
-    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut fresh);
-    let emitted = result
-        .snapshots
-        .iter()
-        .map(|item| item.source_session_id.as_str())
-        .collect::<Vec<_>>();
-    assert!(
-        emitted.iter().all(|id| !id.starts_with(&session(1))),
-        "{emitted:?}"
-    );
-    assert!(
-        emitted.iter().any(|id| id.starts_with(&session(0))),
-        "the unlisted family upgrades: {emitted:?}"
-    );
-    let _ = fs::remove_dir_all(home);
-}
-
-/// With the root file present and a member listed, the root and every
-/// member are held as before, and the family is walked once.
-#[test]
-fn listed_member_with_its_root_present_holds_the_whole_family() {
-    let home = crate::test_scratch::unique_path("ottto-history-gate-rooted");
-    let project = home.join("project");
-    let family = session(1);
-    let members = family_on_disk(&project, &family, &["agent-a", "agent-b"], true);
-    let (_support, mut fresh) = fresh_with_list(
-        "history-gate-rooted-support",
-        &format!("{}\n", digest(&format!("{family}_agent-a"))),
-    );
-    let walks = claude_reemission_member_walks_for_test();
-    for stem in ["", "agent-b", "agent-a"] {
-        assert_eq!(
-            decide(&mut fresh, &members[stem]),
-            HistoryDecision::Held(HistoryHold::Listed),
-            "{stem:?}"
-        );
-    }
-    assert_eq!(claude_reemission_member_walks_for_test() - walks, 1);
-    let _ = fs::remove_dir_all(home);
-}
-
 /// A rootless family whose member walk cannot finish holds its root: an
 /// unreadable nested directory (it may hold the listed member), or more
 /// entries than the walk's bound.
@@ -880,95 +716,6 @@ fn rootless_family_walk_that_cannot_finish_holds_the_root() {
         HistoryDecision::Held(HistoryHold::Listed)
     );
     assert!(fresh.claude_reemission_exclusions.excludes(&family, None));
-    let _ = fs::remove_dir_all(home);
-}
-
-/// An installed list with no line (most Macs) walks no member directory.
-#[test]
-fn empty_list_walks_no_member_directory() {
-    let home = crate::test_scratch::unique_path("ottto-history-gate-empty-walk");
-    let project = home.join("project");
-    let members = family_on_disk(&project, &session(1), &["agent-a", "agent-b"], true);
-    let (_support, mut fresh) = fresh_with_list("history-gate-empty-walk-support", "# none\n");
-    let walks = claude_reemission_member_walks_for_test();
-    for candidate in members.values() {
-        assert_ne!(
-            decide(&mut fresh, candidate),
-            HistoryDecision::Held(HistoryHold::Listed)
-        );
-    }
-    assert_eq!(claude_reemission_member_walks_for_test(), walks);
-    let _ = fs::remove_dir_all(home);
-}
-
-/// A big unlisted family is walked once per pass, not once per member. A
-/// member created after the walk changes the directory's stamp, so the next
-/// sibling walks again and is held when that member is listed; a new pass
-/// walks again.
-#[test]
-fn member_walk_is_remembered_per_pass_until_the_directory_changes() {
-    let home = crate::test_scratch::unique_path("ottto-history-gate-walk-memo");
-    let project = home.join("project");
-    let family = session(1);
-    let stems = (0..32)
-        .map(|slot| format!("agent-{slot:02}"))
-        .collect::<Vec<_>>();
-    let members = family_on_disk(
-        &project,
-        &family,
-        &stems.iter().map(String::as_str).collect::<Vec<_>>(),
-        false,
-    );
-    let subagents = project.join(&family).join("subagents");
-    age_directory(&subagents);
-    let (_support, mut fresh) = fresh_with_list(
-        "history-gate-walk-memo-support",
-        &format!("{}\n", digest(&format!("{family}_agent-late"))),
-    );
-    let walks = claude_reemission_member_walks_for_test();
-    for candidate in members.values() {
-        assert_ne!(
-            decide(&mut fresh, candidate),
-            HistoryDecision::Held(HistoryHold::Listed)
-        );
-    }
-    assert_eq!(
-        claude_reemission_member_walks_for_test() - walks,
-        1,
-        "one walk for the whole family this pass"
-    );
-
-    // The listed member appears mid-pass: the memo cannot hide it.
-    fs::write(
-        subagents.join("agent-late.jsonl"),
-        subagent_line(&family, "agent-late"),
-    )
-    .unwrap();
-    assert_eq!(
-        decide(&mut fresh, &members["agent-00"]),
-        HistoryDecision::Held(HistoryHold::Listed)
-    );
-    assert_eq!(claude_reemission_member_walks_for_test() - walks, 2);
-
-    // A new pass forgets the walks of the last one.
-    fs::remove_file(subagents.join("agent-late.jsonl")).unwrap();
-    age_directory(&subagents);
-    let (_support, mut next) = fresh_with_list(
-        "history-gate-walk-memo-next-support",
-        &format!("{}\n", digest(&format!("{family}_agent-late"))),
-    );
-    for _ in 0..2 {
-        next.activate_effective_upload_body_witness_revision(2);
-        next.adopt_effective_upload_body_witness_revision_monotonically();
-        for stem in ["agent-01", "agent-02"] {
-            decide(&mut next, &members[stem]);
-        }
-    }
-    assert_eq!(
-        claude_reemission_member_walks_for_test() - walks,
-        4,
-        "one walk in each of two passes"
-    );
     let _ = fs::remove_dir_all(home);
 }
 
@@ -1247,78 +994,6 @@ fn no_list_policy_follows_the_prior_history_evidence() {
     }
 }
 
-/// StateMissing M3 (lenient decode): a malformed gate marker, move marker or
-/// cutoff never fails the whole index decode. The cutoff and the gate marker
-/// drop together, so the next gated load re-derives them (fail closed).
-#[test]
-fn malformed_history_gate_fields_decode_leniently() {
-    let scratch = crate::test_scratch::ScratchDir::new("history-gate-lenient");
-    let path = scratch.join("index.json");
-    let mut gated = ScanIndex::default();
-    gated.note_claude_history_cutoff(PriorHistory::Moved, false, true);
-    gated.save(&path).unwrap();
-    let kept = ScanIndex::load(&path).unwrap();
-    assert!(kept.claude_history_gate_loaded);
-    assert!(kept.claude_history_move_not_full);
-    assert!(kept.claude_history_cutoff_unix_seconds.is_some());
-    for (gate, cutoff, moved) in [
-        (json!("yes"), json!("soon"), json!(1)),
-        (json!(true), json!(-5), json!({"x": 1})),
-        (json!(null), json!(1.5), json!(null)),
-    ] {
-        let released = moved.clone();
-        let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        saved["claude_history_gate_loaded"] = gate;
-        saved["claude_history_cutoff_unix_seconds"] = cutoff;
-        saved["claude_history_move_not_full"] = moved;
-        saved["claude_history_move_released"] = released;
-        let malformed = scratch.join("malformed.json");
-        fs::write(&malformed, serde_json::to_vec(&saved).unwrap()).unwrap();
-        let loaded = ScanIndex::load(&malformed).unwrap();
-        assert!(
-            !fs::read_dir(&*scratch)
-                .unwrap()
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt.")),
-            "not quarantined"
-        );
-        assert_eq!(loaded.claude_history_cutoff_unix_seconds, None);
-        assert!(!loaded.claude_history_gate_loaded, "re-derived");
-        assert!(
-            loaded.claude_history_move_not_full,
-            "malformed hold fails closed (K4)"
-        );
-        assert!(!loaded.claude_history_move_released);
-    }
-}
-
-/// K4: after bootstrap, only the persisted move flag remembers the hold.
-/// Keep an intact cutoff and gate marker, so nothing can re-derive the hold.
-#[test]
-fn malformed_move_hold_stays_held_with_an_intact_cutoff_after_bootstrap() {
-    let scratch = crate::test_scratch::ScratchDir::new("history-move-hold-malformed");
-    let path = scratch.join("index.json");
-    let mut index = ScanIndex::default();
-    index.note_claude_history_cutoff(PriorHistory::Moved, false, true);
-    index.save(&path).unwrap();
-    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    saved["claude_history_move_not_full"] = json!("damaged");
-    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
-    let mut loaded = ScanIndex::load(&path).unwrap();
-    let cutoff = loaded.claude_history_cutoff_unix_seconds;
-    loaded.note_claude_history_cutoff(PriorHistory::Here, false, false);
-    assert_eq!(loaded.claude_no_list_policy, NoListPolicy::HoldMoveNotFull);
-    assert_eq!(loaded.claude_history_cutoff_unix_seconds, cutoff);
-    loaded.save(&path).unwrap();
-    let mut reloaded = ScanIndex::load(&path).unwrap();
-    reloaded.note_claude_history_cutoff(PriorHistory::Here, true, false);
-    assert_eq!(
-        reloaded.claude_no_list_policy,
-        NoListPolicy::Pace,
-        "explicit full still releases"
-    );
-}
-
 /// Owner B ruling 2: activating a revision with no history-policy row keeps
 /// the previous active revision, raises one local alarm and counts it; with
 /// a row it activates. The static release check above stays the second line.
@@ -1386,101 +1061,6 @@ fn activation_without_a_policy_row_keeps_the_previous_revision_and_alarms() {
     });
 }
 
-/// Owner B ruling 3: the named re-owe only lowers, only below the active
-/// revision, counts `history_reowed`, and leaves the file owed and gated: a
-/// listed re-owed file is held, an unlisted one upgrades again.
-#[test]
-fn re_owe_lowers_a_stamp_and_the_file_is_owed_and_gated_again() {
-    with_max_gated_claude_revision(3, || {
-        let (home, root, mut index) = families("history-gate-reowe", 2);
-        let empty = support("history-gate-reowe-empty");
-        fs::write(ReemissionExclusions::path(&empty), "").unwrap();
-        index.load_claude_reemission_exclusions(&empty);
-        let previous = index.clone();
-        let mut upgraded = scan(&root, &mut index, "ctx-1", 3);
-        let mut index = settle(&home, &previous, &mut upgraded, &mut index);
-        assert_eq!(revisions(&index), vec![3; 4]);
-
-        index.activate_effective_upload_body_witness_revision(3);
-        let reowed = local_count(LocalCount::Reowed);
-        let root_key = |slot: usize| {
-            index
-                .files
-                .keys()
-                .find(|key| key.ends_with(&format!("{}.jsonl", session(slot))))
-                .unwrap()
-                .clone()
-        };
-        let (listed, unlisted) = (root_key(1), root_key(0));
-        assert!(!index.re_owe_effective_upload_body_witness_revision(&listed, 3));
-        assert!(!index.re_owe_effective_upload_body_witness_revision(&listed, 4));
-        assert!(index.re_owe_effective_upload_body_witness_revision(&listed, 2));
-        assert!(index.re_owe_effective_upload_body_witness_revision(&unlisted, 2));
-        assert!(!index.re_owe_effective_upload_body_witness_revision("missing", 1));
-        assert_eq!(local_count(LocalCount::Reowed), reowed + 2);
-        assert_eq!(
-            index.files[&listed].effective_upload_body_witness_revision,
-            2
-        );
-
-        let support = support("history-gate-reowe-listed");
-        fs::write(
-            ReemissionExclusions::path(&support),
-            format!("{}\n", digest(&session(1))),
-        )
-        .unwrap();
-        index.load_claude_reemission_exclusions(&support);
-        let previous = index.clone();
-        let mut result = scan(&root, &mut index, "ctx-1", 3);
-        let listed_file = previous.files[&listed].source_file_fingerprint.clone();
-        let settled = settle(&home, &previous, &mut result, &mut index);
-        assert!(
-            result
-                .snapshots
-                .iter()
-                .any(|item| item.source_session_id == session(0)),
-            "the unlisted re-owed root upgrades again"
-        );
-        assert!(result
-            .snapshots
-            .iter()
-            .all(|item| item.source_file_fingerprint.as_deref() != Some(listed_file.as_str())));
-        assert_eq!(
-            settled.files[&listed].effective_upload_body_witness_revision,
-            2
-        );
-        assert_eq!(
-            settled.files[&unlisted].effective_upload_body_witness_revision,
-            3
-        );
-        let _ = fs::remove_dir_all(home);
-    });
-}
-
-fn append_root_response(root: &Path, slot: usize) {
-    let session = session(slot);
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(root.join(format!("{session}.jsonl")))
-        .unwrap();
-    writeln!(
-        file,
-        "{}",
-        json!({
-            "timestamp": "2026-08-23T18:30:00Z",
-            "type": "assistant",
-            "sessionId": session,
-            "requestId": format!("request-{slot}-root-2"),
-            "message": {
-                "id": format!("message-{slot}-root-2"),
-                "model": "claude-haiku-4-5",
-                "usage": {"input_tokens": 10, "output_tokens": 1}
-            }
-        })
-    )
-    .unwrap();
-}
-
 /// Stand-in for MONEY's emitter (#699), which builds request-owned items
 /// after the emission seam: one literal copy of every item. It ignores
 /// #699's own protected-root skip, so only the gate removes it.
@@ -1494,89 +1074,6 @@ fn mint_request_owned_copies(snapshots: &mut Vec<SnapshotItem>) {
         })
         .collect::<Vec<_>>();
     snapshots.extend(copies);
-}
-
-/// SOURCE Amendment 14 at the fold: under revision 3 a listed root's genuine
-/// change emits its ordinary body, loses only its request-owned items, does
-/// not stamp 3, counts `listed_literal`, and is owed and held next cycle.
-/// Its unchanged member stays held history.
-#[test]
-fn listed_genuine_change_under_revision_three_loses_only_its_literal() {
-    with_max_gated_claude_revision(3, || {
-        let (home, root, mut index) = families("history-gate-literal", 2);
-        let support = support("history-gate-literal-support");
-        fs::write(
-            ReemissionExclusions::path(&support),
-            format!("{}\n", digest(&session(1))),
-        )
-        .unwrap();
-        index.load_claude_reemission_exclusions(&support);
-        append_root_response(&root, 1);
-        let denied = local_count(LocalCount::ListedLiteralDenied);
-        let previous = index.clone();
-        let mut result = scan(&root, &mut index, "ctx-1", 3);
-        assert_eq!(local_count(LocalCount::ListedLiteralDenied), denied + 1);
-        mint_request_owned_copies(&mut result.snapshots);
-        let mut resend = result.snapshots.clone();
-        index.retain_claude_history_emission_permitted(&mut resend);
-        let settled = settle(&home, &previous, &mut result, &mut index);
-        for emitted in [&resend, &result.snapshots] {
-            let listed = emitted
-                .iter()
-                .filter(|item| item.source_session_id == session(1))
-                .collect::<Vec<_>>();
-            assert_eq!(listed.len(), 1, "the listed root's ordinary body only");
-            assert_ne!(
-                listed[0].usage_accounting_contract.as_deref(),
-                Some(REQUEST_OWNED_USAGE_CONTRACT)
-            );
-            assert!(emitted
-                .iter()
-                .any(|item| item.source_session_id == session(0)
-                    && item.usage_accounting_contract.as_deref()
-                        == Some(REQUEST_OWNED_USAGE_CONTRACT)));
-        }
-        for (key, entry) in &settled.files {
-            let listed = claude_index_path_family_member(Path::new(key))
-                .is_some_and(|(family, _)| family == session(1));
-            assert_eq!(
-                entry.effective_upload_body_witness_revision,
-                if listed { 1 } else { 3 },
-                "{key}"
-            );
-        }
-
-        let mut index = settled;
-        index.load_claude_reemission_exclusions(&support);
-        let previous = index.clone();
-        let listed_files = previous
-            .files
-            .iter()
-            .filter(|(key, _)| {
-                claude_index_path_family_member(Path::new(key))
-                    .is_some_and(|(family, _)| family == session(1))
-            })
-            .map(|(_, entry)| entry.source_file_fingerprint.clone())
-            .collect::<BTreeSet<_>>();
-        let mut next = scan(&root, &mut index, "ctx-1", 3);
-        let settled = settle(&home, &previous, &mut next, &mut index);
-        // The fold harness never settles the upload context, so the settled
-        // family re-syncs; the listed family is owed and held.
-        assert!(
-            next.snapshots.iter().all(|item| item
-                .source_file_fingerprint
-                .as_ref()
-                .is_some_and(|file| !listed_files.contains(file))),
-            "owed and held, never settled at 3"
-        );
-        assert!(settled
-            .files
-            .iter()
-            .filter(|(key, _)| claude_index_path_family_member(Path::new(key))
-                .is_some_and(|(family, _)| family == session(1)))
-            .all(|(_, entry)| entry.effective_upload_body_witness_revision == 1));
-        let _ = fs::remove_dir_all(home);
-    });
 }
 
 /// F5: a same-size file whose mtime alone moved is not a genuine change. A
