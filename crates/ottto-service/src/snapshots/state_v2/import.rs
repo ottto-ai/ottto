@@ -844,8 +844,6 @@ fn verify_normalized_at(
         after = page.last().map(|h| h.key.clone());
     }
     anyhow::ensure!(proof.refs.is_empty(), Pause::Mismatch);
-    cx.prepared = None;
-    cx.committed = checkpoints;
     Ok(cx)
 }
 struct ReadBack<'a> {
