@@ -325,7 +325,6 @@ pub(super) fn parse_ordinary_with_metadata(
         None,
         None,
         artifacts,
-        true,
     )?;
     while !parser.step()? {}
     let index = ordinary_index(ScanIndex::default());

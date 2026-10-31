@@ -250,7 +250,6 @@ fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
                     None,
                     &[],
                     false,
-                    true,
                 );
                 assert_eq!(scan.audit_now, captured);
                 assert!(
@@ -435,7 +434,6 @@ fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
                 None,
                 &[],
                 false,
-                true,
             )
             .with_sampled_acquisition(hold.cache.clone(), Scope(NAMESPACE.into()));
             let (mut audited, raw, _, modes, _) = finish_production_scan_page(scan, CLAUDE);
