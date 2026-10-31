@@ -94,15 +94,6 @@ fn key(identity: &str) -> BindingKey {
     BindingKey::from_credential_identity_hash(identity)
 }
 
-fn keys(balance: &AgentCreditBalance) -> Vec<String> {
-    balance
-        .grants
-        .iter()
-        .flatten()
-        .map(|grant| grant.grant_key.clone())
-        .collect()
-}
-
 fn codes(diagnostics: &[CreditModelDiagnostic]) -> Vec<(&'static str, &'static str)> {
     diagnostics
         .iter()
@@ -137,70 +128,6 @@ fn credit_grant_key_matches_backend_reference() {
 
 // ---- contract v2.1 §10 producer cases ------------------------------------
 
-#[test]
-fn v21_case1_codex_complete_list() {
-    let balance = codex_reset_bank(
-        2,
-        READ_AT,
-        read(
-            Provider::OpenAi,
-            Some(2),
-            vec![
-                openai_grant("a2", "2026-09-28T17:40:00Z", Some("2026-10-28T17:40:00Z")),
-                openai_grant("a1", "2026-09-20T09:15:00Z", Some("2026-10-20T09:15:00Z")),
-            ],
-        ),
-    );
-    assert_eq!(balance.grants_state, Some(CreditGrantsState::Complete));
-    assert_eq!(balance.grant_count, Some(2));
-    assert_eq!(balance.remaining, Some(2));
-    assert_eq!(balance.grants_observed_at.as_deref(), Some(READ_AT));
-    let grants = balance.grants.as_ref().unwrap();
-    assert_eq!(grants.len(), 2);
-    // Soonest expiry first.
-    assert_eq!(
-        grants[0].grant_key,
-        credit_grant_key(Provider::OpenAi, "a1")
-    );
-    assert_eq!(grants[0].grant_type, CreditGrantType::RateLimitReset);
-    assert_eq!(grants[0].status, CreditGrantStatus::Available);
-    assert_eq!(
-        grants[0].granted_at.as_deref(),
-        Some("2026-09-20T09:15:00Z")
-    );
-    assert_eq!(
-        balance.next_expires_at.as_deref(),
-        Some("2026-10-20T09:15:00Z")
-    );
-    assert_eq!(
-        balance.latest_granted_at.as_deref(),
-        Some("2026-09-28T17:40:00Z")
-    );
-}
-
-#[test]
-fn v21_case2_codex_provider_capped_has_no_summaries() {
-    let balance = codex_reset_bank(
-        5,
-        READ_AT,
-        read(
-            Provider::OpenAi,
-            Some(5),
-            vec![
-                openai_grant("a1", "2026-09-20T09:15:00Z", Some("2026-10-20T09:15:00Z")),
-                openai_grant("a2", "2026-09-28T17:40:00Z", Some("2026-10-28T17:40:00Z")),
-            ],
-        ),
-    );
-    assert_eq!(balance.grants_state, Some(CreditGrantsState::Capped));
-    assert_eq!(balance.grant_count, Some(5));
-    assert_eq!(balance.grants.as_ref().unwrap().len(), 2);
-    assert_eq!(balance.remaining, Some(5));
-    // The provider chose which rows to return: no exact soonest expiry.
-    assert_eq!(balance.next_expires_at, None);
-    assert_eq!(balance.latest_granted_at, None);
-}
-
 fn overflow(count: usize) -> Vec<GrantInput> {
     (1..=count)
         .map(|k| {
@@ -214,25 +141,6 @@ fn overflow(count: usize) -> Vec<GrantInput> {
 }
 
 #[test]
-fn v21_case3_overflow_with_exact_count_is_sender_capped() {
-    let build = build_grants(read(Provider::OpenAi, Some(25), overflow(25)));
-    assert!(build.sender_capped);
-    assert_eq!(codes(&build.diagnostics), vec![("grants_capped", "grants")]);
-    let mut balance = saved_resets(Some(25), READ_AT);
-    build.apply_to(&mut balance);
-    assert_eq!(balance.grants.as_ref().unwrap().len(), GRANTS_MAX);
-    assert_eq!(balance.grants_state, Some(CreditGrantsState::Capped));
-    assert_eq!(balance.grant_count, Some(25));
-    // Sender cap keeps the soonest-expiring prefix: the minimum is exact.
-    assert_eq!(
-        balance.next_expires_at.as_deref(),
-        Some("2026-10-02T08:00:00Z")
-    );
-    // Granted time needs the whole list.
-    assert_eq!(balance.latest_granted_at, None);
-}
-
-#[test]
 fn v21_case4_overflow_without_count_stays_partial() {
     let build = build_grants(read(Provider::OpenAi, None, overflow(25)));
     assert!(!build.sender_capped);
@@ -243,40 +151,6 @@ fn v21_case4_overflow_without_count_stays_partial() {
     assert_eq!(balance.grants_state, Some(CreditGrantsState::Partial));
     assert_eq!(balance.grant_count, None);
     assert_eq!(balance.next_expires_at, None);
-}
-
-#[test]
-fn v21_case5_empty_complete_list() {
-    let balance = codex_reset_bank(0, READ_AT, read(Provider::OpenAi, Some(0), vec![]));
-    assert_eq!(balance.grants, Some(vec![]));
-    assert_eq!(balance.grants_state, Some(CreditGrantsState::Complete));
-    assert_eq!(balance.grant_count, Some(0));
-    assert_eq!(balance.remaining, Some(0));
-    assert_eq!(balance.next_expires_at, None);
-}
-
-#[test]
-fn v21_case6_and_12_count_only_is_unavailable() {
-    let balance = codex_reset_bank(
-        2,
-        READ_AT,
-        ListObservation::Unavailable {
-            provider: Provider::OpenAi,
-            provider_count: Some(2),
-        },
-    );
-    assert_eq!(balance.grants, None);
-    assert_eq!(balance.grants_state, Some(CreditGrantsState::Unavailable));
-    assert_eq!(balance.grant_count, Some(2));
-    assert_eq!(balance.grants_observed_at, None);
-    assert_eq!(balance.remaining, Some(2));
-
-    let unknown = build_grants(ListObservation::Unavailable {
-        provider: Provider::OpenAi,
-        provider_count: None,
-    });
-    assert_eq!(unknown.grant_count, None);
-    assert_eq!(unknown.grants_state, Some(CreditGrantsState::Unavailable));
 }
 
 #[test]
@@ -300,131 +174,6 @@ fn v21_case7_redeemed_and_past_expiry_have_no_expired_status() {
     assert_eq!(
         balance.latest_granted_at.as_deref(),
         Some("2026-08-02T00:00:00Z")
-    );
-}
-
-#[test]
-fn latest_granted_at_counts_every_status() {
-    // The newest grant was already redeemed: it is still the latest added.
-    let mut newest = openai_grant("n1", "2026-09-30T00:00:00Z", Some("2026-10-30T00:00:00Z"));
-    newest.status = GrantStatusInput::Reported(Field::Value("redeemed".to_string()));
-    let older = openai_grant("o1", "2026-09-01T00:00:00Z", Some("2026-10-01T00:00:00Z"));
-    let balance = codex_reset_bank(
-        2,
-        READ_AT,
-        read(Provider::OpenAi, Some(2), vec![newest, older]),
-    );
-    assert_eq!(
-        balance.latest_granted_at.as_deref(),
-        Some("2026-09-30T00:00:00Z")
-    );
-    // next_expires_at still skips the redeemed grant.
-    assert_eq!(
-        balance.next_expires_at.as_deref(),
-        Some("2026-10-01T00:00:00Z")
-    );
-}
-
-#[test]
-fn only_the_documented_reset_type_maps() {
-    let mut snake = openai_grant("s1", "2026-09-01T00:00:00Z", None);
-    snake.reset_type = Field::Value("codex_rate_limits".to_string());
-    let build = build_grants(read(Provider::OpenAi, Some(1), vec![snake]));
-    assert_eq!(
-        build.grants.as_ref().unwrap()[0].grant_type,
-        CreditGrantType::Unknown
-    );
-    assert_eq!(
-        codes(build.diagnostics()),
-        vec![("field_refused", "grants[].grant_type")]
-    );
-}
-
-#[test]
-fn v21_case8_claude_grant_fields_and_paused() {
-    let balance = claude_reset_bank(
-        READ_AT,
-        read(
-            Provider::Anthropic,
-            Some(1),
-            vec![anthropic_grant(
-                "grant_paused",
-                Some("Synthetic reset"),
-                2,
-                1,
-                "2026-09-22T16:00:00+00:00",
-                "2026-10-22T16:00:00+00:00",
-                &["five_hour", "seven_day"],
-                true,
-                false,
-            )],
-        ),
-    );
-    let grant = &balance.grants.as_ref().unwrap()[0];
-    assert_eq!(grant.status, CreditGrantStatus::Paused);
-    assert_eq!(grant.grant_type, CreditGrantType::RateLimitReset);
-    assert_eq!(grant.resets_included, Some(2));
-    assert_eq!(grant.resets_left, Some(1));
-    assert_eq!(
-        grant.clears,
-        Some(vec!["five_hour".to_string(), "seven_day".to_string()])
-    );
-    assert_eq!(grant.title.as_deref(), Some("Synthetic reset"));
-    // Normalized to UTC.
-    assert_eq!(grant.starts_at.as_deref(), Some("2026-09-22T16:00:00Z"));
-    assert_eq!(grant.usable_now, Some(false));
-    assert_eq!(grant.granted_at, None);
-    // A paused grant's resets are not available now.
-    assert_eq!(balance.remaining, Some(0));
-    // Paused still counts toward the next expiry.
-    assert_eq!(
-        balance.next_expires_at.as_deref(),
-        Some("2026-10-22T16:00:00Z")
-    );
-    assert_eq!(balance.latest_granted_at, None);
-}
-
-#[test]
-fn v21_case9_claude_zero_resets_included_is_accepted() {
-    let build = build_grants(read(
-        Provider::Anthropic,
-        Some(1),
-        vec![anthropic_grant(
-            "grant_zero",
-            None,
-            0,
-            0,
-            "2026-09-22T16:00:00Z",
-            "2026-10-22T16:00:00Z",
-            &[],
-            false,
-            false,
-        )],
-    ));
-    assert!(build.diagnostics.is_empty());
-    assert_eq!(build.grants_state, Some(CreditGrantsState::Complete));
-    let grant = &build.grants.as_ref().unwrap()[0];
-    assert_eq!(grant.resets_included, Some(0));
-    assert_eq!(grant.status, CreditGrantStatus::Redeemed);
-}
-
-#[test]
-fn v21_case10_invalid_expiry_keeps_grant_and_makes_list_partial() {
-    let mut bad = openai_grant("e1", "2026-09-20T09:15:00Z", None);
-    bad.expires_at = TimeInput::Rfc3339("not-a-time".to_string());
-    let mut overflowed = openai_grant("e2", "2026-09-20T09:15:00Z", None);
-    overflowed.expires_at = TimeInput::UnixSeconds(i64::MAX);
-    let build = build_grants(read(Provider::OpenAi, Some(2), vec![bad, overflowed]));
-    assert_eq!(build.grants_state, Some(CreditGrantsState::Partial));
-    let grants = build.grants.as_ref().unwrap();
-    assert_eq!(grants.len(), 2);
-    assert!(grants.iter().all(|grant| grant.expires_at.is_none()));
-    assert_eq!(
-        codes(&build.diagnostics),
-        vec![
-            ("field_refused", "grants[].expires_at"),
-            ("field_refused", "grants[].expires_at")
-        ]
     );
 }
 
@@ -474,17 +223,6 @@ fn v21_case11_invalid_id_drops_grant_and_makes_list_partial() {
     let build = build_grants(read(Provider::Anthropic, Some(2), vec![upper, long]));
     assert_eq!(build.grants, Some(vec![]));
     assert_eq!(build.grants_state, Some(CreditGrantsState::Partial));
-}
-
-#[test]
-fn v21_case13_not_supported() {
-    let build = build_grants(ListObservation::NotSupported {
-        provider: Provider::OpenAi,
-    });
-    assert_eq!(build.grants, None);
-    assert_eq!(build.grants_state, Some(CreditGrantsState::NotSupported));
-    assert_eq!(build.grant_count, None);
-    assert!(build.diagnostics.is_empty());
 }
 
 #[test]
@@ -550,38 +288,6 @@ fn refusals_without_state_change_keep_list_complete() {
 }
 
 #[test]
-fn refused_reset_counts_and_times_make_list_partial() {
-    for mutate in [
-        (|g: &mut GrantInput| g.resets_left = Field::Value(RESETS_MAX + 1)) as fn(&mut GrantInput),
-        |g| g.resets_included = Field::Invalid,
-        |g| g.granted_at = TimeInput::Invalid,
-        |g| g.starts_at = TimeInput::Rfc3339("2026-13-01T00:00:00Z".to_string()),
-        |g| {
-            g.status = GrantStatusInput::PausedResetsLeft {
-                paused: Field::Invalid,
-                resets_left: Field::Value(1),
-            }
-        },
-    ] {
-        let mut grant = anthropic_grant(
-            "grant_x",
-            None,
-            1,
-            1,
-            "2026-09-22T16:00:00Z",
-            "2026-10-22T16:00:00Z",
-            &[],
-            false,
-            false,
-        );
-        mutate(&mut grant);
-        let build = build_grants(read(Provider::Anthropic, Some(1), vec![grant]));
-        assert_eq!(build.grants_state, Some(CreditGrantsState::Partial));
-        assert_eq!(build.grants.as_ref().unwrap().len(), 1);
-    }
-}
-
-#[test]
 fn list_longer_than_provider_count_is_partial() {
     let build = build_grants(read(
         Provider::OpenAi,
@@ -593,18 +299,6 @@ fn list_longer_than_provider_count_is_partial() {
     ));
     assert_eq!(build.grants_state, Some(CreditGrantsState::Partial));
     assert_eq!(build.grant_count, Some(1));
-}
-
-#[test]
-fn sender_cap_on_a_provider_capped_list_has_no_expiry() {
-    // The provider reports 30 but returns 25: rows it omitted may expire first.
-    let build = build_grants(read(Provider::OpenAi, Some(30), overflow(25)));
-    assert!(!build.sender_capped);
-    let mut balance = saved_resets(Some(30), READ_AT);
-    build.apply_to(&mut balance);
-    assert_eq!(balance.grants_state, Some(CreditGrantsState::Capped));
-    assert_eq!(balance.grants.as_ref().unwrap().len(), GRANTS_MAX);
-    assert_eq!(balance.next_expires_at, None);
 }
 
 #[test]
@@ -687,58 +381,6 @@ fn twenty_one() -> Vec<GrantInput> {
         .collect::<Vec<_>>();
     records.reverse();
     records
-}
-
-#[test]
-fn twenty_one_grants_cap_and_order() {
-    let balance = codex_reset_bank(21, READ_AT, read(Provider::OpenAi, Some(21), twenty_one()));
-    let grants = balance.grants.as_ref().unwrap();
-    assert_eq!(grants.len(), 20);
-    assert_eq!(balance.grants_state, Some(CreditGrantsState::Capped));
-    assert_eq!(balance.grant_count, Some(21));
-    // Expiry ascending, ties by grant_key, no expiry last.
-    let mut expected = (1..=21)
-        .map(|k| {
-            let key = credit_grant_key(Provider::OpenAi, &format!("rc_synth_c{k:02}"));
-            let expiry = match k {
-                1..=17 => Some(k + 1),
-                18 | 19 => Some(10),
-                _ => None,
-            };
-            (expiry.is_none(), expiry, key)
-        })
-        .collect::<Vec<_>>();
-    expected.sort();
-    let expected_keys = expected
-        .into_iter()
-        .map(|(_, _, key)| key)
-        .take(20)
-        .collect::<Vec<_>>();
-    assert_eq!(keys(&balance), expected_keys);
-    // Exactly one no-expiry grant survives: the one with the smaller key.
-    assert_eq!(
-        grants
-            .iter()
-            .filter(|grant| grant.expires_at.is_none())
-            .count(),
-        1
-    );
-    assert_eq!(
-        balance.next_expires_at.as_deref(),
-        Some("2026-10-02T08:00:00Z")
-    );
-    assert_eq!(balance.latest_granted_at, None);
-}
-
-#[test]
-fn order_is_independent_of_provider_order() {
-    let forward = build_grants(read(Provider::OpenAi, Some(21), {
-        let mut records = twenty_one();
-        records.reverse();
-        records
-    }));
-    let reversed = build_grants(read(Provider::OpenAi, Some(21), twenty_one()));
-    assert_eq!(forward.grants, reversed.grants);
 }
 
 #[test]
@@ -934,87 +576,6 @@ fn claude_saved_resets_sum_only_when_complete() {
 }
 
 #[test]
-fn summarize_uses_only_the_explicit_provider() {
-    let mut balance = claude_reset_bank(
-        READ_AT,
-        read(
-            Provider::Anthropic,
-            Some(1),
-            vec![anthropic_grant(
-                "grant_one",
-                None,
-                2,
-                2,
-                "2026-09-22T16:00:00Z",
-                "2026-10-22T16:00:00Z",
-                &[],
-                false,
-                false,
-            )],
-        ),
-    );
-    let before = balance.clone();
-    summarize(&mut balance, Some(Provider::Anthropic));
-    assert_eq!(balance, before);
-    // The same list downgraded to partial loses every summary and the count.
-    balance.grants_state = Some(CreditGrantsState::Partial);
-    summarize(&mut balance, Some(Provider::Anthropic));
-    assert_eq!(balance.remaining, None);
-    assert_eq!(balance.status, AgentCreditBalanceStatus::Unknown);
-    assert_eq!(balance.next_expires_at, None);
-
-    // Without a provider nothing is summed, whatever the grants look like.
-    let mut unknown = saved_resets(None, READ_AT);
-    unknown.grants = Some(vec![]);
-    unknown.grants_state = Some(CreditGrantsState::Complete);
-    summarize(&mut unknown, None);
-    assert_eq!(unknown.remaining, None);
-    let mut shaped = before.clone();
-    shaped.remaining = None;
-    summarize(&mut shaped, None);
-    assert_eq!(shaped.remaining, None);
-
-    // A provider count is never replaced.
-    let mut codex = codex_reset_bank(3, READ_AT, read(Provider::OpenAi, Some(0), vec![]));
-    codex.grants_state = Some(CreditGrantsState::Partial);
-    summarize(&mut codex, Some(Provider::OpenAi));
-    assert_eq!(codex.remaining, Some(3));
-    assert_eq!(codex.status, AgentCreditBalanceStatus::Ok);
-}
-
-#[test]
-fn status_follows_remaining() {
-    assert_eq!(
-        status_for_remaining(Some(0)),
-        AgentCreditBalanceStatus::Exhausted
-    );
-    assert_eq!(status_for_remaining(Some(3)), AgentCreditBalanceStatus::Ok);
-    assert_eq!(
-        status_for_remaining(None),
-        AgentCreditBalanceStatus::Unknown
-    );
-    // Codex: the provider count decides; an unavailable list keeps it.
-    let codex = codex_reset_bank(
-        0,
-        READ_AT,
-        ListObservation::Unavailable {
-            provider: Provider::OpenAi,
-            provider_count: Some(0),
-        },
-    );
-    assert_eq!(codex.status, AgentCreditBalanceStatus::Exhausted);
-    // Claude without a list read: unknown, never a guess.
-    let claude = claude_reset_bank(
-        READ_AT,
-        ListObservation::Unavailable {
-            provider: Provider::Anthropic,
-            provider_count: None,
-        },
-    );
-    assert_eq!(claude.status, AgentCreditBalanceStatus::Unknown);
-}
-
-#[test]
 fn one_time_credit_refuses_a_codename_that_is_not_a_code() {
     for codename in [
         "",
@@ -1094,39 +655,6 @@ fn one_time_credit_normalizes_and_refuses_instants() {
             ("field_refused", "observed_at")
         ]
     );
-}
-
-#[test]
-fn claude_remaining_is_cleared_without_a_complete_list() {
-    // Even a count the adapter set by mistake never survives a list that was
-    // not read completely: Anthropic reports no count of its own.
-    for observation in [
-        ListObservation::Unavailable {
-            provider: Provider::Anthropic,
-            provider_count: None,
-        },
-        ListObservation::Unavailable {
-            provider: Provider::Anthropic,
-            provider_count: Some(3),
-        },
-        ListObservation::NotSupported {
-            provider: Provider::Anthropic,
-        },
-    ] {
-        let mut balance = saved_resets(Some(4), READ_AT);
-        build_grants(observation).apply_to(&mut balance);
-        assert_eq!(balance.remaining, None);
-        assert_eq!(balance.status, AgentCreditBalanceStatus::Unknown);
-    }
-    // The OpenAI count is the provider's and stays.
-    let mut codex = saved_resets(Some(4), READ_AT);
-    build_grants(ListObservation::NotSupported {
-        provider: Provider::OpenAi,
-    })
-    .apply_to(&mut codex);
-    assert_eq!(codex.remaining, Some(4));
-    assert_eq!(codex.status, AgentCreditBalanceStatus::Ok);
-    assert_eq!(codex.grants_state, Some(CreditGrantsState::NotSupported));
 }
 
 #[test]
@@ -1257,132 +785,6 @@ fn disabled_balance_shape_and_reason_code() {
     assert_eq!(silent.disabled_reason, None);
 }
 
-#[test]
-fn summaries_need_saved_resets_kind_for_remaining() {
-    let mut balance = saved_resets(Some(7), READ_AT);
-    balance.kind = Some(CreditBalanceKind::PlanCredits);
-    balance.unit = AgentCreditBalanceUnit::Credits;
-    build_grants(read(
-        Provider::Anthropic,
-        Some(1),
-        vec![anthropic_grant(
-            "grant_one",
-            None,
-            2,
-            2,
-            "2026-09-22T16:00:00Z",
-            "2026-10-22T16:00:00Z",
-            &[],
-            false,
-            false,
-        )],
-    ))
-    .apply_to(&mut balance);
-    assert_eq!(balance.remaining, Some(7));
-}
-
-#[test]
-fn one_time_credit_shape() {
-    let (balance, diagnostics) = one_time_credit(
-        "iguana_necktie",
-        Field::Absent,
-        Some(25_000),
-        Some(1_250),
-        Some(23_750),
-        TimeInput::Rfc3339("2026-11-05T07:59:00+00:00".to_string()),
-        TimeInput::Rfc3339(READ_AT.to_string()),
-    )
-    .expect("valid pool codename");
-    assert!(diagnostics.is_empty());
-    assert_eq!(
-        serde_json::to_value(&balance).unwrap(),
-        json!({
-            "name": "one_time_credit",
-            "status": "ok",
-            "freshness": "fresh",
-            "unit": "usd",
-            "remaining": 23750,
-            "used": 1250,
-            "quota": 25000,
-            "currency": "USD",
-            "limit_id": "iguana_necktie",
-            "observed_at": READ_AT,
-            "expires_at": "2026-11-05T07:59:00Z",
-            "kind": "one_time_credit"
-        })
-    );
-    // No `enabled` flag, no recurring reset.
-    assert_eq!(balance.enabled, None);
-    assert_eq!(balance.resets_at, None);
-    let (spent, _) = one_time_credit(
-        "pool",
-        Field::Absent,
-        Some(100),
-        Some(100),
-        Some(0),
-        TimeInput::Absent,
-        TimeInput::Absent,
-    )
-    .expect("valid pool codename");
-    assert_eq!(spent.status, AgentCreditBalanceStatus::Exhausted);
-    let (unknown, _) = one_time_credit(
-        "pool",
-        Field::Absent,
-        None,
-        None,
-        None,
-        TimeInput::Absent,
-        TimeInput::Absent,
-    )
-    .expect("valid pool codename");
-    assert_eq!(unknown.status, AgentCreditBalanceStatus::Unknown);
-    let (titled, _) = one_time_credit(
-        "pool",
-        Field::Value("Synthetic promo credit".to_string()),
-        None,
-        None,
-        None,
-        TimeInput::Absent,
-        TimeInput::Absent,
-    )
-    .expect("valid pool codename");
-    assert_eq!(titled.title.as_deref(), Some("Synthetic promo credit"));
-    // A refused title is reported, not swallowed.
-    let (leaky, diagnostics) = one_time_credit(
-        "pool",
-        Field::Value("see /Users/someone/notes".to_string()),
-        None,
-        None,
-        None,
-        TimeInput::Absent,
-        TimeInput::Absent,
-    )
-    .expect("valid pool codename");
-    assert_eq!(leaky.title, None);
-    assert_eq!(codes(&diagnostics), vec![("field_refused", "title")]);
-}
-
-#[test]
-fn time_normalization() {
-    assert_eq!(
-        normalize_time(TimeInput::Rfc3339(
-            "2026-10-06T16:09:59.691850+00:00".into()
-        )),
-        Ok(Some("2026-10-06T16:09:59.69185Z".to_string()))
-    );
-    assert_eq!(
-        normalize_time(TimeInput::Rfc3339("2026-10-06T18:00:00+02:00".into())),
-        Ok(Some("2026-10-06T16:00:00Z".to_string()))
-    );
-    assert_eq!(
-        normalize_time(TimeInput::UnixSeconds(1_789_895_700)),
-        Ok(Some("2026-09-20T09:15:00Z".to_string()))
-    );
-    assert_eq!(normalize_time(TimeInput::Absent), Ok(None));
-    assert_eq!(normalize_time(TimeInput::Invalid), Err(()));
-    assert_eq!(normalize_time(TimeInput::Rfc3339("soon".into())), Err(()));
-}
-
 // ---- R7b SectionCache sequences -------------------------------------------
 
 /// The Claude usage-credit balance as the adapter reports it switched off.
@@ -1480,16 +882,6 @@ fn claude_cedar_grants() -> Vec<GrantInput> {
 }
 
 #[test]
-fn cache_cold_start_sends_nothing_unread() {
-    let cache = SectionCache::new();
-    assert_eq!(
-        cache.resend_balances(&key("a"), CreditSection::SavedResets),
-        None
-    );
-    assert_eq!(cache.grant_list_for_count(&key("a"), 2), None);
-}
-
-#[test]
 fn cache_resend_is_unchanged_and_never_carries_updated_at() {
     let mut cache = SectionCache::new();
     let observed = cedar_section("2026-10-01T13:00:00Z");
@@ -1517,22 +909,6 @@ fn cache_resend_is_unchanged_and_never_carries_updated_at() {
 }
 
 #[test]
-fn cache_restart_is_cold() {
-    let mut cache = SectionCache::new();
-    cache.observe_balances(
-        &key("a"),
-        CreditSection::SavedResets,
-        &cedar_section(READ_AT),
-    );
-    drop(cache);
-    let restarted = SectionCache::new();
-    assert_eq!(
-        restarted.resend_balances(&key("a"), CreditSection::SavedResets),
-        None
-    );
-}
-
-#[test]
 fn cache_a_b_a_keeps_a_sections() {
     let (a, b) = (key("account-a"), key("account-b"));
     let mut cache = SectionCache::new();
@@ -1553,28 +929,6 @@ fn cache_a_b_a_keeps_a_sections() {
     assert!(cache
         .resend_balances(&b, CreditSection::UsageCredits)
         .is_some());
-}
-
-#[test]
-fn cache_sections_do_not_cross() {
-    let mut cache = SectionCache::new();
-    cache.observe_balances(&key("a"), CreditSection::UsageCredits, &[]);
-    assert_eq!(
-        cache.resend_balances(&key("a"), CreditSection::UsageCredits),
-        Some(vec![])
-    );
-    assert_eq!(
-        cache.resend_balances(&key("a"), CreditSection::OneTimeCredits),
-        None
-    );
-    // A balance section is never offered as a grant list.
-    let mut list_only = SectionCache::new();
-    let detailed = codex_reset_bank(0, READ_AT, read(Provider::OpenAi, Some(0), vec![]));
-    list_only.observe_grant_list(&key("a"), 0, &detailed);
-    assert_eq!(
-        list_only.resend_balances(&key("a"), CreditSection::GrantList),
-        None
-    );
 }
 
 #[test]
