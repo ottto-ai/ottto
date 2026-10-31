@@ -69,6 +69,35 @@ impl Hold {
             })
             .unwrap_or("integrity_or_io");
         telemetry::event("db_unavailable", &reason);
+        // Content-free cause: where (outermost static state_v2_* code) and what
+        // (innermost code, io kind or SQLite extended code); never text or paths.
+        let code = |e: &(dyn std::error::Error + 'static)| {
+            let text = e.to_string();
+            (text.starts_with("state_v2_")
+                && text.len() <= 64
+                && text
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+            .then_some(text)
+            .or_else(|| {
+                e.downcast_ref::<std::io::Error>()
+                    .map(|io| format!("io_{:?}", io.kind()))
+            })
+            .or_else(|| match e.downcast_ref::<rusqlite::Error>() {
+                Some(rusqlite::Error::SqliteFailure(f, _)) => {
+                    Some(format!("sqlite_{}", f.extended_code))
+                }
+                _ => None,
+            })
+        };
+        let codes = error.chain().filter_map(code).collect::<Vec<_>>();
+        let cause = serde_json::json!({ "at": codes.first(), "cause": codes.last() });
+        #[cfg(test)]
+        eprintln!(
+            "state_v2 storage hold [{}]: {cause}",
+            std::thread::current().name().unwrap_or("?")
+        );
+        telemetry::event("db_unavailable_cause", &cause);
         let hold = if sqlite::disk_full(&error) {
             telemetry::event("sqlite_full", &1);
             Self::SaveFull
