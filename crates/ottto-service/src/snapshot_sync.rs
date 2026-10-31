@@ -9620,6 +9620,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             roots: usage_roots,
             deferred: BTreeSet::new(),
             deferred_bytes: 0,
+            allowance: strict_cohort::BYTES_PER_PASS,
         }
     };
     let mut deferred_roots = strict_plan.deferred.len();
@@ -9628,12 +9629,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         full_rearm_evidence_complete = false;
         identity_unhealthy_roots.extend(strict_plan.deferred.iter().cloned());
     }
+    let allowance = strict_plan.allowance;
     let usage_roots = strict_plan.roots;
-    let strict_budget = crate::snapshots::claude_terminal_off().then(|| {
-        crate::claude_local_otel::strict_budget::StrictReadBudget::new(
-            strict_cohort::BYTES_PER_PASS,
-        )
-    });
+    let strict_budget = crate::snapshots::claude_terminal_off()
+        .then(|| crate::claude_local_otel::strict_budget::StrictReadBudget::new(allowance));
 
     // Effort has already updated pending-family state. Release all non-paired
     // rows before moving the selected roots into the usage aggregate.
@@ -9737,7 +9736,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     let strict_bytes = strict_budget.as_ref().map_or(0, |b| b.consumed());
     drop(strict_budget);
     if crate::snapshots::claude_terminal_off() {
-        eprintln!("strict_cohort_deferred roots={deferred_roots} bytes={} consumed_bytes={strict_bytes} allowance_bytes={} custody=UNPROVEN", deferred_bytes, strict_cohort::BYTES_PER_PASS);
+        eprintln!("strict_cohort_deferred roots={deferred_roots} bytes={} consumed_bytes={strict_bytes} allowance_bytes={allowance} custody=UNPROVEN", deferred_bytes);
     }
     // Keep global negative-dependency debt separate from per-root health:
     // page-local healthy accounting must not become an unrelated read error.

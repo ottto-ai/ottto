@@ -6,6 +6,8 @@ pub(super) struct Plan {
     pub roots: Vec<String>,
     pub deferred: BTreeSet<String>,
     pub deferred_bytes: u64,
+    /// Pass read allowance: the plan's reservation, never below BYTES_PER_PASS.
+    pub allowance: u64,
 }
 // A normal source cycle reloads ScanIndex. Keep scheduling in bounded
 // process-owned memory, scoped to support directory + active context/replay.
@@ -24,6 +26,7 @@ pub(super) fn plan(
             roots,
             deferred: BTreeSet::new(),
             deferred_bytes: 0,
+            allowance: BYTES_PER_PASS,
         };
     }
 
@@ -71,6 +74,7 @@ fn select(
         roots: Vec::new(),
         deferred: BTreeSet::new(),
         deferred_bytes: 0,
+        allowance: BYTES_PER_PASS,
     };
     let mut reserved = 0u64;
     let mut next = None;
@@ -101,6 +105,7 @@ fn select(
     if let Some(next) = next {
         *cursor = Some(next);
     }
+    plan.allowance = reserved.max(BYTES_PER_PASS);
     plan
 }
 
@@ -246,19 +251,35 @@ mod tests {
     /// instead of being deferred on every pass. The OFF row is main.
     #[test]
     fn strict_cohort_plans_root_over_pass_allowance() {
-        // (terminal_off, page roots, planned, deferred)
+        // (terminal_off, page roots, planned, deferred, pass allowance). A
+        // pair reserves its lengths plus one sentinel per file: big = 18 MiB + 2.
         type Row = (
             bool,
             &'static [&'static str],
             &'static [&'static str],
             &'static [&'static str],
+            u64,
         );
-        let rows: [Row; 3] = [
-            (true, &["big", "page"], &["big", "page", "tail"], &[]),
-            (true, &["page"], &["page", "big"], &["tail"]),
-            (false, &["page"], &["big", "page", "tail"], &[]),
+        let big = (18 << 20) + 2;
+        let rows: [Row; 4] = [
+            (
+                true,
+                &["big", "page"],
+                &["big", "page", "tail"],
+                &[],
+                big + 4,
+            ),
+            (true, &["page"], &["page", "big"], &["tail"], big + 2),
+            (true, &["tail"], &["tail", "big"], &["page"], big + 2),
+            (
+                false,
+                &["page"],
+                &["big", "page", "tail"],
+                &[],
+                BYTES_PER_PASS,
+            ),
         ];
-        for (terminal_off, page, planned, deferred) in rows {
+        for (terminal_off, page, planned, deferred, allowance) in rows {
             let _terminal_off =
                 terminal_off.then(crate::snapshots::ClaudeTerminalOffForTest::enabled);
             let scratch = crate::test_scratch::ScratchDir::new("strict-cohort-big-root");
@@ -276,6 +297,10 @@ mod tests {
                 result.deferred.iter().collect::<Vec<_>>(),
                 deferred,
                 "terminal_off={terminal_off} page={page:?}"
+            );
+            assert_eq!(
+                result.allowance, allowance,
+                "the reader allowance covers the reservation"
             );
         }
     }
