@@ -90,15 +90,15 @@ fn compose_roots(
 }
 
 /// The watcher covers the Codex slot homes discovery scans; without them
-/// growth in a slot home waits for the next census walk. Best effort, as the
-/// watcher is: a slot home that cannot be resolved is skipped, as the status
-/// collection skips it, and an unreadable registry leaves the default roots.
+/// growth in a slot home waits for the next census walk. A slot home that
+/// cannot be resolved is skipped, as the status collection skips it; an
+/// unreadable registry is an error, so the caller keeps its current watcher.
+/// Sorted so a reordered registry does not replace the watcher.
 pub(crate) fn watcher_roots(home: &Path) -> Result<Vec<(SnapshotSource, PathBuf)>> {
-    let codex_homes = registered_codex_homes(&FileCodexAccountSlotSettingsStore::default())
-        .into_iter()
-        .flatten()
-        .flatten()
+    let mut codex_homes = registered_codex_homes(&FileCodexAccountSlotSettingsStore::default())?
+        .filter_map(Result::ok)
         .collect::<Vec<_>>();
+    codex_homes.sort();
     watcher_roots_with(home, &codex_homes)
 }
 
@@ -443,6 +443,9 @@ mod tests {
                 Err(error) => panic!("watch event channel: {error}"),
             }
         }
+        // The queue is process-wide; leave no scratch hints for other tests.
+        drop(watcher);
+        let _ = crate::snapshot_watcher::take_pending_snapshot_paths(SnapshotSource::Codex);
     }
 
     #[test]
