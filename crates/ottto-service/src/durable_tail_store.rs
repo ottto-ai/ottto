@@ -737,7 +737,8 @@ pub(crate) struct DurableTailStore {
     rebuilt: BTreeMap<Digest32, Rebuild>,
     startup_synced: bool,
     gc_after: Option<Digest32>,
-    private_purge_after: Option<Digest32>,
+    private_purge_entries: Option<fs::ReadDir>,
+    private_purge_page: Option<PrivateLabelPage>,
     private_purge_dirty: bool,
     pending: BTreeMap<Digest32, PendingWrite>,
     resource_pause: Option<stream::ResourcePause>,
@@ -775,9 +776,19 @@ const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp, b
 /// Counts erasures and unadjudicated records in one privacy pass. No receipt
 /// or per-key state escapes the store; partial progress is always reported.
 pub(crate) struct PrivateLabelPurge {
+    pub(crate) visited: u64,
     pub(crate) scanned: u64,
+    pub(crate) verified: u64,
     pub(crate) erased: u64,
     pub(crate) refused: u64,
+}
+
+#[derive(Default)]
+struct PrivateLabelPage {
+    keys: BTreeSet<Digest32>,
+    visited: u64,
+    refused: u64,
+    complete: bool,
 }
 
 impl DurableTailStore {
@@ -794,7 +805,8 @@ impl DurableTailStore {
             rebuilt: BTreeMap::new(),
             startup_synced: false,
             gc_after: None,
-            private_purge_after: None,
+            private_purge_entries: None,
+            private_purge_page: None,
             private_purge_dirty: false,
             pending: BTreeMap::new(),
             resource_pause: None,
@@ -2325,13 +2337,39 @@ impl DurableTailStore {
         Ok(Some(keys))
     }
 
-    /// The same page for retention planning and erase; its cursor is separate
-    /// from ordinary GC so neither owner can skip another owner's keys.
-    pub(crate) fn private_label_candidates(&self) -> io::Result<BTreeSet<Digest32>> {
-        match self.private_label_keys().unwrap_or(None) {
-            Some(keys) => Ok(keys),
-            None => self.inventory_after(self.private_purge_after),
+    /// Retention planning and erasure share one page. Every directory entry,
+    /// including foreign names and entry errors, consumes the visit allowance.
+    pub(crate) fn private_label_candidates(&mut self) -> io::Result<BTreeSet<Digest32>> {
+        if let Some(keys) = self.private_label_keys().unwrap_or(None) {
+            return Ok(keys);
         }
+        if self.private_purge_page.is_none() {
+            if self.private_purge_entries.is_none() {
+                self.private_purge_entries = Some(fs::read_dir(&self.dir)?);
+            }
+            let entries = self.private_purge_entries.as_mut().expect("privacy cursor");
+            let mut page = PrivateLabelPage::default();
+            for _ in 0..GC_RECORDS_PER_PASS {
+                let Some(entry) = entries.next() else {
+                    page.complete = true;
+                    break;
+                };
+                page.visited += 1;
+                match entry {
+                    Ok(entry) => {
+                        if let Some(key) = entry.file_name().to_str()
+                            .and_then(|name| name.strip_suffix(RECORD_SUFFIX))
+                            .and_then(parse_hex_digest)
+                        {
+                            page.keys.insert(key);
+                        }
+                    }
+                    Err(_) => page.refused += 1,
+                }
+            }
+            self.private_purge_page = Some(page);
+        }
+        Ok(self.private_purge_page.as_ref().expect("privacy page").keys.clone())
     }
 
     pub(crate) fn private_label_purge_needed(&self, keep: Option<&BTreeSet<Digest32>>) -> bool {
@@ -2372,7 +2410,8 @@ impl DurableTailStore {
     ) -> io::Result<()> {
         // A newly staged literal invalidates a prior partial no-label sweep,
         // including a new canonical key ordered before its old cursor.
-        self.private_purge_after = None;
+        self.private_purge_entries = None;
+        self.private_purge_page = None;
         self.private_purge_dirty = false;
         let mut keys = self.private_label_keys().unwrap_or(None);
         if let Some(keys) = keys.as_mut() {
@@ -2394,9 +2433,11 @@ impl DurableTailStore {
         let keys = self.private_label_candidates()?;
         let mut remaining = BTreeSet::new();
         let mut report = PrivateLabelPurge {
+            visited: self.private_purge_page.as_ref().map_or(0, |page| page.visited),
             scanned: 0,
+            verified: 0,
             erased: 0,
-            refused: 0,
+            refused: self.private_purge_page.as_ref().map_or(0, |page| page.refused),
         };
         let mut erased = 0;
         for key in &keys {
@@ -2425,6 +2466,7 @@ impl DurableTailStore {
                     continue;
                 }
             };
+            report.verified += 1;
             if !contains(&verified.record.record.body) {
                 continue;
             }
@@ -2447,13 +2489,12 @@ impl DurableTailStore {
         report.erased = erased;
         if known.is_none() {
             self.private_purge_dirty |= report.refused > 0 || !remaining.is_empty();
-            if keys.len() >= GC_RECORDS_PER_PASS {
-                // Advance over retained/non-label records too; the marker stays
-                // unknown until an entire bounded traversal proves erasure.
-                self.private_purge_after = keys.last().copied();
+            let complete = self.private_purge_page.take().is_some_and(|page| page.complete);
+            if !complete {
+                // Keep the live directory cursor; do not rescan earlier names.
                 return Ok(report);
             }
-            self.private_purge_after = None;
+            self.private_purge_entries = None;
             if std::mem::take(&mut self.private_purge_dirty) {
                 // Earlier pages may owe retry, but a failure on this page is
                 // already counted. Never count the same refusal twice.

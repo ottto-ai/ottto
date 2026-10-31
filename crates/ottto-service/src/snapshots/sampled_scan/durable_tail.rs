@@ -5468,8 +5468,8 @@ impl SharedCache {
                         codec::body_has_skill_labels(body).unwrap_or(true)
                     }),
                 };
-                let (scanned, erased, failed) =
-                    result.map_or((0, 0, 1), |r| (r.scanned, r.erased, r.refused));
+                let (visited, scanned, verified, erased, failed) = result.map_or(
+                    (0, 0, 0, 0, 1), |r| (r.visited, r.scanned, r.verified, r.erased, r.refused));
                 slot.skill_label_purge_complete =
                     failed == 0 && !slot.store.private_label_purge_needed(None);
                 slot.skill_label_purge_failures = if failed == 0 {
@@ -5479,7 +5479,9 @@ impl SharedCache {
                 };
                 let alarm = slot.skill_label_purge_failures > 3;
                 for (class, count) in [
+                    ("skill_label_entries_visited", visited),
                     ("skill_label_scanned", scanned),
+                    ("skill_label_verified", verified),
                     ("skill_label_purged", erased),
                     ("skill_label_purge_failed", failed),
                 ] {
@@ -5903,7 +5905,7 @@ impl SharedCache {
     ) -> std::io::Result<()> {
         if let Some(ds) = durable_source(snapshot_source) {
             let possible = self.durable().and_then(|mut stores| {
-                let slot = stores.slot(ds).as_ref()?;
+                let slot = stores.slot(ds).as_mut()?;
                 if !slot.store.private_label_purge_needed(None) {
                     return None;
                 }

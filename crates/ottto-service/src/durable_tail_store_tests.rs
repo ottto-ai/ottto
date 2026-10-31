@@ -4689,9 +4689,27 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
     let mut corrupt = fs::read(&file).unwrap();
     *corrupt.last_mut().unwrap() ^= 1;
     put_record(&file, &corrupt);
-    let report = store.purge_private_labels(&lock, |_| true).unwrap();
-    assert_eq!(report.erased, 1);
-    assert_eq!(report.refused, 1);
+    // Foreign names consume work too; they cannot all be visited in one save.
+    for n in 0..1024 {
+        fs::write(store.dir().join(format!("foreign-{n}")), b"untouched").unwrap();
+    }
+    let mut erased = 0;
+    let mut refused = 0;
+    let mut visited = 0;
+    for pass in 0..3 {
+        let report = store.purge_private_labels(&lock, |_| true).unwrap();
+        assert!(report.visited <= 512);
+        visited += report.visited;
+        erased += report.erased;
+        refused += report.refused;
+        if pass == 0 {
+            assert!(store.private_label_keys().unwrap().is_none());
+        }
+    }
+    assert_eq!(visited, 1026);
+    assert_eq!(erased, 1);
+    assert!(refused >= 1);
+    assert!(store.private_label_keys().unwrap().is_none());
     assert!(!record_file(&store, &good.key).exists());
     assert_eq!(
         fs::read(&file).unwrap(),
