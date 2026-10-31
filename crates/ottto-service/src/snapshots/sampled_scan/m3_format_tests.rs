@@ -179,9 +179,11 @@ fn m3_p4a_scope_formula_uses_canonical_counting_and_distinct_domain() {
     );
 }
 
-/// [format] Pi round-trips format three and refuses unknown historical envelopes.
+/// [format] Pi round-trips format three with its tag and write-ahead protocol.
+/// Pi format 1 and 2 envelopes stay Unknown through GC in the all-source rows
+/// `on_current_pin_v1_is_refused_…` and `m3_p4a_v3_dispatch_…`.
 #[test]
-fn pi_format_three_store_row_round_trips_and_v1_v2_stay_unknown() {
+fn pi_format_three_store_row_round_trips() {
     let root = crate::test_scratch::ScratchDir::new("pi-format-three");
     let lock = test_locks::hold(&root);
     let transcript = root.join("fixture.jsonl");
@@ -216,16 +218,6 @@ fn pi_format_three_store_row_round_trips_and_v1_v2_stay_unknown() {
         record.record.acquisition.unwrap().protocol,
         AcquisitionProtocol::WriteAhead
     );
-    for format in [1u16, 2] {
-        let mut unknown = bytes.clone();
-        unknown[8..10].copy_from_slice(&format.to_le_bytes());
-        resign(&mut unknown);
-        std::fs::write(&file, &unknown).unwrap();
-        let mut reader = store::DurableTailStore::new(dir.clone(), DurableSource::Pi);
-        assert_eq!(reader.read(&key), ReadOutcome::Refused(Refusal::Unknown));
-        reader.gc(lock, &[0; 32], &BTreeMap::new()).unwrap();
-        assert_eq!(std::fs::read(&file).unwrap(), unknown);
-    }
 }
 /// [format] ON refuses current-pin v1 forgeries without write or restore authority.
 #[test]
@@ -257,6 +249,7 @@ fn on_current_pin_v1_is_refused_and_cannot_be_written_or_restored() {
         assert_eq!(disk.read(&key), ReadOutcome::Refused(Refusal::Unknown));
         let mut cold = store::DurableTailStore::new(dir.clone(), row.source);
         assert_eq!(cold.read(&key), ReadOutcome::Refused(Refusal::Unknown));
+        cold.gc(lock, &[0; 32], &BTreeMap::new()).unwrap();
         assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
     }
 }
