@@ -13064,3 +13064,37 @@ fn retired_missing_native_rebuild_then_successor_tails_without_double_count() {
     assert_eq!(tail.snapshots[0].input_tokens, 600);
 }
 
+/// [off=main] No-record growth follows the ordinary Full path with zero store I/O.
+#[test]
+fn off_no_record_growth_uses_ordinary_full_without_store_io() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    let f = O3Fixture::new();
+    std::fs::remove_dir_all(store::store_dir_for_index(&f.index_path)).unwrap();
+    let marker = store::store_dir_for_index(&f.index_path).with_extension("private-labels");
+    if marker.exists() {
+        std::fs::remove_file(marker).unwrap();
+    }
+    let _off = crate::snapshots::RestartRestoreForTest::disabled();
+    let owner = f.owner();
+    let mut prior = f.prior.clone();
+    store::test_hooks::set_before_access(Some(Box::new(|_, _| panic!("OFF store I/O"))));
+    let (_, quiet, modes) = f.scan(&owner, &mut prior);
+    assert!(quiet.snapshots.is_empty());
+    assert_eq!(modes.0 + modes.1, 0);
+    f.append("growth", 200);
+    let (_, grown, modes) = f.scan(&owner, &mut prior);
+    store::test_hooks::set_before_access(None);
+    assert_eq!(modes.0, 1);
+    assert_eq!(modes.1, 0);
+    assert_eq!(grown.snapshots[0].input_tokens, 300);
+    let (counts, store) = owner
+        .cache
+        .durable_counters(SnapshotSource::ClaudeCode)
+        .unwrap();
+    assert_eq!(counts.restore_attempts, 0);
+    assert_eq!(
+        store.guard_header_bytes + store.guard_verify_bytes + store.bytes_read,
+        0
+    );
+    assert_eq!(store.records_written, 0);
+}
