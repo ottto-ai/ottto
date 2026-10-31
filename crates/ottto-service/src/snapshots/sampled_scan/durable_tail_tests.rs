@@ -6212,9 +6212,13 @@ fn a1a_scan_at(
     owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
     roots: &[PathBuf],
     support: &Path,
-    index: ScanIndex,
+    mut index: ScanIndex,
     at: &str,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    // Match the sync cycle after every fresh or reloaded index, before scanning.
+    index.activate_effective_upload_body_witness_revision(effective_revision(
+        SnapshotSource::ClaudeCode,
+    ));
     let mut scan = OwnedSourceScan::new_with_identity_capture(
         SnapshotSource::ClaudeCode,
         roots,
@@ -13244,20 +13248,15 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
     let index_path = parent.join("claude_code-test-scan-index.json");
     let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
     owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
-    let mut prev = ScanIndex::default();
-    prev.activate_effective_upload_body_witness_revision(effective_revision(
-        SnapshotSource::ClaudeCode,
-    ));
+    let prev = ScanIndex::default();
     let (mut next, mut scan, _) =
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
-            owner.scan(
+            a1a_scan_at(
+                &owner,
                 std::slice::from_ref(&projects),
                 &root,
                 prev.clone(),
-                100,
-                true,
-                &BTreeMap::new(),
-                &[],
+                "2026-08-02T08:00:00Z",
             )
         });
     a1a_wire(&root, &mut next, &mut scan);
@@ -13288,14 +13287,12 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
     owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
     let (mut cold, mut scan, modes) =
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
-            owner.scan(
+            a1a_scan_at(
+                &owner,
                 std::slice::from_ref(&projects),
                 &root,
                 imported.clone(),
-                100,
-                true,
-                &BTreeMap::new(),
-                &[],
+                "2026-08-02T08:00:00Z",
             )
         });
     assert_eq!(
@@ -13496,14 +13493,12 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
     owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
     let (mut page, mut scan, _) =
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
-            owner.scan(
+            a1a_scan_at(
+                &owner,
                 std::slice::from_ref(&projects),
                 &root,
                 prev.clone(),
-                100,
-                true,
-                &BTreeMap::new(),
-                &[],
+                "2026-08-02T08:00:00Z",
             )
         });
     a1a_wire(&root, &mut page, &mut scan);
