@@ -1306,7 +1306,12 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     )
     .is_err());
     let restored = load_locked(&f.path, None, published(&f.path).unwrap())
-        .unwrap()
+        .unwrap_or_else(|e| {
+            panic!(
+                "reload after FULL: {e:#}; cause={:?}",
+                telemetry::latest_for_test("db_unavailable_cause")
+            )
+        })
         .0
         .unwrap();
     assert_eq!(restored.generation, committed_generation);
