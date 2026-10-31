@@ -3572,6 +3572,9 @@ pub(crate) const TELEMETRY_FLUSH_WINDOW_SECONDS: u64 = 300;
 /// Scan-local evidence shared by every item of one Claude pass.
 #[derive(Default)]
 pub(crate) struct ScanEvidence<'a> {
+    /// Borrowed from the same loader input: retain account observations even
+    /// when the request index correctly refuses conflicting duplicate ids.
+    sidecar_rows: Option<&'a BTreeMap<String, Vec<ClaudeLocalOtelEvidence>>>,
     pub(crate) requests: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeLocalOtelEvidence>>,
     pub(crate) owners: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeTraceOwnershipEvidence>>,
     /// Each request id named by loaded API or trace rows, sorted, with the
@@ -3628,6 +3631,7 @@ impl<'a> ScanEvidence<'a> {
         desktop_census: Option<DesktopCensus>,
     ) -> Self {
         let mut evidence = Self {
+            sidecar_rows: Some(&api.evidence),
             unhealthy_roots,
             desktop_census,
             sole_login_enabled: TRANSCRIPT_SOLE_LOGIN_ENABLED,
