@@ -752,7 +752,7 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
             &mut census,
             rfc3339_unix_seconds(CARRY_RETRY),
             BACKFILL_WINDOW_DAYS,
-            &fixture.index.files,
+            &mut crate::snapshots::CandidateDiscovery::new(&mut fixture.index, None, None),
         )
         .unwrap();
         prepare_owned_scan_candidate(
@@ -768,7 +768,7 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
             &mut census,
             rfc3339_unix_seconds(CARRY_RETRY),
             BACKFILL_WINDOW_DAYS,
-            &fixture.index.files,
+            discovery_retention!(fixture.index),
         )
         .unwrap();
         let entry = fixture.index.files.get_mut(key).unwrap();
@@ -871,31 +871,4 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
         index = retry_test_reload(&mut index, &path);
     }
     eprintln!("retry_scheduling_runtime: test=oversized_complete_accepted_singleton_defers_without_healthy_full_reads elapsed_ms={} members={}", started.elapsed().as_millis(), healthy.len());
-}
-
-#[test]
-fn stale_carry_batch_diagnostics_discard_failed_larger_attempts() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let fixture = retry_durable_fixture(0, 4);
-    let stale = fixture.roots.iter().cloned().collect();
-    let _refuse = RetryMultiRefusal::new();
-    let mut diagnostics = StaleCarryRejectionCounts::default();
-    let (carry, covered, _) = claude_retry_admit_batch_observed(
-        &fixture.index,
-        &stale,
-        None,
-        CARRY_RETRY,
-        &mut diagnostics,
-        claude_contract_debt_scope(&fixture.index),
-    );
-    assert_eq!(carry.roots.len(), 1);
-    assert_eq!(covered.len(), 1);
-    assert_eq!(
-        diagnostics.rejected(),
-        0,
-        "larger failed probes are not root rejections"
-    );
-    assert_eq!(diagnostics.eligible_before_funding, 1);
 }

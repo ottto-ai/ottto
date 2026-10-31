@@ -179,6 +179,7 @@ impl CapPace {
 }
 
 pub(crate) struct SharedCache {
+    pub(crate) withheld_memo: withheld_account::Memo,
     inner: Mutex<RetainedCache>,
     cap_pace: Mutex<CapPace>,
     /// The resumable Codex job slot and held-singleton memo. Charged once,
@@ -192,17 +193,22 @@ pub(crate) struct SharedCache {
     /// held while taking another. Not part of the state budget: bounded by
     /// `durable_tail::STORES_RESIDENT_BOUND` and never walked.
     #[cfg(unix)]
-    durable: Mutex<durable_tail::Stores>,
+    durable: Mutex<durable_tail::StoreRoot>,
+    #[cfg(unix)]
+    durable_bytes: std::sync::atomic::AtomicUsize,
 }
 impl Default for SharedCache {
     fn default() -> Self {
         Self {
+            withheld_memo: Default::default(),
             inner: Mutex::new(TranscriptCache::with_byte_limit(state_bytes())),
             cap_pace: Mutex::new(CapPace::default()),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
             side: Mutex::new(side_ledger::SideLedger::default()),
             #[cfg(unix)]
-            durable: Mutex::new(durable_tail::Stores::default()),
+            durable: Mutex::new(durable_tail::StoreRoot::default()),
+            #[cfg(unix)]
+            durable_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -213,6 +219,9 @@ impl std::fmt::Debug for SharedCache {
 }
 impl HeapLayoutBound for SharedCache {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        // The shared cache owns the memo allocation header even when empty.
+        // Its optional entries are priced separately by the rotation owner.
+        self.withheld_memo.heap_bound(c)?;
         if BLOCKING_RESIDENT_MEASURE.with(std::cell::Cell::get) {
             // P1-RETAIN R0's completion measure: wait for each lock, one at a
             // time and in lock order (`retained` checks this thread holds
@@ -229,7 +238,7 @@ impl HeapLayoutBound for SharedCache {
         // every copy budget. The ledger's whole heap is this proved constant;
         // its inline tables are inside `size_of::<SharedCache>()`, which the
         // caller's `bound` (or `Arc`) charges once (D5′ size test).
-        c.add(side_ledger::SIDE_LEDGER_BYTES)
+        c.add(side_ledger::SIDE_LEDGER_BYTES.checked_add(self.durable_root_charge())?)
     }
 }
 #[cfg(test)]
@@ -241,7 +250,42 @@ impl SharedCache {
     }
 }
 
+// Qualified 64-bit main root: Stores 18,272 B, complete SharedCache 40,784 B.
+// #876's memo handle fits the root's existing padding; its owned header is
+// charged separately above. #962 changes visits only; #963's touched-family
+// view remains behind the already boxed cursor job.
+// Keep its reservation while OFF, even though optional M3 owners now allocate
+// only for ON or the approved erasure/invalidation actions.
+const OFF_MAIN_SHARED_BYTES: usize = 40_784;
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<SharedCache>() <= OFF_MAIN_SHARED_BYTES);
 impl SharedCache {
+    // Main's Stores root reservation on the qualified 64-bit toolchains.
+    // This is conservative when OFF's optional owner is absent; every real
+    // ON/exception allocation is added as well, without taking a leaf lock.
+    fn durable_root_charge(&self) -> usize {
+        #[cfg(unix)]
+        {
+            OFF_MAIN_SHARED_BYTES.saturating_sub(size_of::<SharedCache>())
+                + self
+                    .durable_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    }
+}
+impl SharedCache {
+    /// Bind before constructor-time discovery/selection, which consults CONTENT.
+    pub(crate) fn bind_withheld(&self, index: &mut ScanIndex) {
+        index.withheld_memo = self.withheld_memo.clone();
+        index
+            .withheld_memo
+            .retain_held(&index.claude_account_deferred_holds);
+    }
+
     /// The retained-copy lock. Lock order: retained, then cursor, never the
     /// reverse; never twice on one thread (both checked in debug builds).
     pub(super) fn retained(&self) -> std::sync::LockResult<RetainedGuard<'_>> {
@@ -440,16 +484,17 @@ impl SharedCache {
             .is_ok()
     }
     /// A completion whose durable record the M3 native route already
-    /// settled. Keep its post-save offer: the saved audit carrier can change
-    /// after native settlement (in particular, quiet audit retirement).
+    /// settled. A receipted record keeps its post-save audit-carrier offer;
+    /// a no-record disposition must not retry the failed write after effects.
     #[cfg(unix)]
     pub(super) fn insert_settled(
         &self,
         key: String,
         completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
+        write_candidate: bool,
     ) -> bool {
-        self.insert_with_custody(key, completed, live_bytes, false, true, false)
+        self.insert_with_custody(key, completed, live_bytes, false, write_candidate, false)
             .is_ok()
     }
     pub(super) fn return_prepared_taken(
@@ -697,42 +742,53 @@ impl OwnedSourceScan {
         namespace: Scope,
     ) -> Self {
         self.durable_guard = Some(Arc::downgrade(&cache));
-        sampled_audit::normalize_marker_storage(&mut self.index);
         if self.source == SnapshotSource::ClaudeCode {
-            sampled_audit::restore_held_audit_deadlines(&mut self.index, self.audit_now);
-            self.prepare_held_audit_progress(self.audit_now);
+            cache.bind_withheld(&mut self.index);
+            self.resource_probe
+                .set_withheld_memo(self.index.withheld_memo.clone());
         }
-        let pending = self
-            .index
-            .files
-            .values()
-            .filter(|entry| entry.has_unverified_source())
-            .take(CACHE_ENTRIES + 1)
-            .count();
-        self.sampling = Some(Context {
-            cache,
-            namespace,
-            // Legacy prefix/audit scheduling and diagnostic observations
-            // keep these values; ordinary restore never gates on them.
-            audit_metadata_supported: pending <= CACHE_ENTRIES,
-            audit_slots: CACHE_ENTRIES.saturating_sub(pending),
-            full_files: 0,
-            tail_files: 0,
-            unchanged_files: 0,
-            native_bytes: 0,
-            sample_bytes: 0,
-            full_reasons: [0; 11],
-            priority_replays: 0,
-            audits_started: 0,
-            audits_completed: 0,
-            audit_quiet_retired: 0,
-            audit_cap_full: 0,
-            audit_cap_delay: 0,
-            pace_evicted: 0,
-            start_overdue_seconds: 0,
-            completion_overdue_seconds: 0,
-            admission: Default::default(),
-        });
+        #[cfg(unix)]
+        let admitted = durable_tail::durable_source(self.source).is_some();
+        #[cfg(not(unix))]
+        let admitted = self.source != SnapshotSource::Pi;
+        if admitted {
+            sampled_audit::normalize_marker_storage(&mut self.index);
+            if self.source == SnapshotSource::ClaudeCode {
+                sampled_audit::restore_held_audit_deadlines(&mut self.index, self.audit_now);
+                self.prepare_held_audit_progress(self.audit_now);
+            }
+            let pending = self
+                .index
+                .files
+                .values()
+                .filter(|entry| entry.has_unverified_source())
+                .take(CACHE_ENTRIES + 1)
+                .count();
+            self.sampling = Some(Context {
+                cache,
+                namespace,
+                // Legacy prefix/audit scheduling and diagnostic observations
+                // keep these values; ordinary restore never gates on them.
+                audit_metadata_supported: pending <= CACHE_ENTRIES,
+                audit_slots: CACHE_ENTRIES.saturating_sub(pending),
+                full_files: 0,
+                tail_files: 0,
+                unchanged_files: 0,
+                native_bytes: 0,
+                sample_bytes: 0,
+                full_reasons: [0; 11],
+                priority_replays: 0,
+                audits_started: 0,
+                audits_completed: 0,
+                audit_quiet_retired: 0,
+                audit_cap_full: 0,
+                audit_cap_delay: 0,
+                pace_evicted: 0,
+                start_overdue_seconds: 0,
+                completion_overdue_seconds: 0,
+                admission: Default::default(),
+            });
+        }
         self
     }
     /// The conservative release: no measurement is supplied, so every shape
@@ -770,7 +826,7 @@ impl OwnedSourceScan {
 /// where another implies it today.
 fn owns_no_optimization_state(active: &OwnedActiveFile) -> bool {
     active.sampling.is_none()
-        && active.parser.pending_taken.is_none()
+        && !active.parser.return_pending()
         && active.cursor.is_none()
         && active.group.is_none()
         && active.aliases.is_empty()
@@ -1083,7 +1139,8 @@ fn context_overhead(context: &Context) -> Option<usize> {
         .checked_sub(size_of::<codex_cursor::PaceTable>())?
         .checked_add(align_of::<SharedCache>())?
         .checked_add(2 * size_of::<usize>())?
-        .checked_add(side_ledger::SIDE_LEDGER_BYTES)?;
+        .checked_add(side_ledger::SIDE_LEDGER_BYTES)?
+        .checked_add(context.cache.durable_root_charge())?;
     size_of::<Context>()
         .checked_add(shared)?
         .checked_add(bound(namespace, state_bytes())?)?
@@ -2137,6 +2194,18 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn set_test_now(now: Option<u64>) {
     TEST_NOW.with(|clock| clock.set(now));
+}
+
+#[cfg(test)]
+pub(super) fn with_test_now<T>(now: u64, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_NOW.with(|clock| clock.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_NOW.with(|clock| clock.replace(Some(now))));
+    f()
 }
 
 pub(super) fn now_seconds() -> u64 {

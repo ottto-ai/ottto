@@ -1,7 +1,7 @@
 //! Q11/N10 tests use the real shared spent owner and physical read adapter.
 //! Integrated native/debt/money qualification belongs to the transition driver.
 use super::*;
-use crate::transcript_acquisition::ReadPlan;
+use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
@@ -32,13 +32,7 @@ impl Fixture {
         std::fs::write(&path, b"{\"n\":1}\n").unwrap();
         let scope = Scope("n10-original-scope".into());
         let mut file = File::open(&path).unwrap();
-        let mut plan = ReadPlan::prepare(&mut file, None, &scope, None, 1_800_000_000).unwrap();
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        plan.observe_complete_records(&bytes).unwrap();
-        let checkpoint = plan
-            .commit_after_native_completion(&file, &scope, 1_800_000_000)
-            .unwrap();
+        let checkpoint = fixture::checkpoint(&mut file, &scope, 1_800_000_000);
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -47,8 +41,7 @@ impl Fixture {
             .unwrap();
         file.seek(SeekFrom::Start(checkpoint.sealed_offset()))
             .unwrap();
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(
+        let cache = fixture::cache(
             SnapshotSource::ClaudeCode,
             &root.join("index.json"),
             &Scope("n10-namespace".into()),
@@ -157,14 +150,15 @@ fn n10_pacing_eviction_allows_growth_without_evicting_spent_authority() {
     let ((), _) = crate::local_resource_diagnostics::capture(|| {
         f.cache.durable_alarm(SnapshotSource::ClaudeCode);
     });
-    assert!(f.cache.retail_full(
-        "new-growing-key",
-        &f.file,
-        f.checkpoint.sealed_offset(),
-        std::time::SystemTime::UNIX_EPOCH
-            + Duration::from_secs(1_800_000_000 + 2 * store::MAX_RECORDS as u64)
-    ));
+    // Eviction is emitted by the admission that evicts, not by durable_alarm.
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+        assert!(f.cache.retail_full(
+            "new-growing-key",
+            &f.file,
+            f.checkpoint.sealed_offset(),
+            std::time::SystemTime::UNIX_EPOCH
+                + Duration::from_secs(1_800_000_000 + 2 * store::MAX_RECORDS as u64)
+        ));
         f.cache.durable_alarm(SnapshotSource::ClaudeCode);
     });
     let pace = alarms

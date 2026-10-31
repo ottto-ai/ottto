@@ -18,28 +18,19 @@ pub(crate) use crate::durable_tail_store::{
 
 /// Borrowed PRE-finalization native state; never a copy of the graph.
 pub(in crate::snapshots) struct LiveFinishView<'a> {
-    pub(in crate::snapshots) accumulator: &'a SnapshotAccumulator,
-    pub(in crate::snapshots) report: &'a JsonlReadReport,
-    pub(in crate::snapshots) recognized_usage_drop_count: usize,
-    pub(in crate::snapshots) positive_recognized_usage_count: usize,
-    pub(in crate::snapshots) positive_usage_evidence: bool,
+    native: PreFinalization<'a>,
     pub(in crate::snapshots) checkpoint: &'a Checkpoint,
     pub(in crate::snapshots) chain: &'a AcquiredChain,
     pub(in crate::snapshots) line_cap: u64,
 }
 impl<'a> LiveFinishView<'a> {
-    #[allow(clippy::too_many_arguments)] // Exact G1 view constructor (skeleton).
     pub(in crate::snapshots) fn new(
-        accumulator: &'a SnapshotAccumulator,
-        report: &'a JsonlReadReport,
-        recognized_usage_drop_count: usize,
-        positive_recognized_usage_count: usize,
-        positive_usage_evidence: bool,
+        native: PreFinalization<'a>,
         checkpoint: &'a Checkpoint,
         chain: &'a AcquiredChain,
         line_cap: u64,
     ) -> Result<Self, NotPersisted> {
-        if accumulator.source != chain.source() || line_cap == 0 {
+        if native.accumulator.source != chain.source() || line_cap == 0 {
             return Err(NotPersisted::Layout);
         }
         if checkpoint.scope() != chain.file_scope() {
@@ -49,11 +40,7 @@ impl<'a> LiveFinishView<'a> {
             return Err(NotPersisted::Unsealed);
         }
         Ok(Self {
-            accumulator,
-            report,
-            recognized_usage_drop_count,
-            positive_recognized_usage_count,
-            positive_usage_evidence,
+            native,
             checkpoint,
             chain,
             line_cap,
@@ -385,16 +372,7 @@ impl SharedCache {
                 lease,
             )
             .ok_or(HeldCause::Incompatible)?;
-        self.authorize_predecessor(
-            lease,
-            source,
-            key,
-            index,
-            &binding,
-            checkpoint,
-            &m,
-            write_ahead_eligible,
-        )?;
+        self.authorize_predecessor(lease, source, &binding, write_ahead_eligible)?;
         acquired::capture_chain(
             acquired::ChainInputs {
                 source,
@@ -443,16 +421,7 @@ impl SharedCache {
                 lease,
             )
             .ok_or(HeldCause::Incompatible)?;
-        self.authorize_predecessor(
-            lease,
-            chain.source(),
-            chain.key(),
-            index,
-            &binding,
-            checkpoint,
-            &m,
-            false,
-        )?;
+        self.authorize_predecessor(lease, chain.source(), &binding, false)?;
         chain.rebind(
             opened_object_identity,
             (m.dev(), m.ino(), birth_unix_nanos(&m)),
@@ -462,19 +431,30 @@ impl SharedCache {
         )
     }
 
-    /// Root's prepare_stream mutates only an exactly authorized Claude
-    /// predecessor. Reuse the strict M1 witness path (it also captures the P2
-    /// original witness the exact replacement ACK consumes), funded first.
-    #[allow(clippy::too_many_arguments)] // One proved native fact per input.
+    /// T14's single Full keeps its existing post-save replacement owner. Native
+    /// chain capture must not turn that rebuild into pre-publication retirement.
+    pub(in crate::snapshots) fn durable_rebuild_started(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+    ) -> bool {
+        durable_source(source).is_some_and(|ds| {
+            self.durable().is_some_and(|mut stores| {
+                stores
+                    .slot(ds)
+                    .as_ref()
+                    .is_some_and(|slot| slot.store.rebuild_started(&store::key_digest(ds, key)))
+            })
+        })
+    }
+
+    /// Root's prepare_stream mutates only an exactly authorized v3 predecessor.
+    /// The bounded read is funded before verification.
     fn authorize_predecessor(
         &self,
         lease: &mut store::ActiveLease,
         source: SnapshotSource,
-        key: &str,
-        index: &ScanIndex,
         binding: &Binding,
-        checkpoint: &Checkpoint,
-        held: &std::fs::Metadata,
         full: bool,
     ) -> Result<(), HeldCause> {
         let ds = durable_source(source).ok_or(HeldCause::Incompatible)?;
@@ -498,6 +478,17 @@ impl SharedCache {
         if full {
             let mut stores = self.durable().ok_or(HeldCause::Fence)?;
             let slot = stores.slot(ds).as_mut().ok_or(HeldCause::Fence)?;
+            if slot
+                .store
+                .allows_rebuild_capture(binding, effective_revision(source), lease)
+                .map_err(|_| HeldCause::CustodyBound)?
+            {
+                return Ok(());
+            }
+        }
+        if full {
+            let mut stores = self.durable().ok_or(HeldCause::Fence)?;
+            let slot = stores.slot(ds).as_mut().ok_or(HeldCause::Fence)?;
             match slot
                 .store
                 .read_bounded(&digest, lease)
@@ -510,14 +501,8 @@ impl SharedCache {
                             .record
                             .acquisition
                             .is_some_and(|a| a.acquired_revision == effective_revision(source));
-                    let recovered_carrier = index
-                        .files
-                        .get(key)
-                        .map_or(true, ScanIndexEntry::has_unverified_source)
-                        && record.format == store::FORMAT_V1
-                        && record.envelope_audit_debt.is_some();
                     if same_context
-                        && (native || recovered_carrier)
+                        && native
                         && record.record.allowlist == ds.properties().allowlist()
                     {
                         // A completed byte-zero read replaces a verified current
@@ -528,7 +513,6 @@ impl SharedCache {
                             &record,
                             &Expected {
                                 binding: record.record.binding.clone(),
-                                committed_generation: record.index_generation,
                             },
                         );
                         return Ok(());
@@ -550,63 +534,26 @@ impl SharedCache {
         }
         // A cold v3 predecessor is read once, then every warm mutation uses
         // the saved stamp. It owes no v1 old-byte witness/custody slot.
-        let native = self
-            .durable()
-            .and_then(|mut stores| {
-                stores
-                    .slot(ds)
-                    .as_mut()
-                    .and_then(|slot| slot.store.representation(&digest))
-            })
-            .is_some_and(|(format, _)| format == store::FORMAT_V3);
-        if source == SnapshotSource::Codex || native {
-            lease
-                .charge(store::RESTORE_INPUT_BYTES)
-                .map_err(|_| HeldCause::CustodyBound)?;
-            let mut stores = self.durable().ok_or(HeldCause::Fence)?;
-            let slot = stores.slot(ds).as_mut().ok_or(HeldCause::Fence)?;
-            match slot
-                .store
-                .read_bounded(&digest, lease)
-                .map_err(|_| HeldCause::CustodyBound)?
-            {
-                ReadOutcome::Found(record) if record.format == store::FORMAT_V3 => {
-                    let expected = Expected {
-                        binding: binding.clone(),
-                        committed_generation: index.generation,
-                    };
-                    slot.store.authorize(&record, &expected);
-                }
-                ReadOutcome::Refused(reason) => return Err(HeldCause::Protected(reason)),
-                _ => {}
-            }
-            return Ok(());
-        }
-        let certificate = checkpoint
-            .durable_certificate(birth_unix_nanos(held))
-            .ok_or(HeldCause::Incompatible)?;
         lease
             .charge(store::RESTORE_INPUT_BYTES)
             .map_err(|_| HeldCause::CustodyBound)?;
-        let digest = binding.key;
-        let mut guard = self.durable().ok_or(HeldCause::Fence)?;
-        let stores = &mut *guard;
-        if !stores.fund_key(digest) {
-            return Err(HeldCause::CustodyBound);
-        }
-        let (Some(slot), Some(custody)) = (
-            stores.slots[DurableSource::ClaudeCode.slot()].as_mut(),
-            stores.retail_spent.get_mut(&digest),
-        ) else {
-            return Err(HeldCause::Fence);
-        };
-        let refused = authorize_strict(slot, source, key, index, custody, binding, &certificate);
-        stores.release_idle_custody(&digest);
-        if refused == Some(store::Refusal::Corrupt) {
-            // Known-corrupt disk state may coexist with valid RAM. It cannot
-            // authorize a new native chain: keep the ordinary RAM publication
-            // without staging or receipt debt. Eviction retains the disk hold.
-            return Err(HeldCause::Protected(store::Refusal::Corrupt));
+        let mut stores = self.durable().ok_or(HeldCause::Fence)?;
+        let slot = stores.slot(ds).as_mut().ok_or(HeldCause::Fence)?;
+        match slot
+            .store
+            .read_bounded(&digest, lease)
+            .map_err(|_| HeldCause::CustodyBound)?
+        {
+            ReadOutcome::Found(record) => {
+                slot.store.authorize(
+                    &record,
+                    &Expected {
+                        binding: binding.clone(),
+                    },
+                );
+            }
+            ReadOutcome::Refused(reason) => return Err(HeldCause::Protected(reason)),
+            ReadOutcome::Missing => {}
         }
         Ok(())
     }
@@ -687,12 +634,12 @@ impl SharedCache {
         // Count first, without allocating the stream buffer; the complete
         // header+trailer record bound is applied before any staging.
         let plan = match codec::BodyEncoding::new(
-            view.accumulator,
-            view.report,
+            view.native.accumulator,
+            view.native.report,
             (
-                view.recognized_usage_drop_count,
-                view.positive_recognized_usage_count,
-                view.positive_usage_evidence,
+                view.native.recognized_usage_drop_count,
+                view.native.positive_recognized_usage_count,
+                view.native.positive_usage_evidence,
             ),
             view.line_cap,
             self.skill_labels_enabled(chain.source()),
@@ -759,8 +706,19 @@ impl SharedCache {
             };
             let index_len =
                 std::fs::metadata(&slot.index_path).map_or(0, |metadata| metadata.len());
-            if !slot.store.check_resources(writer, index_len) {
-                return PrepareOutcome::Degraded(Degraded::Paused);
+            match slot.store.check_resources(writer, index_len) {
+                Ok(true) => {}
+                Ok(false) => return PrepareOutcome::Degraded(Degraded::Paused),
+                Err(_) => return PrepareOutcome::Degraded(Degraded::Refused),
+            }
+            if (!view.native.accumulator.activity_skills.is_empty()
+                || !view.native.accumulator.provider_skills.is_empty())
+                && slot
+                    .store
+                    .mark_private_labels(writer, chain.binding().key)
+                    .is_err()
+            {
+                return PrepareOutcome::NotPersisted(NotPersisted::Codec);
             }
             match slot.store.prepare_stream(writer, header) {
                 Ok(preparation) => preparation,
@@ -1203,7 +1161,10 @@ impl SharedCache {
             return true;
         };
         let index_len = std::fs::metadata(&slot.index_path).map_or(0, |metadata| metadata.len());
-        !slot.store.check_resources(writer, index_len)
+        !slot
+            .store
+            .check_resources(writer, index_len)
+            .unwrap_or(false)
     }
 
     /// Native discovery/publication query for a held Claude key; counts growth
@@ -1307,26 +1268,17 @@ fn receipted_locked(stores: &mut Stores, source: DurableSource, key: &str, recei
     let digest = store::key_digest(source, key);
     stores.release_hold(digest, HoldRelease::Write);
     stores.release_restore_pending(&digest, receipt.identity().certificate().length);
-    if source != DurableSource::ClaudeCode {
-        return;
-    }
-    let Some(slot) = stores.slots[source.slot()].as_mut() else {
-        return;
-    };
-    if let Some(custody) = stores.retail_spent.get_mut(&digest) {
-        if custody
-            .original
-            .as_ref()
-            .is_some_and(|original| slot.store.replacement_receipted(original, receipt))
-        {
-            stores.counters.migration[3] += u64::from(
-                custody
-                    .original
-                    .as_ref()
-                    .is_some_and(|original| original.is_migration()),
-            );
-            custody.original = None;
-        }
+    let replaced = stores
+        .retail_spent
+        .get(&digest)
+        .and_then(|c| c.original.as_ref())
+        .is_some_and(|original| {
+            stores.slots[source.slot()]
+                .as_ref()
+                .is_some_and(|slot| slot.store.replacement_receipted(original, receipt))
+        });
+    if replaced {
+        stores.complete_predecessor_replacement(&digest, false);
     }
     stores.release_idle_custody(&digest);
 }

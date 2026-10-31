@@ -128,10 +128,6 @@ impl Holds {
             self.1.sum,
         )
     }
-    #[cfg(test)]
-    pub(super) fn clone_provenance_for_test(&self) -> impl Sized {
-        self.1
-    }
     pub(super) fn contains(&self, field: &str, key: &str) -> bool {
         self.0.get(field).is_some_and(|map| map.contains_key(key))
     }
@@ -323,9 +319,6 @@ impl Serialize for ScanIndex {
         field!(accepted_rebuild_pending_since_unix_seconds, Option::is_none);
         field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
         field!(codex_counting_tombstones, BTreeMap::is_empty);
-        if !self.o3_replay.is_empty() {
-            map.serialize_entry("reread_guard", &self.o3_replay)?;
-        }
         field!(
             codex_counting_evicted_legacy,
             codex_counting_version::EvictedLegacyOwners::is_empty
@@ -335,6 +328,10 @@ impl Serialize for ScanIndex {
         field!(
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
+        );
+        field!(
+            claude_copy_removals,
+            claude_request_money::copy_removals::CopyRemovals::is_empty
         );
         map.end()
     }
@@ -422,12 +419,13 @@ pub(super) const FIELDS: &[&str] = &[
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
     "codex_counting_tombstones",
-    "reread_guard", // O3 negative spends only; keep the legacy positional slot.
+    "reread_guard", // Retired positional slot: drained and never serialized.
     "codex_counting_evicted_legacy",
     "upload_ack_retirement_handoff",
     "held_audit_progress",
     "claude_money_birth_store",
     "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
+    "claude_copy_removals",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -822,7 +820,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
                 reader.consume(1);
                 name
             };
-            let optional = optional_census(name) || name == Some("claude_money_birth_store");
+            let optional = optional_census(name) || optional_money_hint(name);
             // CensusRead streams positional-array separator whitespace before
             // capture; object-field evidence starts immediately after ':'.
             if array {
@@ -869,6 +867,14 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
     reader.seek(SeekFrom::Start(0))?;
     Ok(resources)
 }
+/// Local money hints: damage drops the hint, never the index.
+fn optional_money_hint(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some("claude_money_birth_store" | "claude_copy_removals")
+    )
+}
+
 fn optional_census(name: Option<&str>) -> bool {
     matches!(
         name,
@@ -1599,8 +1605,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                 self.eat(b':')?;
                 name
             };
-            let value = self
-                .span_optional(optional_census(name) || name == Some("claude_money_birth_store"))?;
+            let value = self.span_optional(optional_census(name) || optional_money_hint(name))?;
             if let Some(name) = name {
                 if matches!(
                     name,
@@ -1624,9 +1629,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                     } else if name == "claude_request_census_shadow" {
                         index.claude_request_census_shadow =
                             ClaudeRequestCensusShadowState::default();
-                    } else if name == "reread_guard" {
-                        index.o3_replay = upgrade_replay::State::refused();
-                    } else if name != "claude_desktop_store_inventory" {
+                    } else if name != "claude_desktop_store_inventory" && name != "reread_guard" {
                         return Err(Error::Refused("duplicate index field"));
                     }
                 } else {
@@ -1640,14 +1643,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         } => {}
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
-                        "reread_guard" => {
-                            index.o3_replay =
-                                if value.len > claude_request_census::MAX_RAW_BYTES as u64 {
-                                    upgrade_replay::State::refused()
-                                } else {
-                                    self.history_scalar(value, upgrade_replay::State::refused())?
-                                };
-                        }
+                        "reread_guard" => {}
                         "claude_desktop_store_inventory" => {
                             // No new refusal: this key was unknown to the last
                             // release. A digest is 64 bytes plus its quotes, so
@@ -2022,6 +2018,29 @@ impl<R: BufRead + Seek> Decoder<R> {
                             }
                             index.claude_money_birth_store = decoded.unwrap_or_default();
                         }
+                        "claude_copy_removals" => {
+                            // Like the birth table: a damaged or over-budget
+                            // value decodes as none (copies decide afresh).
+                            let decoded = if !value.resource
+                                && value.len
+                                    <= (claude_request_money::copy_removals::MAX_BYTES as u64) / 3
+                                        * 4
+                                        + 64
+                            {
+                                self.typed::<claude_request_money::copy_removals::CopyRemovals>(
+                                    value,
+                                )
+                                .ok()
+                            } else {
+                                None
+                            };
+                            if decoded.is_none() {
+                                self.counts.drops.activity += 1;
+                            }
+                            index.claude_copy_removals = decoded.unwrap_or_else(
+                                claude_request_money::copy_removals::CopyRemovals::missing,
+                            );
+                        }
                         "accepted_rebuild_incidence" => {
                             if value.len > CARRIED_ACK_BYTES_MAX as u64 {
                                 return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
@@ -2046,6 +2065,10 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
 
         if pass == Pass::Full {
+            if !seen.contains("claude_copy_removals") {
+                index.claude_copy_removals =
+                    claude_request_money::copy_removals::CopyRemovals::missing();
+            }
             // Migrate the old marker without granting later ACKs blanket retention.
             if index.accepted_incidence_pending_census
                 && index.accepted_rebuild_incidence.is_empty()
@@ -2282,8 +2305,6 @@ impl ScanIndex {
         self.decode_holds.1.count == 0 || self.decode_holds.1 == working.decode_holds.1
     }
     pub(super) fn decode_holds_family(&self, root: &str) -> bool {
-        #[cfg(test)]
-        SCOPE_VISITS.with(|count| count.set(count.get() + 1));
         !self.persistence_available()
             || self.decode_holds.2.contains(&repair_key(root))
             || [
@@ -2297,8 +2318,6 @@ impl ScanIndex {
             .any(|field| self.decode_holds.contains(field, root))
     }
     pub(crate) fn decode_holds_file(&self, key: &str) -> bool {
-        #[cfg(test)]
-        SCOPE_VISITS.with(|count| count.set(count.get() + 1));
         self.decode_holds.contains("files", key)
             || claude_index_path_member_ref(Path::new(key))
                 .is_some_and(|member| self.decode_holds_family(member.root))
@@ -2441,7 +2460,7 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     validate_original(&mut std::io::Cursor::new(bytes)).inspect_err(|error| {
         note_refusal(error, "cas", "unattributed");
     })?;
-    let (normalized, duplicate_census, duplicate_shadow, duplicate_upgrade) =
+    let (normalized, duplicate_census, duplicate_shadow) =
         claude_request_census::normalized_bounded_bytes(bytes)?;
     bounded_shape(&normalized).inspect_err(|_| {
         note_refusal(
@@ -2456,9 +2475,6 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     }
     if duplicate_shadow {
         index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
-    }
-    if duplicate_upgrade {
-        index.o3_replay = upgrade_replay::State::refused();
     }
     Ok(index)
 }
@@ -2689,13 +2705,6 @@ pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
 
 fn repair_key(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
-}
-
-#[cfg(test)]
-thread_local! { static SCOPE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-#[cfg(test)]
-pub(super) fn scope_visits_for_test(reset: bool) -> usize {
-    SCOPE_VISITS.with(|count| if reset { count.replace(0) } else { count.get() })
 }
 
 #[cfg(test)]

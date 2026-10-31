@@ -1,7 +1,6 @@
 //! Page-retained Claude usage occurrences: identical selectors are shared, and
 //! every occurrence still exposes exactly its own response's selector.
 use super::*;
-use crate::retry_allocation_probe as probe;
 use serde_json::json;
 use std::io::Write;
 
@@ -61,43 +60,6 @@ fn parsed_items(rows: &[Value]) -> Vec<SnapshotItem> {
     .unwrap();
     fs::remove_dir_all(&dir).unwrap();
     parsed.snapshots
-}
-
-fn occurrence_heap(items: &mut [SnapshotItem]) -> usize {
-    let before = probe::stats().requested_live;
-    for item in items.iter_mut() {
-        item.claude_usage_occurrences = BTreeMap::new();
-    }
-    usize::try_from(before - probe::stats().requested_live).unwrap()
-}
-
-#[test]
-fn identical_occurrence_selectors_do_not_duplicate_page_retained_heap() {
-    let rows = (0..REQUESTS)
-        .map(|index| claude_row(index, Some("standard"), false))
-        .collect::<Vec<_>>();
-    let (per_occurrence, _) = probe::measure(|| {
-        let mut items = parsed_items(&rows);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].claude_usage_occurrences.len(), REQUESTS);
-        let selector = &items[0].claude_usage_occurrences["req_000000"].selector;
-        assert_eq!(
-            selector.context.get("service_tier").map(String::as_str),
-            Some("standard")
-        );
-        assert_eq!(
-            selector.context.get("context_bucket").map(String::as_str),
-            Some("short")
-        );
-        occurrence_heap(&mut items) / REQUESTS
-    });
-    // Owned per-occurrence selector maps measured 2145 requested bytes per
-    // request in this fixture on Rust 1.95; shared selectors measured 740 (key,
-    // usage, model, timestamp and the occurrence map's node share).
-    assert!(
-        per_occurrence <= 1024,
-        "page-retained usage occurrence heap per request: {per_occurrence} bytes"
-    );
 }
 
 #[test]

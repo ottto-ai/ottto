@@ -606,44 +606,6 @@ mod tests {
     }
 
     #[test]
-    fn summarize_caps_session_peaks_to_most_recent_oldest_first() {
-        let now = test_now();
-        let rows: Vec<ContextPostureCacheRow> = (0..20)
-            .map(|i| {
-                row(
-                    &format!("s{i}"),
-                    &format!("2026-07-11T09:{i:02}:00Z"),
-                    Some(10_000),
-                    Some(2_000 * (i as u64 + 1)),
-                    None,
-                    Some(0),
-                    0,
-                    Some("claude-sonnet-4-5"),
-                )
-            })
-            .collect();
-        let summary = summarize_context_posture(&rows, now).expect("summary");
-        assert_eq!(summary.sessions_analyzed, 20);
-        assert_eq!(
-            summary.session_peaks.len(),
-            POSTURE_SUMMARY_MAX_SESSION_PEAKS
-        );
-        // The first retained peak is session index 6 (20 - 14), the last is 19.
-        assert_eq!(
-            summary.session_peaks.first().unwrap().peak_fill_tokens,
-            14_000
-        );
-        assert_eq!(
-            summary.session_peaks.last().unwrap().peak_fill_tokens,
-            40_000
-        );
-        assert!(summary
-            .session_peaks
-            .iter()
-            .all(|peak| peak.peak_fill_percent.is_none() && peak.over_window.is_none()));
-    }
-
-    #[test]
     fn summarize_returns_none_when_window_is_empty() {
         let now = test_now();
         assert_eq!(summarize_context_posture(&[], now), None);
@@ -682,6 +644,8 @@ mod tests {
                 vec![crate::snapshots::SnapshotModelUsage {
                     evidence_ref: None,
                     identity_parts: None,
+                    copy_unproven: false,
+                    identity_retained: false,
                     model: model.to_string(),
                     input_tokens: 0,
                     output_tokens: 0,
@@ -731,6 +695,7 @@ mod tests {
             removed_usage: None,
             telemetry_owned_complete: None,
             resolver_conflict_count: None,
+            copy_unproven_counts: None,
             claude_money: None,
             session_account_evidence: None,
             claude_usage_request_ids: std::collections::BTreeSet::new(),

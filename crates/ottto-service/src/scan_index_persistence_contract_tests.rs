@@ -124,24 +124,19 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
         .try_into()
         .unwrap();
     let logical = serde_json::to_value(index).unwrap();
-    let entry = index.files.get("synthetic-file").unwrap();
     let context = logical["upload_context_fingerprint"].as_str();
     let binding = durable::Binding {
         source,
         key: durable::key_digest(source, "synthetic-file"),
         context: durable::context_digest(&"a".repeat(64), context),
         scope: durable::scope_digest("synthetic-scope", &allowlist, "identity:v1", "legacy"),
-        entry: durable::replay_entry_digest(
-            &durable::entry_digest(
-                &entry.source_file_fingerprint,
-                entry.last_upload_body_witness.as_deref(),
-            ),
-            entry.effective_upload_body_witness_revision,
-            0,
-        ),
+        entry: [0; 32],
     };
     let record = durable::PendingRecord {
-        acquisition: None,
+        acquisition: Some(durable::AcquisitionFields {
+            acquired_revision: 3,
+            protocol: crate::snapshots::AcquisitionProtocol::Legacy,
+        }),
         binding: binding.clone(),
         certificate,
         body: crate::snapshots::durable_store_fixture_body(
@@ -177,16 +172,14 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
     assert_eq!(restored.index_generation, generation);
     assert_eq!(restored.record, record);
     // The actual admission seam: a write-ahead record may lead its index, so
-    // only V1 Codex keeps the generation gate; context and scope always refuse.
+    // context and scope always refuse.
     let expected = durable::Expected {
         binding: binding.clone(),
-        committed_generation: root["generation"].as_u64().unwrap(),
     };
     assert!(restored.eligible(&expected).is_ok());
     assert!(restored
         .eligible(&durable::Expected {
             binding: binding.clone(),
-            committed_generation: generation - 1
         })
         .is_ok());
     assert!(restored
@@ -195,15 +188,9 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
                 scope: [9; 32],
                 ..binding.clone()
             },
-            committed_generation: generation
         })
         .is_err());
-    assert!(restored
-        .eligible(&durable::Expected {
-            binding,
-            committed_generation: generation + 1
-        })
-        .is_ok());
+    assert!(restored.eligible(&durable::Expected { binding }).is_ok());
     assert!(restored.index_generation <= root["generation"].as_u64().unwrap());
     assert!(crate::snapshots::verify_durable_body(
         &restored.record.body,

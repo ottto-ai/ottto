@@ -5,23 +5,18 @@ use crate::durable_tail_store::{
     self as store, AcquisitionFields, Binding, DurableSource, PendingRecord, ReadOutcome, Refusal,
 };
 use crate::locked_state_dir::test_locks;
+use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::snapshots::{AcquisitionProtocol, ImmutableCounting};
-use crate::transcript_acquisition::{birth_unix_nanos, DurableCertificate, ReadPlan};
+use crate::transcript_acquisition::{birth_unix_nanos, DurableCertificate};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 fn certificate(path: &Path) -> DurableCertificate {
     let scope = Scope("m3-format-fixture".into());
     let mut file = File::open(path).unwrap();
-    let mut plan = ReadPlan::prepare(&mut file, None, &scope, None, 1_800_000_000).unwrap();
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).unwrap();
-    plan.observe_complete_records(&bytes).unwrap();
-    plan.commit_after_native_completion(&file, &scope, 1_800_000_000)
-        .unwrap()
+    fixture::checkpoint(&mut file, &scope, 1_800_000_000)
         .durable_certificate(birth_unix_nanos(&file.metadata().unwrap()))
         .unwrap()
 }
@@ -53,8 +48,7 @@ fn pending(
     }
 }
 fn path(dir: &Path, key: &store::Digest32) -> std::path::PathBuf {
-    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-    dir.join(format!("{hex}.rec"))
+    fixture::record_path(dir, key)
 }
 fn found(outcome: ReadOutcome) -> store::DurableRecord {
     match outcome {
@@ -80,16 +74,10 @@ fn m3_p4a_source_table_admits_exact_triples_without_repinning_body() {
     {
         assert_eq!(row.source.slot(), slot);
         assert_eq!(row.tag as usize, slot + 1);
-        assert_eq!(
-            row.write_format, 1,
-            "P4a preserves the original writer until native activation"
-        );
-        assert_eq!(row.representations.len(), 2);
+        assert_eq!(row.write_format, 3);
+        assert_eq!(row.representations.len(), 1);
         let pin = row.allowlist();
-        assert_eq!(
-            row.representation(1, &pin).unwrap().header_bytes,
-            store::HEADER_BYTES
-        );
+        assert!(row.representation(1, &pin).is_none());
         assert_eq!(
             row.representation(3, &pin).unwrap().header_bytes,
             store::HEADER_V3_BYTES
@@ -97,101 +85,7 @@ fn m3_p4a_source_table_admits_exact_triples_without_repinning_body() {
         assert!(row.representation(2, &pin).is_none());
         assert!(row.representation(4, &pin).is_none());
         assert!(row.representation(3, &[0; 32]).is_none());
-        assert_eq!(
-            row.representation(1, &pin).unwrap().allowlist_pin,
-            row.representation(3, &pin).unwrap().allowlist_pin
-        );
     }
-}
-
-/// [format] m3 p4a wire offsets generation and mixed restart twice.
-#[test]
-fn m3_p4a_wire_offsets_generation_and_mixed_restart_twice() {
-    let root = crate::test_scratch::private_dir("ottto-m3-mixed-envelope");
-    let lock = test_locks::hold(&root);
-    let transcript = root.join("fixture.jsonl");
-    std::fs::write(&transcript, b"{\"n\":1}\n").unwrap();
-    let cert = certificate(&transcript);
-    for row in crate::snapshots::durable_sources::SOURCES
-        .iter()
-        .filter(|row| row.source != DurableSource::Pi)
-    {
-        let dir = root.join(row.snapshot.api_slug());
-        let mut store = store::DurableTailStore::new(dir.clone(), row.source);
-        let old = pending(row.source, "v1", &cert, false);
-        let new = pending(row.source, "v3", &cert, true);
-        let old_key = old.binding.key;
-        let new_key = new.binding.key;
-        let body = new.body.clone();
-        let old_len = old.body.len() + store::HEADER_BYTES + 32;
-        let new_len = body.len() + store::HEADER_V3_BYTES + 32;
-        let receipt = store.write_after_save(lock, 81, 0, vec![old, new]).unwrap();
-        assert_eq!(receipt.written, 2);
-        let old_wire = std::fs::read(path(&dir, &old_key)).unwrap();
-        let new_wire = std::fs::read(path(&dir, &new_key)).unwrap();
-        assert_eq!(old_wire.len(), old_len);
-        assert_eq!(new_wire.len(), new_len);
-        assert_eq!(&new_wire[8..10], &3u16.to_le_bytes());
-        assert_eq!(&new_wire[43..75], &new_key);
-        assert_eq!(&new_wire[139..171], &[0; 32]);
-        assert_eq!(&new_wire[171..179], &81u64.to_le_bytes());
-        assert_eq!(&new_wire[179..187], &17u64.to_le_bytes());
-        assert_eq!(new_wire[187], 0);
-        assert_eq!(
-            &new_wire[store::HEADER_V3_BYTES..new_wire.len() - 32],
-            &body
-        );
-        let keep = BTreeMap::from([(old_key, None), (new_key, None)]);
-        let context = store::context_digest("m3-format-tests", None);
-        for _ in 0..2 {
-            drop(store);
-            store = store::DurableTailStore::new(dir.clone(), row.source);
-            let mut records = Vec::new();
-            for key in [old_key, new_key] {
-                let record = found(store.read(&key));
-                assert!(!record.record.body.is_empty());
-                assert!(record.wire.is_some());
-                let expected = store::Expected {
-                    binding: record.record.binding.clone(),
-                    committed_generation: 0,
-                };
-                if key == new_key {
-                    assert_eq!(record.format, 3);
-                    assert_eq!(record.record.acquisition.unwrap().acquired_revision, 17);
-                    assert!(record.eligible(&expected).is_ok());
-                    for generation in [0, 81, 999] {
-                        let expected = store::Expected {
-                            binding: record.record.binding.clone(),
-                            committed_generation: generation,
-                        };
-                        assert!(record.eligible(&expected).is_ok());
-                        store.authorize(&record, &expected);
-                    }
-                } else {
-                    assert_eq!(record.format, 1);
-                    assert!(record.record.acquisition.is_none());
-                    store.authorize(
-                        &record,
-                        &store::Expected {
-                            binding: record.record.binding.clone(),
-                            committed_generation: 81,
-                        },
-                    );
-                }
-                records.push(record);
-            }
-            let before = store.counters().gc_bytes_read;
-            store.gc(lock, &context, &keep).unwrap();
-            assert_eq!(
-                store.counters().gc_bytes_read - before,
-                (store::HEADER_BYTES + store::HEADER_V3_BYTES) as u64
-            );
-            assert_eq!(std::fs::read(path(&dir, &old_key)).unwrap(), old_wire);
-            assert_eq!(std::fs::read(path(&dir, &new_key)).unwrap(), new_wire);
-            assert_eq!(records.len(), 2);
-        }
-    }
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// [format] m3 p4a v3 dispatch lengths and unknown survivors.
@@ -336,4 +230,104 @@ fn pi_format_three_store_row_round_trips_and_v1_v2_stay_unknown() {
         reader.gc(lock, &[0; 32], &BTreeMap::new()).unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), unknown);
     }
+}
+/// [format] ON refuses current-pin v1 forgeries without write or restore authority.
+#[test]
+fn on_current_pin_v1_is_refused_and_cannot_be_written_or_restored() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    let root = crate::test_scratch::ScratchDir::new("v3-only-retired");
+    let lock = test_locks::hold(&root);
+    let transcript = root.join("source.jsonl");
+    std::fs::write(&transcript, b"{}\n").unwrap();
+    for row in crate::snapshots::durable_sources::SOURCES {
+        let dir = root.join(row.snapshot.api_slug());
+        let mut disk = store::DurableTailStore::new(dir.clone(), row.source);
+        let old = pending(row.source, "old", &certificate(&transcript), false);
+        let key = old.binding.key;
+        assert_eq!(
+            disk.write_after_save(lock, 1, 0, vec![old.clone()])
+                .unwrap()
+                .written,
+            0
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bytes = store::tests::pinned_v1_bytes(&old, 1);
+        let record_path = path(&dir, &key);
+        std::fs::write(&record_path, &bytes).unwrap();
+        std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(disk.missing_cause(&key), None);
+        assert_eq!(disk.read(&key), ReadOutcome::Refused(Refusal::Unknown));
+        let mut cold = store::DurableTailStore::new(dir.clone(), row.source);
+        assert_eq!(cold.read(&key), ReadOutcome::Refused(Refusal::Unknown));
+        assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
+    }
+}
+
+/// [format] v3 wire offsets, generation, and two real store restarts.
+#[test]
+fn m3_p4a_wire_offsets_generation_and_v3_restart_twice() {
+    let root = crate::test_scratch::private_dir("ottto-m3-mixed-envelope");
+    let lock = test_locks::hold(&root);
+    let transcript = root.join("fixture.jsonl");
+    std::fs::write(&transcript, b"{\"n\":1}\n").unwrap();
+    let cert = certificate(&transcript);
+    for row in crate::snapshots::durable_sources::SOURCES {
+        let dir = root.join(row.snapshot.api_slug());
+        let mut store = store::DurableTailStore::new(dir.clone(), row.source);
+        let old = pending(row.source, "earlier-v3", &cert, true);
+        let new = pending(row.source, "v3", &cert, true);
+        let old_key = old.binding.key;
+        let new_key = new.binding.key;
+        let body = new.body.clone();
+        let old_len = old.body.len() + store::HEADER_V3_BYTES + 32;
+        let new_len = body.len() + store::HEADER_V3_BYTES + 32;
+        let receipt = store.write_after_save(lock, 81, 0, vec![old, new]).unwrap();
+        assert_eq!(receipt.written, 2);
+        let old_wire = std::fs::read(path(&dir, &old_key)).unwrap();
+        let new_wire = std::fs::read(path(&dir, &new_key)).unwrap();
+        assert_eq!(old_wire.len(), old_len);
+        assert_eq!(new_wire.len(), new_len);
+        assert_eq!(&new_wire[8..10], &3u16.to_le_bytes());
+        assert_eq!(&new_wire[43..75], &new_key);
+        assert_eq!(&new_wire[139..171], &[0; 32]);
+        assert_eq!(&new_wire[171..179], &81u64.to_le_bytes());
+        assert_eq!(&new_wire[179..187], &17u64.to_le_bytes());
+        assert_eq!(new_wire[187], 0);
+        assert_eq!(
+            &new_wire[store::HEADER_V3_BYTES..new_wire.len() - 32],
+            &body
+        );
+        let keep = BTreeMap::from([(old_key, None), (new_key, None)]);
+        let context = store::context_digest("m3-format-tests", None);
+        for _ in 0..2 {
+            drop(store);
+            store = store::DurableTailStore::new(dir.clone(), row.source);
+            let mut records = Vec::new();
+            for key in [old_key, new_key] {
+                let record = found(store.read(&key));
+                assert!(!record.record.body.is_empty());
+                assert!(record.wire.is_some());
+                let expected = store::Expected {
+                    binding: record.record.binding.clone(),
+                };
+                assert_eq!(record.format, 3);
+                assert_eq!(record.record.acquisition.unwrap().acquired_revision, 17);
+                assert!(record.eligible(&expected).is_ok());
+                store.authorize(&record, &expected);
+                records.push(record);
+            }
+            let before = store.counters().gc_bytes_read;
+            store.gc(lock, &context, &keep).unwrap();
+            assert_eq!(
+                store.counters().gc_bytes_read - before,
+                (2 * store::HEADER_V3_BYTES) as u64
+            );
+            assert_eq!(std::fs::read(path(&dir, &old_key)).unwrap(), old_wire);
+            assert_eq!(std::fs::read(path(&dir, &new_key)).unwrap(), new_wire);
+            assert_eq!(records.len(), 2);
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }

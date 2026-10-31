@@ -9,10 +9,10 @@
 //! with a cold Full read of the same file.
 use super::sampled_scan::durable_tail::{durable_source, Counters};
 use super::sampled_scan::test_hooks::{self as scan_hooks, Point};
+use super::sampled_scan::transition_fixture::native_cold::{self as fixture, NativeColdStore};
 use super::sampled_scan::SharedCache;
 use super::*;
 use crate::durable_tail_store::{self as store, test_hooks as store_hooks};
-use crate::locked_state_dir::test_locks;
 use crate::transcript_acquisition::{AuditDebt, Scope};
 use serde_json::{json, Value};
 use std::cell::Cell;
@@ -46,16 +46,13 @@ fn claude_line(session: &str, n: u64) -> String {
 
 fn codex_head(session: &str) -> String {
     let at = "2026-10-07T10:00:00Z";
-    [
+    fixture::jsonl([
         json!({"type":"session_meta","timestamp":at,"payload":{"id":session,
             "timestamp":at,"cwd":"/tmp/m3-d3","originator":"codex_cli_rs",
             "cli_version":"0.50.0","source":"cli"}}),
         json!({"type":"turn_context","timestamp":at,
             "payload":{"turn_id":"turn-1","cwd":"/tmp/m3-d3","model":"gpt-5.2"}}),
-    ]
-    .iter()
-    .map(|line| line.to_string() + "\n")
-    .collect()
+    ])
 }
 
 fn codex_line(n: u64) -> String {
@@ -103,12 +100,23 @@ fn scan(
     cache: Arc<SharedCache>,
     namespace: &Scope,
 ) -> (ScanIndex, Vec<SnapshotItem>) {
-    let mut scan = OwnedSourceScan::new(
+    scan_with_window(source, sessions, index, cache, namespace, 365)
+}
+
+fn scan_with_window(
+    source: SnapshotSource,
+    sessions: &Path,
+    index: ScanIndex,
+    cache: Arc<SharedCache>,
+    namespace: &Scope,
+    backfill_window_days: u64,
+) -> (ScanIndex, Vec<SnapshotItem>) {
+    let scan = OwnedSourceScan::new(
         source,
         &[sessions.to_path_buf()],
         index,
         COLLECTED,
-        365,
+        backfill_window_days,
         100,
         false,
         None,
@@ -117,25 +125,18 @@ fn scan(
         true,
     )
     .with_sampled_acquisition(cache, namespace.clone());
-    for _ in 0..10_000 {
-        match scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => scan = next,
-            OwnedSourceScanStep::Complete {
-                mut index,
-                mut scan,
-                ..
-            } => {
-                finalize_scan_after_policy_with_body_witness(
-                    source,
-                    &mut scan,
-                    &mut index,
-                    snapshot_upload_body_witness,
-                );
-                return (index, scan.snapshots);
-            }
-        }
+    let (mut index, mut scan, _, _) = fixture::scan(scan, 10_000);
+    finalize_scan_after_policy_with_body_witness(
+        source,
+        &mut scan,
+        &mut index,
+        snapshot_upload_body_witness,
+    );
+    if source == SnapshotSource::Codex {
+        // End the finalized recovery traversal at the same explicit boundary.
+        scan.finish_codex_capture_boundary(&mut index);
     }
-    panic!("production scan did not complete");
+    (index, scan.snapshots)
 }
 
 /// What one pass published and reported.
@@ -184,22 +185,14 @@ impl Pass {
 
 /// A daemon-shaped state directory: index, store and transcripts under one
 /// root whose state-directory lock this process holds.
-struct Rig {
-    source: SnapshotSource,
-    root: PathBuf,
-    sessions: PathBuf,
-    index_path: PathBuf,
-    namespace: Scope,
-    cache: Arc<SharedCache>,
-    index: ScanIndex,
-    _scratch: Option<crate::test_scratch::ScratchDir>,
-}
+type Rig = NativeColdStore;
 impl Rig {
     fn new(source: SnapshotSource, tag: &str) -> Self {
-        let scratch = crate::test_scratch::ScratchDir::new(tag);
-        let mut rig = Self::open(source, scratch.to_path_buf());
-        rig._scratch = Some(scratch);
-        rig
+        assert!(
+            crate::heap_layout_bound::layout_supported(),
+            "validated native admission layout"
+        );
+        Self::with_scope(source, tag, Scope("m3-d3".into()))
     }
     /// Takes this process's lock on `root`; a killed child released its own.
     fn open(source: SnapshotSource, root: PathBuf) -> Self {
@@ -207,30 +200,7 @@ impl Rig {
             crate::heap_layout_bound::layout_supported(),
             "validated native admission layout"
         );
-        let sessions = root.join("sessions");
-        fs::create_dir_all(&sessions).unwrap();
-        test_locks::hold(&root);
-        let index_path = root.join("index.json");
-        let index = if index_path.exists() {
-            ScanIndex::load(&index_path).unwrap()
-        } else {
-            ScanIndex::default()
-        };
-        Self {
-            source,
-            root,
-            sessions,
-            index_path,
-            namespace: Scope("m3-d3".into()),
-            cache: Arc::new(SharedCache::default()),
-            index,
-            _scratch: None,
-        }
-    }
-    /// A new process view: no RAM, the index as last saved, the store on disk.
-    fn restart(&mut self) {
-        self.cache = Arc::new(SharedCache::default());
-        self.index = ScanIndex::load(&self.index_path).unwrap();
+        Self::open_with_scope(source, root, Scope("m3-d3".into()))
     }
     /// One production pass: begin, scan, save, then the post-save hook that
     /// writes M1 copies, collects garbage and reports the diagnostics line.
@@ -246,7 +216,7 @@ impl Rig {
                 cache.clone(),
                 &self.namespace,
             );
-            index.save(&self.index_path).unwrap();
+            fixture::save(&self.index_path, &mut index);
             durable_after_save(&cache, &self.root, self.source, &index);
             (index, snapshots)
         });
@@ -268,18 +238,6 @@ impl Rig {
             &self.namespace,
         );
         witness_of(self.source, &snapshots, session).expect("cold Full publishes the session")
-    }
-    fn path(&self, session: &str) -> PathBuf {
-        self.sessions.join(format!("{session}.jsonl"))
-    }
-    fn key(&self, session: &str) -> String {
-        local_index_key(&self.path(session))
-    }
-    fn digest(&self, session: &str) -> store::Digest32 {
-        store::key_digest(durable_source(self.source).unwrap(), &self.key(session))
-    }
-    fn store_dir(&self) -> PathBuf {
-        store::store_dir_for_index(&self.index_path)
     }
     fn record(&self, session: &str) -> PathBuf {
         let hex = self
@@ -416,12 +374,15 @@ fn owed_shrink_fulls(pass: &Pass) -> u64 {
 }
 
 fn assert_cold_body(rig: &Rig, pass: &Pass) {
-    let (_, mut cold) = scan(
+    // The cold oracle has no recovery debt to discover this test's
+    // 400-day-old input. Include it in the oracle's enumeration window.
+    let (_, mut cold) = scan_with_window(
         rig.source,
         &rig.sessions,
         ScanIndex::default(),
         Arc::new(SharedCache::default()),
         &rig.namespace,
+        730,
     );
     let mut actual = pass.snapshots.clone();
     apply_upload_policy(rig.source, &mut actual, SnapshotUploadPolicy::default());
@@ -493,7 +454,12 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
                 "verified_extent" => {
                     entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into())
                 }
-                "future_revision" => entry.effective_upload_body_witness_revision = revision + 1,
+                "future_revision" => {
+                    entry.effective_upload_body_witness_revision =
+                        crate::snapshot_sync::effective_upload_body_witness_revision(
+                            SnapshotSource::ClaudeCode,
+                        ) + 1;
+                }
                 "not_due" => entry.set_unverified_deadline(
                     now_unix() + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS / 2,
                 ),
@@ -1081,7 +1047,7 @@ fn m3_d3_codex_strict_rebind_survives_save_and_load_and_refuses_a_with_one_full(
     assert!(!refused.disabled());
     let (counts, stats) = rig.counters();
     assert_eq!(
-        counts.ineligible.get("selection_cleared.stale_record"),
+        counts.ineligible.get("selection_cleared.stale_record_full"),
         Some(&1)
     );
     assert_eq!(counts.restored, 0);
@@ -1401,6 +1367,14 @@ fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
         );
         assert_eq!(publications.len(), 1);
         assert!(rig.cache.durable_store_faulted(rig.source));
+        let staged_due = working.files[&key]
+            .unverified_deadline()
+            .expect("the native Tail stages its audit obligation");
+        fs::write(
+            rig.root.join("pre-barrier-audit.json"),
+            serde_json::to_vec(&staged_due).unwrap(),
+        )
+        .unwrap();
         let marker = rig.root.join("point-reached");
         scan_hooks::set(
             if after {
@@ -1470,7 +1444,18 @@ fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
             rig.index.files[&key].source_file_fingerprint.is_empty(),
             after
         );
+        let staged_due: u64 =
+            serde_json::from_slice(&fs::read(scratch.join("pre-barrier-audit.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            rig.index.files[&key].unverified_deadline(),
+            after.then_some(staged_due),
+            "the barrier carries exactly the staged audit debt before ACK"
+        );
         entry["source_file_fingerprint"] = pre["source_file_fingerprint"].clone();
+        // The independently checked audit marker is scheduling metadata;
+        // every accepted fact and all other entry fields must stay PRE.
+        entry["scan_identity_version"] = pre["scan_identity_version"].clone();
         assert_eq!(
             entry, pre,
             "the barrier never fabricates accepted revision/extent/body"
@@ -1534,13 +1519,29 @@ fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
 fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let mut rig = Rig::new(SnapshotSource::Codex, "m3-singleton-group");
-    rig.create(CODEX_SESSION, 2);
+    let first = codex_file_join::tests::member(CODEX_SESSION, "rotation-a", 200, 200);
+    fs::write(
+        rig.path(CODEX_SESSION),
+        first
+            .iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
     assert_eq!(rig.pass().published(CODEX_SESSION), 1);
     rig.assert_native_record(CODEX_SESSION);
     let stale = fs::read(rig.record(CODEX_SESSION)).unwrap();
     let alias = rig.sessions.join("joined.jsonl");
-    fs::copy(rig.path(CODEX_SESSION), &alias).unwrap();
-    rig.append(CODEX_SESSION, 1);
+    // A copied cumulative-only file has no independent ownership chain.
+    // Use the production join fixture's contiguous native response proof.
+    let next = codex_file_join::tests::member(CODEX_SESSION, "rotation-b", 100, 300);
+    fs::write(
+        &alias,
+        next.iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
     rig.cache = Arc::new(SharedCache::default());
     let grouped = rig.pass();
     assert_eq!(

@@ -24,6 +24,208 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+/// Checked historical bytes and independent generation facts, for transition consumers.
+pub(crate) struct V1Golden<'a> {
+    pub(crate) case_id: &'static str,
+    pub(crate) record: &'a [u8],
+    pub(crate) input: &'a [u8],
+    pub(crate) expected: Value,
+    pub(crate) metadata: Value,
+}
+
+impl V1Golden<'_> {
+    /// Relocate only the envelope key for a scratch-path rebuild fixture.
+    /// The body, old pin, generation, certificate and interpretation stay archived;
+    /// this is NOT evidence of a portable old-writer restore binding.
+    pub(crate) fn relocated_record(&self, key: [u8; 32]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut bytes = self.record.to_vec();
+        bytes[43..75].copy_from_slice(&key);
+        let end = bytes.len() - 32;
+        let checksum = Sha256::digest(&bytes[..end]);
+        bytes[end..].copy_from_slice(&checksum);
+        bytes
+    }
+}
+
+#[derive(Clone, Copy)]
+struct V1Files<'a> {
+    case_id: &'static str,
+    record: &'a [u8],
+    input: &'a [u8],
+    expected: &'a [u8],
+}
+
+const V1_MANIFEST: &[u8] = include_bytes!("../../../testdata/v1/MANIFEST.json");
+const V1_FILES: [V1Files<'static>; 4] = {
+    macro_rules! case {
+        ($id:literal) => {
+            V1Files {
+                case_id: $id,
+                record: include_bytes!(concat!("../../../testdata/v1/", $id, ".rec")),
+                input: include_bytes!(concat!("../../../testdata/v1/inputs/", $id, ".jsonl")),
+                expected: include_bytes!(concat!("../../../testdata/v1/expected/", $id, ".json")),
+            }
+        };
+    }
+    [
+        case!("claude-three-request"),
+        case!("claude-selector-unequal"),
+        case!("codex-legacy-acked"),
+        case!("codex-v2-24b"),
+    ]
+};
+
+/// Validate provenance and every file before returning any fixture authority.
+pub(crate) fn load_v1_goldens() -> Result<Vec<V1Golden<'static>>, String> {
+    validate_v1_goldens(
+        serde_json::from_slice(V1_MANIFEST).map_err(|e| e.to_string())?,
+        &V1_FILES,
+    )
+}
+
+fn validate_v1_goldens<'a>(
+    manifest: Value,
+    files: &[V1Files<'a>; 4],
+) -> Result<Vec<V1Golden<'a>>, String> {
+    use sha2::{Digest, Sha256};
+    let bad = || "invalid v1 golden manifest or file".to_owned();
+    if manifest["schema_version"] != 1
+        || manifest["source_sha"] != "53d05a4304f2e87effbaa48661e10286bff01c58"
+        || manifest["repo"] != "ottto-ai/ottto"
+        || manifest["workflow_path"] != ".github/workflows/linux-tests.yml"
+        || manifest["artifact_id"] != 13031099044u64
+        || manifest["artifact_name"] != "v1-goldens-53d05a43"
+        || [
+            "generator_commit",
+            "run_id",
+            "run_attempt",
+            "run_url",
+            "toolchain",
+            "rustc",
+            "runner_os",
+            "runner_arch",
+        ]
+        .iter()
+        .any(|key| manifest[*key].as_str().map_or(true, str::is_empty))
+    {
+        return Err(bad());
+    }
+    let cases = manifest["cases"]
+        .as_array()
+        .filter(|cases| cases.len() == 4)
+        .ok_or_else(bad)?;
+    files
+        .iter()
+        .zip(cases)
+        .map(|(file, case)| {
+            if case["case_id"] != file.case_id {
+                return Err(bad());
+            }
+            for (metadata, bytes, path) in [
+                (case, file.record, format!("{}.rec", file.case_id)),
+                (
+                    &case["input"],
+                    file.input,
+                    format!("inputs/{}.jsonl", file.case_id),
+                ),
+                (
+                    &case["expected"],
+                    file.expected,
+                    format!("expected/{}.json", file.case_id),
+                ),
+            ] {
+                if metadata["path"] != path
+                    || metadata["byte_length"].as_u64() != Some(bytes.len() as u64)
+                    || metadata["sha256"] != format!("{:x}", Sha256::digest(bytes))
+                {
+                    return Err(bad());
+                }
+            }
+            let expected: Value =
+                serde_json::from_slice(file.expected).map_err(|e| e.to_string())?;
+            if expected["case_id"] != file.case_id || expected["facts"] != case["expected_facts"] {
+                return Err(bad());
+            }
+            Ok(V1Golden {
+                case_id: file.case_id,
+                record: file.record,
+                input: file.input,
+                expected,
+                metadata: case.clone(),
+            })
+        })
+        .collect()
+}
+
+/// [format] Historical fixtures lose authority on provenance, inventory or byte tampering.
+#[test]
+fn v1_golden_provenance_and_tampering() {
+    let manifest: Value = serde_json::from_slice(V1_MANIFEST).unwrap();
+    assert_eq!(load_v1_goldens().unwrap().len(), 4);
+    for pointer in ["/source_sha", "/cases/0/sha256", "/run_id"] {
+        let mut changed = manifest.clone();
+        *changed.pointer_mut(pointer).unwrap() = Value::Null;
+        assert!(
+            validate_v1_goldens(changed, &V1_FILES).is_err(),
+            "{pointer}"
+        );
+    }
+    let mut missing = manifest.clone();
+    missing.as_object_mut().unwrap().remove("run_id");
+    assert!(validate_v1_goldens(missing, &V1_FILES).is_err());
+    let mut incomplete = manifest.clone();
+    incomplete["cases"].as_array_mut().unwrap().pop();
+    assert!(validate_v1_goldens(incomplete, &V1_FILES).is_err());
+    let mut changed = V1_FILES[0].record.to_vec();
+    changed[crate::durable_tail_store::HEADER_BYTES] ^= 1;
+    let mut files = V1_FILES;
+    files[0].record = &changed;
+    assert!(validate_v1_goldens(manifest, &files).is_err());
+}
+
+/// Emitted-body comparison for native scan fixtures without a transport driver.
+pub(crate) fn scan_money(
+    source: SnapshotSource,
+    index: &super::super::ScanIndex,
+    scan: &super::super::SourceScanResult,
+) -> RouteResult {
+    let batches = if scan.snapshots.is_empty() {
+        Vec::new()
+    } else {
+        let mut request = super::super::tests::valid_v6_batch_request();
+        request.source = source.api_slug().into();
+        request.snapshots = scan.snapshots.clone();
+        vec![serde_json::to_vec(&request).unwrap()]
+    };
+    let mut route = RouteResult::emitted(Mode::Ram, source, batches, &scan.snapshots);
+    if source == SnapshotSource::Codex {
+        route.codex_evidence = codex_evidence(index, scan);
+    }
+    route
+}
+
+/// The actual post-scan tier/ownership state and emitted token counts. Shared
+/// by ordinary scan and durable-transition adapters; absence is collected too.
+pub(crate) fn codex_evidence(
+    index: &super::super::ScanIndex,
+    scan: &super::super::SourceScanResult,
+) -> Value {
+    json!({
+        "TierReplay": index.files.iter().map(|(key, entry)| (key.clone(), json!({
+            "applied": entry.codex_applied_tier_receipt,
+            "required": entry.codex_applied_tier_receipt_required,
+            "captured": entry.codex_captured_tier_receipt,
+            "owner": entry.codex_protected_owner,
+            "v2": entry.codex_counting_v2,
+        }))).collect::<BTreeMap<_, _>>(),
+        "token_count": scan.snapshots.iter().map(|item| (item.source_session_id.clone(), json!([
+            item.input_tokens, item.output_tokens, item.cache_read_tokens,
+            item.reasoning_output_tokens, item.request_count,
+        ]))).collect::<BTreeMap<_, _>>(),
+    })
+}
+
 /// Keep private acquisition internals private; sibling test adapters enter here.
 pub(crate) fn local_key(path: &Path) -> String {
     super::super::local_index_key(path)
@@ -32,10 +234,9 @@ pub(crate) fn seed_old_writer(
     cache: &super::SharedCache,
     source: SnapshotSource,
     key: &str,
-    index: &super::super::ScanIndex,
     pin: &str,
 ) -> Vec<u8> {
-    super::durable_tail::transition_seed::seed_pinned_v1(cache, source, key, index, pin)
+    super::durable_tail::transition_seed::seed_pinned_v1(cache, source, key, pin)
 }
 
 /// The production body allowlist, without exposing the private codec module.
@@ -896,4 +1097,271 @@ fn native_m3_plain_flush_matrix_has_no_file_fsync_boundary() {
         !temp_commit.contains(".sync"),
         "native temp commit added fsync"
     );
+}
+
+/// Native cold-store setup shared by transition tests. Scans stop before
+/// policy finalization, ACK and save; each driver chooses its settlement.
+pub(crate) mod native_cold {
+    use super::super::{durable_tail, SharedCache};
+    use crate::durable_tail_store::{self as store, DurableSource};
+    use crate::locked_state_dir::test_locks;
+    use crate::snapshots::*;
+    use crate::transcript_acquisition::Scope;
+    use std::sync::Arc;
+
+    pub(crate) struct NativeColdStore {
+        pub(crate) writer: &'static crate::locked_state_dir::LockedStateDir,
+        pub(crate) source: SnapshotSource,
+        pub(crate) root: PathBuf,
+        pub(crate) sessions: PathBuf,
+        pub(crate) index_path: PathBuf,
+        pub(crate) namespace: Scope,
+        pub(crate) cache: Arc<SharedCache>,
+        pub(crate) index: ScanIndex,
+        scratch: Option<crate::test_scratch::ScratchDir>,
+    }
+    impl NativeColdStore {
+        pub(crate) fn with_scope(source: SnapshotSource, tag: &str, namespace: Scope) -> Self {
+            let scratch = crate::test_scratch::ScratchDir::new(tag);
+            let mut fixture = Self::open_with_scope(source, scratch.to_path_buf(), namespace);
+            fixture.scratch = Some(scratch);
+            fixture
+        }
+        pub(crate) fn open_with_scope(
+            source: SnapshotSource,
+            root: PathBuf,
+            namespace: Scope,
+        ) -> Self {
+            let sessions = root.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let writer = test_locks::hold(&root);
+            let index_path = root.join("index.json");
+            let index = if index_path.exists() {
+                ScanIndex::load(&index_path).unwrap()
+            } else {
+                ScanIndex::default()
+            };
+            Self {
+                writer,
+                source,
+                root,
+                sessions,
+                index_path,
+                namespace,
+                cache: Arc::new(SharedCache::default()),
+                index,
+                scratch: None,
+            }
+        }
+        pub(crate) fn restart(&mut self) {
+            self.cache = Arc::new(SharedCache::default());
+            self.index = ScanIndex::load(&self.index_path).unwrap();
+        }
+        pub(crate) fn path(&self, session: &str) -> PathBuf {
+            self.sessions.join(format!("{session}.jsonl"))
+        }
+        pub(crate) fn key(&self, session: &str) -> String {
+            local_index_key(&self.path(session))
+        }
+        pub(crate) fn digest(&self, session: &str) -> store::Digest32 {
+            store::key_digest(
+                durable_tail::durable_source(self.source).unwrap(),
+                &self.key(session),
+            )
+        }
+        pub(crate) fn store_dir(&self) -> PathBuf {
+            store::store_dir_for_index(&self.index_path)
+        }
+    }
+
+    pub(crate) fn jsonl(lines: impl IntoIterator<Item = serde_json::Value>) -> String {
+        lines
+            .into_iter()
+            .map(|line| line.to_string() + "\n")
+            .collect()
+    }
+    pub(crate) fn save(index_path: &Path, index: &mut ScanIndex) {
+        index.save(index_path).unwrap();
+    }
+
+    pub(crate) fn cache(
+        source: SnapshotSource,
+        index: &Path,
+        namespace: &Scope,
+        capture: bool,
+    ) -> SharedCache {
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, index, namespace, capture);
+        cache
+    }
+    pub(crate) fn store(index: &Path, source: DurableSource) -> store::DurableTailStore {
+        store::DurableTailStore::new(store::store_dir_for_index(index), source)
+    }
+    pub(crate) fn acquisition(source: SnapshotSource) -> Option<store::AcquisitionFields> {
+        Some(store::AcquisitionFields {
+            acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(source),
+            protocol: AcquisitionProtocol::Legacy,
+        })
+    }
+    pub(crate) fn pending(
+        source: SnapshotSource,
+        binding: store::Binding,
+        certificate: crate::transcript_acquisition::DurableCertificate,
+        body: Vec<u8>,
+    ) -> store::PendingRecord {
+        store::PendingRecord {
+            acquisition: acquisition(source),
+            binding,
+            certificate,
+            body,
+            allowlist: super::allowlist_digest(source),
+        }
+    }
+
+    /// Advance production scanning only. The pre-step counters match native
+    /// drivers; source-specific finish/save/ACK remains with each caller.
+    pub(crate) fn scan(
+        mut owned: OwnedSourceScan,
+        steps: usize,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize), u64) {
+        for _ in 0..steps {
+            let (modes, bytes) = owned.sampling.as_ref().map_or(((0, 0, 0), 0), |s| {
+                (
+                    (s.full_files, s.tail_files, s.unchanged_files),
+                    s.native_bytes,
+                )
+            });
+            match owned.step(None) {
+                OwnedSourceScanStep::Pending(next) => owned = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => {
+                    return (index, scan, modes, bytes)
+                }
+            }
+        }
+        panic!("native fixture scan did not complete");
+    }
+
+    pub(crate) fn scan_modes(
+        owned: OwnedSourceScan,
+        steps: usize,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        let (index, scan, modes, _) = scan(owned, steps);
+        (index, scan, modes)
+    }
+    pub(crate) fn scan_reads(
+        owned: OwnedSourceScan,
+        steps: usize,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, u64)) {
+        let (index, scan, modes, bytes) = scan(owned, steps);
+        (index, scan, (modes.0, modes.1, bytes))
+    }
+    /// Seal the exact complete bytes through production ReadPlan, retaining
+    /// the caller's open file and resulting position for later growth reads.
+    pub(crate) fn checkpoint(
+        file: &mut std::fs::File,
+        scope: &Scope,
+        now: u64,
+    ) -> crate::transcript_acquisition::Checkpoint {
+        use std::io::Read;
+        let mut plan =
+            crate::transcript_acquisition::ReadPlan::prepare(file, None, scope, None, now).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        plan.observe_complete_records(&bytes).unwrap();
+        plan.commit_after_native_completion(file, scope, now)
+            .unwrap()
+    }
+
+    pub(crate) fn record_path(dir: &Path, key: &store::Digest32) -> PathBuf {
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        dir.join(format!("{hex}.rec"))
+    }
+
+    pub(crate) fn native_header(
+        source: DurableSource,
+        binding: store::Binding,
+        certificate: crate::transcript_acquisition::DurableCertificate,
+        revision: u64,
+        generation: u64,
+        body_len: usize,
+    ) -> store::PreparedHeader {
+        store::PreparedHeader {
+            binding,
+            certificate,
+            format: store::FORMAT_V3,
+            allowlist: source.properties().allowlist(),
+            acquisition: store::AcquisitionFields {
+                acquired_revision: revision,
+                protocol: AcquisitionProtocol::WriteAhead,
+            },
+            generation,
+            body_len,
+        }
+    }
+
+    pub(in crate::snapshots) fn parser(
+        source: SnapshotSource,
+        path: &Path,
+        file: std::fs::File,
+        apply: fn(&serde_json::Value, &mut SnapshotAccumulator),
+    ) -> OwnedJsonlParser {
+        OwnedJsonlParser::new(file, path, source, apply, None, None, None, false, true).unwrap()
+    }
+    pub(in crate::snapshots) fn finish_record(
+        parser: &mut OwnedJsonlParser,
+        scope: &Scope,
+        now: u64,
+    ) -> (
+        crate::snapshots::sampled_jsonl::CachedJsonlReduction,
+        crate::transcript_acquisition::Checkpoint,
+    ) {
+        while !parser.step().unwrap() {}
+        let reduction = parser.durable_test_reduction_copy();
+        let checkpoint = match parser.certify_without_retention(scope, now).unwrap() {
+            crate::snapshots::sampled_jsonl::SideCertificate::Certified { completed, .. } => {
+                completed.checkpoint
+            }
+            _ => panic!("a clean native fixture is certified"),
+        };
+        (reduction, checkpoint)
+    }
+
+    /// Reset existing counterfactual-route records without manufacturing a
+    /// receipt or changing their per-route save/ACK order.
+    pub(crate) fn restore_records(
+        index: &Path,
+        records: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        let dir = store::store_dir_for_index(index);
+        for (path, bytes) in records {
+            let target = dir.join(path.file_name().unwrap());
+            if fs::read(&target).unwrap() != *bytes {
+                fs::write(target, bytes).unwrap();
+            }
+        }
+    }
+
+    /// Real v3 streaming; no receipt is synthesized and flush stays explicit.
+    pub(crate) fn commit(
+        disk: &mut store::DurableTailStore,
+        writer: &dyn store::SingleWriter,
+        header: store::PreparedHeader,
+        body: &[u8],
+    ) -> store::ReceiptProof {
+        let prepared = disk
+            .prepare_stream(writer, header)
+            .unwrap()
+            .write(|out| {
+                out.write_all(body)
+                    .map_err(|_| crate::durable_tail_codec::Refuse::WriteFailed)?;
+                Ok(body.len())
+            })
+            .unwrap();
+        let committed = disk
+            .commit_stream(writer, prepared)
+            .unwrap()
+            .commit()
+            .unwrap();
+        disk.finish_stream(committed).unwrap()
+    }
 }

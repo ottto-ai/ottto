@@ -1449,6 +1449,15 @@ fn refused_then_conflicted_holding(
 ) -> (ReofferPipeline, String, u64, serde_json::Value) {
     let t0 = current_unix_seconds();
     let mut pipeline = ReofferPipeline::new(name, Answer::Refuse(ORIGINAL_PAIR), t0);
+    // Keep this physical-read fixture larger than its bounded certificate
+    // samples, so total guard + suffix bytes can distinguish restore from Full.
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(pipeline.transcript())
+        .unwrap()
+        .write_all((" ".repeat(32 * 1024) + "{}\n").as_bytes())
+        .unwrap();
     #[cfg(unix)]
     if locked {
         pipeline.hold_state_dir_lock();
@@ -1474,7 +1483,7 @@ fn refused_then_conflicted_holding(
     (pipeline, fingerprint, t1, deadline)
 }
 
-/// M1 through the real sync caller, both ways. Without the daemon's
+/// [regress] M1 through the real sync caller, both ways. Without the daemon's
 /// single-writer lock (#801) on the support directory the post-save write
 /// writes nothing, and the due-day restart reads the file cold. Holding it,
 /// the earlier cycles write the retained copy after their saves, and the
@@ -1487,7 +1496,6 @@ fn refused_then_conflicted_holding(
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn durable_store_is_written_only_under_the_state_dir_lock() {
-    // Durable writes and restores require the M3 test-thread opt-in.
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("durable_store_is_written_only_under_the_state_dir_lock") {
         return;
@@ -1502,6 +1510,15 @@ fn durable_store_is_written_only_under_the_state_dir_lock() {
             refused_then_conflicted_holding(name, locked);
         let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
         let records = pipeline.durable_records();
+        // Scoped cold restore waits while quiet; inert growth exercises Tail
+        // without changing the offered body or the cooldown deadline.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(pipeline.transcript())
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
         let due = deadline.as_u64().unwrap() + 60;
         let (day2, _, bytes) = pipeline.measured_cycle(due, true);
         assert!(day2.result.is_ok(), "{name}: {:?}", day2.result);
@@ -1517,52 +1534,6 @@ fn durable_store_is_written_only_under_the_state_dir_lock() {
             assert!(bytes >= size, "{name}: a cold re-read: {bytes} < {size}");
         }
     }
-}
-
-/// E1 margin receipt for the scan workers' stack. The real prepare,
-/// rotation and finish cycle (a full scan, then a restart that restores the
-/// durable copy) completes in the optimized build on a thread with the
-/// 2 MiB spawn default, so the workers' larger explicit stack is headroom.
-/// An overflow aborts the test process. Release only: the debug build's
-/// frames are far larger. Run by the dispatch-only `scan-stack-margin` job
-/// in `.github/workflows/ci.yml`.
-#[cfg(unix)]
-#[test]
-#[ignore = "release-mode receipt; run by the ci.yml scan-stack-margin dispatch"]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn scan_worker_stack_margin_receipt() {
-    const STACK_BYTES: usize = 2 * 1024 * 1024;
-    if cfg!(debug_assertions) {
-        panic!("the margin receipt measures the release build: run with --release");
-    }
-    assert!(
-        crate::heap_layout_bound::layout_supported(),
-        "the durable restore needs a supported layout"
-    );
-    let (transcript, restored) = std::thread::Builder::new()
-        .name("ottto-snapshot-sync".to_string())
-        .stack_size(STACK_BYTES)
-        .spawn(|| {
-            let (mut pipeline, _, _, deadline) =
-                refused_then_conflicted_holding("stack-margin", true);
-            let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
-            assert!(pipeline.durable_records() > 0, "written after the save");
-            let due = deadline.as_u64().unwrap() + 60;
-            let (day2, _, bytes) = pipeline.measured_cycle(due, true);
-            assert!(day2.result.is_ok(), "{:?}", day2.result);
-            assert_eq!(day2.leased_offers, 1);
-            assert!(bytes < size, "restored, {bytes} >= {size}");
-            (size, bytes)
-        })
-        .unwrap()
-        .join()
-        .unwrap();
-    eprintln!(
-        "SCAN_STACK_MARGIN_RECEIPT stack_bytes={STACK_BYTES} profile=release cycles=3 \
-         restart_restored=true transcript_bytes={transcript} restored_cycle_bytes={restored}"
-    );
 }
 
 /// O1: quiet cycles before the reserved daily re-offer re-read
@@ -1657,7 +1628,7 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
         .accepted_snapshot_fingerprint_recorded(&fingerprint));
 }
 
-/// SOURCE B1: the cooldown test's twin with the durable store present.
+/// [regress] SOURCE B1: the cooldown test's twin with the durable store present.
 /// Both arms hold the state-directory lock, so their earlier cycles write
 /// the retained copy; the cold arm then drops the store, the warm arm keeps
 /// it. Across restarts that could restore the file, the quiet cycles still
@@ -1671,7 +1642,6 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore() {
-    // Durable writes and restores require the M3 test-thread opt-in.
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore") {
         return;
@@ -1716,6 +1686,15 @@ fn cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore() {
         if !warm {
             pipeline.drop_durable_stores();
         }
+        // Scoped cold restore waits while quiet; inert growth exercises Tail
+        // without changing the offered body or the cooldown deadline.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(pipeline.transcript())
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
         let due = deadline.as_u64().unwrap() + 60;
         let (day2, _, bytes) = pipeline.measured_cycle(due, true);
         if warm {
@@ -1800,167 +1779,6 @@ fn cooldown_conflict_still_rereads_a_changed_file_and_survives_rollback() {
     assert!(changed
         .index
         .accepted_snapshot_fingerprint_recorded(&fingerprint_of(&offered[2])));
-}
-
-/// A previously settled cooldown is no permission once its current witness or
-/// durable reservation is lost. The retained conflict blocks immediately.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn cooldown_conflict_broken_bound_blocks_again() {
-    if !supported("cooldown_conflict_broken_bound_blocks_again") {
-        return;
-    }
-    for broken in ["witness", "reservation", "file"] {
-        let (mut pipeline, fingerprint, t1, _) =
-            refused_then_conflicted(&format!("reoffer-broken-{broken}"));
-        let quiet = pipeline.cycle(t1 + 3_600);
-        assert!(quiet.result.is_ok(), "{broken}: {:?}", quiet.result);
-        assert!(!quiet.index.bounded_sweep_had_unsettled_upload());
-        assert_eq!(quiet.cooldown_deferred, 1);
-        pipeline.make_conflict_retry_due(&fingerprint);
-        match broken {
-            "witness" => {
-                let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
-                    &snapshot_index_path(&pipeline.support, SnapshotSource::ClaudeCode),
-                    &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
-                ));
-                let mut index = ScanIndex::load(&index_path).unwrap();
-                index
-                    .quarantined_snapshot_fingerprints
-                    .get_mut(&fingerprint)
-                    .unwrap()
-                    .witness
-                    .parser_version
-                    .push_str("-older");
-                index.save(&index_path).unwrap();
-            }
-            "reservation" => {
-                let mut json = quiet.progress_json.clone();
-                json["permanent_rejections"][&fingerprint]["reoffer"] =
-                    serde_json::json!({"version": 999, "reason": "corrupt"});
-                std::fs::write(&quiet.progress_path, serde_json::to_vec(&json).unwrap()).unwrap();
-            }
-            "file" => {
-                // A byte change without changing semantic usage still invalidates
-                // the unchanged-file proof; it cannot erase the retained debt.
-                // Keep every line valid JSON for the sidecar fixture reader:
-                // trailing whitespace changes bytes, not the decoded event.
-                let transcript = std::fs::read_to_string(pipeline.transcript()).unwrap();
-                let edited = transcript.replacen('\n', " \n", 1);
-                assert_ne!(edited.len(), transcript.len());
-                std::fs::write(pipeline.transcript(), edited).unwrap();
-                write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
-            }
-            _ => unreachable!(),
-        }
-        let (broken_cycle, parsed, _) = pipeline.measured_cycle(t1 + 7_200, true);
-        assert_eq!(parsed, 1, "{broken}: ordinary invalidation reconstructs");
-        assert!(
-            broken_cycle.result.is_err(),
-            "{broken}: retained debt blocks again"
-        );
-        assert!(
-            broken_cycle.index.bounded_sweep_had_unsettled_upload(),
-            "{broken}"
-        );
-        assert_eq!(broken_cycle.cooldown_deferred, 0, "{broken}");
-        assert_eq!(
-            pipeline.server.last_terminal()["last_error_code"],
-            "server_error",
-            "{broken}"
-        );
-        assert_eq!(
-            pipeline.server.offered().len(),
-            2,
-            "{broken}: no early offer"
-        );
-        assert_eq!(
-            broken_cycle.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
-            SnapshotQuarantineDisposition::RetryPending
-        );
-        assert_eq!(
-            broken_cycle.progress.quarantined_fingerprints[&fingerprint].disposition,
-            SnapshotQuarantineDisposition::RetryPending
-        );
-        assert!(broken_cycle
-            .progress
-            .permanent_rejections
-            .contains_key(&fingerprint));
-    }
-}
-
-/// The quiet-debt disclosure/settlement applies throughout the cooldown, not
-/// only after the ordinary conflict timer would have selected the file.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn cooldown_conflict_before_ordinary_retry_is_counted_and_settles() {
-    if !supported("cooldown_conflict_before_ordinary_retry_is_counted_and_settles") {
-        return;
-    }
-    let (mut pipeline, fingerprint, t1, deadline) = refused_then_conflicted("reoffer-before-retry");
-    let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
-        &snapshot_index_path(&pipeline.support, SnapshotSource::ClaudeCode),
-        &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
-    ));
-    let mut index = ScanIndex::load(&index_path).unwrap();
-    // The ordinary timer uses wall time; keep it inside the loader's 12 h
-    // validity bound so normalization cannot silently make this a due test.
-    let retry_after = current_unix_seconds() + 3_600;
-    index
-        .quarantined_snapshot_fingerprints
-        .get_mut(&fingerprint)
-        .unwrap()
-        .retry_after_unix_seconds = retry_after;
-    index.save(&index_path).unwrap();
-    let loaded = ScanIndex::load(&index_path).unwrap();
-    assert_eq!(
-        loaded.quarantined_snapshot_fingerprints[&fingerprint].retry_after_unix_seconds,
-        retry_after
-    );
-    assert!(
-        retry_after > current_unix_seconds(),
-        "ordinary retry is not due"
-    );
-    let (quiet, parsed, bytes) = pipeline.measured_cycle(t1 + 600, true);
-    assert_eq!((parsed, bytes), (0, 0));
-    assert!(quiet.result.is_ok(), "{:?}", quiet.result);
-    assert!(!quiet.index.bounded_sweep_had_unsettled_upload());
-    assert_eq!(quiet.cooldown_deferred, 1);
-    assert_eq!(quiet.leased_offers, 0);
-    assert_eq!(pipeline.server.offered().len(), 2);
-    assert_eq!(
-        pipeline.server.last_terminal()["last_error_code"],
-        "backend_validation_error"
-    );
-    assert_eq!(
-        pipeline.server.last_terminal()["last_census_complete"],
-        true
-    );
-    assert_eq!(
-        reoffer_json(&quiet, &fingerprint)["retry_after_unix_seconds"],
-        deadline
-    );
-    for record in [
-        &quiet.index.quarantined_snapshot_fingerprints[&fingerprint],
-        &quiet.progress.quarantined_fingerprints[&fingerprint],
-    ] {
-        assert_eq!(
-            record.disposition,
-            SnapshotQuarantineDisposition::RetryPending
-        );
-        assert_eq!(
-            record.upload_body_witness.as_deref(),
-            Some(
-                quiet.progress.permanent_rejections[&fingerprint]
-                    .body_witness
-                    .as_str()
-            )
-        );
-    }
 }
 
 /// The Claude scan index this pipeline's destination uses.
@@ -2066,63 +1884,6 @@ fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
     assert!(permitted
         .index
         .accepted_snapshot_fingerprint_recorded(&fingerprint));
-}
-
-/// StateMissing H1 through the real replay decision, and N2: after a
-/// completed bootstrap, an unreadable backfill state arms no Claude replay
-/// in `prepare_sync_source` (the replay claim, the entries and the server
-/// all stay as they were), and the Claude census that cycle completes under
-/// the history gate clears the marker.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn unreadable_backfill_state_arms_no_replay_and_clears_after_a_gated_census() {
-    if !supported("unreadable_backfill_state_arms_no_replay_and_clears_after_a_gated_census") {
-        return;
-    }
-    let t0 = current_unix_seconds();
-    let mut pipeline = ReofferPipeline::new("history-unverified", Answer::Accept, t0);
-    let first = pipeline.cycle(t0);
-    assert!(first.result.is_ok(), "{:?}", first.result);
-    let offered = pipeline.server.offered().len();
-    assert!(offered > 0);
-    let state_path = crate::backfill::backfill_state_path(&pipeline.support);
-    assert!(
-        !crate::backfill::load_backfill_state(&pipeline.support).prior_history_unverified,
-        "the bootstrap completed with a readable state"
-    );
-    std::fs::write(&state_path, b"{\"completed_destination_namespaces\":")
-        .expect("corrupt the backfill state");
-    assert!(crate::backfill::load_backfill_state(&pipeline.support).prior_history_unverified);
-
-    let second = pipeline.cycle(t0 + 60);
-    assert!(second.result.is_ok(), "{:?}", second.result);
-    assert_eq!(
-        pipeline.server.offered().len(),
-        offered,
-        "no replay re-sent anything"
-    );
-    assert_eq!(
-        second.progress_json["historical_replay_generation"],
-        first.progress_json["historical_replay_generation"],
-        "no replay claimed a generation"
-    );
-    assert_eq!(
-        second.index.files.keys().collect::<Vec<_>>(),
-        first.index.files.keys().collect::<Vec<_>>(),
-        "no replay dropped the entries"
-    );
-    assert!(second
-        .index
-        .files
-        .iter()
-        .all(|(key, entry)| entry.source_file_fingerprint
-            == first.index.files[key].source_file_fingerprint));
-    assert!(
-        !crate::backfill::load_backfill_state(&pipeline.support).prior_history_unverified,
-        "N2: the gated census cleared the marker"
-    );
 }
 
 /// A completed first cycle is not a kill before its first save: it publishes

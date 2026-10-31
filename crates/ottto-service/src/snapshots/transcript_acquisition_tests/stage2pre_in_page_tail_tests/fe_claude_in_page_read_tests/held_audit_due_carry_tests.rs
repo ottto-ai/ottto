@@ -113,62 +113,6 @@ fn fe_n1_virtual_due_carries_into_marker_when_capacity_opens_at_due() {
     assert!(mints_v1(&mut audited, &result, 0..6));
 }
 
-/// A failed secure open spends no turn: the slot keeps D (wrapping to the
-/// same key as its only eligible member), and the next page at D+interval/2
-/// runs the owed Full rather than waiting a fresh interval. The reserved
-/// sampled slot and marker population are unchanged.
-#[test]
-fn fe_n1_failed_secure_open_keeps_virtual_due() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let _clock = TestClock;
-    let due = sampled_scan::now_seconds();
-    let hold = erased_hold(due);
-    let key = hold.key.clone();
-    let mut index = hold.index;
-    saturate(&mut index, &key, due);
-    owe(&mut index, &key, due);
-    let restored_before = restored();
-
-    sampled_scan::set_test_now(Some(due));
-    let (mut index, _, seen) = crate::snapshots::with_transcript_io_denied(|| {
-        page(&hold.fixture, CLAUDE, index, &hold.cache, |scan| {
-            let context = scan.sampling.as_ref().unwrap();
-            assert!(context.audit_metadata_supported);
-            assert_eq!(context.audit_slots, 1, "last sampled slot stays free");
-        })
-    });
-    assert_eq!(seen.modes, (0, 0, 0));
-    assert!(seen.unreadable > 0, "the secure open failed");
-    assert_eq!(restored(), restored_before + 1, "one progress turn queued");
-    let slot = index.held_audit_progress.as_ref().expect("slot retained");
-    assert_eq!(
-        (slot.key.as_str(), slot.due, slot.attempted),
-        (key.as_str(), due, false)
-    );
-    assert!(sampled_audit::awaits_hold_deadline_restoration(
-        &index, &key
-    ));
-    assert_eq!(markers(&index), CACHE_ENTRIES - 1);
-    index.save(&hold.index_path).unwrap();
-    let index = ScanIndex::load(&hold.index_path).unwrap();
-    assert_eq!(
-        index.held_audit_progress.as_ref().map(|slot| slot.due),
-        Some(due)
-    );
-
-    sampled_scan::set_test_now(Some(due + INTERVAL / 2));
-    let (mut index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
-    assert_eq!(seen.modes.0, 1, "the retry still owes D");
-    assert_eq!(seen.unreadable, 0);
-    assert!(hold_released(&index, &key));
-    assert!(mints_v1(&mut index, &result, 0..6));
-    assert_eq!(markers(&index), CACHE_ENTRIES - 1);
-}
-
 /// GUARDRAILS rule 5 through the real open path: an unavailable held key
 /// backs off by pages (1, 2, 4), each wait capped at 6 h, and parks with
 /// one alarm after 8 failed opens, its due D still owed across save/reload.

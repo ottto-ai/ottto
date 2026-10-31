@@ -1,3 +1,7 @@
+// Containment migration: native walk exhaustion never grants completion.
+// Quiet-after-context-change controls below additionally require paired #901
+// (source-wide mismatch AND no matching receipt, Lead B B1). Money totals,
+// exact ACKs, refusal, account holds and correction ownership are not relaxed.
 // Executed-shape regression for Claude census convergence. A bounded Claude
 // traversal runs page by page through the post-scan stages and the settlement
 // helpers that `finish_sync_source` uses, with an in-process upload in place
@@ -47,6 +51,7 @@ struct PipelineCycle<'a> {
 }
 
 struct PipelinePage {
+    parsed: BTreeSet<String>,
     scan: crate::snapshots::SourceScanResult,
     /// The index reloaded from disk after the page's durable save.
     index: ScanIndex,
@@ -61,6 +66,7 @@ struct PipelinePage {
 }
 
 struct PipelineFixture {
+    cache: crate::snapshots::sampled_scan::SharedCache,
     base: PathBuf,
     root: PathBuf,
     support: PathBuf,
@@ -70,7 +76,38 @@ struct PipelineFixture {
 }
 
 impl PipelineFixture {
+    fn terminal_off_on_new(name: &str) -> Self {
+        let base = test_dir(name);
+        let root = base.join("projects");
+        let support = base.join("support");
+        std::fs::create_dir_all(&root).expect("create synthetic Claude root");
+        std::fs::create_dir_all(&support).expect("create empty support directory");
+        for (number, session) in PIPELINE_SESSIONS.iter().enumerate() {
+            std::fs::write(
+                root.join(format!("{session}.jsonl")),
+                pipeline_transcript_line(session, &format!("req_{number}_1"), 0),
+            )
+            .expect("write synthetic Claude transcript");
+        }
+        let fixture = Self {
+            cache: Default::default(),
+            index_path: base.join("claude-scan-index.json"),
+            page_files: PIPELINE_PAGE_FILES,
+            durable_progress: false,
+            base,
+            root,
+            support,
+        };
+        let mut current = ScanIndex::default();
+        current.initialize_current_claude_contract_for_test();
+        current.save(&fixture.index_path).unwrap();
+        fixture
+    }
+
     fn new(name: &str) -> Self {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return Self::terminal_off_on_new(name);
+        }
         let base = test_dir(name);
         let root = base.join("projects");
         let support = base.join("support");
@@ -84,6 +121,7 @@ impl PipelineFixture {
             .expect("write synthetic Claude transcript");
         }
         Self {
+            cache: Default::default(),
             index_path: base.join("claude-scan-index.json"),
             page_files: PIPELINE_PAGE_FILES,
             durable_progress: false,
@@ -147,7 +185,7 @@ impl PipelineFixture {
         })
     }
 
-    fn page_with_reoffers_born(
+    fn terminal_off_on_page_with_reoffers_born(
         &self,
         collected_at: &str,
         cycle: &PipelineCycle<'_>,
@@ -156,6 +194,328 @@ impl PipelineFixture {
         reoffers: bool,
     ) -> PipelinePage {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.cache.bind_withheld(&mut index);
+        index.activate_upload_context(cycle.upload_context.to_string());
+        if cycle.historical_replay {
+            index.prepare_historical_replay(cycle.replay_generation.to_string());
+        }
+        index.activate_effective_upload_body_witness_revision(
+            effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
+        );
+        let progress_path = self.base.join("upload-progress.json");
+        let mut progress = if self.durable_progress {
+            SnapshotUploadProgress::load(
+                &progress_path,
+                &format!("{:064x}", 99),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .expect("load durable synthetic upload progress")
+        } else {
+            test_upload_progress()
+        };
+        activate_source_upload_context(
+            SnapshotSource::ClaudeCode,
+            cycle.upload_context.to_string(),
+            &mut index,
+            &mut progress,
+        );
+        let committed_index = index.clone();
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&self.root),
+            &mut index,
+            collected_at,
+            183,
+            self.page_files,
+            true,
+        )
+        .expect("scan bounded Claude page");
+        let parsed = scan
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone())
+            .collect();
+        let (mut disposition, census_withheld, _) =
+            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
+        if let Some(owner_session) = cycle.proven_owner_session {
+            for item in scan
+                .snapshots
+                .iter_mut()
+                .filter(|item| item.source_session_id == owner_session)
+            {
+                for row in item.model_usage.iter_mut().chain(
+                    item.usage_buckets
+                        .iter_mut()
+                        .flat_map(|bucket| bucket.model_usage.iter_mut()),
+                ) {
+                    row.account_identifier_hash = Some("a".repeat(64));
+                }
+            }
+        }
+        let deferred_accounts = index.bind_session_accounts_with_mixed(
+            SnapshotSource::ClaudeCode,
+            PIPELINE_MACHINE_ID,
+            &mut scan.snapshots,
+            &[],
+            &disposition.mixed_uploads,
+        );
+        disposition.defer_sessions(deferred_accounts);
+        apply_upload_policy(
+            SnapshotSource::ClaudeCode,
+            &mut scan.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::ClaudeCode,
+            &mut scan,
+            &mut index,
+            |snapshot| {
+                effective_snapshot_upload_body_witness(
+                    snapshot,
+                    &progress,
+                    false,
+                    false,
+                    &BTreeSet::new(),
+                    &disposition,
+                )
+            },
+        );
+        before_classify(&mut index);
+        if reoffers {
+            // Inject due, exact server refusals after the real policy/body
+            // finalization. Even a lease for the held revision must pass the
+            // production authority gates below.
+            for item in &scan.snapshots {
+                progress.quarantine_permanent_body(
+                    &item.snapshot_fingerprint,
+                    &snapshot_upload_body_witness(item),
+                    reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
+                );
+                progress
+                    .permanent_rejections
+                    .get_mut(&item.snapshot_fingerprint)
+                    .unwrap()
+                    .reoffer = Some(reason_reoffer::RefusalReoffer::OriginalPair {
+                    retry_after_unix_seconds: 0,
+                });
+                index.quarantined_snapshot_fingerprints.insert(
+                    item.snapshot_fingerprint.clone(),
+                    progress.quarantined_fingerprints[&item.snapshot_fingerprint].clone(),
+                );
+            }
+            let now = OffsetDateTime::parse(collected_at, &Rfc3339)
+                .unwrap()
+                .unix_timestamp() as u64;
+            let scope = reason_reoffer::Scope {
+                index: &index,
+                now,
+                window_start_unix_seconds: now - 183 * 86_400,
+            };
+            progress.prepare_quarantine_and_reason_retries(
+                &index.quarantined_snapshot_fingerprints,
+                Some(&scope),
+            );
+            assert_eq!(
+                progress.reason_reoffer_counts.selected,
+                scan.snapshots.len()
+            );
+            progress
+                .save(&progress_path)
+                .expect("save lease before synthetic upload");
+        }
+        let holds = LocalHoldSettlement::classify(
+            SnapshotSource::ClaudeCode,
+            &mut index,
+            &mut scan,
+            &disposition,
+        );
+        if reoffers {
+            progress
+                .extend_reason_reoffers_before_upload(&scan.snapshots, &holds.held_fingerprints);
+            progress
+                .save(&progress_path)
+                .expect("save pre-send cooldown");
+        }
+        let leased_reoffers = progress.active_reason_reoffers.clone();
+        let mut uploaded = BTreeSet::new();
+        let mut accepted = 0;
+        progress.prepare_context_receipt_candidates(&index, &committed_index, &scan.snapshots);
+        let result = upload_resumable_batches_with_body_witness(
+            &scan.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |snapshot| snapshot.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
+                if let PipelineUpload::EntityAckRejected { session, reason } = upload {
+                    let mut response = accepted_batch(0);
+                    response.entity_ack_contract =
+                        Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string());
+                    for item in items {
+                        if item.source_session_id == session {
+                            response.rejected_entities.push(
+                                crate::snapshot_client::SnapshotEntityRejection {
+                                    source_session_id: item.source_session_id.clone(),
+                                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                                    reason: reason.to_string(),
+                                    detail: "synthetic permanent refusal".to_string(),
+                                    permanent: true,
+                                    occurrence_count: 1,
+                                },
+                            );
+                        } else {
+                            let accepted = exact_pipeline_accept(std::slice::from_ref(&item))?;
+                            response
+                                .accepted_entities
+                                .extend(accepted.accepted_entities);
+                            response.accepted += 1;
+                        }
+                    }
+                    Ok(response)
+                } else {
+                    exact_pipeline_accept(&items)
+                }
+            },
+            |checkpoint| {
+                if self.durable_progress {
+                    checkpoint.save(&progress_path)?;
+                }
+                Ok(())
+            },
+        )
+        .expect("in-process upload");
+        if reoffers {
+            progress.finish_reason_reoffers(
+                &leased_reoffers,
+                false,
+                SnapshotSource::ClaudeCode.api_slug(),
+            );
+        }
+        if !matches!(upload, PipelineUpload::EntityAckRejected { .. }) {
+            assert_eq!(result, ResumableUploadResult::Completed);
+        }
+        // Completed/restorable holds are the sole changed production route.
+        // Keep all existing field/ACK/debt/restart assertions below, and compare
+        // the full state at that boundary with the borrowed reference surface.
+        // Both whole-index arms may remember replay witnesses during restore.
+        let borrowed_reference = (matches!(
+            &upload,
+            PipelineUpload::Accept
+                | PipelineUpload::ServerRejected
+                | PipelineUpload::EntityAckRejected { .. }
+        ) && holds.held_entity_count > 0
+            && !holds.progress_blocking
+            && index.locally_held_keys_restorable(
+                &committed_index,
+                &holds.held_fingerprints,
+                &holds.account_deferred_fingerprints,
+            ))
+        .then(|| {
+            serde_json::to_vec(&index.with_locally_held_keys_reverted(
+                &committed_index,
+                &holds.held_fingerprints,
+                &holds.account_deferred_fingerprints,
+            ))
+            .unwrap()
+        });
+        let settlement = match upload {
+            PipelineUpload::Accept => {
+                settle_completed_upload(index, &committed_index, &progress, &holds)
+            }
+            PipelineUpload::ServerDeferred => {
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
+            }
+            PipelineUpload::ServerRejected => {
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
+            }
+            PipelineUpload::EntityAckRejected { .. } => match &result {
+                ResumableUploadResult::Rejected { .. } => {
+                    settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
+                }
+                ResumableUploadResult::Completed => {
+                    settle_completed_upload(index, &committed_index, &progress, &holds)
+                }
+                other => panic!("unexpected entity-ACK outcome: {other:?}"),
+            },
+        };
+        if let Some(reference) = borrowed_reference {
+            assert_eq!(
+                serde_json::to_vec(&settlement.index).unwrap(),
+                reference,
+                "{upload:?}: restorable holds settle through the owned Completed restore path"
+            );
+        }
+        let mut index = settlement.index;
+        settle_index_after_upload(&mut index, &committed_index, &progress);
+        let fully_settled = settle_upload_corrections_after_selection(
+            &mut index,
+            &scan,
+            &committed_index,
+            &progress,
+            &[],
+            &[],
+            settlement.fully_settled,
+            &mut Default::default(),
+        );
+        let census_complete = scan.census_complete;
+        settle_context_curve_replay_state(
+            &mut index,
+            true,
+            census_complete && fully_settled,
+            cycle.replay_generation,
+        );
+        index.accept_file_upload_context_acks(
+            &progress.context_receipt_candidates,
+            &progress.fresh_context_body_acks,
+        );
+        let (window_start, window_end) =
+            snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");
+        save_index_and_publish_manifest(
+            &mut index,
+            &self.index_path,
+            PIPELINE_DESTINATION,
+            SnapshotSource::ClaudeCode,
+            census_complete,
+            &window_start,
+            &window_end,
+        )
+        .expect("save index and publish manifest");
+        PipelinePage {
+            parsed,
+            scan,
+            index: ScanIndex::load(&self.index_path).expect("reload scan index"),
+            fully_settled,
+            backfill_succeeded: census_complete && !census_withheld && fully_settled,
+            held: holds.held_fingerprints,
+            progress_blocking: holds.progress_blocking,
+            uploaded,
+            result,
+            progress,
+        }
+    }
+
+    fn page_with_reoffers_born(
+        &self,
+        collected_at: &str,
+        cycle: &PipelineCycle<'_>,
+        upload: PipelineUpload,
+        before_classify: impl FnOnce(&mut ScanIndex),
+        reoffers: bool,
+    ) -> PipelinePage {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return self.terminal_off_on_page_with_reoffers_born(
+                collected_at,
+                cycle,
+                upload,
+                before_classify,
+                reoffers,
+            );
+        }
+        let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.cache.bind_withheld(&mut index);
         index.activate_upload_context(cycle.upload_context.to_string());
         if cycle.historical_replay {
             index.prepare_historical_replay(cycle.replay_generation.to_string());
@@ -406,6 +766,7 @@ impl PipelineFixture {
             &[],
             &[],
             settlement.fully_settled,
+            &mut Default::default(),
         );
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
@@ -427,6 +788,7 @@ impl PipelineFixture {
         )
         .expect("save index and publish manifest");
         PipelinePage {
+            parsed: BTreeSet::new(),
             scan,
             index: ScanIndex::load(&self.index_path).expect("reload scan index"),
             fully_settled,
@@ -439,8 +801,37 @@ impl PipelineFixture {
         }
     }
 
+    /// A finite service round covers actual synthetic paths, never proof.
+    fn terminal_off_on_traversal(&self, hour: u32, cycle: &PipelineCycle<'_>) -> Vec<PipelinePage> {
+        let mut pages: Vec<PipelinePage> = Vec::new();
+        for number in 0..PIPELINE_MAX_PAGES {
+            let upload = if number == 0 {
+                cycle.first_page_upload
+            } else {
+                PipelineUpload::Accept
+            };
+            let page = self.page(
+                &format!("2026-08-02T{hour:02}:{number:02}:00Z"),
+                cycle,
+                upload,
+            );
+            // Native walk exhaustion is scheduling, never terminal authority.
+            let complete = page.scan.census_complete
+                || page.index.scan_traversal_exhausted_for_test()
+                || page.parsed.contains(PIPELINE_SESSIONS[2]);
+            pages.push(page);
+            if complete {
+                break;
+            }
+        }
+        pages
+    }
+
     /// Pages of one traversal, until its census completes or the page bound.
     fn traversal(&self, hour: u32, cycle: &PipelineCycle<'_>) -> Vec<PipelinePage> {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return self.terminal_off_on_traversal(hour, cycle);
+        }
         let mut pages: Vec<PipelinePage> = Vec::new();
         for number in 0..PIPELINE_MAX_PAGES {
             let upload = if number == 0 {
@@ -462,8 +853,31 @@ impl PipelineFixture {
         pages
     }
 
+    fn terminal_off_on_baseline(&self) -> ScanIndex {
+        let pages = self.traversal(
+            8,
+            &PipelineCycle {
+                upload_context: "upload-context-1",
+                replay_generation: "replay-generation-1",
+                proven_owner_session: Some(PIPELINE_HELD_SESSION),
+                first_page_upload: PipelineUpload::Accept,
+                historical_replay: false,
+            },
+        );
+        let last = pages.last().expect("baseline page");
+        assert!(!last.scan.census_complete);
+        assert!(last.fully_settled);
+        assert!(!last.backfill_succeeded);
+        assert!(pages.iter().all(|page| page.held.is_empty()));
+        assert_eq!(last.index.claude_account_deferred_hold_count(), 0);
+        last.index.clone()
+    }
+
     /// The baseline: every session committed and accepted, one owner proven.
     fn baseline(&self) -> ScanIndex {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return self.terminal_off_on_baseline();
+        }
         let pages = self.traversal(
             8,
             &PipelineCycle {
@@ -497,6 +911,7 @@ impl PipelineFixture {
     /// leave them. Returns that revision.
     fn seed_retry_pending_authority(&self, session: &str) -> String {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.cache.bind_withheld(&mut index);
         let revision = index.files[&Self::key(&index, session)]
             .source_file_fingerprint
             .clone();
@@ -557,6 +972,7 @@ impl PipelineFixture {
     /// would leave them. Returns that revision.
     fn seed_terminal_authority(&self, session: &str) -> String {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.cache.bind_withheld(&mut index);
         let revision = index.files[&Self::key(&index, session)]
             .source_file_fingerprint
             .clone();
@@ -592,8 +1008,8 @@ const PIPELINE_HOLD_CYCLE: PipelineCycle<'static> = PipelineCycle {
 /// its accepted revision, activity, and manifest entry; the new body is never
 /// uploaded or accepted; health stays red through a non-terminal ownership
 /// count; backfill and context-curve replay stay pending; and the next
-/// ordinary traversal reparses only the held file instead of every unchanged
-/// file.
+/// ordinary traversal skips unchanged held content; later growth reparses only
+/// that held file instead of every unchanged sibling.
 #[test]
 #[serial(source_manifests)]
 fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
@@ -694,8 +1110,27 @@ fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
     assert!(settled.context_curve_replay_needed(PIPELINE_HOLD_CYCLE.replay_generation));
     assert_eq!(settled.claude_account_deferred_hold_count(), 1);
 
-    // The next ordinary traversal reparses only the held file.
-    let next = fixture.traversal(10, &PIPELINE_HOLD_CYCLE);
+    // R14: the real Completed/save/reload path preserves the content memo.
+    let idle = fixture.traversal(10, &PIPELINE_HOLD_CYCLE);
+    assert_eq!(
+        idle.iter()
+            .map(|page| page.scan.scanned_file_count)
+            .sum::<usize>(),
+        0,
+        "unchanged held content is not parsed again"
+    );
+    assert!(idle.iter().all(|page| page.uploaded.is_empty()));
+    assert_eq!(
+        idle.last()
+            .unwrap()
+            .index
+            .claude_account_deferred_hold_count(),
+        1
+    );
+    assert!(!idle.last().unwrap().fully_settled);
+    // Preserve the one-key reparse assertion, with real growth as its trigger.
+    fixture.append(PIPELINE_HELD_SESSION, "req_0_3");
+    let next = fixture.traversal(11, &PIPELINE_HOLD_CYCLE);
     let next_last = next.last().expect("next traversal page");
     assert!(next_last.scan.census_complete);
     assert_eq!(
@@ -1796,7 +2231,25 @@ fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_gener
     );
 
     let before = terminal_hold_settlement_count();
-    let next = fixture.traversal(10, &PIPELINE_HOLD_CYCLE);
+    let idle = fixture.traversal(10, &PIPELINE_HOLD_CYCLE);
+    assert_eq!(
+        idle.iter()
+            .map(|page| page.scan.scanned_file_count)
+            .sum::<usize>(),
+        0,
+        "reloaded held content skips until evidence or content changes"
+    );
+    assert!(idle.iter().all(|page| page.uploaded.is_empty()));
+    assert_eq!(
+        idle.last()
+            .unwrap()
+            .index
+            .claude_account_deferred_hold_count(),
+        1
+    );
+    assert!(!idle.last().unwrap().fully_settled);
+    fixture.append(PIPELINE_HELD_SESSION, "req_0_3");
+    let next = fixture.traversal(11, &PIPELINE_HOLD_CYCLE);
     let last = next.last().unwrap();
     assert!(last.scan.census_complete);
     assert_eq!(
@@ -1939,11 +2392,10 @@ fn assert_real_rejected_hold(
     if account_hold {
         for page in [&first, &last] {
             assert_eq!(page.index.claude_account_deferred_hold_count(), 1);
-            assert!(
-                page.index.files[&held_key]
-                    .source_file_fingerprint
-                    .is_empty(),
-                "restoration retains the account reparse debt"
+            assert_eq!(
+                page.index.files[&held_key].source_file_fingerprint,
+                baseline.files[&held_key].source_file_fingerprint,
+                "R14: restoration preserves committed identity; memo owns account retry"
             );
             assert!(!page.fully_settled);
             assert!(!page.backfill_succeeded);
@@ -2509,6 +2961,7 @@ impl PipelineFixture {
     /// window that proved it, so the absence tests see it go or stay.
     fn seed_retry_pending_family_pending(&self, session: &str) {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.cache.bind_withheld(&mut index);
         index.insert_claude_usage_family_pending_for_test(session, "2026-08-01T00:00:00Z");
         index.save(&self.index_path).expect("save scan index");
         let index = ScanIndex::load(&self.index_path).expect("reload scan index");
@@ -3778,4 +4231,39 @@ fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause(
     assert!(last
         .index
         .claude_usage_family_pending_retained_for_test(PIPELINE_HELD_SESSION));
+}
+
+/// Receiving-side adapter: ACK only actual offered identities and public body
+/// witnesses, through the same request validator as the HTTP client.
+pub(super) fn exact_pipeline_accept(
+    items: &[SnapshotItem],
+) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+    let references = items.iter().map(|item| {
+        let version = crate::snapshot_client::snapshot_ack_body_witness_version(item)
+            .expect("production public ACK mapping");
+        serde_json::json!({
+            "source_session_id":item.source_session_id,
+            "snapshot_fingerprint":item.snapshot_fingerprint, "occurrence_count":1,
+            "body_witness_version":version,
+            "body_witness_digest":version.map(|_| snapshot_upload_body_witness(item)),
+            "head_etag":item.cache_observations.is_some().then(|| snapshot_upload_body_witness(item)),
+        })
+    }).collect::<Vec<_>>();
+    let response: crate::snapshot_client::SnapshotBatchResponse =
+        serde_json::from_value(serde_json::json!({
+            "accepted":items.len(), "sessions_reconciled":items.len(), "session_ids":[],
+            "disabled":false, "disabled_reason":null,
+            "entity_ack_contract":"snapshot_entity_ack:v1", "accepted_entities":references,
+            "unchanged_entities":[], "rejected_entities":[], "conflict_entities":[],
+        }))?;
+    response.validate_entity_ack(&SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: "claude_code".into(),
+        machine_id: PIPELINE_MACHINE_ID.into(),
+        collector_version: None,
+        snapshots: items.to_vec(),
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    })?;
+    Ok(response)
 }

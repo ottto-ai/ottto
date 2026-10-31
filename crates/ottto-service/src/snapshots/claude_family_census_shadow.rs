@@ -5,8 +5,7 @@
 //! most 64 other roots, whether the family would be complete in the current
 //! window, and emits counts only. The predicate is pure: it never sets a bit
 //! (source `census_complete`, manifest, wire, account window), calls a fold,
-//! retires, loads evidence, schedules or reads. [`FamilyConsumer`] names the
-//! only consumers E7-8b may wire it to; 8a wires none.
+//! retires, loads evidence, schedules or reads. It feeds no decisions.
 //!
 //! Coverage is attestation, not presence (E1 Q-E1-3). A member counts as
 //! covered only when this generation recorded a real attestation of its
@@ -22,15 +21,6 @@
 //! family is `evidence` until ordinary finalization catches up. A subagent's
 //! rows only gain an account from a prior witness or a family proven at a
 //! terminal page, so a fresh multi-member family stays `evidence` mid-walk.
-//!
-//! For 8b's ruling the shadow also measures how many families missing only a
-//! child's finalized revision could have it finalized without a terminal
-//! (`family_child_finalize_eligible`, `family_child_finalize_blocked{cause}`).
-//! It reads only per-member state a page already holds and finalizes nothing.
-//! `session_account_bindings` is out of reach here (its key needs the machine
-//! id), and cross-family state a terminal derives from parsed bodies is not
-//! persisted, so the eligible count is an upper bound. See
-//! [`ChildFinalizeBlocked`].
 //!
 //! Runtime state (rotation cursor, root path counts, attestations, sticky
 //! vetoes, `first_pending_at`) is process-local, bounded and charged in
@@ -75,9 +65,6 @@ const ATTESTATION_FLUSH: usize = 1_024;
 /// Equality Skips one page may attest. Later ones run no decision and count
 /// `attest_capped`; their members stay `presence_only`.
 pub(super) const MAX_EQUALITY_ATTESTS_PER_PAGE: u64 = 4_096;
-/// Entries of each cross-family record one page may read for child-finalize
-/// candidates; past it every candidate counts `cross_family_unknown`.
-pub(super) const MAX_CROSS_FAMILY_ENTRIES: usize = 16_384;
 const OVER_24H_SECONDS: u64 = 24 * 60 * 60;
 
 /// First-match reason an evaluated family is incomplete. The order is the
@@ -133,81 +120,6 @@ pub(super) enum Completion {
     Incomplete(Incomplete),
 }
 
-/// First-match reason a family that lacks only child revisions fails E1's
-/// conditions for finalizing them without a terminal. The order is the match
-/// order (E1's conditions 1 to 4), with what a source-wide veto hides after the
-/// veto, so the causes partition the blocked count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ChildFinalizeBlocked {
-    /// The root member is absent or confirmed empty, so no bound root anchors
-    /// the children.
-    RootAbsent,
-    /// A child has no account evidence: it is outside the pending proof's
-    /// members or request sets, or has no source/entity/body tuple to bind.
-    WitnessMissing,
-    /// A prior family witness names another account than the pending proof.
-    WitnessConflict,
-    /// A member counts `held`, or a decode hold covers the family's account or
-    /// usage records.
-    WitnessHeld,
-    /// The family's usage witness carries a legacy copied prefix, or another
-    /// family's witness names this root as the owner of one.
-    SharedParent,
-    /// A persisted duplicate-request witness names this root.
-    NativeOwnershipConflict,
-    /// The duplicate witness overflowed, or the cross-family records are over
-    /// `MAX_CROSS_FAMILY_ENTRIES`, so neither check above is proven.
-    CrossFamilyUnknown,
-    /// A request-identity contract change is pending.
-    IdentityContractChanged,
-    /// A member path has a twin: the root has more paths than the family, or a
-    /// member name maps to two paths. Terminal co-scheduling resolves these.
-    TwinSet,
-    /// A sticky namespace-loss or unattributed veto.
-    StickyVeto,
-    /// The directory queue has not drained, or the watcher overflowed.
-    EnumerationOpen,
-    /// The uniqueness pass has not finished, so a twin is not ruled out.
-    UniquenessUnknown,
-    /// The pending proof is not this traversal's account window.
-    WindowMoved,
-    /// A member's body was not uploaded under the active context policy.
-    PolicyChanged,
-}
-
-/// A candidate family's verdict for child finalization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChildFinalize {
-    Eligible,
-    Blocked(ChildFinalizeBlocked),
-}
-
-/// The consumers E7-8b may wire a complete verdict to once Lead B and SOURCE
-/// clear them (Q-LB-3, Q-SOURCE-2). Anything not named here, including the
-/// source census bit and the existing account/usage folds, never consumes a
-/// family verdict. Unused in 8a.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FamilyConsumer {
-    /// Mark only that root's current account window.
-    AccountWindowMark,
-    /// Census record aging through the source-wide keep-overlap rule.
-    CensusRecordAging,
-    /// Evidence already admitted under the shared strict-cohort allowance.
-    ScopedEvidenceLoad,
-    /// Per-family retry and held-family scheduling.
-    FamilyRetrySchedule,
-}
-
-impl Completion {
-    /// Whether this verdict may feed `consumer`. 8a enables none.
-    #[allow(dead_code)]
-    pub(super) fn permits(self, _consumer: FamilyConsumer) -> bool {
-        false
-    }
-}
-
 /// A family named by the `<dir>/<root>` key prefix its members share.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct FamilyRef {
@@ -237,7 +149,9 @@ impl FamilyRef {
 /// The families one page's selection touched, deduplicated and bounded.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Touched {
-    families: Vec<FamilyRef>,
+    // Immutable after selection: summarize the owned heaps once rather than
+    // visiting two strings per family on every parked-frame bound.
+    families: crate::owned_heap::OwnedVec<FamilyRef>,
     over_cap: u64,
 }
 
@@ -263,14 +177,14 @@ impl Touched {
             }
         }
         Self {
-            families: families.into_iter().collect(),
+            families: families.into_iter().collect::<Vec<_>>().into(),
             over_cap,
         }
     }
 }
 
 crate::heap_layout_bound::fields!(FamilyRef; prefix, root);
-crate::heap_layout_bound::fields!(Touched; families, over_cap);
+crate::heap_layout_bound::split_fields!(Touched; inline: [over_cap]; heap: [families]);
 
 /// One entry of the per-pass skipped set.
 #[derive(Debug, Clone, Copy)]
@@ -309,16 +223,11 @@ pub(super) fn skipped_view(index: &ScanIndex) -> impl Iterator<Item = Skipped<'_
 }
 
 /// The skipped set's paths alone.
+#[cfg(test)]
 pub(super) fn skipped_census_members(
     index: &ScanIndex,
 ) -> impl Iterator<Item = &ScanTraversalPath> + '_ {
     skipped_view(index).map(|skipped| skipped.path)
-}
-
-/// Size of the skipped set, without an iterator in the caller's frame.
-#[inline(never)]
-pub(super) fn skipped_census_member_count(index: &ScanIndex) -> usize {
-    skipped_census_members(index).count()
 }
 
 /// Per-family completion counts. `complete + deferred + Σ incomplete ==
@@ -343,12 +252,6 @@ pub(super) struct FamilyCounts {
     /// and unrelated keys included.
     #[serde(rename = "member_keys_visited")]
     pub(super) member_keys: u64,
-    /// Families that lack only child revisions and pass E1's conditions.
-    #[serde(rename = "family_child_finalize_eligible")]
-    pub(super) child_finalize_eligible: u64,
-    /// Families that lack only child revisions, by first failed condition.
-    #[serde(rename = "family_child_finalize_blocked")]
-    pub(super) child_finalize_blocked: BTreeMap<ChildFinalizeBlocked, u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -359,10 +262,6 @@ pub(super) struct Deferred {
 impl FamilyCounts {
     pub(super) fn incomplete_total(&self) -> u64 {
         self.incomplete.values().sum()
-    }
-
-    pub(super) fn child_finalize_candidates(&self) -> u64 {
-        self.child_finalize_eligible + self.child_finalize_blocked.values().sum::<u64>()
     }
 }
 
@@ -694,7 +593,7 @@ pub(super) fn equality_skip(
         )
 }
 
-fn hash64(bytes: &[u8]) -> u64 {
+pub(super) fn hash64(bytes: &[u8]) -> u64 {
     // Fixed keys: deterministic within one process, never persisted.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     hasher.write(bytes);
@@ -799,67 +698,6 @@ impl Sticky {
     }
 }
 
-/// Roots the persisted cross-family records name, sorted by hash. Read at most
-/// once per page, and only when a child-finalize candidate asks. A hash
-/// collision only blocks a family, which fails closed.
-#[derive(Debug, Default)]
-struct CrossFamily {
-    legacy_owners: Vec<u64>,
-    duplicate_owners: Vec<u64>,
-    overflowed: bool,
-    visited: u64,
-}
-
-impl CrossFamily {
-    fn of(index: &ScanIndex) -> Self {
-        let witnesses = &index.claude_usage_family_witnesses;
-        let duplicates = &index.claude_duplicate_request_owners;
-        if witnesses.len().max(duplicates.len()) > MAX_CROSS_FAMILY_ENTRIES {
-            return Self {
-                overflowed: true,
-                ..Self::default()
-            };
-        }
-        fn sorted(roots: impl Iterator<Item = u64>) -> Vec<u64> {
-            let mut roots = roots.take(MAX_CROSS_FAMILY_ENTRIES + 1).collect::<Vec<_>>();
-            roots.sort_unstable();
-            roots
-        }
-        let legacy_owners = sorted(
-            witnesses
-                .values()
-                .flat_map(|witness| &witness.legacy_owner_roots)
-                .map(|root| hash64(root.as_bytes())),
-        );
-        let duplicate_owners = sorted(
-            duplicates
-                .values()
-                .flatten()
-                .map(|owner| hash64(owner.root_session_id_hash.as_bytes())),
-        );
-        Self {
-            overflowed: index.claude_duplicate_request_witness_overflowed
-                || legacy_owners.len().max(duplicate_owners.len()) > MAX_CROSS_FAMILY_ENTRIES,
-            visited: (witnesses.len() + duplicates.len()) as u64,
-            legacy_owners,
-            duplicate_owners,
-        }
-    }
-
-    fn owns_legacy_prefix(&self, root: &str) -> bool {
-        self.legacy_owners
-            .binary_search(&hash64(root.as_bytes()))
-            .is_ok()
-    }
-
-    fn duplicates_requests_of(&self, root: &str) -> bool {
-        let owner = claude_duplicate_request_owner(root, "");
-        self.duplicate_owners
-            .binary_search(&hash64(owner.root_session_id_hash.as_bytes()))
-            .is_ok()
-    }
-}
-
 /// The page's view of the persisted state and runtime attestations every
 /// verdict reads.
 pub(super) struct View<'a> {
@@ -880,7 +718,6 @@ pub(super) struct View<'a> {
     /// `MAX_HISTORY_GATES` gates it overflows and every family counts held.
     held_history_roots: Vec<u64>,
     history_gates_overflowed: bool,
-    cross_family: std::cell::OnceCell<CrossFamily>,
 }
 
 /// The shared budget of one page's member lookups, in range advances.
@@ -955,7 +792,6 @@ impl<'a> View<'a> {
             queued_roots_overflowed,
             held_history_roots,
             history_gates_overflowed,
-            cross_family: std::cell::OnceCell::new(),
         }
     }
 
@@ -1160,156 +996,6 @@ impl<'a> View<'a> {
         None
     }
 
-    /// `family`'s verdict for child finalization, or `None` unless it lacks
-    /// only child revisions: every other member check passes, ignoring what E1's
-    /// conditions themselves name (source-wide vetoes, holds, window, uniqueness),
-    /// a live root is bound at its current tuple (a family with no live root is
-    /// `root_absent`), no bound child is stale, and each member's current revision
-    /// is attested. Pure, like `classify`.
-    fn child_finalize(
-        &self,
-        family: &FamilyRef,
-        family_members: &Members,
-    ) -> Option<ChildFinalize> {
-        let index = self.index;
-        let members = family_members.live.as_slice();
-        if self.closure(family, members, Vetoes::default()).is_some() {
-            return None;
-        }
-        let names = member_names(members);
-        if self.custody(family, members, &names).is_some() {
-            return None;
-        }
-        let pending = index
-            .claude_account_family_pending
-            .get(&family.root)
-            .filter(|pending| !pending.invalid)?;
-        let name_set = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
-        if pending
-            .members
-            .keys()
-            .chain(pending.member_requests.keys())
-            .any(|member| *member != family.root && !name_set.contains(member.as_str()))
-        {
-            return None;
-        }
-        let mut root_present = false;
-        let mut unfinalized = false;
-        let mut unwitnessed = false;
-        let mut revisions = Vec::with_capacity(members.len());
-        for (key, member) in members.iter().zip(&names) {
-            let entry = index
-                .files
-                .get(*key)
-                .filter(|entry| !entry.source_file_fingerprint.is_empty())?;
-            let current = claude_account_identity_revision(
-                &entry.source_file_fingerprint,
-                entry.last_snapshot_fingerprint.as_deref(),
-                entry.last_upload_body_witness.as_deref(),
-            );
-            let requests = pending
-                .member_requests
-                .get(member)
-                .filter(|_| pending.members.contains_key(member));
-            match requests.map(|requests| requests.identity_revision.as_ref()) {
-                Some(Some(finalized)) if current.as_ref() != Some(finalized) => return None,
-                Some(Some(_)) => {}
-                _ if *member == family.root => return None,
-                unbound => {
-                    unfinalized = true;
-                    unwitnessed |= unbound.is_none() || current.is_none();
-                }
-            }
-            root_present |= *member == family.root;
-            revisions.push(entry.source_file_fingerprint.as_str());
-        }
-        if !unfinalized
-            || revisions.len() != members.len()
-            || !self.attested_current
-            || !members
-                .iter()
-                .zip(&revisions)
-                .all(|(key, revision)| self.attested.covers(key, revision))
-        {
-            return None;
-        }
-        if !root_present {
-            return Some(ChildFinalize::Blocked(ChildFinalizeBlocked::RootAbsent));
-        }
-        let twin = name_set.len() != members.len();
-        let cause = self.child_finalize_blocked(family, family_members, pending, unwitnessed, twin);
-        Some(cause.map_or(ChildFinalize::Eligible, ChildFinalize::Blocked))
-    }
-
-    /// E1's conditions on a candidate, first failure first.
-    fn child_finalize_blocked(
-        &self,
-        family: &FamilyRef,
-        family_members: &Members,
-        pending: &ClaudeAccountFamilyPending,
-        unwitnessed: bool,
-        twin: bool,
-    ) -> Option<ChildFinalizeBlocked> {
-        use ChildFinalizeBlocked as Blocked;
-        let index = self.index;
-        let members = family_members.live.as_slice();
-        let root = family.root.as_str();
-        if unwitnessed {
-            return Some(Blocked::WitnessMissing);
-        }
-        if index
-            .claude_account_family_witnesses
-            .get(root)
-            .is_some_and(|witness| {
-                witness.account_identifier_hash != pending.account_identifier_hash
-            })
-        {
-            return Some(Blocked::WitnessConflict);
-        }
-        if self.held(family, members) || index.decode_holds_family(root) {
-            return Some(Blocked::WitnessHeld);
-        }
-        let cross = self.cross_family.get_or_init(|| CrossFamily::of(index));
-        if cross.owns_legacy_prefix(root)
-            || index
-                .claude_usage_family_witnesses
-                .get(root)
-                .is_some_and(|witness| !claude_usage_family_witness_legacy_free(witness))
-        {
-            return Some(Blocked::SharedParent);
-        }
-        if cross.duplicates_requests_of(root) {
-            return Some(Blocked::NativeOwnershipConflict);
-        }
-        if cross.overflowed {
-            return Some(Blocked::CrossFamilyUnknown);
-        }
-        if index.claude_request_identity_contract_changed {
-            return Some(Blocked::IdentityContractChanged);
-        }
-        let root_paths = self.roots.paths_of(root);
-        let family_paths = u32::try_from(family_members.paths).ok();
-        if twin || root_paths.is_some_and(|paths| Some(paths) != family_paths) {
-            return Some(Blocked::TwinSet);
-        }
-        if self.vetoes.namespace_loss || self.vetoes.unattributed {
-            return Some(Blocked::StickyVeto);
-        }
-        if self.vetoes.enumeration_open {
-            return Some(Blocked::EnumerationOpen);
-        }
-        if root_paths.is_none() {
-            return Some(Blocked::UniquenessUnknown);
-        }
-        if pending.census_window_end != self.traversal.census_window_end {
-            return Some(Blocked::WindowMoved);
-        }
-        members
-            .iter()
-            .any(|key| index.file_upload_context_requires_adoption(key))
-            .then_some(Blocked::PolicyChanged)
-    }
-
     /// Classify `families` in order. The first `FAMILY_QUANTUM` complete
     /// families count complete; later complete ones count deferred. Member
     /// lookups share one page budget.
@@ -1343,24 +1029,6 @@ impl<'a> View<'a> {
                 Ok(members) => {
                     counts.singletons += u64::from(members.live.len() == 1);
                     let reason = self.classify(family, &members);
-                    // Reasons at or before the proof that E1's conditions name.
-                    if matches!(
-                        reason,
-                        Some(
-                            Incomplete::MembershipUnknown
-                                | Incomplete::RefusedReadUnattributed
-                                | Incomplete::Held
-                                | Incomplete::Evidence
-                        )
-                    ) {
-                        match self.child_finalize(family, &members) {
-                            Some(ChildFinalize::Eligible) => counts.child_finalize_eligible += 1,
-                            Some(ChildFinalize::Blocked(cause)) => {
-                                *counts.child_finalize_blocked.entry(cause).or_default() += 1
-                            }
-                            None => {}
-                        }
-                    }
                     reason.map_or(Completion::Complete, Completion::Incomplete)
                 }
             };
@@ -1447,7 +1115,7 @@ pub(super) fn rotation(
 /// dropped for it.
 #[derive(Debug, Default)]
 pub(super) struct FirstPending {
-    stamps: Vec<(u64, u64)>,
+    stamps: Vec<(u64, u64, super::money_freshness::Metadata)>,
 }
 
 /// Freshness of the skipped set. `count` counts entries (queue + replay) as
@@ -1468,6 +1136,8 @@ pub(super) struct PendingCensusMembers {
     pub(super) pace_evicted: u64,
     /// How long this process has stamped this scope: no age exceeds it.
     pub(super) stamped_for_s: u64,
+    #[serde(flatten)]
+    pub(super) freshness: super::money_freshness::Counts,
 }
 
 /// E1's rotation diagnostic: an order-free digest of the skipped entries and
@@ -1488,16 +1158,26 @@ impl FirstPending {
         skipped: impl Iterator<Item = Skipped<'p>>,
         resolved: impl Fn(u64) -> bool,
         now: u64,
+        index: Option<&ScanIndex>,
+        epoch: u64,
     ) -> (PendingCensusMembers, SkippedSet) {
         // One pass, never more than `MAX_FIRST_PENDING + 1` stamps held: a
         // min-heap on stamp evicts the oldest as soon as it overflows.
         let mut kept = std::collections::BinaryHeap::new();
         let mut pending = PendingCensusMembers::default();
+        pending.freshness.ages_are_process_local_lower_bounds = true;
+        const QUEUED: u8 = 1;
+        const UNREAD: u8 = 2;
+        const REPLAY: u8 = 4;
+        const OBSERVED: u8 = 8;
+        const KNOWN: u8 = 16;
+        const CHANGED: u8 = 32;
+        let mut unread_entries = 0_u64;
         let mut retained = 0_u64;
         let (mut sum, mut xor) = (0_u64, 0_u64);
         // Which held stamps this pass saw (bounded by the stamps themselves),
         // so a stamp evicted from the pass is not carried back.
-        let mut seen = vec![false; self.stamps.len()];
+        let mut seen = vec![(0_u8, 0_u64, 0_u64); self.stamps.len()];
         for entry in skipped {
             pending.count += 1;
             pending.replay += u64::from(entry.replay);
@@ -1509,15 +1189,47 @@ impl FirstPending {
             xor ^= mix64(mixed);
             let position = self
                 .stamps
-                .binary_search_by_key(&hash, |(hash, _)| *hash)
+                .binary_search_by_key(&hash, |(hash, _, _)| *hash)
                 .ok();
-            if let Some(position) = position {
-                seen[position] = true;
-            }
             let previous = position.map(|position| self.stamps[position].1);
             retained += u64::from(previous.is_some());
             pending.replay_repeat += u64::from(entry.replay && previous.is_some());
-            kept.push(std::cmp::Reverse((previous.unwrap_or(now), hash)));
+            let metadata = position.map(|p| self.stamps[p].2).unwrap_or_default();
+            let indexed =
+                index.and_then(|index| index.files.get(entry.path.path.to_string_lossy().as_ref()));
+            let unread = indexed.is_none() && !entry.replay;
+            unread_entries += u64::from(unread);
+            let observed = epoch != 0 && metadata.epoch == epoch;
+            let mut flags =
+                QUEUED | if unread { UNREAD } else { 0 } | if entry.replay { REPLAY } else { 0 };
+            if observed {
+                flags |= OBSERVED;
+            }
+            if let Some(indexed) = indexed.filter(|_| observed) {
+                flags |= KNOWN;
+                if indexed.size_bytes != metadata.size
+                    || indexed.modified_unix_seconds != metadata.seconds
+                    || indexed
+                        .modified_unix_nanos
+                        .is_some_and(|nanos| nanos != metadata.nanos)
+                {
+                    flags |= CHANGED;
+                }
+            }
+            if let Some(position) = position {
+                let observed = &mut seen[position];
+                observed.0 |= flags;
+                observed.1 += 1;
+                observed.2 += u64::from(unread);
+            }
+            kept.push(std::cmp::Reverse((
+                previous.unwrap_or(now),
+                hash,
+                metadata,
+                flags,
+                1_u64,
+                u64::from(unread),
+            )));
             if kept.len() > MAX_FIRST_PENDING {
                 kept.pop();
                 pending.pace_evicted += 1;
@@ -1525,27 +1237,35 @@ impl FirstPending {
         }
         let mut current = kept
             .into_iter()
-            .map(|std::cmp::Reverse((stamp, hash))| (hash, stamp))
+            .map(
+                |std::cmp::Reverse((stamp, hash, metadata, flags, entries, unread))| {
+                    (hash, stamp, metadata, flags, entries, unread)
+                },
+            )
             .collect::<Vec<_>>();
         current.sort_unstable();
         // A path both queued and in carry replay keeps its oldest stamp.
-        current.dedup_by_key(|(hash, _)| *hash);
-        let ages = current.iter().map(|(_, stamp)| now.saturating_sub(*stamp));
-        pending.oldest_age_s = ages.clone().max().unwrap_or_default();
-        pending.over_24h = ages.filter(|age| *age > OVER_24H_SECONDS).count() as u64;
+        current.dedup_by(|a, b| {
+            if a.0 != b.0 {
+                return false;
+            }
+            b.3 |= a.3;
+            b.4 += a.4;
+            b.5 += a.5;
+            true
+        });
         // Keep stamps of keys that left the queue unresolved.
-        let queued = current.len();
         let carried = self
             .stamps
             .iter()
             .zip(&seen)
-            .filter(|((hash, _), seen)| !**seen && !resolved(*hash))
-            .map(|(stamp, _)| *stamp)
+            .filter(|((hash, _, _), seen)| seen.0 == 0 && !resolved(*hash))
+            .map(|((hash, since, metadata), _)| (*hash, *since, *metadata, 0_u8, 0_u64, 0_u64))
             .collect::<Vec<_>>();
         current.extend(carried);
         if current.len() > MAX_FIRST_PENDING {
             let excess = current.len() - MAX_FIRST_PENDING;
-            current.sort_unstable_by_key(|(hash, stamp)| (*stamp, *hash));
+            current.sort_unstable_by_key(|(hash, stamp, _, _, _, _)| (*stamp, *hash));
             current.drain(..excess);
             pending.pace_evicted += excess as u64;
         }
@@ -1553,8 +1273,60 @@ impl FirstPending {
         // The heap's allocation came along; keep the retained bound exact.
         current.shrink_to(MAX_FIRST_PENDING);
         pending.tracked = current.len() as u64;
-        pending.unqueued_unresolved = current.len().saturating_sub(queued) as u64;
-        self.stamps = current;
+        let mut queued = 0_u64;
+        let mut covered_entries = 0_u64;
+        let mut covered_unread_entries = 0_u64;
+        self.stamps = current
+            .into_iter()
+            .map(
+                |(hash, since, metadata, mut flags, mut entries, mut unread)| {
+                    if flags & QUEUED != 0 {
+                        // The cap may discard an occurrence while another one of
+                        // its key survives. Reuse the existing stamp-indexed seen
+                        // buffer so all occurrences of a retained known key count.
+                        if let Ok(position) =
+                            self.stamps.binary_search_by_key(&hash, |stamp| stamp.0)
+                        {
+                            (flags, entries, unread) = seen[position];
+                        }
+                        queued += 1;
+                        covered_entries += entries;
+                        covered_unread_entries += unread;
+                        let age = now.saturating_sub(since);
+                        pending.oldest_age_s = pending.oldest_age_s.max(age);
+                        pending.over_24h += u64::from(age > OVER_24H_SECONDS);
+                        let row = &mut pending.freshness;
+                        if flags & UNREAD != 0 && flags & REPLAY == 0 {
+                            row.discovered_unread_tracked_files += 1;
+                            row.oldest_discovered_unread_age_seconds =
+                                row.oldest_discovered_unread_age_seconds.max(age);
+                            row.discovered_unread_over_24h_tracked_files +=
+                                u64::from(age > OVER_24H_SECONDS);
+                        } else {
+                            row.indexed_or_replay_tracked_files += 1;
+                        }
+                        row.metadata_observed_files += u64::from(flags & OBSERVED != 0);
+                        if flags & KNOWN != 0 {
+                            row.changed_since_scan_files += u64::from(flags & CHANGED != 0);
+                            row.unchanged_since_scan_files += u64::from(flags & CHANGED == 0);
+                        } else {
+                            row.changed_since_scan_unknown_files += 1;
+                        }
+                    }
+                    (hash, since, metadata)
+                },
+            )
+            .collect();
+        // collect may reuse the wider transient allocation; cap retained bytes.
+        self.stamps.shrink_to(MAX_FIRST_PENDING);
+        pending.unqueued_unresolved = pending.tracked.saturating_sub(queued);
+        let row = &mut pending.freshness;
+        row.skipped_untracked_entries = pending.count.saturating_sub(covered_entries);
+        row.discovered_unread_untracked_entries =
+            unread_entries.saturating_sub(covered_unread_entries);
+        row.changed_since_scan_complete_count = (row.changed_since_scan_unknown_files == 0
+            && row.skipped_untracked_entries == 0)
+            .then_some(row.changed_since_scan_files);
         let skipped = SkippedSet {
             digest: format!("{sum:016x}{xor:016x}"),
             retained,
@@ -1562,8 +1334,21 @@ impl FirstPending {
         (pending, skipped)
     }
 
+    pub(super) fn observe_metadata(
+        &mut self,
+        hash: u64,
+        metadata: super::money_freshness::Metadata,
+    ) {
+        if let Ok(p) = self
+            .stamps
+            .binary_search_by_key(&hash, |(hash, _, _)| *hash)
+        {
+            self.stamps[p].2 = metadata;
+        }
+    }
+
     fn heap_bytes(&self) -> usize {
-        self.stamps.capacity() * size_of::<(u64, u64)>()
+        self.stamps.capacity() * size_of::<(u64, u64, super::money_freshness::Metadata)>()
     }
 }
 
@@ -1584,6 +1369,8 @@ pub(super) struct Runtime {
     scope_since: Option<u64>,
     cursor: Option<String>,
     first_pending: FirstPending,
+    freshness: super::money_freshness::Episode,
+    metadata_epoch: u64,
     roots: RootCounts,
     attested: Attestations,
     sticky: Sticky,
@@ -1599,6 +1386,8 @@ impl Runtime {
             scope_since: None,
             cursor: None,
             first_pending: FirstPending::new(),
+            freshness: super::money_freshness::Episode::new(),
+            metadata_epoch: 1,
             roots: RootCounts::new(),
             attested: Attestations::new(),
             sticky: Sticky::new(),
@@ -1649,10 +1438,6 @@ pub(super) struct Cost {
     pub(super) rotation_keys_visited: u64,
     pub(super) queue_entries_visited: u64,
     pub(super) history_gates_visited: u64,
-    /// Outer-map entries of the cross-family records, on a page with a
-    /// child-finalize candidate: not the owner references flattened from them.
-    pub(super) cross_family_entries_visited: u64,
-    pub(super) cross_family_overflowed: bool,
     pub(super) root_index_restarted: bool,
     pub(super) root_index_complete: bool,
     pub(super) root_index_overflowed: bool,
@@ -1719,8 +1504,20 @@ pub(super) fn evaluate_page<'p>(
         skipped_view(index),
         |hash| resolved.binary_search(&hash).is_ok(),
         now,
+        Some(index),
+        runtime.metadata_epoch,
     );
     pending_census_members.stamped_for_s = now.saturating_sub(scope_since);
+    runtime
+        .freshness
+        .update(&mut pending_census_members.freshness, now);
+    // Epoch wrap only loses metadata coverage; it never affects selection.
+    runtime.metadata_epoch = runtime.metadata_epoch.checked_add(1).unwrap_or(1);
+    if runtime.metadata_epoch == 1 {
+        for (_, _, metadata) in &mut runtime.first_pending.stamps {
+            *metadata = Default::default();
+        }
+    }
     let (vetoes, sticky_vetoes) =
         runtime
             .sticky
@@ -1762,36 +1559,28 @@ pub(super) fn evaluate_page<'p>(
         families.evaluated,
         "the reasons partition the incomplete count"
     );
-    debug_assert!(
-        families.child_finalize_candidates() <= families.evaluated,
-        "a family is one child-finalize candidate at most"
-    );
     let queued_roots_overflowed = view.queued_roots_overflowed;
-    let (cross_family_entries_visited, cross_family_overflowed) = view
-        .cross_family
-        .get()
-        .map_or((0, false), |cross| (cross.visited, cross.overflowed));
     let history_gates_overflowed = view.history_gates_overflowed;
     let queue_entries =
         traversal.pending_candidates.len() + index.claude_stale_family_carry.replay.len();
     let history_gates = index.claude_history_emission.files.len();
     let parsed_count = parsed_keys.len();
-    runtime.followup = Touched::from_keys(parsed_keys, MAX_FOLLOWUP_FAMILIES).families;
+    runtime.followup = Touched::from_keys(parsed_keys, MAX_FOLLOWUP_FAMILIES)
+        .families
+        .into_vec();
     let cost = Cost {
         predicate_cpu_us: super::codex_compressed_input::thread_cpu_micros()
             .saturating_sub(started),
         families_evaluated: families.evaluated,
         root_index_keys_processed: (root_keys + parsed_count) as u64,
         rotation_keys_visited,
-        // The stamp pass and the queued-root pass.
+        // The combined stamp/freshness pass and queued-root pass.
         queue_entries_visited: 2 * queue_entries as u64,
         history_gates_visited: if history_gates_overflowed {
             0
         } else {
             history_gates as u64
         },
-        cross_family_entries_visited,
-        cross_family_overflowed,
         root_index_restarted,
         root_index_complete: runtime.roots.complete(),
         root_index_overflowed: runtime.roots.overflowed,
@@ -1824,7 +1613,7 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
     const LONGEST_KEY: usize = 4_096; // Linux PATH_MAX; macOS is 1,024.
     const LONGEST_ROOT: usize = 255; // One path component.
     const FOLLOWUP: usize = size_of::<FamilyRef>() + LONGEST_KEY + LONGEST_ROOT;
-    MAX_FIRST_PENDING * size_of::<(u64, u64)>()
+    MAX_FIRST_PENDING * size_of::<(u64, u64, super::money_freshness::Metadata)>()
         + MAX_ATTESTATIONS * size_of::<(u64, u64)>()
         + ATTESTATION_FLUSH * size_of::<(u64, u64)>()
         + MAX_ATTESTATIONS * size_of::<u64>()
@@ -1838,22 +1627,23 @@ pub(super) const RUNTIME_RETAINED_WORST_BYTES: usize = {
 /// reported per page as `cost.runtime_heap_bytes`.
 ///
 /// Retained heap, worst case, with every cap full (no maps: sorted vectors
-/// only): stamps 16,384 × 16 + attestations 16,384 × 16 + attestation buffer
+/// only): stamps 16,384 × 48 + attestations 16,384 × 16 + attestation buffer
 /// 1,024 × 16 + since-pass keys 16,384 × 8 + root counts 16,384 × 16 = 933,888
-/// bytes, plus follow-up families 256 × (48 + K + R) and the rotation and
+/// bytes before R1 metadata (which adds 524,288 bytes), plus follow-up families 256 × (48 + K + R) and the rotation and
 /// uniqueness cursors 2K, for key length K and root length R. At K = 4,096
-/// (Linux `PATH_MAX`) and R = 255 that is 2,068,224 bytes (1.97 MiB) before
+/// (Linux `PATH_MAX`) and R = 255 that is 2,592,512 bytes (2.47 MiB) before
 /// allocator rounding; at a typical K = 200, R = 36 it is about 1.0 MiB. Inline:
 /// under 512 bytes. A page's transients add at most 1.8 MiB more (1.1 MiB at
-/// typical lengths), outside `runtime_heap_bytes`. Counts only, so nothing is
+/// typical lengths), plus at most 4 MiB for enlarged stamp transients with
+/// per-entry classification, outside `runtime_heap_bytes`;
+/// no separate gauge-dedup allocation, outside `runtime_heap_bytes`. Counts only, so nothing is
 /// refused at the bound.
 ///
 /// `observe_page` holds this lock for its whole evaluation and each equality
 /// Skip for its own attestation, so every update is whole: a sticky veto,
 /// attestation or cap meter is never overwritten, and one state exists. The
 /// hold is bounded by the page budgets (16,384 member advances, 8,192 root
-/// advances, 4,096 rotation keys, 16,384 history gates, 2 × 16,384 cross-family
-/// entries) plus the queue passes, which are O(queue). No I/O runs under it and it nests no other lock.
+/// advances, 4,096 rotation keys, 16,384 history gates) plus the queue passes, which are O(queue). No I/O runs under it and it nests no other lock.
 #[cfg(not(test))]
 static RUNTIME: Mutex<Runtime> = Mutex::new(Runtime::new());
 
@@ -1897,6 +1687,9 @@ pub(super) fn attest_equality_skip(
     sampling: &Option<sampled_scan::Context>,
     now: u64,
 ) {
+    if !super::money_freshness::enabled() {
+        return;
+    }
     let Some(traversal) = index.traversal.as_ref() else {
         return;
     };
@@ -1933,6 +1726,9 @@ pub(super) fn observe_page(
     sampling: &Option<sampled_scan::Context>,
     now: u64,
 ) {
+    if !super::money_freshness::enabled() {
+        return;
+    }
     let none = Touched::default();
     let touched = touched.as_deref().unwrap_or(&none);
     let scope = scope_of(sampling);
@@ -1949,7 +1745,38 @@ pub(super) fn observe_page(
     let counts = with_runtime(|runtime| {
         evaluate_page(runtime, index, touched, parsed, removed_keys, scope, now)
     });
-    if let Some(counts) = counts {
+    if let Some(mut counts) = counts {
+        counts.pending_census_members.freshness.tracker_initialized =
+            super::money_freshness::first_observation();
         crate::local_resource_diagnostics::claude_family_census_shadow(&counts);
     }
+}
+
+/// Reuse only metadata already observed by this pass. New/untracked keys stay
+/// unknown until FirstPending admits them; no additional per-file map or stat.
+#[inline(never)]
+pub(super) fn observe_freshness_metadata(
+    candidate: &CandidateFile,
+    sampling: &Option<sampled_scan::Context>,
+) {
+    if !super::money_freshness::enabled() {
+        return;
+    }
+    with_runtime(|runtime| {
+        runtime.align_scope(scope_of(sampling));
+        runtime.first_pending.observe_metadata(
+            hash64(candidate.path.as_os_str().as_encoded_bytes()),
+            super::money_freshness::Metadata::new(candidate, runtime.metadata_epoch),
+        );
+    });
+}
+
+#[cfg(test)]
+pub(super) fn runtime_pristine_for_test() -> bool {
+    with_runtime(|runtime| {
+        runtime.scope_since.is_none()
+            && runtime.first_pending.stamps.is_empty()
+            && runtime.attested.len() == 0
+            && runtime.meter.attempts == 0
+    })
 }

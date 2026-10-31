@@ -37,6 +37,8 @@ pub(super) struct KeyDebt {
     /// Diagnostic only: the first non-quiet scoped replay result this process.
     pub(super) first_rederive_failed: Option<bool>,
     pub(super) first_retire_held: Option<bool>,
+    /// OFF diagnostic only; first failure survives retries until removal.
+    pub(super) off_v1_failed_since: Option<(DurableSource, std::time::Instant)>,
     pub(super) retire_source: Option<DurableSource>,
     pub(super) retire_sync: bool,
     /// D3: this Claude key's stale predecessor survived a failed write.
@@ -54,6 +56,7 @@ impl KeyDebt {
         self.owed == OwedMark::None
             && self.hold.is_none()
             && self.rederive_hold.is_none()
+            && self.off_v1_failed_since.is_none()
             && self.retire_source.is_none()
             && !self.retire_sync
             && !self
@@ -64,6 +67,7 @@ impl KeyDebt {
         self.owed == OwedMark::None
             && self.hold.is_none()
             && self.rederive_hold.is_none()
+            && self.off_v1_failed_since.is_none()
             && self.retire_source.is_none()
             && self.full_spend.is_none()
             && self.first_rederive_failed.is_none()
@@ -219,7 +223,7 @@ impl Stores {
         self.release_idle_debt(digest);
     }
     /// Frees an empty debt node, so a discharged key never pins a slot.
-    fn release_idle_debt(&mut self, digest: &store::Digest32) {
+    pub(super) fn release_idle_debt(&mut self, digest: &store::Digest32) {
         if self
             .key_debt
             .get(digest)

@@ -58,6 +58,7 @@ pub(crate) use stream::{
 pub(crate) const FORMAT_V1: u16 = 1;
 pub(crate) const FORMAT_V3: u16 = 3;
 // Historical fixture/writer pin; never reinterpret v1 as the current writer.
+#[cfg(test)]
 pub(crate) const FORMAT_VERSION: u16 = FORMAT_V1;
 const MAGIC: [u8; 8] = *b"ottto-dt";
 /// One record never exceeds the RAM cache's per-entry bound
@@ -196,6 +197,7 @@ pub(crate) fn scope_digest(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn scope_digest_for(
     format: u16,
     file_scope: &str,
@@ -250,7 +252,14 @@ fn header_len(format: u16, source: DurableSource, allowlist: &Digest32) -> Resul
     if format > FORMAT_V3 {
         return Err(Refusal::NewerFormat);
     }
-    if retired_pin(source, format, allowlist) {
+    // Header-only compatibility remains for OFF invalidation and consent erasure.
+    if retired_pin(source, format, allowlist)
+        || format == FORMAT_V1
+            && source
+                .properties()
+                .representation(FORMAT_V3, allowlist)
+                .is_some()
+    {
         return Ok(HEADER_BYTES);
     }
     source
@@ -282,23 +291,6 @@ pub(crate) fn replay_scope_digest(
     )
 }
 
-/// Per-file applied revision and money replay marks committed with the entry.
-/// An old reduction cannot inherit a new applied-rule/obligation marker.
-pub(crate) fn replay_entry_digest(
-    entry: &Digest32,
-    applied_revision: u64,
-    money_marks: u8,
-) -> Digest32 {
-    digest(
-        "ottto-dt-replay-entry:v1",
-        &[
-            entry.as_slice(),
-            &applied_revision.to_le_bytes(),
-            &[money_marks],
-        ],
-    )
-}
-
 /// The garbage-collection unit: the destination namespace and the account
 /// (upload context) in force. A record from another context is unreachable.
 pub(crate) fn context_digest(namespace: &str, upload_context: Option<&str>) -> Digest32 {
@@ -314,6 +306,7 @@ pub(crate) fn context_digest(namespace: &str, upload_context: Option<&str>) -> D
 /// The committed index selection a record was written for: the entry's
 /// source fingerprint and upload body witness, as the index save committed
 /// them.
+#[cfg(test)]
 pub(crate) fn entry_digest(source_file_fingerprint: &str, body_witness: Option<&str>) -> Digest32 {
     digest(
         "ottto-dt-entry:v1",
@@ -347,14 +340,14 @@ pub(crate) struct AcquisitionFields {
 }
 
 /// Original verified wire facts survive decoding of retired body/header fields.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WireIdentity {
     encoded_len: u64,
     trailer: Digest32,
 }
 
 /// A record before the store stamps it with a committed generation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PendingRecord {
     pub(crate) binding: Binding,
     pub(crate) certificate: DurableCertificate,
@@ -377,7 +370,7 @@ impl PendingRecord {
 
 /// A record as stored: the pending record plus the generation of the index
 /// save it followed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DurableRecord {
     pub(crate) record: PendingRecord,
     pub(crate) index_generation: u64,
@@ -385,6 +378,48 @@ pub(crate) struct DurableRecord {
     /// Validated v1 compatibility debt; never checkpoint authority.
     pub(crate) envelope_audit_debt: Option<u64>,
     pub(crate) wire: Option<WireIdentity>,
+}
+
+// Encoded bodies may contain private labels. Wrapping Debug implementations
+// inherit this length-only representation; no content-derived identifiers escape.
+impl std::fmt::Debug for PendingRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRecord")
+            .field("format", &self.format())
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+impl std::fmt::Debug for DurableRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableRecord")
+            .field("format", &self.format)
+            .field("body_len", &self.record.body.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for WireIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireIdentity")
+            .field("encoded_len", &self.encoded_len)
+            .finish()
+    }
+}
+impl std::fmt::Debug for WireRecordIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireRecordIdentity")
+            .field("format", &self.format)
+            .field("encoded_len", &self.encoded_len)
+            .finish()
+    }
+}
+impl std::fmt::Debug for WireReceiptProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WireReceiptProof")
+            .field(&self.identity)
+            .finish()
+    }
 }
 
 /// Writer-owned retirement distinguishes absence/verified replacement from
@@ -401,9 +436,7 @@ pub(crate) struct MutationWitness {
     original: Digest32,
     content: Digest32,
     stamp: Stamp,
-    // The current binding is folded into original for migration witnesses.
     // Keep the immutable floor inline without growing the prepaid custody node.
-    migration_floor: Option<std::num::NonZeroU64>,
 }
 fn original_digest(record: &DurableRecord, content: &Digest32) -> Digest32 {
     digest(
@@ -417,16 +450,10 @@ fn original_digest(record: &DurableRecord, content: &Digest32) -> Digest32 {
         ],
     )
 }
-fn migration_binding(original: &Digest32, current: &Expected) -> Digest32 {
-    digest(
-        "ottto-dt-migration:v1",
-        &[original, &current.binding.context, &current.binding.scope],
-    )
-}
 
 /// Exact encoded candidate, including the original trailer (not a re-encoding
 /// of decoded fields, which may discard retired positional values).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct WireRecordIdentity {
     key: Digest32,
     allowlist: Digest32,
@@ -467,7 +494,7 @@ struct PendingWrite {
 const _: () = assert!(std::mem::size_of::<(Digest32, PendingWrite)>() <= 320);
 
 /// Acquisition durability only; never accepted-money or replacement ACK credit.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(crate) struct WireReceiptProof {
     identity: WireRecordIdentity,
     stamp: Stamp,
@@ -511,7 +538,6 @@ pub(crate) enum ReadOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Expected {
     pub(crate) binding: Binding,
-    pub(crate) committed_generation: u64,
 }
 
 /// Why a well-formed record does not bind to the committed index.
@@ -524,9 +550,6 @@ pub(crate) enum Ineligible {
     /// Another interpretation scope, format, allowlist, identity contract or
     /// counting view.
     Scope,
-    /// Written after a save the loaded index does not contain (index old,
-    /// checkpoint new).
-    GenerationAhead,
     /// The committed entry is not the one this record was written for: a
     /// later save recorded another selection (an append, truncate, replace
     /// or edit) and no record followed it.
@@ -545,18 +568,8 @@ impl DurableRecord {
             Err(Ineligible::Key)
         } else if have.context != want.context {
             Err(Ineligible::Context)
-        } else if have.scope != want.scope {
+        } else if have.scope != want.scope || self.format != FORMAT_V3 {
             Err(Ineligible::Scope)
-        } else if self.format == FORMAT_V1
-            && have.source == DurableSource::Codex
-            && self.index_generation > expected.committed_generation
-        {
-            Err(Ineligible::GenerationAhead)
-        } else if self.format == FORMAT_V1
-            && have.source == DurableSource::Codex
-            && have.entry != want.entry
-        {
-            Err(Ineligible::EntryChanged)
         } else {
             Ok(())
         }
@@ -638,6 +651,9 @@ pub(crate) struct StoreCounters {
     pub(crate) gc_bytes_read: u64,
     /// Records deleted because their selection was held or reverted.
     pub(crate) records_invalidated: u64,
+    /// OFF discards only retired v1 headers outgrown by a native publication.
+    pub(crate) off_v1_invalidated: u64,
+    pub(crate) off_v1_invalidate_failed: u64,
     /// Peak transient encode/decode buffer, in bytes.
     pub(crate) peak_codec_bytes: u64,
 }
@@ -690,13 +706,16 @@ pub(crate) struct DurableTailStore {
     disabled: Option<&'static str>,
     /// This pass: directory checked and [records loaded, T14 rebuilds].
     checked: bool,
-    /// M1's reader ceiling, selected by the source owner before a pass.
-    read_v1_only: bool,
     pass: [u64; 2],
     /// Process-lifetime attempts, removed only after a successful replacement.
     rebuilt: BTreeMap<Digest32, Rebuild>,
     startup_synced: bool,
+    off_v1_sync_due: bool,
     gc_after: Option<Digest32>,
+    private_purge_entries: Option<fs::ReadDir>,
+    private_purge_page: Option<PrivateLabelPage>,
+    private_purge_dirty: bool,
+    private_purge_kept: BTreeSet<Digest32>,
     pending: BTreeMap<Digest32, PendingWrite>,
     resource_pause: Option<stream::ResourcePause>,
     stream_dirty: Arc<AtomicU64>,
@@ -733,8 +752,19 @@ const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp, b
 /// Counts erasures and unadjudicated records in one privacy pass. No receipt
 /// or per-key state escapes the store; partial progress is always reported.
 pub(crate) struct PrivateLabelPurge {
+    pub(crate) visited: u64,
+    pub(crate) scanned: u64,
+    pub(crate) verified: u64,
     pub(crate) erased: u64,
     pub(crate) refused: u64,
+}
+
+#[derive(Default)]
+struct PrivateLabelPage {
+    keys: BTreeSet<Digest32>,
+    visited: u64,
+    refused: u64,
+    complete: bool,
 }
 
 impl DurableTailStore {
@@ -747,11 +777,15 @@ impl DurableTailStore {
             cleanup: Arc::new(TempCleanupCounts::default()),
             disabled: None,
             checked: false,
-            read_v1_only: false,
             pass: [0; 2],
             rebuilt: BTreeMap::new(),
             startup_synced: false,
+            off_v1_sync_due: false,
             gc_after: None,
+            private_purge_entries: None,
+            private_purge_page: None,
+            private_purge_dirty: false,
+            private_purge_kept: BTreeSet::new(),
             pending: BTreeMap::new(),
             resource_pause: None,
             stream_dirty: Arc::default(),
@@ -761,12 +795,6 @@ impl DurableTailStore {
             resource_checked: false,
             resource_granted: false,
         }
-    }
-
-    /// Preserve main's envelope admission while restart restore is OFF.
-    /// Only explicit consent erasure may inspect newer known records.
-    pub(crate) fn restrict_reads_to_v1(&mut self) {
-        self.read_v1_only = true;
     }
 
     /// A new pass: the directory is checked again and the T14 breaker resets.
@@ -908,6 +936,19 @@ impl DurableTailStore {
         self.dir.join(format!("{}{RECORD_SUFFIX}", hex(key)))
     }
 
+    /// Existing owned directory, without permission repair or startup sync.
+    fn read_only_directory(&self) -> io::Result<bool> {
+        let metadata = match inspect_path(&self.dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_dir() || metadata.uid() != our_uid() || metadata.mode() & 0o777 != 0o700 {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        Ok(true)
+    }
+
     /// Owner/mode (store-level) precede header dispatch, which precedes the
     /// size check. Only a verified known record licenses mutation. `Ok(None)`
     /// also when the store is disabled.
@@ -918,15 +959,26 @@ impl DurableTailStore {
         writer: Option<&dyn SingleWriter>,
     ) -> Result<Option<Header>, Refusal> {
         let restoring = matches!(work, "restore" | "privacy_restore");
+        let read_only = matches!(work, "privacy_restore" | "off_invalidate");
         let writable = writer
             .or_else(|| {
                 crate::locked_state_dir::held_for(&self.dir).map(|w| w as &dyn SingleWriter)
             })
             .is_some_and(|w| self.check_writer(w).is_ok());
-        if !self.usable(writer) {
+        if read_only {
+            // Privacy dispatch is not startup/restore: never repair metadata
+            // or run the startup barrier merely to identify unrelated bytes.
+            if !self
+                .read_only_directory()
+                .map_err(|_| Refusal::Undecodable)?
+            {
+                return Ok(None);
+            }
+        } else if !self.usable(writer) {
             return Ok(None);
         }
         let path = self.record_path(key);
+        let mut corrupt_retired = None;
         let result = (|| {
             let open = || {
                 #[cfg(test)]
@@ -939,9 +991,17 @@ impl DurableTailStore {
             let mut file = match open() {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !read_only => {
                     let repaired = match inspect_path(&path) {
-                        Ok(m) => m.is_file() && self.repair(&path, &m, 0o600, writable),
+                        Ok(m) => {
+                            m.is_file()
+                                && self.repair(
+                                    &path,
+                                    &m,
+                                    0o600,
+                                    writable && work != "off_invalidate",
+                                )
+                        }
                         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                         Err(_) => false,
                     };
@@ -957,20 +1017,22 @@ impl DurableTailStore {
                         }
                     }
                 }
-                Err(e) => return Err(self.read_failure(e, Refusal::Undecodable)),
+                Err(e) => return Err(self.read_failure(e, Refusal::Undecodable, read_only)),
             };
-            let Some(metadata) = self.inspect_file(&file) else {
-                return Ok(None);
-            };
+            let metadata = self.inspect_file(&file, read_only)?;
             if !metadata.is_file() {
                 return Err(Refusal::Undecodable);
             }
-            if !self.repair(&path, &metadata, 0o600, writable) {
+            if read_only {
+                if metadata.uid() != our_uid() {
+                    return Err(Refusal::Undecodable);
+                }
+            } else if !self.repair(&path, &metadata, 0o600, writable) {
                 return Ok(None);
             }
             #[cfg(test)]
             test_hooks::before_access(&path, "header")
-                .map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
+                .map_err(|e| self.read_failure(e, Refusal::Undecodable, read_only))?;
             let mut header = Vec::with_capacity(HEADER_V3_BYTES);
             let first = Read::by_ref(&mut file)
                 .take(DISPATCH_BYTES as u64)
@@ -982,15 +1044,7 @@ impl DurableTailStore {
             } else {
                 self.counters.guard_header_bytes += n as u64;
             }
-            first.map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
-            if self.read_v1_only
-                && work != "privacy_restore"
-                && header.len() >= 10
-                && header[..8] == MAGIC
-                && u16::from_le_bytes([header[8], header[9]]) > FORMAT_V1
-            {
-                return Err(Refusal::NewerFormat);
-            }
+            first.map_err(|e| self.read_failure(e, Refusal::Undecodable, read_only))?;
             let (_, _, _, size) = dispatch(&header)?;
             let rest = Read::by_ref(&mut file)
                 .take((size - n) as u64)
@@ -1000,20 +1054,46 @@ impl DurableTailStore {
             } else {
                 self.counters.guard_header_bytes += (header.len() - n) as u64;
             }
-            rest.map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
+            rest.map_err(|e| self.read_failure(e, Refusal::Corrupt, read_only))?;
             n = header.len();
             let mut binding = decode_header(&header, key, self.source)?;
             let retired = retired_pin(self.source, binding.format, &binding.record.allowlist);
-            if retired && work != "overwrite" {
+            if work == "off_invalidate" {
+                // Header identity alone is the OFF exception. Never acquire a
+                // body or mutation authority for any other representation.
+                if !retired {
+                    return Ok(None);
+                }
+                if metadata.mode() & 0o777 != 0o600 {
+                    return Err(Refusal::Undecodable);
+                }
+                binding.stamp = Some(Stamp::of(&metadata));
+                return Ok(Some(binding));
+            }
+            let erasure = work == "privacy_restore"
+                && binding.format == FORMAT_V1
+                && self
+                    .source
+                    .properties()
+                    .representation(FORMAT_V3, &binding.record.allowlist)
+                    .is_some();
+            // A current pin on a v1 envelope is not a retired writer. Only
+            // consent erasure may inspect it; it grants no acquisition or
+            // mutation authority, with restart restore either ON or OFF.
+            if binding.format == FORMAT_V1 && !retired && !erasure {
+                return Err(Refusal::Unknown);
+            }
+            if retired && !erasure && work != "overwrite" && work != "guard" {
                 return Err(Refusal::Repin); // Missing to readers, opaque to current decoders.
+            }
+            if read_only && metadata.mode() & 0o777 != 0o600 {
+                return Err(Refusal::Undecodable);
             }
             if work == "presence" {
                 return Ok(None); // Presence is never verification or mutation authority.
             }
             // After any repair: its ctime moved.
-            let Some(metadata) = self.inspect_file(&file) else {
-                return Ok(None);
-            };
+            let metadata = self.inspect_file(&file, read_only)?;
             let stamp = Stamp::of(&metadata);
             binding.stamp = Some(stamp);
             if !metadata.is_file() || metadata.len() > (RECORD_BYTES + size + TRAILER_BYTES) as u64
@@ -1021,19 +1101,22 @@ impl DurableTailStore {
                 return Err(Refusal::Corrupt);
             }
             if let Some((content, old, _)) = self.durable.get(key) {
-                if !restoring && *old == stamp && (work != "overwrite" || content.is_some()) {
+                if !restoring && *old == stamp && content.is_some() {
+                    if retired && work == "guard" {
+                        return Err(Refusal::Repin);
+                    }
                     binding.content = *content;
                     return Ok(Some(binding));
                 }
             }
             #[cfg(test)]
             test_hooks::before_access(&path, "body")
-                .map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
+                .map_err(|e| self.read_failure(e, Refusal::Corrupt, read_only))?;
             let mut bytes = header;
             bytes.reserve_exact(INPUT_ENVELOPE - bytes.len());
             file.take((INPUT_ENVELOPE - n) as u64)
                 .read_to_end(&mut bytes)
-                .map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
+                .map_err(|e| self.read_failure(e, Refusal::Corrupt, read_only))?;
             let read = bytes.len().saturating_sub(n) as u64;
             match work {
                 "delete" => self.counters.delete_verify_bytes += read,
@@ -1041,8 +1124,32 @@ impl DurableTailStore {
                 _ => self.counters.guard_verify_bytes += read,
             }
             self.note_codec(bytes.capacity());
-            verify(&bytes, self.source)?;
-            if work == "overwrite" || restoring {
+            if let Err(reason) = verify(&bytes, self.source) {
+                // The one started byte-zero rebuild may replace this exact
+                // corrupt native predecessor. This header is never restore
+                // authority; allows_rebuild_capture checks context and revision.
+                if work == "rebuild"
+                    && reason == Refusal::Corrupt
+                    && binding.format == FORMAT_V3
+                    && self.rebuilt.get(key) == Some(&Rebuild::Started)
+                    && stamp_at(&path).ok() == Some(Some(stamp))
+                {
+                    return Ok(Some(binding));
+                }
+                if retired
+                    && work == "guard"
+                    && self.rebuilt.get(key) != Some(&Rebuild::Started)
+                    && reason == Refusal::Corrupt
+                    && stamp_at(&path).ok() == Some(Some(stamp))
+                {
+                    corrupt_retired = Some(stamp);
+                }
+                return Err(reason);
+            }
+            if retired && work == "guard" {
+                return Err(Refusal::Repin);
+            }
+            if work == "overwrite" || work == "rebuild" || restoring {
                 binding.content = Some(stored_digest(&bytes));
             }
             let content = stored_digest(&bytes);
@@ -1055,11 +1162,26 @@ impl DurableTailStore {
             }
             Ok(Some(binding))
         })();
-        if self.disabled.is_some() {
+        if !read_only && self.disabled.is_some() {
             return Ok(None);
         }
         if let Err(reason) = result {
-            self.durable.remove(key);
+            let exact_corrupt = self.durable.get(key).is_some_and(|(content, stamp, _)| {
+                content.is_none() && stamp_at(&self.record_path(key)).ok() == Some(Some(*stamp))
+            });
+            if !(exact_corrupt
+                && (reason == Refusal::Repin
+                    || (work == "overwrite"
+                        && reason == Refusal::Corrupt
+                        && self.rebuilt.get(key) == Some(&Rebuild::Started))))
+            {
+                self.durable.remove(key);
+            }
+            if let Some(stamp) = corrupt_retired {
+                // Not verified content: only the exact corrupt predecessor that
+                // the ordinary one-rebuild owner may replace after a Full.
+                self.memoize(*key, (None, stamp, false));
+            }
             if reason != Refusal::Repin {
                 self.counters.format_hold[reason as usize] += 1;
             }
@@ -1067,22 +1189,27 @@ impl DurableTailStore {
         result
     }
 
-    fn read_failure(&mut self, error: io::Error, reason: Refusal) -> Refusal {
-        if error.kind() != io::ErrorKind::InvalidData {
+    fn read_failure(&mut self, error: io::Error, reason: Refusal, read_only: bool) -> Refusal {
+        if !read_only && error.kind() != io::ErrorKind::InvalidData {
             self.disable("record_access");
         }
         reason
     }
 
-    fn inspect_file(&mut self, file: &File) -> Option<fs::Metadata> {
+    fn inspect_file(&mut self, file: &File, read_only: bool) -> Result<fs::Metadata, Refusal> {
         #[cfg(test)]
         if test_hooks::before_access(&self.dir, "fstat").is_err() {
-            self.disable("record_metadata");
-            return None;
+            if !read_only {
+                self.disable("record_metadata");
+            }
+            return Err(Refusal::Undecodable);
         }
-        file.metadata()
-            .inspect_err(|_| self.disable("record_metadata"))
-            .ok()
+        file.metadata().map_err(|_| {
+            if !read_only {
+                self.disable("record_metadata");
+            }
+            Refusal::Undecodable
+        })
     }
 
     /// U holds. T14 permits one rebuild; the adapter checks RAM before holding.
@@ -1130,6 +1257,10 @@ impl DurableTailStore {
         }
     }
 
+    pub(crate) fn rebuild_started(&self, key: &Digest32) -> bool {
+        self.rebuilt.get(key) == Some(&Rebuild::Started)
+    }
+
     pub(crate) fn full_hold(&mut self, key: &Digest32, start: bool) -> Option<Refusal> {
         self.full_guard(key, start, true, &[0; 32]).err()
     }
@@ -1154,11 +1285,7 @@ impl DurableTailStore {
         live_context: &Digest32,
     ) -> Result<Option<u64>, Refusal> {
         let held = self.guard_with_carrier(key, has_index, live_context);
-        // The OFF/M1 reader has no successor writer. Its optional corrupt
-        // cache may recover in RAM, but cannot consume an attempt whose only
-        // discharge would be a new durable record.
         if start
-            && !self.read_v1_only
             && held.is_ok()
             && self.disabled.is_none()
             && self.rebuilt.get(key) == Some(&Rebuild::Authorized)
@@ -1220,7 +1347,11 @@ impl DurableTailStore {
         self.counters.max_record_bytes = self.counters.max_record_bytes.max(bytes.len() as u64);
         let size = dispatch(&bytes).map_or(HEADER_V3_BYTES, |(_, _, _, size)| size);
         self.note_codec(bytes.capacity() + bytes.len().saturating_sub(size));
-        match decode(&bytes) {
+        match if privacy_erasure {
+            decode_for_erasure(&bytes, true)
+        } else {
+            decode(&bytes)
+        } {
             Ok(record) => {
                 if let Some((content, _, _)) = self.durable.get_mut(key) {
                     *content = Some(stored_digest(&bytes));
@@ -1367,9 +1498,7 @@ impl DurableTailStore {
                     }
                     file.sync_all()?;
                     true
-                } else if prior.is_some()
-                    && before == prior
-                    && verified.record.format == FORMAT_VERSION
+                } else if prior.is_some() && before == prior && verified.record.format == FORMAT_V3
                 {
                     if stamp_at(&path)? != before {
                         return Err(io::Error::other("predecessor changed"));
@@ -1430,11 +1559,7 @@ impl DurableTailStore {
         record: &DurableRecord,
         expected: &Expected,
     ) -> Option<MutationWitness> {
-        if record.eligible(expected).is_err()
-            || record.format == FORMAT_V1
-                && (record.record.binding.entry != expected.binding.entry
-                    || record.index_generation > expected.committed_generation)
-        {
+        if record.eligible(expected).is_err() {
             return None;
         }
         let key = record.record.binding.key;
@@ -1447,7 +1572,6 @@ impl DurableTailStore {
             original: original_digest(record, &digest),
             content: digest,
             stamp: *stamp,
-            migration_floor: None,
         };
         (*content == digest && self.witness_current(&proof)).then_some(proof)
     }
@@ -1481,10 +1605,6 @@ impl DurableTailStore {
         expected: &Expected,
         proof: &MutationWitness,
     ) {
-        if proof.is_migration() {
-            self.revoke(&record.record.binding.key);
-            return;
-        }
         self.authorize_bound_witness(
             record,
             expected,
@@ -1502,9 +1622,6 @@ impl DurableTailStore {
         self.revoke(&record.record.binding.key);
         let content = record_digest(record);
         if record.eligible(expected).is_err()
-            || record.format == FORMAT_V1
-                && (record.record.binding.entry != expected.binding.entry
-                    || record.index_generation > expected.committed_generation)
             || proof.key != record.record.binding.key
             || proof.original != identity
             || proof.content != content
@@ -1536,77 +1653,11 @@ impl DurableTailStore {
         self.durable.insert(key, value);
     }
 
-    /// Only the supported no-match acquisition classifier calls this, BEFORE O3 reserve.
-    pub(crate) fn migration_witness(
-        &self,
-        record: &DurableRecord,
-        current: &Expected,
-        floor: u64,
-    ) -> Option<MutationWitness> {
-        if self.source != DurableSource::ClaudeCode
-            || record.format != 1
-            || record.record.binding.source != self.source
-            || record.record.binding.key != current.binding.key
-            || record.record.binding.context != current.binding.context
-        {
-            return None;
-        }
-        let mut original = current.clone();
-        original.binding.scope = record.record.binding.scope;
-        original.binding.entry = record.record.binding.entry;
-        let mut proof = self.mutation_witness(record, &original)?;
-        proof.original = migration_binding(&proof.original, current);
-        proof.migration_floor = Some(std::num::NonZeroU64::new(floor)?);
-        Some(proof)
-    }
-    pub(crate) fn migration_matches(
-        &self,
-        proof: &MutationWitness,
-        record: &DurableRecord,
-        current: &Expected,
-    ) -> bool {
-        proof.key == current.binding.key
-            && record.record.binding.key == proof.key
-            && record.record.binding.context == current.binding.context
-            && proof.migration_floor.is_some()
-            && proof.original
-                == migration_binding(&original_digest(record, &record_digest(record)), current)
-            && proof.content == record_digest(record)
-            && self.witness_current(proof)
-    }
-    /// The caller supplies a completed native checkpoint and strict saved selection.
-    pub(crate) fn authorize_migration(
-        &mut self,
-        record: &DurableRecord,
-        current: &Expected,
-        replacement: &DurableCertificate,
-        proof: &MutationWitness,
-    ) {
-        self.revoke(&record.record.binding.key);
-        let old = &record.record.certificate;
-        if !self.migration_matches(proof, record, current)
-            || (old.device, old.inode) != (replacement.device, replacement.inode)
-            || (old.birth_nanos != 0
-                && replacement.birth_nanos != 0
-                && old.birth_nanos != replacement.birth_nanos)
-            || !proof
-                .migration_floor
-                .is_some_and(|floor| replacement.sealed_offset >= floor.get())
-        {
-            return;
-        }
-        let mut original = current.clone();
-        original.binding.scope = record.record.binding.scope;
-        original.binding.entry = record.record.binding.entry;
-        let identity = migration_binding(&original_digest(record, &record_digest(record)), current);
-        self.authorize_bound_witness(record, &original, proof, identity);
-    }
-    fn authorized(&mut self, key: &Digest32, format: u16) -> bool {
-        let allowed = format == FORMAT_V1 && self.source != DurableSource::ClaudeCode
-            || self.durable.get(key).is_some_and(|(_, stamp, yes)| {
-                *yes && fs::symlink_metadata(self.record_path(key))
-                    .is_ok_and(|m| Stamp::of(&m) == *stamp)
-            });
+    fn authorized(&mut self, key: &Digest32, _format: u16) -> bool {
+        let allowed = self.durable.get(key).is_some_and(|(_, stamp, yes)| {
+            *yes && fs::symlink_metadata(self.record_path(key))
+                .is_ok_and(|m| Stamp::of(&m) == *stamp)
+        });
         self.counters.mutation_unproved += u64::from(!allowed);
         allowed
     }
@@ -1655,7 +1706,7 @@ impl DurableTailStore {
         if !self.usable(Some(writer)) {
             return Ok(receipt);
         }
-        if !self.check_resources(writer, index_length) {
+        if !self.check_resources(writer, index_length)? {
             receipt
                 .deferred_keys
                 .extend(pending.iter().map(|record| record.binding.key));
@@ -1788,7 +1839,10 @@ impl DurableTailStore {
         let (mut on_disk, mut unlisted) = self
             .scan_disk()
             .inspect_err(|_| self.counters.store_write_failed[1] += 1)?;
-        let mut attempted = receipt.completed.len();
+        // Native staging and this post-save batch share the pass allowance.
+        // A declined native record must not bypass it through its RAM offer.
+        let mut attempted = self.stream_records + receipt.completed.len();
+        let mut encoded_pass_bytes = self.stream_bytes;
         for (record, content, prior, verified_prior) in dirty {
             if attempted >= MAX_BATCH {
                 receipt.deferred += 1;
@@ -1824,6 +1878,15 @@ impl DurableTailStore {
                 continue;
             }
             let bytes = encode(&stored);
+            if self.stream_records != 0
+                && encoded_pass_bytes
+                    .checked_add(bytes.len())
+                    .map_or(true, |bytes| bytes > WRITE_PASS_BYTES)
+            {
+                receipt.deferred += 1;
+                receipt.deferred_keys.push(key);
+                continue;
+            }
             let ack_bytes = if self.source == DurableSource::ClaudeCode {
                 BATCH_ACK_BYTES
             } else {
@@ -1851,6 +1914,7 @@ impl DurableTailStore {
                     .get_or_insert_with(|| Box::new([None; MAX_BATCH]));
             }
             attempted += 1;
+            encoded_pass_bytes = encoded_pass_bytes.saturating_add(bytes.len());
             let candidate = WireRecordIdentity::verified(&stored, &bytes);
             self.pending.insert(
                 key,
@@ -2208,94 +2272,349 @@ impl DurableTailStore {
         Ok(keys)
     }
 
-    /// Explicit privacy erasure after the owning cycle's index save. Only
-    /// fully verified records of the current representation are inspected;
-    /// unknown/future records retain their existing protection. This is not
-    /// overwrite authority, a receipt, or settlement of acquisition debt.
-    /// Compact pending receipt metadata stays owed if its record is erased.
-    pub(crate) fn purge_private_labels<W: SingleWriter>(
+    /// Known-empty inventory is the only negative privacy fact. An absent
+    /// store needs no sweep; an existing store with a missing/damaged inventory
+    /// fails closed. The inventory carries key digests only, never labels.
+    pub(crate) fn private_label_keys(&self) -> io::Result<Option<BTreeSet<Digest32>>> {
+        if matches!(fs::symlink_metadata(&self.dir), Err(e) if e.kind() == io::ErrorKind::NotFound)
+        {
+            return Ok(Some(BTreeSet::new()));
+        }
+        let path = self.dir.with_extension("private-labels");
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(_) => return Ok(None),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.uid() != our_uid() || metadata.mode() & 0o777 != 0o600 {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take((4 + 32 * MAX_RECORDS + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if !bytes.starts_with(b"PL01")
+            || (bytes.len() - 4) % 32 != 0
+            || bytes.len() > 4 + 32 * MAX_RECORDS
+        {
+            return Ok(None);
+        }
+        let mut keys = BTreeSet::new();
+        for key in bytes[4..].chunks_exact(32) {
+            if !keys.insert(key.try_into().expect("digest width")) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(keys))
+    }
+
+    /// Retention planning and erasure share one page. Every directory entry,
+    /// including foreign names and entry errors, consumes the visit allowance.
+    pub(crate) fn private_label_candidates(&mut self) -> io::Result<BTreeSet<Digest32>> {
+        if let Some(keys) = self.private_label_keys().unwrap_or(None) {
+            return Ok(keys);
+        }
+        if self.private_purge_page.is_none() {
+            if self.private_purge_entries.is_none() {
+                self.private_purge_entries = Some(fs::read_dir(&self.dir)?);
+            }
+            let entries = self.private_purge_entries.as_mut().expect("privacy cursor");
+            let mut page = PrivateLabelPage::default();
+            for _ in 0..GC_RECORDS_PER_PASS {
+                let Some(entry) = entries.next() else {
+                    page.complete = true;
+                    break;
+                };
+                page.visited += 1;
+                match entry {
+                    Ok(entry) => {
+                        if let Some(key) = entry
+                            .file_name()
+                            .to_str()
+                            .and_then(|name| name.strip_suffix(RECORD_SUFFIX))
+                            .and_then(parse_hex_digest)
+                        {
+                            page.keys.insert(key);
+                        }
+                    }
+                    Err(_) => page.refused += 1,
+                }
+            }
+            self.private_purge_page = Some(page);
+        }
+        Ok(self
+            .private_purge_page
+            .as_ref()
+            .expect("privacy page")
+            .keys
+            .clone())
+    }
+
+    pub(crate) fn private_label_purge_needed(&self, keep: Option<&BTreeSet<Digest32>>) -> bool {
+        !matches!(self.private_label_keys(), Ok(Some(keys)) if keys.iter().all(|key| keep.is_some_and(|keep| keep.contains(key))))
+    }
+
+    fn write_private_label_keys<W: SingleWriter>(
         &mut self,
         writer: &W,
+        keys: Option<&BTreeSet<Digest32>>,
+    ) -> io::Result<()> {
+        self.check_writer(writer)?;
+        ensure_private_dir(&self.dir)?;
+        let mut bytes = b"PL??".to_vec();
+        if let Some(keys) = keys.filter(|keys| keys.len() <= MAX_RECORDS) {
+            bytes = b"PL01".to_vec();
+            for key in keys {
+                bytes.extend_from_slice(key);
+            }
+        }
+        let path = self.dir.with_extension("private-labels");
+        write_atomic(
+            writer,
+            &self.dir,
+            &path,
+            &bytes,
+            stamp_at(&path)?,
+            self.cleanup.clone(),
+        )?;
+        self.sync_store()
+    }
+
+    /// Persist the inventory BEFORE any literal can reach a record or temp.
+    pub(crate) fn mark_private_labels<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        key: Digest32,
+    ) -> io::Result<()> {
+        // A newly staged literal invalidates a prior partial no-label sweep,
+        // including a new canonical key ordered before its old cursor.
+        self.private_purge_entries = None;
+        self.private_purge_page = None;
+        self.private_purge_dirty = false;
+        self.private_purge_kept.clear();
+        let mut keys = self.private_label_keys().unwrap_or(None);
+        if let Some(keys) = keys.as_mut() {
+            keys.insert(key);
+        }
+        self.write_private_label_keys(writer, keys.as_ref())
+    }
+
+    /// Consent/source erasure uses the existing bounded inventory and verifier.
+    /// `keep` is empty for revoked consent; otherwise it protects live PL keys.
+    pub(crate) fn purge_private_labels_kept<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        keep: &BTreeSet<Digest32>,
         mut contains: impl FnMut(&[u8]) -> bool,
     ) -> io::Result<PrivateLabelPurge> {
         self.check_writer(writer)?;
-        if !self.usable(Some(writer)) {
-            return Err(io::Error::other("privacy erasure store unavailable"));
-        }
-        let entries = match fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Ok(PrivateLabelPurge {
-                    erased: 0,
-                    refused: 0,
-                })
-            }
-            Err(e) => return Err(e),
-        };
+        let known = self.private_label_keys().unwrap_or(None);
+        let keys = self.private_label_candidates()?;
+        let mut remaining = BTreeSet::new();
         let mut report = PrivateLabelPurge {
+            visited: self
+                .private_purge_page
+                .as_mut()
+                .map_or(0, |page| std::mem::take(&mut page.visited)),
+            scanned: 0,
+            verified: 0,
             erased: 0,
-            refused: 0,
+            refused: self
+                .private_purge_page
+                .as_ref()
+                .map_or(0, |page| page.refused),
         };
-        // Stream names, holding at most one existing bounded record body.
-        // Consent erasure covers every known record, even after a bad entry.
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    report.refused += 1;
-                    continue;
-                }
-            };
-            let name = entry.file_name();
-            let Some(key) = name
-                .to_str()
-                .and_then(|s| s.strip_suffix(RECORD_SUFFIX))
-                .and_then(parse_hex_digest)
-            else {
+        let mut erased = 0;
+        for key in &keys {
+            if keep.contains(key) {
+                remaining.insert(*key);
                 continue;
-            };
-            let path = self.record_path(&key);
+            }
+            report.scanned += 1;
+            let path = self.record_path(key);
             let before = match stamp_at(&path) {
-                Ok(stamp) => stamp,
-                Err(_) => {
-                    report.refused += 1;
-                    continue;
-                }
-            };
-            let verified = match self.read_known(&key, Some(writer), true) {
-                Ok(Some(verified)) => verified,
                 Ok(None) => continue,
-                Err(Refusal::Unknown | Refusal::NewerFormat) => continue,
+                Ok(Some(stamp)) => stamp,
                 Err(_) => {
                     report.refused += 1;
+                    remaining.insert(*key);
                     continue;
                 }
             };
+            let verified = match self.read_known(key, Some(writer), true) {
+                Ok(Some(verified)) => verified,
+                Ok(None) if !path.exists() && self.disabled.is_none() => continue,
+                Err(Refusal::Repin) => continue, // The pre-PL pin cannot contain label literals.
+                _ => {
+                    report.refused += 1;
+                    remaining.insert(*key);
+                    continue;
+                }
+            };
+            report.verified += 1;
             if !contains(&verified.record.record.body) {
                 continue;
             }
-            if before.is_none() || stamp_at(&path).ok() != Some(before) {
+            if stamp_at(&path).ok() != Some(Some(before)) || remove_if_present(&path).is_err() {
                 report.refused += 1;
+                remaining.insert(*key);
                 continue;
             }
-            if remove_if_present(&path).is_err() {
-                report.refused += 1;
-                continue;
-            }
-            // Erasure revokes an undelivered retained completion, not the
-            // candidate's owed work. Reconciliation must subsequently prove
-            // synced absence and return Retired, never deliver that receipt.
-            if let Some(pending) = self.pending.get_mut(&key) {
+            if let Some(pending) = self.pending.get_mut(key) {
                 pending.completed = None;
             }
-            self.durable.remove(&key);
-            report.erased += 1;
+            self.durable.remove(key);
+            erased += 1;
         }
-        // Also sync an empty retry after an earlier failed erasure sync.
-        if self.sync_store().is_err() {
+        // No erase count until unlink AND its directory barrier have succeeded.
+        if erased > 0 && self.sync_store().is_err() {
+            report.refused += erased;
+            return Ok(report); // Previous inventory still says PL may exist.
+        }
+        report.erased = erased;
+        if known.is_none() {
+            self.private_purge_dirty |= report.refused > 0;
+            // Keep a bounded conservative positive inventory across pages.
+            // A live key is not an erase failure and need not be body-read.
+            for key in &remaining {
+                if self.private_purge_kept.len() < MAX_RECORDS
+                    || self.private_purge_kept.contains(key)
+                {
+                    self.private_purge_kept.insert(*key);
+                } else {
+                    self.private_purge_dirty = true;
+                }
+            }
+            let complete = self
+                .private_purge_page
+                .take()
+                .is_some_and(|page| page.complete);
+            if !complete {
+                // Keep the live directory cursor; do not rescan earlier names.
+                return Ok(report);
+            }
+            self.private_purge_entries = None;
+            if std::mem::take(&mut self.private_purge_dirty) {
+                self.private_purge_kept.clear();
+                // Earlier pages may owe retry, but a failure on this page is
+                // already counted. Never count the same refusal twice.
+                report.refused = report.refused.max(1);
+                return Ok(report);
+            }
+            remaining = std::mem::take(&mut self.private_purge_kept);
+        }
+        if self
+            .write_private_label_keys(writer, Some(&remaining))
+            .is_err()
+        {
             report.refused += 1;
         }
         Ok(report)
+    }
+
+    pub(crate) fn purge_private_labels<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        contains: impl FnMut(&[u8]) -> bool,
+    ) -> io::Result<PrivateLabelPurge> {
+        self.purge_private_labels_kept(writer, &BTreeSet::new(), contains)
+    }
+
+    /// OFF may remove only the retired v1 record for this published key.
+    /// Failure never gates native publication; the next publication retries.
+    pub(crate) fn invalidate_outgrown_v1<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        key: &Digest32,
+        published_end: u64,
+    ) -> io::Result<bool> {
+        let result = (|| -> io::Result<bool> {
+            self.check_writer(writer)?;
+            // Retry only our own unlink barrier, never the startup restore sync.
+            self.sync_off_v1_unlink()?;
+            if self.pending.contains_key(key) {
+                return Ok(false);
+            }
+            let header = match self.classify(key, "off_invalidate", Some(writer)) {
+                Ok(Some(header)) => header,
+                Ok(None) => return Ok(self.record_missing(key)),
+                Err(_) => return Err(io::Error::other("OFF v1 classification refused")),
+            };
+            if published_end <= header.record.certificate.length {
+                return Ok(false);
+            }
+            let path = self.record_path(key);
+            if stamp_at(&path)? != header.stamp {
+                return Ok(false); // Never unlink a replacement of the identified header.
+            }
+            remove_if_present(&path)?;
+            self.durable.remove(key);
+            // If the barrier fails, the next classification retries it even
+            // though the pathname is now absent. No deletion is reported early.
+            self.startup_synced = false;
+            self.off_v1_sync_due = true;
+            self.sync_off_v1_unlink()?;
+            Ok(true)
+        })();
+        if result.is_err() {
+            self.counters.off_v1_invalidate_failed += 1;
+        }
+        result
+    }
+
+    /// Physical absence after any outstanding OFF unlink barrier. A missing
+    /// name alone cannot settle a deletion whose directory sync failed.
+    pub(crate) fn record_missing(&self, key: &Digest32) -> bool {
+        !self.off_v1_sync_due && matches!(stamp_at(&self.record_path(key)), Ok(None))
+    }
+
+    /// Destination changes cannot drop an unlink that still owes its barrier.
+    pub(crate) fn retry_off_v1_unlink(
+        &mut self,
+        writer: Option<&dyn SingleWriter>,
+    ) -> io::Result<()> {
+        if !self.off_v1_sync_due {
+            return Ok(());
+        }
+        let result = (|| {
+            self.check_writer(
+                writer.ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?,
+            )?;
+            self.sync_off_v1_unlink()
+        })();
+        if result.is_err() {
+            self.counters.off_v1_invalidate_failed += 1;
+        }
+        result
+    }
+
+    pub(crate) fn inherit_off_v1_counts(&mut self, previous: &Self) {
+        debug_assert!(!previous.off_v1_sync_due);
+        self.counters.off_v1_invalidated += previous.counters.off_v1_invalidated;
+        self.counters.off_v1_invalidate_failed += previous.counters.off_v1_invalidate_failed;
+    }
+
+    fn sync_off_v1_unlink(&mut self) -> io::Result<()> {
+        if self.off_v1_sync_due {
+            if self.read_only_directory()? {
+                self.sync_store()?;
+            } else {
+                // A removed whole store is settled by its parent's barrier.
+                sync_dir(
+                    self.dir
+                        .parent()
+                        .ok_or_else(|| io::Error::other("store parent"))?,
+                )?;
+            }
+            self.off_v1_sync_due = false;
+            self.startup_synced = true;
+            self.counters.off_v1_invalidated += 1;
+        }
+        Ok(())
     }
 
     /// Retire exactly the verified predecessor. `sync_due` belongs to writer
@@ -2485,13 +2804,6 @@ impl DurableTailStore {
 impl MutationWitness {
     pub(crate) fn same_predecessor(&self, other: &Self) -> bool {
         self.key == other.key && self.content == other.content && self.stamp == other.stamp
-    }
-
-    pub(crate) fn migration_floor(&self) -> Option<u64> {
-        self.migration_floor.map(|floor| floor.get())
-    }
-    pub(crate) fn is_migration(&self) -> bool {
-        self.migration_floor.is_some()
     }
 }
 
@@ -3249,9 +3561,25 @@ impl<'a> Cursor<'a> {
 /// The version is checked before the trailer: a newer layout is not ours to
 /// judge. Everything else must pass the trailer and decode exactly.
 fn decode(bytes: &[u8]) -> Result<DurableRecord, Refusal> {
+    decode_for_erasure(bytes, false)
+}
+
+// Only consent erasure may inspect an admitted, label-capable v1 body.
+// The returned envelope is never admitted to restore or native provenance.
+fn decode_for_erasure(bytes: &[u8], erasure: bool) -> Result<DurableRecord, Refusal> {
     let (format, pin, source, _) = dispatch(bytes)?;
-    if retired_pin(source, format, &pin) {
-        return Err(Refusal::Repin);
+    if format == FORMAT_V1
+        && !(erasure
+            && source
+                .properties()
+                .representation(FORMAT_V3, &pin)
+                .is_some())
+    {
+        return Err(if retired_pin(source, format, &pin) {
+            Refusal::Repin
+        } else {
+            Refusal::Unknown
+        });
     }
 
     let source = bytes

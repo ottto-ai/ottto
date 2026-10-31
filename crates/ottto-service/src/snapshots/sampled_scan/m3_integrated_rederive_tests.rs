@@ -2,6 +2,7 @@
 use super::*;
 use crate::snapshots::sampled_scan::now_seconds;
 use crate::snapshots::sampled_scan::test_hooks::{self, Point};
+use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::transcript_acquisition::ReadMode;
 use std::cell::Cell;
 use std::io::{Seek, SeekFrom, Write};
@@ -41,9 +42,9 @@ impl ColdReplay {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         lines[0]["payload"]["source"] = serde_json::json!({
-            "subagent":{"thread_spawn":{"agent_path":"/agents/PRIVATE-LABEL-M3"}}
+            "subagent":{"thread_spawn":{"agent_path":"/root/private_label_m3"}}
         });
-        let mut text: String = lines.iter().map(|line| line.to_string() + "\n").collect();
+        let mut text: String = fixture::jsonl(lines);
         if raw_value {
             text.push_str("{\"$serde_json::private::RawValue\":\"{}\"}\n");
         }
@@ -95,10 +96,10 @@ impl ColdReplay {
             }))
             .unwrap(),
         );
-        index.save(&index_path).unwrap();
+        fixture::save(&index_path, &mut index);
         let key = local_index_key(&path);
         let i = Interpretation::of(SnapshotSource::Codex, &key, &index, false, &namespace);
-        let expected = expected(
+        let mut expected = expected(
             DurableSource::Codex,
             SnapshotSource::Codex,
             &key,
@@ -106,23 +107,28 @@ impl ColdReplay {
             &index,
             &i,
             Some((
-                store::FORMAT_V1,
+                store::FORMAT_V3,
                 codec::allowlist_digest(SnapshotSource::Codex),
                 effective_revision(SnapshotSource::Codex),
             )),
         )
         .unwrap();
-        let mut disk = DurableTailStore::new(
-            store::store_dir_for_index(&index_path),
-            DurableSource::Codex,
+        expected.binding.scope = v3_replay_scope(
+            SnapshotSource::Codex,
+            &scope,
+            &index,
+            &i,
+            effective_revision(SnapshotSource::Codex),
+            &acquired::ImmutableCounting::from_reduction(&reduction).unwrap(),
         );
+        let mut disk = fixture::store(&index_path, DurableSource::Codex);
         let receipt = disk
             .write_after_save(
                 test_locks::hold(&root),
                 index.generation,
                 0,
                 vec![PendingRecord {
-                    acquisition: None,
+                    acquisition: fixture_acquisition(SnapshotSource::Codex),
                     binding: expected.binding,
                     certificate: checkpoint
                         .durable_certificate(birth_unix_nanos(&std::fs::metadata(&path).unwrap()))
@@ -154,14 +160,12 @@ impl ColdReplay {
         local_index_key(&self.path)
     }
     fn cache(&self) -> SharedCache {
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(
+        fixture::cache(
             SnapshotSource::Codex,
             &self.index_path,
             &self.namespace,
             false,
-        );
-        cache
+        )
     }
     fn append(&self) {
         writeln!(
@@ -171,28 +175,21 @@ impl ColdReplay {
         .unwrap();
     }
     fn replace_body(&self, body: Vec<u8>) {
-        let mut disk = DurableTailStore::new(
-            store::store_dir_for_index(&self.index_path),
-            DurableSource::Codex,
-        );
+        let mut disk = fixture::store(&self.index_path, DurableSource::Codex);
         let ReadOutcome::Found(mut record) =
             disk.read(&full_pace_key(SnapshotSource::Codex, &self.key()))
         else {
             panic!("seed record")
         };
         record.record.body = body;
-        std::fs::write(
-            &self.record_path,
-            store::tests::pinned_v1_bytes(&record.record, record.index_generation),
-        )
-        .unwrap();
+        std::fs::write(&self.record_path, store::tests::current_bytes(&record)).unwrap();
     }
     fn scan(
         &self,
         cache: Arc<SharedCache>,
         index: ScanIndex,
     ) -> (ScanIndex, SourceScanResult, usize) {
-        let mut owned = OwnedSourceScan::new_with_identity_capture(
+        let owned = OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::Codex,
             &[self.root.to_path_buf()],
             index,
@@ -207,15 +204,12 @@ impl ColdReplay {
             false,
         )
         .with_sampled_acquisition(cache, self.namespace.clone());
-        for _ in 0..100_000 {
-            let fulls = owned.sampling.as_ref().unwrap().full_files;
-            match owned.step(None) {
-                OwnedSourceScanStep::Pending(next) => owned = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, fulls),
-            }
-        }
-        panic!("scan did not complete");
+        let (mut index, mut scan, modes, _) = fixture::scan(owned, 100_000);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        scan.finish_codex_capture_boundary(&mut index);
+        (index, scan, modes.0)
     }
+
     fn restore(&self, cache: &SharedCache) -> RestoreOutcome {
         let i = Interpretation::of(
             SnapshotSource::Codex,
@@ -292,7 +286,7 @@ fn cold_store_each_fence_class_and_certificate_reason_retires_before_one_full() 
                 FullReason::HeadChanged | FullReason::BoundaryChanged => {
                     // Distinct sample windows are needed to reach boundary_changed.
                     let needle = if reason == FullReason::HeadChanged {
-                        b"PRIVATE-LABEL-M3".as_slice()
+                        b"private_label_m3".as_slice()
                     } else {
                         b"PRIVATE-TITLE-M3".as_slice()
                     };
@@ -313,7 +307,7 @@ fn cold_store_each_fence_class_and_certificate_reason_retires_before_one_full() 
         let original_record = std::fs::read(&rig.record_path).unwrap();
         let (outcome, rows) = crate::local_resource_diagnostics::capture(|| rig.restore(&cache));
         assert!(
-            matches!(outcome, RestoreOutcome::Miss(MissClass::RealEdit(got) | MissClass::Failure(Failure::Certificate(CertificateRefusal::Changed(got)))) if got == reason),
+            matches!(outcome, RestoreOutcome::Miss(MissClass::Failure(Failure::Certificate(CertificateRefusal::Changed(got)))) if got == reason),
             "row {row}: {reason:?}"
         );
         if row < 5 {
@@ -333,7 +327,7 @@ fn cold_store_each_fence_class_and_certificate_reason_retires_before_one_full() 
         );
         cache
             .durable_write_after_save(
-                test_locks::hold(&rig.root),
+                crate::locked_state_dir::held_for(&rig.index_path).unwrap(),
                 SnapshotSource::Codex,
                 &rig.index,
             )
@@ -373,7 +367,7 @@ fn cold_store_each_fence_class_and_certificate_reason_retires_before_one_full() 
         assert!(idle.snapshots.is_empty());
         cache
             .durable_write_after_save(
-                test_locks::hold(&rig.root),
+                crate::locked_state_dir::held_for(&rig.index_path).unwrap(),
                 SnapshotSource::Codex,
                 &rig.index,
             )
@@ -533,4 +527,139 @@ fn claude_both_restore_floor_edges_hold_then_catch_up_without_moving_accepted_fa
         assert!(idle.snapshots.is_empty());
         assert_eq!(modes.0, 0);
     }
+}
+
+/// [regress] Exact native replacement must not retire its good successor after RAM eviction.
+#[test]
+fn native_replacement_finishes_retirement_before_eviction_and_growth() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for failed_barrier in [false, true] {
+        let rig = ColdReplay::new(None, false, false);
+        let original = std::fs::read(&rig.path).unwrap();
+        let offset = original
+            .windows(b"private_label_m3".len())
+            .position(|s| s == b"private_label_m3")
+            .unwrap();
+        let mut file = File::options().write(true).open(&rig.path).unwrap();
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        file.write_all(b"X").unwrap();
+        rig.append();
+        let cache = Arc::new(rig.cache());
+        assert!(matches!(rig.restore(&cache), RestoreOutcome::Miss(_)));
+        let digest = full_pace_key(SnapshotSource::Codex, &rig.key());
+        assert_eq!(
+            cache.durable().unwrap().key_debt[&digest].retire_source,
+            Some(DurableSource::Codex)
+        );
+        if failed_barrier {
+            store::test_hooks::set_before_dir_sync(Some(Box::new(|_| {
+                Err(std::io::Error::other("retirement barrier"))
+            })));
+            cache.durable_write_after_save(
+                crate::locked_state_dir::held_for(&rig.index_path).unwrap(),
+                SnapshotSource::Codex,
+                &rig.index,
+            );
+            store::test_hooks::set_before_dir_sync(None);
+            assert!(cache.durable().unwrap().key_debt[&digest].retire_sync);
+        }
+        let (next, _, fulls) = rig.scan(cache.clone(), rig.index.clone());
+        assert_eq!(fulls, 1);
+        cache.durable_write_after_save(
+            crate::locked_state_dir::held_for(&rig.index_path).unwrap(),
+            SnapshotSource::Codex,
+            &next,
+        );
+        {
+            let stores = cache.durable().unwrap();
+            assert!(
+                stores
+                    .key_debt
+                    .get(&digest)
+                    .is_none_or(|d| d.retire_source.is_none() && !d.retire_sync),
+                "replacement retires custody after failed_barrier={failed_barrier}"
+            );
+            assert!(stores
+                .retail_spent
+                .get(&digest)
+                .is_none_or(|c| c.original.is_none()));
+        }
+        cache.retained().unwrap().clear();
+        rig.append();
+        let (_, _, fulls) = rig.scan(cache.clone(), next);
+        assert_eq!(fulls, 0, "good successor must restore then Tail");
+    }
+}
+
+/// [money] A corrupt recognized retired predecessor gets one T14 Full, then restore/Tail.
+#[test]
+fn corrupt_retired_predecessor_rebuilds_once_without_withholding_native_usage() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let rig = ColdReplay::new(None, false, false);
+    let mut disk = fixture::store(&rig.index_path, DurableSource::Codex);
+    let ReadOutcome::Found(mut record) =
+        disk.read(&full_pace_key(SnapshotSource::Codex, &rig.key()))
+    else {
+        panic!("native fixture record");
+    };
+    record.record.allowlist =
+        store::parse_hex_digest("02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1")
+            .unwrap();
+    let mut bytes = store::tests::pinned_v1_bytes(&record.record, record.index_generation);
+    *bytes.last_mut().unwrap() ^= 1;
+    // Preserve the recognized header and damage its checksum, never decode it.
+    std::fs::write(&rig.record_path, bytes).unwrap();
+    rig.append();
+    {
+        let probe = rig.cache();
+        let source = SnapshotSource::Codex;
+        assert_eq!(
+            probe.durable_full_hold(source, &rig.key(), true).unwrap(),
+            None
+        );
+        assert_eq!(
+            probe.durable_full_hold(source, &rig.key(), false).unwrap(),
+            Some(store::Refusal::Corrupt)
+        );
+        assert_eq!(
+            probe
+                .durable_carrier_reprobe(source, &rig.key(), &ScanIndex::default())
+                .unwrap(),
+            None
+        );
+    }
+    let cache = Arc::new(rig.cache());
+    let (next, rebuilt, fulls) = rig.scan(cache.clone(), rig.index.clone());
+    assert_eq!(fulls, 1);
+    let (_, cold, _) = rig.scan(Arc::new(SharedCache::default()), ScanIndex::default());
+    assert_eq!(
+        serde_json::to_value(&rebuilt.snapshots).unwrap(),
+        serde_json::to_value(&cold.snapshots).unwrap()
+    );
+    let counts = cache.durable_counters(SnapshotSource::Codex).unwrap().1;
+    assert_eq!(counts.t14_rebuild, 1);
+    assert_eq!(counts.t14_rebuild_full_started, 1);
+    cache.durable_write_after_save(
+        crate::locked_state_dir::held_for(&rig.index_path).unwrap(),
+        SnapshotSource::Codex,
+        &next,
+    );
+    cache.retained().unwrap().clear();
+    rig.append();
+    let (_, _, fulls) = rig.scan(cache.clone(), next);
+    assert_eq!(fulls, 0);
+    assert_eq!(
+        cache
+            .durable_counters(SnapshotSource::Codex)
+            .unwrap()
+            .1
+            .t14_rebuild,
+        1
+    );
 }

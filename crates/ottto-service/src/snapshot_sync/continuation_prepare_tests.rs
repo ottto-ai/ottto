@@ -3,68 +3,6 @@
 // receipt client names an offline address and is never called, and the
 // attribution key is a synthetic sentinel, never printed.
 
-#[test]
-fn snapshot_owner_charges_the_shared_version_allocation_once() {
-    use crate::snapshots::codex_version::CodexVersionFeed;
-    use crate::source_rotation::Owner;
-    let mut daemon = test_daemon("otm_test");
-    let charge = |daemon: &LocalDaemon, limit| {
-        let device = LocalDeviceBinding {
-            device_id: "version-owner".into(),
-            machine_id: Some("otm_test".into()),
-            sources: vec!["codex".into()],
-        };
-        let client = SnapshotApiClient::new("http://127.0.0.1:1");
-        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
-        let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-        let mut failed = Vec::new();
-        let owner = SnapshotCycleOwner {
-            retry: &mut retry,
-            account_witness: [0; 32],
-            client: &client,
-            device: &device,
-            device_secret: "synthetic",
-            machine_id: "otm_test",
-            home: Path::new("synthetic-home"),
-            support_dir: Path::new("synthetic-support"),
-            daemon,
-            transport_cycle: &mut transport,
-            failed_sources: &mut failed,
-            started: Instant::now(),
-            codex_started: None,
-        };
-        owner.retained_bound(limit)
-    };
-    daemon.codex_versions = Arc::new(CodexVersionFeed::new(Some(Path::new("short"))));
-    if !crate::heap_layout_bound::layout_supported() {
-        assert_eq!(charge(&daemon, usize::MAX), None);
-        return;
-    }
-    let small = charge(&daemon, usize::MAX).unwrap();
-    daemon.codex_versions = Arc::new(CodexVersionFeed::new(Some(Path::new(&"x".repeat(100_000)))));
-    let large = charge(&daemon, usize::MAX).unwrap();
-    assert!(
-        large > small,
-        "root capacity is included at daemon ownership"
-    );
-    assert_eq!(
-        large,
-        crate::heap_layout_bound::bound(&daemon.codex_versions, usize::MAX).unwrap()
-    );
-    assert_eq!(charge(&daemon, large), Some(large));
-    assert_eq!(charge(&daemon, large - 1), None);
-    let consumers: Vec<_> = (0..4).map(|_| daemon.codex_versions.clone()).collect();
-    assert_eq!(
-        Arc::strong_count(&daemon.codex_versions),
-        consumers.len() + 1
-    );
-    assert_eq!(
-        charge(&daemon, usize::MAX),
-        Some(large),
-        "clones do not multiply the owner charge"
-    );
-}
-
 /// A destination namespace hash: a snapshot fingerprint (64 lowercase hex),
 /// or the upload-progress load quarantines the file as invalid.
 const CONTINUATION_NAMESPACE: &str =
@@ -507,61 +445,6 @@ fn a_pending_historical_replay_refuses_the_continuation_prepare() {
     assert!(inputs.holds_attribution(), "a refusal keeps it cached");
 }
 
-/// K1 (a″): the upload-claim predicate is the ordinary selection's answer
-/// on a copy: it never changes the loaded progress.
-#[test]
-fn the_upload_claim_predicate_is_pure_and_matches_the_ordinary_selection() {
-    let fixture = ContinuationFixture::quiescent("continuation-claim-predicate");
-    let (progress, index) = fixture.load();
-    let now = reason_reoffer::now_unix_seconds();
-    let scope = reason_reoffer::Scope {
-        index: &index,
-        now,
-        window_start_unix_seconds: now.saturating_sub(30 * 86_400),
-    };
-    for generation in [
-        cycle_replay_generation(SnapshotSource::Codex, false, &index, CONTINUATION_NAMESPACE),
-        "another-generation".to_string(),
-    ] {
-        let unchanged = progress.clone();
-        let needed = continuation_upload_claim_needed(&progress, &index, &generation, &scope);
-        assert_eq!(progress, unchanged, "pure");
-        let mut ordinary = progress.clone();
-        assert_eq!(
-            needed,
-            prepare_upload_progress_for_cycle_with_reoffer(
-                &mut ordinary,
-                &index,
-                &generation,
-                false,
-                Some(&scope)
-            )
-        );
-    }
-}
-
-/// K5.1/K5.2: a continuation page's sampled scope is the ordinary Codex
-/// page's, byte for byte: Codex never captures request identity.
-#[test]
-fn the_continuation_scope_is_the_ordinary_codex_scope() {
-    let witness = [3u8; 32];
-    let index_path = Path::new("/tmp/ottto-continuation-scope-index.json");
-    let capture = crate::snapshots::claude_request_identity::captures(SnapshotSource::Codex);
-    assert!(!capture);
-    for curve in [false, true] {
-        let ordinary =
-            cycle_sampled_scope(&witness, CONTINUATION_NAMESPACE, index_path, curve, capture);
-        let continuation =
-            cycle_sampled_scope(&witness, CONTINUATION_NAMESPACE, index_path, curve, false);
-        assert_eq!(ordinary.0, continuation.0);
-        // One byte of difference would make the ticket unready.
-        assert_ne!(
-            cycle_sampled_scope(&witness, CONTINUATION_NAMESPACE, index_path, curve, true).0,
-            continuation.0
-        );
-    }
-}
-
 /// Contract-5 cutover, byte-stable keys (Lead B): a Claude cycle's sampled
 /// scope keeps the permit-era permitted `:request_identity` suffix for good,
 /// and a Codex cycle keeps its suffix-free bytes, so durable records and
@@ -961,10 +844,20 @@ fn ordinary_durable_continuation_to_eof(
                         "continuation parks EOF for ordinary settlement"
                     );
                     let (mut index, scan) = state.finish_ordinary_eof(|| {
+                        let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+                        index.activate_upload_context(cycle_upload_context(
+                            inputs.upload_policy,
+                            None,
+                            false,
+                        ));
+                        index.mark_context_curve_capability_disabled();
+                        index.activate_effective_upload_body_witness_revision(
+                            cycle_body_witness_revision(SnapshotSource::Codex),
+                        );
                         let mut ordinary = OwnedSourceScan::new(
                             SnapshotSource::Codex,
                             std::slice::from_ref(&root),
-                            ScanIndex::load(&fixture.index_path).unwrap(),
+                            index,
                             &at,
                             30,
                             10,

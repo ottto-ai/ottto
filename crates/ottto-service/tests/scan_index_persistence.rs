@@ -5,7 +5,7 @@ use persistence::*;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -306,3 +306,101 @@ fn syntax_failure_never_erases_an_observed_storage_fence() {
 
 #[path = "support/scan_index_r3.rs"]
 mod r3;
+
+/// [format] Optional restore siblings never waive unsafe or unknown prior state,
+/// including a witness arriving between Missing and the first save.
+#[test]
+fn optional_restore_siblings_fail_closed_before_cleanup_or_encoding() {
+    use std::os::unix::fs::symlink;
+    for late in [false, true] {
+        for kind in [
+            "symlink",
+            "marker_symlink",
+            "non_private_dir",
+            "file",
+            "marker_dir",
+            "other",
+        ] {
+            let s = Scratch::new();
+            let store = s.store();
+            let baseline = if late {
+                let Opened::Missing(root) = store.open().unwrap() else {
+                    panic!("fresh")
+                };
+                Some(root)
+            } else {
+                None
+            };
+            let target = s.0.join("outside");
+            fs::create_dir(&target).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(target.join("content"), b"untouched").unwrap();
+            let witness = s.0.join(match kind {
+                "marker_symlink" | "marker_dir" => "scan-index.private-labels",
+                "other" => "scan-index.durable-tail.extra",
+                _ => "scan-index.durable-tail",
+            });
+            match kind {
+                "symlink" | "marker_symlink" => symlink(&target, &witness).unwrap(),
+                "non_private_dir" | "marker_dir" => {
+                    fs::create_dir(&witness).unwrap();
+                    fs::set_permissions(
+                        &witness,
+                        fs::Permissions::from_mode(if kind == "non_private_dir" {
+                            0o755
+                        } else {
+                            0o700
+                        }),
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    fs::write(&witness, b"prior state").unwrap();
+                    fs::set_permissions(&witness, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            }
+            let temp =
+                s.0.join(format!("scan-index.json.storage-tmp-{}", "a".repeat(32)));
+            fs::write(&temp, b"not discarded").unwrap();
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
+            let before = fs::read_dir(&s.0)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>();
+            if let Some(root) = baseline {
+                assert!(
+                    store
+                        .write_legacy(&root, 1, |_| panic!("must refuse before encoding"))
+                        .is_err(),
+                    "{kind}"
+                );
+            } else {
+                assert!(store.open().is_err(), "{kind}");
+            }
+            assert_eq!(fs::read(&temp).unwrap(), b"not discarded");
+            assert_eq!(fs::read(target.join("content")).unwrap(), b"untouched");
+            assert_eq!(
+                before,
+                fs::read_dir(&s.0)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "{kind}"
+            );
+            assert!(!s.root().exists());
+        }
+    }
+    // The same owned-directory validator rejects a real foreign directory.
+    // No root/lock creation occurs: LockedStore validates its parent first.
+    if fs::metadata("/").unwrap().uid() != unsafe { libc::geteuid() } {
+        assert!(LockedStore::new(
+            std::path::Path::new("/scan-index.json"),
+            Binding {
+                source: Source::Claude,
+                namespace_hash: "a".repeat(64),
+            },
+            FIELDS
+        )
+        .is_err());
+    }
+}

@@ -4,9 +4,10 @@
 //! every platform.
 use super::*;
 use crate::durable_tail_codec::take_l_spans;
+use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::transcript_acquisition::{birth_unix_nanos, FullReason, ReadMode, Scope};
 use serde_json::json;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -14,6 +15,286 @@ const NOW: u64 = 1_790_000_000;
 const COLLECTED: &str = "2026-10-20T12:00:00Z";
 const CLAUDE_SESSION: &str = "5f0c2a8e-1111-4222-8333-944445555666";
 const CODEX_SESSION: &str = "0199f7a0-0000-7000-8000-0000000d7a11";
+
+// The store publishes no reduction from a retired pin. In particular, a valid
+// checksum never turns opaque old-writer bytes into current money authority.
+fn assert_v1_has_no_record(
+    golden: &crate::snapshots::sampled_scan::transition_fixture::V1Golden<'_>,
+    bytes: &[u8],
+    corrupt: Option<bool>,
+) {
+    use crate::durable_tail_store::{DurableSource, DurableTailStore, ReadOutcome, Refusal};
+    let scratch = Scratch::new(golden.case_id);
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = if golden.metadata["source_tag"] == 1 {
+        DurableSource::ClaudeCode
+    } else {
+        DurableSource::Codex
+    };
+    let key = bytes[43..75].try_into().unwrap();
+    let path = scratch.0.join(format!("{}.rec", hex(key)));
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut disk = DurableTailStore::new(scratch.0.clone(), source);
+    assert_eq!(
+        disk.missing_cause(&key),
+        Some("repin"),
+        "{}",
+        golden.case_id
+    );
+    // `body` is the existing store hook immediately before body input is
+    // read for verification/decode. No body input means no decoder can run.
+    struct ClearAccess;
+    impl Drop for ClearAccess {
+        fn drop(&mut self) {
+            crate::durable_tail_store::test_hooks::set_before_access(None);
+        }
+    }
+    let clear = ClearAccess;
+    let headers = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = headers.clone();
+    crate::durable_tail_store::test_hooks::set_before_access(Some(Box::new(
+        move |_, operation| {
+            assert_ne!(
+                operation, "body",
+                "retired dispatch must precede body input/decode"
+            );
+            if operation == "header" {
+                seen.set(seen.get() + 1);
+            }
+            Ok(())
+        },
+    )));
+    assert_eq!(disk.read(&key), ReadOutcome::Missing, "{}", golden.case_id);
+    assert_eq!(headers.get(), 1, "the header was actually classified");
+    if corrupt.is_none() {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        return; // ClearAccess drops: no body input/decode in this entire row.
+    }
+    drop(clear);
+    let corrupt = corrupt.unwrap();
+    assert_eq!(disk.full_hold(&key, corrupt), None);
+    assert_eq!(
+        disk.full_hold(&key, false),
+        corrupt.then_some(Refusal::Corrupt)
+    );
+    assert_eq!(disk.read(&key), ReadOutcome::Missing);
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+/// [format] Exact retired v1 pins dispatch to a rebuild without decoding a body.
+#[test]
+fn v1_goldens_retired_pin_dispatches_without_a_record() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        assert_eq!(
+            golden.input.len() as u64,
+            golden.expected["post_save"]["entry"]["size_bytes"]
+        );
+        for (name, range) in [
+            ("key", 43..75),
+            ("context", 75..107),
+            ("scope", 107..139),
+            ("entry", 139..171),
+        ] {
+            assert_eq!(
+                hex(golden.record[range].try_into().unwrap()),
+                golden.expected["binding"][name]
+            );
+        }
+        assert_eq!(
+            u64::from_le_bytes(golden.record[171..179].try_into().unwrap()),
+            golden.metadata["index_generation"]
+        );
+        assert_v1_has_no_record(&golden, golden.record, Some(false));
+    }
+}
+
+/// [format] A one-byte body edit cannot supply a reduction; the integrity guard
+/// refuses its corrupt envelope after the single ordinary rebuild allowance.
+#[test]
+fn v1_goldens_one_byte_body_edit_refuses_a_record() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        let mut changed = golden.record.to_vec();
+        changed[crate::durable_tail_store::HEADER_BYTES] ^= 1;
+        assert_v1_has_no_record(&golden, &changed, Some(true));
+    }
+}
+
+/// [format] Swapping the archived selector maps cannot publish a reduction.
+#[test]
+fn v1_goldens_selector_swap_refuses_a_record() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        if golden.metadata["selector_span"].is_null() {
+            continue;
+        }
+        let span = &golden.metadata["selector_span"];
+        let start = span["offset"].as_u64().unwrap() as usize;
+        let context_len = span["context"]["length"].as_u64().unwrap() as usize;
+        let length = span["length"].as_u64().unwrap() as usize;
+        let mut changed = golden.record.to_vec();
+        changed[start..start + length].rotate_left(context_len);
+        assert_ne!(changed, golden.record);
+        assert_v1_has_no_record(&golden, &changed, Some(true));
+    }
+}
+
+fn resign_v1_mutation(bytes: &mut [u8]) {
+    use sha2::{Digest, Sha256};
+    let end = bytes.len() - 32;
+    let checksum = Sha256::digest(&bytes[..end]);
+    bytes[end..].copy_from_slice(&checksum);
+}
+
+// Attack the current representation too: retired dispatch alone would make
+// every body mutation below vacuous. A changed pin must not launder old bytes.
+fn assert_v1_mutation_refused(
+    golden: &crate::snapshots::sampled_scan::transition_fixture::V1Golden<'_>,
+    bytes: &[u8],
+) {
+    use crate::durable_tail_store::{DurableSource, DurableTailStore, ReadOutcome};
+    assert_v1_has_no_record(golden, bytes, None);
+    let source = if golden.metadata["source_tag"] == 1 {
+        SnapshotSource::ClaudeCode
+    } else {
+        SnapshotSource::Codex
+    };
+    let ds = if source == SnapshotSource::ClaudeCode {
+        DurableSource::ClaudeCode
+    } else {
+        DurableSource::Codex
+    };
+    let mut attack = bytes.to_vec();
+    attack[10..42].copy_from_slice(&allowlist_digest(source));
+    resign_v1_mutation(&mut attack);
+    let scratch = Scratch::new(golden.case_id);
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let key = attack[43..75].try_into().unwrap();
+    let path = scratch.0.join(format!("{}.rec", hex(key)));
+    fs::write(&path, &attack).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    for enabled in [false, true] {
+        let _policy = if enabled {
+            crate::snapshots::RestartRestoreForTest::enabled()
+        } else {
+            crate::snapshots::RestartRestoreForTest::disabled()
+        };
+        let mut disk = DurableTailStore::new(scratch.0.clone(), ds);
+        assert!(
+            matches!(disk.read(&key), ReadOutcome::Refused(_)),
+            "{}: current-pin attack cannot publish a reduction",
+            golden.case_id
+        );
+        assert_eq!(
+            disk.full_hold(&key, true),
+            Some(crate::durable_tail_store::Refusal::Unknown),
+            "a forged pin cannot authorize a rebuild Full"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            attack,
+            "refusal leaves the input immutable"
+        );
+    }
+}
+
+/// [money] Opaque serializer-header tokens inside an archived payload, even
+/// with a valid checksum, never grant restored money authority under M3.
+#[test]
+fn pinned_v1_refuses_impl_with_opaque_header_tokens() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        for header in [
+            "impl<T: Marker<{ /* { */ 2 }>> Durable for Added<T>",
+            r##"impl<T: Marker<{ { let _ = r#"{}"#; 2 } }>> Durable for Added<T>"##,
+            "#[cfg(unix)] impl<T> Durable for Added<T>",
+            "macro_rules! nested { () => { impl<T: Marker<{ 2 }>> Durable for Added<T> { BODY } }; }",
+        ] {
+            for value in [9, 7] {
+                let body = format!("fn put(&self, e: &mut Enc) {{ e.varint({value}) }}");
+                let mutation = if header.contains("BODY") {
+                    header.replace("BODY", &body)
+                } else {
+                    format!("{header} {{ {body} }}")
+                };
+                let mut changed = golden.record.to_vec();
+                let start = crate::durable_tail_store::HEADER_BYTES;
+                changed[start..start + mutation.len()].copy_from_slice(mutation.as_bytes());
+                resign_v1_mutation(&mut changed);
+                assert_v1_mutation_refused(&golden, &changed);
+            }
+        }
+    }
+}
+
+/// [money] Reversed publication and shadowed iteration over archived fields
+/// never publish an old reduction, including with a recomputed checksum.
+#[test]
+fn pinned_v1_refuses_body_publication_and_shadowed_iterator() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        for shadowed_iterator in [false, true] {
+            let mut changed = golden.record.to_vec();
+            let start = crate::durable_tail_store::HEADER_BYTES;
+            let end = changed.len() - 32;
+            if shadowed_iterator {
+                // Reverse iteration over two same-typed, unequal selector maps.
+                let span = &golden.metadata["selector_span"];
+                if span.is_null() {
+                    continue;
+                }
+                let offset = span["offset"].as_u64().unwrap() as usize;
+                let length = span["length"].as_u64().unwrap() as usize;
+                let context_len = span["context"]["length"].as_u64().unwrap() as usize;
+                changed[offset..offset + length].rotate_left(context_len);
+            } else {
+                changed[start..end].reverse();
+            }
+            assert_ne!(changed, golden.record);
+            resign_v1_mutation(&mut changed);
+            assert_v1_mutation_refused(&golden, &changed);
+        }
+    }
+}
+
+/// [format] Unequal historical selector maps catch both reader and writer swaps.
+#[test]
+fn v1_golden_selector_named_fields_and_writer_order() {
+    use crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens;
+    let golden = load_v1_goldens()
+        .unwrap()
+        .into_iter()
+        .find(|g| g.case_id == "claude-selector-unequal")
+        .unwrap();
+    let span = &golden.metadata["selector_span"];
+    let offset = span["offset"].as_u64().unwrap() as usize;
+    let length = span["length"].as_u64().unwrap() as usize;
+    let bytes = &golden.record[offset..offset + length];
+    let mut d = Dec::new(bytes);
+    let capture = SelectorCapture::take(&mut d).unwrap();
+    d.finish().unwrap();
+    let independent = SelectorCapture {
+        context: BTreeMap::from([("service_tier".into(), "priority".into())]),
+        sources: BTreeMap::from([("service_tier".into(), "derived_from_logs_2".into())]),
+    };
+    assert_eq!(capture, independent);
+    let mut e = Enc::bytes(length);
+    independent.put(&mut e).unwrap();
+    assert_eq!(e.into_bytes(), bytes);
+    let map_span = |name: &str| {
+        let offset = span[name]["offset"].as_u64().unwrap() as usize;
+        let length = span[name]["length"].as_u64().unwrap() as usize;
+        &golden.record[offset..offset + length]
+    };
+    assert_eq!([map_span("context"), map_span("sources")].concat(), bytes);
+    let swapped_bytes = [map_span("sources"), map_span("context")].concat();
+    let mut d = Dec::new(&swapped_bytes);
+    let swapped = SelectorCapture::take(&mut d).unwrap();
+    d.finish().unwrap();
+    assert_eq!(swapped.context, independent.sources);
+    assert_eq!(swapped.sources, independent.context);
+    assert_ne!(
+        swapped, independent,
+        "same-type map swap parses but changes semantics"
+    );
+}
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -52,18 +333,7 @@ fn apply_for(source: SnapshotSource) -> fn(&Value, &mut SnapshotAccumulator) {
 }
 
 fn parser(path: &Path, source: SnapshotSource) -> OwnedJsonlParser {
-    OwnedJsonlParser::new(
-        File::open(path).unwrap(),
-        path,
-        source,
-        apply_for(source),
-        None,
-        None,
-        None,
-        false,
-        true,
-    )
-    .unwrap()
+    fixture::parser(source, path, File::open(path).unwrap(), apply_for(source))
 }
 
 /// A cold positioned Full read: the retained copy and its checkpoint.
@@ -73,13 +343,7 @@ fn full_read(path: &Path, source: SnapshotSource) -> (CachedJsonlReduction, Chec
         .prepare_acquisition(None, &scope(), None, NOW)
         .unwrap();
     assert!(matches!(mode, ReadMode::Full(_)));
-    while !parser.step().unwrap() {}
-    let reduction = parser.reduction_copy();
-    let checkpoint = match parser.certify_without_retention(&scope(), NOW).unwrap() {
-        SideCertificate::Certified { completed, .. } => completed.checkpoint,
-        _ => panic!("a clean fixture read is certified"),
-    };
-    (reduction, checkpoint)
+    fixture::finish_record(&mut parser, &scope(), NOW)
 }
 
 /// The finished upload items of a parser that read to completion. Claude
@@ -158,11 +422,30 @@ fn items_at(
     json!({"items": serde_json::to_value(&parsed.snapshots).unwrap(), "money": money})
 }
 
-/// The unsampled native oracle: a plain cold parse, no acquisition.
+/// The unsampled native oracle: an independently admitted cold Full.
 fn cold_items(path: &Path, source: SnapshotSource) -> Value {
     let mut parser = parser(path, source);
+    assert!(matches!(
+        parser
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap(),
+        ReadMode::Full(_)
+    ));
     while !parser.step().unwrap() {}
     items(parser, path, source)
+}
+
+fn assert_cold_items(path: &Path, source: SnapshotSource, actual: &Value) {
+    let cold = cold_items(path, source);
+    let mut differences = Vec::new();
+    sampled_scan::transition_fixture::money_oracle::diff(
+        "native_body",
+        &cold,
+        actual,
+        &mut differences,
+    );
+    assert!(differences.is_empty(), "{source:?}: {differences:#?}");
+    assert_eq!(actual, &cold, "{source:?}");
 }
 
 /// Every encoded class and every content field, for exact equality.
@@ -182,8 +465,10 @@ fn restore(
     source: SnapshotSource,
 ) -> Result<(CachedJsonlReduction, RederiveReceipt), Refuse> {
     let decoded = decode(body, source).expect("decode");
-    let parser = rederive_parser(File::open(path).unwrap(), path, &decoded).unwrap();
-    decoded.rederive(parser, &mut File::open(path).unwrap(), line_cap())
+    let plan = decoded.rederive_plan().map_err(Refuse::NotRederivable)?;
+    decoded
+        .rederive_content_planned(&File::open(path).unwrap(), &plan)
+        .map(|(reduction, receipt, _)| (reduction, receipt))
 }
 
 /// A later skill reference must not also create an unsupported opening-call
@@ -585,7 +870,7 @@ fn record_body_holds_no_content_and_provider_ids_only_in_l_fields() {
     }
 }
 
-/// F1 instruction canary, per source: two sessions (one file rewritten in
+/// [format] F1 instruction canary, per source: two sessions (one file rewritten in
 /// place) differing only in private instruction text of equal length. Their retained copies differ
 /// (the text and its reversible `ConfigDigest` are content), yet the
 /// encoded reductions are byte-identical (nothing derived from the text is
@@ -719,7 +1004,7 @@ fn e_content_refuses_and_approved_mid_file_skills_persist() {
     );
 }
 
-/// SOURCE P2-5: request-shape and blob keys (client content hashes of
+/// [format] SOURCE P2-5: request-shape and blob keys (client content hashes of
 /// instruction text) are stored only as their domain-separated SHA-256 (`H`),
 /// never raw, whatever the key holds. The fixture seals with the request-1
 /// window still holding both, keyed by the secret, so a raw key would show as
@@ -823,7 +1108,7 @@ fn attribution_selector_context_refuses_the_record() {
     }
 }
 
-/// Decode plus bounded re-derivation gives back exactly the retained copy,
+/// [format] Decode plus bounded re-derivation gives back exactly the retained copy,
 /// content fields included, within the head bound and named-line budget.
 #[test]
 fn restore_rederives_the_exact_retained_copy() {
@@ -1120,7 +1405,7 @@ fn pi_tail_title_follows_its_update_and_the_first_prompt_fields_stay() {
     assert_eq!(tailed[0]["attribution_facts"], cold[0]["attribution_facts"]);
 }
 
-/// Full-equivalence control per source: a restored copy continued by Tail
+/// [money] Full-equivalence control per source: a restored copy continued by Tail
 /// finishes to the same upload items as a cold Full of the grown file.
 #[test]
 fn restore_then_tail_matches_cold_full() {
@@ -1154,19 +1439,8 @@ fn restore_then_tail_matches_cold_full() {
         drop(file);
         let mut held = File::open(&path).unwrap();
         let (checkpoint, _) = certificate.restore(&mut held, scope()).unwrap();
-        let (oracle, _) = restore(&path, &body, case.source).unwrap();
-        let (restored, _) = {
-            let decoded = decode(&body, case.source).unwrap();
-            decoded
-                .rederive_plan()
-                .map_err(Refuse::NotRederivable)
-                .and_then(|plan| {
-                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
-                })
-                .map(|(reduction, receipt, _)| (reduction, receipt))
-        }
-        .unwrap();
-        assert_eq!(full_digest(&restored), full_digest(&oracle));
+        let (restored, _) = restore(&path, &body, case.source).unwrap();
+        assert_eq!(full_digest(&restored), full_digest(&reduction));
         let mut continued = parser(&path, case.source);
         let mode = continued
             .prepare_acquisition(
@@ -1219,16 +1493,11 @@ fn restore_then_tail_matches_cold_full() {
                 grouping(&cold_reduction.accumulator)
             );
         }
-        assert_eq!(
-            items(continued, &path, case.source),
-            cold_items(&path, case.source),
-            "{:?}",
-            case.source
-        );
+        assert_cold_items(&path, case.source, &items(continued, &path, case.source));
     }
 }
 
-/// A metadata-only touch (ctime moves, bytes and mtime do not) still
+/// [format] A metadata-only touch (ctime moves, bytes and mtime do not) still
 /// restores, and the restored checkpoint reads as Unchanged.
 #[test]
 fn metadata_only_touch_restores_unchanged() {
@@ -1284,7 +1553,7 @@ fn edit_in_place(path: &Path, at: u64, bytes: &[u8]) {
     file.set_modified(modified).unwrap();
 }
 
-/// Crash matrix after a checkpoint, with real records: truncate, replace,
+/// [format] Crash matrix after a checkpoint, with real records: truncate, replace,
 /// a same-size edit in a sample window, and a same-size edit of a
 /// re-derived field outside both windows. Each ends in a Full read with
 /// nothing restored.
@@ -1369,9 +1638,7 @@ fn edits_after_the_checkpoint_refuse_restore() {
         .unwrap();
     assert_eq!(
         restore(&path, &body, source).err(),
-        Some(Refuse::NotRederivable(
-            "SnapshotAccumulator.first_prompt_material"
-        ))
+        Some(Refuse::NotRederivable("content_fence"))
     );
 }
 
@@ -1688,7 +1955,7 @@ fn budget_bounds_hold() {
     assert_eq!(MAX_BATCH, 32);
 }
 
-/// Budget receipt (measured) on the synthetic transcripts: body and record
+/// [format] Budget receipt (measured) on the synthetic transcripts: body and record
 /// bytes, the encode buffer, and one restore's re-derivation I/O.
 #[test]
 fn codec_budget_receipt() {
@@ -1935,32 +2202,6 @@ fn borrowed_count_exact_encoding_matches_populated_both_source_canaries() {
         assert_borrowed_count_identity(&reduction);
     }
     assert_eq!(covered, BTreeSet::from(["claude_code", "codex"]));
-}
-
-#[test]
-fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
-    let scratch = Scratch::new("zst-refusal");
-    let plain = scratch.write(
-        "plain.jsonl",
-        &[format!(
-            r#"{{"type":"session_meta","payload":{{"id":"{CODEX_SESSION}"}}}}"#
-        )],
-    );
-    let (reduction, _) = full_read(&plain, SnapshotSource::Codex);
-    let body = encode(&reduction, 8 * 1024 * 1024, jsonl_line_cap() as u64).unwrap();
-    let decoded = decode(&body, SnapshotSource::Codex).unwrap();
-    let archive = scratch.0.join("rollout.jsonl.zst");
-    fs::write(&archive, b"synthetic archive bytes").unwrap();
-    let mut file = File::open(&archive).unwrap();
-    file.seek(SeekFrom::Start(3)).unwrap();
-    codex_zst_refusal_tests::assert_refused(CodexZstCause::DurableTailUnsupported, || {
-        assert!(rederive_parser(file.try_clone().unwrap(), &archive, &decoded).is_err());
-        assert_eq!(
-            file.stream_position().unwrap(),
-            3,
-            "refused before offset use"
-        );
-    });
 }
 
 /// [money] tail reuse allowance cannot block an independently due full.
@@ -2372,7 +2613,7 @@ fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
             );
             while !tail.step().unwrap() {}
             let actual = items(tail, &path, source);
-            assert_eq!(actual, cold_items(&path, source));
+            assert_cold_items(&path, source, &actual);
             assert!(actual.to_string().contains("Synthetic first prompt"));
         }
     }
@@ -2711,6 +2952,7 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
         let mut scan = SourceScanResult::empty(source);
         scan.snapshots = parsed.snapshots;
         scan.pending_finalization.push(PendingIndexFinalization {
+            withheld_content: None,
             restored_behind_accepted: sampled_scan::durable_tail::restored_tail_below_accepted(
                 source,
                 true,
@@ -3035,4 +3277,143 @@ fn copied_only_pi_fork_is_complete_emits_zero_and_restores_tail() {
         bad["items"].as_array().unwrap().is_empty(),
         "invalid owned evidence cannot manufacture a zero carrier"
     );
+}
+/// [money] A certified PRE body cannot replace its predecessor after native
+/// finish reports loss. E5's Pi seal-boundaries fixture supplies the real
+/// cross-shape conflict; this unit seam covers the source-independent decision.
+#[test]
+fn native_finish_loss_keeps_predecessor_and_discloses_without_receipt_hold() {
+    use crate::snapshots::sampled_scan::durable_tail::{
+        FinishAcquisition, NativeFinishAttempt, PrepareOutcome,
+    };
+    let _on = RestartRestoreForTest::enabled();
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = Scratch::new("native-finish-loss");
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let _lock = crate::locked_state_dir::test_locks::hold(&root.0);
+    let source = SnapshotSource::Codex;
+    let path = root.write("source.jsonl", &codex_lines());
+    let key = local_index_key(&path);
+    let index_path = root.0.join("index.json");
+    let cache = sampled_scan::SharedCache::default();
+    let mut index = ScanIndex::default();
+    index.save(&index_path).unwrap();
+    let mut predecessor = None;
+    for loss in [
+        "none",
+        "dropped_usage",
+        "incomplete_parse",
+        "ownership",
+        "zero_snapshot",
+    ] {
+        cache.durable_begin_pass(source, &index_path, &scope(), false);
+        let held = File::open(&path).unwrap();
+        let identity = opened_object_identity(source, &mut held.try_clone().unwrap()).unwrap();
+        let mut live = parser(&path, source);
+        let mode = live.prepare_acquisition(None, &scope(), None, NOW).unwrap();
+        while !live.step().unwrap() {}
+        live.accumulator.first_prompt_material = None;
+        live.accumulator.first_prompt_title = None;
+        let SideCertificate::Certified { mut completed, .. } =
+            live.certify_without_retention(&scope(), NOW).unwrap()
+        else {
+            panic!("loss is unknown at certification")
+        };
+        let counting =
+            sampled_scan::durable_tail::ImmutableCounting::from_accumulator(&live.accumulator)
+                .unwrap();
+        bind_native_chain(
+            &cache,
+            &mut completed,
+            &NativeChainRequest {
+                source,
+                key: &key,
+                opened_object_identity: &identity,
+                mode,
+                counting: Some(counting),
+                held: &held,
+                index: &index,
+            },
+        );
+        let mut acquisition = FinishAcquisition::Certified(completed);
+        let mut preparation = None;
+        let mut native = live
+            .finish_native(
+                FinishRequest {
+                    expected_opened_object_identity: &identity,
+                    path: &path,
+                    collected_at: COLLECTED,
+                    source_file_fingerprint: "finish-loss".into(),
+                    codex_title_metadata: None,
+                    claude_title_metadata: None,
+                    attribution_context: None,
+                    repository_identity: None,
+                    money_context: None,
+                },
+                Some(&mut |view| {
+                    preparation = stage_preparation(&mut acquisition, view, |lease, view| {
+                        cache.prepare_live(lease, view)
+                    });
+                }),
+            )
+            .unwrap();
+        assert!(
+            matches!(preparation, Some(PrepareOutcome::Prepared(_))),
+            "a real successor was staged before finish: {loss}"
+        );
+        // Inject only the final native report at the unit boundary. The
+        // certificate, staged body, predecessor, and commit fences stay real.
+        match loss {
+            "dropped_usage" => {
+                native.recognized_usage_drop_count = 1;
+                native.dropped_usage_record_count = 1;
+            }
+            "incomplete_parse" => native.report.malformed_json_line_count = 1,
+            "ownership" => native.ownership_incomplete_file_count = 1,
+            "zero_snapshot" => native.zero_snapshot_usage_evidence = true,
+            _ => {}
+        }
+        let settled = settle_native_attempt(
+            &cache,
+            NativeFinishAttempt {
+                native: Ok(native),
+                acquisition,
+                preparation,
+            },
+            held,
+            NativeFence {
+                source,
+                key: &key,
+                path: &path,
+                expected_opened_object_identity: &identity,
+                committed_index: &index,
+            },
+        );
+        let native = settled.native.unwrap();
+        let record_path = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "rec"))
+            .unwrap();
+        let bytes = fs::read(record_path).unwrap();
+        if loss == "none" {
+            assert!(settled.publication.is_some_and(|p| p.publishes()));
+            predecessor = Some(bytes);
+        } else {
+            assert_eq!(bytes, *predecessor.as_ref().unwrap(), "{loss}");
+            assert!(settled.publication.is_none(), "native discloses {loss}");
+            assert!(
+                settled.completed.is_none(),
+                "lossy candidate is not retained"
+            );
+            if loss == "dropped_usage" {
+                assert_eq!(native.dropped_usage_record_count, 1);
+            }
+        }
+        // A buggy commit would publish this distinct generation even when
+        // the reduction bytes happen to equal the predecessor's body.
+        index.generation += 1;
+    }
 }

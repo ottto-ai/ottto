@@ -1,15 +1,15 @@
 //! Lead B's condition for #882: count the restart Fulls left by a failed
 //! post-save store write, and the write failures themselves. Counters and
 //! alarm only; the requeue fix is E1 / M3 D3.
-use super::tests::{certificate, codex_budget_fixture};
+use super::tests::{certificate, native_fixture, native_record, native_v3_completion};
 use super::*;
 use crate::locked_state_dir::test_locks;
 use crate::transcript_acquisition::ReadMode;
 use std::time::{Duration, Instant};
 
-// EntryChanged is the Codex strict-binding observation. Claude keeps its
-// original-v1 adapter and accepted-floor holds; it is not this counter premise.
-const SOURCE: SnapshotSource = SnapshotSource::Codex;
+// In v3, a verified Claude accepted extent beyond the native predecessor is
+// the EntryChanged observation. It exercises the same process-local diagnostics.
+const SOURCE: SnapshotSource = SnapshotSource::ClaudeCode;
 
 struct Restarted {
     root: PathBuf,
@@ -54,7 +54,6 @@ impl Restarted {
             RestoreOutcome::StaleUnregistered(reason, _) => {
                 panic!("unexpected unregistered obligation: {reason}")
             }
-            RestoreOutcome::M1Restored(_) => panic!("M3 fixture must enable its switch"),
             RestoreOutcome::Held(_) => "held",
         }
     }
@@ -83,7 +82,7 @@ fn restart_over(name: &str, stale: Option<bool>) -> Restarted {
     let root = crate::test_scratch::private_dir(name);
     let lock = test_locks::hold(&root);
     let path = root.join("fixture.jsonl");
-    codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
+    native_fixture(&path);
     let key = local_index_key(&path);
     let namespace = Scope("store-write-failed".into());
     let scope = Scope("store-write-failed-file".into());
@@ -92,7 +91,7 @@ fn restart_over(name: &str, stale: Option<bool>) -> Restarted {
     index.files.insert(
         key.clone(),
         serde_json::from_value(serde_json::json!({
-            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp-accepted",
+            "size_bytes":std::fs::metadata(&path).unwrap().len(),"modified_unix_seconds":1,"source_file_fingerprint":"fp-accepted",
             "effective_upload_body_witness_revision":effective_revision(SOURCE)
         }))
         .unwrap(),
@@ -101,13 +100,9 @@ fn restart_over(name: &str, stale: Option<bool>) -> Restarted {
     if let Some(stale) = stale {
         let ds = durable_source(SOURCE).unwrap();
         let interpretation = Interpretation::of(SOURCE, &key, &index, false, &namespace);
-        let mut binding = expected(ds, SOURCE, &key, &scope, &index, &interpretation, None)
+        let binding = expected(ds, SOURCE, &key, &scope, &index, &interpretation, None)
             .unwrap()
             .binding;
-        if stale {
-            // The predecessor: written for the entry before the accepted one.
-            binding.entry[0] ^= 1;
-        }
         let mut certificate = certificate(&path, &scope);
         certificate.audit_debt_unix_seconds = None;
         let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
@@ -117,16 +112,30 @@ fn restart_over(name: &str, stale: Option<bool>) -> Restarted {
                 index.generation,
                 0,
                 vec![PendingRecord {
-                    acquisition: None,
+                    acquisition: super::tests::fixture_acquisition(SOURCE),
                     binding,
                     certificate,
-                    body: crate::snapshots::durable_store_fixture_body(SOURCE, 0, 0),
+                    body: codec::encode(
+                        &native_record(&path, &scope).0,
+                        store::BODY_BYTES,
+                        jsonl_line_cap() as u64,
+                    )
+                    .unwrap(),
                     allowlist: codec::allowlist_digest(SOURCE),
                 }],
             )
             .unwrap();
         assert_eq!(receipt.written, 1);
+        if stale {
+            std::io::Write::write_all(
+                &mut File::options().append(true).open(&path).unwrap(),
+                b"{}\n",
+            )
+            .unwrap();
+            index.files.get_mut(&key).unwrap().size_bytes = std::fs::metadata(&path).unwrap().len();
+        }
     }
+    index.save(&index_path).unwrap();
     let cache = SharedCache::default();
     cache.durable_begin_pass(SOURCE, &index_path, &namespace, false);
     Restarted {
@@ -197,8 +206,9 @@ fn fault_free_restart_leaves_the_counters_at_zero() {
                 drop(taken);
                 lease.release();
             }
+            RestoreOutcome::QuietPending => {}
             RestoreOutcome::Degraded if !crate::heap_layout_bound::layout_supported() => {
-                // Correct binding, but this binary cannot retain a decoded v1
+                // Correct binding, but this binary cannot retain a decoded v3
                 // graph. This is eligibility only: no Full is started here.
                 assert_eq!(run.counts().restored, 0);
             }
@@ -322,27 +332,27 @@ fn failed_write_case(fail: bool) {
     let root = crate::test_scratch::ScratchDir::new("ottto-dt-store-write-failed");
     let lock = test_locks::hold(&root);
     let path = root.join("source.jsonl");
-    let source = SnapshotSource::Codex;
-    codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
+    let source = SnapshotSource::ClaudeCode;
+    native_fixture(&path);
     let key = local_index_key(&path);
     let scope = Scope("store-write-failed-file".into());
     let namespace = Scope("store-write-failed-scan".into());
     let index_path = root.join("index.json");
     let record = store::store_dir_for_index(&index_path).join(format!(
         "{}.rec",
-        store::key_digest(DurableSource::Codex, &key)
+        store::key_digest(DurableSource::ClaudeCode, &key)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     ));
     // Drive the real parser/certificate and retained owner, but deliberately
-    // exercise M1's post-save writer: no native v3 seed or synthetic receipt.
+    // exercise M1's post-save writer with a natively acquired v3 chain.
     let parse = |taken| {
         let mut parser = OwnedJsonlParser::new(
             File::open(&path).unwrap(),
             &path,
             source,
-            apply_codex_line,
+            apply_claude_code_line,
             None,
             None,
             None,
@@ -379,6 +389,13 @@ fn failed_write_case(fail: bool) {
     cache.durable_begin_pass(source, &index_path, &namespace, false);
     let (completed, mode, _, _) = parse(None);
     assert!(matches!(mode, ReadMode::Full(_)));
+    let completed = native_v3_completion(
+        &cache,
+        &path,
+        source,
+        completed.reduction.unwrap(),
+        completed.checkpoint,
+    );
     assert!(cache.insert_admitted(key.clone(), completed, 0));
     cache.durable_note_selection(&key, "fp-a");
     cache.durable_note_scope(source, &key, &scope);
@@ -407,6 +424,13 @@ fn failed_write_case(fail: bool) {
     let (completed, mode, bytes, _) = parse(Some(Box::new(taken)));
     assert_eq!(mode, ReadMode::Tail);
     assert_eq!(bytes, suffix_bytes, "RAM Tail reads only new bytes");
+    let completed = native_v3_completion(
+        &cache,
+        &path,
+        source,
+        completed.reduction.unwrap(),
+        completed.checkpoint,
+    );
     assert!(cache.insert_admitted(key.clone(), completed, 0));
     cache.durable_note_selection(&key, "fp-b");
     cache.durable_note_scope(source, &key, &scope);

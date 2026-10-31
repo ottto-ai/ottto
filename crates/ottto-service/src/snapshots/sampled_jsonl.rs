@@ -282,27 +282,6 @@ impl OwnedJsonlParser {
             .map_err(|rejected| rejected.error)
     }
 
-    pub(in crate::snapshots) fn prepare_acquisition_owned_with_reuse_gate(
-        &mut self,
-        taken: Option<Box<crate::transcript_cache::Taken<CachedJsonlReduction>>>,
-        scope: &Scope,
-        debt: Option<AuditDebt>,
-        now: u64,
-        reuse: impl FnMut(&Checkpoint, &File) -> Result<bool>,
-    ) -> std::result::Result<ReadMode, PrepareRejected> {
-        #[cfg(test)]
-        if let Some(original) = taken.as_ref() {
-            if let Err(error) = preparation_tests::check(original) {
-                return Err(PrepareRejected {
-                    error,
-                    taken,
-                    refusal: PreparationRefusal::Transient,
-                });
-            }
-        }
-        self.prepare_acquisition_inner(taken, scope, debt, now, (true, None), reuse)
-    }
-
     fn prepare_acquisition_inner(
         &mut self,
         mut taken: Option<Box<crate::transcript_cache::Taken<CachedJsonlReduction>>>,
@@ -336,10 +315,12 @@ impl OwnedJsonlParser {
             Ok(())
         })();
         if let Err(error) = checked {
-            crate::local_resource_diagnostics::durable_tail_alarm(
-                self.source.api_slug(),
-                &serde_json::json!({"prepare_invariant": 1}),
-            );
+            if restart_restore::enabled() {
+                crate::local_resource_diagnostics::durable_tail_alarm(
+                    self.source.api_slug(),
+                    &serde_json::json!({"prepare_invariant": 1}),
+                );
+            }
             return Err(PrepareRejected {
                 error,
                 taken,

@@ -8,11 +8,9 @@
 //! where in the file each was last assigned. Growth-only M3 restore prepays a
 //! bounded native content replay and fences every X field before adoption.
 //! Empty obligations move the paid decoded graph.
-//! The native parser also serves the default-OFF M1 warm-restore route.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 
 pub(crate) mod pl_text;
 
@@ -322,12 +320,14 @@ pub(crate) struct Decoded {
     rederive: Rederive,
 }
 
+#[cfg(test)]
 pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Corrupt> {
     let source = crate::durable_tail_store::DurableSource::from_snapshot(source).ok_or(Corrupt)?;
     let row = source.properties();
     (row.decode)(body, row.snapshot)
 }
 
+#[cfg(test)]
 pub(in crate::snapshots) fn decode_body(
     body: &[u8],
     source: SnapshotSource,
@@ -464,6 +464,7 @@ impl Decoded {
 
     /// Move the already-paid graph only when no content needs native input.
     /// Even a zero head mark cannot excuse a nonempty digest obligation.
+    #[cfg(test)]
     pub(crate) fn without_rederive(
         self,
     ) -> Result<(CachedJsonlReduction, RederiveReceipt), RederiveUnfunded> {
@@ -473,13 +474,15 @@ impl Decoded {
         Ok((self.reduction, RederiveReceipt::default()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
+        self.reduction.durable_counting()
+    }
+
     pub(in crate::snapshots) fn immutable_counting(
         &self,
     ) -> Result<crate::snapshots::ImmutableCounting, crate::durable_tail_store::Refusal> {
         crate::snapshots::ImmutableCounting::from_reduction(&self.reduction)
-    }
-    pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
-        self.reduction.durable_counting()
     }
 
     /// How far the head re-parse must read: the latest mark of a field to
@@ -528,136 +531,6 @@ impl Decoded {
             .ok_or(Refuse::NotRederivable("SnapshotAccumulator.title"))?;
         Ok((offset.saturating_add(len) > head_end).then_some((offset, len)))
     }
-
-    /// Re-derives the content fields with `parser`, a fresh parser for the
-    /// same source and options on a descriptor of the same file positioned at
-    /// 0 (`rederive_parser`), and `file` for the named-line pread. Every value
-    /// must hash-equal its digest. The decoded copy is consumed either way: a
-    /// refusal leaves nothing behind.
-    pub(crate) fn rederive(
-        self,
-        mut parser: OwnedJsonlParser,
-        file: &mut File,
-        line_cap: u64,
-    ) -> Result<(CachedJsonlReduction, RederiveReceipt), Refuse> {
-        let end = self.head_end()?;
-        let title_line = self.title_line(end)?;
-        let Self {
-            mut reduction,
-            rederive,
-        } = self;
-        let mut receipt = RederiveReceipt::default();
-        let refused = Refuse::NotRederivable;
-        if end > 0 {
-            parser.reader.set_extent_limit(end);
-            loop {
-                match parser.step() {
-                    Ok(true) => break,
-                    Ok(false) => {}
-                    Err(_) => return Err(refused("head")),
-                }
-            }
-            receipt.head_bytes = parser.reader.consumed_bytes();
-            if receipt.head_bytes != end {
-                return Err(refused("head"));
-            }
-        }
-        if let Some((offset, len)) = title_line {
-            if len > line_cap || len == 0 {
-                return Err(refused("SnapshotAccumulator.title"));
-            }
-            let line =
-                pread_line(file, offset, len).map_err(|_| refused("SnapshotAccumulator.title"))?;
-            receipt.named_lines = 1;
-            receipt.line_bytes = len;
-            let value = std::str::from_utf8(&line)
-                .ok()
-                .and_then(|text| {
-                    serde_json::from_str::<Value>(text.trim_end_matches(['\n', '\r'])).ok()
-                })
-                .ok_or(refused("SnapshotAccumulator.title"))?;
-            parser.tee_line(&value);
-        }
-        let fresh = &mut parser.accumulator;
-        let acc = &mut reduction.accumulator;
-        if let Some(expected) = rederive.first_prompt {
-            if first_prompt_digest(fresh)? != expected {
-                return Err(refused("SnapshotAccumulator.first_prompt_material"));
-            }
-            acc.first_prompt_material = fresh.first_prompt_material.take();
-            acc.first_prompt_title = fresh.first_prompt_title.take();
-        }
-        if let Some(expected) = rederive.workspace {
-            if workspace_digest(fresh)? != expected {
-                return Err(refused("SnapshotAccumulator.workspace_path"));
-            }
-            acc.workspace_path = fresh.workspace_path.take();
-        }
-        if let Some(expected) = rederive.agent_label {
-            if agent_label_digest(fresh)? != expected {
-                return Err(refused("SnapshotAccumulator.codex_agent_label"));
-            }
-            acc.codex_agent_label = fresh.codex_agent_label.take();
-        }
-        if let Some(expected) = rederive.session_start {
-            if fresh.session_start.durable_content_hash()? != expected {
-                return Err(refused("SessionStartState.content_end"));
-            }
-            acc.session_start
-                .adopt_durable_content(&mut fresh.session_start);
-        }
-        if let Some(expected) = rederive.title {
-            if title_digest(fresh)? != expected {
-                return Err(refused("SnapshotAccumulator.title"));
-            }
-            acc.title = fresh.title.take();
-        }
-        Ok((reduction, receipt))
-    }
-}
-
-/// Exactly one complete line: `len` bytes at `offset`, ending in a newline.
-fn pread_line(file: &mut File, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
-    let len = usize::try_from(len).map_err(|_| std::io::ErrorKind::InvalidInput)?;
-    let mut line = vec![0; len];
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(&mut line)?;
-    if line.last() != Some(&b'\n') {
-        return Err(std::io::ErrorKind::InvalidData.into());
-    }
-    Ok(line)
-}
-
-/// A fresh parser for re-derivation: the same source and options as the
-/// record's, no title metadata and no live inputs (no re-derived field reads
-/// them), and no reread binding (a bounded head read, not a Full).
-pub(crate) fn rederive_parser(
-    mut file: File,
-    path: &Path,
-    decoded: &Decoded,
-) -> Result<OwnedJsonlParser> {
-    if decoded.reduction.accumulator.source == SnapshotSource::Codex {
-        refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)?;
-    }
-    // A duplicated descriptor shares the held one's offset: start at 0.
-    file.seek(SeekFrom::Start(0))?;
-    let acc = &decoded.reduction.accumulator;
-    let mut parser = OwnedJsonlParser::new(
-        file,
-        path,
-        acc.source,
-        crate::durable_tail_store::DurableSource::from_snapshot(acc.source)
-            .ok_or_else(|| anyhow::anyhow!("unadmitted durable source"))?
-            .properties()
-            .apply_line,
-        None,
-        None,
-        None,
-        acc.artifacts_enabled,
-        acc.context_curve_enabled,
-    )?;
-    parser.accumulator.claude_request_identity_capture = acc.claude_request_identity_capture;
-    Ok(parser)
 }
 
 #[cfg(test)]

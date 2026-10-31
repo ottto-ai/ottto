@@ -15,7 +15,7 @@ pub(super) struct ResourcePause {
     next_probe: SystemTime,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RecordIdentity {
     binding: Binding,
     certificate: DurableCertificate,
@@ -69,7 +69,7 @@ impl RecordIdentity {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(crate) struct ReceiptProof {
     identity: Box<RecordIdentity>,
     stamp: Stamp,
@@ -81,6 +81,20 @@ impl ReceiptProof {
     }
     pub(crate) fn generation(&self) -> u64 {
         self.identity.generation
+    }
+}
+
+impl std::fmt::Debug for RecordIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordIdentity")
+            .field("format", &self.format)
+            .field("encoded_len", &self.encoded_len)
+            .finish()
+    }
+}
+impl std::fmt::Debug for ReceiptProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ReceiptProof").field(&self.identity).finish()
     }
 }
 
@@ -534,6 +548,39 @@ impl DurableTailStore {
         checked
     }
 
+    /// Capture permission for the one started native rebuild. Corruption
+    /// supplies no reduction or mutation proof; replacement remains post-save.
+    pub(crate) fn allows_rebuild_capture(
+        &mut self,
+        binding: &Binding,
+        revision: u64,
+        lease: &mut ActiveLease,
+    ) -> Result<bool, ActiveOverBudget> {
+        let key = binding.key;
+        if self.rebuilt.get(&key) != Some(&Rebuild::Started) {
+            return Ok(false);
+        }
+        lease.charge(RESTORE_INPUT_BYTES)?;
+        let Some(header) = self.classify(&key, "rebuild", None).ok().flatten() else {
+            return Ok(false);
+        };
+        let Some(stamp) = header.stamp else {
+            return Ok(false);
+        };
+        if header.format != FORMAT_V3
+            || header.content.is_some()
+            || header.record.binding.context != binding.context
+            || !header
+                .record
+                .acquisition
+                .is_some_and(|a| a.acquired_revision == revision)
+            || stamp_at(&self.record_path(&key)).ok() != Some(Some(stamp))
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     pub(crate) fn prepare_stream(
         &mut self,
         writer: &dyn SingleWriter,
@@ -558,7 +605,7 @@ impl DurableTailStore {
             if self.disabled.is_some() {
                 return Err(io::Error::other("store disabled"));
             }
-            if !self.check_resources(writer, 0) {
+            if !self.check_resources(writer, 0)? {
                 return Err(io::Error::from_raw_os_error(libc::ENOSPC));
             }
             let size = header_len(header.format, header.binding.source, &header.allowlist)
@@ -628,11 +675,22 @@ impl DurableTailStore {
                 if retired_pin(self.source, old.format, &old.record.allowlist) {
                     // THE classifier verifies the opaque predecessor and funds the
                     // ordinary exact-stamp overwrite permission; never decode it.
-                    self.classify(&key, "overwrite", Some(writer))
-                        .map_err(|reason| {
+                    match self.classify(&key, "overwrite", Some(writer)) {
+                        Ok(_) => {}
+                        Err(Refusal::Corrupt)
+                            if old.record.binding.context == header.binding.context
+                                && self.rebuilt.get(&key) == Some(&Rebuild::Started)
+                                && self.durable.get(&key).is_some_and(|(content, stamp, _)| {
+                                    content.is_none() && *stamp == prior
+                                }) =>
+                        {
+                            self.memoize(key, (None, prior, true));
+                        }
+                        Err(reason) => {
                             protected = Some(reason);
-                            io::Error::other("unverified retired predecessor")
-                        })?;
+                            return Err(io::Error::other("unverified retired predecessor"));
+                        }
+                    }
                 }
                 if stamp_at(&attempt.path)? != Some(prior) || !self.authorized(&key, old.format) {
                     protected = Some(Refusal::Unbindable);
@@ -933,19 +991,23 @@ impl DurableTailStore {
     pub(crate) fn resource_paused(&self) -> bool {
         self.resource_pause.is_some()
     }
-    pub(crate) fn check_resources(&mut self, writer: &dyn SingleWriter, index_len: u64) -> bool {
+    pub(crate) fn check_resources(
+        &mut self,
+        writer: &dyn SingleWriter,
+        index_len: u64,
+    ) -> io::Result<bool> {
         if self.check_writer(writer).is_err() || self.disabled.is_some() {
-            return false;
+            return Ok(false);
         }
         let now = SystemTime::now();
         if let Some(pause) = self.resource_pause.as_mut() {
             if now < pause.next_probe {
                 self.counters.resource_pause_skipped += 1;
-                return false;
+                return Ok(false);
             }
             pause.next_probe = now + PAUSE_RECHECK;
         } else if self.resource_checked {
-            return self.resource_granted;
+            return Ok(self.resource_granted);
         }
         self.counters.resource_pause_checks += 1;
         let dir = if self.dir.exists() {
@@ -954,7 +1016,8 @@ impl DurableTailStore {
             self.dir.parent().unwrap_or(&self.dir)
         };
         // One statvfs reserves a whole bounded pass, not one syscall per record.
-        let enough = above_floor(dir, WRITE_PASS_BYTES as u64, index_len).unwrap_or(false);
+        let enough = above_floor(dir, WRITE_PASS_BYTES as u64, index_len)
+            .inspect_err(|_| self.counters.store_write_failed[2] += 1)?;
         self.resource_checked = true;
         self.resource_granted = enough;
         if !enough {
@@ -963,7 +1026,7 @@ impl DurableTailStore {
                 self.counters.budget_refused += 1;
             }
             self.pause_resources();
-            return false;
+            return Ok(false);
         }
         if let Some(pause) = self.resource_pause.take() {
             self.counters.resource_paused_seconds =
@@ -972,7 +1035,7 @@ impl DurableTailStore {
                         .map_or(0, |age| age.as_secs()),
                 );
         }
-        true
+        Ok(true)
     }
     pub(crate) fn note_degraded_publish(&mut self) {
         self.counters.durable_write_failed_published += 1;
@@ -1020,6 +1083,9 @@ pub(super) fn no_space(error: &io::Error) -> bool {
 mod tests {
     use super::*;
     use crate::durable_tail_store::tests::{binding, certificate, Scratch};
+    use crate::snapshots::sampled_scan::transition_fixture::native_cold::{
+        self as fixture, commit,
+    };
 
     fn header(scratch: &Scratch, source: DurableSource, count: u64) -> (PreparedHeader, Vec<u8>) {
         let snapshot = source.properties().snapshot;
@@ -1029,42 +1095,9 @@ mod tests {
         binding.source = source;
         binding.entry = [0; 32];
         (
-            PreparedHeader {
-                binding,
-                certificate: certificate(&path),
-                format: FORMAT_V3,
-                allowlist: source.properties().allowlist(),
-                acquisition: AcquisitionFields {
-                    acquired_revision: 17,
-                    protocol: crate::snapshots::AcquisitionProtocol::WriteAhead,
-                },
-                generation: 9,
-                body_len: body.len(),
-            },
+            fixture::native_header(source, binding, certificate(&path), 17, 9, body.len()),
             body,
         )
-    }
-    fn commit(
-        store: &mut DurableTailStore,
-        writer: &dyn SingleWriter,
-        header: PreparedHeader,
-        body: &[u8],
-    ) -> ReceiptProof {
-        let prepared = store
-            .prepare_stream(writer, header)
-            .unwrap()
-            .write(|out| {
-                out.write_all(body)
-                    .map_err(|_| codec::Refuse::WriteFailed)?;
-                Ok(body.len())
-            })
-            .unwrap();
-        let committed = store
-            .commit_stream(writer, prepared)
-            .unwrap()
-            .commit()
-            .unwrap();
-        store.finish_stream(committed).unwrap()
     }
     /// [money] native population beyond memo bound reverifies and updates without hold.
     #[test]
@@ -1102,7 +1135,6 @@ mod tests {
             &record,
             &Expected {
                 binding: record.record.binding.clone(),
-                committed_generation: next.generation,
             },
         );
         assert!(

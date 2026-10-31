@@ -213,6 +213,14 @@ def has_forbidden_diff(diff):
     return any(diff[kind] for kind in ("added", "removed", "changed"))
 
 
+def require_base_scan_fixture(base):
+    """Keep the base's scanner adapter: the head's may require newer runtime APIs."""
+    fixture = base / "crates/ottto-service/src/snapshots/e2_pipeline_scan_fixture.rs"
+    text = fixture.read_text()
+    if any(f"fn {name}(" not in text for name in ("scan", "scan_other", "begin_durable")):
+        raise RuntimeError("base compat: scanner fixture lacks scan/scan_other/begin_durable")
+
+
 def main():
     started = time.monotonic()
     repo = Path.cwd()
@@ -252,8 +260,7 @@ def main():
     try:
         # Only test code is transplanted. No P2a/runtime/limits/lockfile changes.
         sync = Path("crates/ottto-service/src/snapshot_sync")
-        helpers = Path("crates/ottto-service/src/snapshots/e2_pipeline_scan_fixture.rs")
-        shutil.copy2(repo / helpers, base / helpers)
+        require_base_scan_fixture(base)
         shutil.copy2(repo / sync / "money_equivalence_tests.rs", base / sync / "money_equivalence_tests.rs")
         # Bases before #870 have no audit-retirement reconcile: their post-save
         # step is durable_after_save alone. Call the base's own production step.
