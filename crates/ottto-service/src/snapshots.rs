@@ -45695,7 +45695,9 @@ fn open_and_identify_scan_candidate_with_rescue_at(
             .get(&local_index_key(&candidate.path))
             .is_some_and(|entry| {
                 entry.codex_compressed_hold.is_some()
-                    && (!retention.retry_allowed || !entry.custody_retry_due(&candidate.path))
+                    && (cache.is_none()
+                        || !retention.retry_allowed
+                        || !entry.custody_retry_due(&candidate.path))
             })
     {
         return None;
@@ -45785,7 +45787,9 @@ fn open_and_identify_scan_candidate_with_rescue_at(
         .and_then(|entry| entry.archive.as_ref().map(|archive| (entry, archive)))
         .filter(|(entry, archive)| {
             source == SnapshotSource::Codex
-                && (!retention.retry_allowed || !entry.custody_retry_due(&candidate.path))
+                && (cache.is_none()
+                    || !retention.retry_allowed
+                    || !entry.custody_retry_due(&candidate.path))
                 && archive.quiet(&opened_file)
         })
     {
