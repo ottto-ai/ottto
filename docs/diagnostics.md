@@ -60,6 +60,77 @@ appear in this section. Approved upload uses the existing disclosure and consent
 
 ## Local Resource Measurements
 
+The default-OFF state-v2 backend uses stage `claude_state_v2` in this same
+local sink. Conversion remains paused while publication integration is incomplete;
+these measurements alone do not establish conversion or rollout acceptance.
+Only opted-in or already active Claude custody enables the resource probes;
+Codex and Pi keep their existing measurements.
+
+| Field | Measurement |
+| --- | --- |
+| `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. |
+| `retained_heap_bytes.{active_graph,cached_graph}.{account_pending,usage_pending,family.requests,census,side_maps,files}` | Requested-layout retained heap estimates by owning graph and class, excluding inline stack slots. Usage excludes the separately charged request-membership maps. Side maps cover remaining index fields, excluding runtime route handles. Cached graph is sampled once before acquisition; active graph at post-pass maintenance before finish releases its inputs. |
+| `cpu_per_pass_us.{p50,p95,max}` | Process CPU delta from prepare through finish returning; p50/p95 use the latest 128 samples, max is the observed lifetime maximum. Concurrent daemon work may contribute. |
+| `rss_bytes.{steady,peak}` | Current endpoint and sampled process RSS peak around save/hydrate. |
+| `decoded_per_pass.{rows,headers,chunks}` | Successful physical value/header/chunk decodes since prepare, including repeated reads for validation or encoding. A failed value may still contribute validated chunks. Reset at each prepare, published at the completed pass boundary. |
+| `cache_used_bytes` | SQLite `SQLITE_DBSTATUS_CACHE_USED` current connection bytes, refreshed at maintenance boundaries. |
+| `bytes_written_per_pass` | Process-attributed physical writes from prepare through finish returning, including other concurrent daemon work. No encoded-size estimate is substituted. |
+| `dirty_rows_per_save`, `encoded_bytes_per_save`, `max_value_bytes`, `erasure_pending_marks` | Backend save work and transactional erasure marks; attempts may roll back. |
+| `wal_peak_bytes`, `wal_alarm`, `wal_measurement_unavailable` | Measured WAL peak, alarm at 64 MiB, and unavailable measurements. The alarm is not a cap. |
+| `import_peak_rss_bytes`, `v1_load_peak_rss_bytes`, `comparison_same_process_corpus`, `import_exceeds_v1_load` | Import peak versus v1 load on the same process/path corpus; comparison/exceed flag is unavailable until both comparable measurements exist. |
+| `commit_latency_us.{p50,p95,recent_samples}` | Latest 128 measured COMMIT calls, excluding encoding, checkpoint and VACUUM. Pre-COMMIT refusals add no latency sample. |
+| `db_bytes`, `record_rows`, `file_rows` | Logical/main-file size and backend owner counts, with existing size alarms. |
+| `baseline_bytes`, `baseline_age_s`, `baseline_14day_escalation_alarm` | Exact preserved root/referenced-shard bytes at import; baseline age and escalation refreshed on import, authenticated save, load and maintenance. |
+| `ack_receipt_inventory` | Companion count/bytes/bounded inventory during maintenance; does not certify a recovery set or authorize GC. |
+
+Null means unavailable, never zero. Physical footprint is unavailable outside
+macOS or after a failed native read; RSS is not substituted. Shared Arc payloads
+are conservatively charged in full to each graph that owns them; heap estimates
+are neither allocator-resident bytes nor a whole-process total. Unsupported
+Rust/platform layouts or unaccountable fields remain null. The existing 50 ms,
+16-slot bounded samplers include stage endpoints; short peaks may be missed.
+The plateau is sampled after finish returns and releases its inputs; it is an
+immediate observation, not a delayed stability proof.
+The retained-history goal is a store heap of at most 56 MiB and a reduction over
+90% from the 630 MiB baseline, with finish peak below 164 MiB. Whole-process
+steady RSS is a gauge, not that retained-history acceptance criterion.
+
+Checkpoint count arrays are ordered PASSIVE, purge, idle reclaim; purge means
+VACUUM plus TRUNCATE. Commit outcome arrays are ordered committed, not published,
+published after error, ambiguous. Backend counters reset with the connection;
+process distributions reset with the process. The pending generation, oldest
+erasure time and attempt/failure pacing persist in the DB. No paths, keys, raw
+values, bindings, database IDs or hash commitments enter these measurements.
+
+SOURCE wording: "Deleted private text is not readable through Ottto's store files within 24 h of deletion while the Mac is awake and has enough free disk. If that is not possible, it is erased at the first moment the Mac is awake with enough disk, before normal collection resumes, and the late erasure is counted and alerted."
+
+The deadline defaults to 24 hours, may be shorter, and cannot exceed 72 hours or
+be disabled; a longer policy requires SOURCE approval. Ottto's own locks do not
+excuse delay: acquisition yields to maintenance by the forced pause, normally
+at 20 hours, after idle attempts from 12 hours. Another process's lock that
+prevents timely purge is a breach. A due pause reserves the next checkpoint-lock
+turn ahead of this process's new normal work and waits up to two seconds for
+an existing owner; own-lock refusal remains a failure and an overdue breach.
+Overdue recovery and recovery from a failed idle purge run before preparation
+continues or acquisition resumes; retry/cadence cooldowns cannot defer them.
+Failure keeps debt and pauses collection. Prior committed data remains committed.
+
+Erasure measurements include `erasure_pending_age_s`, `oldest_pending_age_s`,
+`erasure_overdue`, `erasure_breaches`, `maintenance_pauses`,
+`erasure_resume_refusals`, `erasure_late_completions`, and
+`erasure_vacuum.{runs,bytes,seconds}`. Fixed failure reasons appear in
+`erasure_vacuum_failed`, including busy, timeout, disk_full, space_or_io,
+backup_io, own_lock, external_lock, lock_io, engine and truncate. The process events
+`erasure_deadline_breach` and `erasure_late_completion_alarm` alert overdue debt
+and late success respectively. Attempt/failure/deferred counts, `vacuum_latency_ms`,
+`vacuum_wal_peak_bytes`, and free-space available/required/admission gauges describe
+maintenance work. A pending age is null when no obligation exists or its clock
+is unavailable; `erasure_overdue` distinguishes conservative clock handling.
+Debt clears only after VACUUM, successful TRUNCATE and measured empty WAL, followed
+by a durable epoch-matching metadata clear. See [the store policy](scan-index-persistence.md).
+
+There is no rebuild; old restart records are re-pinned lazily by M3 only when a file grows.
+
 The existing service error log contains content-free JSON lines prefixed
 `ottto-service: local_resources`. The macOS app/dev LaunchAgent writes
 `~/Library/Logs/Ottto/ottto-service.err.log`; Homebrew writes
@@ -1801,6 +1872,25 @@ buckets; already stripped proof cannot be recovered from the hint ledger.
 Upstream authority-key allocation loss remains fail-closed: inherited partitions
 are not reclassified as request proof by budget recovery or a uniform starting-account
 retry. Only an intact current grouping can enter the cap allocator.
+
+The default-OFF Claude state-v2 route reports current bounded states through the
+existing local resource diagnostics sink, including `growth_claim_refused` labels.
+It keeps CPU/RSS, WAL, import peak versus the same-process v1 load, erasure inventory
+and baseline-age/escalation gauges. It does not maintain a second cumulative event
+or label counter registry. Hydration and saves create no rolling backup copies.
+Each save reports `save_dirty_rows` and `save_dirty_bytes` distributions (`p50`, `p95`, `max`)
+on the `claude_state_v2` row. Samples include refused attempts; percentiles use
+the last 128 samples and maximum is process-lifetime. Charges include old/new
+values, chunks, metadata, tombstones, reference updates and restart staging.
+`save_payload_alarm` (>32 MiB), `save_page_reduced` and the existing WAL alarm
+(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records a
+whole-save refusal above 256 MiB; at page size one, `save_oversize_alarm` and
+`state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
+`state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
+`account_windows_alarm` and `account_windows_retained` still report retained
+account-window pressure without capping owed history. The fixed import pause label
+`r1_staging_not_installed` means **R1 staging not installed**.
+These events contain no keys, paths, restart names, reference tuples or digests.
 
 ### Option (ii): `identity_retained` bucket rows
 

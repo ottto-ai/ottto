@@ -772,6 +772,42 @@ fn integrated_no_store_true_first_install_still_initializes_without_transcript_r
     assert_eq!(observations.iter().map(|(_, _, n)| n).sum::<u64>(), 0);
 }
 
+/// [off=main] off large v1 manifest load cas and containment match compact v1.
+#[test]
+fn off_large_v1_manifest_load_cas_and_containment_match_compact_v1() {
+    let compact = Fixture::new();
+    let large = Fixture::new();
+    assert_eq!(large.manifest["storage_format"], json!(1));
+    let mut bytes = fs::read(&large.root).unwrap();
+    bytes.extend_from_slice(&vec![b' '; 8192]);
+    assert!(bytes.len() > 4096);
+    assert!(bytes.len() < scan_index_persistence::MAX_ROOT_BYTES);
+    fs::write(&large.root, &bytes).unwrap();
+    // No sentinel or environment opt-in: exercise the real source-aware OFF
+    // route, v1 CAS writer, and the shared containment admission guard.
+    let mut expected = compact.load();
+    let mut actual = large.load();
+    assert!(actual.v2().persistence_v2.is_none());
+    assert!(actual.persistence_available());
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(fs::read(&large.root).unwrap(), bytes);
+    {
+        let _lock = CheckpointLock::acquire(&large.root).unwrap();
+        state_v2::guard_containment_locked(&large.root).unwrap();
+    }
+    expected.save(&compact.root).unwrap();
+    actual.save(&large.root).unwrap();
+    assert_eq!(
+        fs::read(&large.root).unwrap(),
+        fs::read(&compact.root).unwrap()
+    );
+    assert!(large.load().persistence_available());
+    assert!(!large.root.with_extension("json.v2.sqlite").exists());
+}
+
 // Snapshot every file in this bounded synthetic index, including storage
 // controls and in-flight publication files, to detect accidental recovery.
 fn inspection_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {

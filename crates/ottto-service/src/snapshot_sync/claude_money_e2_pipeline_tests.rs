@@ -237,6 +237,13 @@ struct Page {
 }
 impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
+        self.enrich_with_accepted(corpus, None)
+    }
+    fn enrich_with_accepted(
+        &mut self,
+        corpus: &Corpus,
+        accepted: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
+    ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
         let ((mut disposition, _, _), released) =
             e2::pipeline_test_observer::capture_released(|| {
                 try_apply_claude_local_evidence_to_scan_with_comparison(
@@ -247,7 +254,7 @@ impl Page {
                     None,
                     None,
                     Some((&self.cache, &self.committed)),
-                    None,
+                    accepted,
                     None,
                 )
                 .unwrap()
@@ -3069,6 +3076,11 @@ mod money_equivalence_tests {
     mod durable_transition_tests {
         include!("../snapshots/sampled_scan/durable_transition_tests.rs");
     }
+}
+
+// V2-only fixtures must not enter the cross-build harness transplanted to v1.
+mod state_v2_money_tests {
+    include!("state_v2_money_tests.rs");
 }
 
 #[test]
