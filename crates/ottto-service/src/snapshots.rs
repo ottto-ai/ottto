@@ -21269,13 +21269,7 @@ impl SnapshotAccumulator {
                 .claude_money
                 .as_deref()
                 .is_some_and(|money| money.entity.resolver_conflicts > 0);
-        // A fully read Pi fork whose positive usage was all copied must
-        // publish zero too: an earlier accepted revision can be inflated.
-        let empty_pi_fork = emit_empty_pi_fork
-            && self.source == SnapshotSource::Pi
-            && self.seen_pi_usage_keys.fork_parts().0
-            && self.seen_pi_usage_keys.fork_parts().1.is_some();
-        if session_rows.is_empty() && !conflict_carrier && !empty_pi_fork {
+        if session_rows.is_empty() && !conflict_carrier && !emit_empty_pi_fork {
             return Vec::new();
         }
         let mut model_usage: Vec<SnapshotModelUsage> = session_rows
@@ -37015,7 +37009,12 @@ impl OwnedJsonlParser {
                     && observation.pair_key.is_none()
             })
             .count();
+        // A fully read Pi fork whose positive usage was all copied must
+        // publish zero too: an earlier accepted revision can be inflated.
+        let (has_parent, header_nanos) = accumulator.seen_pi_usage_keys.fork_parts();
         let emit_empty_pi_fork = source == SnapshotSource::Pi
+            && has_parent
+            && header_nanos.is_some()
             && report.complete()
             && recognized_usage_drop_count == 0
             && accumulator_dropped_usage_record_count == 0
