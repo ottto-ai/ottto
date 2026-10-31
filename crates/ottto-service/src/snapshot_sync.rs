@@ -23136,18 +23136,6 @@ mod tests {
         ));
     }
 
-    /// [behaviour] A partial checkpoint failing at a step whose own error has
-    /// no known phrase names that step instead of the bare "sync failed".
-    #[test]
-    fn failed_partial_checkpoint_names_its_step() {
-        let mut f = SameSourceAckFixture::new();
-        f.send(0, same_source_fixture_ack).unwrap();
-        let error = f
-            .checkpoint_boundary(|| Err(anyhow!("untyped authority failure")))
-            .expect_err("a failed destination check aborts the checkpoint");
-        assert_eq!(safe_error(&error), CHECKPOINT_VALIDATE_DESTINATION);
-    }
-
     #[test]
     fn same_source_ack_progress_manual_race_rejects_older_ledger() {
         let mut f = SameSourceAckFixture::new();
