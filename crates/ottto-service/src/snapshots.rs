@@ -31698,6 +31698,24 @@ impl OwnedSourceScan {
                     // retry instead of cloning it or guessing a nested root.
                     let quiet_scan_root =
                         quiet_audit_checked.then(|| std::mem::take(&mut recorded.scan_root));
+                    // Native completion succeeded. Invalidate an outgrown old
+                    // restart record before exposing this publication; failure
+                    // is counted and never changes OFF money/census settlement.
+                    #[cfg(unix)]
+                    if let Some(context) = sampling.as_ref() {
+                        context.cache.durable_off_published(
+                            source,
+                            &index_key,
+                            recorded.size_bytes,
+                        );
+                        for alias in &aliases {
+                            context.cache.durable_off_published(
+                                source,
+                                &local_index_key(&alias.path),
+                                alias.size_bytes,
+                            );
+                        }
+                    }
                     index.record(recorded, last_snapshot_fingerprint, outcome);
                     // The counting version travels in the same entry as the
                     // fingerprint it describes; no separate save can split them.

@@ -677,6 +677,9 @@ pub(crate) struct StoreCounters {
     pub(crate) gc_bytes_read: u64,
     /// Records deleted because their selection was held or reverted.
     pub(crate) records_invalidated: u64,
+    /// OFF discards only retired v1 headers outgrown by a native publication.
+    pub(crate) off_v1_invalidated: u64,
+    pub(crate) off_v1_invalidate_failed: u64,
     /// Peak transient encode/decode buffer, in bytes.
     pub(crate) peak_codec_bytes: u64,
 }
@@ -977,7 +980,15 @@ impl DurableTailStore {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                     let repaired = match inspect_path(&path) {
-                        Ok(m) => m.is_file() && self.repair(&path, &m, 0o600, writable),
+                        Ok(m) => {
+                            m.is_file()
+                                && self.repair(
+                                    &path,
+                                    &m,
+                                    0o600,
+                                    writable && work != "off_invalidate",
+                                )
+                        }
                         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                         Err(_) => false,
                     };
@@ -1001,7 +1012,12 @@ impl DurableTailStore {
             if !metadata.is_file() {
                 return Err(Refusal::Undecodable);
             }
-            if !self.repair(&path, &metadata, 0o600, writable) {
+            if !self.repair(
+                &path,
+                &metadata,
+                0o600,
+                writable && work != "off_invalidate",
+            ) {
                 return Ok(None);
             }
             #[cfg(test)]
@@ -1032,6 +1048,12 @@ impl DurableTailStore {
             n = header.len();
             let mut binding = decode_header(&header, key, self.source)?;
             let retired = retired_pin(self.source, binding.format, &binding.record.allowlist);
+            if work == "off_invalidate" {
+                // Header identity alone is the OFF exception. Never acquire a
+                // body or mutation authority for any other representation.
+                binding.stamp = Some(Stamp::of(&metadata));
+                return Ok(retired.then_some(binding));
+            }
             if retired && work != "overwrite" && work != "guard" {
                 return Err(Refusal::Repin); // Missing to readers, opaque to current decoders.
             }
@@ -2454,6 +2476,44 @@ impl DurableTailStore {
         contains: impl FnMut(&[u8]) -> bool,
     ) -> io::Result<PrivateLabelPurge> {
         self.purge_private_labels_kept(writer, &BTreeSet::new(), contains)
+    }
+
+    /// OFF may remove only the retired v1 record for this published key.
+    /// Failure never gates native publication; the next publication retries.
+    pub(crate) fn invalidate_outgrown_v1<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        key: &Digest32,
+        published_end: u64,
+    ) {
+        let result = (|| -> io::Result<()> {
+            self.check_writer(writer)?;
+            if self.pending.contains_key(key) {
+                return Ok(());
+            }
+            let Ok(Some(header)) = self.classify(key, "off_invalidate", Some(writer)) else {
+                return Ok(()); // Absent, unknown, newer or unidentifiable: untouched.
+            };
+            if published_end <= header.record.certificate.length {
+                return Ok(());
+            }
+            let path = self.record_path(key);
+            if stamp_at(&path)? != header.stamp {
+                return Ok(()); // Never unlink a replacement of the identified header.
+            }
+            remove_if_present(&path)?;
+            self.durable.remove(key);
+            // If the barrier fails, the next classification retries it even
+            // though the pathname is now absent. No deletion is reported early.
+            self.startup_synced = false;
+            self.sync_store()?;
+            self.startup_synced = true;
+            self.counters.off_v1_invalidated += 1;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.counters.off_v1_invalidate_failed += 1;
+        }
     }
 
     /// Retire exactly the verified predecessor. `sync_due` belongs to writer

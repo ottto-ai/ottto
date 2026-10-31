@@ -411,7 +411,7 @@ impl Counters {
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
-             records_invalidated={} mutation_unproved={} peak_codec_bytes={} t14_rebuild_full_started={} \
+             off_v1_invalidated={} off_v1_invalidate_failed={} records_invalidated={} mutation_unproved={} peak_codec_bytes={} t14_rebuild_full_started={} \
              d3_hold[growth_bytes,released_write,released_content,unfunded]={:?} \
              store_write_after_save_failed[files]={} \
              store_write_failed_restart_full[files,bytes]={:?} \
@@ -466,6 +466,8 @@ impl Counters {
             store.gc_records_read,
             store.gc_bytes_read,
             self.gc_keep_peak,
+            store.off_v1_invalidated,
+            store.off_v1_invalidate_failed,
             store.records_invalidated,
             store.mutation_unproved,
             store.peak_codec_bytes,
@@ -2347,6 +2349,36 @@ impl SharedCache {
                     slot.store.check_resources(writer, index_len);
                 }
             }
+        }
+    }
+
+    /// The sole OFF publication exception: discard this key's outgrown v1
+    /// restart record. No inventory, body read, new store or publication hold.
+    pub(crate) fn durable_off_published(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        published_end: u64,
+    ) {
+        if restart_restore::enabled() {
+            return;
+        }
+        let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) else {
+            return;
+        };
+        let Some(slot) = stores
+            .slot(source)
+            .as_mut()
+            .filter(|slot| slot.dir.exists())
+        else {
+            return; // Preserve the no-store OFF path without acquiring a record.
+        };
+        if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
+            slot.store.invalidate_outgrown_v1(
+                writer,
+                &store::key_digest(source, key),
+                published_end,
+            );
         }
     }
 
