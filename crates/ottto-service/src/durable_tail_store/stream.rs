@@ -628,11 +628,22 @@ impl DurableTailStore {
                 if retired_pin(self.source, old.format, &old.record.allowlist) {
                     // THE classifier verifies the opaque predecessor and funds the
                     // ordinary exact-stamp overwrite permission; never decode it.
-                    self.classify(&key, "overwrite", Some(writer))
-                        .map_err(|reason| {
+                    match self.classify(&key, "overwrite", Some(writer)) {
+                        Ok(_) => {}
+                        Err(Refusal::Corrupt)
+                            if old.record.binding.context == header.binding.context
+                                && self.rebuilt.get(&key) == Some(&Rebuild::Started)
+                                && self.durable.get(&key).is_some_and(|(content, stamp, _)| {
+                                    content.is_none() && *stamp == prior
+                                }) =>
+                        {
+                            self.memoize(key, (None, prior, true));
+                        }
+                        Err(reason) => {
                             protected = Some(reason);
-                            io::Error::other("unverified retired predecessor")
-                        })?;
+                            return Err(io::Error::other("unverified retired predecessor"));
+                        }
+                    }
                 }
                 if stamp_at(&attempt.path)? != Some(prior) || !self.authorized(&key, old.format) {
                     protected = Some(Refusal::Unbindable);

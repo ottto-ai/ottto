@@ -592,3 +592,47 @@ fn native_replacement_finishes_retirement_before_eviction_and_growth() {
         assert_eq!(fulls, 0, "good successor must restore then Tail");
     }
 }
+
+/// [money] A corrupt recognized retired predecessor gets one T14 Full, then restore/Tail.
+#[test]
+fn corrupt_retired_predecessor_rebuilds_once_without_withholding_native_usage() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let rig = ColdReplay::new(None, false, false);
+    let mut bytes = std::fs::read(&rig.record_path).unwrap();
+    bytes[10..42].copy_from_slice(
+        &store::parse_hex_digest(
+            "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+        )
+        .unwrap(),
+    );
+    // Preserve the recognized header and damage its checksum, never decode it.
+    std::fs::write(&rig.record_path, bytes).unwrap();
+    rig.append();
+    let cache = Arc::new(rig.cache());
+    let (next, rebuilt, fulls) = rig.scan(cache.clone(), rig.index.clone());
+    assert_eq!(fulls, 1);
+    let (_, cold, _) = rig.scan(Arc::new(SharedCache::default()), ScanIndex::default());
+    assert_eq!(
+        serde_json::to_value(&rebuilt.snapshots).unwrap(),
+        serde_json::to_value(&cold.snapshots).unwrap()
+    );
+    let counts = cache.durable_counters(SnapshotSource::Codex).unwrap().1;
+    assert_eq!(counts.t14_rebuild, 1);
+    assert_eq!(counts.t14_rebuild_full_started, 1);
+    cache.durable_write_after_save(test_locks::hold(&rig.root), SnapshotSource::Codex, &next);
+    cache.retained().unwrap().clear();
+    rig.append();
+    let (_, _, fulls) = rig.scan(cache.clone(), next);
+    assert_eq!(fulls, 0);
+    assert_eq!(
+        cache
+            .durable_counters(SnapshotSource::Codex)
+            .unwrap()
+            .1
+            .t14_rebuild,
+        1
+    );
+}

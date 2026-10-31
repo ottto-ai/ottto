@@ -934,6 +934,7 @@ impl DurableTailStore {
             return Ok(None);
         }
         let path = self.record_path(key);
+        let mut corrupt_retired = None;
         let result = (|| {
             let open = || {
                 #[cfg(test)]
@@ -1003,7 +1004,7 @@ impl DurableTailStore {
             n = header.len();
             let mut binding = decode_header(&header, key, self.source)?;
             let retired = retired_pin(self.source, binding.format, &binding.record.allowlist);
-            if retired && work != "overwrite" {
+            if retired && work != "overwrite" && work != "guard" {
                 return Err(Refusal::Repin); // Missing to readers, opaque to current decoders.
             }
             if work == "presence" {
@@ -1040,7 +1041,18 @@ impl DurableTailStore {
                 _ => self.counters.guard_verify_bytes += read,
             }
             self.note_codec(bytes.capacity());
-            verify(&bytes, self.source)?;
+            if let Err(reason) = verify(&bytes, self.source) {
+                if retired
+                    && reason == Refusal::Corrupt
+                    && stamp_at(&path).ok() == Some(Some(stamp))
+                {
+                    corrupt_retired = Some(stamp);
+                }
+                return Err(reason);
+            }
+            if retired && work == "guard" {
+                return Err(Refusal::Repin);
+            }
             if work == "overwrite" || restoring {
                 binding.content = Some(stored_digest(&bytes));
             }
@@ -1059,6 +1071,11 @@ impl DurableTailStore {
         }
         if let Err(reason) = result {
             self.durable.remove(key);
+            if let Some(stamp) = corrupt_retired {
+                // Not verified content: only the exact corrupt predecessor that
+                // the ordinary one-rebuild owner may replace after a Full.
+                self.memoize(*key, (None, stamp, false));
+            }
             if reason != Refusal::Repin {
                 self.counters.format_hold[reason as usize] += 1;
             }
