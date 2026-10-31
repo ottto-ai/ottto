@@ -234,3 +234,16 @@ never-quarantine suites. Linux green does not substitute for that evidence.
 | 190 | [snapshots/upload_context_receipt.rs:280](../../crates/ottto-service/src/snapshots/upload_context_receipt.rs#L280)<br>`@@ -110,0 +280,15 @@` | gated / neutral | OFF adoption runs main’s own body: the ON branch is an inserted claude_terminal_off() block (r31 removed the frozen main copy). Mixed context view is empty/false in OFF, including stale-view query protection; memo and retry-hold narrowing are ON-only. Main per-ACK receipt format/validation/context policies are untouched. |
 | 191 | [snapshots/upload_context_receipt.rs:310](../../crates/ottto-service/src/snapshots/upload_context_receipt.rs#L310)<br>`@@ -125,0 +310,6 @@` | gated / neutral | OFF adoption runs main’s own body: the ON branch is an inserted claude_terminal_off() block (r31 removed the frozen main copy). Mixed context view is empty/false in OFF, including stale-view query protection; memo and retry-hold narrowing are ON-only. Main per-ACK receipt format/validation/context policies are untouched. |
 | 192 | [snapshots/upload_context_receipt.rs:328](../../crates/ottto-service/src/snapshots/upload_context_receipt.rs#L328)<br>`@@ -138,3 +328,10 @@` | gated / neutral | OFF adoption runs main’s own body: the ON branch is an inserted claude_terminal_off() block (r31 removed the frozen main copy). Mixed context view is empty/false in OFF, including stale-view query protection; memo and retry-hold narrowing are ON-only. Main per-ACK receipt format/validation/context policies are untouched. |
+
+## X3 addendum: #920 retirement under ON (base main `562a40128`)
+
+Five production-counted hunks in two paths. Each is ON-only; with OFF the
+strip-ON proof (`strip_on.py`) of every touched function equals main.
+
+| # | File:new line / git hunk | Classification | Why OFF is main |
+| --- | --- | --- | --- |
+| X3-1 | [claude_request_census.rs:2938](../../crates/ottto-service/src/snapshots/claude_request_census.rs#L2938)<br>`@@ -2938 +2938 @@` | gated | Stay-retired guard cutoff uses `retirement_window(window)`, which returns `window` with OFF. |
+| X3-2 | [claude_request_census.rs:2992](../../crates/ottto-service/src/snapshots/claude_request_census.rs#L2992)<br>`@@ -2992 +2992 @@` | gated | Admission release cutoff, same as X3-1. The record's stamped window is unchanged in both modes. |
+| X3-3 | [claude_request_census.rs:3097](../../crates/ottto-service/src/snapshots/claude_request_census.rs#L3097)<br>`@@ -3096,0 +3097,14 @@` | gated | `retire_aged_while_terminal_withheld` returns first with OFF. ON runs the terminal's aged retirement (keep overlap, 90% occupancy release) at the service clock; no vanished prune, join or shadow counts; zero transcript reads. |
+| X3-4 | [claude_request_census.rs:3114](../../crates/ottto-service/src/snapshots/claude_request_census.rs#L3114)<br>`@@ -3099,0 +3114,12 @@` | gated | `retirement_window`: OFF returns `window`; ON returns max(window, service clock floored to a day). |
+| X3-5 | [snapshots.rs:31437](../../crates/ottto-service/src/snapshots.rs#L31437)<br>`@@ -31436,0 +31437,4 @@` | gated | One call in the withheld-terminal block after `terminal_off_offer`. With OFF, `terminal_effects_allowed` is true for every source, so the block never runs, and the callee returns first. |

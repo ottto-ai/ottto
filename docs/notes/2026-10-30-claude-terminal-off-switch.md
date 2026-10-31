@@ -82,6 +82,22 @@ Linux and the merge-queue Mac. Two ON blockers are fixed here, both gated on
   cleared member stays cleared until it is read; eviction or a restart costs
   at most one more re-read, never proof, ACK or settlement.
 
+**X3 (#920 retirement under ON).** ON never starts a new generation, so the
+traversal's census window is frozen and #920's terminal retirement never runs.
+With ON, the stay-retired guard and the admission release cutoff age against
+the service clock (floored to a day), and the drained-walk withheld-terminal
+block runs the terminal's aged retirement (keep overlap, 90% occupancy release)
+at that clock, without the vanished prune, join or shadow counts. OFF is main.
+If an ON walk never drains, admission still frees space, in mtime order
+(counted by `census_retire_kept_overflow_admission_total`).
+
+**X3-R (disclosed, pending Lead B's ruling).** Under ON, vanished keys are never
+pruned (the prune stays terminal-only), so the census record count only grows.
+A new key past 65,536 records is refused: unknown, fail-closed, never "no
+holder". Each refusal is counted by `census_record_limit_refused_total`.
+Proposed: ship with disclosure for M4 ON with an alarm when that count exceeds 0;
+the fleet fix goes with E7-8 paging or a terminal-only prune.
+
 OFF retains main's retry-admission completion veto: a retained, storage-deferred
 admission cannot grant a complete census. The unchanged oversized accepted
 singleton control guards that refusal; disabling containment does not bypass it.
