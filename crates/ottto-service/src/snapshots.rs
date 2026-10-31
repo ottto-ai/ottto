@@ -3266,6 +3266,7 @@ pub(crate) fn durable_after_save(
 ) {
     match crate::locked_state_dir::held_for(support_dir) {
         Some(writer) => {
+            cache.durable_fence_archives(writer, source);
             let _ = cache.durable_write_after_save(writer, source, index);
             let _ = cache.durable_gc(writer, source, index);
         }
@@ -27957,7 +27958,7 @@ impl OwnedSourceScan {
                             continue;
                         }
                         if inventory.member_held(&candidate.path) {
-                            if inventory.feed_member_held(&candidate.path) {
+                            if inventory.feed_member_carrier(&candidate.path) {
                                 index.hold_compressed(
                                     &candidate.path,
                                     codex_session_id_candidates_from_path(&candidate.path)

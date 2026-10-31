@@ -10469,6 +10469,32 @@ fn a_release_without_a_measure_drops_no_proof() {
     refuses(overflow, "poisoned cursor");
 }
 
+/// [regress] A poisoned cursor read as "custody escrow pending", so every Codex
+/// step yielded forever (W9 spun 48 min on Linux; fixed in b7a625cda). With no
+/// escrow the poisoned cursor no longer waits; an escrowed payload still does.
+#[test]
+fn regress_poisoned_cursor_without_escrow_does_not_spin_custody_replay() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let empty = SharedCache::default();
+    let escrowed = SharedCache::default();
+    escrowed.with_cursor(|cursor| cursor.custody_unsaved = Some(CustodyWrite { pending: None }));
+    for cache in [&empty, &escrowed] {
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            cache.with_cursor(|_| panic!("poison the cursor"));
+        }));
+        assert!(unwound.is_err());
+        assert!(!cursor_held());
+    }
+    assert!(
+        !empty.replay_custody_decision(),
+        "no escrow: poison is not a pending payload"
+    );
+    assert!(
+        escrowed.replay_custody_decision(),
+        "escrow survives poison and still waits"
+    );
+}
+
 // Continuation fixtures drive the enabled resume-only scan frame directly.
 
 /// Steps `scan` to completion with the collector's post-policy finalization
@@ -10903,10 +10929,31 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
                 assert!(index.files.contains_key(&key));
                 assert_eq!(index.files[&key].size_bytes, prefix_len);
                 assert_eq!(index.files[&key].last_upload_body_witness, witness);
-                assert!(index.codex_counting_tombstones.contains_key(&owner));
-                let traversal = index.traversal.as_ref().expect("census checkpoint");
-                assert!(traversal.codex_rollout_paths.contains(&key));
-                assert!(traversal.observed_index_keys.contains(&key));
+                // C's collect_tombstones absorbs the Legacy tombstone into the
+                // live proven-owner entry; either way the evidence survives.
+                assert!(
+                    index.codex_counting_tombstones.contains_key(&owner)
+                        || (codex_counting_version::proven_owner(&index.files[&key])
+                            == Some(owner.as_str())
+                            && codex_counting_version::AckEvidence::of_view(Some(
+                                &index.files[&key]
+                            )) == codex_counting_version::AckEvidence::LegacyAcked),
+                    "counting evidence lost: tombstones={}",
+                    index.codex_counting_tombstones.len()
+                );
+                // Custody is non-red: a one-page census completes and retires
+                // its walk (snapshots.rs census-complete clear). The
+                // codex_held_growth row below proves the walk stat'ed the key.
+                match index.traversal.as_ref() {
+                    Some(traversal) => {
+                        assert!(traversal.codex_rollout_paths.contains(&key));
+                        assert!(traversal.observed_index_keys.contains(&key));
+                    }
+                    None => assert!(
+                        result.census_complete,
+                        "walk retired without a complete census"
+                    ),
+                }
                 assert!(rows.iter().any(|r| r["stage"] == "codex_held_growth"
                     && r["counts"]["held_growth_bytes"] == length - prefix_len
                     && r["counts"]["held_growth_files"] == 1
@@ -13467,11 +13514,13 @@ fn deferred_group_preserves_accepted_extent_and_releases_through_existing_ends()
             let before = index.files.clone();
             let mut committed = index.clone();
             let key = local_index_key(&held);
-            index
-                .files
-                .entry(key.clone())
-                .or_default()
-                .codex_compressed_hold = Some(CodexZstCause::ParentLedgerUnbound);
+            // Production-shaped mint (the parent-unbound hold_compressed site):
+            // owner-scoped, so a cold restart fences the group's sibling too.
+            index.hold_compressed(
+                &held,
+                BTreeSet::from([SESSION.to_owned()]),
+                CodexZstCause::ParentLedgerUnbound,
+            );
             let saved = fixture._dir.0.join("deferred-group.json");
             let mut holder = codex_scan(&fixture, index, NOW)
                 .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
@@ -13558,7 +13607,12 @@ fn deferred_group_preserves_accepted_extent_and_releases_through_existing_ends()
                 let (_, output) = page(&fixture, restarted, Some(Arc::clone(&cold)));
                 assert!(output.snapshots.is_empty());
             });
-            assert_eq!(counter(&cold, |c| c.jobs_started), 0);
+            assert_eq!(
+                counter(&cold, |c| c.jobs_started),
+                0,
+                "cold restart; {}",
+                counters(&cold)
+            );
         });
     }
 }
@@ -13664,6 +13718,12 @@ fn custody_negative_payload_survives_save_failure_funding_refusal_and_restart() 
             let saved = fixture._dir.0.join("negative-payload.json");
             index.save(&saved).unwrap();
             let mut committed = index.clone();
+            // The fixture's paused group already vetoes SESSION, unattributed
+            // (F8 paused-group owner), before any custody payload exists.
+            assert!(committed
+                .codex_state_only_blocked_unattributed
+                .contains(SESSION));
+            let baseline_ids = committed.codex_state_only_blocked_session_ids.clone();
             index
                 .files
                 .entry(key.clone())
@@ -13700,11 +13760,19 @@ fn custody_negative_payload_survives_save_failure_funding_refusal_and_restart() 
                     cache.replay_custody_decision(),
                     "refusal owns COMPLETE debt"
                 );
-                assert!(!committed
-                    .codex_state_only_blocked_by_file
-                    .contains_key(&key));
-                assert!(!committed
-                    .codex_state_only_blocked_session_ids
+                // Refusal leaves the index it was given exactly as before:
+                // no escrowed file attribution and no added or removed veto.
+                let target = if failure == 1 { &stale } else { &committed };
+                assert!(!target.codex_state_only_blocked_by_file.contains_key(&key));
+                assert_eq!(
+                    target.codex_state_only_blocked_session_ids,
+                    baseline_ids,
+                    "failure={failure}: refusal adds/removes no veto; blocked_files={} {}",
+                    target.codex_state_only_blocked_by_file.len(),
+                    counters(&cache)
+                );
+                assert!(target
+                    .codex_state_only_blocked_unattributed
                     .contains(SESSION));
                 drop(scan); // Real Refused preparation loss.
                 if failure == 2 {
@@ -13884,10 +13952,31 @@ fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails
                 assert!(index.files.contains_key(&key));
                 assert_eq!(index.files[&key].size_bytes, prefix_len);
                 assert_eq!(index.files[&key].last_upload_body_witness, witness);
-                assert!(index.codex_counting_tombstones.contains_key(&owner));
-                let traversal = index.traversal.as_ref().expect("census checkpoint");
-                assert!(traversal.codex_rollout_paths.contains(&key));
-                assert!(traversal.observed_index_keys.contains(&key));
+                // C's collect_tombstones absorbs the Legacy tombstone into the
+                // live proven-owner entry; either way the evidence survives.
+                assert!(
+                    index.codex_counting_tombstones.contains_key(&owner)
+                        || (codex_counting_version::proven_owner(&index.files[&key])
+                            == Some(owner.as_str())
+                            && codex_counting_version::AckEvidence::of_view(Some(
+                                &index.files[&key]
+                            )) == codex_counting_version::AckEvidence::LegacyAcked),
+                    "counting evidence lost: tombstones={}",
+                    index.codex_counting_tombstones.len()
+                );
+                // Custody is non-red: a one-page census completes and retires
+                // its walk (snapshots.rs census-complete clear). The
+                // codex_held_growth row below proves the walk stat'ed the key.
+                match index.traversal.as_ref() {
+                    Some(traversal) => {
+                        assert!(traversal.codex_rollout_paths.contains(&key));
+                        assert!(traversal.observed_index_keys.contains(&key));
+                    }
+                    None => assert!(
+                        result.census_complete,
+                        "walk retired without a complete census"
+                    ),
+                }
                 assert!(rows.iter().any(|r| r["stage"] == "codex_held_growth"
                     && r["counts"]["held_growth_bytes"] == length - prefix_len
                     && r["counts"]["held_growth_files"] == 1
@@ -14301,6 +14390,19 @@ fn deferred_custody_tail_priority_eof_never_reopens_as_full() {
         assert!(prior.last_upload_body_witness.is_some());
         let saved = fixture._dir.0.join("priority-custody.json");
         index.save(&saved).unwrap();
+        // The resume gate needs the prepared inventory a production page
+        // carries; the held file alone builds none (as the frozen sibling test).
+        let mut dirs = codex_file_join::DirectoryCensus::new();
+        dirs.observe(&fixture.root, &fs::metadata(&fixture.root).unwrap());
+        let mut inventory = codex_file_join::HeaderInventory::new(
+            std::slice::from_ref(&fixture.root),
+            &BTreeSet::from([key.clone()]),
+            Some(&dirs),
+        );
+        while inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
+            != codex_file_join::HeaderStep::Complete
+        {}
+        assert!(inventory.complete);
         let mut committed = index.clone();
         index.files.get_mut(&key).unwrap().codex_compressed_hold =
             Some(CodexZstCause::ParentLedgerUnbound);
@@ -14345,12 +14447,16 @@ fn deferred_custody_tail_priority_eof_never_reopens_as_full() {
             },
             || {
                 for number in 65..=192 {
-                    let (next, output, modes) = page_at(
+                    let (next, output, modes) = page_with(
                         &fixture,
                         index,
                         Some(Arc::clone(&cache)),
                         "cursor-fixture",
                         &collected_at(number),
+                        |scan| {
+                            scan.codex_join_inventory = Some(inventory.clone());
+                            scan.codex_join_prepared = true;
+                        },
                     );
                     index = next;
                     assert_eq!(modes.0, 0, "custody must veto protected-tier Full replay");
@@ -14370,7 +14476,11 @@ fn deferred_custody_tail_priority_eof_never_reopens_as_full() {
                 }
             },
         );
-        assert!(reached.get(), "held Tail reached genuine priority EOF");
+        assert!(
+            reached.get(),
+            "held Tail reached genuine priority EOF; {}",
+            counters(&cache)
+        );
         assert!(cache.cursor_slot_free());
         assert_eq!(counter(&cache, |c| c.jobs_started), started);
         assert_eq!(
@@ -14403,6 +14513,29 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
         money_oracle, Accepted, Mode, RouteResult,
     };
     fn route(items: &[SnapshotItem], index: &ScanIndex, mode: Mode) -> RouteResult {
+        // Main's group fan-out emits one item per physical member ("one alias
+        // per physical member"); aliases share one body identity and differ
+        // only in source_file_fingerprint. The shared oracle routes one per unit.
+        let mut units: Vec<SnapshotItem> = Vec::new();
+        for item in items {
+            match units
+                .iter()
+                .find(|unit| unit.snapshot_fingerprint == item.snapshot_fingerprint)
+            {
+                Some(first) => {
+                    let (mut a, mut b) = (first.clone(), item.clone());
+                    a.source_file_fingerprint = None;
+                    b.source_file_fingerprint = None;
+                    assert_eq!(
+                        serde_json::to_value(&a).unwrap(),
+                        serde_json::to_value(&b).unwrap(),
+                        "physical aliases differ only in source_file_fingerprint"
+                    );
+                }
+                None => units.push(item.clone()),
+            }
+        }
+        let items = units.as_slice();
         let request = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: "codex".into(),
@@ -14417,6 +14550,16 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
         } else {
             vec![serde_json::to_vec(&request).unwrap()]
         };
+        // Diagnostic (counts only) ahead of the oracle's duplicate check.
+        eprintln!(
+            "route {mode:?}: items={} unique_fingerprints={}",
+            items.len(),
+            items
+                .iter()
+                .map(|i| &i.snapshot_fingerprint)
+                .collect::<BTreeSet<_>>()
+                .len()
+        );
         let mut result = RouteResult::emitted(mode, SnapshotSource::Codex, batches, items);
         result.codex_evidence = json!({
             "TierReplay": index.files.iter().map(|(k,e)| (k.clone(),
@@ -14923,7 +15066,8 @@ fn omitted_raw_archive_fences_paused_singleton_and_group_across_reload() {
                     assert_eq!(
                         counter(&cache, |c| c.jobs_resumed),
                         resumed + 1,
-                        "positive control: same job/context is compatible before raw reload"
+                        "positive control: same job/context is compatible before raw reload; {}",
+                        counters(&cache)
                     );
                     assert!(control_output.snapshots.is_empty());
                     assert!(cache.paused_members_for_test().is_some());

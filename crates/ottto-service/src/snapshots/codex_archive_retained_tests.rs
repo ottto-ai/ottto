@@ -646,6 +646,7 @@ fn compressed_retained_save_never_writes_a_durable_record() {
     assert_eq!(cache.durable_selected_count_for_test(), 0);
     // Normal admission and save: the compressed reduction is never offered.
     index.save(&index_path).unwrap();
+    cache.durable_fence_archives(writer, SnapshotSource::Codex);
     cache.durable_write_after_save(writer, SnapshotSource::Codex, &index);
     cache
         .durable_gc(writer, SnapshotSource::Codex, &index)

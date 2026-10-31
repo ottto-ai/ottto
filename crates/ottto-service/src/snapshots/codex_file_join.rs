@@ -825,6 +825,11 @@ impl HeaderInventory {
         let mut metadata_checks = 0_u64;
         for path in iter.by_ref().take(MAX_HEADER_FILES) {
             last = Some(path.clone());
+            // Feed prep is idempotent over already-witnessed headers: re-queuing
+            // would re-read a decode-held cold header and duplicate its witness.
+            if self.owner_for_path(Path::new(path)).is_some() {
+                continue;
+            }
             // Raw custody contributes negative owner scope even when another
             // custody record excludes all archives from acquisition. This is
             // metadata-only classification, before every fact-cache operation.
@@ -5136,35 +5141,33 @@ pub(in crate::snapshots) mod header_cache_tests {
             let ((mut index, mut scan), reads) = tests::header_reads(|| {
                 let mut inventoried = false;
                 for _ in 0..1000 {
-                    if let Some(inventory) = owned
-                        .codex_join_inventory
-                        .as_mut()
-                        .filter(|i| i.feed_prepared && !inventoried)
-                    {
-                        let before = serde_json::to_value(&owned.index).unwrap();
-                        let (_, operations) = cache_operations(|| {
-                            while inventory.step_with_archive(
-                                &CodexTitleMetadata::default(),
-                                &mut owned.index,
-                                Some(&cache),
-                            ) != HeaderStep::Complete
-                            {}
-                        });
-                        assert_eq!(serde_json::to_value(&owned.index).unwrap(), before);
-                        assert!(inventory.complete);
-                        assert!(inventory.refused.is_empty());
-                        assert_eq!(inventory.reuse_hits, paths.len() - 2);
-                        assert_eq!(inventory.reuse_misses, 2);
-                        assert_eq!(
-                            inventory.owner_for_path(Path::new(&held)),
-                            Some(owner.as_str())
-                        );
-                        assert!(
-                            operations.iter().all(|(_, key)| key != &held),
-                            "held key has no cache lookup, invalidation or insertion"
-                        );
-                        assert!(operations.iter().any(|(operation, _)| *operation == "get"));
-                        inventoried = true;
+                    if !inventoried {
+                        if let Some(inventory) = owned.codex_join_inventory.as_mut() {
+                            let before = serde_json::to_value(&owned.index).unwrap();
+                            let (_, operations) = cache_operations(|| {
+                                while inventory.step_with_archive(
+                                    &CodexTitleMetadata::default(),
+                                    &mut owned.index,
+                                    Some(&cache),
+                                ) != HeaderStep::Complete
+                                {}
+                            });
+                            assert_eq!(serde_json::to_value(&owned.index).unwrap(), before);
+                            assert!(inventory.complete);
+                            assert!(inventory.refused.is_empty());
+                            assert_eq!(inventory.reuse_hits, paths.len() - 2);
+                            assert_eq!(inventory.reuse_misses, 2);
+                            assert_eq!(
+                                inventory.owner_for_path(Path::new(&held)),
+                                Some(owner.as_str())
+                            );
+                            assert!(
+                                operations.iter().all(|(_, key)| key != &held),
+                                "held key has no cache lookup, invalidation or insertion"
+                            );
+                            assert!(operations.iter().any(|(operation, _)| *operation == "get"));
+                            inventoried = true;
+                        }
                     }
                     match owned.step(None) {
                         OwnedSourceScanStep::Pending(next) => owned = next,
