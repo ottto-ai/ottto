@@ -3326,7 +3326,7 @@ fn retire_claude_transcript_records(
         .records
         .iter()
         .filter(|(key, record)| {
-            !held.contains(key.as_str())
+            (!super::restart_restore::enabled() || !held.contains(key.as_str()))
                 && transcript_retirement_age(files, cutoff, key, record).is_some()
         })
         .count();
@@ -3337,7 +3337,7 @@ fn retire_claude_transcript_records(
             .iter()
             .enumerate()
             .filter_map(|(position, (key, record))| {
-                (!held.contains(key.as_str()))
+                (!super::restart_restore::enabled() || !held.contains(key.as_str()))
                     .then(|| transcript_retirement_age(files, cutoff, key, record))
                     .flatten()
                     .map(|modified| (modified, position, record.hash_count()))
