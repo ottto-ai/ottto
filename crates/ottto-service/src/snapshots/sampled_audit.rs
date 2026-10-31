@@ -1497,15 +1497,16 @@ mod provenance_tests {
 /// restores its marker. Preserve the actual read's root: guessing from nested
 /// roots could change the acquisition scope. A committed retirement skips it.
 pub(super) fn queue_quiet_retirement(index: &mut ScanIndex, key: &str, scan_root: PathBuf) {
-    queue_pending(index, Path::new(key), scan_root, false, false);
+    queue_pending(index, Path::new(key), || scan_root, false, false);
 }
 
 /// The one deduplicated pending-candidate insert. Callers keep their own side
 /// effects (rearm cause, growth residue); an absent traversal queues nothing.
+/// The root is produced only on insertion.
 fn queue_pending(
     index: &mut ScanIndex,
     path: &Path,
-    scan_root: PathBuf,
+    scan_root: impl FnOnce() -> PathBuf,
     census_member: bool,
     watcher_hint: bool,
 ) {
@@ -1516,7 +1517,7 @@ fn queue_pending(
             .any(|queued| queued.path == path)
         {
             traversal.pending_candidates.push_back(ScanTraversalPath {
-                scan_root,
+                scan_root: scan_root(),
                 path: path.to_owned(),
                 census_member,
                 watcher_hint,
@@ -1542,7 +1543,7 @@ pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) 
     queue_pending(
         index,
         &candidate.path,
-        candidate.scan_root.clone(),
+        || candidate.scan_root.clone(),
         true,
         true,
     );
@@ -2086,7 +2087,7 @@ pub(super) fn revalidate_growth(index: &mut ScanIndex, key: &str, roots: &[PathB
 }
 
 fn queue_growth_path(index: &mut ScanIndex, key: &str, scan_root: PathBuf, census_member: bool) {
-    queue_pending(index, Path::new(key), scan_root, census_member, false);
+    queue_pending(index, Path::new(key), || scan_root, census_member, false);
     if let Some(walk) = index.traversal.as_mut() {
         walk.residue.index_keys.insert(key.to_owned());
     }
