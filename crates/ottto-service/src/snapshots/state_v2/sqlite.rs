@@ -344,7 +344,10 @@ impl Drop for Txn<'_> {
                 self.store.reload = true;
             }
             if let Some(conn) = self.store.conn.as_ref() {
-                if conn.execute_batch("ROLLBACK").is_err() {
+                // FULL/IOERR/NOMEM may already have rolled the transaction
+                // back, so ROLLBACK then fails harmlessly. Only a refused
+                // ROLLBACK of a still-open transaction leaves state unknown.
+                if conn.execute_batch("ROLLBACK").is_err() && !conn.is_autocommit() {
                     self.store.reload = true;
                 }
             }
