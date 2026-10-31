@@ -1977,9 +1977,12 @@ fn duplicate_desktop_inventory_is_not_a_new_refusal() {
     let streaming =
         lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
     let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+    // The first valid occurrence wins; the duplicate is ignored, not refused.
+    seed.claude_desktop_store_inventory = Some("a".repeat(64));
+    let kept = serde_json::to_vec(&seed).unwrap();
     for decoded in [streaming, bounded] {
         assert!(decoded.decode_holds.is_empty());
-        assert_eq!(serde_json::to_vec(&decoded).unwrap(), without);
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), kept);
     }
 }
 

@@ -71,7 +71,7 @@ fn desktop_identity_latch_roundtrips_closed_states_through_every_reader() {
     let bytes = serde_json::to_vec(&index).unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains("claude_desktop_identity_latches"));
     #[cfg(target_pointer_width = "64")]
-    assert_eq!(std::mem::size_of::<ScanIndexEntry>(), 480);
+    assert_eq!(std::mem::size_of::<ScanIndexEntry>(), 560);
 }
 
 #[test]

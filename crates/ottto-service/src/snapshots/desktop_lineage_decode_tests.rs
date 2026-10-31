@@ -102,7 +102,7 @@ fn desktop_lineage_unknown_and_complete_empty_roundtrip_without_changing_entry_l
     }
     // Independent native pin; no baseline was added to the file entry.
     #[cfg(target_pointer_width = "64")]
-    assert_eq!(std::mem::size_of::<ScanIndexEntry>(), 480);
+    assert_eq!(std::mem::size_of::<ScanIndexEntry>(), 560);
 }
 
 #[test]

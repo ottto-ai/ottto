@@ -208,8 +208,12 @@ impl IdentityFixture {
         );
         item
     }
+    /// Each restart gets its own file, so a branch from an older index is not
+    /// refused by the save CAS against a sibling branch's later save.
     fn restart(&self, mut index: ScanIndex) -> ScanIndex {
-        let path = self.home.join("index.json");
+        static RESTARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = RESTARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = self.home.join(format!("index-{n}.json"));
         index.save(&path).unwrap();
         ScanIndex::load(&path).unwrap()
     }
