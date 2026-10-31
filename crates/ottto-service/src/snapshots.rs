@@ -14091,18 +14091,6 @@ pub(crate) fn claude_reemission_seen_marker_path(support_dir: &Path) -> PathBuf 
     ReemissionExclusions::seen_marker_path(support_dir)
 }
 
-#[cfg(test)]
-thread_local! {
-    static CLAUDE_REEMISSION_MEMBER_WALKS_FOR_TEST: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
-/// Member-directory walks the re-emission closure started on this thread.
-#[cfg(test)]
-pub(crate) fn claude_reemission_member_walks_for_test() -> usize {
-    CLAUDE_REEMISSION_MEMBER_WALKS_FOR_TEST.with(std::cell::Cell::get)
-}
-
 /// A subagent file's family `subagents` directory: its nearest `subagents`
 /// ancestor, as `claude_index_path_member_ref` reads it, whose parent is the
 /// family's `root` directory. `None` when the path does not have that shape.
@@ -46562,8 +46550,6 @@ impl ScanIndex {
         }) {
             return;
         }
-        #[cfg(test)]
-        CLAUDE_REEMISSION_MEMBER_WALKS_FOR_TEST.with(|walks| walks.set(walks.get() + 1));
         let mut pending = vec![subagents.to_path_buf()];
         let mut members = Vec::new();
         let mut visited = 0_usize;
