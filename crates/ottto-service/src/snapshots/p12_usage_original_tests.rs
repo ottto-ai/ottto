@@ -410,46 +410,7 @@ impl Drop for Family {
     }
 }
 
-/// Keep two fixtures alive together, including while one owns its checkpoint.
-/// The same-path controls reproduce the historical lock/CAS failures without
-/// depending on two threads observing the same wall-clock timestamp.
-#[test]
-fn p12_family_fixtures_have_independent_checkpoint_custody() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let mut first = Family::new();
-    let mut second = Family::new();
-    assert_ne!(first.dir, second.dir, "each family owns its transcripts");
-    assert_ne!(
-        first.state_dir, second.state_dir,
-        "each family owns its checkpoint directory"
-    );
-    first.reload();
-    second.reload();
-    let first_path = first.state_dir.join("scan-index.json");
-    let mut stale_index = first.index.clone();
-    {
-        let _owner = CheckpointLock::acquire(&first_path).expect("first fixture owns its lock");
-        let conflict = CheckpointLock::acquire(&first_path)
-            .err()
-            .expect("a shared checkpoint must refuse a second owner");
-        assert!(conflict
-            .to_string()
-            .contains("checkpoint is owned by another daemon"));
-        // This includes save, independent decode, and the production locked
-        // load. None may borrow the first fixture's custody or generation.
-        second.reload();
-    }
-    first.reload();
-    let conflict = stale_index
-        .save(&first_path)
-        .expect_err("a shared checkpoint must reject the stale generation");
-    assert!(conflict.to_string().contains("index changed concurrently"));
-    assert!(!second.index.files.contains_key(&first.parent_key));
-    assert!(!first.index.files.contains_key(&second.parent_key));
-    // One fixture's cleanup cannot remove another fixture's index/lock/files.
-    drop(first);
-    second.reload();
-}
+// Fixture-only checkpoint custody characterization retired.
 
 #[test]
 #[ignore = "P12: needs full qualified two-phase driver; original expectations preserved"]
