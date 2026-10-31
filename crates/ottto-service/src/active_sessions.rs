@@ -2618,7 +2618,7 @@ mod tests {
     #[test]
     fn own_request_parts_gate_account_fallbacks() {
         // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
         use crate::claude_local_otel::{
             ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipEvidence,
             ClaudeTraceOwnershipLoadReport,
@@ -2696,7 +2696,7 @@ mod tests {
                     .or_default()
                     .push(owner);
             }
-            let mut items = crate::snapshots::parse_claude_code_jsonl_file(
+            let mut items = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
                 &transcript,
                 "2026-08-02T07:01:00Z",
                 "child-fp".to_string(),
