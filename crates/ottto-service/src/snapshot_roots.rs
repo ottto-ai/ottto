@@ -89,56 +89,66 @@ fn compose_roots(
     roots
 }
 
-pub(crate) struct WatcherRoots {
-    pub(crate) roots: Vec<(SnapshotSource, PathBuf)>,
-    /// False when the Codex slot registry could not be read: `roots` then
-    /// hold no slot homes, so a running watcher is kept rather than replaced.
-    pub(crate) codex_slots_read: bool,
+/// The Codex slot homes the watcher last read from the slot registry.
+#[derive(Debug, Default)]
+pub(crate) struct WatchedCodexHomes {
+    homes: Vec<PathBuf>,
+    registry_unreadable: bool,
 }
 
 /// The watcher covers the Codex slot homes discovery scans; without them
 /// growth in a slot home waits for the next census walk. A slot home that
 /// cannot be resolved is skipped, as the status collection skips it. Sorted
 /// so a reordered registry does not replace the watcher.
-pub(crate) fn watcher_roots(home: &Path) -> Result<WatcherRoots> {
-    let codex_homes = registered_codex_homes(&FileCodexAccountSlotSettingsStore::default())
+pub(crate) fn watcher_roots(
+    home: &Path,
+    codex: &mut WatchedCodexHomes,
+) -> Result<Vec<(SnapshotSource, PathBuf)>> {
+    let read = registered_codex_homes(&FileCodexAccountSlotSettingsStore::default())
         .map(|homes| homes.filter_map(Result::ok).collect());
-    watcher_roots_with(home, codex_homes)
+    watcher_roots_with(home, read, codex)
 }
 
-/// An unreadable slot registry never costs the other roots: it is counted in
-/// the local diagnostics and the slot homes join on a later successful read.
-fn watcher_roots_with(home: &Path, codex_homes: Result<Vec<PathBuf>>) -> Result<WatcherRoots> {
-    let codex_slots_read = codex_homes.is_ok();
-    let mut codex_homes = codex_homes.unwrap_or_else(|_| {
-        crate::local_resource_diagnostics::traversal_point(
-            "watcher_roots",
-            "codex",
-            &serde_json::json!({"codex_slot_registry_unreadable": 1}),
-        );
-        Vec::new()
-    });
-    codex_homes.sort();
-    let roots = [
+/// An unreadable slot registry never costs the other roots: the last slot
+/// homes read (none at start) stay watched, the failure is counted once in
+/// the local diagnostics, and the next successful read replaces them.
+fn watcher_roots_with(
+    home: &Path,
+    read: Result<Vec<PathBuf>>,
+    codex: &mut WatchedCodexHomes,
+) -> Result<Vec<(SnapshotSource, PathBuf)>> {
+    match read {
+        Ok(mut homes) => {
+            homes.sort();
+            *codex = WatchedCodexHomes {
+                homes,
+                registry_unreadable: false,
+            };
+        }
+        Err(_) if !codex.registry_unreadable => {
+            codex.registry_unreadable = true;
+            crate::local_resource_diagnostics::traversal_point(
+                "watcher_roots",
+                "codex",
+                &serde_json::json!({"codex_slot_registry_unreadable": 1}),
+            );
+        }
+        Err(_) => {}
+    }
+    [
         SnapshotSource::Codex,
         SnapshotSource::ClaudeCode,
         SnapshotSource::Pi,
     ]
     .into_iter()
     .map(|source| {
-        Ok(scan_roots(source, home, &codex_homes)?
+        Ok(scan_roots(source, home, &codex.homes)?
             .into_iter()
             .map(|root| (source, root))
             .collect::<Vec<_>>())
     })
-    .collect::<Result<Vec<_>>>()?
-    .into_iter()
-    .flatten()
-    .collect();
-    Ok(WatcherRoots {
-        roots,
-        codex_slots_read,
-    })
+    .collect::<Result<Vec<_>>>()
+    .map(|roots| roots.into_iter().flatten().collect())
 }
 
 pub(crate) fn validate_claude_roots(home: &Path, expected: &[PathBuf]) -> Result<()> {
@@ -467,38 +477,67 @@ mod tests {
         let slot_home = base.join("codex-accounts/slot/home");
         let day = slot_home.join("sessions/2026/10/31");
         fs::create_dir_all(&day).unwrap();
-        let next = watcher_roots_with(&base.join("user"), Ok(vec![slot_home.clone()])).unwrap();
-        assert!(next.codex_slots_read);
-        assert!(next
-            .roots
-            .contains(&(SnapshotSource::Codex, slot_home.join("sessions"))));
+        let roots = watcher_roots_with(
+            &base.join("user"),
+            Ok(vec![slot_home.clone()]),
+            &mut WatchedCodexHomes::default(),
+        )
+        .unwrap();
+        assert!(roots.contains(&(SnapshotSource::Codex, slot_home.join("sessions"))));
         assert_codex_write_queued(
-            next.roots,
+            roots,
             &day.join("rollout-2026-10-31T10-00-00-slot.jsonl"),
             &slot_home.join("history.jsonl"),
         );
     }
 
     /// [behaviour] An unreadable Codex slot registry at start still watches
-    /// the other roots, and is counted in the local diagnostics.
+    /// the other roots and is counted once; later, it keeps the slot homes
+    /// last read until a successful read replaces them.
     #[test]
     fn unreadable_codex_slot_registry_still_watches_other_roots() {
         let scratch = ScratchDir::new("codex-slot-registry-unreadable");
-        let home = fs::canonicalize(&scratch).unwrap().join("user");
+        let base = fs::canonicalize(&scratch).unwrap();
+        let home = base.join("user");
         let day = home.join(".codex/sessions/2026/10/31");
         fs::create_dir_all(&day).unwrap();
-        let (next, lines) = crate::local_resource_diagnostics::capture(|| {
-            watcher_roots_with(&home, Err(anyhow::anyhow!("synthetic unreadable registry")))
-                .unwrap()
+        let slot_sessions = base.join("slot/home/sessions");
+        fs::create_dir_all(&slot_sessions).unwrap();
+        let unreadable =
+            || -> Result<Vec<PathBuf>> { Err(anyhow::anyhow!("synthetic unreadable registry")) };
+        let mut codex = WatchedCodexHomes::default();
+        let (roots, lines) = crate::local_resource_diagnostics::capture(|| {
+            let roots = watcher_roots_with(&home, unreadable(), &mut codex).unwrap();
+            assert_eq!(
+                watcher_roots_with(&home, unreadable(), &mut codex).unwrap(),
+                roots
+            );
+            roots
         });
-        assert!(!next.codex_slots_read);
-        assert!(lines.iter().any(|line| line["stage"] == "watcher_roots"
-            && line["counts"]["codex_slot_registry_unreadable"] == 1));
+        let counted = |lines: &[serde_json::Value]| {
+            lines
+                .iter()
+                .filter(|line| {
+                    line["stage"] == "watcher_roots"
+                        && line["counts"]["codex_slot_registry_unreadable"] == 1
+                })
+                .count()
+        };
+        assert_eq!(counted(&lines), 1);
+        assert!(!roots.iter().any(|(_, root)| root == &slot_sessions));
         assert_codex_write_queued(
-            next.roots,
+            roots,
             &day.join("rollout-2026-10-31T10-00-00-default.jsonl"),
             &home.join(".codex/history.jsonl"),
         );
+        let slot = (SnapshotSource::Codex, slot_sessions.clone());
+        let read = watcher_roots_with(&home, Ok(vec![base.join("slot/home")]), &mut codex);
+        assert!(read.unwrap().contains(&slot));
+        let (kept, lines) = crate::local_resource_diagnostics::capture(|| {
+            watcher_roots_with(&home, unreadable(), &mut codex).unwrap()
+        });
+        assert!(kept.contains(&slot));
+        assert_eq!(counted(&lines), 1);
     }
 
     #[test]
