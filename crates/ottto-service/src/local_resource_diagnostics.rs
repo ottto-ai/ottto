@@ -120,6 +120,7 @@ thread_local! {
 pub(crate) fn claude_identity_over_cap(
     reasons: &std::collections::BTreeSet<crate::snapshots::claude_request_identity::OverCap>,
     item_bytes: usize,
+    components: Option<&ClaudeIdentityOverCapBytes>,
 ) {
     use crate::snapshots::claude_request_identity::OverCap;
     const LABELS: [&str; 6] = [
@@ -143,9 +144,12 @@ pub(crate) fn claude_identity_over_cap(
             let _ = counters[index].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
         }
         #[derive(Serialize)]
-        struct Counts {
+        struct Counts<'a> {
             claude_request_identity_over_cap: BTreeMap<&'static str, u64>,
             claude_request_identity_last_over_cap_item_bytes: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            claude_request_identity_last_over_cap_components:
+                Option<&'a ClaudeIdentityOverCapBytes>,
         }
         traversal_point(
             "claude_request_identity_over_cap",
@@ -156,6 +160,7 @@ pub(crate) fn claude_identity_over_cap(
                     .zip(counters.iter().map(|n| n.load(Relaxed)))
                     .collect(),
                 claude_request_identity_last_over_cap_item_bytes: item_bytes,
+                claude_request_identity_last_over_cap_components: components,
             },
         );
     };
@@ -163,6 +168,21 @@ pub(crate) fn claude_identity_over_cap(
     CLAUDE_IDENTITY_OVER_CAP.with(record);
     #[cfg(not(test))]
     record(&CLAUDE_IDENTITY_OVER_CAP);
+}
+
+/// Wire bytes of the last over-cap tagged body by component, measured before
+/// its display leaves are shed; `after_shed` is what the tag selector then
+/// sees. Counts and an 8-hex entity digest only.
+#[derive(Serialize)]
+pub(crate) struct ClaudeIdentityOverCapBytes {
+    pub(crate) entity: String,
+    pub(crate) item: usize,
+    pub(crate) context_curve: usize,
+    pub(crate) cache_observations: usize,
+    pub(crate) identity: usize,
+    pub(crate) usage_buckets: usize,
+    pub(crate) rest: usize,
+    pub(crate) after_shed: usize,
 }
 
 /// Closed, content-free refusal labels; cumulative process counters on #799.

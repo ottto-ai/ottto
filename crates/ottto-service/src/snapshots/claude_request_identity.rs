@@ -1061,7 +1061,12 @@ fn apply_grouped_with_accepted(
     // below must satisfy the same wire bounds and reconciliation rules.
     install(item, &evidence, top_identities, bucket_identities, refusals);
     let attempted_bytes = grouping.item_bytes(item);
-    if attempted_bytes > MAX_ITEM_BYTES {
+    let components = (attempted_bytes > MAX_ITEM_BYTES)
+        .then(|| shed_display_leaves(item, &grouping, attempted_bytes));
+    if components
+        .as_ref()
+        .is_some_and(|bytes| bytes.after_shed > MAX_ITEM_BYTES)
+    {
         over_cap.insert(OverCap::Bytes);
     }
     let unpriced = over_cap
@@ -1090,7 +1095,11 @@ fn apply_grouped_with_accepted(
         }
         over_cap.insert(OverCap::Bytes);
     }
-    crate::local_resource_diagnostics::claude_identity_over_cap(&over_cap, attempted_bytes);
+    crate::local_resource_diagnostics::claude_identity_over_cap(
+        &over_cap,
+        attempted_bytes,
+        components.as_ref(),
+    );
     let attempted_counts = cap_counts(item, &grouping, accepted, None);
     let accepted_tagged_attempted = item
         .usage_buckets
@@ -1992,6 +2001,66 @@ fn set_row(
                     .collect(),
             );
         }
+    }
+}
+
+/// Money identity outranks display data (#909 P0): an over-cap tagged body
+/// first sheds context-curve points, then its newest cache observations, and
+/// only then may the selector strip tags. Returns the pre-shed component bytes
+/// (counts only) and the bytes after shedding.
+fn shed_display_leaves(
+    item: &mut SnapshotItem,
+    grouping: &Grouping,
+    attempted: usize,
+) -> crate::local_resource_diagnostics::ClaudeIdentityOverCapBytes {
+    let mut probe = item.clone();
+    probe.context_curve = None;
+    let without_curve = grouping.item_bytes(&probe);
+    probe.cache_observations = None;
+    let without_cache = grouping.item_bytes(&probe);
+    strip(&mut probe);
+    let untagged = grouping.item_bytes(&probe);
+    probe.usage_buckets.clear();
+    let rest = grouping.item_bytes(&probe);
+    drop(probe);
+    let fits = |item: &SnapshotItem| grouping.item_bytes(item) <= MAX_ITEM_BYTES;
+    super::fit_context_curve(item, fits);
+    while !fits(item) {
+        let Some(cache) = item.cache_observations.as_mut() else {
+            break;
+        };
+        let Some(dropped) = cache.operations.pop() else {
+            break;
+        };
+        // The receiver keeps accepted rows on a partial patch; the omitted
+        // count stays exact when it was known.
+        let omitted = match cache.coverage.as_str() {
+            "complete" => Some(0),
+            "partial" => cache.omitted_observation_count,
+            _ => None,
+        };
+        let observed = matches!(
+            &dropped,
+            super::cache_observations::Operation::Upsert { observation }
+                if observation.status != "retracted"
+        );
+        cache.coverage = "partial".into();
+        cache.omitted_observation_count = omitted.and_then(|n| n.checked_add(u64::from(observed)));
+    }
+    crate::local_resource_diagnostics::ClaudeIdentityOverCapBytes {
+        // SHA-256(session id)[:8], the investigation reports' entity digest.
+        entity: format!(
+            "{:x}",
+            sha2::Sha256::digest(item.source_session_id.as_bytes())
+        )[..8]
+            .to_owned(),
+        item: attempted,
+        context_curve: attempted.saturating_sub(without_curve),
+        cache_observations: without_curve.saturating_sub(without_cache),
+        identity: without_cache.saturating_sub(untagged),
+        usage_buckets: untagged.saturating_sub(rest),
+        rest,
+        after_shed: grouping.item_bytes(item),
     }
 }
 
