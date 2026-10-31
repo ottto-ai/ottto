@@ -2052,6 +2052,17 @@ fn every_persisted_field_fixture() -> ScanIndex {
                 store.record_observation("session", "/synthetic/0.jsonl", 1);
                 serde_json::to_value(store).unwrap()
             }
+            "claude_copy_removals" => {
+                let mut removals = claude_request_money::copy_removals::CopyRemovals::default();
+                removals.store(
+                    claude_money_birth_store::location_key("/synthetic/copy.jsonl"),
+                    BTreeMap::from([(
+                        claude_money_birth_store::location_key("/synthetic/original.jsonl"),
+                        BTreeSet::from([1, 2]),
+                    )]),
+                );
+                serde_json::to_value(removals).unwrap()
+            }
             "traversal" => {
                 serde_json::json!({"context_fingerprint":"context","census_window_end":"2026-10-22T00:00:00Z","scan_roots":["/synthetic"],"pending_directories":[],"pending_candidates":[],"observed_index_keys":["file"],"reconciliation_upper_bound":"file","reconciliation_after":null,"reconciliation_started":true,"counts":{}})
             }
@@ -2135,16 +2146,21 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     let current = serde_json::to_value(&seed).unwrap();
     let fields = lenient_decode::FIELDS;
     assert_eq!(
-        &fields[fields.len() - 4..],
+        &fields[fields.len() - 5..],
         &[
             "upload_ack_retirement_handoff",
             "held_audit_progress",
             "claude_money_birth_store",
             "claude_desktop_store_inventory",
+            "claude_copy_removals",
         ]
     );
     for earlier_e2 in [false, true] {
         let mut legacy = current.clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("claude_copy_removals");
         legacy.as_object_mut().unwrap().remove(if earlier_e2 {
             "held_audit_progress"
         } else {
@@ -2155,7 +2171,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             // The main positional schema ends at audit progress; appending E2
             // must leave every already-shipped position intact.
             forms.push(Value::Array(
-                fields[..fields.len() - 2]
+                fields[..fields.len() - 3]
                     .iter()
                     .map(|name| legacy[*name].clone())
                     .collect(),
@@ -2318,19 +2334,52 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
     let _on = RestartRestoreForTest::enabled();
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
     let fields = lenient_decode::FIELDS;
-    assert_eq!(fields.last(), Some(&DESKTOP_INVENTORY));
+    let tombstone_slot = fields.len() - 2;
+    assert_eq!(fields[tombstone_slot], DESKTOP_INVENTORY);
+    assert_eq!(fields[tombstone_slot + 1], "claude_copy_removals");
     let slot = |name: &&str| current[*name].clone();
-    let shorter: Vec<Value> = fields[..fields.len() - 1].iter().map(slot).collect();
+    let shorter: Vec<Value> = fields[..tombstone_slot].iter().map(slot).collect();
+    let mut legacy = current.clone();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("claude_copy_removals");
     let mut full = shorter.clone();
     full.push(serde_json::json!("a".repeat(64)));
-    for slots in [shorter, full] {
+    full.push(current["claude_copy_removals"].clone());
+    for (slots, expected) in [(shorter, &legacy), (full, &current)] {
         let bytes = serde_json::to_vec(&Value::Array(slots)).unwrap();
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
         let streaming =
             lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
         let bounded = lenient_decode::read_bounded(&bytes).unwrap();
         for decoded in [native, streaming, bounded] {
-            assert_eq!(serde_json::to_value(decoded).unwrap(), current);
+            assert_eq!(serde_json::to_value(decoded).unwrap(), *expected);
+        }
+    }
+}
+
+#[test]
+fn copy_removals_keep_existing_positional_index_slots() {
+    let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
+    let mut legacy = current.clone();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("claude_copy_removals");
+    let fields = lenient_decode::FIELDS;
+    assert_eq!(fields.last(), Some(&"claude_copy_removals"));
+    for (expected, slots) in [(&legacy, &fields[..fields.len() - 1]), (&current, fields)] {
+        let bytes = serde_json::to_vec(&Value::Array(
+            slots.iter().map(|name| expected[*name].clone()).collect(),
+        ))
+        .unwrap();
+        let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+        let streaming =
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+        for decoded in [native, streaming, bounded] {
+            assert_eq!(serde_json::to_value(decoded).unwrap(), *expected);
         }
     }
 }
@@ -5017,4 +5066,102 @@ fn o3_ambiguous_negative_evidence_refuses_through_every_reader() {
             assert!(!reopened.o3_replay.needs_save());
         }
     }
+}
+
+// Pin every positional slot, including the decode-and-drop inventory tombstone.
+#[test]
+fn scan_index_full_positional_field_order_is_pinned() {
+    assert_eq!(
+        lenient_decode::FIELDS,
+        &[
+            "schema_version",
+            "generation",
+            "upload_context_fingerprint",
+            "files",
+            "session_account_bindings",
+            "terminal_jsonl_dispositions",
+            "known_configured_scan_roots",
+            "legacy_unresolved_root_file_witnesses",
+            "codex_state_only_snapshot_fingerprints",
+            "codex_state_only_blocked_session_ids",
+            "codex_state_only_blocked_by_file",
+            "codex_state_only_blocked_unattributed",
+            "codex_state_only_blocked_legacy",
+            "codex_state_only_blocked_attributed",
+            "codex_parent_ownership_refs",
+            "codex_parent_ownership_ledgers",
+            "codex_parent_side_requests",
+            "codex_parent_side",
+            "codex_parent_side_generation",
+            "codex_parent_proof_wrap_epoch",
+            "codex_parent_prefix_proofs",
+            "codex_parent_proof_cursor",
+            "codex_parent_side_cursor",
+            "codex_parent_proof_seq",
+            "codex_proof_index_incarnation",
+            "claude_desktop_title_files",
+            "claude_account_family_witnesses",
+            "claude_account_family_pending",
+            "claude_usage_family_witnesses",
+            "claude_usage_family_pending",
+            "claude_request_census",
+            "claude_request_census_shadow",
+            "claude_usage_authority_quarantine",
+            "claude_retired_family_tombstones",
+            "claude_retired_family_tombstones_initialized",
+            "claude_retired_family_tombstones_uncertain",
+            "claude_duplicate_request_owners",
+            "claude_duplicate_request_witness_overflowed",
+            "claude_owned_start_census",
+            "claude_account_deferred_holds",
+            "claude_duplicate_fence_rearm_attempt",
+            "claude_duplicate_fence_next_full_rearm_unix_seconds",
+            "claude_full_rearm_progress",
+            "claude_request_identity_contract",
+            "claude_request_identity_contract_changed",
+            "claude_desktop_store_cursor",
+            "claude_desktop_store_upper_bound",
+            "claude_desktop_store_sweep_had_errors",
+            "claude_desktop_identity_census_complete",
+            "claude_desktop_lineage_census_complete",
+            "claude_desktop_census_witness",
+            "claude_desktop_store_retry_attempt",
+            "claude_desktop_store_retry_not_before_unix_seconds",
+            "resume_after_path",
+            "resume_upper_bound_path",
+            "resume_census_window_end",
+            "bounded_sweep_had_unsettled_upload",
+            "bounded_sweep_unsettled_causes",
+            "traversal",
+            "claude_stale_family_carry",
+            "scan_residue_witness",
+            "historical_replay_generation",
+            "context_curve_capability_enabled",
+            "context_curve_replay_epoch",
+            "completed_context_curve_replay_generation",
+            "confirmed_empty_files",
+            "file_snapshot_fingerprints",
+            "snapshot_activity_at",
+            "accepted_snapshot_fingerprints",
+            "accepted_snapshot_fingerprint_ledger_version",
+            "legacy_settlement_reconcile_after_fingerprint",
+            "quarantined_snapshot_fingerprints",
+            "claude_history_cutoff_unix_seconds",
+            "claude_history_gate_loaded",
+            "claude_history_move_not_full",
+            "claude_history_move_released",
+            "accepted_incidence_pending_census",
+            "accepted_rebuild_incidence",
+            "accepted_rebuild_pending_since_unix_seconds",
+            "accepted_rebuild_last_alarm_unix_seconds",
+            "codex_counting_tombstones",
+            "reread_guard", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+            "codex_counting_evicted_legacy",
+            "upload_ack_retirement_handoff",
+            "held_audit_progress",
+            "claude_money_birth_store",
+            "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
+            "claude_copy_removals",
+        ]
+    );
 }

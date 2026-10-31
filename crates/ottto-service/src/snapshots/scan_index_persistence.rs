@@ -997,6 +997,17 @@ impl LockedStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
+        self.open_read_only_with_map_validator(validate)
+    }
+
+    /// Inspect an immutable published representation without a checkpoint lock.
+    /// Never recover initialization, create a prior-root marker or repair state.
+    /// Missing/in-progress storage refuses through current() rather than being
+    /// converted into a fresh index.
+    pub(crate) fn open_read_only_with_map_validator(
+        &self,
+        validate: &mut impl FnMut(Field, &mut LogicalReader) -> Result<()>,
+    ) -> Result<Opened> {
         let (file, mut root) = self.current()?;
         match &mut root {
             Root::Missing => Ok(Opened::Missing(LoadedRoot(Arc::new(root)))),

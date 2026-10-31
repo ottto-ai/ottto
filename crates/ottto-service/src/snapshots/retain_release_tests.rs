@@ -1113,6 +1113,7 @@ fn x_out_coverage_witness_names_every_finished_field() {
             removed_request_count: _,                       // inline optional wire counters
             removed_usage: _,                               // inline optional wire counters
             telemetry_owned_complete: _,                    // inline optional authority marker
+            copy_unproven_counts: _,                        // inline optional money disclosure
             resolver_conflict_count: _,                     // inline optional wire counter
             claude_money: _, // E aggregate is covered by finish output reserve
             usage_accounting_contract: _, // K (literal)

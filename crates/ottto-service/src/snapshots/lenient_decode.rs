@@ -336,6 +336,10 @@ impl Serialize for ScanIndex {
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
         );
+        field!(
+            claude_copy_removals,
+            claude_request_money::copy_removals::CopyRemovals::is_empty
+        );
         map.end()
     }
 }
@@ -428,6 +432,7 @@ pub(super) const FIELDS: &[&str] = &[
     "held_audit_progress",
     "claude_money_birth_store",
     "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
+    "claude_copy_removals",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -822,7 +827,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
                 reader.consume(1);
                 name
             };
-            let optional = optional_census(name) || name == Some("claude_money_birth_store");
+            let optional = optional_census(name) || optional_money_hint(name);
             // CensusRead streams positional-array separator whitespace before
             // capture; object-field evidence starts immediately after ':'.
             if array {
@@ -869,6 +874,14 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
     reader.seek(SeekFrom::Start(0))?;
     Ok(resources)
 }
+/// Local money hints: damage drops the hint, never the index.
+fn optional_money_hint(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some("claude_money_birth_store" | "claude_copy_removals")
+    )
+}
+
 fn optional_census(name: Option<&str>) -> bool {
     matches!(
         name,
@@ -1599,8 +1612,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                 self.eat(b':')?;
                 name
             };
-            let value = self
-                .span_optional(optional_census(name) || name == Some("claude_money_birth_store"))?;
+            let value = self.span_optional(optional_census(name) || optional_money_hint(name))?;
             if let Some(name) = name {
                 if matches!(
                     name,
@@ -2022,6 +2034,29 @@ impl<R: BufRead + Seek> Decoder<R> {
                             }
                             index.claude_money_birth_store = decoded.unwrap_or_default();
                         }
+                        "claude_copy_removals" => {
+                            // Like the birth table: a damaged or over-budget
+                            // value decodes as none (copies decide afresh).
+                            let decoded = if !value.resource
+                                && value.len
+                                    <= (claude_request_money::copy_removals::MAX_BYTES as u64) / 3
+                                        * 4
+                                        + 64
+                            {
+                                self.typed::<claude_request_money::copy_removals::CopyRemovals>(
+                                    value,
+                                )
+                                .ok()
+                            } else {
+                                None
+                            };
+                            if decoded.is_none() {
+                                self.counts.drops.activity += 1;
+                            }
+                            index.claude_copy_removals = decoded.unwrap_or_else(
+                                claude_request_money::copy_removals::CopyRemovals::missing,
+                            );
+                        }
                         "accepted_rebuild_incidence" => {
                             if value.len > CARRIED_ACK_BYTES_MAX as u64 {
                                 return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
@@ -2046,6 +2081,10 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
 
         if pass == Pass::Full {
+            if !seen.contains("claude_copy_removals") {
+                index.claude_copy_removals =
+                    claude_request_money::copy_removals::CopyRemovals::missing();
+            }
             // Migrate the old marker without granting later ACKs blanket retention.
             if index.accepted_incidence_pending_census
                 && index.accepted_rebuild_incidence.is_empty()

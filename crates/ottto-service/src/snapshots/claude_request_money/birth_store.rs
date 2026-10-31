@@ -21,6 +21,15 @@ fn key(domain: &[u8], value: &str) -> LocationKey {
     h.update(value.as_bytes());
     LocationKey(h.finalize()[..16].try_into().expect("digest prefix"))
 }
+impl LocationKey {
+    /// The stored digest bytes (local state encodings only, never wire).
+    pub(crate) fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+    pub(crate) fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+}
 pub(crate) fn location_key(path: &str) -> LocationKey {
     key(b"claude-money-path-v1\0", path)
 }

@@ -3,8 +3,11 @@
 import copy
 import json
 import unittest
+from pathlib import Path
+import tempfile
 
-from money_equivalence import decode_receipt, has_forbidden_diff, receipt_diff
+from money_equivalence import (decode_receipt, has_forbidden_diff, receipt_diff,
+                               require_base_scan_fixture)
 
 
 CONTRACT = "usage_decrease_hold_ack_contract"
@@ -345,6 +348,28 @@ class MoneyEquivalenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as error:
                     decode_receipt(invalid)
                 self.assertNotIn("DO_NOT_LOG_THIS_VALUE", str(error.exception))
+
+
+class TransplantTests(unittest.TestCase):
+    def test_base_scanner_fixture_is_preserved_and_missing_apis_fail_closed(self):
+        # Older bases must never acquire the head's ClaudeTerminalOffForTest
+        # prologue. Validate the real transplant guard without touching runtime.
+        with tempfile.TemporaryDirectory() as scratch:
+            base = Path(scratch)
+            fixture = base / "crates/ottto-service/src/snapshots/e2_pipeline_scan_fixture.rs"
+            fixture.parent.mkdir(parents=True)
+            original = b"// base adapter\nfn scan() {}\nfn scan_other() {}\nfn begin_durable() {}\n"
+            fixture.write_bytes(original)
+            require_base_scan_fixture(base)
+            self.assertEqual(fixture.read_bytes(), original)
+            for method in ("scan", "scan_other", "begin_durable"):
+                with self.subTest(missing=method):
+                    fixture.write_bytes(original.replace(f"fn {method}(".encode(), b"fn missing("))
+                    with self.assertRaisesRegex(RuntimeError, "base compat"):
+                        require_base_scan_fixture(base)
+            fixture.unlink()
+            with self.assertRaises(FileNotFoundError):
+                require_base_scan_fixture(base)
 
 
 if __name__ == "__main__":
