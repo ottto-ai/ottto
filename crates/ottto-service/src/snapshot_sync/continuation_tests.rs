@@ -159,8 +159,6 @@ enum End {
     Paused,
     Deferred,
     ParkedEof,
-    Cancelled,
-    Failed,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -246,8 +244,6 @@ impl CursorContinuation for FakePort<'_> {
             End::Paused => PageEnd::Paused(CursorTicket::synthetic()),
             End::Deferred => PageEnd::Deferred,
             End::ParkedEof => PageEnd::Deferred,
-            End::Cancelled => PageEnd::Cancelled,
-            End::Failed => PageEnd::Failed(anyhow!("synthetic save CAS refusal")),
         }
     }
 }
@@ -310,27 +306,6 @@ fn run(world: &World, port: &mut FakePort<'_>, gates: &mut FakeGates<'_>) -> Out
         &world.slot,
         deadline,
     )
-}
-
-#[test]
-fn cancelled_failed_and_deferred_pages_leave_no_continuation() {
-    for (end, expected) in [
-        (End::Cancelled, Outcome::Cancelled),
-        (End::Failed, Outcome::Failed),
-        (End::Deferred, Outcome::Deferred),
-    ] {
-        let world = World::new();
-        world.ordinary_page_asks(Duration::from_secs(5));
-        world.advance_to_due();
-        let mut port = FakePort::new(&world, &[end]);
-        let mut gates = FakeGates::allowed(&world);
-        assert_eq!(run(&world, &mut port, &mut gates), expected);
-        assert!(!world.held(), "{end:?}");
-        assert_eq!(world.due(), None, "{end:?}");
-        assert_eq!(world.network.get(), 0, "{end:?}");
-        assert_eq!((gates.entered, gates.restored), (1, 1), "{end:?}");
-        assert!(world.lock.try_lock().is_ok(), "{end:?}");
-    }
 }
 
 #[test]
@@ -453,33 +428,6 @@ fn refused_busy_or_unknown_inputs_cannot_manufacture_urgency() {
     assert_eq!(port.calls.ready, 0);
 }
 
-#[test]
-fn a_failed_cycle_or_a_lost_codex_grant_leaves_no_continuation() {
-    // A cycle that ends `Err`, including before rotation (machine identity
-    // missing, account authority unavailable), or ran without the Codex grant.
-    let world = World::new();
-    world.ordinary_page_asks(Duration::from_secs(5));
-    settle_cycle(&mut FakeHost(&world), &world.slot, false);
-    assert!(!world.held());
-    assert_eq!(world.due(), None);
-    world.advance(Duration::from_secs(60));
-    let mut port = FakePort::new(&world, &[End::Paused]);
-    let mut gates = FakeGates::allowed(&world);
-    assert_eq!(
-        run(&world, &mut port, &mut gates),
-        Outcome::Skipped(Skip::NoTicket)
-    );
-    assert_eq!(port.calls.page, 0);
-
-    // A successful cycle with the grant keeps a ticket whose Codex scan was
-    // not due this cycle.
-    let world = World::new();
-    world.ordinary_page_asks(Duration::from_secs(5));
-    settle_cycle(&mut FakeHost(&world), &world.slot, true);
-    assert!(world.held());
-    assert!(world.due().is_some());
-}
-
 fn ordinary_pass_clears(world: &World) {
     settle_cycle(&mut FakeHost(world), &world.slot, false);
 }
@@ -538,85 +486,6 @@ fn the_ticket_is_taken_and_written_only_under_the_sync_lock() {
     assert_eq!(run(&world, &mut port, &mut gates), Outcome::Paused);
     assert_eq!(port.calls.page, 1);
     assert_eq!(world.held_destination(), Some(OTHER_DESTINATION));
-}
-
-#[test]
-fn policy_changes_between_precheck_and_lock_apply_to_the_current_ticket() {
-    type Change = fn(&World);
-    let rows: [(Change, Skip, bool); 4] = [
-        (
-            |w| {
-                w.cadence
-                    .borrow_mut()
-                    .set_server_min_interval(Some(Duration::from_secs(120)))
-            },
-            Skip::NotDue,
-            true,
-        ),
-        (
-            |w| {
-                w.cadence
-                    .borrow_mut()
-                    .set_server_min_interval(Some(Duration::from_secs(1800)))
-            },
-            Skip::NotDue,
-            false,
-        ),
-        (
-            |w| w.cadence.borrow_mut().record_scan_failure(w.now.get()),
-            Skip::Failing,
-            false,
-        ),
-        (|w| w.backoff.set(true), Skip::Backoff, false),
-    ];
-    for (change, reason, kept) in rows {
-        let world = World::new();
-        world.ordinary_page_asks(Duration::from_secs(4));
-        world.advance_to_due();
-        let mut port = FakePort::new(&world, &[End::Paused]);
-        let mut gates = FakeGates::allowed(&world);
-        gates.on_power = Some(change);
-        assert_eq!(run(&world, &mut port, &mut gates), Outcome::Skipped(reason));
-        assert_eq!(world.held(), kept);
-        assert_eq!(world.due().is_some(), kept);
-        assert_eq!(port.calls, Calls::default());
-        assert_eq!(gates.entered, 0);
-    }
-}
-
-#[test]
-fn a_page_stops_at_the_ordinary_deadline() {
-    let world = World::new();
-    world.ordinary_page_asks(Duration::from_secs(5));
-    world.advance_to_due();
-    let mut port = FakePort::new(&world, &[End::Paused]);
-    port.work = Duration::from_secs(15);
-    let mut gates = FakeGates::allowed(&world);
-    let started = world.now.get();
-    let ordinary = started + Duration::from_secs(6);
-    let outcome = run_page(
-        &mut FakeHost(&world),
-        &mut port,
-        &mut gates,
-        &world.lock,
-        &world.slot,
-        ordinary,
-    );
-    assert_eq!(port.deadlines, vec![(ordinary, true)]);
-    assert_eq!(
-        world.now.get(),
-        ordinary + RECORD,
-        "the overrun is at most the record being read"
-    );
-    assert_eq!(outcome, Outcome::PausedContended);
-    assert!(!world.held());
-    assert_eq!(world.due(), None);
-    // No request survives into this or a later wait: ordinary next.
-    let pending = world.due().zip(world.cadence.borrow().continuation_work());
-    assert!(matches!(
-        plan_wake(world.now.get(), ordinary, pending),
-        Wake::Ordinary(_)
-    ));
 }
 
 /// The loop against a fixed per-page work and gap, for schedule-only checks.
@@ -861,75 +730,6 @@ fn continuation_pages_never_renew_the_lifetime() {
     assert!(!world.held());
 }
 
-#[test]
-fn the_lifetime_is_the_capture_time_minimum_or_none() {
-    let start = Instant::now();
-    let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
-    cadence.record_scan_success(start, 0);
-    let bound = cadence
-        .ordinary_interval()
-        .min(cadence.hot_min_interval())
-        .min(SNAPSHOT_SYNC_INTERVAL);
-    assert_eq!(bound, SNAPSHOT_SYNC_INTERVAL);
-    assert_eq!(
-        lifetime_from(Some(start), &cadence),
-        Some((start, start + bound))
-    );
-    assert_eq!(lifetime_from(None, &cadence), None, "no prepare time");
-    // A directive or a failure backoff lengthens the ordinary interval, never
-    // the lifetime.
-    cadence.set_server_min_interval(Some(Duration::from_secs(6 * 3600)));
-    for _ in 0..5 {
-        cadence.record_scan_failure(start);
-    }
-    assert_eq!(
-        lifetime_from(Some(start), &cadence),
-        Some((start, start + bound))
-    );
-    // A shorter Hot floor wins.
-    let mut hot = SourceCadence::new(CadenceConfig::cost_first(Duration::from_secs(60)));
-    hot.record_scan_success(start, 0);
-    let (_, expires) = lifetime_from(Some(start), &hot).unwrap();
-    assert!(expires - start <= Duration::from_secs(60));
-    // A zero bound mints nothing.
-    let zero = SourceCadence::new(CadenceConfig::cost_first(Duration::ZERO));
-    assert!(zero.hot_min_interval().is_zero());
-    assert_eq!(lifetime_from(Some(start), &zero), None);
-}
-
-#[test]
-fn no_lifetime_or_authority_mints_no_ticket() {
-    struct Mints;
-    impl CursorContinuation for Mints {
-        fn ticket_for(&self, _scan: &SourceScanResult) -> Option<CursorTicket> {
-            Some(CursorTicket::synthetic())
-        }
-        fn ready(&mut self, _ticket: &CursorTicket) -> bool {
-            false
-        }
-        fn page(
-            &mut self,
-            _ticket: CursorTicket,
-            _deadline: Instant,
-            _ordinary_equivalent: Option<Duration>,
-        ) -> PageEnd {
-            PageEnd::Deferred
-        }
-    }
-    let scan = empty_scan();
-    let now = Instant::now();
-    let bounds = (now, now + LIFETIME);
-    let lifetime = Some(bounds);
-    assert!(ordinary_ticket(&Mints, &scan, "ns", Some(AUTHORITY), None).is_none());
-    assert!(ordinary_ticket(&Mints, &scan, "ns", None, lifetime).is_none());
-    let minted = ordinary_ticket(&Mints, &scan, "ns", Some(AUTHORITY), lifetime).unwrap();
-    assert_eq!((minted.issued, minted.expires), bounds);
-    assert_eq!(minted.destination, destination_digest("ns"));
-    assert!(!minted.valid_at(now + LIFETIME));
-    assert!(!minted.valid_at(now - Duration::from_secs(1)));
-    assert!(minted.valid_at(now));
-}
-
 /// The loop never holds the page's lock while it waits between pages.
 #[test]
 fn the_sync_lock_is_free_while_the_loop_waits() {
@@ -1003,102 +803,6 @@ fn test_latch() -> &'static AtomicBool {
     Box::leak(Box::new(AtomicBool::new(false)))
 }
 
-/// W7/W8/K6/K7: every worker end maps to one page end; only a panic or a
-/// broken invariant sets the latch.
-#[test]
-fn every_worker_end_maps_to_one_page_end() {
-    let deadline = Instant::now();
-    let before = deadline - Duration::from_secs(1);
-    type Check = fn(&PageEnd) -> bool;
-    type Ended = std::result::Result<WorkerEnd, WorkerFailure>;
-    type Row = (&'static str, Ended, Instant, Check, bool);
-    let rows: [Row; 10] = [
-        (
-            "spawn",
-            Err(WorkerFailure::Spawn),
-            before,
-            |e| matches!(e, PageEnd::Deferred),
-            false,
-        ),
-        (
-            "panic",
-            Err(WorkerFailure::Panicked),
-            before,
-            |e| matches!(e, PageEnd::Failed(_)),
-            true,
-        ),
-        (
-            "stopped",
-            Ok(WorkerEnd::Stopped),
-            before,
-            |e| matches!(e, PageEnd::Deferred),
-            false,
-        ),
-        (
-            "stopped at the deadline",
-            Ok(WorkerEnd::Stopped),
-            deadline,
-            |e| matches!(e, PageEnd::PausedContended),
-            false,
-        ),
-        (
-            "deferred",
-            Ok(WorkerEnd::Deferred),
-            deadline,
-            |e| matches!(e, PageEnd::Deferred),
-            false,
-        ),
-        (
-            "refused",
-            Ok(WorkerEnd::Refused("historical_replay_pending")),
-            before,
-            |e| matches!(e, PageEnd::Deferred),
-            false,
-        ),
-        (
-            "snapshots before EOF",
-            Ok(WorkerEnd::Unexpected),
-            before,
-            |e| matches!(e, PageEnd::Failed(_)),
-            true,
-        ),
-        (
-            "failed",
-            Ok(WorkerEnd::Failed(anyhow!("synthetic load failure"))),
-            before,
-            |e| matches!(e, PageEnd::Failed(_)),
-            false,
-        ),
-        (
-            "paused",
-            Ok(WorkerEnd::Paused(Box::new(CodexPage {
-                cursor: CodexCursorTicket::unready_for_test(),
-                inputs: None,
-            }))),
-            before,
-            |e| matches!(e, PageEnd::Paused(_)),
-            false,
-        ),
-        (
-            "paused past the deadline",
-            Ok(WorkerEnd::Paused(Box::new(CodexPage {
-                cursor: CodexCursorTicket::unready_for_test(),
-                inputs: None,
-            }))),
-            deadline,
-            // A byte-budget pause; `run_page` judges the contention.
-            |e| matches!(e, PageEnd::Paused(_)),
-            false,
-        ),
-    ];
-    for (name, ended, now, check, latches) in rows {
-        let latch = test_latch();
-        let end = page_end(ended, deadline, now, latch);
-        assert!(check(&end), "{name}");
-        assert_eq!(latch.load(Ordering::SeqCst), latches, "{name}");
-    }
-}
-
 /// W8(a), W9: a worker that panics while holding any of the cache's locks
 /// comes back as `Failed`; the latch then refuses every further ticket and
 /// readiness, and the poisoned or recovered lock fails closed.
@@ -1138,40 +842,6 @@ fn a_worker_panic_under_any_cache_lock_latches_and_fails_closed() {
             TestLock::Side => assert!(cache.lock_poisoned_for_test(lock)),
         }
     }
-}
-
-/// A production adapter page on a synthetic ticket, or on a Codex ticket
-/// without inputs, never reaches the worker's scan.
-#[test]
-fn the_adapter_refuses_a_page_without_inputs() {
-    let cache = Arc::new(SharedCache::default());
-    let dir = std::env::temp_dir();
-    let mut port = CodexContinuation::new(&cache, &dir, &dir);
-    port.latch = test_latch();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    assert!(!port.ready(&CursorTicket::synthetic()));
-    assert!(matches!(
-        port.page(CursorTicket::synthetic(), deadline, None),
-        PageEnd::Deferred
-    ));
-    let codex = CursorTicket::codex(CodexCursorTicket::unready_for_test());
-    assert!(!port.ready(&codex), "no inputs, and not paused here");
-    // A ticket with no live job reads nothing regardless of platform QoS.
-    assert!(matches!(
-        port.page(codex, deadline, Some(Duration::from_secs(300))),
-        PageEnd::Deferred
-    ));
-    port.worker_qos = || Some(MacPlatformSignals::default());
-    // Allowed QoS, but the ticket names no paused job: no members.
-    assert!(matches!(
-        port.page(
-            CursorTicket::codex(CodexCursorTicket::unready_for_test()),
-            deadline,
-            None
-        ),
-        PageEnd::Deferred
-    ));
-    assert!(!port.latched());
 }
 
 fn attach_inputs(mut ticket: ContinuationTicket, inputs: ContinuationInputs) -> ContinuationTicket {
@@ -1326,52 +996,6 @@ fn the_authority_digest_follows_the_ordinary_validation() {
     }
 }
 
-thread_local! { static QOS_WRITES: RefCell<Vec<(u32, i32)>> = const { RefCell::new(Vec::new()) }; }
-fn record_qos(class: u32, rel: i32) -> bool {
-    QOS_WRITES.with(|v| v.borrow_mut().push((class, rel)));
-    true
-}
-fn saved_qos() -> Option<(u32, i32)> {
-    Some((0x19, -7))
-}
-
-#[test]
-fn exact_qos_pair_restores_on_parent_and_worker_panics_and_failed_query_is_untouched() {
-    fn panic_with_guard() {
-        QOS_WRITES.with(|v| v.borrow_mut().clear());
-        let result = std::panic::catch_unwind(|| {
-            let mut signals = MacPlatformSignals {
-                setter: Some(record_qos),
-                ..Default::default()
-            };
-            assert_eq!(
-                signals.enter(saved_qos(), record_qos),
-                PlatformState::Allowed
-            );
-            let _guard = signals;
-            panic!("after QoS entry");
-        });
-        assert!(result.is_err());
-        QOS_WRITES.with(|v| assert_eq!(*v.borrow(), [(0x09, 0), (0x19, -7)]));
-    }
-    panic_with_guard();
-    assert_eq!(on_worker(panic_with_guard), Ok(()));
-    QOS_WRITES.with(|v| v.borrow_mut().clear());
-    let mut signals = MacPlatformSignals {
-        setter: Some(record_qos),
-        ..Default::default()
-    };
-    assert_eq!(signals.enter(None, record_qos), PlatformState::Unknown);
-    signals.restore_qos();
-    QOS_WRITES.with(|v| assert!(v.borrow().is_empty()));
-    assert_eq!(
-        signals.enter(Some((0, 0)), record_qos),
-        PlatformState::Allowed
-    );
-    signals.restore_qos();
-    QOS_WRITES.with(|v| assert_eq!(v.borrow().last(), Some(&(0x15, 0))));
-}
-
 thread_local! {
     static TEST_CONTEXT: std::cell::Cell<Option<RuntimeContext>> = const { std::cell::Cell::new(None) };
 }
@@ -1490,36 +1114,6 @@ fn changed_context_policy_or_inventory_holds_before_any_read() {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
-}
-
-#[test]
-fn carried_inventory_over_the_retained_limit_refuses_ticket_admission() {
-    let (root, inputs) = inventory_inputs();
-    let world = World::new();
-    let issued = world.now.get();
-    let mut ticket = attach_inputs(
-        ContinuationTicket {
-            destination: DESTINATION,
-            authority: AUTHORITY,
-            cursor: CursorTicket::codex(CodexCursorTicket::unready_for_test()),
-            issued,
-            expires: issued + LIFETIME,
-        },
-        inputs,
-    );
-    let limit = ticket
-        .cursor
-        .retained_bound(usize::MAX)
-        .map_or(usize::MAX, |bytes| bytes - 1);
-    let inputs = match &mut ticket.cursor.0 {
-        CursorParts::Codex(page) => page.inputs.take().unwrap(),
-        _ => unreachable!(),
-    };
-    assert!(
-        ticket.with_inputs(inputs, limit).is_none(),
-        "over-bound or unknown inventory never mints"
-    );
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

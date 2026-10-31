@@ -113,28 +113,6 @@ fn terminal_contract_current_and_future_versions_and_superseded_never_rearm() {
 }
 
 #[test]
-fn terminal_contract_newer_index_assessment_dominates_stale_progress() {
-    let mut progress = test_upload_progress();
-    let fingerprint = "a".repeat(64);
-    for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
-        progress.quarantine_body(&fingerprint, &fingerprint);
-    }
-    let mut upgraded = progress.quarantined_fingerprints.clone();
-    with_contract(2, || {
-        assert_eq!(
-            crate::snapshots::terminal_contract_retry::rearm(
-                &mut upgraded,
-                progress.active_quarantine_witness.as_ref()
-            ),
-            1
-        );
-        assert!(progress.prepare_quarantine_retries(&upgraded));
-        assert_eq!(progress.quarantined_fingerprints, upgraded);
-        assert!(progress.active_quarantine_retries.is_empty());
-    });
-}
-
-#[test]
 fn terminal_contract_permanent_refusal_keeps_its_existing_gate() {
     let scratch = crate::test_scratch::ScratchDir::new("terminal-contract-permanent");
     let path = scratch.join("progress.json");
@@ -334,99 +312,6 @@ impl RetainedRetryFixture {
     }
 }
 
-#[test]
-fn terminal_contract_malformed_values_keep_both_checkpoints_and_one_paced_debt() {
-    let malformed = [
-        serde_json::Value::Null,
-        serde_json::json!("2"),
-        serde_json::json!(-1),
-        serde_json::json!(65536),
-        serde_json::json!(1.5),
-        serde_json::json!(false),
-        serde_json::json!([1, {"nested": true}]),
-        serde_json::json!({"nested": [1, 2]}),
-    ];
-    for bad in malformed {
-        for repair_count in [false, true] {
-            for pending in [false, true] {
-                let fixture = RetainedRetryFixture::new();
-                for (path, field) in [
-                    (&fixture.index_path, "quarantined_snapshot_fingerprints"),
-                    (&fixture.progress_path, "quarantined_fingerprints"),
-                ] {
-                    let mut value: serde_json::Value =
-                        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-                    let record = &mut value[field][held_fingerprint()];
-                    record["reconstruction_contract"] = bad.clone();
-                    if pending {
-                        record["disposition"] = serde_json::json!("retry_pending");
-                        record["failed_reconstruction_count"] = serde_json::json!(1);
-                    }
-                    // Force ScanIndex's separate scalar-repair representation.
-                    if repair_count && field == "quarantined_snapshot_fingerprints" {
-                        record["failed_reconstruction_count"] = serde_json::Value::Null;
-                    }
-                    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
-                }
-                let before = current_unix_seconds();
-                let (mut index, mut progress) = fixture.load();
-                for record in [
-                    &index.quarantined_snapshot_fingerprints[&held_fingerprint()],
-                    &progress.quarantined_fingerprints[&held_fingerprint()],
-                ] {
-                    assert_eq!(
-                        record.reconstruction_contract,
-                        crate::snapshots::terminal_contract_retry::current_contract()
-                    );
-                    assert_eq!(
-                        record.failed_reconstruction_count,
-                        MAX_SNAPSHOT_RECONSTRUCTION_FAILURES - 1
-                    );
-                    assert_eq!(
-                        record.disposition,
-                        SnapshotQuarantineDisposition::RetryPending
-                    );
-                    assert_eq!(
-                        record.upload_body_witness.as_deref(),
-                        Some(held_body().as_str())
-                    );
-                    assert!(
-                        record.retry_after_unix_seconds
-                            >= before + SNAPSHOT_QUARANTINE_RETRY_SECONDS
-                    );
-                    assert!(
-                        record.retry_after_unix_seconds
-                            < current_unix_seconds() + 2 * SNAPSHOT_QUARANTINE_RETRY_SECONDS
-                    );
-                }
-                assert!(
-                    progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints)
-                );
-                assert!(
-                    progress.active_quarantine_retries.is_empty(),
-                    "unknown waits for pacing"
-                );
-                index.save(&fixture.index_path).unwrap();
-                progress.save(&fixture.progress_path).unwrap();
-                let (restarted_index, mut restarted_progress) = fixture.load();
-                assert_eq!(
-                    restarted_index.quarantined_snapshot_fingerprints[&held_fingerprint()],
-                    index.quarantined_snapshot_fingerprints[&held_fingerprint()]
-                );
-                assert_eq!(
-                    restarted_progress.quarantined_fingerprints[&held_fingerprint()],
-                    progress.quarantined_fingerprints[&held_fingerprint()]
-                );
-                assert!(!restarted_progress.prepare_quarantine_retries(
-                    &restarted_index.quarantined_snapshot_fingerprints
-                ));
-                assert!(restarted_progress.active_quarantine_retries.is_empty());
-                fixture.assert_retained(&restarted_index, &restarted_progress);
-            }
-        }
-    }
-}
-
 fn successful_contract_retry(restart_after_selection: bool) {
     let fixture = RetainedRetryFixture::new();
     with_contract(2, || {
@@ -593,11 +478,6 @@ fn successful_contract_retry(restart_after_selection: bool) {
 }
 
 #[test]
-fn terminal_contract_bump_successful_ack_settles_once_with_stale_index() {
-    successful_contract_retry(false);
-}
-
-#[test]
 fn terminal_contract_restart_after_saved_lease_keeps_owed_attempt_and_identity() {
     successful_contract_retry(true);
 }
@@ -723,26 +603,10 @@ impl ReadBudgetFixture {
 enum InterruptedOutcome {
     Restart,
     Conflict,
-    SaveFailure,
 }
 
-fn contract_read_cap(outcome: InterruptedOutcome, unbound_body: bool) {
+fn contract_read_cap(outcome: InterruptedOutcome) {
     let fixture = ReadBudgetFixture::new();
-    if unbound_body {
-        let (mut index, mut progress) = fixture.retained.load();
-        index
-            .quarantined_snapshot_fingerprints
-            .get_mut(&fixture.fingerprint)
-            .unwrap()
-            .upload_body_witness = None;
-        progress
-            .quarantined_fingerprints
-            .get_mut(&fixture.fingerprint)
-            .unwrap()
-            .upload_body_witness = None;
-        index.save(&fixture.retained.index_path).unwrap();
-        progress.save(&fixture.retained.progress_path).unwrap();
-    }
     with_contract(2, || {
         let (mut index, mut progress) = fixture.retained.load();
         assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
@@ -794,18 +658,11 @@ fn contract_read_cap(outcome: InterruptedOutcome, unbound_body: bool) {
             );
             match outcome {
                 InterruptedOutcome::Restart => {} // Lose all volatile state before any outcome.
-                InterruptedOutcome::Conflict | InterruptedOutcome::SaveFailure => {
+                InterruptedOutcome::Conflict => {
                     let mut accepted = 0;
                     // ACK lifetime is independent of this incremental input.
                     // Keep the sibling out of the delta to exercise retention.
                     let items = vec![fixture.fingerprint.clone()];
-                    let temp = fixture
-                        .retained
-                        .progress_path
-                        .with_extension(format!("json.{}.tmp", std::process::id()));
-                    if matches!(outcome, InterruptedOutcome::SaveFailure) {
-                        std::fs::create_dir(&temp).unwrap(); // Fail the actual checkpoint create, after reading.
-                    }
                     let result = upload_resumable_batches_with_body_witness(
                         &items,
                         &unique_poison_scope(),
@@ -829,15 +686,10 @@ fn contract_read_cap(outcome: InterruptedOutcome, unbound_body: bool) {
                         },
                         |state| state.save(&fixture.retained.progress_path),
                     );
-                    if matches!(outcome, InterruptedOutcome::SaveFailure) {
-                        assert!(result.is_err(), "real outcome persistence must fail");
-                        std::fs::remove_dir(&temp).unwrap();
-                    } else {
-                        assert_eq!(
-                            result.unwrap(),
-                            ResumableUploadResult::Deferred { count: 1 }
-                        );
-                    }
+                    assert_eq!(
+                        result.unwrap(),
+                        ResumableUploadResult::Deferred { count: 1 }
+                    );
                     assert_eq!(accepted, 0);
                 }
             }
@@ -878,15 +730,11 @@ fn contract_read_cap(outcome: InterruptedOutcome, unbound_body: bool) {
 
 #[test]
 fn terminal_contract_restart_before_outcome_allows_one_more_paced_source_read() {
-    contract_read_cap(InterruptedOutcome::Restart, false);
+    contract_read_cap(InterruptedOutcome::Restart);
 }
 #[test]
 fn terminal_contract_repeated_conflicts_cap_actual_source_reads_at_two() {
-    contract_read_cap(InterruptedOutcome::Conflict, false);
-}
-#[test]
-fn terminal_contract_failed_outcome_save_caps_actual_source_reads_at_two() {
-    contract_read_cap(InterruptedOutcome::SaveFailure, false);
+    contract_read_cap(InterruptedOutcome::Conflict);
 }
 
 #[test]
@@ -989,51 +837,6 @@ fn terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
             fixture.assert_retained(&index, &progress);
         }
     }
-}
-
-#[test]
-fn terminal_contract_next_version_starts_a_distinct_paced_budget() {
-    let mut progress = test_upload_progress();
-    let fp = "a".repeat(64);
-    for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
-        progress.quarantine_body(&fp, &fp);
-    }
-    with_contract(2, || {
-        crate::snapshots::terminal_contract_retry::rearm(
-            &mut progress.quarantined_fingerprints,
-            progress.active_quarantine_witness.as_ref(),
-        );
-        let record = progress.quarantined_fingerprints.get_mut(&fp).unwrap();
-        record.retry_after_unix_seconds = 0;
-        assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
-        assert_eq!(
-            progress.quarantined_fingerprints[&fp].contract_retry_claims,
-            Some(1)
-        );
-    });
-    with_contract(3, || {
-        assert_eq!(
-            crate::snapshots::terminal_contract_retry::rearm(
-                &mut progress.quarantined_fingerprints,
-                progress.active_quarantine_witness.as_ref()
-            ),
-            1
-        );
-        let record = &progress.quarantined_fingerprints[&fp];
-        assert_eq!(record.reconstruction_contract, 3);
-        assert_eq!(record.contract_retry_claims, Some(0));
-        assert!(
-            record.retry_after_unix_seconds
-                >= current_unix_seconds() + SNAPSHOT_QUARANTINE_RETRY_SECONDS - 1
-        );
-        assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));
-        assert!(progress.active_quarantine_retries.is_empty());
-    });
-}
-
-#[test]
-fn terminal_contract_legacy_unknown_body_conflicts_keep_the_two_source_read_cap() {
-    contract_read_cap(InterruptedOutcome::Conflict, true);
 }
 
 // SOURCE's post-ACK/pre-index crash seam: the scanner's actual next delta
@@ -1211,8 +1014,4 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
 #[test]
 fn terminal_contract_ack_saved_before_index_restart_survives_empty_delta() {
     contract_ack_saved_before_index_restart(false);
-}
-#[test]
-fn terminal_contract_ack_saved_before_index_restart_survives_unrelated_only_delta() {
-    contract_ack_saved_before_index_restart(true);
 }

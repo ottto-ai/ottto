@@ -126,13 +126,7 @@ crate::durable_tail_codec::durable_struct!(LocalContextPoint {
     N prompt_tokens: u32,
 });
 
-impl crate::heap_layout_bound::HeapLayoutBound for LocalContextPoint {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; LocalContextPoint);
 
 /// Per-accumulator point list, at most `LOCAL_CONTEXT_POINT_CAP` entries of
 /// 8 bytes each.
