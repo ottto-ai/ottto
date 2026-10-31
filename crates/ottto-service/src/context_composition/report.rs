@@ -78,11 +78,6 @@ pub(crate) struct WorkspaceReport {
     /// resumed or forked transcript repeats earlier records under the same
     /// uuid. About 8 bytes per record, freed with the report.
     pub(super) claude_records: HashSet<u64>,
-    /// Sessions skipped whole: a fork whose copied history has no boundary
-    /// in the file, or a transcript made only of already-counted records.
-    pub(crate) excluded_not_fresh: u64,
-    /// Sessions whose copied history was trimmed to residency only.
-    pub(crate) copied_history_sessions: u64,
 }
 
 impl WorkspaceReport {
@@ -93,8 +88,6 @@ impl WorkspaceReport {
             files: BTreeMap::new(),
             sessions: BTreeMap::new(),
             claude_records: HashSet::new(),
-            excluded_not_fresh: 0,
-            copied_history_sessions: 0,
         }
     }
 

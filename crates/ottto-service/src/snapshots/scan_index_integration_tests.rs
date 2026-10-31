@@ -592,19 +592,20 @@ fn recovery_emission_boundaries(
 
 #[test]
 fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcript_reads() {
+    let _resumed_prefix = e2::ResumedPrefixForTest::set(true);
     use claude_request_money::e2;
     for map in 0..3 {
         let fixture = Fixture::new();
         let healthy = fixture.load();
-        let (prepared, evidence) = e2::with_enabled(|| prepared_recovery_page(&fixture, &healthy));
+        let (prepared, evidence) = { prepared_recovery_page(&fixture, &healthy) };
         assert_eq!(prepared.len(), 1, "positive prepared E2 page");
         let mut control = healthy.clone();
         let ((control_scan, control_manifest, control_held), reads) =
             terminal_contract_retry::source_acquisitions(|| {
                 with_transcript_io_denied(|| {
-                    e2::with_enabled(|| {
+                    {
                         recovery_emission_boundaries(prepared.clone(), &evidence, &mut control)
-                    })
+                    }
                 })
             });
         assert!(reads.is_empty());
@@ -641,21 +642,19 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
         let ((held_scan, manifest, held), reads) =
             terminal_contract_retry::source_acquisitions(|| {
                 with_transcript_io_denied(|| {
-                    e2::with_enabled(|| {
-                        unknown.retire_committed_claude_account_pending_windows();
-                        assert!(matches!(
-                            unknown.lower_claude_retired_family_tombstone_fence(
-                                &BTreeSet::new(),
-                                &BTreeSet::new()
-                            ),
-                            ClaudeTombstoneFenceRepair::Kept { .. }
-                        ));
-                        assert!(!claude_stale_rearm_can_reopen_fence(
-                            &unknown,
+                    unknown.retire_committed_claude_account_pending_windows();
+                    assert!(matches!(
+                        unknown.lower_claude_retired_family_tombstone_fence(
+                            &BTreeSet::new(),
                             &BTreeSet::new()
-                        ));
-                        recovery_emission_boundaries(prepared.clone(), &evidence, &mut unknown)
-                    })
+                        ),
+                        ClaudeTombstoneFenceRepair::Kept { .. }
+                    ));
+                    assert!(!claude_stale_rearm_can_reopen_fence(
+                        &unknown,
+                        &BTreeSet::new()
+                    ));
+                    recovery_emission_boundaries(prepared.clone(), &evidence, &mut unknown)
                 })
             });
         assert!(
@@ -684,9 +683,9 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
                         !unknown.persistence_available(),
                         "old views never clear in place"
                     );
-                    let (scan, manifest, held) = e2::with_enabled(|| {
+                    let (scan, manifest, held) = {
                         recovery_emission_boundaries(prepared.clone(), &evidence, &mut restored)
-                    });
+                    };
                     (restored, scan, manifest.unwrap(), held)
                 })
             });
