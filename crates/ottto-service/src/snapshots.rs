@@ -42630,15 +42630,27 @@ fn ensure_bounded_traversal(
                 .cloned()
                 .collect()
         };
-        // R11: a member main independently accepted whose per-file receipt is
-        // current keeps its body; B-P2's unACKed heads are still re-armed.
+        // R11: an unchanged exact-ACK member keeps its body (context debt
+        // stays owed); B-P2's unACKed heads are still re-armed.
         let semantic_members: BTreeSet<_> = index
             .files
             .iter()
             .filter(|(key, entry)| {
-                claude_index_path_member_ref(Path::new(key))
+                if !claude_index_path_member_ref(Path::new(key))
                     .is_some_and(|m| semantic.contains(m.root))
-                    && !terminal_off_stale_member_can_skip_clear(index, key, entry)
+                {
+                    return false;
+                }
+                if !terminal_off_stale_member_can_skip_clear(index, key, entry) {
+                    return true;
+                }
+                if !index.receipt_matches(key, entry) {
+                    crate::local_resource_diagnostics::terminal_off_count(
+                        crate::local_resource_diagnostics::TerminalOffCount::CarriedExactAckWithoutReceipt,
+                        1,
+                    );
+                }
+                false
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -42660,8 +42672,11 @@ fn ensure_bounded_traversal(
         }
         if !semantic.is_empty() {
             eprintln!(
-                "claude_terminal_off semantic_context_reselection files={}",
-                index.files.len()
+                "claude_terminal_off semantic_context_reselection files={} carried_exact_ack_without_receipt={}",
+                index.files.len(),
+                crate::local_resource_diagnostics::take_terminal_off_count(
+                    crate::local_resource_diagnostics::TerminalOffCount::CarriedExactAckWithoutReceipt,
+                ),
             );
         }
         claude_terminal_unproven(index, collected_at);

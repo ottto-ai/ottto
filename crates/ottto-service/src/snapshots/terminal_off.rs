@@ -136,9 +136,13 @@ pub(crate) fn claude_terminal_authority(_index: &ScanIndex, offered: bool, _wind
     offered && !claude_terminal_off()
 }
 
-// R11: main's independent acceptance and a current per-file ACK receipt are
-// both required. This grants no source/census authority and cannot protect
-// held or listed debt; the BASE control keeps main's re-arm.
+// R11 (Lead B Ask 1, 2026-10-31): the contract (money) re-arm carries a member
+// main independently accepted (every snapshot fingerprint ACKed, committed head
+// current) whose request census is current for its fingerprint, as main's C1b
+// retry carry checks it. No upload-context receipt is required: that debt stays
+// owed on its own paced UploadContext path. Any member change re-arms. This
+// grants no source/census authority and cannot protect held or listed debt;
+// the BASE control keeps main's re-arm.
 fn terminal_off_stale_member_can_skip_clear(
     index: &ScanIndex,
     key: &str,
@@ -152,7 +156,11 @@ fn terminal_off_stale_member_can_skip_clear(
         return false;
     }
     claude_stale_member_independently_accepted(index, key, entry)
-        && index.receipt_matches(key, entry)
+        && !entry.source_file_fingerprint.is_empty()
+        && index
+            .claude_request_census
+            .retry_carry_record(key)
+            .map_or(true, |record| record.current_for(&entry.source_file_fingerprint))
 }
 
 fn claude_redundant_stale_clear_suppressed(index: &ScanIndex) -> bool {
@@ -721,19 +729,24 @@ fn terminal_off_held_retry_decision(
     {
         return decided;
     }
+    // Lead B Ask 2c: process total of floor-expiry forced reads.
+    let forced = crate::local_resource_diagnostics::terminal_off_count(
+        crate::local_resource_diagnostics::TerminalOffCount::NbfFloorExpiryForcedRead,
+        1,
+    );
     crate::local_resource_diagnostics::traversal_point(
         "terminal_off_held_retry_due_read",
         SnapshotSource::ClaudeCode.api_slug(),
-        &BTreeMap::from([("keys", 1u64), ("bytes", 0)]),
+        &BTreeMap::from([
+            ("keys", 1u64),
+            ("bytes", 0),
+            ("nbf_floor_expiry_forced_reads", forced),
+        ]),
     );
     (
         CandidateDecision::Parse,
         Some(CandidateParseReason::ActivityOrQuarantineRetry),
     )
-}
-#[cfg(test)]
-pub(crate) fn nbf_initial_retry_reads_for_test() -> u64 {
-    terminal_off_discovery::nbf_initial_retry_reads()
 }
 
 // Scheduling only: ordinary ScanIndex reloads must not reset the cadence.

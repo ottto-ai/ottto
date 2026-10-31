@@ -98,33 +98,6 @@ fn with_walks<T>(f: impl FnOnce(&mut BTreeMap<String, Walk>) -> T) -> T {
         result
     }
 }
-// Lead B (NBF): a fresh non-blocking hold may be read twice in its first six
-// hours. Process-lifetime count of those extra early reads; RAM only.
-#[cfg(test)]
-thread_local! {
-    static NBF_INITIAL_RETRY_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-#[cfg(not(test))]
-static NBF_INITIAL_RETRY_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-fn note_nbf_initial_retry_read() -> u64 {
-    #[cfg(test)]
-    {
-        NBF_INITIAL_RETRY_READS.with(|count| {
-            count.set(count.get().saturating_add(1));
-            count.get()
-        })
-    }
-    #[cfg(not(test))]
-    {
-        NBF_INITIAL_RETRY_READS
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(1)
-    }
-}
-#[cfg(test)]
-pub(super) fn nbf_initial_retry_reads() -> u64 {
-    NBF_INITIAL_RETRY_READS.with(std::cell::Cell::get)
-}
 fn digest(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
 }
@@ -501,7 +474,12 @@ pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile, now: u64) {
         initial_retry
     });
     if initial_retry {
-        let total = note_nbf_initial_retry_read();
+        // Lead B (NBF): a fresh non-blocking hold may be read twice in its
+        // first six hours; process total of those extra early reads.
+        let total = crate::local_resource_diagnostics::terminal_off_count(
+            crate::local_resource_diagnostics::TerminalOffCount::NbfInitialRetryRead,
+            1,
+        );
         crate::local_resource_diagnostics::traversal_point(
             "terminal_off_nbf_initial_retry_read",
             "claude_code",

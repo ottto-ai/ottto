@@ -2457,6 +2457,7 @@ fn terminal_off_held_context_memo_forgets_changes_and_nonheld_parse_without_cred
 /// committed, unchanged entry (only the floor-expiry read serves it).
 #[test]
 fn terminal_off_nonblocking_hold_reads_once_per_six_hours_and_never_idles() {
+    use crate::local_resource_diagnostics::TerminalOffCount;
     let _on = ClaudeTerminalOffForTest::enabled();
     let t0 = rfc3339_unix_seconds(W1).unwrap();
     let at = |offset: u64| {
@@ -2483,7 +2484,10 @@ fn terminal_off_nonblocking_hold_reads_once_per_six_hours_and_never_idles() {
             // its committed entry.
             index.files.get_mut(&key).unwrap().source_file_fingerprint.clear();
         }
-        let early_before = nbf_initial_retry_reads_for_test();
+        // Process totals in the static diagnostics array (adding 0 reads them).
+        let total = |count| crate::local_resource_diagnostics::terminal_off_count(count, 0);
+        let early_before = total(TerminalOffCount::NbfInitialRetryRead);
+        let forced_before = total(TerminalOffCount::NbfFloorExpiryForcedRead);
         // The never-committed key reverts as main's held-retry control does
         // (reparse); the committed key reverts to its unchanged entry.
         let reparse = !committed;
@@ -2526,9 +2530,17 @@ fn terminal_off_nonblocking_hold_reads_once_per_six_hours_and_never_idles() {
         // Lead B: at most one early read per new hold; floor-expiry reads are
         // never early.
         assert_eq!(
-            nbf_initial_retry_reads_for_test() - early_before,
+            total(TerminalOffCount::NbfInitialRetryRead) - early_before,
             u64::from(!committed),
             "committed={committed}"
         );
+        if committed {
+            // Lead B Ask 2c: both floor-expiry reads (+22,200 s, +43,800 s) of
+            // the committed, unchanged key are forced and counted.
+            assert_eq!(
+                total(TerminalOffCount::NbfFloorExpiryForcedRead) - forced_before,
+                2
+            );
+        }
     }
 }
