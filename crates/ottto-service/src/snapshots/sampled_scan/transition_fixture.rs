@@ -33,6 +33,21 @@ pub(crate) struct V1Golden<'a> {
     pub(crate) metadata: Value,
 }
 
+impl V1Golden<'_> {
+    /// Relocate only the envelope key for a scratch-path rebuild fixture.
+    /// The body, old pin, generation, certificate and interpretation stay archived;
+    /// this is NOT evidence of a portable old-writer restore binding.
+    pub(crate) fn relocated_record(&self, key: [u8; 32]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut bytes = self.record.to_vec();
+        bytes[43..75].copy_from_slice(&key);
+        let end = bytes.len() - 32;
+        let checksum = Sha256::digest(&bytes[..end]);
+        bytes[end..].copy_from_slice(&checksum);
+        bytes
+    }
+}
+
 #[derive(Clone, Copy)]
 struct V1Files<'a> {
     case_id: &'static str,
@@ -177,10 +192,9 @@ pub(crate) fn seed_old_writer(
     cache: &super::SharedCache,
     source: SnapshotSource,
     key: &str,
-    index: &super::super::ScanIndex,
     pin: &str,
 ) -> Vec<u8> {
-    super::durable_tail::transition_seed::seed_pinned_v1(cache, source, key, index, pin)
+    super::durable_tail::transition_seed::seed_pinned_v1(cache, source, key, pin)
 }
 
 /// The production body allowlist, without exposing the private codec module.

@@ -15,139 +15,159 @@ const COLLECTED: &str = "2026-10-20T12:00:00Z";
 const CLAUDE_SESSION: &str = "5f0c2a8e-1111-4222-8333-944445555666";
 const CODEX_SESSION: &str = "0199f7a0-0000-7000-8000-0000000d7a11";
 
-/// [format] The current store/body reader accepts genuine v1 records and publishes
-/// no reduction from a body edit. Native certificate portability is not asserted.
-#[test]
-fn v1_goldens_current_reader_matches_facts_and_refuses_body_edit() {
-    use crate::durable_tail_store::{
-        self as store, DurableSource, DurableTailStore, ReadOutcome, Refusal,
+// The store publishes no reduction from a retired pin. In particular, a valid
+// checksum never turns opaque old-writer bytes into current money authority.
+fn assert_v1_has_no_record(
+    golden: &crate::snapshots::sampled_scan::transition_fixture::V1Golden<'_>,
+    bytes: &[u8],
+    corrupt: bool,
+) {
+    use crate::durable_tail_store::{DurableSource, DurableTailStore, ReadOutcome, Refusal};
+    let scratch = Scratch::new(golden.case_id);
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = if golden.metadata["source_tag"] == 1 {
+        DurableSource::ClaudeCode
+    } else {
+        DurableSource::Codex
     };
-    use crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens;
-    for golden in load_v1_goldens().unwrap() {
-        let scratch = Scratch::new(golden.case_id);
-        let claude = golden.metadata["source_tag"] == 1;
-        let source = if claude {
-            SnapshotSource::ClaudeCode
-        } else {
-            SnapshotSource::Codex
-        };
-        let ds = if claude {
-            DurableSource::ClaudeCode
-        } else {
-            DurableSource::Codex
-        };
-        let key: [u8; 32] = golden.record[43..75].try_into().unwrap();
-        let record_path = scratch.0.join(format!("{}.rec", hex(key)));
-        fs::write(&record_path, golden.record).unwrap();
-        let mut disk = DurableTailStore::new(scratch.0.clone(), ds);
-        let ReadOutcome::Found(record) = disk.read(&key) else {
-            panic!(
-                "{}: current reader must accept the historical representation",
-                golden.case_id
-            );
-        };
-        assert_eq!(record.format as u64, golden.metadata["envelope_version"]);
-        assert_eq!(record.index_generation, golden.metadata["index_generation"]);
-        assert_eq!(
-            hex(record.record.allowlist),
-            golden.metadata["historical_allowlist"]
-        );
-        for (name, digest) in [
-            ("key", record.record.binding.key),
-            ("context", record.record.binding.context),
-            ("scope", record.record.binding.scope),
-            ("entry", record.record.binding.entry),
-        ] {
-            assert_eq!(hex(digest), golden.expected["binding"][name]);
-        }
-        let decoded = decode(&record.record.body, source).unwrap();
-        let counting_version = match decoded.counting().map(|(_, version, _)| version) {
-            None => "not_applicable",
-            Some(1) => "Legacy",
-            Some(2) => "V2",
-            other => panic!("unexpected counting: {other:?}"),
-        };
-        assert_eq!(
-            counting_version,
-            golden.expected["facts"]["counting_version"]
-        );
-        if let Some((_, _, evidence)) = decoded.counting() {
-            assert_eq!(
-                evidence,
-                if golden.case_id == "codex-legacy-acked" {
-                    2
-                } else {
-                    0
-                }
-            );
-        }
-        let mut receipts = crate::codex_scan_diagnostics::CountingV2Receipts::default();
-        if let Some(counting) = decoded.reduction.accumulator.codex_counting.as_ref() {
-            counting.fold_receipts(&mut receipts);
-        }
-        assert_eq!(
-            serde_json::to_value(receipts).unwrap(),
-            golden.expected["counting_receipts"]
-        );
-        let path = scratch.0.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
-        fs::write(&path, golden.input).unwrap();
-        let fresh = rederive_parser(File::open(&path).unwrap(), &path, &decoded).unwrap();
-        let (reduction, _) = decoded
-            .rederive(fresh, &mut File::open(&path).unwrap(), line_cap())
-            .unwrap();
-        let selector = reduction.accumulator.current_selector.clone();
-        let tier_replay_persisted = reduction.accumulator.codex_tier_replay.is_some();
-        let mut acc = reduction.accumulator;
-        if claude {
-            acc.finalize_claude_responses();
-        }
-        let item = acc
-            .into_items(&path, COLLECTED, "synthetic-v1".into(), None)
-            .pop()
-            .unwrap();
-        let start = item.session_start.as_deref();
-        let actual = json!({
-            "source_session_id": item.source_session_id, "input_tokens": item.input_tokens,
-            "output_tokens": item.output_tokens, "request_count": item.request_count,
-            "cache_read_tokens": item.cache_read_tokens, "cache_creation_5m_tokens": item.cache_creation_5m_tokens,
-            "cache_creation_1h_tokens": item.cache_creation_1h_tokens, "counting_version": counting_version,
-            "cli_version": if !claude { start.and_then(|s| s.client_version.as_deref()) } else { None },
-            "opening_request_count": if claude { start.and_then(|s| s.opening_request_count) } else { None },
-            "opening_output_tokens": if claude { start.and_then(|s| s.opening_output_tokens) } else { None },
-            "request_2_context_tokens": if claude { start.and_then(|s| s.request_2_context_tokens) } else { None },
-            "request_3_context_tokens": if claude { start.and_then(|s| s.request_3_context_tokens) } else { None },
-            "selector_context": selector.context, "selector_sources": selector.sources,
-            "tier_replay_persisted": tier_replay_persisted,
-        });
-        // These four generation facts belong to sidecars, not the serialized reduction.
-        let mut expected = golden.expected["facts"].clone();
-        let facts = expected.as_object_mut().unwrap();
-        for name in [
-            "accepted_body_witness",
-            "telemetry_cost_micros",
-            "tier_replay_finished",
-            "protected_tier_receipt_present",
-        ] {
-            facts.remove(name);
-        }
-        assert_eq!(actual, expected, "{}", golden.case_id);
-        assert!(
-            golden.expected["post_save"]["entry"]["last_upload_body_witness"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty())
-        );
-        assert_eq!(golden.expected["facts"]["accepted_body_witness"], true);
+    let key = bytes[43..75].try_into().unwrap();
+    let path = scratch.0.join(format!("{}.rec", hex(key)));
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut disk = DurableTailStore::new(scratch.0.clone(), source);
+    assert_eq!(
+        disk.missing_cause(&key),
+        Some("repin"),
+        "{}",
+        golden.case_id
+    );
+    assert_eq!(disk.read(&key), ReadOutcome::Missing, "{}", golden.case_id);
+    assert_eq!(disk.full_hold(&key, corrupt), None);
+    assert_eq!(
+        disk.full_hold(&key, false),
+        corrupt.then_some(Refusal::Corrupt)
+    );
+    assert_eq!(disk.read(&key), ReadOutcome::Missing);
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
 
-        let mut corrupted = golden.record.to_vec();
-        corrupted[store::HEADER_BYTES] ^= 1;
-        fs::write(&record_path, &corrupted).unwrap();
-        disk.begin_pass();
+/// [format] Exact retired v1 pins dispatch to a rebuild without decoding a body.
+#[test]
+fn v1_goldens_retired_pin_dispatches_without_a_record() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
         assert_eq!(
-            disk.read(&key),
-            ReadOutcome::Refused(Refusal::Corrupt),
-            "no restored reduction from {}",
-            golden.case_id
+            golden.input.len() as u64,
+            golden.expected["post_save"]["entry"]["size_bytes"]
         );
+        for (name, range) in [
+            ("key", 43..75),
+            ("context", 75..107),
+            ("scope", 107..139),
+            ("entry", 139..171),
+        ] {
+            assert_eq!(
+                hex(golden.record[range].try_into().unwrap()),
+                golden.expected["binding"][name]
+            );
+        }
+        assert_eq!(
+            u64::from_le_bytes(golden.record[171..179].try_into().unwrap()),
+            golden.metadata["index_generation"]
+        );
+        assert_v1_has_no_record(&golden, golden.record, false);
+    }
+}
+
+/// [format] A one-byte body edit cannot supply a reduction; the integrity guard
+/// refuses its corrupt envelope after the single ordinary rebuild allowance.
+#[test]
+fn v1_goldens_one_byte_body_edit_refuses_a_record() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        let mut changed = golden.record.to_vec();
+        changed[crate::durable_tail_store::HEADER_BYTES] ^= 1;
+        assert_v1_has_no_record(&golden, &changed, true);
+    }
+}
+
+/// [format] Swapping the archived selector maps cannot publish a reduction.
+#[test]
+fn v1_goldens_selector_swap_refuses_a_record() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        if golden.metadata["selector_span"].is_null() {
+            continue;
+        }
+        let span = &golden.metadata["selector_span"];
+        let start = span["offset"].as_u64().unwrap() as usize;
+        let context_len = span["context"]["length"].as_u64().unwrap() as usize;
+        let length = span["length"].as_u64().unwrap() as usize;
+        let mut changed = golden.record.to_vec();
+        changed[start..start + length].rotate_left(context_len);
+        assert_ne!(changed, golden.record);
+        assert_v1_has_no_record(&golden, &changed, true);
+    }
+}
+
+fn resign_v1_mutation(bytes: &mut [u8]) {
+    use sha2::{Digest, Sha256};
+    let end = bytes.len() - 32;
+    let checksum = Sha256::digest(&bytes[..end]);
+    bytes[end..].copy_from_slice(&checksum);
+}
+
+/// [money] Opaque serializer-header tokens inside an archived payload, even
+/// with a valid checksum, never grant restored money authority under M3.
+#[test]
+fn pinned_v1_refuses_impl_with_opaque_header_tokens() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        for header in [
+            "impl<T: Marker<{ /* { */ 2 }>> Durable for Added<T>",
+            r##"impl<T: Marker<{ { let _ = r#"{}"#; 2 } }>> Durable for Added<T>"##,
+            "#[cfg(unix)] impl<T> Durable for Added<T>",
+            "macro_rules! nested { () => { impl<T: Marker<{ 2 }>> Durable for Added<T> { BODY } }; }",
+        ] {
+            for value in [9, 7] {
+                let body = format!("fn put(&self, e: &mut Enc) {{ e.varint({value}) }}");
+                let mutation = if header.contains("BODY") {
+                    header.replace("BODY", &body)
+                } else {
+                    format!("{header} {{ {body} }}")
+                };
+                let mut changed = golden.record.to_vec();
+                let start = crate::durable_tail_store::HEADER_BYTES;
+                changed[start..start + mutation.len()].copy_from_slice(mutation.as_bytes());
+                resign_v1_mutation(&mut changed);
+                assert_v1_has_no_record(&golden, &changed, false);
+            }
+        }
+    }
+}
+
+/// [money] Reversed publication and shadowed iteration over archived fields
+/// never publish an old reduction, including with a recomputed checksum.
+#[test]
+fn pinned_v1_refuses_body_publication_and_shadowed_iterator() {
+    for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
+        for shadowed_iterator in [false, true] {
+            let mut changed = golden.record.to_vec();
+            let start = crate::durable_tail_store::HEADER_BYTES;
+            let end = changed.len() - 32;
+            if shadowed_iterator {
+                // Reverse iteration over two same-typed, unequal selector maps.
+                let span = &golden.metadata["selector_span"];
+                if span.is_null() {
+                    continue;
+                }
+                let offset = span["offset"].as_u64().unwrap() as usize;
+                let length = span["length"].as_u64().unwrap() as usize;
+                let context_len = span["context"]["length"].as_u64().unwrap() as usize;
+                changed[offset..offset + length].rotate_left(context_len);
+            } else {
+                changed[start..end].reverse();
+            }
+            assert_ne!(changed, golden.record);
+            resign_v1_mutation(&mut changed);
+            assert_v1_has_no_record(&golden, &changed, false);
+        }
     }
 }
 

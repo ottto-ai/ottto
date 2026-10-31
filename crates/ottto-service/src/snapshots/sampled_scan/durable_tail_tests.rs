@@ -13097,16 +13097,15 @@ fn retired_missing_native_rebuild_then_successor_tails_without_double_count() {
     }
     let _on = RestartRestoreForTest::enabled();
     let f = O3Fixture::from_rows(&a1a_row("accepted", 100), false);
-    let mut old = fs::read(&f.record_path).unwrap();
-    old[10..42].copy_from_slice(
-        &store::parse_hex_digest(
-            "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
-        )
-        .unwrap(),
-    );
-    let end = old.len() - 32;
-    let digest = Sha256::digest(&old[..end]);
-    old[end..].copy_from_slice(&digest);
+    let golden = super::super::transition_fixture::load_v1_goldens()
+        .unwrap()
+        .into_iter()
+        .find(|golden| golden.case_id == "claude-three-request")
+        .unwrap();
+    // This row tests a missing-reduction rebuild, never old-body restoration.
+    // Relocate only the path key; preserve the historical body and retired pin.
+    let key = store::key_digest(DurableSource::ClaudeCode, &local_index_key(&f.path));
+    let old = golden.relocated_record(key);
     fs::write(&f.record_path, &old).unwrap();
     let owner = f.owner();
     let mut prior = f.prior.clone();

@@ -73,12 +73,11 @@ impl M1 {
         );
         let prior = disk.commit(&warm.cache, SOURCE, &mut warm.index);
         assert_eq!(disk.records(), 1, "native warm reduction must be persisted");
-        // Check the actual pinned main-writer v1 artifact without relabeling it.
+        // Install an archived body/old pin, relocating only its scratch-path key.
+        // M3 dispatches this as a missing reduction (Repin), not a restore.
+        // Keep the route assertions below pending the historical-row ruling.
         let key = fixture::local_key(&path);
-        // The writer binds the live post-save index. Loading `prior` clears
-        // runtime upload-context and projection inputs, so it is for restart,
-        // not for independently checking the artifact just written.
-        let old = fixture::seed_old_writer(&ram.cache, SOURCE, &key, &warm.index, pin);
+        let old = fixture::seed_old_writer(&ram.cache, SOURCE, &key, pin);
         assert_eq!(&old[..8], b"ottto-dt");
         assert_eq!(u16::from_le_bytes(old[8..10].try_into().unwrap()), 1);
         let old_bytes = disk.record_bytes();
@@ -1283,7 +1282,6 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         &writer.cache,
         source,
         &fixture::local_key(&path),
-        &index,
         WRITERS[0],
     );
     assert_eq!(disk.record_bytes().values().next().unwrap(), &old);
