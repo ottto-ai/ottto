@@ -36,6 +36,55 @@ impl Fixture {
             .unwrap();
         writeln!(file, "{line}").unwrap();
     }
+    fn codex_turn(&self, n: u64) {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .unwrap();
+        if n == 1 {
+            writeln!(
+                file,
+                "{}",
+                json!({"type":"session_meta",
+                "timestamp":"2026-10-27T09:00:00Z","payload":{"id":SESSION}})
+            )
+            .unwrap();
+        }
+        writeln!(
+            file,
+            "{}",
+            json!({"timestamp":"2026-10-27T10:00:00Z",
+            "type":"event_msg", "payload":{"type":"token_count","info":{
+            "model":"gpt-5.2", "total_token_usage":{"input_tokens":n*10,
+                "cached_input_tokens":n*2,"output_tokens":n*3},
+            "last_token_usage":{"input_tokens":10,"cached_input_tokens":2,
+                "output_tokens":3}}}})
+        )
+        .unwrap();
+    }
+    fn retained_codex(&self) -> ScanIndex {
+        self.codex_turn(1);
+        let (mut index, scan, _, _) = self.page(SnapshotSource::Codex, ScanIndex::default());
+        assert_eq!(scan.snapshots.len(), 1);
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&self.root),
+            &mut index,
+            &now,
+            7,
+        );
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None);
+        let traversal = index.traversal.as_mut().unwrap();
+        // This known member was already consumed. Saved retryable loss
+        // elsewhere retains the roster; the retry is not due yet.
+        traversal.pending_candidates.clear();
+        traversal.counts.unreadable_path_count = 1;
+        traversal.unhealthy_retry_not_before_unix_seconds =
+            Some(sampled_scan::now_seconds() + UNHEALTHY_SCAN_RETRY_MAX_SECONDS);
+        index
+    }
     fn age(&self, days: u64) {
         let modified = SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
         File::options()
@@ -48,17 +97,25 @@ impl Fixture {
     fn page(
         &self,
         source: SnapshotSource,
+        index: ScanIndex,
+    ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        self.page_at(source, index, &now)
+    }
+    fn page_at(
+        &self,
+        source: SnapshotSource,
         mut index: ScanIndex,
+        now: &str,
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         self.cache.bind_withheld(&mut index);
-        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
         let reads = Reads::default();
         let ((index, result), rows) = capture(|| {
             let mut scan = OwnedSourceScan::new(
                 source,
                 std::slice::from_ref(&self.root),
                 index,
-                &now,
+                now,
                 7,
                 10,
                 false,
@@ -627,4 +684,112 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     let (_, idle, reads, _) = f.page(source, caught);
     assert!(idle.snapshots.is_empty(), "emitted once");
     assert!(reads.0.lock().unwrap().0.is_empty());
+}
+
+/// [money] F3: a known default-home rollout append with no directory move or
+/// watcher hint is Tail-read once and emits the same whole money body as Full.
+#[test]
+fn retained_codex_stat_growth_tails_once_with_full_money() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let f = Fixture::new();
+    let mut index = f.retained_codex();
+    f.codex_turn(2);
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .codex_join_directory_census
+        .as_ref()
+        .unwrap()
+        .moved_directories()
+        .is_empty());
+    refresh_retained_codex_roster(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        7,
+        discovery_retention!(index),
+    );
+    let traversal = index.traversal.as_ref().unwrap();
+    assert_eq!(traversal.counts.codex_roster_growth_enqueued, 1);
+    assert_eq!(traversal.pending_candidates.len(), 1);
+    assert!(!traversal.pending_candidates[0].census_member);
+    // A second refresh before selection cannot duplicate queued work.
+    refresh_retained_codex_roster(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        7,
+        discovery_retention!(index),
+    );
+    assert_eq!(
+        index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .counts
+            .codex_roster_growth_enqueued,
+        1
+    );
+    let (caught, scan, reads, _) = f.page(SnapshotSource::Codex, index);
+    assert_eq!(reads.0.lock().unwrap().0, vec![DeliveryMode::Tail]);
+    assert_eq!(scan.snapshots.len(), 1);
+    let item = &scan.snapshots[0];
+    assert_eq!(item.input_tokens, Some(20));
+    assert_eq!(item.cache_read_tokens, Some(4));
+    assert_eq!(item.output_tokens, Some(6));
+    assert_eq!(item.request_count, Some(2));
+    f.cache.clear();
+    let (cold_index, cold, _, _) = f.page_at(
+        SnapshotSource::Codex,
+        ScanIndex::default(),
+        &scan.snapshots[0].collected_at,
+    );
+    sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+        &sampled_scan::transition_fixture::scan_money(SnapshotSource::Codex, &cold_index, &cold),
+        &sampled_scan::transition_fixture::scan_money(SnapshotSource::Codex, &caught, &scan),
+    );
+    let (_, idle, reads, _) = f.page(SnapshotSource::Codex, caught);
+    assert!(idle.snapshots.is_empty());
+    assert!(reads.0.lock().unwrap().0.is_empty());
+}
+
+/// [behaviour] Unchanged bytes and inventory-held growth cannot enqueue or
+/// acquire again while their stat/refusal evidence stays unchanged.
+#[test]
+fn retained_codex_unchanged_or_inventory_held_member_is_not_enqueued() {
+    for held_growth in [false, true] {
+        let f = Fixture::new();
+        let mut index = f.retained_codex();
+        if held_growth {
+            f.codex_turn(2);
+            let key = local_index_key(&f.path);
+            index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .residue
+                .codex_inventory_hold = Some(CodexInventoryHold {
+                owed: BTreeSet::from([key.clone()]),
+                refused_headers: BTreeMap::from([(key, codex_file_join::path_witness(&f.path))]),
+                ..CodexInventoryHold::default()
+            });
+        } else {
+            f.age(1); // mtime alone cannot grant another acquisition
+        }
+        for _ in 0..2 {
+            refresh_retained_codex_roster(
+                SnapshotSource::Codex,
+                index.traversal.as_mut().unwrap(),
+                7,
+                discovery_retention!(index),
+            );
+            let traversal = index.traversal.as_ref().unwrap();
+            assert!(traversal.pending_candidates.is_empty());
+            assert_eq!(traversal.counts.codex_roster_growth_enqueued, 0);
+        }
+        let (_, scan, reads, _) = f.page(SnapshotSource::Codex, index);
+        assert!(scan.snapshots.is_empty());
+        assert!(reads.0.lock().unwrap().0.is_empty());
+    }
 }
