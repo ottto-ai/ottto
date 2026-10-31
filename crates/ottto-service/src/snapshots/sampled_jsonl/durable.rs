@@ -232,11 +232,14 @@ impl<'a> BodyEncoding<'a> {
                 &self.rederive,
             );
         }
-        self.accumulator.put(e)?;
-        self.report.put(e)?;
-        self.scalars.0.put(e)?;
-        self.scalars.1.put(e)?;
-        self.scalars.2.put(e)?;
+        CachedJsonlReduction::put_borrowed(
+            e,
+            self.accumulator,
+            self.report,
+            &self.scalars.0,
+            &self.scalars.1,
+            &self.scalars.2,
+        )?;
         self.rederive.put(e)
     }
     pub(in crate::snapshots) fn count(&self, limit: usize) -> Result<usize, Refuse> {

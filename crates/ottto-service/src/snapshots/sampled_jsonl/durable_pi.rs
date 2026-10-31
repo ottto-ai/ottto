@@ -43,11 +43,7 @@ pub(in crate::snapshots) fn put_body(
         return Err(Refuse::TooLarge);
     }
     e.with_moved_field("SnapshotAccumulator.seen_pi_usage_keys", |e| {
-        acc.put(e)?;
-        report.put(e)?;
-        scalars.0.put(e)?;
-        scalars.1.put(e)?;
-        scalars.2.put(e)
+        CachedJsonlReduction::put_borrowed(e, acc, report, &scalars.0, &scalars.1, &scalars.2)
     })?;
     rederive.put(e)?;
     PiSection::put_borrowed(e, keys, &has_parent, &header_nanos)
