@@ -13168,9 +13168,25 @@ fn off_no_record_growth_uses_ordinary_full_without_store_io() {
                 &[],
             )
         };
-        let (mut prior, mut first, modes) = scan(ScanIndex::default());
+        let mut initial = ScanIndex::default();
+        // The real sync caller activates the current row before scanning.
+        // Revision zero would correctly veto the request-owned literal.
+        initial.activate_effective_upload_body_witness_revision(
+            crate::snapshot_sync::effective_upload_body_witness_revision(
+                SnapshotSource::ClaudeCode,
+            ),
+        );
+        let (mut prior, mut first, modes) = scan(initial);
         assert_eq!(modes.0, 1);
         a1a_wire(&root, &mut prior, &mut first);
+        assert_eq!(first.snapshots[0].input_tokens, 100);
+        prior.record_accepted_snapshot_fingerprints(
+            &first
+                .snapshots
+                .iter()
+                .map(|s| s.snapshot_fingerprint.clone())
+                .collect(),
+        );
         let (prior, quiet, modes) = scan(prior);
         assert!(quiet.snapshots.is_empty());
         assert_eq!(modes.0 + modes.1, 0);
