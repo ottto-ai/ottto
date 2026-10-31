@@ -24546,6 +24546,54 @@ mod tests {
         })
     }
 
+    /// The fixture ACK on the production head-CAS contract: a cache-bearing
+    /// body or a CAS stage is acknowledged with `head` under its public body
+    /// witness version, and validated as the source upload validates it.
+    fn head_cas_fixture_ack(
+        items: Vec<SnapshotItem>,
+        enforce_head_cas: bool,
+        head: &str,
+    ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "a".repeat(64),
+            collector_version: Some(collector_version()),
+            snapshots: items,
+            upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let headed = enforce_head_cas
+            || request
+                .snapshots
+                .iter()
+                .any(|item| item.cache_observations.is_some());
+        let entities = request
+            .snapshots
+            .iter()
+            .map(|item| {
+                Ok(serde_json::json!({
+                    "source_session_id": item.source_session_id,
+                    "snapshot_fingerprint": item.snapshot_fingerprint,
+                    "occurrence_count": 1,
+                    "body_witness_version":
+                        crate::snapshot_client::snapshot_ack_body_witness_version(item)?,
+                    "body_witness_digest": snapshot_upload_body_witness(item),
+                    "head_etag": headed.then_some(head),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let response: crate::snapshot_client::SnapshotBatchResponse =
+            serde_json::from_value(serde_json::json!({
+                "accepted": entities.len(), "sessions_reconciled": entities.len(),
+                "session_ids": [], "disabled": false, "disabled_reason": null,
+                "entity_ack_contract": crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,
+                "accepted_entities": entities
+            }))?;
+        response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
+        Ok(response)
+    }
+
     // Offline candidate at the existing post-policy source/page boundary.
     // It never receives an active parser/index borrow or an arbitrary disk merge.
     struct SameSourceAckFixture {
@@ -24579,7 +24627,7 @@ mod tests {
             baseline.prepare_historical_replay("boundary-pending-replay".into());
             baseline.save(&index_path).unwrap();
             let mut working = baseline.clone();
-            let mut items = Self::prepare(&root, &mut working, false).snapshots;
+            let mut items = Self::prepare(&root, &mut working, None).snapshots;
             items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
             assert_eq!(items.len(), 3);
             let keys = items
@@ -24615,8 +24663,13 @@ mod tests {
             assert!(f.baseline.files.contains_key(&f.keys[2]));
             f
         }
-        /// `keep_cache` keeps the scanned cache evidence (the default strips it).
-        fn prepare(root: &Path, index: &mut ScanIndex, keep_cache: bool) -> SourceScanResult {
+        /// `cache` keeps the scanned cache evidence and finalizes with the source
+        /// pass's effective (projected) body witness; `None` strips it.
+        fn prepare(
+            root: &Path,
+            index: &mut ScanIndex,
+            cache: Option<&SnapshotUploadProgress>,
+        ) -> SourceScanResult {
             index.activate_upload_context("boundary-current-policy".into());
             index.activate_effective_upload_body_witness_revision(1);
             let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
@@ -24630,13 +24683,31 @@ mod tests {
             )
             .unwrap();
             for item in &mut scan.snapshots {
-                if !keep_cache {
+                if cache.is_none() {
                     item.cache_observations = None;
                     item.cache_observations_state = None;
                 }
                 item.session_account_evidence = None;
             }
-            finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, index);
+            let Some(progress) = cache else {
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, index);
+                return scan;
+            };
+            finalize_scan_after_policy_with_body_witness(
+                SnapshotSource::Codex,
+                &mut scan,
+                index,
+                |item| {
+                    effective_snapshot_upload_body_witness(
+                        item,
+                        progress,
+                        true,
+                        false,
+                        &BTreeSet::new(),
+                        &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+                    )
+                },
+            );
             scan
         }
         fn send(
@@ -24709,10 +24780,6 @@ mod tests {
         fn restart(&mut self, keep_cache: bool) -> SourceScanResult {
             self.baseline = ScanIndex::load(&self.index_path).unwrap();
             self.working = self.baseline.clone();
-            let mut scan = Self::prepare(&self.root, &mut self.working, keep_cache);
-            self.items = std::mem::take(&mut scan.snapshots);
-            self.items
-                .sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
             self.progress = SnapshotUploadProgress::load(
                 &self.progress_path,
                 &self.progress.destination_namespace_hash,
@@ -24721,6 +24788,11 @@ mod tests {
             .unwrap();
             self.progress
                 .prepare_historical_replay("boundary-pending-replay");
+            let cache = keep_cache.then_some(&self.progress);
+            let mut scan = Self::prepare(&self.root, &mut self.working, cache);
+            self.items = std::mem::take(&mut scan.snapshots);
+            self.items
+                .sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
             scan
         }
         fn stable_context(index: &ScanIndex) {
@@ -25090,7 +25162,7 @@ mod tests {
                         |items, enforce_head_cas| {
                             posts.set(posts.get() + 1);
                             stages.borrow_mut().push(enforce_head_cas);
-                            headed(items)
+                            head_cas_fixture_ack(items, enforce_head_cas, &"e".repeat(64))
                         },
                         |progress| progress.save(&f.progress_path),
                     )
@@ -25107,13 +25179,15 @@ mod tests {
                 assert_eq!(f.items[0].cache_base_head_etag, Some("e".repeat(64)));
                 assert!(f.items[0].cache_observations.is_some());
                 let reopened = f.items[0].clone();
+                // The cache-bearing body is head-CAS: its ACK returns the next head.
                 f.send(0, |items| {
                     posts.set(posts.get() + 1);
-                    headed(items)
+                    head_cas_fixture_ack(items, false, &"a".repeat(64))
                 })
                 .unwrap();
                 assert_eq!(posts.get(), 5);
-                assert_eq!(f.progress.accepted_cache_heads[&c], "e".repeat(64));
+                assert_eq!(f.progress.accepted_cache_heads[&c], "a".repeat(64));
+                assert!(f.progress.accepted_cache_states.contains_key(&c));
                 assert!(f.progress.contains_body(
                     &reopened.snapshot_fingerprint,
                     &snapshot_upload_body_witness(&reopened)
