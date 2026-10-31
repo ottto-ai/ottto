@@ -28890,6 +28890,14 @@ impl OwnedSourceScan {
                     pending!();
                 }
                 if active.parser.reader.reader.is_compressed() && !index.archive_pass.ready(1) {
+                    if index.archive_pass.cpu != u64::MAX && index.archive_pass.gates.power_ready()
+                    {
+                        // A spent CPU/work page keeps the same paid RAM parser.
+                        codex_page = sampled_scan::codex_cursor::PageBudget::default();
+                        index.archive_pass.prepare();
+                        active_file = Some(active);
+                        pending!();
+                    }
                     index.archive_hold(&active.candidate.path, CodexZstCause::AdmissionRefused);
                     census
                         .record_unreadable_file(UnreadableCause::Reduction, &active.candidate.path);
@@ -54009,15 +54017,6 @@ fn sha256_hex_owned(parts: &[String]) -> String {
         digest.update([0]);
     }
     format!("{:x}", digest.finalize())
-}
-
-/// Identity comparisons only. The open path, index key and ACK stay physical.
-fn codex_logical_rollout_path(path: &Path) -> std::borrow::Cow<'_, Path> {
-    if codex_archive_path(path) {
-        std::borrow::Cow::Owned(path.with_extension(""))
-    } else {
-        std::borrow::Cow::Borrowed(path)
-    }
 }
 
 fn codex_archive_path(path: &Path) -> bool {

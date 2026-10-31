@@ -1,7 +1,9 @@
 //! Bounded `.jsonl.zst` rollout input behind the one opened-object parser seam.
 //! Archive metadata never grants ownership or acceptance authority.
 use crate::local_resource_diagnostics::{codex_zst_refused, CodexZstCause};
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
@@ -251,7 +253,11 @@ impl ArchiveEvidence {
     /// retry deadline instead of turning revocable debt into a terminal state.
     pub(super) fn defer_custody(&mut self, cause: CodexZstCause) {
         let retry_after = match self.disposition {
-            ArchiveDisposition::Pending { retry_after, .. } => retry_after,
+            ArchiveDisposition::Pending { retry_after, .. }
+                if retry_after > super::sampled_scan::now_seconds() =>
+            {
+                retry_after
+            }
             _ => super::sampled_scan::now_seconds().saturating_add(6 * 3600),
         };
         self.hold = Some(cause);
@@ -647,8 +653,16 @@ impl super::ScanIndex {
         if !work.allowed {
             return Ok(HeaderRead::Deferred);
         }
-        let file = open_candidate_beneath_root(candidate)?;
         let key = local_index_key(&candidate.path);
+        if self.decode_holds_file(&key) {
+            crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::OwnerUnproven);
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                "codex",
+                &serde_json::json!({"archive_held":1}),
+            );
+            return Ok(HeaderRead::Deferred);
+        }
+        let file = open_candidate_beneath_root(candidate)?;
         let previous = self.files.get(&key).and_then(|e| e.archive.as_deref());
         let old = previous.filter(|a| a.matches(&file));
         if let Some(header) = old.and_then(|a| a.header_for(&candidate.path)) {
@@ -781,6 +795,22 @@ crate::heap_layout_bound::fields!(ArchiveEvidence; stamp, logical_id, owner, dis
 impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         c.add(0)
+    }
+}
+
+impl std::fmt::Debug for ArchiveEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArchiveEvidence")
+            .field("attempts", &self.decode_attempts)
+            .field("disposition", &self.disposition)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Debug for ValidatedHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatedHeader")
+            .field("owner_bytes", &self.owner.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -1833,6 +1863,35 @@ pub(in crate::snapshots) mod tests {
         assert_eq!(full_decodes(&rows), 0);
     }
 
+    /// [format] An elapsed fence retry saves a new paced deadline; a Full
+    /// already in flight retains the reservation saved before its first byte.
+    #[test]
+    fn archive_hold_paces_elapsed_fence_retries_without_spending_a_full() {
+        let f = ArchiveFixture::new(b"metadata only");
+        for expired in [false, true] {
+            let mut a = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+            a.decode_attempts = 0;
+            let deadline = if expired {
+                0
+            } else {
+                sampled_scan::now_seconds() + 21600
+            };
+            a.disposition = ArchiveDisposition::Pending {
+                attempts: 0,
+                retry_after: deadline,
+            };
+            a.defer_custody(CodexZstCause::OwnerUnproven);
+            let ArchiveDisposition::Pending { retry_after, .. } = a.disposition else {
+                panic!("held retry remains owed")
+            };
+            assert!(retry_after >= sampled_scan::now_seconds());
+            if !expired {
+                assert_eq!(retry_after, deadline);
+            }
+            assert_eq!(a.decode_attempts, 0);
+        }
+    }
+
     /// [format] Unknown/malformed archive metadata is held by the existing
     /// lenient file owner; unchanged plain entries serialize identically.
     #[test]
@@ -1855,6 +1914,23 @@ pub(in crate::snapshots) mod tests {
             let held = ScanIndex::load(&path).unwrap();
             assert!(held.decode_holds_file(&key));
             assert!(held.accepted_snapshot_fingerprints.is_empty());
+            let mut held = held;
+            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                let result = held
+                    .inventory_archive_header(
+                        &f.candidate(),
+                        Some(&Arc::new(sampled_scan::SharedCache::default())),
+                        &mut HeaderWork {
+                            allowed: true,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert!(matches!(result, HeaderRead::Deferred));
+            });
+            assert!(!rows
+                .iter()
+                .any(|r| r["stage"] == "codex_zst_inventory" || r["stage"] == "codex_zst_input"));
         }
         index.files.clear();
         assert_eq!(before, serde_json::to_value(index).unwrap());
@@ -2195,21 +2271,5 @@ pub(in crate::snapshots) mod tests {
             );
             assert!(!scan.index.files.contains_key(&key));
         }
-    }
-}
-
-impl std::fmt::Debug for ArchiveEvidence {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ArchiveEvidence")
-            .field("attempts", &self.decode_attempts)
-            .field("disposition", &self.disposition)
-            .finish_non_exhaustive()
-    }
-}
-impl std::fmt::Debug for ValidatedHeader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ValidatedHeader")
-            .field("owner_bytes", &self.owner.len())
-            .finish_non_exhaustive()
     }
 }
