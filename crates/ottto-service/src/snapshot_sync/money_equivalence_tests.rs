@@ -1182,9 +1182,10 @@ fn pi_disk_corpus(
     let scanner = disk.owner(SnapshotSource::Pi);
     let (mut index, scan, modes) =
         other_page(&c, &scanner, SnapshotSource::Pi, ScanIndex::default());
-    // The copied harness runs on main too: only head admits Pi to RAM.
+    // The copied harness also runs on the base, which may predate Pi RAM: its
+    // own build decides there, and head must sample.
     let sampled = match std::env::var("OTTTO_MONEY_EQUIVALENCE_PI_RAM_EXPECTED").as_deref() {
-        Ok("0") => false,
+        Ok("any") => modes == (1, 0, 0),
         Ok("1") | Err(_) => true,
         Ok(other) => panic!("invalid Pi RAM expectation: {other}"),
     };

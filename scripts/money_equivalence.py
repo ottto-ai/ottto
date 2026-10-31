@@ -21,10 +21,6 @@ def output(args):
 
 # Cap refusals use the shared entry-cap diagnostic; capability and emitted-body
 # receipts below remain the durable evidence, independent of cache counters.
-PI_DURABLE_EXPECTED = True
-# Flip to True once the comparison base contains Pi-a (the release after Pi-a, or Pi-b2).
-PI_RAM_IN_BASE = False
-
 # Pi writes cross-build receipts even when the base has no durable Pi store.
 PI_FIXTURES = (
     "pi_plain_session", "pi_tool_turn", "pi_compaction", "pi_branch_summary",
@@ -213,6 +209,17 @@ def has_forbidden_diff(diff):
     return any(diff[kind] for kind in ("added", "removed", "changed"))
 
 
+def check_pi_capability(arm, capabilities):
+    """Every Pi fixture declares one capability. Head restores Pi durably; the
+    base reports either, uniformly, so a base that predates or contains durable
+    Pi both compare."""
+    if len(capabilities) != len(PI_FIXTURES) or {name for name, _ in capabilities} != set(PI_FIXTURES):
+        raise RuntimeError(f"incomplete {arm} Pi capability declarations: {capabilities}")
+    allowed = ({"SUPPORTED"},) if arm == "head" else ({"SUPPORTED"}, {"UNSUPPORTED"})
+    if {status for _, status in capabilities} not in allowed:
+        raise RuntimeError(f"invalid {arm} Pi capability: {capabilities}")
+
+
 def require_base_scan_fixture(base):
     """Keep the base's scanner adapter: the head's may require newer runtime APIs."""
     fixture = base / "crates/ottto-service/src/snapshots/e2_pipeline_scan_fixture.rs"
@@ -287,7 +294,8 @@ def main():
             env = dict(os.environ, CARGO_TARGET_DIR=str(root / f"{arm}-target"),
                        OTTTO_MONEY_EQUIVALENCE_ROOT=str(root / "inputs"),
                        OTTTO_MONEY_EQUIVALENCE_OUTPUT=str(receipts / arm),
-                       OTTTO_MONEY_EQUIVALENCE_PI_RAM_EXPECTED="1" if arm == "head" or PI_RAM_IN_BASE else "0")
+                       # The base's own build decides whether it samples Pi.
+                       OTTTO_MONEY_EQUIVALENCE_PI_RAM_EXPECTED="1" if arm == "head" else "any")
             build = receipts / f"{arm}-build.jsonl"
             with build.open("w") as log:
                 command(["cargo", "test", "-p", "ottto-service", "--lib", "--locked",
@@ -329,12 +337,7 @@ def main():
             result.check_returncode()
             if len(verified) != len(expected) or set(verified) != expected or "UNEXECUTED" in result.stdout:
                 raise RuntimeError(f"incomplete native coverage: {verified}")
-            if len(capabilities) != len(PI_FIXTURES) or {name for name, _ in capabilities} != set(PI_FIXTURES):
-                raise RuntimeError(f"incomplete {arm} Pi capability declarations: {capabilities}")
-            pi_support = {status for _, status in capabilities}
-            allowed_support = ({"SUPPORTED"},) if arm == "head" and PI_DURABLE_EXPECTED else ({"UNSUPPORTED"},)
-            if pi_support not in allowed_support:
-                raise RuntimeError(f"invalid {arm} Pi capability: {capabilities}")
+            check_pi_capability(arm, capabilities)
             expected_disk = [(name, "UNSUPPORTED" if name in PI_FIXTURES
                               and pi_capability[name] == "UNSUPPORTED" else "VERIFIED")
                              for name in DISK_FIXTURES]
@@ -380,7 +383,7 @@ def main():
                     f"base `{base_sha}`, head `{head_sha}`. "
                     f"{manifest['runtime_seconds']:.1f}s. "
                     f"Base Pi disk UNSUPPORTED: {', '.join(sorted(unsupported)) or 'none'}; "
-                    f"Head Pi disk expected: {'VERIFIED' if PI_DURABLE_EXPECTED else 'UNSUPPORTED'}. "
+                    f"Head Pi disk expected: VERIFIED. "
                     f"Family vector remains ignored.\n")
             counts = {kind: ", ".join(f"{arm} " + "/".join(str(manifest["receipt_counts"][arm][kind][k])
                                                             for k in ("existing", "pi", "total"))

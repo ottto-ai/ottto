@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 import tempfile
 
-from money_equivalence import (decode_receipt, has_forbidden_diff, receipt_diff,
-                               require_base_scan_fixture)
+from money_equivalence import (PI_FIXTURES, check_pi_capability, decode_receipt,
+                               has_forbidden_diff, receipt_diff, require_base_scan_fixture)
 
 
 CONTRACT = "usage_decrease_hold_ack_contract"
@@ -383,6 +383,27 @@ class TransplantTests(unittest.TestCase):
             fixture.unlink()
             with self.assertRaises(FileNotFoundError):
                 require_base_scan_fixture(base)
+
+
+def pi_capabilities(status):
+    return [(name, status) for name in PI_FIXTURES]
+
+
+class PiCapabilityTests(unittest.TestCase):
+    def test_base_without_durable_pi_compares_and_head_must_support_it(self):
+        """[behaviour] A base that predates durable Pi reports UNSUPPORTED."""
+        check_pi_capability("base", pi_capabilities("UNSUPPORTED"))
+        with self.assertRaisesRegex(RuntimeError, "invalid head Pi capability"):
+            check_pi_capability("head", pi_capabilities("UNSUPPORTED"))
+
+    def test_base_with_durable_pi_compares_and_mixed_support_fails(self):
+        """[behaviour] A base cut after durable Pi reports SUPPORTED."""
+        check_pi_capability("base", pi_capabilities("SUPPORTED"))
+        check_pi_capability("head", pi_capabilities("SUPPORTED"))
+        mixed = pi_capabilities("SUPPORTED")
+        mixed[0] = (mixed[0][0], "UNSUPPORTED")
+        with self.assertRaisesRegex(RuntimeError, "invalid base Pi capability"):
+            check_pi_capability("base", mixed)
 
 
 if __name__ == "__main__":
