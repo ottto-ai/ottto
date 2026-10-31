@@ -6313,9 +6313,13 @@ fn a1a_scan_at(
     owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
     roots: &[PathBuf],
     support: &Path,
-    index: ScanIndex,
+    mut index: ScanIndex,
     at: &str,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    // Match the sync cycle before the literal-emission guard runs.
+    index.activate_effective_upload_body_witness_revision(effective_revision(
+        SnapshotSource::ClaudeCode,
+    ));
     // Model an ordinary file born before its fixed August response timestamps.
     // The fold is constructed before the driver's per-file birth setter runs.
     claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
@@ -8011,8 +8015,11 @@ fn a0h_scan(
     owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
     roots: &[PathBuf],
     root: &Path,
-    index: ScanIndex,
+    mut index: ScanIndex,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    index.activate_effective_upload_body_witness_revision(effective_revision(
+        SnapshotSource::ClaudeCode,
+    ));
     claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
         owner.scan(roots, root, index, 100, true, &BTreeMap::new(), &[])
     })
