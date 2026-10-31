@@ -98,7 +98,7 @@ impl Starting {
             watcher_overflow: t.watcher_hint_seen,
             retry_attempt: t.unhealthy_retry_attempt,
             retry_not_before_unix_seconds: t.unhealthy_retry_not_before_unix_seconds,
-            retryable_problems: t.counts.has_retryable_problems(),
+            retryable_problems: t.counts.has_retryable_problems(source),
             unsettled_residue: t.counts.has_unsettled_residue(),
             counts: t.counts.clone(),
         });

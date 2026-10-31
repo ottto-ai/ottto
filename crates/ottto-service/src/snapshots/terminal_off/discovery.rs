@@ -399,7 +399,9 @@ pub(super) fn walk_path(
         }
         o.stat = stat;
         o.round = round;
-        if metadata.len() > MAX_CLAUDE_JSONL_FILE_BYTES {
+        if metadata.len() > max_jsonl_file_bytes(SnapshotSource::ClaudeCode)
+            && !oversized_discovery::pressure_only(SnapshotSource::ClaudeCode)
+        {
             o.served = Some((stat, [0; 32]));
             o.served_at = Some(now);
         }

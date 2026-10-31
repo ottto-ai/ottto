@@ -93,7 +93,10 @@ impl ContinuationFixture {
     fn ordinary_prepare_saves(&self) {
         let source = SnapshotSource::Codex;
         let (mut progress, mut index) = self.load();
-        let _ = index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE);
+        let _ = index.prepare_snapshot_admission_reoffer(
+            SnapshotSource::Codex,
+            SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE,
+        );
         if index.legacy_settlement_ledger_needs_migration() {
             let _ = index.prepare_legacy_settlement_reconciliation(
                 source,
@@ -559,7 +562,10 @@ fn a_pending_admission_reoffer_refuses_the_continuation_prepare() {
         },
     );
     // The ordinary prepare's arming and save.
-    assert!(index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE));
+    assert!(index.prepare_snapshot_admission_reoffer(
+        SnapshotSource::Codex,
+        SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE
+    ));
     index.save(&fixture.index_path).unwrap();
     assert!(fixture.load().1.snapshot_admission_reoffer_pending());
     fixture.assert_refused(ContinuationRefusal::AdmissionReoffer);

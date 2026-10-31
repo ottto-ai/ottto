@@ -1104,7 +1104,10 @@ fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
     assert!(
         counts.ownership_incomplete_file_count > counts.terminal_ownership_incomplete_file_count
     );
-    assert_eq!(counts.disclosed_loss(), DisclosedLoss::Unsettled);
+    assert_eq!(
+        counts.disclosed_loss(SnapshotSource::ClaudeCode),
+        DisclosedLoss::Unsettled
+    );
     assert!(!last.fully_settled);
     assert!(!last.backfill_succeeded);
     assert!(settled.context_curve_replay_needed(PIPELINE_HOLD_CYCLE.replay_generation));
@@ -1222,7 +1225,7 @@ fn server_deferred_and_retry_pending_holds_keep_the_claude_traversal_incomplete(
             let counts = SyncCounts::from_scan_result(&last.scan, 0, 183)
                 .with_snapshot_terminal_counts(&last.index);
             assert_eq!(
-                counts.disclosed_loss(),
+                counts.disclosed_loss(SnapshotSource::ClaudeCode),
                 DisclosedLoss::Unsettled,
                 "the withheld census stays non-terminal"
             );
@@ -2036,7 +2039,10 @@ fn rejected_page_with_terminal_bound_holds_lets_the_claude_census_complete() {
         SyncCounts::from_scan_result(&last.scan, 0, 183).with_snapshot_terminal_counts(settled);
     assert!(counts.census_complete);
     assert!(counts.terminal_ownership_incomplete_file_count >= 1);
-    assert_ne!(counts.disclosed_loss(), DisclosedLoss::None);
+    assert_ne!(
+        counts.disclosed_loss(SnapshotSource::ClaudeCode),
+        DisclosedLoss::None
+    );
     let (window_start, window_end) =
         snapshot_manifest_window(&last.scan.census_window_end, 183).expect("manifest window");
     let manifest = settled
@@ -2407,7 +2413,10 @@ fn assert_real_rejected_hold(
             counts.ownership_incomplete_file_count
                 > counts.terminal_ownership_incomplete_file_count
         );
-        assert_eq!(counts.disclosed_loss(), DisclosedLoss::Unsettled);
+        assert_eq!(
+            counts.disclosed_loss(SnapshotSource::ClaudeCode),
+            DisclosedLoss::Unsettled
+        );
     } else {
         assert!(last
             .index
@@ -2793,7 +2802,10 @@ fn bound_retry_pending_hold_settles_without_marking_the_sweep() {
         );
         let counts = SyncCounts::from_scan_result(&last.scan, 0, 183)
             .with_snapshot_terminal_counts(&last.index);
-        assert_eq!(counts.disclosed_loss(), DisclosedLoss::Unsettled);
+        assert_eq!(
+            counts.disclosed_loss(SnapshotSource::ClaudeCode),
+            DisclosedLoss::Unsettled
+        );
         assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
     }
 }

@@ -4431,7 +4431,7 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
         let counts = &loaded.traversal.as_ref().unwrap().counts;
         assert_eq!(serde_json::to_value(counts).unwrap(), expected);
         assert_eq!(counts.discovered_file_count, 7);
-        assert_eq!(counts.has_retryable_problems(), full);
+        assert_eq!(counts.has_retryable_problems(SnapshotSource::Codex), full);
         loaded
             .save(&path)
             .expect("legacy checkpoint can still CAS-save");
@@ -4571,7 +4571,7 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
                     .as_ref()
                     .unwrap()
                     .counts
-                    .has_retryable_problems(),
+                    .has_retryable_problems(SnapshotSource::Codex),
                 "nonzero retired refusal must not request another read"
             );
             assert_eq!(

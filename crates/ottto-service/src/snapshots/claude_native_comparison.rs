@@ -167,7 +167,7 @@ pub(crate) fn selected_page_is_clean(
         && scan.directory_entry_cap_exceeded_count == 0
         && scan.symlink_rejected_count == 0
         && scan.unreadable_path_count == 0
-        && scan.oversized_file_count == 0
+        && (scan.oversized_file_count == 0 || oversized_discovery::pressure_only(scan.source))
         && scan.disappeared_file_count == 0
         && scan.malformed_json_line_count == 0
         && scan.invalid_utf8_line_count == 0
@@ -183,7 +183,7 @@ pub(crate) fn selected_page_is_clean(
         && (scan.census_complete
             || index.traversal.as_ref().is_some_and(|traversal| {
                 traversal.census_window_end == scan.census_window_end
-                    && !traversal.counts.has_errors()
+                    && !traversal.counts.has_errors(SnapshotSource::ClaudeCode)
                     && !traversal.watcher_hint_seen
             }))
 }
@@ -245,7 +245,7 @@ impl TerminalTraversal {
                     && !traversal.context_fingerprint.is_empty()
                     && traversal.pending_directories.is_empty()
                     && traversal.pending_candidates.is_empty()
-                    && !traversal.counts.has_errors()
+                    && !traversal.counts.has_errors(SnapshotSource::ClaudeCode)
                     && !traversal.watcher_hint_seen
                     && !traversal.codex_parent_resolution_retry_required
             })

@@ -3795,10 +3795,11 @@ impl SyncCounts {
     /// counters so the receipt can never claim a settled residue the scan did
     /// not: a walk that could not enter, open, read, or parse something may
     /// simply not have seen the file that would resolve a fork.
-    fn has_retryable_problems(&self) -> bool {
+    fn has_retryable_problems(&self, source: SnapshotSource) -> bool {
         self.symlink_rejected_count > 0
             || self.unreadable_path_count > 0
-            || self.oversized_file_count > 0
+            || (self.oversized_file_count > 0
+                && !crate::snapshots::oversized_discovery::pressure_only(source))
             || self.disappeared_file_count > 0
             || self.malformed_json_line_count > 0
             || self.invalid_utf8_line_count > 0
@@ -3813,7 +3814,7 @@ impl SyncCounts {
             || self.dropped_usage_record_count > 0
     }
 
-    fn disclosed_loss(&self) -> DisclosedLoss {
+    fn disclosed_loss(&self, source: SnapshotSource) -> DisclosedLoss {
         // A partial census is itself unsettled evidence even when it has not
         // yet populated one of the public loss counters. In particular,
         // RetryPending Claude authority families deliberately lower
@@ -3833,7 +3834,7 @@ impl SyncCounts {
             && self.recognized_usage_drop_count == self.terminal_recognized_usage_drop_count
             && self.dropped_usage_record_count == self.terminal_dropped_usage_record_count
             && self.over_line_cap_count == self.terminal_over_line_cap_count;
-        if !self.has_retryable_problems() && every_class_terminal {
+        if !self.has_retryable_problems(source) && every_class_terminal {
             DisclosedLoss::Terminal
         } else {
             DisclosedLoss::Unsettled
@@ -6584,7 +6585,8 @@ fn prepare_sync_source_inner(
     );
     let historical_replay_pending = backfill_pending || curve_replay_pending;
     if !historical_replay_pending
-        && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
+        && index
+            .prepare_snapshot_admission_reoffer(source, SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
     {
         // Persist the one-shot policy adoption before progress or scan can
         // advance. Existing generation CAS rejects overlapping stale writers.
@@ -11445,7 +11447,7 @@ fn collector_status_request(
     census_residue_status_admitted: bool,
 ) -> Result<SnapshotStatusRequest> {
     let finished_at = current_rfc3339();
-    let disclosed_loss = status.counts.disclosed_loss();
+    let disclosed_loss = status.counts.disclosed_loss(status.source);
     let (
         enabled,
         disabled_reason,
@@ -18095,7 +18097,7 @@ mod tests {
             BTreeSet::from([large.snapshot_fingerprint.clone()]),
         );
         index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
-        assert!(index.prepare_snapshot_admission_reoffer(50));
+        assert!(index.prepare_snapshot_admission_reoffer(SnapshotSource::Codex, 50));
         index.save(&root.join("index.json")).unwrap();
         progress.active_quarantine_witness = Some(test_quarantine_witness());
         assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
@@ -18171,7 +18173,7 @@ mod tests {
         );
         index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
         let index_path = root.join("index.json");
-        assert!(index.prepare_snapshot_admission_reoffer(50));
+        assert!(index.prepare_snapshot_admission_reoffer(SnapshotSource::Codex, 50));
         index.save(&index_path).unwrap();
         progress =
             SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
@@ -18223,7 +18225,7 @@ mod tests {
         );
         index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
-        assert!(!index.prepare_snapshot_admission_reoffer(50));
+        assert!(!index.prepare_snapshot_admission_reoffer(SnapshotSource::Codex, 50));
         let mut unrelated =
             SnapshotUploadProgress::load(&path, &"d".repeat(64), test_quarantine_witness())
                 .unwrap();
