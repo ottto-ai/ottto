@@ -195,10 +195,6 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
     let state = {
         let mut states = states().lock().map_err(|_| Hold::DbUnavailable)?;
         // Latches are never evicted. Release the registry before blocking work.
-        ensure!(
-            states.contains_key(path) || states.len() < 64,
-            Hold::DbUnavailable
-        );
         states
             .entry(path.to_owned())
             .or_insert_with(|| {
@@ -1078,7 +1074,7 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
 
 /// Close/erase only live runtimes already owned by this process. The caller's
 /// existing whole-tree removal owns legacy files and unregistered artifacts;
-/// discovering those files here would consume the bounded route registry.
+/// discovering those files here would register routes for files no source reads.
 pub(in super::super) fn erase_tree(support: &Path) -> Result<()> {
     close_tree(support, true)
 }
