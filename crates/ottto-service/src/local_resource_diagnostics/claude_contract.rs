@@ -35,6 +35,27 @@ counters!(ContextChange {
     replay_changed,
     roots_changed
 });
+// AR2 D34 (evidence owed ON): each owed member the traversal's selection
+// visits, by outcome, by why a re-stamp was refused, and by the age of its
+// family's stored evidence window against this census window.
+counters!(EvidenceOwed {
+    restamped,
+    read,
+    owed_waiting_cap,
+    changed,
+    refused_contract_latch,
+    refused_scan_identity,
+    refused_pending_invalid,
+    refused_evidence,
+    refused_record,
+    refused_family_unverified,
+    refused_no_pending,
+    age_le_1h,
+    age_le_1d,
+    age_le_7d,
+    age_gt_7d,
+    age_unknown
+});
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Counts {
     #[serde(skip_serializing_if = "Transition::is_empty")]
@@ -47,6 +68,8 @@ pub(crate) struct Counts {
     pub(crate) traversal_context_change: ContextChange,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) deferred_by_contract_debt: u64,
+    #[serde(skip_serializing_if = "EvidenceOwed::is_empty")]
+    pub(crate) evidence_owed: EvidenceOwed,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) root_count: Option<u64>,
 }
@@ -63,6 +86,7 @@ impl Counts {
         self.deferred_by_contract_debt = self
             .deferred_by_contract_debt
             .saturating_add(other.deferred_by_contract_debt);
+        self.evidence_owed.merge(other.evidence_owed);
         self.root_count = other.root_count.or(self.root_count);
     }
 }

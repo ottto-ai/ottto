@@ -4779,6 +4779,7 @@ fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
         let _owed = on.then(evidence_owed::EvidenceOwedForTest::on);
         let mut candidates = fixture.candidates.clone();
         candidates[0].source_file_fingerprint = "f".repeat(64);
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let parsed = owed_selected_parses(
             &mut fixture.index,
             &mut evidence_owed::Page::default(),
@@ -4786,6 +4787,19 @@ fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
             &window,
         );
         assert_eq!(parsed, if on { 1 } else { 4 }, "on={on}");
+        // AR2 D34: every owed visit is counted by outcome and evidence age.
+        let counts = scope.finish().contract.evidence_owed;
+        if on {
+            assert_eq!((counts.restamped, counts.changed, counts.read), (3, 1, 0));
+            let aged = counts.age_le_1h
+                + counts.age_le_1d
+                + counts.age_le_7d
+                + counts.age_gt_7d
+                + counts.age_unknown;
+            assert_eq!(aged, 4);
+        } else {
+            assert_eq!(counts, Default::default());
+        }
         let owed = fixture.index.files.values().filter(|e| e.evidence_owed);
         assert_eq!(owed.count(), usize::from(on), "only the changed member stays owed");
     }

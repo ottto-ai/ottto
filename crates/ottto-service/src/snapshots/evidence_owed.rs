@@ -197,9 +197,17 @@ pub(super) fn resolve(
         return;
     };
     let family = claude_index_path_family_member(&candidate.path);
+    if enabled() {
+        note_age(
+            index,
+            family.as_ref().map(|(root, _)| root.as_str()),
+            census_window_end,
+        );
+    }
     if entry.source_file_fingerprint != candidate.source_file_fingerprint {
         // A real change parses fresh evidence, never against its carried copy.
         if let Some((root, member)) = family.filter(|_| enabled()) {
+            claude_contract::note(|c| c.evidence_owed.changed += 1);
             if let Some(pending) = index
                 .claude_usage_family_pending
                 .get_mut(&root)
@@ -213,14 +221,32 @@ pub(super) fn resolve(
     }
     if *decision != CandidateDecision::Skip {
         // Otherwise selected: the parse records a fresh entry.
+        if enabled() {
+            claude_contract::note(|c| c.evidence_owed.read += 1);
+        }
         return;
     }
     if let Some((root, member)) = family.filter(|_| enabled()) {
-        if restamp(index, &key, &root, &member, census_window_end) {
-            if let Some(entry) = index.files.get_mut(&key) {
-                entry.evidence_owed = false;
+        match restamp(index, &key, &root, &member, census_window_end) {
+            Ok(()) => {
+                claude_contract::note(|c| c.evidence_owed.restamped += 1);
+                if let Some(entry) = index.files.get_mut(&key) {
+                    entry.evidence_owed = false;
+                }
+                return;
             }
-            return;
+            Err(refusal) => claude_contract::note(|c| {
+                let owed = &mut c.evidence_owed;
+                *match refusal {
+                    Refusal::ContractLatch => &mut owed.refused_contract_latch,
+                    Refusal::ScanIdentity => &mut owed.refused_scan_identity,
+                    Refusal::PendingInvalid => &mut owed.refused_pending_invalid,
+                    Refusal::Evidence => &mut owed.refused_evidence,
+                    Refusal::Record => &mut owed.refused_record,
+                    Refusal::FamilyUnverified => &mut owed.refused_family_unverified,
+                    Refusal::NoPending => &mut owed.refused_no_pending,
+                } += 1;
+            }),
         }
     }
     let Some(entry) = index.files.get(&key) else {
@@ -250,10 +276,48 @@ pub(super) fn resolve(
             }
         },
     };
+    if enabled() {
+        claude_contract::note(|c| match arm {
+            Arm::Read => c.evidence_owed.read += 1,
+            // Re-examined at every visit: read once its requests fit the cap.
+            Arm::KeptOwed => c.evidence_owed.owed_waiting_cap += 1,
+        });
+    }
     if arm == Arm::Read {
         *decision = CandidateDecision::Parse;
         *reason = Some(CandidateParseReason::Rearmed);
     }
+}
+
+/// D34 age: this owed member's family evidence window against this census.
+fn note_age(index: &ScanIndex, root: Option<&str>, census_window_end: &str) {
+    let age = root
+        .and_then(|root| index.claude_usage_family_pending.get(root))
+        .and_then(|pending| rfc3339_unix_seconds(&pending.census_window_end))
+        .zip(rfc3339_unix_seconds(census_window_end))
+        .map(|(stored, now)| now.saturating_sub(stored));
+    claude_contract::note(|c| {
+        let owed = &mut c.evidence_owed;
+        *match age {
+            None => &mut owed.age_unknown,
+            Some(age) if age <= 3_600 => &mut owed.age_le_1h,
+            Some(age) if age <= 86_400 => &mut owed.age_le_1d,
+            Some(age) if age <= 7 * 86_400 => &mut owed.age_le_7d,
+            Some(_) => &mut owed.age_gt_7d,
+        } += 1;
+    });
+}
+
+/// Why a re-stamp did not count as an observation (counts only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    ContractLatch,
+    ScanIdentity,
+    PendingInvalid,
+    Evidence,
+    Record,
+    FamilyUnverified,
+    NoPending,
 }
 
 /// (a) Lead B ruling 1 (2026-10-31): an unchanged member's stored occurrences
@@ -266,29 +330,41 @@ pub(super) fn resolve(
 /// A stale family moves only while every other member with stored evidence
 /// is still owed: each is verified at its own selection, and owed members
 /// stay unobserved for fence coverage until then.
-fn restamp(index: &mut ScanIndex, key: &str, root: &str, member: &str, window: &str) -> bool {
+fn restamp(
+    index: &mut ScanIndex,
+    key: &str,
+    root: &str,
+    member: &str,
+    window: &str,
+) -> Result<(), Refusal> {
     let (Some(entry), Some(pending)) = (
         index.files.get(key),
         index.claude_usage_family_pending.get(root),
     ) else {
-        return false;
+        return Err(Refusal::NoPending);
     };
-    let bound = !index.claude_request_identity_contract_changed
-        && entry.scan_identity_version.as_deref() == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
-        && !pending.invalid
-        && pending
-            .member_occurrences
-            .get(member)
-            .zip(pending.member_request_id_hashes.get(member))
-            .is_some_and(|(occurrences, hashes)| {
-                occurrences.keys().eq(hashes.iter())
-                    && index.claude_request_census.get(key).is_some_and(|record| {
-                        record.current_for(&entry.source_file_fingerprint)
-                            && record_hashes(hashes).as_deref() == Some(record.request_hashes())
-                    })
-            });
-    if !bound {
-        return false;
+    if index.claude_request_identity_contract_changed {
+        return Err(Refusal::ContractLatch);
+    }
+    if entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION) {
+        return Err(Refusal::ScanIdentity);
+    }
+    if pending.invalid {
+        return Err(Refusal::PendingInvalid);
+    }
+    let Some(hashes) = pending
+        .member_occurrences
+        .get(member)
+        .zip(pending.member_request_id_hashes.get(member))
+        .and_then(|(occurrences, hashes)| occurrences.keys().eq(hashes.iter()).then_some(hashes))
+    else {
+        return Err(Refusal::Evidence);
+    };
+    if !index.claude_request_census.get(key).is_some_and(|record| {
+        record.current_for(&entry.source_file_fingerprint)
+            && record_hashes(hashes).as_deref() == Some(record.request_hashes())
+    }) {
+        return Err(Refusal::Record);
     }
     if pending.census_window_end != window {
         let others_owed = family(index, key, root).all(|(other, entry)| {
@@ -298,13 +374,13 @@ fn restamp(index: &mut ScanIndex, key: &str, root: &str, member: &str, window: &
                     .is_some_and(|(_, other)| !pending.member_occurrences.contains_key(&other))
         });
         if !others_owed {
-            return false;
+            return Err(Refusal::FamilyUnverified);
         }
         if let Some(pending) = index.claude_usage_family_pending.get_mut(root) {
             pending.census_window_end = window.to_owned();
         }
     }
-    true
+    Ok(())
 }
 
 /// Pending keys request ids by full SHA-256 hex; a census record keeps the
