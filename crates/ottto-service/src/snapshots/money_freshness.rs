@@ -96,20 +96,20 @@ fn claim_first_observation(observed: &std::sync::atomic::AtomicBool) -> bool {
 mod tests;
 
 // Default ON, sampled once per process like restart_restore/#899 policy.
-super::terminal_off_policy::local_switch!(
+super::local_switch::local_switch!(
     "money_freshness_disabled",
     marker_enables = false,
     test_default = true
 );
 #[cfg(test)]
 pub(super) struct DisabledForTest {
-    _switch: super::terminal_off_policy::ThreadSwitchForTest,
+    _switch: super::local_switch::ThreadSwitchForTest,
 }
 #[cfg(test)]
 impl DisabledForTest {
     pub(super) fn new() -> Self {
         Self {
-            _switch: super::terminal_off_policy::ThreadSwitchForTest::set(&ENABLED, false),
+            _switch: super::local_switch::ThreadSwitchForTest::set(&ENABLED, false),
         }
     }
 }

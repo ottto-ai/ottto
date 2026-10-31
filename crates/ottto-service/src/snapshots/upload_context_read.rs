@@ -173,7 +173,7 @@ impl Budget {
     }
 }
 impl ScanIndex {
-    pub(super) fn context_only_read(&self, candidate: &CandidateFile, audit_now: u64) -> bool {
+    pub(super) fn context_only_read(&self, candidate: &CandidateFile, _audit_now: u64) -> bool {
         if !self.file_upload_context_enabled {
             return false;
         }
@@ -190,7 +190,7 @@ impl ScanIndex {
             .get(&key)
             .is_some_and(|entities| !entities.is_empty())
             && self
-                .candidate_decision_with_reason_at(candidate, terminal_off_decision_now(audit_now))
+                .candidate_decision_with_reason_at(candidate, sampled_scan::now_seconds())
                 .1
                 == Some(CandidateParseReason::UploadContext)
     }
