@@ -4597,7 +4597,6 @@ fn r3_page_zero_forced_family_is_counted_and_bounded_off_and_on() {
         let mut index: ScanIndex = serde_json::from_value(value).unwrap();
         let before = index.claude_authority_record_for_test(&root).unwrap();
         assert!(before.bound_to_retained_witness);
-        crate::snapshots::take_parse_reason_lines_for_test(SnapshotSource::ClaudeCode);
         let scan = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
             &[transcripts],
@@ -4608,17 +4607,17 @@ fn r3_page_zero_forced_family_is_counted_and_bounded_off_and_on() {
             false,
         )
         .unwrap();
-        let forced: usize =
-            crate::snapshots::take_parse_reason_lines_for_test(SnapshotSource::ClaudeCode)
-                .iter()
-                .flat_map(|line| line.split_whitespace())
-                .filter_map(|field| field.strip_prefix("forced_family="))
-                .map(|count| count.parse::<usize>().unwrap())
-                .sum();
+        let forced = scan.forced_family_for_test;
         let family = BTreeSet::from([root.clone(), apc_m2_agent(0)]);
-        let parsed = scan.snapshots.iter()
-            .map(|item| item.source_session_id.clone()).collect::<BTreeSet<_>>();
-        assert_eq!(parsed, family, "page zero parses every member of exactly this family");
+        let parsed = scan
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            parsed, family,
+            "page zero parses every member of exactly this family"
+        );
         assert_eq!(forced, family.len(), "one counted family-unit burst");
         assert!(scan.scanned_file_count <= 1 + forced);
         assert_eq!(scan.scanned_file_count, family.len());

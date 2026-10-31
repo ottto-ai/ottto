@@ -7571,10 +7571,18 @@ macro_rules! scan_result {
         $($(#[$attr:meta])* $vis:vis $field:ident: $ty:ty,)*
     }) => {
         #[derive(Debug, Clone)]
-        pub struct $name { pub source: SnapshotSource, $($(#[$attr])* $vis $field: $ty,)* }
+        pub struct $name {
+            pub source: SnapshotSource, $($(#[$attr])* $vis $field: $ty,)*
+            #[cfg(test)]
+            pub(crate) forced_family_for_test: usize,
+        }
         impl $name {
             fn empty(source: SnapshotSource) -> Self {
-                Self { source, $($field: Default::default(),)* }
+                Self {
+                    source, $($field: Default::default(),)*
+                    #[cfg(test)]
+                    forced_family_for_test: 0,
+                }
             }
         }
     };
@@ -31528,8 +31536,7 @@ impl OwnedSourceScan {
                     ) {
                         eprintln!("{line}");
                         #[cfg(test)]
-                        SOURCE_PARSE_REASON_LINES
-                            .with(|lines| lines.borrow_mut().push((source, line)));
+                        CODEX_PARSE_REASON_LINES.with(|lines| lines.borrow_mut().push(line));
                     }
                 }
                 if source == SnapshotSource::ClaudeCode
@@ -31545,16 +31552,6 @@ impl OwnedSourceScan {
                     );
                     let held_audit_open_failed =
                         sampled_audit::held_audit_open_failed(terminal_off_decision_now(audit_now));
-                    #[cfg(test)]
-                    SOURCE_PARSE_REASON_LINES.with(|lines| {
-                        lines.borrow_mut().push((
-                            source,
-                            census_count_fields(
-                                &CANDIDATE_PARSE_REASON_NAMES,
-                                &census.parse_reasons,
-                            ),
-                        ));
-                    });
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
@@ -32142,6 +32139,9 @@ impl OwnedSourceScan {
                     );
                 }
                 let scan = SourceScanResult {
+                    #[cfg(test)]
+                    forced_family_for_test: census.parse_reasons
+                        [CandidateParseReason::ForcedFamily as usize],
                     strict_cohort_deferred_root_count: 0,
                     source,
                     backfill_window_days,
@@ -45215,24 +45215,13 @@ fn census_count_fields(names: &[&str], counts: &[usize]) -> String {
 
 #[cfg(test)]
 thread_local! {
-    static SOURCE_PARSE_REASON_LINES: std::cell::RefCell<Vec<(SnapshotSource, String)>> =
+    static CODEX_PARSE_REASON_LINES: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
-pub(crate) fn take_parse_reason_lines_for_test(source: SnapshotSource) -> Vec<String> {
-    SOURCE_PARSE_REASON_LINES.with(|lines| {
-        let (selected, retained): (Vec<_>, Vec<_>) = std::mem::take(&mut *lines.borrow_mut())
-            .into_iter()
-            .partition(|(kind, _)| *kind == source);
-        *lines.borrow_mut() = retained;
-        selected.into_iter().map(|(_, line)| line).collect()
-    })
-}
-
-#[cfg(test)]
 fn take_codex_parse_reason_lines_for_test() -> Vec<String> {
-    take_parse_reason_lines_for_test(SnapshotSource::Codex)
+    CODEX_PARSE_REASON_LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
 }
 
 struct CheckpointLock {
