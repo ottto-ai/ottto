@@ -19958,7 +19958,7 @@ mod tests {
     }
 
     /// [off=main] Absent/null/unknown admission preserves the complete legacy
-    /// payload for both sources, including failures=1 and no retry deadline.
+    /// payload for all three sources, including failures=1 and no retry deadline.
     #[test]
     #[serial(source_manifests)]
     fn census_status_without_exact_token_preserves_legacy_bytes() {
@@ -20013,7 +20013,11 @@ mod tests {
   "collector_version": "fixed",
   "parser_version": "fixed"
 }"#;
-        for source in [SnapshotSource::Codex, SnapshotSource::ClaudeCode] {
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
             for hint in [
                 "",
                 r#","census_status_contract":null"#,
@@ -20087,7 +20091,11 @@ mod tests {
     #[serial(source_manifests)]
     fn census_status_contract_reports_first_gate_and_real_retry() {
         let _source_manifests = SourceManifestTestGuard::new();
-        for source in [SnapshotSource::Codex, SnapshotSource::ClaudeCode] {
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
             // One row per cause; each earlier row also fails later gates.
             for (
                 cause,

@@ -115,9 +115,7 @@ impl Budget {
         }
         let alone = ordinary.is_empty() && self.admitted.is_empty();
         if wire > wire_left && !(alone && wire > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES) {
-            if source == SnapshotSource::Codex {
-                index.context_read_counts.transport_reservation_refused = true;
-            }
+            index.context_read_counts.transport_reservation_refused = true;
             return false;
         }
         self.wire_reserved = self.wire_reserved.saturating_add(wire);
