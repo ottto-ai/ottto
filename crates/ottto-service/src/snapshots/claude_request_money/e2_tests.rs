@@ -4408,3 +4408,159 @@ fn e2_identity_incomplete_clock_survives_discarded_twin_in_both_orders() {
         }
     };
 }
+
+/// [regress] retained growth identity failure cannot suppress another sessions request.
+#[test]
+fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
+    use crate::snapshots::claude_request_census::{
+        invalidate_claude_request_census, retain_held, ClaudeRequestBirth,
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    use std::os::unix::fs::MetadataExt;
+    {
+        for held in [false, true] {
+            let scratch = crate::test_scratch::ScratchDir::canonical("growth-identity-copy");
+            let root = scratch.join("sources");
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join(format!("{ROOT}.jsonl"));
+            fs::write(&path, b"{\"requestId\":\"old\"}\n").unwrap();
+            let metadata = fs::metadata(&path).unwrap();
+            let modified = crate::snapshots::unix_seconds(metadata.modified().unwrap()).unwrap();
+            let key = local_index_key(&path);
+            let mut index = ScanIndex::default();
+            let fingerprint = "a".repeat(64);
+            index.files.insert(
+                key.clone(),
+                serde_json::from_value(json!({
+                    "size_bytes":metadata.len(), "modified_unix_seconds":modified,
+                    "source_file_fingerprint":fingerprint,
+                    "scan_identity_version":crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION,
+                }))
+                .unwrap(),
+            );
+            index.claude_request_census.insert_for_test(
+                &key,
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &fingerprint,
+                    modified,
+                    ClaudeRequestCensusShape::Exact,
+                    vec![claude_request_hash("old")],
+                )
+                .with_modified_for_test(Some(modified))
+                .with_birth_for_test(Some(ClaudeRequestBirth {
+                    unix_seconds: modified,
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                })),
+            );
+            index
+                .claude_money_birth_store
+                .record_observation(ROOT, &key, t0());
+            index.v2_mut().growth_retention.insert(
+                key.clone(),
+                serde_json::from_value(json!({
+                    "predecessor_size":1,
+                }))
+                .unwrap(),
+            );
+            let parent = scratch.join("snapshots/destinations").join("a".repeat(64));
+            fs::create_dir_all(&parent).unwrap();
+            let index_path = parent.join("claude_code-identity-scan-index.json");
+            let progress = br#"{"generation":0}"#;
+            crate::snapshot_sync::with_state_v2_progress_lock(&index_path, |p| {
+                ottto_core::write_owner_only_file_atomic(p, progress).map_err(Into::into)
+            })
+            .unwrap();
+            let mut index =
+                crate::snapshots::publish_state_v2_for_test(&index, &index_path, progress);
+            assert!(crate::snapshots::sampled_audit::growth_retirement_excluded(
+                &index, &key
+            ));
+            let debt = index.v2().growth_retention.clone();
+            let replacement = root.join("replacement");
+            fs::write(&replacement, b"{\"requestId\":\"new\"}\n").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&replacement)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+                .unwrap();
+            fs::rename(&replacement, &path).unwrap();
+            let replaced = fs::metadata(&path).unwrap();
+            assert_eq!(replaced.len(), metadata.len());
+            assert_eq!(
+                crate::snapshots::unix_seconds(replaced.modified().unwrap()),
+                Some(modified)
+            );
+            assert_ne!(replaced.ino(), metadata.ino());
+            let stale = index.claude_request_census.get(&key).unwrap();
+            assert_eq!(
+                scan_evidence(&index, &key, stale),
+                Evidence::Current,
+                "same-length/same-second replacement reproduces the false proof premise"
+            );
+            assert!(stale.clone().with_unverified_for_test(true).proves_scan());
+            let other = "b0000000-0000-4000-8000-00000000000b";
+            let copy_path = root.join(format!("{other}.jsonl"));
+            fs::write(&copy_path, b"synthetic copy\n").unwrap();
+            let mut response = line("old", &at(1), 10);
+            response["sessionId"] = json!(other);
+            let parse_copy = |index: &ScanIndex| {
+                parse(
+                    &copy_path,
+                    Some(t0() + 60_000_000_000),
+                    index,
+                    std::slice::from_ref(&response),
+                )
+            };
+            assert_eq!(
+                fold(&parse_copy(&index)).entity.removed_requests,
+                1,
+                "stale census would suppress this other session"
+            );
+            if held {
+                let candidate = crate::snapshots::CandidateFile {
+                    physical_identity: Some([replaced.dev(), replaced.ino()]),
+                    scan_root: root.clone(),
+                    path: path.clone(),
+                    size_bytes: replaced.len(),
+                    modified_unix_seconds: modified,
+                    modified_unix_nanos: 0,
+                    source_file_fingerprint: fingerprint.clone(),
+                    legacy_source_file_fingerprint: String::new(),
+                    legacy_config_reconciliation_required: false,
+                    opened_object_identity: String::new(),
+                    fingerprint_changed_nanos: 0,
+                    fingerprint_birth_nanos: 0,
+                    withheld_content_stamp: None,
+                };
+                assert!(!retain_held(&mut index, &candidate));
+            } else {
+                // Same invalidation used by the native reader on failed
+                // scope/object revalidation; the old file entry stays put.
+                invalidate_claude_request_census(&mut index, &path);
+            }
+            assert_eq!(
+                index.v2().growth_retention,
+                debt,
+                "scheduling obligation survives"
+            );
+            assert!(index.claude_request_census.get(&key).is_none());
+            let stub = index
+                .claude_request_census
+                .storage_records()
+                .get(&key)
+                .unwrap();
+            assert!(!stub.proves_scan());
+            assert_eq!(scan_evidence(&index, &key, stub), Evidence::None);
+            let copy = parse_copy(&index);
+            assert!(!fold(&copy).entity.held);
+            assert_eq!(
+                fold(&copy).entity.removed_requests,
+                0,
+                "decide_holders cannot use stale ids"
+            );
+            assert_eq!(fold(&copy).entity.totals().1, 1);
+        }
+    }
+}

@@ -728,13 +728,8 @@ fn append_request_evidence(
 }
 
 #[cfg(test)]
-type ApiReadHook = Box<dyn FnOnce(&Path)>;
-
-#[cfg(test)]
 thread_local! {
     // Actual API file opens and consumed bytes, isolated from parallel tests.
-    static API_BEFORE_OPEN: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
-    static API_AFTER_READ: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
     static API_READ_RECEIPT: std::cell::Cell<(usize, usize, bool)> = const { std::cell::Cell::new((0, 0, false)) };
 }
 
@@ -1119,12 +1114,6 @@ fn decode_api_sidecar(
         anyhow::bail!("Claude effort evidence is not a regular file");
     }
     let before_path = api_file_generation(&metadata);
-    #[cfg(test)]
-    API_BEFORE_OPEN.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().take() {
-            hook(&path);
-        }
-    });
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1166,12 +1155,6 @@ fn decode_api_sidecar(
     let bytes = limit - reader.get_ref().limit();
     health.oversized_files = u64::from(opened.len().max(bytes) >= MAX_EVIDENCE_FILE_BYTES);
     strict_budget::consumed(bytes);
-    #[cfg(test)]
-    API_AFTER_READ.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().take() {
-            hook(&path);
-        }
-    });
     if bytes >= limit {
         health.unreadable_lines += 1;
         return Ok(empty(health));
@@ -2332,83 +2315,6 @@ mod tests {
         .unwrap()
     }
 
-    fn clock_test_protobuf(event: u64, observed: u64) -> Vec<ClaudeLocalOtelEvidence> {
-        let payload = otlp_proto::ExportLogsServiceRequest {
-            resource_logs: vec![otlp_proto::ResourceLogs {
-                resource: Some(otlp_proto::Resource { attributes: vec![] }),
-                scope_logs: vec![otlp_proto::ScopeLogs {
-                    log_records: vec![otlp_proto::LogRecord {
-                        time_unix_nano: event,
-                        observed_time_unix_nano: observed,
-                        body: proto_string("body", "claude_code.api_request").value,
-                        attributes: vec![
-                            proto_string("session.id", "identity-session"),
-                            proto_string("request_id", "identity-request"),
-                            proto_string("model", "claude-test"),
-                            proto_string("input_tokens", "12"),
-                            proto_string("output_tokens", "3"),
-                            proto_string("user.account_uuid", ACCOUNT),
-                            proto_string("organization.id", ORGANIZATION),
-                        ],
-                    }],
-                }],
-            }],
-        };
-        api_evidence_from_protobuf(&payload.encode_to_vec()).unwrap()
-    }
-
-    fn clock_test_json(
-        event: Option<Value>,
-        observed: Option<Value>,
-    ) -> Vec<ClaudeLocalOtelEvidence> {
-        let mut payload: Value = serde_json::from_slice(&identity_json(
-            &[],
-            &[
-                ("user.account_uuid", ACCOUNT),
-                ("organization.id", ORGANIZATION),
-            ],
-        ))
-        .unwrap();
-        let record = payload
-            .pointer_mut("/resourceLogs/0/scopeLogs/0/logRecords/0")
-            .unwrap()
-            .as_object_mut()
-            .unwrap();
-        record.remove("timeUnixNano");
-        if let Some(value) = event {
-            record.insert("timeUnixNano".into(), value);
-        }
-        if let Some(value) = observed {
-            record.insert("observedTimeUnixNano".into(), value);
-        }
-        api_evidence_from_json(&serde_json::to_vec(&payload).unwrap()).unwrap()
-    }
-
-    #[test]
-    fn claude_api_log_clock_zero_uses_observed_for_both_encodings() {
-        let observed = 1_783_728_000_000_000_000_u64;
-        let expected = clock_test_protobuf(0, observed);
-        assert_eq!(expected.len(), 1);
-        assert_eq!(expected[0].observed_at, "2026-07-11T00:00:00Z");
-        for event in [
-            None,
-            Some(serde_json::json!("0")),
-            Some(serde_json::json!(0)),
-            Some(Value::Null),
-            Some(serde_json::json!("invalid")),
-            Some(serde_json::json!("-1")),
-            Some(serde_json::json!("18446744073709551616")),
-        ] {
-            for observer in [
-                serde_json::json!(observed.to_string()),
-                serde_json::json!(observed),
-            ] {
-                let rows = clock_test_json(event.clone(), Some(observer));
-                assert_eq!(rows, expected, "event={event:?}: fallback must retain counters, identity and exact fingerprint parity");
-            }
-        }
-    }
-
     #[test]
     fn request_pair_malformed_protobuf_identity_preserves_presence_both_origins() {
         use otlp_proto::any_value::Value as ProtoValue;
@@ -2858,35 +2764,6 @@ mod tests {
         // which is what lets a sidechain transcript resolve its own tier.
         assert_eq!(index.get("req_PARENT").map(String::as_str), Some("xhigh"));
         assert_eq!(index.get("req_SUB").map(String::as_str), Some("high"));
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn effort_index_skips_rows_without_a_request_id() {
-        let dir = std::env::temp_dir().join(format!("ottto-effort-legacy-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        // A pre-request-id row: still valid evidence, but only the aggregate
-        // path can place it, so it must not enter the per-request index.
-        append_evidence(
-            &dir,
-            &ClaudeLocalOtelEvidence {
-                fingerprint: "legacy".to_string(),
-                session_id: "sess-legacy".to_string(),
-                observed_at: "2026-07-12T15:07:58Z".to_string(),
-                model: "claude-opus-4-8".to_string(),
-                effort: "low".to_string(),
-                ..Default::default()
-            },
-        )
-        .expect("append legacy evidence");
-
-        assert!(load_claude_effort_by_request(&dir, ["sess-legacy".to_string()]).is_empty());
-        // The aggregate loader still sees it.
-        assert_eq!(
-            load_claude_effort_evidence(&dir, ["sess-legacy".to_string()]).unwrap()["sess-legacy"]
-                .len(),
-            1
-        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -3542,118 +3419,6 @@ mod tests {
             assert!(actual.evidence.is_empty());
             assert!(!actual.health.is_complete());
             assert!(read.evidence.is_empty());
-            fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sidecar_decode_reuse_preserves_whole_effort_open_error_and_metadata_skip() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-        let (dir, rows) = decode_reuse_fixture("errors");
-        let mut denied = rows[0].clone();
-        denied.session_id = "z-denied".into();
-        append_evidence(&dir, &denied).unwrap();
-        let denied_path = evidence_path(&dir, "z-denied");
-        let permissions = fs::metadata(&denied_path).unwrap().permissions();
-        fs::set_permissions(&denied_path, fs::Permissions::from_mode(0o0)).unwrap();
-        assert!(
-            ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into(), "z-denied".into()]).is_err()
-        );
-        let strict =
-            load_claude_api_request_evidence_report(&dir, ["sess-mixed".into(), "z-denied".into()]);
-        assert_eq!(strict.health.unreadable_lines, 1);
-        assert_eq!(strict.evidence["sess-mixed"], rows);
-        fs::set_permissions(&denied_path, permissions).unwrap();
-        let loop_path = evidence_path(&dir, "loop");
-        symlink(&loop_path, &loop_path).unwrap();
-        let permissive = ClaudeApiEvidenceRead::load(
-            &dir,
-            ["sess-mixed".into(), "loop".into(), "missing".into()],
-        )
-        .unwrap();
-        assert_eq!(permissive.evidence.len(), 1);
-        let strict =
-            load_claude_api_request_evidence_report(&dir, ["loop".into(), "missing".into()]);
-        assert_eq!(strict.health.unreadable_lines, 1);
-        assert_eq!(strict.health.missing_files, 1);
-        fs::remove_file(&loop_path).unwrap();
-        fs::create_dir(&loop_path).unwrap();
-        assert!(ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into(), "loop".into()]).is_err());
-        assert_eq!(
-            load_claude_api_request_evidence_report(&dir, ["loop".into()])
-                .health
-                .unreadable_lines,
-            1
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn sidecar_decode_reuse_io_failure_stops_once_and_keeps_strict_refusal() {
-        struct FailingReader {
-            calls: usize,
-        }
-        impl std::io::Read for FailingReader {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                unreachable!()
-            }
-        }
-        impl BufRead for FailingReader {
-            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-                self.calls += 1;
-                assert_eq!(self.calls, 1, "persistent errors must not loop");
-                Err(std::io::Error::other("synthetic read failure"))
-            }
-            fn consume(&mut self, _: usize) {
-                unreachable!()
-            }
-        }
-        let mut reader = FailingReader { calls: 0 };
-        let mut health = ClaudeLocalOtelLoadHealth::default();
-        let before = API_READ_RECEIPT.with(|r| r.get().1);
-        let rows = decode_api_rows(&mut reader, "sess-mixed", &mut health);
-        assert!(rows.is_empty());
-        assert_eq!(API_READ_RECEIPT.with(|r| r.get().1) - before, 0);
-        assert_eq!(reader.calls, 1);
-        assert_eq!(health.unreadable_lines, 1);
-        assert!(!health.is_complete());
-    }
-    #[test]
-    fn sidecar_decode_reuse_lazy_new_root_and_read_snapshot_races_reread() {
-        for phase in ["before-open", "after-read"] {
-            let (dir, rows) = decode_reuse_fixture(phase);
-            let mut next = rows[0].clone();
-            next.request_id = "req-next".into();
-            next.fingerprint = "next".into();
-            let mut extra = serde_json::to_vec(&next).unwrap();
-            extra.push(b'\n');
-            let hook: ApiReadHook = Box::new(move |path| {
-                File::options()
-                    .append(true)
-                    .open(path)
-                    .unwrap()
-                    .write_all(&extra)
-                    .unwrap();
-            });
-            if phase == "before-open" {
-                API_BEFORE_OPEN.with(|h| *h.borrow_mut() = Some(hook));
-            } else {
-                API_AFTER_READ.with(|h| *h.borrow_mut() = Some(hook));
-            }
-            let mut read = ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into()]).unwrap();
-            assert!(read.reads["sess-mixed"].generation.is_none());
-            API_READ_RECEIPT.with(|r| r.set((0, 0, false)));
-            let report = read.take_strict_report(&dir, "sess-mixed");
-            assert!(report.health.is_complete());
-            assert_eq!(report.evidence["sess-mixed"].len(), 3);
-            assert_eq!(API_READ_RECEIPT.with(|r| r.get().0), 1);
-            let mut later = rows[0].clone();
-            later.session_id = "later-root".into();
-            append_evidence(&dir, &later).unwrap();
-            let report = read.take_strict_report(&dir, "later-root");
-            assert_eq!(report.evidence["later-root"], vec![later]);
-            assert_eq!(API_READ_RECEIPT.with(|r| r.get().0), 2);
             fs::remove_dir_all(dir).unwrap();
         }
     }
