@@ -10366,7 +10366,11 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         if evidence_owed::enabled()
             && index.claude_request_identity_contract_changed
             && index.claude_request_identity_contract.as_deref() == Some(contract)
-            && evidence_owed::evidence_from_window(index, census_window_end)
+            && evidence_owed::evidence_from_window(
+                index,
+                census_window_end,
+                &indexed_claude_family_ids,
+            )
         {
             claude_contract::note(|counts| counts.identity_contract_latch.cleared += 1);
             index.claude_request_identity_contract_changed = false;

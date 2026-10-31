@@ -320,11 +320,25 @@ fn record_hashes(hashes: &BTreeSet<String>) -> Option<Vec<u64>> {
 }
 
 /// Q5 (RF1 #992): every stored evidence set is from this census window, or
-/// there is none to mix with the recorded contract.
-pub(super) fn evidence_from_window(index: &ScanIndex, census_window_end: &str) -> bool {
-    index.claude_usage_family_pending.values().all(|pending| {
-        pending.invalid || evidence_free(pending) || pending.census_window_end == census_window_end
-    })
+/// there is none to mix with the recorded contract. Pending this completion
+/// retires (no indexed member, no quarantine: `owed_at_completion`) is none.
+pub(super) fn evidence_from_window(
+    index: &ScanIndex,
+    census_window_end: &str,
+    indexed_claude_family_ids: &BTreeSet<String>,
+) -> bool {
+    index
+        .claude_usage_family_pending
+        .iter()
+        .all(|(root_session_id, pending)| {
+            pending.invalid
+                || evidence_free(pending)
+                || pending.census_window_end == census_window_end
+                || !(index
+                    .claude_usage_authority_quarantine
+                    .contains_key(root_session_id)
+                    || owed_at_completion(root_session_id, pending, false, indexed_claude_family_ids))
+        })
 }
 
 /// The admission drop (RF1 #992 rev F2): an unfinished admission still owes

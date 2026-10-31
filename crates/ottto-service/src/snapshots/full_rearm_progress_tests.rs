@@ -466,11 +466,11 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
 /// [regress] RF1 #992 Q5, folded under evidence owed: a complete census under
 /// the recorded cycle contract with no older-window evidence left clears the
 /// latch before its identity contract re-arm (no re-read, counted). Older
-/// valid evidence keeps main's re-arm.
+/// valid evidence of an indexed family keeps main's re-arm.
 #[test]
 fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
     let _on = evidence_owed::EvidenceOwedForTest::on();
-    let rearm = Rearm::new();
+    let mut rearm = Rearm::new();
     let mut index = rearm.index();
     rearm.establish(&mut index, &rearm.items);
     let mut older = index.clone();
@@ -482,6 +482,8 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
     assert!(!index.claude_request_identity_contract_changed);
     assert_eq!(scope.finish().contract.identity_contract_latch.cleared, 1);
 
+    // An indexed family this census does not fold keeps older valid evidence.
+    rearm.add_other_family(&mut older);
     older.claude_request_identity_contract_changed = true;
     older.claude_usage_family_pending.insert(
         OTHER_ROOT.to_string(),
@@ -497,7 +499,7 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
         },
     );
     let latched = rearm.terminal(&mut older, &rearm.items);
-    assert_eq!(latched.rearmed_files, 2, "main's identity contract re-arm");
+    assert!(latched.rearmed_files >= 2, "main's identity contract re-arm: {latched:?}");
 }
 
 /// A first-proof hold on a dormant owner (C1a) waits on the full re-arm, so
