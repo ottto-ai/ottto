@@ -1516,6 +1516,52 @@ fn durable_store_is_written_only_under_the_state_dir_lock() {
     }
 }
 
+/// E1 margin receipt for the scan workers' stack. The real prepare,
+/// rotation and finish cycle (a full scan, then a restart that restores the
+/// durable copy) completes in the optimized build on a thread with the
+/// 2 MiB spawn default, so the workers' larger explicit stack is headroom.
+/// An overflow aborts the test process. Release only: the debug build's
+/// frames are far larger. Run by the dispatch-only `scan-stack-margin` job
+/// in `.github/workflows/ci.yml`.
+#[cfg(unix)]
+#[test]
+#[ignore = "release-mode receipt; run by the ci.yml scan-stack-margin dispatch"]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn scan_worker_stack_margin_receipt() {
+    const STACK_BYTES: usize = 2 * 1024 * 1024;
+    if cfg!(debug_assertions) {
+        panic!("the margin receipt measures the release build: run with --release");
+    }
+    assert!(
+        crate::heap_layout_bound::layout_supported(),
+        "the durable restore needs a supported layout"
+    );
+    let (transcript, restored) = std::thread::Builder::new()
+        .name("ottto-snapshot-sync".to_string())
+        .stack_size(STACK_BYTES)
+        .spawn(|| {
+            let (mut pipeline, _, _, deadline) =
+                refused_then_conflicted_holding("stack-margin", true);
+            let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
+            assert!(pipeline.durable_records() > 0, "written after the save");
+            let due = deadline.as_u64().unwrap() + 60;
+            let (day2, _, bytes) = pipeline.measured_cycle(due, true);
+            assert!(day2.result.is_ok(), "{:?}", day2.result);
+            assert_eq!(day2.leased_offers, 1);
+            assert!(bytes < size, "restored, {bytes} >= {size}");
+            (size, bytes)
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    eprintln!(
+        "SCAN_STACK_MARGIN_RECEIPT stack_bytes={STACK_BYTES} profile=release cycles=3 \
+         restart_restored=true transcript_bytes={transcript} restored_cycle_bytes={restored}"
+    );
+}
+
 /// O1: quiet cycles before the reserved daily re-offer re-read
 /// nothing for an unchanged file whose only selection is its already
 /// refused exact body, across a restart that rebuilds the runtime view.
