@@ -430,7 +430,6 @@ pub(super) const FIELDS: &[&str] = &[
     "generation",
     "upload_context_fingerprint",
     "files",
-    "archives",
     "session_account_bindings",
     "terminal_jsonl_dispositions",
     "known_configured_scan_roots",
@@ -515,6 +514,7 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_money_birth_store",
     "claude_desktop_store_inventory", // Decoded and ignored; never serialized.
     "claude_copy_removals",
+    "archives",
 ];
 
 #[derive(Debug, thiserror::Error)]

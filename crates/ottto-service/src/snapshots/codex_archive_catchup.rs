@@ -24,14 +24,18 @@ impl ScanIndex {
     pub(super) fn disclose_archive_debt(&self) {
         for a in self.archives.values() {
             if let Some(cause) = a.owed_cause() {
-                archive_owed(cause, cause != CodexZstCause::CorrectionUnapplied);
+                archive_owed(cause, 1, cause != CodexZstCause::CorrectionUnapplied);
             }
         }
         for _ in self.decode_holds.archive_keys() {
-            archive_owed(CodexZstCause::OwnerUnproven, true);
+            archive_owed(CodexZstCause::OwnerUnproven, 1, true);
         }
         if self.archive_pass.deferred > 0 {
-            archive_owed(CodexZstCause::AdmissionRefused, true);
+            archive_owed(
+                CodexZstCause::AdmissionRefused,
+                self.archive_pass.deferred,
+                true,
+            );
         }
     }
     pub(super) fn hold_archive_corrections(&mut self) {
@@ -41,7 +45,7 @@ impl ScanIndex {
                 ArchiveDisposition::Acquired | ArchiveDisposition::Empty
             ) {
                 a.hold(CodexZstCause::CorrectionUnapplied);
-                archive_owed(CodexZstCause::CorrectionUnapplied, true);
+                archive_owed(CodexZstCause::CorrectionUnapplied, 1, true);
             }
         }
     }
@@ -69,21 +73,17 @@ impl ScanIndex {
             .iter()
             .find(|h| h.candidate.path == Path::new(key))
             .ok_or(CodexZstCause::OwnerUnproven)?;
-        if i.headers
+        if i.archive_headers
             .iter()
-            .chain(&i.archive_headers)
             .any(|other| other.owner == h.owner && other.candidate.path != h.candidate.path)
         {
-            return Err(
-                if i.archive_headers
-                    .iter()
-                    .any(|other| other.owner == h.owner && other.candidate.path != h.candidate.path)
-                {
-                    CodexZstCause::FamilyUnproven
-                } else {
-                    CodexZstCause::ArchiveEquivalenceUnproven
-                },
-            );
+            return Err(CodexZstCause::FamilyUnproven);
+        }
+        if i.headers
+            .iter()
+            .any(|other| codex_protected_owner(&other.owner) == h.owner)
+        {
+            return Err(CodexZstCause::ArchiveEquivalenceUnproven);
         }
         if self
             .archives
@@ -128,25 +128,11 @@ impl ScanIndex {
                 Err(cause) => self.archive_hold(&c.path, cause),
                 Ok(()) => {
                     let a = self.archives.get_mut(&key).unwrap();
-                    if matches!(
-                        a.disposition,
-                        ArchiveDisposition::Held {
-                            cause: CodexZstCause::ParentLedgerUnbound
-                        }
-                    ) && a.work.as_ref().is_some_and(|w| w.attempts > 0)
+                    // A structural failure after a spent Full has no new proof
+                    // on this stamp. Only pre-Full fence holds can release here.
+                    if matches!(a.disposition, ArchiveDisposition::Held { .. })
+                        && a.work.as_ref().is_some_and(|w| w.attempts > 0)
                     {
-                        continue;
-                    }
-                    // Same-stamp post-Full structural failures never re-decode.
-                    if matches!(
-                        a.disposition,
-                        ArchiveDisposition::Held {
-                            cause: CodexZstCause::OutputHeld
-                                | CodexZstCause::DecodeFailed
-                                | CodexZstCause::HeaderInvalid
-                                | CodexZstCause::CorrectionUnapplied
-                        }
-                    ) {
                         continue;
                     }
                     a.reserve();
@@ -175,7 +161,7 @@ impl ScanIndex {
         }
         if !budget.archive_ready(&self.archive_pass) {
             // No Full bytes spent: cancel the unconsumed reservation.
-            self.archives.get_mut(&key).unwrap().disposition = ArchiveDisposition::HeaderValidated;
+            self.archives.get_mut(&key).unwrap().cancel_reservation();
             return Admission::Held;
         }
         if let Err(cause) = inventory

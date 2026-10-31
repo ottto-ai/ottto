@@ -309,6 +309,7 @@ impl ArchivePass {
             0,
         );
         *power = gates.power_ready();
+        self.deferred = 0;
     }
 
     /// Archive work may start now: prepare-time and live power, the pass's
@@ -532,6 +533,12 @@ crate::heap_layout_bound::fields!(ContentStamp; dev, ino, extent, modified);
 impl ContentStamp {
     pub(in crate::snapshots) fn extent(&self) -> u64 {
         self.extent
+    }
+    pub(in crate::snapshots) fn matches_acquisition(
+        &self,
+        stamp: &crate::transcript_acquisition::FileStamp,
+    ) -> bool {
+        stamp.same_listing(self.dev, self.ino, self.extent, self.modified)
     }
     pub(in crate::snapshots) fn same_content(&self, other: &Self) -> bool {
         self == other

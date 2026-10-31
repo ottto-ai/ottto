@@ -88,12 +88,12 @@ pub(super) fn thread_cpu_micros() -> u64 {
 
 /// Archive debt uses the existing closed diagnostic carrier and generic alarm.
 /// Correction debt alarms only when the context owner creates that transition.
-pub(super) fn archive_owed(cause: CodexZstCause, alarm: bool) {
-    crate::local_resource_diagnostics::codex_zst_held(cause);
+pub(super) fn archive_owed(cause: CodexZstCause, count: usize, alarm: bool) {
+    crate::local_resource_diagnostics::codex_zst_held(cause, count);
     if alarm {
         crate::local_resource_diagnostics::durable_tail_alarm(
             "codex",
-            &serde_json::json!({"archive_owed":1}),
+            &serde_json::json!({"archive_owed":count}),
         );
     }
 }
@@ -188,6 +188,16 @@ impl ArchiveEvidence {
             attempts: work.attempts,
             retry_after: super::sampled_scan::now_seconds().saturating_add(21600),
         };
+    }
+    pub(super) fn cancel_reservation(&mut self) {
+        if let Some(w) = self.work.as_mut() {
+            if w.reserved {
+                w.attempts = w.attempts.saturating_sub(1);
+            }
+            w.reserved = false;
+            w.reservation_saved = false;
+        }
+        self.disposition = ArchiveDisposition::HeaderValidated;
     }
     pub(super) fn ready_full(&self) -> bool {
         self.work
@@ -574,6 +584,7 @@ impl std::error::Error for ArchiveAdmissionYield {}
 #[derive(Debug)]
 pub(super) enum HeaderRead {
     Validated(ValidatedHeader),
+    Settled(String),
     Deferred,
 }
 impl super::ScanIndex {
@@ -602,18 +613,12 @@ impl super::ScanIndex {
             return Ok(HeaderRead::Validated(h.clone()));
         }
         if a.work.is_none() {
-            if a.owed_cause().is_none() {
-                if let Some(owner) = self.files.get(&key).and_then(|e| {
-                    e.codex_counting_owner
-                        .as_deref()
-                        .or(e.codex_protected_owner.as_deref())
-                }) {
-                    return Ok(HeaderRead::Validated(ValidatedHeader {
-                        owner: owner.to_owned(),
-                        created_unix_ms: None,
-                        parent: None,
-                    }));
-                }
+            if let Some(owner) = self.files.get(&key).and_then(|e| {
+                e.codex_counting_owner
+                    .as_deref()
+                    .or(e.codex_protected_owner.as_deref())
+            }) {
+                return Ok(HeaderRead::Settled(owner.to_owned()));
             }
             return Ok(HeaderRead::Deferred);
         }
@@ -1694,6 +1699,9 @@ pub(in crate::snapshots) mod tests {
             let a = &staged.archives[&local_index_key(&f.0)];
             assert_eq!(matches!(a.disposition, ArchiveDisposition::Acquired), exact);
             assert_eq!(a.work.is_none(), exact);
+            assert!(staged.files[&local_index_key(&f.0)]
+                .codex_counting_owner
+                .is_some());
             let (_, quiet, logs) = run_archive(
                 &f,
                 saved(&staged),
@@ -1744,7 +1752,30 @@ pub(in crate::snapshots) mod tests {
         assert!(logs
             .iter()
             .any(|l| l["counts"]["codex_zst_decoded_bytes"].as_u64() == Some(bytes.len() as u64)));
+
+        // A cancelled reservation has spent no Full and must not buy a retry
+        // penalty or a retry counter. A structural post-Full failure is quiet.
+        for spent in [false, true] {
+            let mut held = saved(&index);
+            let a = held.archives.get_mut(&local_index_key(&f.0)).unwrap();
+            a.reserve();
+            a.work.as_mut().unwrap().reserved = true;
+            if spent {
+                a.hold(CodexZstCause::OwnerUnproven);
+            } else {
+                a.cancel_reservation();
+                assert_eq!(a.work.as_ref().unwrap().attempts, 0);
+            }
+            let (_, next, logs) = run_archive(
+                &f,
+                saved(&held),
+                Arc::new(sampled_scan::SharedCache::default()),
+            );
+            assert_eq!(full_decodes(&logs), usize::from(!spent));
+            assert_eq!(next.snapshots.is_empty(), spent);
+        }
     }
+
     /// [format] Unknown side-map records remain opaque owed custody. Retired
     /// domination labels decode conservatively; no unknown state grants ACK.
     #[test]
@@ -1801,27 +1832,37 @@ pub(in crate::snapshots) mod tests {
             })
             .collect();
         index.settle_archive_outcome(|fp| bodies.get(fp).map(String::as_str));
-        index.activate_upload_context("first".into());
-        let (_, logs) = crate::local_resource_diagnostics::capture(|| {
-            index.activate_upload_context("changed".into());
-            index.activate_upload_context("changed".into());
-        });
-        assert_eq!(index.archive_owed_count(), 1);
-        assert_eq!(
-            logs.iter()
-                .filter(|l| l["stage"] == "durable_tail_alarm")
-                .count(),
-            1
-        );
-        let (_, scan, logs) = run_archive(
-            &f,
-            saved(&index),
-            Arc::new(sampled_scan::SharedCache::default()),
-        );
-        assert!(!scan.census_complete);
-        assert_eq!(full_decodes(&logs), 0);
-        assert!(!logs.iter().any(|l| l["stage"] == "durable_tail_alarm"));
+        for replay in [false, true] {
+            let mut changed = saved(&index);
+            changed.activate_upload_context("first".into());
+            let (_, logs) = crate::local_resource_diagnostics::capture(|| {
+                for _ in 0..2 {
+                    if replay {
+                        changed.prepare_historical_replay("changed".into());
+                    } else {
+                        changed.activate_upload_context("changed".into());
+                    }
+                }
+            });
+            assert_eq!(changed.archive_owed_count(), 1);
+            assert!(changed.files.contains_key(&local_index_key(&f.0)));
+            assert_eq!(
+                logs.iter()
+                    .filter(|l| l["stage"] == "durable_tail_alarm")
+                    .count(),
+                1
+            );
+            let (_, scan, logs) = run_archive(
+                &f,
+                saved(&changed),
+                Arc::new(sampled_scan::SharedCache::default()),
+            );
+            assert!(!scan.census_complete);
+            assert_eq!(full_decodes(&logs), 0);
+            assert!(!logs.iter().any(|l| l["stage"] == "durable_tail_alarm"));
+        }
     }
+
     fn downgrade_member(root: &Path, owner: &str, compressed: bool) -> PathBuf {
         let dir = root.join("sessions");
         fs::create_dir_all(&dir).unwrap();

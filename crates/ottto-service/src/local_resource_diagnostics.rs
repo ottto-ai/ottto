@@ -307,11 +307,11 @@ pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
     }
 }
 
-pub(crate) fn codex_zst_held(cause: CodexZstCause) {
+pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
     traversal_point(
         "codex_zst_held",
         "codex",
-        &BTreeMap::from([("codex_zst_held", BTreeMap::from([(cause, 1_u64)]))]),
+        &BTreeMap::from([("codex_zst_held", BTreeMap::from([(cause, count)]))]),
     );
 }
 

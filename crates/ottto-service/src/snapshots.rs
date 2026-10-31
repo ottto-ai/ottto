@@ -3470,8 +3470,6 @@ pub struct ScanIndex {
     /// RAM-only pacing spans ordinary + continuation pages, never durable authority.
     #[serde(skip)]
     pub(crate) archive_pass: sampled_scan::ArchivePass,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) archives: BTreeMap<String, codex_compressed_input::ArchiveEvidence>,
     #[serde(skip)]
     withheld_memo: withheld_account::Memo,
     #[serde(default = "scan_index_schema_version")]
@@ -4063,6 +4061,9 @@ pub struct ScanIndex {
         deserialize_with = "claude_request_money::copy_removals::CopyRemovals::deserialize_lenient"
     )]
     pub(crate) claude_copy_removals: claude_request_money::copy_removals::CopyRemovals,
+    // Append persisted fields so every older positional slot stays stable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) archives: BTreeMap<String, codex_compressed_input::ArchiveEvidence>,
     /// Runtime capability only: never persisted, absent hint defaults OFF.
     #[serde(skip)]
     pub(crate) copy_unproven_enabled: bool,
@@ -31255,16 +31256,28 @@ impl OwnedSourceScan {
                         });
                     }
                 }
-                let counting_owner = parsed.first().and_then(|item| {
-                    if source != SnapshotSource::Codex {
-                        return None;
-                    }
-                    let owner = codex_join_inventory
-                        .as_ref()?
-                        .owner_for_path(&candidate.path)?;
-                    let binding = codex_protected_owner(owner);
-                    (binding == codex_protected_owner(&item.source_session_id)).then_some(binding)
-                });
+                let counting_owner = if codex_archive_path(&candidate.path) {
+                    codex_join_inventory
+                        .as_ref()
+                        .and_then(|i| {
+                            i.archive_headers
+                                .iter()
+                                .find(|h| h.candidate.path == candidate.path)
+                        })
+                        .map(|h| h.owner.clone())
+                } else {
+                    parsed.first().and_then(|item| {
+                        if source != SnapshotSource::Codex {
+                            return None;
+                        }
+                        let owner = codex_join_inventory
+                            .as_ref()?
+                            .owner_for_path(&candidate.path)?;
+                        let binding = codex_protected_owner(owner);
+                        (binding == codex_protected_owner(&item.source_session_id))
+                            .then_some(binding)
+                    })
+                };
                 let joined_marker =
                     (!aliases.is_empty()).then(|| codex_file_join::member_set_witness(&aliases));
                 let protected_owner = (!aliases.is_empty()
@@ -32574,7 +32587,8 @@ impl OwnedSourceScan {
             }
             // Reject budget debt before opening/constructing any body parser.
             // Requeue the original census membership; absence/completion stays owed.
-            if index.context_only_read(&candidate, audit_now)
+            if !codex_archive_path(&candidate.path)
+                && index.context_only_read(&candidate, audit_now)
                 && !context_read_budget.admit(source, index, &candidate, &snapshots)
             {
                 context_read_budget.defer(candidate);
@@ -33500,7 +33514,7 @@ impl OwnedSourceScan {
                     }
                     pending!();
                 }
-                Err(_) => {
+                Err(error) => {
                     if source == SnapshotSource::ClaudeCode {
                         claude_request_census::invalidate_claude_request_census(
                             index,
@@ -33508,8 +33522,17 @@ impl OwnedSourceScan {
                         );
                     }
                     if codex_archive_path(&candidate.path) {
-                        if let Some(a) = index.archives.get_mut(&local_index_key(&candidate.path)) {
-                            a.disposition = ArchiveDisposition::HeaderValidated;
+                        if error
+                            .downcast_ref::<codex_compressed_input::ArchiveAdmissionYield>()
+                            .is_some()
+                        {
+                            if let Some(a) =
+                                index.archives.get_mut(&local_index_key(&candidate.path))
+                            {
+                                a.cancel_reservation();
+                            }
+                        } else {
+                            index.archive_hold(&candidate.path, CodexZstCause::DecodeFailed);
                         }
                         pending!();
                     }
@@ -44997,6 +45020,13 @@ impl<'a> DiscoveryRetention<'a> {
         current_len: u64,
         stamp: Option<codex_fragment::Stamp>,
     ) -> bool {
+        if codex_archive_path(path) {
+            if let Some(a) = self.archives.get(&local_index_key(path)) {
+                if stamp.map_or(true, |s| !s.matches_acquisition(&a.stamp)) {
+                    return true;
+                }
+            }
+        }
         let grown = self
             .files
             .get(&local_index_key(path))
@@ -48736,8 +48766,9 @@ impl ScanIndex {
         // Replay resets delivery authority, not file-owned recovery evidence.
         // Otherwise a missing member or expired trace can silently shrink or
         // reprice a previously joined contribution during ordinary replay.
-        self.files
-            .retain(|_, entry| entry.retain_history_evidence());
+        self.files.retain(|key, entry| {
+            self.archives.contains_key(key) || entry.retain_history_evidence()
+        });
         // Retired entries' ACK evidence resets with the entries it outlived.
         self.codex_counting_tombstones.clear();
         self.codex_counting_evicted_legacy = Default::default();
@@ -53303,13 +53334,6 @@ fn codex_session_id_candidates_from_path(path: &Path) -> Vec<String> {
 /// unique. Timestamp-shaped names require state/header evidence and are never
 /// shortened by this evidence-free helper.
 fn codex_session_id_from_path(path: &Path) -> Option<String> {
-    let logical;
-    let path = if codex_archive_path(path) {
-        logical = path.with_extension("");
-        logical.as_path()
-    } else {
-        path
-    };
     let candidates = codex_session_id_candidates_from_path(path);
     (candidates.len() == 1).then(|| candidates[0].clone())
 }

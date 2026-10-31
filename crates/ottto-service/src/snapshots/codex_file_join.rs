@@ -438,15 +438,11 @@ impl HeaderInventory {
     pub(super) fn content_unchanged(&self) -> bool {
         self.complete
             && self.pending.is_empty()
-            && self
-                .headers
-                .iter()
-                .chain(&self.archive_headers)
-                .all(|header| {
-                    fs::symlink_metadata(&header.candidate.path)
-                        .and_then(crate::transcript_acquisition::FileStamp::capture)
-                        .is_ok_and(|stamp| header.stamp.same_content(&stamp))
-                })
+            && self.headers.iter().all(|header| {
+                fs::symlink_metadata(&header.candidate.path)
+                    .and_then(crate::transcript_acquisition::FileStamp::capture)
+                    .is_ok_and(|stamp| header.stamp.same_content(&stamp))
+            })
     }
     pub(super) fn archives_unchanged(&self) -> bool {
         self.archive_headers.iter().all(|h| {
@@ -519,7 +515,15 @@ impl HeaderInventory {
         if self.archive_headers.len() >= MAX_HEADER_FILES {
             // Separate bounded archive share: ordinary joins remain complete.
             self.archive_complete = false;
-            index.archive_pass.deferred = self.archive_pending.len();
+            index.archive_pass.deferred = self
+                .archive_pending
+                .iter()
+                .filter(|p| {
+                    let key = local_index_key(p);
+                    !index.archives.contains_key(&key)
+                        && !index.decode_holds.contains("archives", &key)
+                })
+                .count();
             self.archive_pending.clear();
             return true;
         }
@@ -557,17 +561,22 @@ impl HeaderInventory {
                 &ClaudeTitleMetadata::default(),
                 None,
             );
-            match index.inventory_archive_header(&candidate, cache)? {
-                codex_compressed_input::HeaderRead::Validated(h) => Ok(Some(HeaderWitness {
-                    home: member_home(root),
-                    candidate,
-                    owner: h.owner,
-                    created_unix_ms: h.created_unix_ms,
-                    metadata: metadata_witness(&stat),
-                    stamp: FileStamp::capture(stat)?,
-                })),
-                codex_compressed_input::HeaderRead::Deferred => Ok(None),
-            }
+            let (owner, created_unix_ms) =
+                match index.inventory_archive_header(&candidate, cache)? {
+                    codex_compressed_input::HeaderRead::Validated(h) => {
+                        (codex_protected_owner(&h.owner), h.created_unix_ms)
+                    }
+                    codex_compressed_input::HeaderRead::Settled(owner) => (owner, None),
+                    codex_compressed_input::HeaderRead::Deferred => return Ok(None),
+                };
+            Ok(Some(HeaderWitness {
+                home: member_home(root),
+                candidate,
+                owner,
+                created_unix_ms,
+                metadata: metadata_witness(&stat),
+                stamp: FileStamp::capture(stat)?,
+            }))
         })();
         if index.archive_pass.dirty {
             return false;
