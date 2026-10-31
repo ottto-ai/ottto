@@ -2629,6 +2629,23 @@ impl DurableTailStore {
         !self.off_v1_sync_due && matches!(stamp_at(&self.record_path(key)), Ok(None))
     }
 
+    /// Destination changes cannot drop an unlink that still owes its barrier.
+    pub(crate) fn retry_off_v1_unlink(&mut self, writer: Option<&dyn SingleWriter>) -> io::Result<()> {
+        if !self.off_v1_sync_due { return Ok(()); }
+        let result = (|| {
+            self.check_writer(writer.ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?)?;
+            self.sync_off_v1_unlink()
+        })();
+        if result.is_err() { self.counters.off_v1_invalidate_failed += 1; }
+        result
+    }
+
+    pub(crate) fn inherit_off_v1_counts(&mut self, previous: &Self) {
+        debug_assert!(!previous.off_v1_sync_due);
+        self.counters.off_v1_invalidated += previous.counters.off_v1_invalidated;
+        self.counters.off_v1_invalidate_failed += previous.counters.off_v1_invalidate_failed;
+    }
+
     fn sync_off_v1_unlink(&mut self) -> io::Result<()> {
         if self.off_v1_sync_due {
             if self.read_only_directory()? {
