@@ -19085,7 +19085,6 @@ impl SnapshotAccumulator {
     fn buffer_codex_boundary_record(&mut self, value: &Value) {
         const MAX_BOUNDARY_BUFFER_RECORDS: usize = 64;
         if self.codex_boundary_buffer_len() == MAX_BOUNDARY_BUFFER_RECORDS {
-            // Proof-only child parsing stays outside these ordinary-ingestion events.
             if !self.codex_proof_decision_only {
                 CapCounts::record(self.source.api_slug(), 0, 1);
             }
@@ -32212,8 +32211,7 @@ impl OwnedSourceScan {
                 if source == SnapshotSource::Codex {
                     let cutoff = codex_turn_traces
                         .as_ref()
-                        .map_or(0, |traces| traces.since_epoch)
-                        as u64;
+                        .map_or(0, |traces| traces.since_epoch as u64);
                     local_diagnostics.price_tier_old_files_without_receipt = index
                         .file_snapshot_fingerprints
                         .iter()
@@ -41141,7 +41139,6 @@ fn load_codex_logs2_priority_turns(
             priority_turns.insert(turn_id);
         }
     }
-    // Saturation is potential omission, not an exact excluded-trace count.
     if read == CODEX_LOGS2_MAX_ROWS as u64 {
         CapCounts::record("codex", 3, 1);
     }

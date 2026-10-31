@@ -282,7 +282,7 @@ struct ClaudeRecordCaps {
     #[serde(skip_serializing_if = "is_zero")]
     claude_money_record_cap_hits: u64,
 }
-fn is_zero(value: &u64) -> bool {
+pub(crate) fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 #[cfg(not(test))]
@@ -332,7 +332,6 @@ pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64) {
     )
 }
 
-/// Sparse local traversal totals; additive named fields, never wire or decision inputs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct CapCounts {
@@ -353,7 +352,6 @@ impl CapCounts {
     pub(crate) fn is_empty(&self) -> bool {
         *self == Self::default()
     }
-    /// Existing process/source event slots, folded into this traversal's local totals.
     pub(crate) fn drain(&mut self, source: &str) -> Self {
         for (event, total) in [
             &mut self.boundary_overflow_events,
@@ -405,7 +403,6 @@ pub(crate) enum UnselectedReason {
     /// F4 kept custody because another same-member path prevents absence proof.
     WithheldAbsenceAmbiguous = 18,
 }
-// Existing discovery/withheld slots 0..19, then six fixed cap-event slots.
 const CAP_EVENT_START: usize = 19;
 const UNSELECTED_REASONS: usize = CAP_EVENT_START + 6;
 /// Claude, Codex, Pi x reason, drained by that source's page line.

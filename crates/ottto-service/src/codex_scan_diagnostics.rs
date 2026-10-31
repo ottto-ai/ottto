@@ -355,10 +355,6 @@ impl ParentUnresolvableCauses {
 }
 crate::heap_layout_bound::fields!(ParentUnresolvableCauses; counts);
 
-fn is_zero(value: &u64) -> bool {
-    *value == 0
-}
-
 #[derive(Default, Serialize)]
 struct CensusLossCounts {
     discovered: u64,
@@ -928,7 +924,7 @@ impl RecoveryLineage {
 pub(crate) struct CodexScanDiagnostics {
     /// Current indexed files with known activity entirely before the trace window
     /// and no applied-tier receipt. Exposure only, never a mispricing count.
-    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(skip_serializing_if = "crate::local_resource_diagnostics::is_zero")]
     pub price_tier_old_files_without_receipt: u64,
     pub version: u8,
     pub generation: u64,
