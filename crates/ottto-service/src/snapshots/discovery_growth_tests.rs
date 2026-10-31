@@ -735,10 +735,10 @@ fn retained_codex_stat_growth_tails_once_with_full_money() {
     assert_eq!(reads.0.lock().unwrap().0, vec![DeliveryMode::Tail]);
     assert_eq!(scan.snapshots.len(), 1);
     let item = &scan.snapshots[0];
-    assert_eq!(item.input_tokens, Some(20));
-    assert_eq!(item.cache_read_tokens, Some(4));
-    assert_eq!(item.output_tokens, Some(6));
-    assert_eq!(item.request_count, Some(2));
+    assert_eq!(item.input_tokens, 20);
+    assert_eq!(item.cache_read_tokens, 4);
+    assert_eq!(item.output_tokens, 6);
+    assert_eq!(item.request_count, 2);
     f.cache.clear();
     let (cold_index, cold, _, _) = f.page_at(
         SnapshotSource::Codex,
