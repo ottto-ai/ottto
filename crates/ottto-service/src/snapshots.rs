@@ -5056,6 +5056,17 @@ struct ClaudeUsageFamilyPending {
         deserialize_with = "deserialize_lenient_default"
     )]
     identity_contract: Option<evidence_owed::EvidenceContract>,
+    /// Evidence owed ON: the identity-contract latch cleared while this family
+    /// was held in authority quarantine, which keeps its older-contract pending
+    /// on purpose. It may re-stamp only through its own contract stamp, never
+    /// through the cleared latch; cleared when its pending is rebuilt. Bounded
+    /// by the quarantined family count.
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not",
+        deserialize_with = "deserialize_lenient_default"
+    )]
+    contract_unproven: bool,
 }
 
 fn claude_idless_revision(fingerprint: &str) -> [u8; 32] {
@@ -10399,16 +10410,25 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         // a placeholder, so a recorded current contract means this window's
         // evidence was parsed under it. With no older evidence left there is
         // nothing to mix; the latch clears before its full re-arm. Counted.
-        if evidence_owed::enabled()
+        if let Some(exempt) = (evidence_owed::enabled()
             && index.claude_request_identity_contract_changed
-            && index.claude_request_identity_contract.as_deref() == Some(contract)
-            && evidence_owed::evidence_from_window(
-                index,
-                census_window_end,
-                &indexed_claude_family_ids,
-            )
+            && index.claude_request_identity_contract.as_deref() == Some(contract))
+        .then(|| {
+            evidence_owed::latch_clearable(index, census_window_end, &indexed_claude_family_ids)
+        })
+        .flatten()
         {
-            claude_contract::note(|counts| counts.identity_contract_latch.cleared += 1);
+            claude_contract::note(|counts| {
+                let latch = &mut counts.identity_contract_latch;
+                latch.cleared += 1;
+                latch.cleared_with_quarantine_exempt += u64::from(!exempt.is_empty());
+                latch.quarantine_exempt_families += exempt.len() as u64;
+            });
+            for root in &exempt {
+                if let Some(pending) = index.claude_usage_family_pending.get_mut(root) {
+                    pending.contract_unproven = true;
+                }
+            }
             index.claude_request_identity_contract_changed = false;
         }
         let latch_rearms = index.claude_request_identity_contract_changed
@@ -11014,6 +11034,7 @@ fn accumulate_claude_usage_family_pending_with_credit(
                     invalid: false,
                     idless_revision: None,
                     identity_contract: None,
+                    contract_unproven: false,
                 }
             });
             if pending.census_window_end != census_window_end {
@@ -11026,6 +11047,7 @@ fn accumulate_claude_usage_family_pending_with_credit(
                     invalid: false,
                     idless_revision: None,
                     identity_contract: None,
+                    contract_unproven: false,
                 };
             }
             let idless_revision = (item.source_session_id == claude_snapshot_family_root_ref(item)
@@ -47444,6 +47466,7 @@ impl ScanIndex {
                 invalid: false,
                 idless_revision: None,
                 identity_contract: None,
+                contract_unproven: false,
             },
         );
     }
@@ -56477,6 +56500,7 @@ mod tests {
                 invalid: false,
                 idless_revision: None,
                 identity_contract: None,
+                contract_unproven: false,
             },
         );
 
@@ -64139,6 +64163,7 @@ mod tests {
             invalid: false,
             idless_revision: None,
             identity_contract: None,
+            contract_unproven: false,
         };
         let mut retained = 1;
         invalidate_claude_usage_family_pending(&mut pending, &mut retained);
@@ -65083,6 +65108,7 @@ mod tests {
                 invalid: false,
                 idless_revision: None,
                 identity_contract: None,
+                contract_unproven: false,
             },
         );
         let (_, stale_after, counts) = claude_census_counts_run_twice(
@@ -65151,6 +65177,7 @@ mod tests {
                 invalid: false,
                 idless_revision: None,
                 identity_contract: None,
+                contract_unproven: false,
             },
         );
         stale_member_index.files.insert(
@@ -65649,6 +65676,7 @@ mod tests {
                 invalid: false,
                 idless_revision: None,
                 identity_contract: None,
+                contract_unproven: false,
             }
         };
         let complete_families = [ancestor, middle, leaf, zero_owned]
@@ -84131,7 +84159,7 @@ crate::heap_layout_bound::fields!(ClaudeEmptyMapAdvance; root, member, key, revi
 crate::heap_layout_bound::fields!(ClaudeAuthorityProofCorrection; proof_witness_fingerprint, owed_member_ids);
 crate::heap_layout_bound::fields!(ClaudeProofCorrectionCandidate; index_key, root, member, proof, revision, fingerprint, body_witness);
 crate::heap_layout_bound::fields!(ClaudeCutoffCorrectionCandidate; index_key, root, member, proof, revision);
-crate::heap_layout_bound::fields!(ClaudeUsageFamilyPending; census_window_end, member_request_id_hashes, member_occurrences, invalid, idless_revision, identity_contract);
+crate::heap_layout_bound::fields!(ClaudeUsageFamilyPending; census_window_end, member_request_id_hashes, member_occurrences, invalid, idless_revision, identity_contract, contract_unproven);
 crate::heap_layout_bound::fields!(ClaudeUsageFamilyWitness; evidence_fingerprint, member_request_id_fingerprints, member_occurrence_fingerprints, assigned_request_id_fingerprints, legacy_excluded_request_id_hashes, legacy_exclusion_evidence_fingerprint, legacy_owner_roots);
 crate::heap_layout_bound::fields!(CodexParentOwnershipLedger; signatures, scan_complete, opened_object_identity, opened_changed_nanos, opened_modified_nanos, opened_birth_nanos, unresolvable);
 crate::heap_layout_bound::fields!(CodexPathSidecarCandidate; identity, recorded_evidence, created_thread, identity_conflict, detail_incomplete, rollout_file_matches, parent, child_created_at_nanos, projected_next_ordinal);

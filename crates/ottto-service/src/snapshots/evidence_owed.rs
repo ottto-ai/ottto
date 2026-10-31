@@ -295,7 +295,13 @@ fn stamp_families<T>(
         .collect::<BTreeMap<_, _>>();
     let result = accumulate(index);
     for (root, before) in prior {
-        if let Some(pending) = index.claude_usage_family_pending.get_mut(&root) {
+        // A pending this accumulation left in another window was not rebuilt:
+        // its stamp is not touched.
+        if let Some(pending) = index
+            .claude_usage_family_pending
+            .get_mut(&root)
+            .filter(|pending| pending.census_window_end == census_window_end)
+        {
             pending.identity_contract = match before {
                 _ if pending.invalid || evidence_free(pending) => None,
                 None => current,
@@ -462,6 +468,7 @@ pub(super) fn resolve(
                 let owed = &mut c.evidence_owed;
                 *match refusal {
                     Refusal::ContractLatch => &mut owed.refused_contract_latch,
+                    Refusal::ContractUnproven => &mut owed.refused_contract_unproven,
                     Refusal::ScanIdentity => &mut owed.refused_scan_identity,
                     Refusal::PendingInvalid => &mut owed.refused_pending_invalid,
                     Refusal::Evidence => &mut owed.refused_evidence,
@@ -562,6 +569,7 @@ enum Restamp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Refusal {
     ContractLatch,
+    ContractUnproven,
     ScanIdentity,
     PendingInvalid,
     Evidence,
@@ -593,15 +601,19 @@ fn restamp(
     ) else {
         return Err(Refusal::NoPending);
     };
-    // Condition 2: no latch (contract unchanged since storage), or Q5b: this
-    // pending's stamp is the recorded, real contract this cycle runs under.
+    // The contract is unchanged since storage (no latch), or this pending's
+    // stamp is the recorded, real contract this cycle runs under. A family
+    // exempted from the latch clear while quarantined proves its contract
+    // only through that stamp.
     let latched = index.claude_request_identity_contract_changed;
-    if latched
-        && !pending
-            .identity_contract
-            .is_some_and(|stamp| Some(stamp) == EvidenceContract::current(index))
-    {
+    let stamped = pending
+        .identity_contract
+        .is_some_and(|stamp| Some(stamp) == EvidenceContract::current(index));
+    if latched && !stamped {
         return Err(Refusal::ContractLatch);
+    }
+    if pending.contract_unproven && !stamped {
+        return Err(Refusal::ContractUnproven);
     }
     if entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION) {
         return Err(Refusal::ScanIdentity);
@@ -672,31 +684,43 @@ fn record_hashes(hashes: &BTreeSet<String>) -> Option<Vec<u64>> {
     Some(prefixes)
 }
 
-/// Q5 (RF1 #992): every stored evidence set is from this census window, or
-/// there is none to mix with the recorded contract. Pending this completion
-/// retires (no indexed member, no quarantine: `owed_at_completion`) is none.
-pub(super) fn evidence_from_window(
+/// The identity-contract latch may clear at a complete census when no
+/// older-contract evidence can mix into proof: every valid pending with
+/// evidence is from this window, or belongs to a family this completion
+/// retires (unindexed), or is held in authority quarantine. Quarantine keeps
+/// that pending on purpose and it proves nothing while held, so it does not
+/// block the clear; those families are returned to be marked
+/// `contract_unproven`. A family with owed members counts as this window's
+/// only when its stamp shows the recorded contract (a re-stamp under the
+/// latch); otherwise it blocks. `None`: the latch stays.
+pub(super) fn latch_clearable(
     index: &ScanIndex,
     census_window_end: &str,
     indexed_claude_family_ids: &BTreeSet<String>,
-) -> bool {
-    index
-        .claude_usage_family_pending
-        .iter()
-        .all(|(root_session_id, pending)| {
-            pending.invalid
-                || evidence_free(pending)
-                || pending.census_window_end == census_window_end
-                || !(index
-                    .claude_usage_authority_quarantine
-                    .contains_key(root_session_id)
-                    || owed_at_completion(
-                        root_session_id,
-                        pending,
-                        false,
-                        indexed_claude_family_ids,
-                    ))
-        })
+) -> Option<BTreeSet<String>> {
+    let owed = owed_roots(index);
+    let current = EvidenceContract::current(index);
+    let mut exempt = BTreeSet::new();
+    for (root, pending) in &index.claude_usage_family_pending {
+        if pending.invalid || evidence_free(pending) {
+            continue;
+        }
+        if pending.census_window_end == census_window_end
+            && (!owed.contains(root) || (current.is_some() && pending.identity_contract == current))
+        {
+            continue;
+        }
+        if index.claude_usage_authority_quarantine.contains_key(root) {
+            exempt.insert(root.clone());
+            continue;
+        }
+        if owed.contains(root)
+            || owed_at_completion(root, pending, false, indexed_claude_family_ids)
+        {
+            return None;
+        }
+    }
+    Some(exempt)
 }
 
 /// The admission drop (RF1 #992 rev F2): an unfinished admission still owes
@@ -853,6 +877,7 @@ mod tests {
             invalid: false,
             idless_revision: None,
             identity_contract: None,
+            contract_unproven: false,
         }
     }
 
@@ -916,11 +941,13 @@ mod tests {
         assert_eq!(stamp(&index), None, "invalid evidence is never stamped");
     }
 
-    /// [format] Q5b S4: an old decoder (no field) rewrites a stamped pending
-    /// without the stamp, which then decodes `None`; a damaged stamp decodes
-    /// `None` without failing the pending.
+    /// [format] An old decoder (no fields) rewrites a stamped, contract-unproven
+    /// pending without either: the stamp decodes `None` and the family looks
+    /// un-exempt. That is safe only because old code has no evidence-owed
+    /// re-stamp to misuse it. A damaged stamp decodes `None` without failing
+    /// the pending.
     #[test]
-    fn q5b_stamp_round_trips_through_an_old_decoder_as_none() {
+    fn contract_stamp_and_unproven_bit_drop_through_an_old_decoder_without_restamp() {
         #[derive(Serialize, Deserialize)]
         struct OldPending {
             census_window_end: String,
@@ -939,14 +966,17 @@ mod tests {
         };
         let mut stamped = pending("W");
         stamped.identity_contract = EvidenceContract::current(&index);
+        stamped.contract_unproven = true;
         let written = serde_json::to_value(&stamped).unwrap();
         assert!(written.get("identity_contract").is_some());
+        assert_eq!(written["contract_unproven"], true);
         let round: ClaudeUsageFamilyPending = serde_json::from_value(written.clone()).unwrap();
         assert_eq!(round, stamped);
         let old: OldPending = serde_json::from_value(written.clone()).unwrap();
         let rewritten: ClaudeUsageFamilyPending =
             serde_json::from_value(serde_json::to_value(&old).unwrap()).unwrap();
         assert_eq!(rewritten.identity_contract, None);
+        assert!(!rewritten.contract_unproven);
         let mut damaged = written;
         damaged["identity_contract"] = serde_json::json!("garbage");
         let damaged: ClaudeUsageFamilyPending = serde_json::from_value(damaged).unwrap();

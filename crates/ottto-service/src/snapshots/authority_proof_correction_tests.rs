@@ -108,6 +108,7 @@ fn apc_terminal_fixture() -> ScanIndex {
             invalid: false,
             idless_revision: None,
             identity_contract: None,
+            contract_unproven: false,
         },
     );
     index

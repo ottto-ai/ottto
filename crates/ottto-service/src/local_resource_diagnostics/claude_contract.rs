@@ -22,7 +22,12 @@ counters!(Transition {
     collector_e2_grouping,
     mid_traversal_placeholder
 });
-counters!(Latch { set, cleared });
+counters!(Latch {
+    set,
+    cleared,
+    cleared_with_quarantine_exempt,
+    quarantine_exempt_families
+});
 // Lead A ruling (a): the one cutover terminal (`runs`) and the files and bytes it re-armed.
 counters!(CutoverRearm { runs, files, bytes });
 counters!(ContextChange {
@@ -47,6 +52,7 @@ counters!(EvidenceOwed {
     owed_waiting_cap,
     changed,
     refused_contract_latch,
+    refused_contract_unproven,
     refused_scan_identity,
     refused_pending_invalid,
     refused_evidence,

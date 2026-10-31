@@ -463,10 +463,12 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
     assert_eq!(scope.finish().contract.identity_contract_latch.cleared, 1);
 }
 
-/// [regress] RF1 #992 Q5, folded under evidence owed: a complete census under
-/// the recorded cycle contract with no older-window evidence left clears the
-/// latch before its identity contract re-arm (no re-read, counted). Older
-/// valid evidence of an indexed family keeps main's re-arm.
+/// [regress] A complete census under the recorded cycle contract with no
+/// older-window evidence left clears the identity-contract latch before its
+/// contract re-arm (no re-read, counted). Older valid evidence of an indexed
+/// family still keeps the latch and main's re-arm. Older evidence of a family
+/// held in authority quarantine no longer blocks the clear: it is kept, not
+/// invalidated, and its family is marked `contract_unproven` (counted).
 #[test]
 fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
     let _on = evidence_owed::EvidenceOwedForTest::on();
@@ -497,10 +499,30 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
             invalid: false,
             idless_revision: None,
             identity_contract: None,
+            contract_unproven: false,
         },
     );
+    let mut quarantined = older.clone();
     let latched = rearm.terminal(&mut older, &rearm.items);
     assert!(latched.rearmed_files >= 2, "main's identity contract re-arm: {latched:?}");
+    assert!(older.claude_request_identity_contract_changed);
+
+    quarantined.insert_unproven_terminal_claude_authority_for_test(OTHER_ROOT, "rev-other");
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    rearm.terminal(&mut quarantined, &rearm.items);
+    let latch = scope.finish().contract.identity_contract_latch;
+    assert!(!quarantined.claude_request_identity_contract_changed);
+    assert_eq!(
+        (
+            latch.cleared,
+            latch.cleared_with_quarantine_exempt,
+            latch.quarantine_exempt_families
+        ),
+        (1, 1, 1)
+    );
+    let pending = &quarantined.claude_usage_family_pending[OTHER_ROOT];
+    assert!(pending.contract_unproven && !pending.invalid);
+    assert_eq!(pending.census_window_end, "2026-08-01T07:10:00Z");
 }
 
 /// [regress] RF1 round 3 (C5 P6, the #893 fold: the first complete census

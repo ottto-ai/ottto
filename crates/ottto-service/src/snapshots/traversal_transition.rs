@@ -81,6 +81,11 @@ pub(super) struct Starting {
     /// clearing (1). Omitted while zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) context_change_owed: usize,
+    /// Evidence owed ON: families exempted from an identity-contract latch
+    /// clear while quarantined, still waiting to prove their contract.
+    /// Omitted while zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) contract_unproven_families: usize,
     disappearance_process_totals_v1: disappearance_diagnostics::Totals,
 }
 
@@ -153,6 +158,11 @@ impl Starting {
             admissions_dropped: 0,
             due_retained: 0,
             context_change_owed: 0,
+            contract_unproven_families: index
+                .claude_usage_family_pending
+                .values()
+                .filter(|pending| pending.contract_unproven)
+                .count(),
         }
     }
 
@@ -434,6 +444,7 @@ mod tests {
                 invalid: false,
                 idless_revision: None,
                 identity_contract: None,
+                contract_unproven: false,
             },
         );
         index.bounded_sweep_had_unsettled_upload = true;
@@ -810,6 +821,7 @@ mod tests {
                     invalid: false,
                     idless_revision: None,
                     identity_contract: None,
+                    contract_unproven: false,
                 },
             );
             plain.bounded_sweep_had_unsettled_upload = flag;

@@ -70,6 +70,7 @@ fn carry_family(index: &mut ScanIndex, root: &str, subagents: &[Option<&str>], w
         invalid: false,
         idless_revision: None,
         identity_contract: None,
+        contract_unproven: false,
     };
     let mut witness = ClaudeUsageFamilyWitness {
         evidence_fingerprint: "e".repeat(64),
@@ -4812,6 +4813,24 @@ fn owed_evidence_q5b_stamp_restamps_under_the_latch_and_keeps_the_vetoes() {
             "{name}"
         );
     }
+
+    // After an exempt latch clear and the quarantine lifting, the family
+    // proves its contract only through its own stamp: without it every owed
+    // member takes the Full path, never a re-stamp through the cleared latch.
+    for (stamped, parsed, restamped, refused) in [(false, 2, 0, 2), (true, 0, 2, 0)] {
+        let mut index = fixture.index.clone();
+        index.claude_request_identity_contract_changed = false;
+        stamp(&mut index, stamped.then_some(current).flatten());
+        for pending in index.claude_usage_family_pending.values_mut() {
+            pending.contract_unproven = true;
+        }
+        let (got, counts) = visit(&mut index);
+        assert_eq!(
+            (got, counts.restamped, counts.refused_contract_unproven),
+            (parsed, restamped, refused),
+            "stamped={stamped}"
+        );
+    }
 }
 
 /// [regress] RF1 round 3 (C5 P4): owed Fulls share ONE per-page allowance
@@ -4920,4 +4939,129 @@ fn owed_evidence_start_drops_an_unfinished_admission() {
         })
         .count();
     assert_eq!(cleared, 0, "re-armed members stay owed with their fingerprint");
+
+    // A healthy start is not completion: while members stay owed they give no
+    // fence coverage, no family proof, no retirement and no latch clear.
+    let _owed = evidence_owed::EvidenceOwedForTest::on();
+    let index = &on_fixture.index;
+    let window = index.traversal.as_ref().unwrap().census_window_end.clone();
+    let indexed = on_fixture.roots.iter().cloned().collect::<BTreeSet<_>>();
+    let owed = evidence_owed::owed_roots(index);
+    assert!(!owed.is_empty() && owed.is_subset(&indexed));
+    assert!(claude_duplicate_fence_coverage_missing_member_count(index, &window) > 0);
+    let pending = index
+        .claude_usage_family_pending
+        .iter()
+        .filter(|(root, _)| owed.contains(*root))
+        .collect::<Vec<_>>();
+    assert!(!pending.is_empty());
+    for (root, pending) in pending {
+        assert!(evidence_owed::owed_at_completion(root, pending, false, &indexed));
+    }
+    assert_eq!(evidence_owed::latch_clearable(index, &window, &indexed), None);
+}
+
+/// [behaviour] An unfinished admission dropped at an evidence-owed start keeps
+/// only its due cursor while due service is unoffered: every due path is then
+/// offered through that cursor exactly once, none is orphaned, and the
+/// finished cursor owes nothing.
+#[test]
+fn owed_evidence_drop_keeps_unserved_due_service_once() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _owed = evidence_owed::EvidenceOwedForTest::on();
+    let mut fixture = retry_durable_fixture(2, 1);
+    fixture.index.bounded_sweep_had_unsettled_upload = false;
+    fixture.index.bounded_sweep_unsettled_causes = 0;
+    fixture.index.claude_request_identity_contract_changed = true;
+    for family in fixture.roots.iter().take(2) {
+        let record = fixture
+            .index
+            .claude_usage_authority_quarantine
+            .get_mut(family)
+            .unwrap();
+        record.contract = CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION.to_string();
+        record.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
+        record.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
+        record.retry_after_unix_seconds = 0;
+        record.proof_correction = Some(ClaudeAuthorityProofCorrection {
+            proof_witness_fingerprint: record.proven_witness_fingerprint.clone(),
+            owed_member_ids: BTreeSet::from([family.clone()]),
+        });
+    }
+    let now = rfc3339_unix_seconds(CARRY_RETRY).unwrap();
+    let stale = fixture.roots.iter().cloned().collect();
+    let admission = claude_retry_admission_start(&fixture.index, &stale, CARRY_RETRY, None);
+    let due = fixture
+        .index
+        .files
+        .keys()
+        .filter(|key| {
+            claude_retry_path_due(
+                &admission,
+                &fixture.index.claude_usage_authority_quarantine,
+                key,
+                now,
+            )
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(due.len(), 2);
+    fixture.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+        context_fingerprint: fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .context_fingerprint
+            .clone(),
+        process: claude_full_rearm_process(),
+        full_rearm_window: false,
+        admission: Some(admission),
+    });
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["due_retained"], 1);
+    assert!(row.get("admissions_dropped").is_none());
+    let retained = |index: &ScanIndex| {
+        index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.admission.clone())
+            .expect("the due cursor is retained")
+    };
+    let state = retained(&fixture.index);
+    assert!(state.roots_complete && !state.complete);
+
+    let root = fixture._scratch.to_path_buf();
+    let path = root.join("due-state.json");
+    retry_test_context(&mut fixture.index, &root);
+    let mut offered = Vec::new();
+    for _ in 0..4 {
+        fixture.index = retry_test_reload(&mut fixture.index, &path);
+        claude_retry_queue_due_families(&mut fixture.index, CARRY_RETRY);
+        let state = retained(&fixture.index);
+        let mut selected = Vec::new();
+        let traversal = fixture.index.traversal.as_mut().unwrap();
+        claude_retry_select_due_paths(
+            &state,
+            &fixture.index.claude_usage_authority_quarantine,
+            &mut traversal.pending_candidates,
+            &mut selected,
+            now,
+            1,
+        );
+        claude_retry_note_offered(&mut fixture.index, &selected, CARRY_RETRY);
+        offered.extend(selected.iter().map(|path| local_index_key(&path.path)));
+    }
+    assert_eq!(offered.len(), due.len(), "none served twice");
+    assert_eq!(
+        offered.into_iter().collect::<BTreeSet<_>>(),
+        due,
+        "none orphaned"
+    );
+    let state = retained(&fixture.index);
+    assert!(state.due_complete && state.complete);
+    assert!(!evidence_owed::due_unoffered(&fixture.index, &state, CARRY_RETRY));
 }

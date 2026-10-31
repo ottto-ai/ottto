@@ -3963,6 +3963,7 @@ fn oversized_idless_marker_strings_refuse_before_reader_token_allocation() {
             invalid: true,
             idless_revision: Some([7; 32]),
             identity_contract: None,
+            contract_unproven: false,
         },
     );
     let valid = serde_json::to_vec_pretty(&seed).unwrap();
@@ -4044,6 +4045,7 @@ fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
         invalid: true,
         idless_revision: None,
         identity_contract: None,
+        contract_unproven: false,
     };
     seed.claude_usage_family_pending
         .insert("family".into(), pending.clone());

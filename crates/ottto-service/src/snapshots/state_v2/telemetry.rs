@@ -564,6 +564,7 @@ mod ops_tests {
                 invalid: false,
                 idless_revision: None,
                 identity_contract: None,
+                contract_unproven: false,
             },
         );
         let observation = retained_heap(&index);
