@@ -24579,7 +24579,7 @@ mod tests {
             baseline.prepare_historical_replay("boundary-pending-replay".into());
             baseline.save(&index_path).unwrap();
             let mut working = baseline.clone();
-            let mut items = Self::prepare(&root, &mut working);
+            let mut items = Self::prepare(&root, &mut working).snapshots;
             items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
             assert_eq!(items.len(), 3);
             let keys = items
@@ -24615,7 +24615,7 @@ mod tests {
             assert!(f.baseline.files.contains_key(&f.keys[2]));
             f
         }
-        fn prepare(root: &Path, index: &mut ScanIndex) -> Vec<SnapshotItem> {
+        fn prepare(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
             index.activate_upload_context("boundary-current-policy".into());
             index.activate_effective_upload_body_witness_revision(1);
             let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
@@ -24634,7 +24634,7 @@ mod tests {
                 item.session_account_evidence = None;
             }
             finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, index);
-            scan.snapshots
+            scan
         }
         fn send(
             &mut self,
@@ -24699,10 +24699,12 @@ mod tests {
             self.baseline = checkpoint;
             Ok(affected)
         }
-        fn restart_preparation(&mut self) {
+        /// Reload as a restarted pass; returns the ordinary scan's counts.
+        fn restart_preparation(&mut self) -> SourceScanResult {
             self.baseline = ScanIndex::load(&self.index_path).unwrap();
             self.working = self.baseline.clone();
-            self.items = Self::prepare(&self.root, &mut self.working);
+            let mut scan = Self::prepare(&self.root, &mut self.working);
+            self.items = std::mem::take(&mut scan.snapshots);
             self.items
                 .sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
             self.progress = SnapshotUploadProgress::load(
@@ -24713,6 +24715,7 @@ mod tests {
             .unwrap();
             self.progress
                 .prepare_historical_replay("boundary-pending-replay");
+            scan
         }
         fn stable_context(index: &ScanIndex) {
             let value = serde_json::to_value(index).unwrap();
@@ -24735,9 +24738,10 @@ mod tests {
     /// headless T (items[0]) and already-headed S (items[1], no pending head).
     /// Phase 1: settled history saturates the bound; pruning it (never a page
     /// session) is durable before the POST, both batches settle into an exact
-    /// receipt/index checkpoint, and a pruned session that reopens takes the
-    /// missing-head bootstrap. A failed POST still leaves a committable partial
-    /// checkpoint. Phase 2: live (pending-head) evidence alone exceeds the
+    /// receipt/index checkpoint. C, accepted before this page and pruned as
+    /// settled history, then grows: the ordinary scan re-reads it once and its
+    /// definite body settles into the receipt and index without a head. A
+    /// failed POST still leaves a committable partial checkpoint. Phase 2: live (pending-head) evidence alone exceeds the
     /// bound; the route takes an alarmed paced hold, nothing is posted and
     /// custody bytes are unchanged.
     #[test]
@@ -24779,6 +24783,17 @@ mod tests {
                     &snapshot_upload_body_witness(item),
                 );
             }
+            // C was accepted before this page: settled history, not on it.
+            let c = cache_session_key(&f.items[2].source_session_id);
+            f.progress.accepted_cache_states.insert(
+                c.clone(),
+                serde_json::json!({"observations":[], "value":"c"}),
+            );
+            f.progress
+                .accepted_cache_heads
+                .insert(c.clone(), "c".repeat(64));
+            let c_entry = serde_json::to_value(&f.baseline.files[&f.keys[2]]).unwrap();
+            let c_item = f.items.pop().unwrap();
             // S is already headed with settled state and no pending head.
             let s = cache_session_key(&f.items[1].source_session_id);
             f.progress.accepted_cache_states.insert(
@@ -24882,10 +24897,13 @@ mod tests {
                 let (result, rows) = crate::local_resource_diagnostics::capture(|| attempt(&mut f));
                 // Settled history only: old-0 is pending-live, S and T are in the page.
                 let pruned = counter(&rows, "ack_custody_pruned").unwrap();
-                assert!(pruned >= pruned_total + 111, "cumulative prune count");
+                assert!(pruned >= pruned_total + 112, "cumulative prune count");
                 pruned_total = pruned;
-                for session in &sessions[1..] {
-                    let key = cache_session_key(session);
+                for key in sessions[1..]
+                    .iter()
+                    .map(|s| cache_session_key(s))
+                    .chain([c.clone()])
+                {
                     assert!(!f.progress.accepted_cache_states.contains_key(&key));
                     assert!(!f.progress.accepted_cache_heads.contains_key(&key));
                 }
@@ -24941,56 +24959,85 @@ mod tests {
                     ));
                 }
                 settled_receipt(&f);
-                // A pruned session reopens with no head: it is selected for the
-                // missing-head bootstrap and settles with a fresh head.
-                let mut reopened = f.items[0].clone();
-                reopened.source_session_id = "old-5".into();
-                reopened.cache_observations = Some(observations.clone());
-                let deferred = capture_deferred_cache_head_identities(
-                    SnapshotSource::Codex,
-                    std::slice::from_ref(&reopened),
-                    &f.progress,
-                    true,
-                    true,
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
-                    &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
-                );
-                assert_eq!(deferred.len(), 1);
-                assert_eq!(deferred[0].session_key, cache_session_key("old-5"));
-                reopened.snapshot_fingerprint = deferred[0].snapshot_fingerprint.clone();
-                f.progress
-                    .freeze_custody_page(std::slice::from_ref(&reopened));
-                let probe = cache_head_probe(&reopened);
+                // Pruned C reopens: its rollout grows and the ordinary scan (the
+                // counted read owner) re-reads only that file into one definite
+                // body. With no head it uploads ordinarily and settles exactly.
+                let path = std::fs::read_dir(&f.root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.to_string_lossy()
+                            .ends_with(&format!("{}.jsonl", c_item.source_session_id))
+                    })
+                    .unwrap();
+                let mut grown = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                for row in [
+                    serde_json::json!({"type":"token_usage_record","timestamp":"2026-09-30T10:00:02Z","payload":{"response_id":"resp_reopened","usage":{"input_tokens":120000,"cached_input_tokens":100000,"output_tokens":2}}}),
+                    serde_json::json!({"type":"event_msg","timestamp":"2026-09-30T10:00:02Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":220000,"cached_input_tokens":190000,"output_tokens":3},"last_token_usage":{"input_tokens":120000,"cached_input_tokens":100000,"output_tokens":2}}}}),
+                ] {
+                    std::io::Write::write_all(&mut grown, format!("{row}\n").as_bytes()).unwrap();
+                }
+                drop(grown);
+                let recovery = f.progress.ack_recovery.take();
+                let scan = f.restart_preparation();
+                f.progress.ack_recovery = recovery;
+                f.progress.freeze_custody_page(&f.items);
+                assert_eq!(scan.scanned_file_count, 1, "only the grown source is read");
+                assert_eq!(scan.semantic_noop_count, 0);
+                assert_eq!(scan.unreadable_path_count, 0);
+                assert_eq!(scan.ownership_incomplete_file_count, 0);
                 assert_eq!(
-                    bootstrap_cache_heads_with_budget(
-                        std::slice::from_ref(&probe),
-                        &unique_poison_scope(),
-                        &mut f.progress,
-                        false,
-                        &mut InplaceRetryBudget::default(),
-                        |items, _| {
-                            posts.set(posts.get() + 1);
-                            headed(items)
-                        },
-                        |progress| progress.save(&f.progress_path),
-                    )
-                    .unwrap(),
-                    0
+                    f.items.len(),
+                    1,
+                    "one definite body for the reopened source"
                 );
+                let reopened = f.items[0].clone();
+                assert_eq!(reopened.source_session_id, c_item.source_session_id);
+                assert_ne!(reopened.snapshot_fingerprint, c_item.snapshot_fingerprint);
+                assert!(!f.progress.accepted_cache_heads.contains_key(&c));
+                f.send(0, |items| {
+                    posts.set(posts.get() + 1);
+                    same_source_fixture_ack(items)
+                })
+                .unwrap();
                 assert_eq!(posts.get(), 3);
-                assert_eq!(
-                    f.progress.accepted_cache_heads[&cache_session_key("old-5")],
-                    "e".repeat(64)
+                assert!(f.progress.contains_body(
+                    &reopened.snapshot_fingerprint,
+                    &snapshot_upload_body_witness(&reopened)
+                ));
+                assert_eq!(f.checkpoint_boundary(|| Ok(())).unwrap(), 1);
+                assert_ne!(
+                    serde_json::to_value(&f.baseline.files[&f.keys[2]]).unwrap(),
+                    c_entry
                 );
+                assert!(f.baseline.file_snapshot_fingerprints[&f.keys[2]]
+                    .contains(&reopened.snapshot_fingerprint));
+                settled_receipt(&f);
                 continue;
             }
             let (error, rows) =
                 crate::local_resource_diagnostics::capture(|| attempt(&mut f).unwrap_err());
             assert!(error.is::<ack_retention::AckSettlementRequired>());
             assert!(f.progress.ack_recovery.as_ref().unwrap().custody_held());
-            let alarms = counter(&rows, "ack_custody_hold_alarm").unwrap();
-            assert!(alarms >= 1, "the live-overflow hold alarms");
+            // The hold event's row carries the cumulative alarm before this
+            // hold; the alarm count then rises by exactly one.
+            let alarms = rows
+                .iter()
+                .filter(|row| row["stage"] == "claude_state_v2")
+                .map(|row| {
+                    row["counts"]["latest"]["ack_custody_hold_alarm"]
+                        .as_u64()
+                        .unwrap_or(0)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                alarms.last(),
+                Some(&(alarms[0] + 1)),
+                "the live-overflow hold alarms once"
+            );
             assert_eq!(posts.get(), 0);
             assert_eq!(f.progress, before);
             assert_eq!(std::fs::read(&f.progress_path).unwrap(), bytes);
