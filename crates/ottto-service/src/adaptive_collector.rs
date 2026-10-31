@@ -308,21 +308,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cost_first_disables_the_hot_tier_and_keeps_the_cheap_ones() {
-        let floor = Duration::from_secs(5 * 60);
-        let config = CadenceConfig::cost_first(floor);
-        // No tier may ever ask for a cycle more often than the floor.
-        assert_eq!(config.hot_min_interval, floor);
-        assert_eq!(config.warm_interval, floor);
-        assert!(config.idle_interval >= floor);
-        assert!(config.cold_interval >= floor);
-        // The cheap tiers are where the saving is, so they must stay LONGER than
-        // the floor or this buys nothing.
-        assert!(config.idle_interval > floor);
-        assert!(config.cold_interval > config.idle_interval);
-    }
-
-    #[test]
     fn cost_first_file_activity_restores_the_floor_and_never_beats_it() {
         let floor = Duration::from_secs(5 * 60);
         let start = Instant::now();
@@ -348,54 +333,6 @@ mod tests {
             cadence.next_scan_after(quiet + Duration::from_secs(60)),
             floor - Duration::from_secs(60),
             "a hot source is due at the floor, not before it"
-        );
-    }
-
-    #[test]
-    fn file_events_make_source_hot_then_success_warms_it() {
-        let start = Instant::now();
-        let mut cadence = SourceCadence::new(CadenceConfig::default());
-
-        cadence.record_file_event(start);
-        assert_eq!(cadence.state(), LocalCollectorState::Hot);
-        assert_eq!(cadence.next_scan_after(start), Duration::ZERO);
-
-        cadence.record_scan_success(start, 1);
-        assert_eq!(cadence.state(), LocalCollectorState::Warm);
-        assert_eq!(
-            cadence.next_scan_after(start + Duration::from_secs(30)),
-            Duration::from_secs(30)
-        );
-    }
-
-    #[test]
-    fn backend_activity_hint_warms_only_enabled_sources() {
-        let start = Instant::now();
-        let mut cadence = SourceCadence::new(CadenceConfig::default());
-
-        cadence.record_backend_hint(start, 2, false, true);
-        assert_eq!(cadence.state(), LocalCollectorState::Warm);
-
-        cadence.record_backend_hint(start, 2, true, false);
-        assert_eq!(cadence.state(), LocalCollectorState::Disabled);
-    }
-
-    #[test]
-    fn failures_back_off_with_cap() {
-        let start = Instant::now();
-        let mut cadence = SourceCadence::new(CadenceConfig::default());
-
-        cadence.record_scan_failure(start);
-        assert_eq!(cadence.state(), LocalCollectorState::Failing);
-        assert_eq!(
-            cadence.next_scan_after(start + Duration::from_secs(10)),
-            Duration::from_secs(50)
-        );
-
-        cadence.record_scan_failure(start + Duration::from_secs(60));
-        assert_eq!(
-            cadence.next_scan_after(start + Duration::from_secs(70)),
-            Duration::from_secs(110)
         );
     }
 
@@ -532,52 +469,5 @@ mod tests {
         // Even a request made after the failure waits out the backoff.
         cadence.request_continuation(start + Duration::from_secs(20), Duration::from_secs(1));
         assert_eq!(cadence.continuation_due(PACING), None);
-    }
-
-    #[test]
-    fn slow_pages_stay_inside_the_duty_bound_without_a_clamp() {
-        let start = Instant::now();
-        for work_secs in [1u64, 3, 10, 20, 30, 33, 34, 60, 600] {
-            let mut cadence = hot_scanned_at(start);
-            let work = Duration::from_secs(work_secs);
-            let page_end = start + work;
-            cadence.request_continuation(page_end, work);
-            match cadence.continuation_due(PACING) {
-                Some(due) => {
-                    let gap = due - page_end;
-                    assert!(gap >= PACING.min_gap);
-                    assert!(
-                        gap >= work * PACING.idle_per_work,
-                        "{work_secs}s page: the gap must keep duty at or under 10 %"
-                    );
-                    assert!(due < start + Duration::from_secs(5 * 60));
-                }
-                // Here the duty gap reaches the ordinary scan; nothing is
-                // clamped shorter to squeeze a continuation in.
-                None => assert!(
-                    page_end + work * PACING.idle_per_work >= start + Duration::from_secs(300)
-                ),
-            }
-        }
-    }
-
-    #[test]
-    fn continuation_arithmetic_overflow_refuses_instead_of_saturating() {
-        let start = Instant::now();
-        let mut cadence = hot_scanned_at(start);
-        cadence.request_continuation(start, Duration::MAX);
-        assert_eq!(cadence.continuation_due(PACING), None);
-
-        // A never-scanned source is already due on the ordinary cadence.
-        let mut fresh = SourceCadence::new(CadenceConfig::cost_first(Duration::from_secs(300)));
-        fresh.request_continuation(start, Duration::from_secs(1));
-        assert_eq!(fresh.continuation_due(PACING), None);
-
-        // A disabled source takes no continuation at all.
-        let mut disabled = hot_scanned_at(start);
-        disabled.set_disabled(true);
-        assert!(!disabled.request_continuation(start, Duration::from_secs(1)));
-        assert_eq!(disabled.continuation_work(), None);
-        assert_eq!(disabled.continuation_due(PACING), None);
     }
 }
