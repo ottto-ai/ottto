@@ -177,10 +177,18 @@ pub(crate) fn effective_item_cap(advertised: Option<u64>) -> usize {
 }
 
 /// This pass's receiver limit and the existing cache reconciliation reserve.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(crate) struct WireBudget<'a> {
-    pub(crate) max_snapshot_item_bytes: Option<u64>,
+    pub(crate) max_item_bytes: usize,
     pub(crate) reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
+}
+impl Default for WireBudget<'_> {
+    fn default() -> Self {
+        Self {
+            max_item_bytes: MAX_ITEM_BYTES,
+            reservation: None,
+        }
+    }
 }
 const MICRO_PICOS: u128 = USD_PICO_SCALE / 1_000_000;
 const MAX_MONEY_PICOS: u128 = 1_000_000_000 * USD_PICO_SCALE;
@@ -1088,17 +1096,21 @@ fn apply_grouped_with_accepted(
     let attempted_bytes = grouping.item_bytes(item);
     if max_item_bytes > MAX_ITEM_BYTES && attempted_bytes > max_item_bytes / 2 {
         crate::local_resource_diagnostics::claude_identity_over_cap(
-            &BTreeSet::from([OverCap::NearCap]), attempted_bytes, None,
+            &BTreeSet::from([OverCap::NearCap]),
+            attempted_bytes,
+            None,
         );
     }
     let components = (attempted_bytes > max_item_bytes)
-        .then(|| shed_display_leaves(item, &grouping, attempted_bytes));
+        .then(|| shed_display_leaves(item, &grouping, attempted_bytes, max_item_bytes));
     if let Some(bytes) = &components {
         if bytes.after_shed > max_item_bytes {
             over_cap.insert(OverCap::Bytes);
         } else if over_cap.is_empty() {
             crate::local_resource_diagnostics::claude_identity_over_cap(
-                &over_cap, attempted_bytes, Some(bytes),
+                &over_cap,
+                attempted_bytes,
+                Some(bytes),
             );
         }
     }
@@ -2046,6 +2058,7 @@ fn shed_display_leaves(
     item: &mut SnapshotItem,
     grouping: &Grouping,
     attempted: usize,
+    max_item_bytes: usize,
 ) -> crate::local_resource_diagnostics::ClaudeIdentityOverCapBytes {
     let mut probe = item.clone();
     probe.context_curve = None;
@@ -2057,8 +2070,8 @@ fn shed_display_leaves(
     probe.usage_buckets.clear();
     let rest = grouping.item_bytes(&probe);
     drop(probe);
-    let fits = |item: &SnapshotItem| grouping.item_bytes(item) <= MAX_ITEM_BYTES;
-    if without_curve > MAX_ITEM_BYTES {
+    let fits = |item: &SnapshotItem| grouping.item_bytes(item) <= max_item_bytes;
+    if without_curve > max_item_bytes {
         // No curve can fit: go straight to the unavailable curve without
         // measuring the whole body once per pruned point.
         super::fit_context_curve(item, |_| false);
@@ -5106,7 +5119,7 @@ fn tag_item(
             grouping,
             accepted,
             retained,
-            effective_item_cap(evidence.wire_budget.max_snapshot_item_bytes),
+            evidence.wire_budget.max_item_bytes,
         );
         if tagged.is_err() {
             (
@@ -5179,7 +5192,7 @@ fn tag_item(
         grouping,
         accepted,
         retained,
-        effective_item_cap(evidence.wire_budget.max_snapshot_item_bytes),
+        evidence.wire_budget.max_item_bytes,
     );
     if tagged.is_ok() && owned {
         crate::desktop_recent::publish(desktop_recent);

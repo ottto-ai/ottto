@@ -8045,6 +8045,20 @@ pub fn apply_upload_policy(
     snapshots: &mut [SnapshotItem],
     policy: SnapshotUploadPolicy,
 ) {
+    apply_upload_policy_with_item_limit(source, snapshots, policy, MAX_SNAPSHOT_ITEM_WIRE_BYTES);
+}
+
+pub(crate) fn apply_upload_policy_with_item_limit(
+    source: SnapshotSource,
+    snapshots: &mut [SnapshotItem],
+    policy: SnapshotUploadPolicy,
+    item_limit: usize,
+) {
+    let item_limit = if source == SnapshotSource::ClaudeCode {
+        item_limit
+    } else {
+        MAX_SNAPSHOT_ITEM_WIRE_BYTES
+    };
     for item in snapshots {
         let mut fingerprint_needs_refresh = false;
         if !policy.session_titles_enabled
@@ -8097,12 +8111,7 @@ pub fn apply_upload_policy(
         if fingerprint_needs_refresh {
             item.snapshot_fingerprint = snapshot_fingerprint(source, item);
         }
-        fit_context_curve_to_snapshot_item_budget(
-            source,
-            item,
-            policy,
-            MAX_SNAPSHOT_ITEM_WIRE_BYTES,
-        );
+        fit_context_curve_to_snapshot_item_budget(source, item, policy, item_limit);
     }
 }
 

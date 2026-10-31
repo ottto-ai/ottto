@@ -25,9 +25,11 @@ use crate::snapshot_client::{
     SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
     CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT,
 };
+#[cfg(test)]
+use crate::snapshots::apply_upload_policy;
 use crate::snapshots::validate_snapshot_batch_request;
 use crate::snapshots::{
-    apply_upload_policy, collector_version, context_curve_derivation_revision,
+    collector_version, context_curve_derivation_revision,
     finalize_scan_after_policy_with_body_witness, prepare_codex_recovery_diagnostics,
     snapshot_quarantine_deadline_is_bounded, snapshot_upload_body_witness, ScanIndex,
     SnapshotBatchRequest, SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
@@ -7516,6 +7518,9 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    let identity_item_cap = crate::snapshots::claude_request_identity::effective_item_cap(
+        activity_hint.max_snapshot_item_bytes,
+    );
     upload_progress
         .accepted_identity_buckets
         .bind_context(attribution_context.as_ref());
@@ -7667,7 +7672,7 @@ fn finish_sync_source(
             Some((&daemon.transcript_cache, &committed_index)),
             Some(&upload_progress.accepted_identity_buckets),
             crate::snapshots::claude_request_identity::WireBudget {
-                max_snapshot_item_bytes: activity_hint.max_snapshot_item_bytes,
+                max_item_bytes: identity_item_cap,
                 reservation: Some(&reserve_cache_bytes),
             },
         );
@@ -7740,7 +7745,12 @@ fn finish_sync_source(
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
 
-    apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
+    crate::snapshots::apply_upload_policy_with_item_limit(
+        source,
+        &mut scan_result.snapshots,
+        upload_policy,
+        identity_item_cap,
+    );
 
     // Account-switch backfill cutoff (server-issued at claim completion): a
     // machine claimed by a different same-org user must not re-attribute the
@@ -7775,7 +7785,12 @@ fn finish_sync_source(
         machine_id,
         |index, snapshots| {
             index.bind_session_accounts(source, machine_id, snapshots, &current_codex_bindings);
-            apply_upload_policy(source, snapshots, upload_policy);
+            crate::snapshots::apply_upload_policy_with_item_limit(
+                source,
+                snapshots,
+                upload_policy,
+                identity_item_cap,
+            );
             apply_backfill_cutoff(snapshots, &backfill_state);
         },
     );
@@ -8125,9 +8140,7 @@ fn finish_sync_source(
                 if let Err(reason) =
                     crate::snapshots::validate_snapshot_batch_request_with_item_limit(
                         &request,
-                        crate::snapshots::claude_request_identity::effective_item_cap(
-                            activity_hint.max_snapshot_item_bytes,
-                        ),
+                        identity_item_cap,
                     )
                 {
                     return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
@@ -8237,9 +8250,7 @@ fn finish_sync_source(
                 if let Err(reason) =
                     crate::snapshots::validate_snapshot_batch_request_with_item_limit(
                         &request,
-                        crate::snapshots::claude_request_identity::effective_item_cap(
-                            activity_hint.max_snapshot_item_bytes,
-                        ),
+                        identity_item_cap,
                     )
                 {
                     return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {

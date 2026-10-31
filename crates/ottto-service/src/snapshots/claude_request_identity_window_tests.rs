@@ -414,10 +414,16 @@ fn sticky_budget_sheds_curve_and_cache_before_stripping_any_tag() {
     let bytes = |key: &str| shed[key].as_u64().unwrap();
     assert!(bytes("after_shed") <= identity::MAX_ITEM_BYTES as u64);
     assert_eq!(
-        ["context_curve", "cache_observations", "identity", "usage_buckets", "rest"]
-            .map(bytes)
-            .iter()
-            .sum::<u64>(),
+        [
+            "context_curve",
+            "cache_observations",
+            "identity",
+            "usage_buckets",
+            "rest"
+        ]
+        .map(bytes)
+        .iter()
+        .sum::<u64>(),
         bytes("item")
     );
     assert!(padded.context_curve.as_ref().unwrap().retained_point_count < curve_points);
@@ -2424,6 +2430,7 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
     let (mut base, mut proof) = sticky_session(400);
     sticky_price_fixture(&mut base, &mut proof);
     sticky_receiver_totals(&mut base);
+    base.context_curve = Some(max_fractional_context_curve_fixture());
     let (mut item, filler) = sticky_pad_to_bytes(&base, 1_600_000);
     proof.extend(filler);
     let baseline = sticky_money(&item);
@@ -2444,9 +2451,19 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
             .as_u64()
             .is_some_and(|n| n > 0)
     ));
+    let curve = serde_json::to_value(&item.context_curve).unwrap();
+    apply_upload_policy_with_item_limit(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_mut(&mut item),
+        SnapshotUploadPolicy::default(),
+        3_145_728,
+    );
+    assert_eq!(serde_json::to_value(&item.context_curve).unwrap(), curve);
     let mut request = valid_v6_batch_request();
     request.snapshots = vec![item.clone()];
-    assert!(validate_snapshot_batch_request(&request).is_err());
+    assert!(validate_snapshot_batch_request(&request)
+        .unwrap_err()
+        .contains("wire body"));
     validate_snapshot_batch_request_with_item_limit(&request, 3_145_728).unwrap();
     // The same production graph used by SourcePreparation::bound includes all
     // vector capacity and nested identity parts. A visit/budget refusal selects
@@ -2459,7 +2476,11 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
     charged_request.source = "codex".into();
     charged_request.snapshots[0].snapshot_fingerprint =
         snapshot_fingerprint(SnapshotSource::Codex, &charged_request.snapshots[0]);
-    assert!(validate_snapshot_batch_request_with_item_limit(&charged_request, 3_145_728).is_err());
+    assert!(
+        validate_snapshot_batch_request_with_item_limit(&charged_request, 3_145_728)
+            .unwrap_err()
+            .contains("wire body")
+    );
 }
 
 /// [money] Previously stripped buckets are new accepted tags on the next ACK,
@@ -2503,7 +2524,10 @@ fn advertised_cap_retags_previously_stripped_accepted_body() {
     assert_eq!(counts["identity_cap"]["refused_new_buckets"], 0);
     ledger.record(&serde_json::to_value(&second).unwrap());
     assert_eq!(ledger.get(&second.source_session_id).unwrap().len(), 400);
-    let accepted_bytes = serde_json::to_vec(&ledger).unwrap();
+    let mut expected_ledger = serde_json::to_value(&ledger).unwrap();
+    for session in expected_ledger.as_object_mut().unwrap().values_mut() {
+        session["last_ack"] = json!(session["last_ack"].as_u64().unwrap() + 1);
+    }
     let mut third = original;
     identity::apply_with_reserved_bytes_for_test(&mut third, &proof, &ledger, 0, Some(2_097_152))
         .unwrap();
@@ -2512,7 +2536,7 @@ fn advertised_cap_retags_previously_stripped_accepted_body() {
         serde_json::to_vec(&second).unwrap()
     );
     ledger.record(&serde_json::to_value(&third).unwrap());
-    assert_eq!(serde_json::to_vec(&ledger).unwrap(), accepted_bytes);
+    assert_eq!(serde_json::to_value(&ledger).unwrap(), expected_ledger);
 }
 
 /// [off=main] No hint, malformed values and smaller limits use main's exact
@@ -2536,7 +2560,7 @@ fn advertised_cap_absent_or_invalid_is_byte_identical_to_main() {
         Some(json!(true)),
         Some(json!(655_359)),
     ] {
-        let mut hint = json!({"source":"claude_code", "server_time":"2026-10-31T00:00:00Z", "last_data_at":null, "record_count_15m":0, "record_count_24h":0, "local_usage_reconciliation_enabled":true, "backfill_window_days":183});
+        let mut hint = json!({"source":"claude_code", "server_time":"2026-10-31T00:00:00Z", "last_data_at":null, "record_count_15m":0, "record_count_24h":0, "local_usage_reconciliation_enabled":true, "backfill_window_days":183,"recommended_scan_after":"2026-10-31T00:01:00Z"});
         if let Some(value) = value {
             hint["max_snapshot_item_bytes"] = value;
         }
