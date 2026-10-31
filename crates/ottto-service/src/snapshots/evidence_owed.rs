@@ -440,6 +440,24 @@ mod tests {
         }
     }
 
+    /// [money] Equality readers that stand for "observed" or feed a proof
+    /// (E2 copy proof, native credit, proof corrections, owned start, record
+    /// retirement, audits) see an owed revision exactly as main's cleared
+    /// one, until a re-stamp or read resolves it.
+    #[test]
+    fn owed_revision_is_unobserved_for_proof_readers_until_resolved() {
+        let _on = EvidenceOwedForTest::on();
+        let mut owed = entry();
+        rearm_cause::clear("/k.jsonl", &mut owed, rearm_cause::Cause::NoRetainedTraversal);
+        assert_eq!(owed.source_file_fingerprint, "revision");
+        assert_eq!(owed.observed_fingerprint(), "");
+        let mut main = entry();
+        main.source_file_fingerprint.clear();
+        assert_eq!(owed.observed_fingerprint(), main.observed_fingerprint());
+        owed.evidence_owed = false;
+        assert_eq!(owed.observed_fingerprint(), "revision");
+    }
+
     /// [format] An index written before the field decodes not owed and
     /// re-encodes byte-identically; an owed entry round-trips.
     #[test]

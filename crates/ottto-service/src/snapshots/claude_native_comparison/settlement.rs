@@ -168,7 +168,7 @@ impl NativeCorrection {
                     claude_usage_family_witness_fingerprint(witness) == self.proof
                 })
             && index.files.get(key).is_some_and(|entry| {
-                entry.source_file_fingerprint == self.revision
+                entry.observed_fingerprint() == self.revision
                     && entry.scan_identity_version.as_deref()
                         == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
                     && entry.last_snapshot_fingerprint.as_ref() == Some(&self.selected_fingerprint)

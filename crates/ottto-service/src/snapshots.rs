@@ -4604,6 +4604,16 @@ impl ScanIndexEntry {
     pub(crate) fn rearmed(&self) -> bool {
         self.source_file_fingerprint.is_empty() || self.evidence_owed
     }
+    /// The fingerprint as main's re-arm leaves it: empty while evidence is
+    /// owed. Readers where equality means "observed" or feeds a proof or
+    /// credit ask this, so an owed revision proves nothing until resolved.
+    pub(crate) fn observed_fingerprint(&self) -> &str {
+        if self.evidence_owed {
+            ""
+        } else {
+            &self.source_file_fingerprint
+        }
+    }
     fn codex_recovery_is_pending(&self) -> bool {
         self.codex_captured_joined_member_set.is_some()
             || self.codex_captured_tier_receipt_required
@@ -9201,7 +9211,7 @@ fn claude_owned_start_eligible(
             let indexed_fingerprint = index.files.iter().find_map(|(index_key, entry)| {
                 claude_index_path_family_member(Path::new(index_key))
                     .filter(|(_, member)| member == source_session_id)
-                    .map(|_| entry.source_file_fingerprint.clone())
+                    .map(|_| entry.observed_fingerprint().to_owned())
             })?;
             (indexed_fingerprint == witness.marker_source_file_fingerprint)
                 .then_some((source_session_id.clone(), indexed_fingerprint))
@@ -52303,7 +52313,8 @@ impl ScanIndex {
                     .files
                     .get(&key)
                     .and_then(|entry| entry.upload_context_receipt.clone()),
-                evidence_owed: false,
+                // An identity migration reads nothing: owed evidence stays owed.
+                evidence_owed: self.files.get(&key).is_some_and(|entry| entry.evidence_owed),
             },
         );
     }

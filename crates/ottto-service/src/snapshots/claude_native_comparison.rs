@@ -409,7 +409,7 @@ impl WindowEligibility {
             && claude_usage_family_witness_fingerprint(witness) == saved.proof
             && saved.certified.iter().all(|(key, skip)| {
                 index.files.get(key).is_some_and(|entry| {
-                    entry.source_file_fingerprint == skip.revision
+                    entry.observed_fingerprint() == skip.revision
                         && entry.scan_identity_version.as_deref()
                             == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
                         && entry.last_snapshot_fingerprint.is_some()
@@ -1637,7 +1637,7 @@ impl NativePhase {
                 if !self.parsed_roots.contains(root)
                     && skip.census_window_end == census_window_end
                     && index.files.get(&key).is_some_and(|entry| {
-                        entry.source_file_fingerprint == skip.revision
+                        entry.observed_fingerprint() == skip.revision
                             && skip.upload_context == index.active_upload_context_fingerprint
                     })
                     && retained

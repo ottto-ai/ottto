@@ -3211,7 +3211,7 @@ fn transcript_retirement_age(
     // Not dirty: the indexed revision is still the one the record (and its
     // mtime) describes.
     let entry = files.get(key).filter(|entry| {
-        decode_fingerprint(&entry.source_file_fingerprint)
+        decode_fingerprint(entry.observed_fingerprint())
             .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
     })?;
     // A record written before `m` (#664) takes the entry's mtime: the equal
