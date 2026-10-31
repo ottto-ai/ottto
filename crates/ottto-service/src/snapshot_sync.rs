@@ -9653,7 +9653,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .into_iter()
         .collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
-    let request_owned_enabled = crate::snapshots::claude_request_money::e2::enabled();
     // A family kept on ordinary money (listed) reads its telemetry as gate off.
     let request_owned =
         |root: &str| crate::snapshots::claude_request_money::e2::family_applies(index, root, None);
@@ -9898,7 +9897,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         index,
     );
     let mut trace_discard_unfolded = BTreeSet::new();
-    if request_owned_enabled {
+    {
         // Reuse the per-root read verdict before identity consumes it. Missing
         // sidecars are ordinary absence; partial pairs and failed strict reads
         // hold only that root's permitted owed history through the existing seam.
@@ -9959,17 +9958,16 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if let Some(comparison) = comparison {
         comparison.retire_native_fold_owner();
     }
-    if crate::snapshots::claude_request_money::e2::enabled() {
-        if let Some(evidence) = &identity_evidence {
-            let no_fallback = crate::snapshots::claude_request_identity::reconcile_request_accounts(
-                &mut scan_result.snapshots,
-                evidence,
-            );
-            // #932's scalar stays, equal to its reason in the map.
-            stats.trace_discard_no_fallback_requests = no_fallback.discarded;
-            stats.unhealthy_root_no_fallback_requests = no_fallback;
-        }
+    if let Some(evidence) = &identity_evidence {
+        let no_fallback = crate::snapshots::claude_request_identity::reconcile_request_accounts(
+            &mut scan_result.snapshots,
+            evidence,
+        );
+        // #932's scalar stays, equal to its reason in the map.
+        stats.trace_discard_no_fallback_requests = no_fallback.discarded;
+        stats.unhealthy_root_no_fallback_requests = no_fallback;
     }
+
     let request_owned_activity = identity_evidence.as_ref().map(|evidence| {
         let ownership =
             crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
@@ -10001,7 +9999,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
     }
     disposition.hold_request_owned(withheld);
-    if request_owned_enabled {
+    {
         for item in &mut scan_result.snapshots {
             if let Some(root) =
                 crate::snapshots::claude_request_money::request_owned_family_root(item)
@@ -10014,7 +10012,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             }
         }
     }
-    if telemetry_read_failed && crate::snapshots::claude_request_money::e2::enabled() {
+    if telemetry_read_failed {
         // No owed history file settles on estimates because this page could
         // not read telemetry: the emission seam drops its bodies, keeps its
         // upload tuple, and it stays owed for a later page.

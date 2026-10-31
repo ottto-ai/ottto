@@ -9561,7 +9561,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         // reaches the legacy fork-prefix exclusion. Its copies are removed
         // once, by the E2 copy rule. The owners still feed the fence and
         // re-arm decisions below (StateMissing inputs), never a v1 body.
-        if claude_request_money::e2::enabled() && item.claude_money.is_some() {
+        if item.claude_money.is_some() {
             continue;
         }
         item.usage_accounting_contract = None;
@@ -10092,7 +10092,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         // reported body as a contract of its own (its literal is installed by
         // `e2::finish_page` after this fold), so it is not a demotion. Account,
         // security and E2 twin holds are separate and still apply.
-        let request_owned = claude_request_money::e2::enabled() && item.claude_money.is_some();
+        let request_owned = item.claude_money.is_some();
         if witness_roots_before.contains(&root_session_id) && contractless && !request_owned {
             demoting_members_by_root
                 .entry(root_session_id)
@@ -10490,8 +10490,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         // E2's revision-3 adoption is the identity upgrade's ONE paced
         // pass. The contract latch must not clear fingerprints and arm a
         // second, unpaced full replay after that pass.
-        let e2_identity_upgrade = claude_request_money::e2::enabled()
-            && identity_contract == claude_request_identity::E2_GROUPING
+        let e2_identity_upgrade = identity_contract == claude_request_identity::E2_GROUPING
             && index.active_effective_upload_body_witness_revision == 3;
         let e2_identity_owed = e2_identity_upgrade
             && index.files.iter().any(|(key, entry)| {
@@ -10729,7 +10728,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
                     item.source_session_id.clone(),
                     item.usage_accounting_contract.as_deref()
                         == Some("session_exclusive_reported_usage:v1")
-                        || (claude_request_money::e2::enabled() && item.claude_money.is_some()),
+                        || (item.claude_money.is_some()),
                 );
             by_root
         },
@@ -14313,10 +14312,7 @@ fn claude_account_evidence_covers_request_ids(
 /// rows and the owner has tagged them; rebuilding from no buckets would
 /// drop them.
 fn rebuild_retagged_model_usage(item: &mut SnapshotItem) {
-    if item.usage_buckets.is_empty()
-        && item.claude_money.is_some()
-        && claude_request_money::e2::enabled()
-    {
+    if item.usage_buckets.is_empty() && item.claude_money.is_some() {
         return;
     }
     rebuild_snapshot_model_usage(item);
@@ -19589,17 +19585,12 @@ impl SnapshotAccumulator {
         let (mut responses, selectors) = std::mem::take(&mut self.claude_responses).into_parts();
         responses.sort_by_key(|response| response.sequence);
         // Gate off, the fold keys by hour only: it never reads the selector.
-        let base_selector = if claude_request_money::e2::enabled() {
-            self.current_selector.clone()
-        } else {
-            SelectorCapture::default()
-        };
+        let base_selector = self.current_selector.clone();
         // Gate on, a family revision 3 keeps on ordinary money gets no fold:
         // its file is read exactly as gate off publishes it (fold-absent).
-        let mut money = (!claude_request_money::e2::enabled()
-            || money_context
-                .as_ref()
-                .map_or(true, claude_request_money::e2::file_applies))
+        let mut money = (money_context
+            .as_ref()
+            .map_or(true, claude_request_money::e2::file_applies))
         .then(|| {
             claude_request_money::e2::FileFold::new(
                 self.claude_file_birth,
@@ -19632,7 +19623,7 @@ impl SnapshotAccumulator {
                     if let Some(money) = money.as_mut() {
                         money.note_resolver_conflict();
                     }
-                    if !(claude_request_money::e2::enabled() && money.is_some()) {
+                    if money.is_none() {
                         self.note_dropped_usage();
                     }
                     continue;
@@ -20295,20 +20286,7 @@ impl SnapshotAccumulator {
                 collected_at.len(),
             )?)?;
         // E: the fold, itemized.
-        let money_output = if claude_request_money::e2::enabled() {
-            self.e2_fold_output_bound(path, book_bounds.fold?, limit)?
-        } else {
-            // Dark retains totals per hour, plus copy sequence ranges. It
-            // never builds live grain keys, selectors or per-response rows.
-            // Three tallies (own, copy, idless copy), Vec growth <= 2n + 4.
-            let slots = resolved.checked_mul(2)?.checked_add(4)?;
-            size_of::<claude_request_money::e2::FileFold>()
-                .checked_add(size_of::<claude_request_money::e2::ClaudeEntityBody>())?
-                .checked_add(RFC3339_TEXT_BYTES)?
-                .checked_add(
-                    slots.checked_mul(3 * size_of::<(u32, u32)>() + size_of::<(u64, u64)>())?,
-                )?
-        };
+        let money_output = { self.e2_fold_output_bound(path, book_bounds.fold?, limit)? };
         let mut out = crate::heap_layout_bound::Counter::new(limit);
         for bytes in [
             money_output,
@@ -20991,9 +20969,8 @@ impl SnapshotAccumulator {
         // E2 (gate on): the fold's grains are this body's one per-hour store
         // until `e2::finish_page` emits them; native per-hour rows would only
         // duplicate them on the page. A withheld body never uploads.
-        let request_owned_hours = self.source == SnapshotSource::ClaudeCode
-            && claude_request_money::e2::enabled()
-            && self.claude_money.is_some();
+        let request_owned_hours =
+            self.source == SnapshotSource::ClaudeCode && self.claude_money.is_some();
         for (bucket_start, bucket) in self.usage_buckets {
             if bucket.rows.is_empty() {
                 continue;
@@ -21023,7 +21000,6 @@ impl SnapshotAccumulator {
         // through the literal emitter like any request-owned body. No tokens
         // are invented; gate off, nothing changes.
         let conflict_carrier = self.source == SnapshotSource::ClaudeCode
-            && claude_request_money::e2::enabled()
             && self
                 .claude_money
                 .as_deref()
@@ -26147,12 +26123,11 @@ fn finish_claude_retry_selection(
     retry_service_end: usize,
     service_at: &str,
 ) {
-    if claude_request_money::e2::enabled() {
-        claude_request_money::e2::defer_roots_of_queued_families(
-            pending_paths,
-            index.traversal.as_mut().expect("traversal initialized"),
-        );
-    }
+    claude_request_money::e2::defer_roots_of_queued_families(
+        pending_paths,
+        index.traversal.as_mut().expect("traversal initialized"),
+    );
+
     let offered_end = retry_service_end.min(pending_paths.len());
     if offered_end > 0 {
         claude_retry_note_offered(index, &pending_paths[..offered_end], service_at);
@@ -27217,7 +27192,7 @@ impl OwnedSourceScan {
         // E2: the page's path-twin groups, built at most once per page and
         // shared with twin staging and the parse-time birth context.
         let claude_twin_groups = std::cell::OnceCell::new();
-        if source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled() {
+        if source == SnapshotSource::ClaudeCode {
             let twin_groups = claude_twin_groups.get_or_init(|| {
                 // A page file not known yet (a new copy) keeps its member's
                 // single known path as its twin.
@@ -45941,48 +45916,46 @@ impl ScanIndex {
             Some((member.root, member.subagent_stem?))
         }));
         self.claude_reemission_exclusions = exclusions;
-        if claude_request_money::e2::enabled() {
-            let mut families = BTreeSet::new();
-            let mut files = 0;
-            let mut unlisted = Vec::new();
-            for key in self.files.keys() {
-                if self.claude_family_listed(key) {
-                    if let Some(member) = claude_index_path_member_ref(Path::new(key)) {
-                        families.insert(member.root);
-                        files += 1;
-                        let location = claude_money_birth_store::location_key(key);
-                        let marks = self.claude_money_birth_store.money_marks(location);
-                        self.claude_money_birth_store.set_money_marks(
-                            key,
-                            marks | claude_request_money::e2::money_mark::LEGACY,
-                        );
-                    }
-                } else {
+
+        let mut families = BTreeSet::new();
+        let mut files = 0;
+        let mut unlisted = Vec::new();
+        for key in self.files.keys() {
+            if self.claude_family_listed(key) {
+                if let Some(member) = claude_index_path_member_ref(Path::new(key)) {
+                    families.insert(member.root);
+                    files += 1;
                     let location = claude_money_birth_store::location_key(key);
                     let marks = self.claude_money_birth_store.money_marks(location);
-                    if marks & claude_request_money::e2::money_mark::LEGACY != 0
-                        && !self.claude_reemission_exclusions.pauses_adoption()
-                        && self.active_effective_upload_body_witness_revision == 3
-                    {
-                        unlisted.push((
-                            key.clone(),
-                            marks & !claude_request_money::e2::money_mark::LEGACY,
-                        ));
-                    }
+                    self.claude_money_birth_store
+                        .set_money_marks(key, marks | claude_request_money::e2::money_mark::LEGACY);
+                }
+            } else {
+                let location = claude_money_birth_store::location_key(key);
+                let marks = self.claude_money_birth_store.money_marks(location);
+                if marks & claude_request_money::e2::money_mark::LEGACY != 0
+                    && !self.claude_reemission_exclusions.pauses_adoption()
+                    && self.active_effective_upload_body_witness_revision == 3
+                {
+                    unlisted.push((
+                        key.clone(),
+                        marks & !claude_request_money::e2::money_mark::LEGACY,
+                    ));
                 }
             }
-            // The legacy money-rule mark converges even if the file had
-            // already reached revision 3 before it was listed. Clear it in
-            // the same save as re-owing, so the existing history gate owns
-            // the single paced read and retries remain owed.
-            let family_count = families.len() as u64;
-            drop(families);
-            for (key, marks) in unlisted {
-                self.re_owe_effective_upload_body_witness_revision(&key, 2);
-                self.claude_money_birth_store.set_money_marks(&key, marks);
-            }
-            claude_request_identity::record_listed_legacy_counts(family_count, files);
         }
+        // The legacy money-rule mark converges even if the file had
+        // already reached revision 3 before it was listed. Clear it in
+        // the same save as re-owing, so the existing history gate owns
+        // the single paced read and retries remain owed.
+        let family_count = families.len() as u64;
+        drop(families);
+        for (key, marks) in unlisted {
+            self.re_owe_effective_upload_body_witness_revision(&key, 2);
+            self.claude_money_birth_store.set_money_marks(&key, marks);
+        }
+        claude_request_identity::record_listed_legacy_counts(family_count, files);
+
         if let Some(cause) = self.claude_reemission_exclusions.missing_cause() {
             crate::local_resource_diagnostics::claude_reemission_list_missing(cause.as_str());
         }
@@ -46213,11 +46186,11 @@ impl ScanIndex {
             self.claude_history_cutoff_unix_seconds,
             birth_unix_seconds,
         );
-        if claude_request_money::e2::enabled() {
-            claude_request_money::e2::timed("e2.stage_twins", || {
-                self.stage_claude_history_twins(&key, page)
-            });
-        }
+
+        claude_request_money::e2::timed("e2.stage_twins", || {
+            self.stage_claude_history_twins(&key, page)
+        });
+
         let decision = claude_history_upgrade::decide(
             kind,
             &claude_history_upgrade::PolicyInputs {
@@ -46812,8 +46785,7 @@ impl ScanIndex {
             ));
         });
         self.claude_request_identity_contract_changed = true;
-        let e2_adoption = claude_request_money::e2::enabled()
-            && contract == claude_request_identity::E2_GROUPING
+        let e2_adoption = contract == claude_request_identity::E2_GROUPING
             && self.active_effective_upload_body_witness_revision == 3;
         let recorded = if self.traversal.is_none() {
             contract
@@ -51640,8 +51612,7 @@ impl ScanIndex {
         // re-parse, usually the binding read, instead of a Full every pass.
         // A prefix-only hold must survive settlement of the file's own turns.
         // Its persisted attempt counter expires on the third decision pass.
-        if claude_request_money::e2::enabled()
-            && claude_request_money::e2::resumed_prefix_enabled()
+        if claude_request_money::e2::resumed_prefix_enabled()
             && self
                 .claude_copy_removals
                 .pending(claude_money_birth_store::location_key(&key))
