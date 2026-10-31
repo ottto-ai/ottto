@@ -309,11 +309,11 @@ fn pinned_v1_refuses_enum_tag_drift() {
 }
 
 #[test]
-fn pinned_v1_refuses_handwritten_codec_order_drift() {
+fn pinned_v1_refuses_selector_codec_order_drift() {
     assert_source_drift_refused(
         "snapshots.rs",
-        "        context.put(e)?;\n        sources.put(e)",
-        "        sources.put(e)?;\n        context.put(e)",
+        "    U context: BTreeMap<String, String>,\n    U sources: BTreeMap<String, String>,",
+        "    U sources: BTreeMap<String, String>,\n    U context: BTreeMap<String, String>,",
     );
 }
 

@@ -619,23 +619,6 @@ pub(crate) const MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES: usize = 641 * 1024;
 pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
 const MAX_TOOL_USAGE_NAMES: usize = 200;
-const CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD: &str = "attribution_mcp_tool";
-/// (raw CC key, canonical selector key). Subagent first (priority dimension).
-const CLAUDE_ATTRIBUTION_FIELDS: [(&str, &str); 5] = [
-    ("attributionAgent", "attribution_subagent"),
-    ("attributionSkill", "attribution_skill"),
-    ("attributionPlugin", "attribution_plugin"),
-    ("attributionMcpServer", "attribution_mcp_server"),
-    ("attributionMcpTool", CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD),
-];
-/// The selector keys attribution capture writes: raw names, never persisted.
-const CLAUDE_ATTRIBUTION_SELECTOR_KEYS: [&str; 5] = [
-    CLAUDE_ATTRIBUTION_FIELDS[0].1,
-    CLAUDE_ATTRIBUTION_FIELDS[1].1,
-    CLAUDE_ATTRIBUTION_FIELDS[2].1,
-    CLAUDE_ATTRIBUTION_FIELDS[3].1,
-    CLAUDE_ATTRIBUTION_FIELDS[4].1,
-];
 /// The backend's admission bound on `model_usage` rows per item and per bucket.
 const MAX_MODEL_USAGE_ROWS: usize = 100;
 
@@ -84095,61 +84078,10 @@ crate::durable_tail_codec::durable_struct!(key ActivityCallId { L id: String });
 crate::heap_layout_bound::fields!(ActivityCallTool; name);
 crate::durable_tail_codec::durable_struct!(ActivityCallTool { U name: String });
 crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
-// P2-1 (SOURCE): Claude attribution capture (`OTTTO_CLAUDE_ATTRIBUTION_CAPTURE`)
-// puts raw skill, plugin, MCP and subagent names into `context`. A context
-// holding any attribution key is class `E`: the record is refused (counted as
-// `not_persisted{SelectorCapture.context.attribution}`) and the entry reads
-// Full after a restart, so raw names never reach the store. Any other
-// context is `U`. Hand-written for that one conditional refusal; the shape
-// names both rules, so the allowlist binds them.
-impl crate::durable_tail_codec::Durable for SelectorCapture {
-    fn put(
-        &self,
-        e: &mut crate::durable_tail_codec::Enc,
-    ) -> Result<(), crate::durable_tail_codec::Refuse> {
-        let Self { context, sources } = self;
-        if context
-            .keys()
-            .any(|key| CLAUDE_ATTRIBUTION_SELECTOR_KEYS.contains(&key.as_str()))
-        {
-            return Err(crate::durable_tail_codec::Refuse::NonEmpty(
-                "SelectorCapture.context.attribution",
-            ));
-        }
-        context.put(e)?;
-        sources.put(e)
-    }
-    fn take(
-        d: &mut crate::durable_tail_codec::Dec<'_>,
-    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
-        type Map = BTreeMap<String, String>;
-        Ok(Self {
-            context: <Map as crate::durable_tail_codec::Durable>::take(d)?,
-            sources: <Map as crate::durable_tail_codec::Durable>::take(d)?,
-        })
-    }
-    fn verify(
-        d: &mut crate::durable_tail_codec::Dec<'_>,
-    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
-        type Map = BTreeMap<String, String>;
-        <Map as crate::durable_tail_codec::Durable>::verify(d)?;
-        <Map as crate::durable_tail_codec::Durable>::verify(d)
-    }
-    fn shape(s: &mut crate::durable_tail_codec::Shape) {
-        type Map = BTreeMap<String, String>;
-        if s.enter("SelectorCapture") {
-            s.push("U context");
-            <Map as crate::durable_tail_codec::Durable>::shape(s);
-            s.push("E context.attribution");
-            for key in CLAUDE_ATTRIBUTION_SELECTOR_KEYS {
-                s.push(key);
-            }
-            s.push("U sources");
-            <Map as crate::durable_tail_codec::Durable>::shape(s);
-            s.leave();
-        }
-    }
-}
+crate::durable_tail_codec::durable_struct!(SelectorCapture {
+    U context: BTreeMap<String, String>,
+    U sources: BTreeMap<String, String>,
+});
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 // Measurement only (#665, X_out family U3): the identity the release proof peeks.
 crate::heap_layout_bound::fields!(crate::context_footprint::RepositoryIdentity; repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind);

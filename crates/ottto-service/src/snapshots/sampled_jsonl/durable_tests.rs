@@ -928,43 +928,6 @@ fn open_call_l_span_is_the_id_alone() {
     assert!(name >= end || name + "call_NAMEHALFcx".len() <= start);
 }
 
-/// P2-1 (SOURCE): a selector context holding any attribution capture key
-/// (raw skill, plugin, MCP or subagent names) is `E`: the record is refused
-/// under its own counted class and the entry reads Full. Any other context
-/// key persists (`U`).
-#[test]
-fn attribution_selector_context_refuses_the_record() {
-    let scratch = Scratch::new("attribution");
-    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
-    let (plain, _) = full_read(&path, SnapshotSource::ClaudeCode);
-    let mut kept = plain.clone();
-    kept.accumulator.current_selector.insert(
-        "service_tier",
-        "priority".into(),
-        "derived_from_logs_2",
-    );
-    encode(&kept, crate::durable_tail_store::RECORD_BYTES, line_cap())
-        .expect("a non-attribution selector context persists");
-    for key in crate::snapshots::CLAUDE_ATTRIBUTION_SELECTOR_KEYS {
-        let mut captured = plain.clone();
-        captured.accumulator.current_selector.insert(
-            key,
-            "CANARY_SKILL_dt".into(),
-            "claude_code_attribution_field",
-        );
-        assert_eq!(
-            encode(
-                &captured,
-                crate::durable_tail_store::RECORD_BYTES,
-                line_cap()
-            )
-            .err(),
-            Some(Refuse::NonEmpty("SelectorCapture.context.attribution")),
-            "{key}"
-        );
-    }
-}
-
 /// Decode plus bounded re-derivation gives back exactly the retained copy,
 /// content fields included, within the head bound and named-line budget.
 #[test]
@@ -1242,7 +1205,6 @@ fn allowlist_digest_binds_source_and_field_classes() {
         "D claude_blobs",
         "D calls",
         "H digest",
-        "E context.attribution",
         "D reducer",
         "D epoch",
         "D last_native",
