@@ -2113,7 +2113,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
     }
 }
 
-/// P1: an overdue restored checkpoint must finish through the real cursor
+/// [regress] P1: an overdue restored checkpoint must finish through the real cursor
 /// seal, publish, replace its disk binding, then restore without rereading.
 /// At 57ffaa32 Codex increments jobs_audit_restarted, never jobs_certified.
 /// Claude is the already-working ordinary-Tail negative regression control.
@@ -2287,13 +2287,23 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
                 group.is_some() && witness.is_some(),
                 "accepted body is bound"
             );
+            // Ordinary Claude Tail already commits its M3 record before ACK;
+            // Codex's paged cursor still offers its record after index save.
+            // Verify that boundary as well as the exact replacement below.
+            if source == SnapshotSource::ClaudeCode {
+                assert_ne!(
+                    read_record().record.binding.entry,
+                    old_record.record.binding.entry,
+                    "native Tail committed before index save",
+                );
+            }
             index.save(&index_path).unwrap();
             assert_eq!(
                 second
                     .durable_write_after_save(lock, source, &index)
                     .unwrap()
                     .written,
-                1
+                usize::from(source == SnapshotSource::Codex),
             );
             let new_record = read_record();
             assert_ne!(
