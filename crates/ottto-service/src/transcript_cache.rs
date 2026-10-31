@@ -647,12 +647,12 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         if heap_layout_bound::bound(&key, self.entry_limit as usize - state_bytes).is_none() {
             return refuse(Event::InsertKeyBoundRefused, incoming);
         }
-        let extra = entry_slot_bytes::<S>(key.len())
-            .and_then(|n| n.checked_add(heap_bytes))
-            .and_then(|n| n.checked_add(self.custody_extra(&key, custody_bytes?)?));
         self.clock = next;
         let mut admitted = true;
         loop {
+            let extra = entry_slot_bytes::<S>(key.len())
+                .and_then(|n| n.checked_add(heap_bytes))
+                .and_then(|n| n.checked_add(self.custody_extra(&key, custody_bytes?)?));
             let fits = self.entries.len() + usize::from(admitted) <= (self.count_limit as usize)
                 && heap_layout_bound::bound(self, usize::MAX)
                     .and_then(|n| n.checked_add(if admitted { extra? } else { 0 }))
@@ -791,6 +791,44 @@ mod tests {
             .expect("same nonclone guard")
             .finish();
         assert!(admitted.durable.take_retail().is_none());
+        let make = |name: &str, rank| {
+            let mut next = Box::new(Taken {
+                retained: Retained {
+                    checkpoint: admitted.retained.checkpoint.clone(),
+                    state: "guarded graph".to_string(),
+                },
+                durable: Default::default(),
+                modified_hint: (rank, 0),
+                finalization_charge: 0,
+                e2_held_new_file: false,
+            });
+            next.durable.put_retail(
+                owner
+                    .begin_retail(
+                        SnapshotSource::ClaudeCode,
+                        name,
+                        &next.retained.checkpoint,
+                        &file,
+                        3,
+                        std::time::Instant::now(),
+                    )
+                    .unwrap(),
+            );
+            next
+        };
+        let mut bounded = TranscriptCache::<String>::new(CACHE_BYTES, ENTRY_BYTES, 1);
+        assert!(bounded
+            .insert_taken_reserving("old".into(), make("old", 1), 0)
+            .is_ok());
+        bounded.byte_limit = heap_layout_bound::bound(&bounded, usize::MAX).unwrap() - 1;
+        let incoming = make("new", 2);
+        assert!(
+            bounded
+                .insert_taken_reserving("new".into(), incoming, 0)
+                .is_err(),
+            "evicting the last custody node must repay the recreated map root"
+        );
+        assert!(heap_layout_bound::bound(&bounded, bounded.byte_limit).is_some());
     }
 
     #[test]
