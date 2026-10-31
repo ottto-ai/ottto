@@ -313,10 +313,13 @@ pub(crate) enum OverCap {
     Rows,
     Bytes,
     NearCap,
+    IdentityHeld,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Tagged {
+    /// Increased-cap body remains owed; no revision may be uploaded.
+    Held,
     /// Tagged body (possibly with every row untagged).
     Sent { refusals: u64 },
     /// Today's untagged shape under the new collector with refusals.
@@ -1139,6 +1142,16 @@ fn apply_grouped_with_accepted(
             });
         }
         over_cap.insert(OverCap::Bytes);
+    }
+    if max_item_bytes > MAX_ITEM_BYTES && !over_cap.is_empty() {
+        over_cap.insert(OverCap::IdentityHeld);
+        crate::local_resource_diagnostics::claude_identity_over_cap(
+            &over_cap,
+            attempted_bytes,
+            components.as_ref(),
+        );
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        return Ok(Tagged::Held);
     }
     crate::local_resource_diagnostics::claude_identity_over_cap(
         &over_cap,
@@ -4677,6 +4690,7 @@ pub(crate) struct ScanOutcome {
     pub(crate) sent: usize,
     pub(crate) fallback: usize,
     pub(crate) ineligible: usize,
+    pub(crate) held: BTreeSet<String>,
 }
 
 const REPORTED: &str = "session_exclusive_reported_usage:v1";
@@ -4844,6 +4858,9 @@ pub(crate) fn apply_scan_with_ownership(
             continue;
         }
         match tag_item(item, evidence, &mut reported, ownership) {
+            Some(Ok(Tagged::Held)) => {
+                outcome.held.insert(item.source_session_id.clone());
+            }
             Some(Ok(Tagged::Sent { .. })) => outcome.sent += 1,
             Some(Ok(Tagged::Fallback { .. })) => outcome.fallback += 1,
             Some(Err(_)) | None => outcome.ineligible += 1,

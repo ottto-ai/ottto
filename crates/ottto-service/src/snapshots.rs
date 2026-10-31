@@ -5182,8 +5182,12 @@ impl ClaudeUsageAuthorityDisposition {
     /// page but never upload; the hold is not bound to an authority record,
     /// so it blocks progress and the files are read again: delayed, never
     /// settled without their body. Not an account deferral.
-    pub(crate) fn hold_request_owned(&mut self, session_ids: BTreeSet<String>) {
+    pub(crate) fn hold_request_owned(
+        &mut self,
+        session_ids: BTreeSet<String>,
+    ) -> &BTreeSet<String> {
         self.quarantined_source_session_ids.extend(session_ids);
+        &self.quarantined_source_session_ids
     }
 
     pub(crate) fn defer_sessions(&mut self, session_ids: BTreeSet<String>) {

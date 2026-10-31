@@ -2481,6 +2481,28 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
             .unwrap_err()
             .contains("wire body")
     );
+    // Lead B's increased-cap last resort: preserve tags and money, and use
+    // the existing upload hold instead of sending a smaller stripped revision.
+    let mut held = item.clone();
+    let before = sticky_money(&held);
+    let result = identity::apply_with_reserved_bytes_for_test(
+        &mut held,
+        &proof,
+        &ledger,
+        0,
+        Some(1_048_576),
+    )
+    .unwrap();
+    assert_eq!(result, Tagged::Held);
+    assert_eq!(sticky_money(&held), before);
+    assert!(held.usage_buckets[..400]
+        .iter()
+        .all(|bucket| sticky_tagged(&bucket.model_usage[0])));
+    let mut disposition = ClaudeUsageAuthorityDisposition::default();
+    disposition.hold_request_owned(BTreeSet::from([held.source_session_id.clone()]));
+    let mut uploadable = vec![held];
+    disposition.retain_uploadable(&mut uploadable);
+    assert!(uploadable.is_empty());
 }
 
 /// [money] Previously stripped buckets are new accepted tags on the next ACK,

@@ -109,10 +109,10 @@ mod footprint;
 pub(crate) mod rearm_cause;
 
 #[cfg(not(test))]
-static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 #[cfg(test)]
 thread_local! {
-    static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 7] = const { [const { AtomicU64::new(0) }; 7] };
+    static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 8] = const { [const { AtomicU64::new(0) }; 8] };
 }
 
 /// Append-only reason labels, cumulative per process (not distinct sessions).
@@ -123,7 +123,7 @@ pub(crate) fn claude_identity_over_cap(
     components: Option<&ClaudeIdentityOverCapBytes>,
 ) {
     use crate::snapshots::claude_request_identity::OverCap;
-    const LABELS: [&str; 7] = [
+    const LABELS: [&str; 8] = [
         "evidence_entries",
         "authority_keys",
         "parts_per_row",
@@ -131,8 +131,9 @@ pub(crate) fn claude_identity_over_cap(
         "rows",
         "bytes",
         "near_cap",
+        "identity_over_cap_held",
     ];
-    let record = |counters: &[AtomicU64; 7]| {
+    let record = |counters: &[AtomicU64; 8]| {
         for reason in reasons {
             let index = match reason {
                 OverCap::EvidenceEntries => 0,
@@ -142,6 +143,7 @@ pub(crate) fn claude_identity_over_cap(
                 OverCap::Rows => 4,
                 OverCap::Bytes => 5,
                 OverCap::NearCap => 6,
+                OverCap::IdentityHeld => 7,
             };
             let _ = counters[index].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
         }
@@ -160,7 +162,9 @@ pub(crate) fn claude_identity_over_cap(
                 claude_request_identity_over_cap: LABELS
                     .into_iter()
                     .zip(counters.iter().map(|n| n.load(Relaxed)))
-                    .filter(|(label, count)| *label != "near_cap" || *count != 0)
+                    .filter(|(label, count)| {
+                        !matches!(*label, "near_cap" | "identity_over_cap_held") || *count != 0
+                    })
                     .collect(),
                 claude_request_identity_last_over_cap_item_bytes: item_bytes,
                 claude_request_identity_last_over_cap_components: components,

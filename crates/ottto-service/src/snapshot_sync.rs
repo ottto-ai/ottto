@@ -10273,13 +10273,18 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 index,
                 &disposition,
             );
-        let _request_identity =
-            crate::snapshots::claude_request_identity::apply_scan_with_ownership(
-                &mut scan_result.snapshots,
-                evidence,
-                std::mem::take(&mut disposition.request_groupings),
-                &ownership,
-            );
+        let request_identity = crate::snapshots::claude_request_identity::apply_scan_with_ownership(
+            &mut scan_result.snapshots,
+            evidence,
+            std::mem::take(&mut disposition.request_groupings),
+            &ownership,
+        );
+        if !request_identity.held.is_empty() {
+            let held = disposition.hold_request_owned(request_identity.held);
+            if let Some((cache, committed)) = retained {
+                cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, held);
+            }
+        }
         if let Some(activity) = request_owned_activity {
             crate::snapshots::claude_request_identity::publish_request_owned_activity(
                 &scan_result.snapshots,
