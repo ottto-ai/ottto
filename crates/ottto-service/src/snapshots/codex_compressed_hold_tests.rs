@@ -2340,9 +2340,10 @@ fn held_archive_replay_does_not_settle_from_historical_fingerprint_alone() {
         let witness = before.last_upload_body_witness.as_ref().unwrap().clone();
         let historical_ack = BTreeMap::from([(fp.clone(), witness.clone())]);
         seed_archive(&mut index, &path, OWNER);
+        let seeded_attempts = 1;
         let archive = index.files.get_mut(&key).unwrap().archive.as_mut().unwrap();
         archive.disposition = ArchiveDisposition::Pending {
-            attempts: 1,
+            attempts: seeded_attempts,
             retry_after: u64::MAX,
         };
         archive.body_witness =
@@ -2397,9 +2398,10 @@ fn held_archive_replay_does_not_settle_from_historical_fingerprint_alone() {
                 "excluded custody is not a quiet opened unacked attempt"
             );
             assert!(!next.files[&key].archive.as_ref().unwrap().reservation_saved);
+            // Replay makes NO new decode: attempts stay at the seeded value.
             assert_eq!(
                 next.files[&key].archive.as_ref().unwrap().decode_attempts,
-                0
+                seeded_attempts
             );
             assert!(
                 next.accepted_snapshot_fingerprints.contains(&fp),
