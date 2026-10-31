@@ -76,28 +76,6 @@ pub(crate) struct ClaudeCutoffCorrectionCandidate {
 
 #[cfg(test)]
 impl ClaudeProofCorrectionCandidate {
-    pub(crate) fn for_test(index: &ScanIndex, key: &str, body_witness: String) -> Self {
-        let (root, member) = claude_index_path_family_member(Path::new(key)).unwrap();
-        Self {
-            proof: index.claude_usage_authority_quarantine[&root]
-                .proof_correction
-                .as_ref()
-                .unwrap()
-                .proof_witness_fingerprint
-                .clone(),
-            root,
-            member,
-            index_key: key.to_string(),
-            revision: index.files[key].source_file_fingerprint.clone(),
-            fingerprint: index.file_snapshot_fingerprints[key]
-                .iter()
-                .next()
-                .unwrap()
-                .clone(),
-            body_witness,
-        }
-    }
-
     pub(crate) fn member_for_test(&self) -> &str {
         &self.member
     }

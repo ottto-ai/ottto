@@ -4424,11 +4424,16 @@ fn r2_no_op_drain_keeps_the_selected_revision_off_and_on() {
                 let scratch = crate::test_scratch::ScratchDir::new("apc-r2-selected-body");
                 let index_path = scratch.join("index.json");
                 let progress_path = scratch.join("progress.json");
-                let transcripts = scratch.join("transcripts");
-                std::fs::create_dir(&transcripts).unwrap();
+                let transcripts = scratch.join("projects");
+                let root = apc_m2_root(0);
+                let member = apc_m2_agent(0);
+                let subagents = transcripts.join(&root).join("subagents");
+                std::fs::create_dir_all(&subagents).unwrap();
+                let path = subagents.join("agent-m20000.jsonl");
+                let key = path.to_str().unwrap().to_string();
                 std::fs::write(
-                    transcripts.join(format!("{}.jsonl", apc_m2_root(0))),
-                    apc_transcript_line(&apc_m2_root(0), None, "req_r2", 1),
+                    &path,
+                    apc_transcript_line(&root, Some("m20000"), "req_r2", 1),
                 )
                 .unwrap();
                 let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
@@ -4441,16 +4446,35 @@ fn r2_no_op_drain_keeps_the_selected_revision_off_and_on() {
                     false,
                 )
                 .unwrap();
-                let mut item = scan.snapshots.remove(0);
-                let (root, member, key) = (apc_m2_root(0), apc_m2_agent(0), apc_m2_agent_key(0));
-                item.source_session_id = member.clone();
-                item.snapshot_fingerprint = apc_m2_digest(3, 1);
-                let body = snapshot_upload_body_witness(&item);
+                assert_eq!(scan.snapshots.len(), 1);
+                let item = &mut scan.snapshots[0];
+                assert_eq!(item.source_session_id, member);
+                // CONTROLLED persisted proof fixture: model its reported body
+                // after authority classification, before correction capture.
+                item.usage_accounting_contract = APC_REPORTED.map(str::to_string);
+                item.snapshot_fingerprint =
+                    crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+                let revision = item.source_file_fingerprint.clone().unwrap();
+                let body = snapshot_upload_body_witness(item);
                 let mut value = serde_json::to_value(apc_m2_index(1, owed, false, true)).unwrap();
-                value["files"][&key]["last_upload_body_witness"] =
+                let old_key = apc_m2_agent_key(0);
+                let old_fingerprint = apc_m2_digest(3, 1);
+                let mut entry = value["files"].as_object_mut().unwrap().remove(&old_key).unwrap();
+                entry["last_snapshot_fingerprint"] = serde_json::json!(item.snapshot_fingerprint);
+                entry["last_upload_body_witness"] =
                     serde_json::json!(crate::snapshots::snapshot_file_upload_body_set_for_test(
                         std::slice::from_ref(&body)
                     ));
+                value["files"][&key] = entry;
+                value["file_snapshot_fingerprints"].as_object_mut().unwrap().remove(&old_key);
+                value["file_snapshot_fingerprints"][&key] = serde_json::json!([item.snapshot_fingerprint]);
+                for fingerprint in value["accepted_snapshot_fingerprints"].as_array_mut().unwrap() {
+                    if fingerprint.as_str() == Some(&old_fingerprint) {
+                        *fingerprint = serde_json::json!(item.snapshot_fingerprint);
+                    }
+                }
+                let activity = value["snapshot_activity_at"].as_object_mut().unwrap().remove(&old_fingerprint).unwrap();
+                value["snapshot_activity_at"][&item.snapshot_fingerprint] = activity;
                 value["claude_usage_family_pending"][&root] = serde_json::json!({
                     "census_window_end": APC_WINDOW_END, "member_request_id_hashes": {}, "invalid": false,
                 });
@@ -4459,16 +4483,16 @@ fn r2_no_op_drain_keeps_the_selected_revision_off_and_on() {
                 let before = committed.claude_authority_record_for_test(&root).unwrap();
                 assert!(before.family_pending_retained && before.bound_to_retained_witness);
                 let mut current = committed.clone();
-                let revision = apc_m2_digest(7, 1);
                 current.files.get_mut(&key).unwrap().source_file_fingerprint = revision.clone();
-                let candidate = crate::snapshots::ClaudeProofCorrectionCandidate::for_test(
-                    &current,
-                    &key,
-                    body.clone(),
+                let candidates = current.capture_claude_proof_corrections(
+                    &mut scan,
+                    &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+                    snapshot_upload_body_witness,
                 );
+                let item = scan.snapshots.remove(0);
                 let drains = current.settle_claude_proof_corrections(
                     &committed,
-                    &[candidate],
+                    &candidates,
                     &BTreeSet::new(),
                     &BTreeMap::new(),
                 );
@@ -4554,8 +4578,8 @@ fn r2_no_op_drain_keeps_the_selected_revision_off_and_on() {
 }
 
 /// [behaviour] R3: a persisted correction with lagging member revisions pulls
-/// its family onto page zero beyond the page cap. The existing forced_family
-/// counter accounts for exactly one family-unit burst, with OFF and ON rows.
+/// its family onto page zero beyond the page cap. The real scan returns only
+/// that family and reads its two members, with OFF and ON rows.
 #[test]
 fn r3_page_zero_forced_family_is_counted_and_bounded_off_and_on() {
     for terminal_on in [false, true] {
@@ -4604,7 +4628,6 @@ fn r3_page_zero_forced_family_is_counted_and_bounded_off_and_on() {
             false,
         )
         .unwrap();
-        let forced = scan.forced_family_for_test;
         let family = BTreeSet::from([root.clone(), apc_m2_agent(0)]);
         let parsed = scan
             .snapshots
@@ -4615,9 +4638,10 @@ fn r3_page_zero_forced_family_is_counted_and_bounded_off_and_on() {
             parsed, family,
             "page zero parses every member of exactly this family"
         );
-        assert_eq!(forced, family.len(), "one counted family-unit burst");
-        assert!(scan.scanned_file_count <= 1 + forced);
-        assert_eq!(scan.scanned_file_count, family.len());
+        assert_eq!(
+            scan.scanned_file_count, 2,
+            "the cap-one page reads both family members and nothing else"
+        );
         let after = index.claude_authority_record_for_test(&root).unwrap();
         assert_eq!(
             after, before,

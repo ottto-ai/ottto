@@ -7671,15 +7671,11 @@ macro_rules! scan_result {
         #[derive(Debug, Clone)]
         pub struct $name {
             pub source: SnapshotSource, $($(#[$attr])* $vis $field: $ty,)*
-            #[cfg(test)]
-            pub(crate) forced_family_for_test: usize,
         }
         impl $name {
             fn empty(source: SnapshotSource) -> Self {
                 Self {
                     source, $($field: Default::default(),)*
-                    #[cfg(test)]
-                    forced_family_for_test: 0,
                 }
             }
         }
@@ -32218,9 +32214,6 @@ impl OwnedSourceScan {
                     scanned_file_count,
                     scanned_session_count,
                     semantic_noop_count,
-                    #[cfg(test)]
-                    forced_family_for_test: census.parse_reasons
-                        [CandidateParseReason::ForcedFamily as usize],
                     census_complete,
                     census_window_end,
                     state_census_complete,
