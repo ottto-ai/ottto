@@ -3695,7 +3695,13 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         let Some(accounts) = fold.accounts.as_deref_mut() else {
             continue;
         };
-        if accounts.unhealthy_no_fallback {
+        // Reconciliation's new Unknown decisions are final for this file.
+        // A blanket root/start fill must not restore an invalid account or
+        // turn an explicitly seedless gap into unmarked per-request proof.
+        if accounts.unhealthy_no_fallback
+            || (accounts.reconciled
+                && (accounts.carried.blocked_no_account > 0 || accounts.carried.no_seed > 0))
+        {
             continue;
         }
         if accounts.subagent {
