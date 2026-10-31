@@ -18,6 +18,7 @@
 //! discovered and reported as `reachable = false` with empty tools (cost zero)
 //! until a network MCP client lands — see `TODO(mcp-http-transport)` below.
 
+use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::codex_version::{CodexVersionFeed, Sample};
 use crate::snapshots::SnapshotSource;
@@ -1865,21 +1866,9 @@ fn read_cache(path: &Path) -> Option<InventoryCacheEntry> {
 /// torn record that would force a redundant re-POST. Best-effort: a write error
 /// is non-fatal (it only costs one extra upload next cycle).
 fn write_cache(path: &Path, entry: &InventoryCacheEntry) {
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
     let mut entry = entry.clone();
     entry.seed = entry.seed.filter(|s| s.sample().is_some());
-    let Ok(payload) = serde_json::to_vec(&entry) else {
-        return;
-    };
-    let temp = path.with_extension("json.tmp");
-    if std::fs::write(&temp, &payload).is_ok() {
-        let _ = std::fs::rename(&temp, path);
-    }
+    write_json_atomic(path, &entry);
 }
 
 /// SHA-256 over the inventory's meaningful content. `machine_id` and

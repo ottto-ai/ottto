@@ -11,6 +11,7 @@ use crate::context_file_counts::{load_or_create_salt, measure_file, FileCounts};
 use crate::instruction_inventory::{
     build_instruction_inventory, default_login_claude_mode, InstructionInventory, InventoryPaths,
 };
+use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{
     load_snapshot_device_credentials, workspace_labels_allowed, ActivityHintResponse,
     SnapshotApiClient,
@@ -1551,7 +1552,7 @@ fn upload_if_changed(
     let payload = serde_json::to_value(request)
         .map_err(|error| anyhow!("encode context footprint: {error}"))?;
     client.upload_context_footprint(relay_token, &payload)?;
-    write_cache(
+    write_json_atomic(
         &path,
         &FootprintCacheEntry {
             identity: identity.to_string(),
@@ -1651,22 +1652,6 @@ fn cache_path(support_dir: &Path, workspace_hash: &str) -> PathBuf {
 fn read_cache(path: &Path) -> Option<FootprintCacheEntry> {
     let bytes = fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
-}
-
-fn write_cache(path: &Path, entry: &FootprintCacheEntry) {
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let Ok(payload) = serde_json::to_vec(entry) else {
-        return;
-    };
-    let temp = path.with_extension("json.tmp");
-    if fs::write(&temp, &payload).is_ok() {
-        let _ = fs::rename(&temp, path);
-    }
 }
 
 fn cache_is_stale(entry: &FootprintCacheEntry, now: OffsetDateTime) -> bool {
