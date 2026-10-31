@@ -472,8 +472,9 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
 /// this cycle's `session_request_account_source:v1` state. Root item + counts.
 fn e2_carry_pages(
     gaps: &[&str],
-    no_account: &[&str],
+    no_account: &[(&str, bool)],
     modes: &[Option<bool>],
+    acknowledge: bool,
 ) -> Vec<(SnapshotItem, serde_json::Value)> {
     let (dir, root, _) = claude_account_family_fixture();
     let support = dir.join("support");
@@ -483,8 +484,16 @@ fn e2_carry_pages(
         e2_resign(row);
     }
     for row in &mut api {
-        if no_account.contains(&row.request_id.as_str()) {
+        if let Some((_, contradictory)) = no_account.iter().find(|(id, _)| *id == row.request_id) {
             row.account_identifier_hash = None;
+            if *contradictory {
+                row.request_identity = Some(serde_json::from_value(json!({
+                    "identity_hash_scheme": "provider-sha256:v1",
+                    "disposition": "invalid",
+                    "account": {"origin": "missing", "disposition": "invalid"},
+                    "organization": {"origin": "missing", "disposition": "missing"}
+                })).unwrap());
+            }
             e2_resign(row);
         }
     }
@@ -496,10 +505,10 @@ fn e2_carry_pages(
         &root,
         &trace,
     );
+    let mut accepted = claude_request_identity::AcceptedBuckets::for_test();
     let pages = modes
         .iter()
         .map(|mode| {
-            let mut accepted = claude_request_identity::AcceptedBuckets::default();
             accepted.set_account_source_enabled(*mode == Some(true));
             let (items, _, failed, counts) = e2_page_counted_with(
                 std::slice::from_ref(&dir),
@@ -508,10 +517,18 @@ fn e2_carry_pages(
                 mode.map(|_| &accepted),
             );
             assert!(!failed);
-            let item = items
-                .into_iter()
-                .find(|item| item.source_session_id == root)
-                .unwrap();
+            // req_5 belongs to the child stream and keeps its own account;
+            // it cannot seed the parent's leading gaps or take the parent's B.
+            if *mode == Some(true) {
+                let child = items.iter().find(|item| item.source_session_id != root).unwrap();
+                assert_eq!(e2_source_counts(child), BTreeMap::from([((Some(e2_account()), None), 1)]));
+            }
+            if acknowledge {
+                for item in &items {
+                    accepted.record(&serde_json::to_value(item).unwrap());
+                }
+            }
+            let item = items.into_iter().find(|item| item.source_session_id == root).unwrap();
             (item, counts)
         })
         .collect();
@@ -585,11 +602,18 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
             0,
         ),
     ] {
-        let pages = e2_carry_pages(gaps, &[], &[Some(false), Some(true)]);
-        let [(off, _), (on, counts)] = &pages[..] else {
+        let pages = e2_carry_pages(gaps, &[], &[Some(false), Some(true), Some(true)], true);
+        let [(off, _), (on, counts), (again, _)] = &pages[..] else {
             unreachable!()
         };
         assert_eq!(e2_source_counts(on), BTreeMap::from_iter(expected), "{gaps:?}");
+        // req_3 is observed B inside the gap stream: carry cannot replace it.
+        assert_eq!(e2_source_counts(on).get(&(b.clone(), None)), Some(&1));
+        // Marking the old merged carry and acknowledging it never strips the
+        // accepted account or invokes B31's starting-binding fallback.
+        assert_eq!(on.request_identity_refusals, 0);
+        assert_eq!(again.request_identity_refusals, 0);
+        assert_eq!(e2_source_counts(again), e2_source_counts(on));
         assert_eq!(e2_count(counts, "claude_carried_forward_requests"), forward);
         assert_eq!(e2_count(counts, "claude_carried_backward_requests"), backward);
         assert_eq!(e2_count(counts, "claude_carry_ambiguous_gap_requests"), ambiguous);
@@ -611,7 +635,7 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
 /// the plain evidence stage, no `account_source`, main's unmarked fill.
 #[test]
 fn e2_pipeline_carry_capability_absent_keeps_main_bytes() {
-    let pages = e2_carry_pages(&["req_2", "req_4"], &[], &[None, Some(false), Some(true)]);
+    let pages = e2_carry_pages(&["req_2", "req_4"], &[], &[None, Some(false), Some(true)], false);
     let [(plain, _), (off, _), (on, _)] = &pages[..] else {
         unreachable!()
     };
@@ -629,22 +653,23 @@ fn e2_pipeline_carry_capability_absent_keeps_main_bytes() {
 /// Unknown and is counted; the next own account seeds again.
 #[test]
 fn e2_pipeline_no_account_row_blocks_the_carry() {
-    let pages = e2_carry_pages(&["req_4"], &["req_2"], &[Some(true)]);
-    let [(on, counts)] = &pages[..] else {
-        unreachable!()
-    };
-    let b = Some("b".repeat(64));
-    assert_eq!(
-        e2_source_counts(on),
-        BTreeMap::from([
-            ((None, None), 1),
-            ((Some(e2_account()), None), 1),
-            ((b.clone(), None), 1),
-            ((b, Some(AccountSource::CarriedForward)), 1),
-        ])
-    );
-    assert_eq!(e2_count(counts, "claude_carry_blocked_no_account_requests"), 1);
-    assert_eq!(e2_count(counts, "claude_carried_forward_requests"), 1);
+    for contradictory in [false, true] {
+        // req_3 is a gap AFTER the invalid row; neither it nor req_2 may
+        // inherit A. req_4's own B restarts the stream.
+        let pages = e2_carry_pages(&["req_3"], &[("req_2", contradictory)], &[Some(true)], false);
+        let [(on, counts)] = &pages[..] else { unreachable!() };
+        assert_eq!(
+            e2_source_counts(on),
+            BTreeMap::from([
+                ((None, None), 2),
+                ((Some(e2_account()), None), 1),
+                ((Some("b".repeat(64)), None), 1),
+            ])
+        );
+        assert_eq!(e2_count(counts, "claude_carry_blocked_no_account_requests"), 1);
+        assert_eq!(e2_count(counts, "claude_carried_forward_requests"), 0);
+        assert_eq!(e2_count(counts, "claude_carry_no_seed_requests"), 1);
+    }
 }
 
 #[test]

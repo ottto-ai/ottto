@@ -1376,7 +1376,9 @@ mod durable_restart {
             first.durable_write_after_save(state.lock, SOURCE, &prior);
             drop(first);
             // No telemetry row for the new request: a gap after req_1's own.
+            let prefix_bytes = fs::metadata(&f.path).unwrap().len();
             f.append_transcript(1);
+            let tail_bytes = fs::metadata(&f.path).unwrap().len() - prefix_bytes;
             let prior = ScanIndex::load(&state.index_path).unwrap();
             let restarted = Arc::new(SharedCache::default());
             state.begin(&restarted);
@@ -1387,6 +1389,12 @@ mod durable_restart {
             );
             let cold = enriched_e2_with(&f, raw_scan(&f, prior, None, |_| {}), Some(&accepted));
             assert_layout_mode(warm.modes, (0, 1, 0));
+            if crate::heap_layout_bound::layout_supported() {
+                assert_eq!(
+                    warm.native_bytes, tail_bytes,
+                    "zero extra native bytes for the seed"
+                );
+            }
             assert_eq!(
                 restored(&restarted),
                 u64::from(crate::heap_layout_bound::layout_supported())

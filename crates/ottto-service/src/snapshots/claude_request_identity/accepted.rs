@@ -358,14 +358,6 @@ impl AcceptedSession {
     pub(super) fn authority_hash(&self, authority: &AuthorityKey) -> [u8; 32] {
         authority_hash(self.key.as_ref().expect("bound accepted epoch"), authority)
     }
-    /// A share's ledger authority: none for a carried share, which is never
-    /// a proven authority (matches `record`'s reading of the wire).
-    pub(super) fn share_hash(&self, authority: &AuthorityKey) -> Option<[u8; 32]> {
-        authority
-            .account_source
-            .is_none()
-            .then(|| self.authority_hash(authority))
-    }
     /// Frozen tagged rows of a present bucket that no current row key matches,
     /// e.g. usage moved to a new key by late effort or billing resolution.
     pub(super) fn vanished_rows<'r>(

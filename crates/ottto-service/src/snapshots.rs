@@ -2138,7 +2138,7 @@ pub struct SnapshotRequestEvidence {
     pub identity_basis: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_workspace_hash: Option<String>,
-    /// Absent: the request's own evidence, as before. Present only under the
+    /// Absent: existing provenance (own evidence or existing fills). Present under the
     /// `session_request_account_source:v1` capability: an account carried
     /// within one transcript to a request with no telemetry row (placement,
     /// never per-request proof).
@@ -2146,7 +2146,12 @@ pub struct SnapshotRequestEvidence {
     pub account_source: Option<AccountSource>,
 }
 
+/// Exact shared activity-hint capability for carried-account provenance.
+/// Missing/null/unknown keeps existing wire bytes for every source.
+pub(crate) const ACCOUNT_SOURCE_CONTRACT: &str = "session_request_account_source:v1";
+
 /// How a carried account reached a request (SOURCE 2026-10-31, class N).
+/// Shared wire shape for source reducers; unmarked provenance stays absent.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountSource {
@@ -8400,7 +8405,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
                         && owned.peek().is_some()
                         && owned.all(|item| {
                             item.source_session_id == member
-                                && exact_session_account_hash(item).as_ref() == Some(account)
+                                // Retirement compares placement, not per-request proof.
+                                && uniform_session_account_hash(item).as_ref() == Some(account)
                         });
                     if let Some(requests) = account_pending.member_requests.get_mut(&member) {
                         requests.identity_revision = qualified
@@ -14268,6 +14274,12 @@ fn exact_session_account_hash(item: &SnapshotItem) -> Option<String> {
     {
         return None;
     }
+    uniform_session_account_hash(item)
+}
+
+/// Uniform placement only, including carried rows. Never use for creator,
+/// retained, sole-login or own-request proof.
+fn uniform_session_account_hash(item: &SnapshotItem) -> Option<String> {
     let mut rows = item.model_usage.iter().chain(
         item.usage_buckets
             .iter()
