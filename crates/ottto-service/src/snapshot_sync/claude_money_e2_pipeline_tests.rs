@@ -4206,6 +4206,66 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
     }
 }
 
+/// [money] Money shard B1 (2026-10-31): path twins of one resumed session
+/// sum into the first item's body, so a copied-marker loan recorded only by a
+/// later twin (its own later turn) must reach the copy-derived selection too.
+/// Switch ON tombstones every OFF row X lent, whichever twin lent it.
+#[test]
+fn e2_pipeline_copy_derived_rows_of_a_later_path_twin_are_invalidated() {
+    for retained in [false, true] {
+        with_e2(|| {
+            use crate::snapshots::claude_request_identity::{take_identity_counts, AcceptedBuckets};
+            let mut c = Corpus::new("e2-pipeline-copy-derived-twins");
+            let scanner = E2ScanFixture::capturing_identity();
+            c.root(ROOT, &resumed(ROOT, &[A]));
+            let old = ScanIndex::default();
+            let page = ready(&c, &scanner, old.clone(), 100, false);
+            let prior = settle(&c, &old, page, &mut e2_progress());
+            let org_x = "11111111-1111-4111-8111-111111111111";
+            let x = ottto_core::billing_identity_hash("anthropic", "organization", org_x).unwrap();
+            let text = json!({"type":"attachment", "sessionId":COPY, "attachment":{
+                "type":"credential_org", "organizationUuid":org_x}}).to_string()
+                + "\n" + &resumed(COPY, &[A, C]);
+            // The later twin alone holds an own turn in a later hour.
+            c.write_at(&format!("a-first/{COPY}.jsonl"), &text, "2026-08-02T07:03:00Z");
+            let later = text + &line_by(COPY, "own-late", "2026-08-02T09:10:00Z", 10, RESUME_WRITER);
+            c.write_at(&format!("z-twin/{COPY}.jsonl"), &later, "2026-08-02T07:03:00Z");
+            let off = {
+                let _off = e2::ResumedPrefixForTest::set(false);
+                ready(&c, &scanner, prior.clone(), 100, false)
+            };
+            let stored = body(&off, COPY).unwrap();
+            let tagged = |item: &SnapshotItem| item.usage_buckets.iter()
+                .filter(|bucket| bucket.model_usage.iter()
+                    .any(|row| row.evidence_ref.is_some() || row.identity_parts.is_some()))
+                .count() as u64;
+            assert_eq!(stored.usage_buckets.len(), 2, "both twins' hours are summed");
+            assert_eq!(tagged(stored), 2, "OFF froze both hours under X");
+            assert!(org_shares(stored).contains_key(&x));
+            let mut ledger = AcceptedBuckets::for_test();
+            ledger.set_retained_enabled(retained);
+            let value = serde_json::to_value(stored).unwrap();
+            ledger.record(&value);
+            if retained {
+                ledger.record_proved(&value, true, &[]);
+            }
+            let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
+            take_identity_counts();
+            page.enrich_with(&c, Some(&mut ledger));
+            let paths = scanner.paths();
+            assert!(paths.iter().any(|path| path.ends_with(format!("z-twin/{COPY}.jsonl"))));
+            let counts = serde_json::to_value(take_identity_counts()).unwrap();
+            let copy = body(&page, COPY).expect("the own turns publish");
+            assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 2,
+                "one tombstone per X row, the later twin's hour included");
+            assert_eq!(copy.request_identity_refusals, 0, "never a refusal");
+            assert!(copy.usage_buckets.iter().flat_map(|bucket| &bucket.model_usage)
+                .all(|row| !row.identity_retained), "no retained X marker");
+            assert_eq!(org_shares(copy).get(&x), None);
+        });
+    }
+}
+
 /// [regress] Strict review 2026-10-31: a row frozen from the corrected
 /// (switch-on) body holds the lent request's own share beside an own-proved
 /// copy of the lent org. A later own change there keeps #909's protection;

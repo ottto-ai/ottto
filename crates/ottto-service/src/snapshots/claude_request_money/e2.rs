@@ -3949,6 +3949,9 @@ pub(crate) fn finish_page(
         locations: Vec<LocationKey>,
         /// Decision counters, recorded once the session is decided.
         decided: Counts,
+        /// Later path twins' copied-marker loans: the emitted first item
+        /// carries them so `copy_derived_rows` sees every summed request.
+        twin_loans: Vec<LentSlot>,
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4010,6 +4013,7 @@ pub(crate) fn finish_page(
                 complete: telemetry == TelemetryRead::Loaded,
                 locations: Vec::new(),
                 decided: Counts::default(),
+                twin_loans: Vec::new(),
             });
         diag("resolver_conflict", fold.entity.resolver_conflicts);
         let unproven = fold.prefix.unproven_requests + fold.prefix.unproven_idless;
@@ -4066,6 +4070,11 @@ pub(crate) fn finish_page(
                 session.first_original = Some(session.entity.clone());
             }
             session.entity.sum(&fold.entity);
+            if let Some(accounts) = fold.accounts.as_deref() {
+                session
+                    .twin_loans
+                    .extend(accounts.copied_marker_lent.values().cloned());
+            }
         }
         session.entity.clock_incomplete |= claude_usage_occurrences.values().any(|occurrence| {
             !occurrence.usage.is_zero()
@@ -4108,7 +4117,7 @@ pub(crate) fn finish_page(
             state.entity.held |= held.contains(session);
             decided.push((session.to_owned(), state.decided));
             let first = (state.first_original, state.first_undo);
-            (session.to_owned(), (state.entity, first))
+            (session.to_owned(), (state.entity, first, state.twin_loans))
         })
         .collect::<BTreeMap<_, _>>();
     let mut withheld = BTreeSet::new();
@@ -4118,7 +4127,8 @@ pub(crate) fn finish_page(
         }
         // One body per session: the first item carries the summed entity.
         // A withheld session keeps every item (twins too) for the hold.
-        let Some((entity, (first_original, undo))) = entities.remove(&item.source_session_id)
+        let Some((entity, (first_original, undo), twin_loans)) =
+            entities.remove(&item.source_session_id)
         else {
             return withheld.contains(&item.source_session_id);
         };
@@ -4135,6 +4145,23 @@ pub(crate) fn finish_page(
         }
         if !emitted {
             withheld.insert(item.source_session_id.clone());
+        }
+        if let Some(accounts) = item
+            .claude_money
+            .as_deref_mut()
+            .and_then(|fold| fold.accounts.as_deref_mut())
+            .filter(|_| emitted)
+        {
+            // Reconcile and telemetry placement are done: past here loans are
+            // read only as values, so later twins take keys after the first's.
+            let lent = &mut accounts.copied_marker_lent;
+            let mut next = lent
+                .last_key_value()
+                .map_or(0, |(key, _)| key.saturating_add(1));
+            for slot in twin_loans {
+                lent.insert(next, slot);
+                next = next.saturating_add(1);
+            }
         }
         if let Some(fold) = item.claude_money.as_deref_mut() {
             fold.entity = match (emitted, first_original) {
