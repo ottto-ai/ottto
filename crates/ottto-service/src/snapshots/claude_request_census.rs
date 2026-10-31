@@ -458,6 +458,11 @@ impl ClaudeRequestCensusRecord {
         Some((&self.source_file_fingerprint, memo))
     }
 
+    /// Missing ids in a lossy scan cannot disprove an earlier removal.
+    pub(crate) fn is_lossy(&self) -> bool {
+        self.shape == ClaudeRequestCensusShape::Lossy
+    }
+
     pub(crate) fn over_budget(&self) -> bool {
         self.shape == ClaudeRequestCensusShape::OverBudget
     }

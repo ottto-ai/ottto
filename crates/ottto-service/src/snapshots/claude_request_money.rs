@@ -1,6 +1,7 @@
 //! Shared Claude request-money normalization and live E2 emission.
 
 pub(crate) mod body;
+pub(crate) mod copy_removals;
 pub(crate) mod e2;
 mod emit;
 // Census decoding still validates legacy ledger facts until their separate cutover.
