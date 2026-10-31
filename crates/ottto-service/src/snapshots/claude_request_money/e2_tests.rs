@@ -74,7 +74,7 @@ fn parse(path: &Path, birth: Option<i128>, index: &ScanIndex, lines: &[Value]) -
     let mut items = a.into_items(path, "2026-08-02T09:00:00Z", "fixture".into(), None);
     // The page's copy decision, as the scan runs it; `publish` decides again
     // over the whole page, where a parsed witness proves its own requests.
-    decide_page_copies(&mut items, index);
+    decide_page_copies(&mut items, index, None);
     items.remove(0)
 }
 /// Parse, then record the read like the scan does (birth + indexed path).
@@ -152,7 +152,7 @@ fn publish(
     telemetry: TelemetryRead,
     index: &ScanIndex,
 ) -> Vec<SnapshotItem> {
-    decide_page_copies(&mut items, index);
+    decide_page_copies(&mut items, index, None);
     if let Some(read) = read {
         attach_page(&mut items, read);
         side_calls_page(
@@ -185,6 +185,31 @@ fn cleanup(paths: &[&Path]) {
     for path in paths {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
+}
+
+/// [behaviour] DS1: the copy-prefix switch is the owner's support-dir marker,
+/// not process environment. Present (a regular file) is ON; absent, a
+/// directory or the old environment key is OFF; tests never read the host.
+#[test]
+fn copy_prefix_switch_is_the_support_marker_and_defaults_off() {
+    let scratch = crate::test_scratch::ScratchDir::new("e2-copy-prefix-marker");
+    assert!(!resumed_prefix_enabled_at(&scratch), "absent marker is OFF");
+    fs::write(scratch.join(RESUMED_PREFIX_MARKER), b"").unwrap();
+    assert!(resumed_prefix_enabled_at(&scratch), "marker present is ON");
+    fs::remove_file(scratch.join(RESUMED_PREFIX_MARKER)).unwrap();
+    fs::create_dir(scratch.join(RESUMED_PREFIX_MARKER)).unwrap();
+    assert!(
+        !resumed_prefix_enabled_at(&scratch),
+        "a directory is not the marker"
+    );
+    assert!(
+        !resumed_prefix_enabled(),
+        "fixtures never consult the host marker"
+    );
+    let on = ResumedPrefixForTest::set(true);
+    assert!(resumed_prefix_enabled());
+    drop(on);
+    assert!(!resumed_prefix_enabled());
 }
 
 #[test]
@@ -1810,7 +1835,7 @@ fn tag_owned_with_fallbacks(
     index: &ScanIndex,
     expected_fallbacks: usize,
 ) -> Vec<SnapshotItem> {
-    decide_page_copies(&mut items, index);
+    decide_page_copies(&mut items, index, None);
     let api = ClaudeLocalOtelLoadReport::default();
     let trace = ClaudeTraceOwnershipLoadReport::default();
     let per_file_originals = claude_request_identity::capture_request_owned_originals(&items);

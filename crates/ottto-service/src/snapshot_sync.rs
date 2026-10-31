@@ -7683,7 +7683,7 @@ fn finish_sync_source(
             Some(&upload_progress.accepted_identity_buckets),
             Some(&reserve_cache_bytes),
         );
-        let (disposition, census_withheld, stats) = match applied {
+        let (mut disposition, census_withheld, stats) = match applied {
             Ok(applied) => applied,
             Err(reason) => {
                 if let Some(lease) = native_comparison_lease.as_mut() {
@@ -7695,6 +7695,15 @@ fn finish_sync_source(
                 return Err(reason.into());
             }
         };
+        // SOURCE 2026-10-31 (#944 xPR F5): the bodies just built treat these
+        // rows as never accepted; the ledger records that durably before any
+        // upload, so a lost reply or restart cannot restore their proof.
+        if upload_progress
+            .accepted_identity_buckets
+            .invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated))
+        {
+            upload_progress.save(&upload_progress_path)?;
+        }
         #[cfg(test)]
         tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::record_evidence_stats(&stats);
         if let Ok(counts) = serde_json::to_string(&stats) {
@@ -9844,6 +9853,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     crate::snapshots::claude_request_money::e2::decide_page_copies(
         &mut scan_result.snapshots,
         index,
+        accepted_identity_buckets,
     )
     .apply(index);
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
@@ -10268,13 +10278,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 index,
                 &disposition,
             );
-        let _request_identity =
-            crate::snapshots::claude_request_identity::apply_scan_with_ownership(
-                &mut scan_result.snapshots,
-                evidence,
-                std::mem::take(&mut disposition.request_groupings),
-                &ownership,
-            );
+        let request_identity = crate::snapshots::claude_request_identity::apply_scan_with_ownership(
+            &mut scan_result.snapshots,
+            evidence,
+            std::mem::take(&mut disposition.request_groupings),
+            &ownership,
+        );
+        disposition.copy_invalidated = request_identity.copy_invalidated;
         if let Some(activity) = request_owned_activity {
             crate::snapshots::claude_request_identity::publish_request_owned_activity(
                 &scan_result.snapshots,

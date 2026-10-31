@@ -10,7 +10,9 @@ use super::super::claude_history_upgrade::{
 };
 use super::super::claude_money_birth_store::{location_key, LocationKey};
 use super::super::claude_request_census::claude_request_hash;
-use super::super::claude_request_identity::{self, AccountPartition, RequestAccounts};
+use super::super::claude_request_identity::{
+    self, AcceptedBuckets, AccountPartition, LentSlot, RequestAccounts,
+};
 use super::super::{
     claude_api_cache_creation, claude_api_matches_transcript_occurrence,
     claude_index_path_family_member, claude_index_path_member_ref, claude_row_placement,
@@ -46,20 +48,27 @@ const HOUR_NANOS: i128 = 3_600_000_000_000;
 /// decide: the affected sessions or families are held, never counted.
 const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
-/// Local release switch. Only the exact value `1` opts in; unset, `0`,
-/// unknown and non-Unicode values preserve released money behavior. This is
-/// process configuration, independent of the server's wire capability.
+/// Local release switch: the owner's support-dir marker (a regular file,
+/// never a symlink), as `claude_terminal_off_enabled`. Absent preserves
+/// released money behavior. Read once per process, so the daemon and the
+/// re-read CLI apply it from their next start. Independent of the server's
+/// wire capability.
+pub(crate) const RESUMED_PREFIX_MARKER: &str = "claude_resumed_prefix_dedupe_enabled";
 pub(crate) fn resumed_prefix_enabled() -> bool {
     #[cfg(test)]
     {
-        if PRE_CHANGE_BUILDER.with(std::cell::Cell::get) {
-            return false;
-        }
-        if let Some(on) = RESUMED_PREFIX.with(std::cell::Cell::get) {
-            return on;
-        }
+        // A test opts in on its own thread, never reading the host marker.
+        !PRE_CHANGE_BUILDER.with(std::cell::Cell::get)
+            && RESUMED_PREFIX.with(std::cell::Cell::get).unwrap_or(false)
     }
-    std::env::var("OTTTO_CLAUDE_RESUMED_PREFIX_DEDUPE").as_deref() == Ok("1")
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| resumed_prefix_enabled_at(&ottto_core::default_support_dir()))
+    }
+}
+pub(crate) fn resumed_prefix_enabled_at(support: &std::path::Path) -> bool {
+    super::super::terminal_off_policy::marker_at(support, RESUMED_PREFIX_MARKER)
 }
 #[cfg(test)]
 thread_local! {
@@ -1914,9 +1923,13 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
 /// page's cross-session checks share ONE census walk. Runs in both gate
 /// modes; dark only counts. Returns the removals to store (gate on only):
 /// the caller applies them to the index (`CopyRemovalUpdates::apply`).
+/// `accepted`, this cycle's #909 accepted-share hints, keeps accepted usage
+/// where the server holds it (gate on, Lead B F3): a prefix hold over
+/// accepted buckets defers the whole session instead of a shrunken revision.
 pub(crate) fn decide_page_copies(
     items: &mut [SnapshotItem],
     index: &ScanIndex,
+    accepted: Option<&AcceptedBuckets>,
 ) -> CopyRemovalUpdates {
     let _spent = PageSpent::start("page.copies");
     if !resumed_prefix_enabled() {
@@ -1966,7 +1979,7 @@ pub(crate) fn decide_page_copies(
     let mut updates = if holders.is_empty() {
         CopyRemovalUpdates::default()
     } else {
-        decide_holders(items, &holders, index)
+        decide_holders(items, &holders, index, accepted)
     };
     if !resolved_holds.is_empty() {
         let state = updates
@@ -2008,8 +2021,31 @@ fn finish_holder_identity(item: &mut SnapshotItem) {
         .map(|o| o.sequence)
         .chain(fold.first_idless)
         .min();
-    let rebuilt =
+    let mut rebuilt =
         accounts.after_copy_decision(claude_org_markers.as_deref(), &fold.skipped, first_retained);
+    // SOURCE 2026-10-31 (#944 xPR F5): identity a copied marker lent to a
+    // counted request is invalidated where a stored body froze it, so the
+    // identity pass learns which (bucket, account) this re-derivation moved.
+    if let Some(own) = rebuilt.as_mut() {
+        let lent = claude_usage_occurrences
+            .values()
+            .filter(|o| !fold.is_skipped(o.sequence) && !o.usage.is_zero())
+            .filter_map(|o| {
+                let lent = accounts.account(o.sequence)?;
+                if own.account(o.sequence).as_ref() == Some(&lent) {
+                    return None;
+                }
+                let slot = LentSlot {
+                    key: fold.occurrence_key(o)?,
+                    origin: None,
+                    lent,
+                    read: false,
+                };
+                Some((o.sequence, slot))
+            })
+            .collect();
+        own.copied_marker_lent = lent;
+    }
     if let Some(own) = rebuilt.as_ref() {
         // Restored identified prefix grains were placed with the original
         // native policy. Own/id-less marker-dependent grains are still staged.
@@ -2102,13 +2138,14 @@ fn indexed_main_files(index: &ScanIndex) -> BTreeMap<LocationKey, &str> {
 }
 
 /// A stored removal of `hash` under `holder` (index key): `None` when the
-/// holder's census can no longer answer (retired, over budget or no
-/// record), so the stored decision stands; else whether its record holds
-/// the hash (a record that lacks it disproves the stored ownership).
-fn stored_holder_answer(index: &ScanIndex, holder: &str, hash: u64) -> Option<bool> {
+/// holder is no longer indexed (Lead B F5) or its census can no longer
+/// answer (retired, over budget or no record), so the stored decision
+/// stands; else whether its record holds the hash (a record that lacks it
+/// disproves the stored ownership).
+fn stored_holder_answer(index: &ScanIndex, holder: Option<&str>, hash: u64) -> Option<bool> {
     index
         .claude_request_census
-        .get(holder)
+        .get(holder?)
         .filter(|record| record.proves_scan())
         .and_then(|record| {
             if record.holds_hash(hash) {
@@ -2343,6 +2380,7 @@ fn decide_holders(
     items: &mut [SnapshotItem],
     folds: &[usize],
     index: &ScanIndex,
+    accepted: Option<&AcceptedBuckets>,
 ) -> CopyRemovalUpdates {
     if !index.persistence_available() {
         for at in folds {
@@ -2358,8 +2396,11 @@ fn decide_holders(
         hashes: Vec<u64>,
         /// Hash -> the earliest holder whose current scan state proves it.
         covered: BTreeMap<u64, (i128, LocationKey)>,
-        /// Hashes a stored removal keeps removed (its holder still indexed).
+        /// Hashes a stored removal keeps removed: not disproven by its
+        /// still-indexed holder, or kept while that holder is not indexed.
         stored: BTreeSet<u64>,
+        /// Of `stored`, those whose recorded holder is no longer indexed.
+        absent: BTreeSet<u64>,
         /// Own turns follow the copied prefix: waits only for a possibly
         /// earlier unscanned holder (`unscanned_earlier_main`).
         resumed: bool,
@@ -2388,19 +2429,29 @@ fn decide_holders(
             hashes.sort_unstable();
             hashes.dedup();
             // Addendum 1: a stored removal stays removed after its holder's
-            // id list retires, while that holder is still indexed. A holder
-            // whose census disproves it invalidates that saved decision.
-            // Positive proof also remains valid if the walk hits its deadline.
+            // id list retires. A holder whose census disproves it invalidates
+            // that saved decision. Positive proof also remains valid if the
+            // walk hits its deadline. Lead B F5: a holder no longer indexed
+            // (its transcript deleted) cannot disprove anything; its recorded
+            // removals stand, counted, instead of re-adding a proven copy.
             let mut stored = BTreeSet::new();
-
+            let mut absent = BTreeSet::new();
             for (holder, held) in index.claude_copy_removals.get(order.1) {
-                let Some(key) = live.get_or_init(|| indexed_main_files(index)).get(holder) else {
-                    continue;
-                };
-                stored.extend(held.iter().filter(|&&hash| {
-                    hashes.binary_search(&hash).is_ok()
-                        && stored_holder_answer(index, key, hash) != Some(false)
-                }));
+                let key = live
+                    .get_or_init(|| indexed_main_files(index))
+                    .get(holder)
+                    .copied();
+                for &hash in held.iter() {
+                    if hashes.binary_search(&hash).is_err()
+                        || stored_holder_answer(index, key, hash) == Some(false)
+                    {
+                        continue;
+                    }
+                    stored.insert(hash);
+                    if key.is_none() {
+                        absent.insert(hash);
+                    }
+                }
             }
 
             Some(Wanted {
@@ -2410,6 +2461,7 @@ fn decide_holders(
                 hashes,
                 covered: BTreeMap::new(),
                 stored,
+                absent,
                 resumed,
                 waiting: false,
                 stale: BTreeSet::new(),
@@ -2490,6 +2542,15 @@ fn decide_holders(
             .iter()
             .filter(|hash| !wanted.covered.contains_key(hash))
             .count() as u64;
+        let absent_kept = wanted
+            .absent
+            .iter()
+            .filter(|hash| !wanted.covered.contains_key(hash))
+            .count() as u64;
+        if absent_kept > 0 {
+            diag("copy_removal_holder_absent_kept", absent_kept);
+            record_counts(Counts::one(25, absent_kept));
+        }
         if let Some(state) = updates.state.as_mut() {
             let groups = stored_groups(index, &live, wanted.covered, wanted.order.1);
             let stored = state.store(wanted.order.1, groups);
@@ -2507,6 +2568,7 @@ fn decide_holders(
                 &mut updates.state,
                 wanted.order.1,
                 "held_copy_deadline",
+                accepted,
             );
             continue;
         }
@@ -2517,6 +2579,7 @@ fn decide_holders(
                 &mut updates.state,
                 wanted.order.1,
                 "held_copy_stale_holder",
+                accepted,
             );
             continue;
         }
@@ -2555,6 +2618,7 @@ fn decide_holders(
                 &mut updates.state,
                 wanted.order.1,
                 "held_copy_unscanned",
+                accepted,
             );
             continue;
         }
@@ -2572,9 +2636,10 @@ fn decide_holders(
     updates
 }
 
-/// The file's removals to store: its stored hashes whose holder is still
-/// indexed and not disproven by a record that lacks them, plus each newly
-/// proven hash under its earliest current holder.
+/// The file's removals to store: its stored hashes not disproven by their
+/// still-indexed holder's record (a holder no longer indexed disproves
+/// nothing: Lead B F5), plus each newly proven hash under its earliest
+/// current holder.
 fn stored_groups<'a>(
     index: &'a ScanIndex,
     live: &std::cell::OnceCell<BTreeMap<LocationKey, &'a str>>,
@@ -2584,9 +2649,10 @@ fn stored_groups<'a>(
     let mut groups = BTreeMap::<LocationKey, BTreeSet<u64>>::new();
     let old = index.claude_copy_removals.get(file);
     for (holder, hashes) in old {
-        let Some(key) = live.get_or_init(|| indexed_main_files(index)).get(holder) else {
-            continue;
-        };
+        let key = live
+            .get_or_init(|| indexed_main_files(index))
+            .get(holder)
+            .copied();
         let kept = hashes
             .iter()
             .filter(|&&hash| stored_holder_answer(index, key, hash) != Some(false));
@@ -2622,11 +2688,23 @@ fn defer_prefix(
     state: &mut Option<super::copy_removals::CopyRemovals>,
     file: LocationKey,
     reason: &'static str,
+    accepted: Option<&AcceptedBuckets>,
 ) {
     let ids = skipped_ids(item)
         .filter(|id| uncovered.binary_search(&claude_request_hash(id)).is_ok())
         .cloned()
         .collect::<Vec<_>>();
+    // Lead B F3: a held request in a bucket a stored-body ACK may have frozen
+    // would leave that bucket undeclared-short and drop its #909 shares at
+    // the next ACK. Such a session defers whole (no new revision).
+    let accepted_prefix = accepted.is_some_and(|accepted| {
+        item.claude_money.as_deref().is_some_and(|fold| {
+            ids.iter()
+                .filter_map(|id| item.claude_usage_occurrences.get(id))
+                .filter_map(|o| fold.occurrence_key(o))
+                .any(|key| accepted.may_have_accepted(&item.source_session_id, &key.0))
+        })
+    });
     let Some(state) = state.as_mut() else {
         hold_copies(item, reason);
         return;
@@ -2672,10 +2750,15 @@ fn defer_prefix(
             fold.entity.certificate_ok = false;
         }
     }
-    if fold.first_own.is_none() {
+    if fold.first_own.is_none() || accepted_prefix {
         // An all-copy file has no own turns to publish; retain its existing
-        // whole-body hold, now bounded by the same retry debt.
+        // whole-body hold, now bounded by the same retry debt. A session whose
+        // held prefix has accepted buckets is held whole the same way.
         fold.entity.held = true;
+        if accepted_prefix {
+            diag("copy_prefix_accepted_session_holds", 1);
+            record_counts(Counts::one(24, 1));
+        }
         // Whole-body undecided counters are otherwise suppressed at finish;
         // the held prefix must still be visible in production diagnostics.
         let mut held = Counts::default();
@@ -2854,6 +2937,14 @@ fn attach_one(
         .flatten();
     fold.entity
         .add_slot(reported, &tokens, requests, row.cost_usd_micros, at);
+    // A copied marker's lent account follows its request to the reported slot.
+    if let Some(lent) = fold
+        .accounts
+        .as_mut()
+        .and_then(|accounts| accounts.copied_marker_lent.get_mut(&occurrence.sequence))
+    {
+        (lent.key, lent.origin) = (reported.0.clone(), reported.1);
+    }
     if let Some(cost) = row.cost_usd_micros {
         if fold.resumed_prefix && fold.unproven_copy(occurrence) {
             fold.prefix.priced_requests += requests;
@@ -3631,6 +3722,9 @@ pub(crate) fn finish_page(
         locations: Vec<LocationKey>,
         /// Decision counters, recorded once the session is decided.
         decided: Counts,
+        /// Later path twins' copied-marker loans: the emitted first item
+        /// carries them so `copy_derived_rows` sees every summed request.
+        twin_loans: Vec<LentSlot>,
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3692,6 +3786,7 @@ pub(crate) fn finish_page(
                 complete: telemetry == TelemetryRead::Loaded,
                 locations: Vec::new(),
                 decided: Counts::default(),
+                twin_loans: Vec::new(),
             });
         diag("resolver_conflict", fold.entity.resolver_conflicts);
         let unproven = fold.prefix.unproven_requests + fold.prefix.unproven_idless;
@@ -3748,6 +3843,11 @@ pub(crate) fn finish_page(
                 session.first_original = Some(session.entity.clone());
             }
             session.entity.sum(&fold.entity);
+            if let Some(accounts) = fold.accounts.as_deref() {
+                session
+                    .twin_loans
+                    .extend(accounts.copied_marker_lent.values().cloned());
+            }
         }
         session.entity.clock_incomplete |= claude_usage_occurrences.values().any(|occurrence| {
             !occurrence.usage.is_zero()
@@ -3784,7 +3884,7 @@ pub(crate) fn finish_page(
             state.entity.held |= held.contains(session);
             decided.push((session.to_owned(), state.decided));
             let first = (state.first_original, state.first_undo);
-            (session.to_owned(), (state.entity, first))
+            (session.to_owned(), (state.entity, first, state.twin_loans))
         })
         .collect::<BTreeMap<_, _>>();
     let mut withheld = BTreeSet::new();
@@ -3794,7 +3894,8 @@ pub(crate) fn finish_page(
         }
         // One body per session: the first item carries the summed entity.
         // A withheld session keeps every item (twins too) for the hold.
-        let Some((entity, (first_original, undo))) = entities.remove(&item.source_session_id)
+        let Some((entity, (first_original, undo), twin_loans)) =
+            entities.remove(&item.source_session_id)
         else {
             return withheld.contains(&item.source_session_id);
         };
@@ -3821,6 +3922,23 @@ pub(crate) fn finish_page(
             };
             *hold_reasons.entry(reason).or_default() += 1;
             withheld.insert(item.source_session_id.clone());
+        }
+        if let Some(accounts) = item
+            .claude_money
+            .as_deref_mut()
+            .and_then(|fold| fold.accounts.as_deref_mut())
+            .filter(|_| emitted)
+        {
+            // Reconcile and telemetry placement are done: past here loans are
+            // read only as values, so later twins take keys after the first's.
+            let lent = &mut accounts.copied_marker_lent;
+            let mut next = lent
+                .last_key_value()
+                .map_or(0, |(key, _)| key.saturating_add(1));
+            for slot in twin_loans {
+                lent.insert(next, slot);
+                next = next.saturating_add(1);
+            }
         }
         if let Some(fold) = item.claude_money.as_deref_mut() {
             fold.entity = match (emitted, first_original) {
@@ -3879,6 +3997,30 @@ fn record_decided(held: bool, counts: Counts) {
     } else {
         record_counts(counts);
     }
+}
+
+/// Copy-prefix switch on: the identity row of each request a copied marker
+/// had lent an account to, as `visit_identity_rows` builds rows:
+/// (bucket start, row, lent account).
+pub(crate) fn copied_marker_lent_rows(
+    item: &SnapshotItem,
+) -> Vec<(&str, super::super::SnapshotModelUsage, &LentSlot)> {
+    let Some(accounts) = item
+        .claude_money
+        .as_deref()
+        .and_then(|fold| fold.accounts.as_deref())
+    else {
+        return Vec::new();
+    };
+    // Row identity fields come from the slot alone, never from its money.
+    accounts
+        .copied_marker_lent
+        .values()
+        .map(|slot| {
+            let row = super::emit::grain_row(&slot.key, slot.origin, &Default::default(), None);
+            (slot.key.0.as_str(), row, slot)
+        })
+        .collect()
 }
 
 /// Visit the exact final placement; account classification belongs to identity.
@@ -3996,7 +4138,7 @@ fn absent_twins(
 // Existing native_collection_page carrier, nonzero only. These are shared
 // process fold deltas since its previous Claude page line.
 use std::sync::atomic::{AtomicU64, Ordering};
-const COUNT_NAMES: [&str; 24] = [
+const COUNT_NAMES: [&str; COUNT_LEN] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -4025,8 +4167,14 @@ const COUNT_NAMES: [&str; 24] = [
     "copy_prefix_removed_cost_micros",
     "copy_prefix_own_requests",
     "copy_prefix_families_corrected",
+    // Copy-prefix ENABLE readiness (Lead B F3/F5): sessions whose held
+    // prefix has accepted buckets deferred whole, and stored removals kept
+    // while their holder is no longer indexed.
+    "copy_prefix_accepted_session_holds",
+    "copy_removal_holder_absent_kept",
 ];
-static COUNTS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+const COUNT_LEN: usize = 26;
+static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
     Instant,
@@ -4058,18 +4206,18 @@ pub(crate) fn take_counts() -> Counts {
     Counts(COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed)))
 }
 #[derive(Debug, Default)]
-pub(crate) struct Counts([u64; 24]);
+pub(crate) struct Counts([u64; COUNT_LEN]);
 impl Counts {
     /// The first seven (work and decision) counters.
     fn work(values: [u64; 7]) -> Self {
-        let mut all = [0; 24];
+        let mut all = [0; COUNT_LEN];
         all[..7].copy_from_slice(&values);
         Self(all)
     }
     /// A decided fold's copied-prefix outcome.
     fn prefix(tally: &PrefixTally) -> Self {
         let unproven = tally.unproven_requests + tally.unproven_idless;
-        let mut all = [0; 24];
+        let mut all = [0; COUNT_LEN];
         all[7..12].copy_from_slice(&[
             unproven,
             u64::from(unproven > 0),
@@ -4086,10 +4234,16 @@ impl Counts {
         Self(all)
     }
     fn removal_store(added: u64, overflow: u64) -> Self {
-        let mut all = [0; 24];
+        let mut all = [0; COUNT_LEN];
         all[12] = added;
         all[13] = overflow;
         all[14] = overflow;
+        Self(all)
+    }
+    /// One enable-readiness counter (index 24..28) by `n`.
+    fn one(at: usize, n: u64) -> Self {
+        let mut all = [0; COUNT_LEN];
+        all[at] = n;
         Self(all)
     }
     fn add(&mut self, other: &Self) {
