@@ -3765,6 +3765,15 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
             std::fs::write(&disk, &bytes).unwrap();
             std::fs::set_permissions(&disk, std::os::unix::fs::PermissionsExt::from_mode(0o600))
                 .unwrap();
+            if source == SnapshotSource::ClaudeCode {
+                // Exercise binding admission on growth, rather than M3's
+                // unconditional quiet-EOF hold before body restoration.
+                std::io::Write::write_all(
+                    &mut File::options().append(true).open(&path).unwrap(),
+                    b"{}\n",
+                )
+                .unwrap();
+            }
             let mut changed_namespace = namespace.clone();
             let mut changed_scope = scope.clone();
             match arm {
@@ -6828,6 +6837,13 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
             .unwrap()
             .path();
         let before = std::fs::read(&disk_path).unwrap();
+        // Quiet EOF deliberately grants no restore; real growth earns the
+        // permission whose cleared/reverted entry cases this test fences.
+        std::io::Write::write_all(
+            &mut File::options().append(true).open(&path).unwrap(),
+            b"{}\n",
+        )
+        .unwrap();
         let cache = SharedCache::default();
         cache.durable_begin_pass(source, &index_path, &ns, false);
         cache.durable_note_scope(source, &key, &scope);
