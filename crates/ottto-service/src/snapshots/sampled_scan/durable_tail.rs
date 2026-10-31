@@ -5712,7 +5712,14 @@ impl SharedCache {
                 if attempts >= store::MAX_BATCH {
                     break;
                 }
-                if debt.retire_source != Some(source) || offered.contains_key(digest) {
+                // An offered successor may be a clean retry of a native
+                // receipt. It still owes a failed predecessor-unlink barrier;
+                // retire_exact syncs and verifies supersession without
+                // deleting the successor. A new offer without that barrier
+                // continues to own its ordinary replacement outcome below.
+                if debt.retire_source != Some(source)
+                    || (offered.contains_key(digest) && !debt.retire_sync)
+                {
                     continue;
                 }
                 let Some(custody) = stores.retail_spent.get_mut(digest) else {

@@ -581,10 +581,13 @@ fn native_replacement_finishes_retirement_before_eviction_and_growth() {
         );
         {
             let stores = cache.durable().unwrap();
-            assert!(stores
-                .key_debt
-                .get(&digest)
-                .is_none_or(|d| d.retire_source.is_none() && !d.retire_sync));
+            assert!(
+                stores
+                    .key_debt
+                    .get(&digest)
+                    .is_none_or(|d| d.retire_source.is_none() && !d.retire_sync),
+                "replacement retires custody after failed_barrier={failed_barrier}"
+            );
             assert!(stores
                 .retail_spent
                 .get(&digest)
