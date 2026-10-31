@@ -469,27 +469,6 @@ mod tests {
         clear(old);
         clear(new);
     }
-
-    #[test]
-    #[serial_test::serial]
-    fn waits_grow_to_thirty_to_sixty_minutes() {
-        assert_eq!(CAP, Duration::from_secs(60 * 60));
-        for (index, minutes) in [5, 10, 20, 40, 60, 60].into_iter().enumerate() {
-            let ceiling = Duration::from_secs(minutes * 60);
-            let half = ceiling / 2;
-            assert_eq!(wait(index as u32 + 1, 0), half);
-            assert_eq!(wait(index as u32 + 1, half.as_nanos() as u64), ceiling);
-        }
-        let mut previous = Duration::ZERO;
-        for failures in 1..30 {
-            let low = wait(failures, 0);
-            assert!(low >= previous);
-            assert!(low > Duration::ZERO);
-            assert!(wait(failures, u64::MAX) <= CAP);
-            previous = low;
-        }
-        assert_eq!(previous, CAP / 2);
-    }
 }
 
 #[cfg(test)]

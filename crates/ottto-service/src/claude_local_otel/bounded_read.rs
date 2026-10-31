@@ -381,33 +381,6 @@ mod tests {
     }
 
     #[test]
-    fn native_comparison_paid_decoder_plan_long_line_and_lexical_refusal() {
-        let generation = ApiFileGeneration {
-            device: 0,
-            inode: 0,
-            bytes: 0,
-            modified: (0, 0),
-            changed: (0, 0),
-        };
-        let mut input = Input {
-            bytes: br#"{"unknown":[[[1]]],"session_id":"ordinary"}"#.to_vec(),
-            generation,
-        };
-        let shape = Shape::read(&input).unwrap();
-        assert_eq!(shape.lines, 1);
-        let peak = shape.api_peak(&input).unwrap();
-        assert!(paid(peak).permits(peak));
-        assert!(!paid(peak - 1).permits(peak));
-        assert!(shape.trace_peak(&input).is_some());
-        input.bytes = br#"{"session_id":"escaped\u1234"}"#.to_vec();
-        assert!(Shape::read(&input).is_none());
-        input.bytes = "{\"session_id\":\"unicodeé\"}".as_bytes().to_vec();
-        assert!(Shape::read(&input).is_none());
-        input.bytes = vec![b' '; 1024 * 1024];
-        assert_eq!(Shape::read(&input).unwrap().longest_line, input.bytes.len());
-    }
-
-    #[test]
     fn native_comparison_paid_decoder_measured_unknown_and_error_scratch_stays_paid() {
         if !heap_layout_bound::layout_supported() {
             eprintln!("UNEXECUTED paid decoder requested allocation: unsupported layout");

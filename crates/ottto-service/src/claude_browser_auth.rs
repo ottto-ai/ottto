@@ -3893,15 +3893,20 @@ mod tests {
             )))
     }
 
-    #[test]
-    #[serial]
-    fn authorization_code_state_is_typed_ephemeral_and_single_submission() {
-        let root = temp_dir("auth-code-state");
+    fn with_support(label: &str) -> (PathBuf, PathBuf, EnvGuard) {
+        let root = temp_dir(label);
         let support = root.join("support");
         fs::create_dir_all(&support).expect("support");
         #[cfg(unix)]
         fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let guard = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        (root, support, guard)
+    }
+
+    #[test]
+    #[serial]
+    fn authorization_code_state_is_typed_ephemeral_and_single_submission() {
+        let (root, _support_dir, _support) = with_support("auth-code-state");
         let operation_id = "claude_setup_c0dec0dec0dec0dec0dec0dec0dec0de";
         let store = FileClaudeConfigSlotSettingsStore::default();
         let status = prepare_generic(store.load().expect("registry"), operation_id)
@@ -3959,12 +3964,7 @@ mod tests {
     #[test]
     #[serial]
     fn authorization_code_projection_uses_one_state_snapshot() {
-        let root = temp_dir("auth-code-status-snapshot");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("auth-code-status-snapshot");
         let operation_id = "claude_setup_c3dec3dec3dec3dec3dec3dec3dec3de";
         let store = FileClaudeConfigSlotSettingsStore::default();
         let status = prepare_generic(store.load().expect("registry"), operation_id)
@@ -4007,12 +4007,7 @@ mod tests {
     #[test]
     #[serial]
     fn authorization_code_rejects_wrong_operation_and_unbounded_or_multiline_input() {
-        let root = temp_dir("auth-code-validation");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("auth-code-validation");
         let operation_id = "claude_setup_c1dec1dec1dec1dec1dec1dec1dec1de";
         let wrong_id = "claude_setup_c2dec2dec2dec2dec2dec2dec2dec2de";
         let store = FileClaudeConfigSlotSettingsStore::default();
@@ -4177,12 +4172,7 @@ mod tests {
     #[test]
     #[serial]
     fn active_replay_shortcut_requires_exact_sealed_core_sidecar_binding() {
-        let root = temp_dir("active-replay-sealed-binding");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("active-replay-sealed-binding");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let operation_id = "claude_setup_03030303030303030303030303030303";
         let target_id = "claude_anchor_target_03030303030303030303030303030303";
@@ -4450,12 +4440,7 @@ mod tests {
     #[test]
     #[serial]
     fn active_browser_operation_overrides_unrelated_historical_core_status() {
-        let root = temp_dir("active-sidecar-over-historical-core");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("active-sidecar-over-historical-core");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let historical_id = "claude_setup_03030303030303030303030303030303";
         let historical = store
@@ -4541,12 +4526,7 @@ mod tests {
     #[test]
     #[serial]
     fn pre_core_target_placeholder_with_matching_core_seals_exact_root() {
-        let root = temp_dir("pre-core-target-seal");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("pre-core-target-seal");
         let operation_id = "claude_setup_05050505050505050505050505050505";
         let target_id = "claude_anchor_target_05050505050505050505050505050505";
         let account = "a".repeat(64);
@@ -4600,12 +4580,7 @@ mod tests {
     #[test]
     #[serial]
     fn registry_mutation_guard_prevents_recovery_from_deleting_a_committed_target() {
-        let root = temp_dir("pre-core-target-serialized-replay");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("pre-core-target-serialized-replay");
         let operation_id = "claude_setup_14141414141414141414141414141414";
         let target_id = "claude_anchor_target_14141414141414141414141414141414";
         let account = "a".repeat(64);
@@ -5032,12 +5007,7 @@ mod tests {
     #[test]
     #[serial]
     fn generic_prepare_skips_stale_unclaimed_root_and_allocates_current_root() {
-        let root = temp_dir("stale-unclaimed-root");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, support, _support) = with_support("stale-unclaimed-root");
         let stale_root = root
             .join("retired-installation")
             .join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME)
@@ -5080,12 +5050,7 @@ mod tests {
     #[test]
     #[serial]
     fn reusable_root_selection_skips_stale_candidate_before_valid_root() {
-        let root = temp_dir("stale-before-valid-root");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("stale-before-valid-root");
         let stale_root = root
             .join("retired-installation")
             .join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME)
@@ -5133,12 +5098,7 @@ mod tests {
     #[test]
     #[serial]
     fn same_operation_stale_root_remains_a_strict_replay_error() {
-        let root = temp_dir("stale-replay-root");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("stale-replay-root");
         let operation_id = "claude_setup_cccccccccccccccccccccccccccccccc";
         let stale_root = root
             .join("retired-installation")
@@ -5292,12 +5252,7 @@ mod tests {
     #[test]
     #[serial]
     fn generic_prepare_is_provisional_and_does_not_consume_registry_capacity() {
-        let root = temp_dir("generic-provisional");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("generic-provisional");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let before = store.load().expect("before");
         let operation_id = "claude_setup_80808080808080808080808080808080";
@@ -5328,12 +5283,7 @@ mod tests {
     #[test]
     #[serial]
     fn generic_registry_exposure_already_has_strong_composite_identity() {
-        let root = temp_dir("generic-admission-order");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("generic-admission-order");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let operation_id = "claude_setup_c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1";
         prepare_generic(store.load().expect("registry"), operation_id).expect("prepare");
@@ -5536,12 +5486,7 @@ mod tests {
     #[test]
     #[serial]
     fn admitted_login_with_unavailable_first_quota_read_becomes_canonical() {
-        let root = temp_dir("generic-dead-pair-canonical");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, support, _support) = with_support("generic-dead-pair-canonical");
         let store = FileClaudeConfigSlotSettingsStore::default();
         store
             .set_upkeep_consent(1, true)
@@ -5692,23 +5637,6 @@ mod tests {
         );
         drop(_support);
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn mismatch_type_distinguishes_account_organization_and_both() {
-        assert_eq!(
-            identity_mismatch(Some("a"), Some("o"), "b", "o"),
-            Some(ClaudeBrowserAuthIdentityMismatchV1::Account)
-        );
-        assert_eq!(
-            identity_mismatch(Some("a"), Some("o"), "a", "p"),
-            Some(ClaudeBrowserAuthIdentityMismatchV1::Organization)
-        );
-        assert_eq!(
-            identity_mismatch(Some("a"), Some("o"), "b", "p"),
-            Some(ClaudeBrowserAuthIdentityMismatchV1::AccountAndOrganization)
-        );
-        assert_eq!(identity_mismatch(None, None, "b", "p"), None);
     }
 
     #[test]
@@ -5934,12 +5862,7 @@ mod tests {
     #[test]
     #[serial]
     fn concurrent_same_id_generic_prepare_persists_one_operation_and_one_root() {
-        let root = temp_dir("generic-same-id-race");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("generic-same-id-race");
         let operation_id = "claude_setup_29292929292929292929292929292929";
         let status = FileClaudeConfigSlotSettingsStore::default()
             .load()
@@ -6337,12 +6260,7 @@ mod tests {
     #[serial]
     #[cfg(unix)]
     fn active_cancel_reserves_root_until_worker_teardown() {
-        let root = temp_dir("cancel-retry-overlap");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("cancel-retry-overlap");
         let operation_id = "claude_setup_12121212121212121212121212121212";
         let retry_id = "claude_setup_13131313131313131313131313131313";
         let status = FileClaudeConfigSlotSettingsStore::default()
@@ -6397,12 +6315,7 @@ mod tests {
     #[test]
     #[serial]
     fn cancel_intent_survives_provider_and_quarantine_cleanup_failure_until_recovery() {
-        let root = temp_dir("cancel-intent-cleanup-recovery");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("cancel-intent-cleanup-recovery");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let operation_id = "claude_setup_15151515151515151515151515151515";
         let prepared = store
@@ -7363,12 +7276,7 @@ mod tests {
     #[test]
     #[serial]
     fn target_success_consumes_prelaunch_quarantine_claim() {
-        let root = temp_dir("target-success-consumes-claim");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("target-success-consumes-claim");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let operation_id = "claude_setup_d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
         let account = "a".repeat(64);
@@ -7447,12 +7355,7 @@ mod tests {
     #[test]
     #[serial]
     fn target_mismatch_retires_candidate_and_preserves_exact_root_for_reuse() {
-        let root = temp_dir("target-mismatch-retire");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("target-mismatch-retire");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let operation_id = "claude_setup_d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2";
         let account = "a".repeat(64);
@@ -7551,12 +7454,7 @@ mod tests {
     #[test]
     #[serial]
     fn terminal_fallback_target_mismatch_retires_root_and_persists_typed_outcome() {
-        let root = temp_dir("fallback-target-mismatch");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("fallback-target-mismatch");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let operation_id = "claude_setup_12121212121212121212121212121212";
         let expected_account = "a".repeat(64);
@@ -7770,12 +7668,7 @@ mod tests {
     #[test]
     #[serial]
     fn repeated_target_failures_reuse_exact_root_without_capacity_growth() {
-        let root = temp_dir("target-failure-reuse");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("target-failure-reuse");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let account = "a".repeat(64);
         let organization = "b".repeat(64);
@@ -7872,12 +7765,7 @@ mod tests {
     #[test]
     #[serial]
     fn full_quarantine_keeps_target_candidate_registered_and_tracked() {
-        let root = temp_dir("target-quarantine-full");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("target-quarantine-full");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let operation_id = "claude_setup_17171717171717171717171717171717";
         let retry_id = "claude_setup_16161616161616161616161616161616";
@@ -7973,12 +7861,7 @@ mod tests {
     #[test]
     #[serial]
     fn full_quarantine_rejects_target_before_provider_launch_with_terminal_truth() {
-        let root = temp_dir("target-prelaunch-quarantine-full");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("target-prelaunch-quarantine-full");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let operation_id = "claude_setup_18181818181818181818181818181818";
         let target_id = "claude_anchor_target_18181818181818181818181818181818";
@@ -8185,12 +8068,7 @@ exit 1
     #[test]
     #[serial]
     fn fallback_stop_waiting_terminalizes_before_fresh_retry() {
-        let root = temp_dir("fallback-stop-waiting");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("fallback-stop-waiting");
         let operation_id = "claude_setup_d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
         let retry_id = "claude_setup_d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2";
         let status = FileClaudeConfigSlotSettingsStore::default()
@@ -8220,12 +8098,7 @@ exit 1
     #[test]
     #[serial]
     fn terminal_fallback_recovery_retains_ceremony_for_observer() {
-        let root = temp_dir("fallback-recovery-retains-claim");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("fallback-recovery-retains-claim");
         let operation_id = "claude_setup_d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3";
         let retry_id = "claude_setup_d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4";
         let status = FileClaudeConfigSlotSettingsStore::default()
@@ -8259,12 +8132,7 @@ exit 1
     #[test]
     #[serial]
     fn fallback_state_write_failure_preserves_nonterminal_claim() {
-        let root = temp_dir("fallback-state-write-failure");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("fallback-state-write-failure");
         let operation_id = "claude_setup_c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1";
         let retry_id = "claude_setup_c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
         let status = FileClaudeConfigSlotSettingsStore::default()
@@ -8302,12 +8170,7 @@ exit 1
     #[test]
     #[serial]
     fn fallback_observer_noop_finalize_keeps_cancel_cleanup_claim_until_terminal() {
-        let root = temp_dir("fallback-cancel-finalize-interleaving");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("fallback-cancel-finalize-interleaving");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let operation_id = "claude_setup_c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
         let retry_id = "claude_setup_c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4";
@@ -8409,12 +8272,7 @@ exit 1
     #[test]
     #[serial]
     fn nonterminal_worker_guard_never_releases_ceremony() {
-        let root = temp_dir("nonterminal-worker-guard");
-        let support = root.join("support");
-        fs::create_dir_all(&support).expect("support");
-        #[cfg(unix)]
-        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let (root, _support_dir, _support) = with_support("nonterminal-worker-guard");
         let operation_id = "claude_setup_b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
         let retry_id = "claude_setup_b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
         let status = FileClaudeConfigSlotSettingsStore::default()

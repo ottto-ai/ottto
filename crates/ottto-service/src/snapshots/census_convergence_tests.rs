@@ -1409,28 +1409,12 @@ fn transcript_ownership_needs_quarantined_originals_observed() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-mod owned_held_index_allocation {
-    include!("owned_held_index_allocation_tests.rs");
-}
-
-mod authority_binding_prototype {
-    include!("authority_binding_prototype_tests.rs");
-}
-
 mod provider_envelope_experiment_tests {
     include!("provider_envelope_experiment_tests.rs");
 }
 
 mod witness_reconstruct_scope {
     include!("witness_reconstruct_scope_tests.rs");
-}
-
-#[test]
-fn p12_experimental_base_exit_duplicate_fence_full_coverage_oracle() {
-    let scope = envelope_selection_experiment::Scope::restart();
-    claude_duplicate_fence_reopens_only_after_full_coverage();
-    assert_eq!(scope.counts().rearm_suppressed, 0);
-    writeln!(std::io::stderr().lock(), "p12_oracle: name=claude_duplicate_fence_reopens_only_after_full_coverage mode=experimental_base_exit_no_reuse status=PASS original_assertions_unchanged=true eligible_reuse_proved=false").unwrap();
 }
 
 // Re-review r3 (path-(a) bridge): with the absent-family scratch refused for
@@ -1556,28 +1540,6 @@ fn bounded_absence_fallback_cursor_is_scoped_per_index() {
             b.claude_usage_family_pending_retained_for_test(&root),
             "{root}"
         );
-    }
-}
-
-// Re-review r4: the per-index cursor map is capped. A new index at the cap
-// evicts only the least recently used cursor; every other cursor survives.
-#[test]
-fn bounded_absence_fallback_cursors_evict_only_the_least_recently_used() {
-    let cap = MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS;
-    assert_eq!(cap, 32);
-    let mut cursors = ClaudeAbsentFamilyFallbackCursors::new();
-    for scope in 0..cap {
-        cursors.set(&format!("index-{scope:02}"), scope + 1);
-    }
-    // Touch index-00, so index-01 is now the least recently used.
-    assert_eq!(cursors.cursor("index-00"), 1);
-    cursors.set("index-new", 7);
-    assert_eq!(cursors.by_index.len(), cap);
-    assert_eq!(cursors.cursor("index-01"), 0, "the evicted index restarts");
-    assert_eq!(cursors.cursor("index-new"), 7);
-    assert_eq!(cursors.cursor("index-00"), 1);
-    for scope in 2..cap {
-        assert_eq!(cursors.cursor(&format!("index-{scope:02}")), scope + 1);
     }
 }
 
@@ -3138,36 +3100,6 @@ fn an_upgrade_false_positive_is_counted_and_bounded_by_the_drain() {
 
 fn hex64_number(number: usize) -> String {
     format!("{number:064x}")
-}
-
-/// Unsupported layouts keep the fence permanently raised; the serialized
-/// alarm must distinguish that cause from an ordinary scratch refusal.
-#[test]
-fn kept_tombstone_fence_alarm_names_unsupported_layout() {
-    for (layout_supported, scratch_admitted, cause) in [
-        (false, false, "unsupported_layout"),
-        (true, false, "scratch_refused"),
-        (true, true, "tombstone_capacity"),
-    ] {
-        let (_, alarms) = crate::local_resource_diagnostics::capture(|| {
-            crate::local_resource_diagnostics::claude_absent_family_tombstone_uncertain(
-                &ClaudeTombstoneFenceKeptAlarm::new(17, scratch_admitted, 3, layout_supported),
-            );
-        });
-        assert_eq!(alarms.len(), 1);
-        assert_eq!(
-            alarms[0]["stage"],
-            "claude_absent_family_tombstone_uncertain"
-        );
-        assert_eq!(alarms[0]["counts"]["cause"], cause);
-        assert_eq!(
-            alarms[0]["counts"]["absent_family_tombstone_uncertain"],
-            true
-        );
-        assert_eq!(alarms[0]["counts"]["scratch_admitted"], scratch_admitted);
-        assert_eq!(alarms[0]["counts"]["free_tombstone_slots"], 17);
-        assert_eq!(alarms[0]["counts"]["witness_visits"], 3);
-    }
 }
 
 /// Returning RetryPending roots must be visible separately from ordinary

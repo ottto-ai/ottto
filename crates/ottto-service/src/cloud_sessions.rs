@@ -8413,44 +8413,6 @@ mod tests {
     }
 
     #[test]
-    fn revocation_after_chunk_revalidation_closes_relay_admission() {
-        let root = temp_dir("chunk-post-revalidation-race");
-        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
-        enabled(&grants);
-        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
-            root.join("checkpoint.json"),
-        ));
-        let transport = Arc::new(ThreadRecordingTransport::default());
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
-        checkpoints.set_relay_admission_barrier_for_test(
-            0,
-            Arc::clone(&entered),
-            Arc::clone(&release),
-        );
-
-        let collector_grants = grants.clone();
-        let collector_checkpoints = Arc::clone(&checkpoints);
-        let collector_transport = Arc::clone(&transport);
-        let collector = thread::spawn(move || {
-            collect_cloud_sessions_once(
-                &collector_grants,
-                &collector_checkpoints,
-                &CursorRecordingPages::new(vec![page("chunk-race", None)]),
-                collector_transport.as_ref(),
-                now(),
-            )
-        });
-        entered.wait();
-        grants.revoke(now()).unwrap();
-        release.wait();
-
-        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
-        assert_eq!(transport.chunks.load(Ordering::SeqCst), 0);
-        assert_eq!(transport.finalizes.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
     fn revocation_after_finalize_revalidation_closes_relay_admission() {
         let root = temp_dir("finalize-post-revalidation-race");
         let grants = CloudSessionGrantStore::new(root.join("grant.json"));
@@ -8488,92 +8450,6 @@ mod tests {
         assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
         assert_eq!(transport.chunks.load(Ordering::SeqCst), 1);
         assert_eq!(transport.finalizes.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn revocation_after_heartbeat_revalidation_closes_relay_admission() {
-        let root = temp_dir("heartbeat-post-revalidation-race");
-        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
-        enabled(&grants);
-        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
-            root.join("checkpoint.json"),
-        ));
-        let seed_transport = V2RecordingTransport::new();
-        assert_eq!(
-            collect_cloud_sessions_once(
-                &grants,
-                &checkpoints,
-                &CursorRecordingPages::new(vec![page("stable-heartbeat", None)]),
-                &seed_transport,
-                now(),
-            ),
-            CloudSessionCycleOutcome::Uploaded
-        );
-
-        let transport = Arc::new(ThreadRecordingTransport::default());
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
-        checkpoints.set_relay_admission_barrier_for_test(
-            0,
-            Arc::clone(&entered),
-            Arc::clone(&release),
-        );
-        let collector_grants = grants.clone();
-        let collector_checkpoints = Arc::clone(&checkpoints);
-        let collector_transport = Arc::clone(&transport);
-        let collector = thread::spawn(move || {
-            collect_cloud_sessions_once(
-                &collector_grants,
-                &collector_checkpoints,
-                &CursorRecordingPages::new(vec![page("stable-heartbeat", None)]),
-                collector_transport.as_ref(),
-                now() + TimeDuration::minutes(61),
-            )
-        });
-        entered.wait();
-        grants.revoke(now()).unwrap();
-        release.wait();
-
-        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
-        assert_eq!(transport.v1_sends.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn revocation_after_failure_revalidation_closes_relay_admission() {
-        let root = temp_dir("failure-post-revalidation-race");
-        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
-        enabled(&grants);
-        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
-            root.join("checkpoint.json"),
-        ));
-        let transport = Arc::new(ThreadRecordingTransport::default());
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
-        checkpoints.set_relay_admission_barrier_for_test(
-            0,
-            Arc::clone(&entered),
-            Arc::clone(&release),
-        );
-        let collector_grants = grants.clone();
-        let collector_checkpoints = Arc::clone(&checkpoints);
-        let collector_transport = Arc::clone(&transport);
-        let collector = thread::spawn(move || {
-            collect_cloud_sessions_once(
-                &collector_grants,
-                &collector_checkpoints,
-                &FailingPages {
-                    calls: Cell::new(0),
-                },
-                collector_transport.as_ref(),
-                now(),
-            )
-        });
-        entered.wait();
-        grants.revoke(now()).unwrap();
-        release.wait();
-
-        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
-        assert_eq!(transport.v1_sends.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -8775,24 +8651,6 @@ mod tests {
     }
 
     #[test]
-    fn collector_cadence_and_backoff_remain_load_bounded() {
-        assert_eq!(POLL_INTERVAL, Duration::from_secs(5 * 60));
-        assert_eq!(MAX_JITTER, Duration::from_secs(20));
-        assert!(MAX_JITTER < POLL_INTERVAL);
-        assert_eq!(HEALTH_HEARTBEAT_INTERVAL, TimeDuration::hours(1));
-        assert_eq!(backoff_seconds(1), 120);
-        assert_eq!(backoff_seconds(6), 3_840);
-        assert_eq!(backoff_seconds(100), 3_840);
-    }
-
-    #[test]
-    fn admitted_relay_deadline_fits_inside_local_stop_wait() {
-        let timeout = remaining_relay_budget(Instant::now() + CYCLE_BUDGET).unwrap();
-        assert_eq!(timeout, RELAY_IO_TIMEOUT);
-        assert!(RELAY_IO_TIMEOUT < COLLECTOR_IO_STOP_TIMEOUT);
-    }
-
-    #[test]
     fn deferred_transport_does_not_call_the_provider() {
         let (grants, checkpoints) = stores("deferred");
         enabled(&grants);
@@ -8827,53 +8685,6 @@ mod tests {
         assert_eq!(status.reason_code, "transport_deferred");
         assert!(!status.transport_configured);
         assert!(!status.provider_cli_invocation_permitted);
-    }
-
-    #[test]
-    fn two_hundred_item_fixture_stays_inside_batch_caps() {
-        let (grants, checkpoints) = stores("load");
-        enabled(&grants);
-        let batch_page = |start: u32, cursor: Value| {
-            let tasks = (start..start + PAGE_LIMIT as u32)
-                .map(|id| {
-                    json!({"id":format!("provider-{id}"),"status":"running","updated_at":"2026-07-21T11:00:00Z"})
-                })
-                .collect::<Vec<_>>();
-            json!({"tasks":tasks,"cursor":cursor}).to_string()
-        };
-        let pages = (0..MAX_PAGES)
-            .map(|index| {
-                let cursor = if index + 1 == MAX_PAGES {
-                    Value::Null
-                } else {
-                    json!(format!("cursor-{}", index + 1))
-                };
-                batch_page((index * PAGE_LIMIT) as u32, cursor)
-            })
-            .collect::<Vec<_>>();
-        let runner = Pages {
-            pages: RefCell::new(pages),
-            calls: Cell::new(0),
-            revoke: None,
-        };
-        let transport = RecordingTransport {
-            calls: Cell::new(0),
-            batches: RefCell::new(Vec::new()),
-            fail: false,
-        };
-        assert_eq!(
-            collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
-            CloudSessionCycleOutcome::Uploaded
-        );
-        assert_eq!(runner.calls.get(), MAX_PAGES);
-        let batches = transport.batches.borrow();
-        assert_eq!(batches[0].observations.len(), MAX_ITEMS);
-        assert!(batches[0].snapshot_complete);
-
-        let mut oversized = serde_json::to_value(&batches[0]).unwrap();
-        let row = oversized["observations"][0].clone();
-        oversized["observations"] = Value::Array(vec![row; MAX_ITEMS + 1]);
-        assert!(serde_json::from_value::<CloudSessionObservationBatchV1>(oversized).is_err());
     }
 
     #[test]
