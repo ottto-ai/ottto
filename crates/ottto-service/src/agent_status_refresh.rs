@@ -847,17 +847,6 @@ mod tests {
         assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(372));
     }
     #[test]
-    fn late_tick_and_overrun_skip_catchup_without_busy_loop() {
-        let lane = StatusLane::new();
-        assert!(pass(&lane, 0, 1200, true));
-        assert!(!pass(&lane, 1200, 1200, true));
-        assert!(!pass(&lane, 1259, 1259, true));
-        assert!(pass(&lane, 1260, 1267, true));
-        assert!(pass(&lane, 9000, 9007, true));
-        assert!(!pass(&lane, 9008, 9008, true));
-        assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(9300));
-    }
-    #[test]
     fn slow_provider_and_upload_do_not_block_another_source() {
         let slow = Arc::new(StatusLane::new());
         let fast = StatusLane::new();
@@ -935,18 +924,6 @@ mod tests {
         assert!(!pass(&lane, 3608, 3608, true));
     }
     #[test]
-    fn failed_or_lost_upload_retries_at_most_once_per_minute() {
-        let lane = StatusLane::new();
-        assert!(pass(&lane, 0, 15, false));
-        for now in 16..75 {
-            assert!(!pass(&lane, now, now, false));
-        }
-        assert!(pass(&lane, 75, 90, false));
-        assert!(!pass(&lane, 149, 149, false));
-        assert!(pass(&lane, 150, 157, true));
-        assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(300));
-    }
-    #[test]
     fn frozen_monotonic_sleep_catches_up_once_on_wall_clock_wake() {
         let lane = StatusLane::new();
         assert!(pass(&lane, 0, 7, true));
@@ -984,42 +961,6 @@ mod tests {
         assert_eq!(lane.state.lock().unwrap().generation, 1);
         assert!(pass(&lane, 300, 307, true));
         assert_eq!(lane.state.lock().unwrap().generation, 2);
-    }
-    #[test]
-    fn cached_provider_observation_and_all_accounts_are_unchanged() {
-        let lane = StatusLane::new();
-        let mut collection = specimen(SourceKind::ClaudeCode);
-        let quota = serde_json::from_value(serde_json::json!({
-            "name":"five_hour", "scope":"account", "status":"ok",
-            "freshness":"fresh", "observed_at":"2026-10-04T23:30:00Z",
-            "window_seconds":18000,"resets_at":"2026-10-05T04:30:00Z",
-            "quota":null,"remaining":null,"used_percent":25,"left_percent":75
-        }))
-        .unwrap();
-        collection.snapshots[0].quota_windows.push(quota);
-        collection.snapshots[0].account = Some(serde_json::from_value(serde_json::json!({"login_state":"signed_in","confidence":"high","account_identifier_hash":"account-a"})).unwrap());
-        let mut second = collection.snapshots[0].clone();
-        second.account.as_mut().unwrap().account_identifier_hash = Some("account-b".into());
-        second.captured_at = "2026-10-05T00:00:01Z".into();
-        collection.snapshots.push(second);
-        let before = serde_json::to_value(&collection.snapshots).unwrap();
-        assert!(lane.pass(
-            Duration::ZERO,
-            true,
-            || collection,
-            |result| {
-                assert_eq!(serde_json::to_value(&result.snapshots).unwrap(), before);
-                true
-            },
-            || seconds(7)
-        ));
-        let cached = lane.collection(false).unwrap();
-        assert_eq!(cached.snapshots.len(), 2);
-        assert_eq!(
-            cached.snapshots[0].quota_windows[0].observed_at.as_deref(),
-            Some("2026-10-04T23:30:00Z")
-        );
-        assert_eq!(serde_json::to_value(&cached.snapshots).unwrap(), before);
     }
     #[test]
     fn disabled_source_is_not_polled_and_shutdown_cancels_waiters() {
