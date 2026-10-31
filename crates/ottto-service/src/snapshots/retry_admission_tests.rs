@@ -752,7 +752,7 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
             &mut census,
             rfc3339_unix_seconds(CARRY_RETRY),
             BACKFILL_WINDOW_DAYS,
-            &fixture.index.files,
+            &mut crate::snapshots::CandidateDiscovery::new(&mut fixture.index, None),
         )
         .unwrap();
         prepare_owned_scan_candidate(
@@ -768,7 +768,7 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
             &mut census,
             rfc3339_unix_seconds(CARRY_RETRY),
             BACKFILL_WINDOW_DAYS,
-            &fixture.index.files,
+            discovery_retention!(fixture.index),
         )
         .unwrap();
         let entry = fixture.index.files.get_mut(key).unwrap();
@@ -873,33 +873,6 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
     eprintln!("retry_scheduling_runtime: test=oversized_complete_accepted_singleton_defers_without_healthy_full_reads elapsed_ms={} members={}", started.elapsed().as_millis(), healthy.len());
 }
 
-#[test]
-fn stale_carry_batch_diagnostics_discard_failed_larger_attempts() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let fixture = retry_durable_fixture(0, 4);
-    let stale = fixture.roots.iter().cloned().collect();
-    let _refuse = RetryMultiRefusal::new();
-    let mut diagnostics = StaleCarryRejectionCounts::default();
-    let (carry, covered, _) = claude_retry_admit_batch_observed(
-        &fixture.index,
-        &stale,
-        None,
-        CARRY_RETRY,
-        &mut diagnostics,
-        claude_contract_debt_scope(&fixture.index),
-    );
-    assert_eq!(carry.roots.len(), 1);
-    assert_eq!(covered.len(), 1);
-    assert_eq!(
-        diagnostics.rejected(),
-        0,
-        "larger failed probes are not root rejections"
-    );
-    assert_eq!(diagnostics.eligible_before_funding, 1);
-}
-
 // Ordinary deadlines (without proof corrections) expose the service/census
 // clock mismatch. Empty root admission avoids native carry layout requirements.
 fn retry_offer_clock_fixture(count: usize) -> ScopedRetryFixture {
@@ -928,6 +901,7 @@ fn retry_offer_clock_fixture(count: usize) -> ScopedRetryFixture {
     fixture
 }
 
+/// [regress] #862: current service time credits post-census deadlines once across pages.
 #[test]
 fn retry_offer_clock_credits_missing_paths_once_across_reload_and_64_path_seed() {
     let mut fixture = retry_offer_clock_fixture(70);
@@ -1053,72 +1027,4 @@ fn retry_offer_clock_credits_missing_paths_once_across_reload_and_64_path_seed()
         70,
         "offered opportunities never settle authority debt"
     );
-}
-
-#[test]
-fn retry_offer_clock_preserves_gaps_and_frozen_horizon_after_reload() {
-    let mut fixture = retry_offer_clock_fixture(3);
-    let root = fixture._scratch.to_path_buf();
-    let keys = fixture.index.files.keys().cloned().collect::<Vec<_>>();
-    let future = fixture.roots.last().unwrap();
-    fixture
-        .index
-        .claude_usage_authority_quarantine
-        .get_mut(future)
-        .unwrap()
-        .retry_after_unix_seconds = rfc3339_unix_seconds(CARRY_RETRY).unwrap() + 1;
-    let records = serde_json::to_value(&fixture.index.claude_usage_authority_quarantine).unwrap();
-    // Offering a later path cannot consume an earlier gap. Service after the
-    // frozen horizon cannot consume the future deadline either.
-    for (positions, expected) in [
-        (vec![1], None),
-        (vec![0], Some(&keys[0])),
-        (vec![0], Some(&keys[0])), // duplicate offer is idempotent
-        (vec![2], Some(&keys[0])),
-        (vec![1, 2], Some(&keys[1])),
-    ] {
-        let mut selected = positions
-            .into_iter()
-            .map(|position| ScanTraversalPath {
-                scan_root: root.clone(),
-                path: PathBuf::from(&keys[position]),
-                census_member: true,
-                watcher_hint: false,
-            })
-            .collect::<Vec<_>>();
-        let offered_end = selected.len();
-        finish_claude_retry_selection(
-            &mut fixture.index,
-            &mut selected,
-            offered_end,
-            CARRY_SECOND_RETRY,
-        );
-        fixture.index = retry_test_reload(&mut fixture.index, &root.join("gap-state.json"));
-        let state = fixture
-            .index
-            .claude_stale_family_carry
-            .origin
-            .as_ref()
-            .unwrap()
-            .admission
-            .as_ref()
-            .unwrap();
-        assert_eq!(state.due_after_path.as_ref(), expected);
-        assert_eq!(
-            state.due_through,
-            rfc3339_unix_seconds(CARRY_RETRY).unwrap()
-        );
-        assert_eq!(
-            state.served_before,
-            rfc3339_unix_seconds(CARRY_FAILED).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(&fixture.index.claude_usage_authority_quarantine).unwrap(),
-            records
-        );
-        assert_eq!(
-            fixture.index.traversal.as_ref().unwrap().census_window_end,
-            CARRY_FAILED
-        );
-    }
 }

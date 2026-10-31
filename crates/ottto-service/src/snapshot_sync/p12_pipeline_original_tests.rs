@@ -562,12 +562,15 @@ impl RearmFixture {
             .iter()
             .map(|item| item.source_session_id.clone())
             .collect();
+        // A page without request identity is a pre-cutover daemon's
+        // unpermitted page: no marker capture and no contract-5 evidence.
+        let _pre_cutover = (!self.request_identity)
+            .then(crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter);
         let (mut disposition, _, _) = if let Some(frame) = native_preparation.as_mut() {
             apply_claude_local_evidence_to_scan_with_comparison(
                 &self.support,
                 &mut scan,
                 &mut index,
-                cycle_request_identity_permit(SnapshotSource::ClaudeCode, &frame.activity_hint),
                 frame.prepared_claude_evidence.take(),
                 comparison_completion.as_mut(),
                 frame.native_comparison_lease.as_ref(),
@@ -624,7 +627,6 @@ impl RearmFixture {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut index,
-            true,
             |snapshot| {
                 let witness = effective_snapshot_upload_body_witness(
                     snapshot,
@@ -1313,44 +1315,6 @@ fn assert_late_import_checks_settled_request_owners(copied: bool) {
 fn novel_import_recovers_after_owner_coverage_then_stops_reading() {
     let _source_manifests = SourceManifestTestGuard::new();
     assert_late_import_checks_settled_request_owners(false);
-}
-
-fn observe_base_prelude(experimental_base_exit: bool) {
-    let _scope = experimental_base_exit
-        .then(crate::snapshots::envelope_selection_experiment::Scope::restart);
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fixture = RearmFixture::new("p12-novel-import-prelude");
-    let established = fixture.establish();
-    let quiet = fixture.generation(10);
-    assert_eq!(
-        rearm_reads(&quiet),
-        rearm_family_sessions().len(),
-        "base re-reads all three members, not the original optimized zero-read requirement"
-    );
-    assert_eq!(
-        RearmFixture::family_heads(&quiet.last().unwrap().index),
-        established.heads
-    );
-    let mode = if experimental_base_exit {
-        "experimental_base_exit_no_reuse"
-    } else {
-        "base_control"
-    };
-    writeln!(std::io::stderr().lock(), "p12_oracle: name=novel_import_recovers_after_owner_coverage_then_stops_reading mode={mode} status=BLOCKED_OPTIMIZED_PRELUDE original_expected_reads=0 observed_reads={} original_oracle_passed=false downstream_assertions_executed=false", rearm_reads(&quiet)).unwrap();
-}
-#[test]
-#[serial(source_manifests)]
-fn p12_novel_import_base_control_reveals_unmet_original_prelude() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    observe_base_prelude(false);
-}
-#[test]
-#[serial(source_manifests)]
-fn p12_novel_import_experiment_base_exit_reveals_unmet_original_prelude() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    observe_base_prelude(true);
 }
 
 #[test]
@@ -2243,18 +2207,6 @@ fn native_comparison_deferred_policy_resource_usefulness() {
         eprintln!("native_comparison_deferred_usefulness: supported_positive=UNEXECUTED");
         return;
     }
-    fn cpu_us() -> u64 {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        // SAFETY: successful getrusage initializes the entire struct.
-        assert_eq!(
-            unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
-            0
-        );
-        let usage = unsafe { usage.assume_init() };
-        (usage.ru_utime.tv_sec as u64 + usage.ru_stime.tv_sec as u64) * 1_000_000
-            + usage.ru_utime.tv_usec as u64
-            + usage.ru_stime.tv_usec as u64
-    }
     fn family_bytes(fixture: &RearmFixture, pages: &[RearmPage]) -> u64 {
         pages
             .iter()
@@ -2313,7 +2265,6 @@ fn native_comparison_deferred_policy_resource_usefulness() {
         assert_eq!(candidate.establish().heads, established.heads);
         assert_eq!(rearm_reads(&candidate.generation(10)), 0);
     }
-    let base_started = cpu_us();
     let mut base_quiet_reads = 0;
     let mut base_quiet_bytes = 0;
     for hour in 11..14 {
@@ -2321,8 +2272,6 @@ fn native_comparison_deferred_policy_resource_usefulness() {
         base_quiet_reads += rearm_reads(&pages);
         base_quiet_bytes += family_bytes(&base, &pages);
     }
-    let base_quiet_cpu = cpu_us().saturating_sub(base_started);
-    let candidate_started = cpu_us();
     let mut candidate_quiet_reads = 0;
     let mut candidate_quiet_bytes = 0;
     {
@@ -2333,20 +2282,16 @@ fn native_comparison_deferred_policy_resource_usefulness() {
             candidate_quiet_bytes += family_bytes(&candidate, &pages);
         }
     }
-    let candidate_quiet_cpu = cpu_us().saturating_sub(candidate_started);
     assert_eq!(candidate_quiet_reads, 0);
+    assert_eq!(candidate_quiet_bytes, 0);
     assert!(base_quiet_reads >= 9 && base_quiet_bytes > 24_000_000);
     const COPY: &str = "c8888888-8888-4888-8888-888888888888";
     let copy_path = native_comparison_add_import(&base, COPY, "req_root_1");
-    let base_hit_started = cpu_us();
     let base_hit = base.generation(14);
-    let base_hit_cpu = cpu_us().saturating_sub(base_hit_started);
-    let candidate_hit_started = cpu_us();
     let candidate_hit = {
         let _native = crate::snapshots::claude_native_comparison::enable_for_test();
         candidate.generation(14)
     };
-    let candidate_hit_cpu = cpu_us().saturating_sub(candidate_hit_started);
     let mut deferrals = 0;
     let mut consecutive = 0;
     let mut max_consecutive = 0;
@@ -2376,15 +2321,11 @@ fn native_comparison_deferred_policy_resource_usefulness() {
     assert_eq!(candidate_copy_parses, base_copy_parses + 1);
     // Include BOTH normal followups in the cost comparison; do not hide the
     // extra post-hit parse/rearm or compare mismatched recovery frontiers.
-    let base_followup_started = cpu_us();
     let base_followup = base.generation(15);
-    let base_followup_cpu = cpu_us().saturating_sub(base_followup_started);
-    let candidate_followup_started = cpu_us();
     let followup = {
         let _native = crate::snapshots::claude_native_comparison::enable_for_test();
         candidate.generation(15)
     };
-    let candidate_followup_cpu = cpu_us().saturating_sub(candidate_followup_started);
     assert!(followup.last().unwrap().fully_settled);
     for (label, pages) in [
         ("base_hit", &base_hit),
@@ -2568,22 +2509,24 @@ fn native_comparison_deferred_policy_resource_usefulness() {
     };
     let base_offers = offered_cost(&[base_hit.as_slice(), base_followup.as_slice()]);
     let candidate_offers = offered_cost(&[candidate_hit.as_slice(), followup.as_slice()]);
-    eprintln!("native_comparison_curve_upload_cost: base_bodies={} base_item_wire_bytes={} candidate_bodies={} candidate_item_wire_bytes={} extra_bodies={} extra_item_wire_bytes={} fake_uploader_CPU_included=true network_latency_UNMEASURED=true three_extra_BASE_qualification_passes_not_counted_as_savings=true", base_offers.0, base_offers.1, candidate_offers.0, candidate_offers.1, candidate_offers.0.saturating_sub(base_offers.0), candidate_offers.1.saturating_sub(base_offers.1));
+    eprintln!("native_comparison_curve_upload_cost: base_bodies={} base_item_wire_bytes={} candidate_bodies={} candidate_item_wire_bytes={} extra_bodies={} extra_item_wire_bytes={} network_latency_UNMEASURED=true three_extra_BASE_qualification_passes_not_counted_as_savings=true", base_offers.0, base_offers.1, candidate_offers.0, candidate_offers.1, candidate_offers.0.saturating_sub(base_offers.0), candidate_offers.1.saturating_sub(base_offers.1));
     let saved_bytes = base_quiet_bytes.saturating_sub(candidate_quiet_bytes);
     assert!(
         saved_bytes > hit_extra_bytes,
         "net-negative native-read policy is not accepted"
     );
-    let saved_cpu = base_quiet_cpu
-        .saturating_add(base_hit_cpu)
-        .saturating_add(base_followup_cpu);
-    let optimized_cpu = candidate_quiet_cpu
-        .saturating_add(candidate_hit_cpu)
-        .saturating_add(candidate_followup_cpu);
+    // scanned_file_count counts native parser/acquisition entries, including
+    // pages later held by the fold. Count ALL files over the same quiet + hit
+    // + followup frontier, so the extra deferred-copy parse and recovery are
+    // charged to the candidate. Process CPU time also includes unrelated test
+    // threads and runner contention; it cannot establish this work invariant.
+    let base_total_reads = base_quiet_reads + rearm_reads(&base_hit) + rearm_reads(&base_followup);
+    let candidate_total_reads =
+        candidate_quiet_reads + rearm_reads(&candidate_hit) + rearm_reads(&followup);
     assert!(
-        saved_cpu > optimized_cpu,
-        "representative CPU including recovery must improve, not only file count"
+        candidate_total_reads < base_total_reads,
+        "deferred policy including recovery must perform strictly fewer native parses"
     );
 
-    eprintln!("native_comparison_deferred_usefulness: quiet_base_reads={base_quiet_reads} quiet_candidate_reads={candidate_quiet_reads} quiet_base_logical_native_bytes={base_quiet_bytes} quiet_candidate_logical_native_bytes={candidate_quiet_bytes} base_quiet_cpu_us={base_quiet_cpu} candidate_quiet_cpu_us={candidate_quiet_cpu} base_hit_cpu_us={base_hit_cpu} candidate_hit_cpu_us={candidate_hit_cpu} base_followup_cpu_us={base_followup_cpu} candidate_followup_cpu_us={candidate_followup_cpu} base_copy_reads_including_followup={base_copy_reads_all} candidate_copy_reads_including_followup={candidate_copy_reads_all} deferrals={deferrals} max_consecutive_deferrals={max_consecutive} base_copy_parses={base_copy_parses} candidate_copy_parses={candidate_copy_parses} hit_extra_logical_bytes={hit_extra_bytes} net_logical_bytes_saved={} total_cpu_saved_us={} full_2000family_admission=UNPROVED installed_RSS_savings=UNPROVED", saved_bytes - hit_extra_bytes, saved_cpu - optimized_cpu);
+    eprintln!("native_comparison_deferred_usefulness: quiet_base_reads={base_quiet_reads} quiet_candidate_reads={candidate_quiet_reads} quiet_base_logical_native_bytes={base_quiet_bytes} quiet_candidate_logical_native_bytes={candidate_quiet_bytes} base_total_reads={base_total_reads} candidate_total_reads={candidate_total_reads} base_copy_reads_including_followup={base_copy_reads_all} candidate_copy_reads_including_followup={candidate_copy_reads_all} deferrals={deferrals} max_consecutive_deferrals={max_consecutive} base_copy_parses={base_copy_parses} candidate_copy_parses={candidate_copy_parses} hit_extra_logical_bytes={hit_extra_bytes} net_logical_bytes_saved={} full_2000family_admission=UNPROVED installed_RSS_savings=UNPROVED", saved_bytes - hit_extra_bytes);
 }

@@ -356,17 +356,22 @@ impl ReofferPipeline {
         self.cycle_with_census(now, false)
     }
 
-    fn cycle_with_census(&mut self, now: u64, complete: bool) -> CycleResult {
-        self.clock.set(now);
-        assert_eq!(clock(), Some(now));
-        self.cadence.next_due_cycle();
-        let collection = || AgentStatusCollection {
+    fn collection() -> AgentStatusCollection {
+        AgentStatusCollection {
             snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
             source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
             codex_scan_homes: Vec::new(),
             codex_home_bindings: Vec::new(),
-        };
-        let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+        }
+    }
+
+    /// Prepare without collecting, so refusal fixtures can inspect the real
+    /// load boundary without unwrapping away its error.
+    fn prepare_cycle(&mut self, now: u64) -> Result<Option<SourcePreparation>> {
+        self.clock.set(now);
+        assert_eq!(clock(), Some(now));
+        self.cadence.next_due_cycle();
+        crate::agent_status_refresh::with_test_collection(Self::collection(), || {
             prepare_sync_source(
                 &self.client,
                 &self.device,
@@ -381,8 +386,13 @@ impl ReofferPipeline {
                 false,
             )
         })
-        .unwrap()
-        .expect("real due preparation");
+    }
+
+    fn cycle_with_census(&mut self, now: u64, complete: bool) -> CycleResult {
+        let frame = self
+            .prepare_cycle(now)
+            .unwrap()
+            .expect("real due preparation");
         let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
         assert_eq!(
             scan.census_complete, complete,
@@ -395,7 +405,7 @@ impl ReofferPipeline {
         let leased_offers = preparation.upload_progress.reason_reoffer_counts.selected;
         let index_path = preparation.index_path.clone();
         let progress_path = preparation.upload_progress_path.clone();
-        let result = crate::agent_status_refresh::with_test_collection(collection(), || {
+        let result = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
             finish_sync_source(
                 preparation,
                 index,
@@ -1786,167 +1796,6 @@ fn cooldown_conflict_still_rereads_a_changed_file_and_survives_rollback() {
         .accepted_snapshot_fingerprint_recorded(&fingerprint_of(&offered[2])));
 }
 
-/// A previously settled cooldown is no permission once its current witness or
-/// durable reservation is lost. The retained conflict blocks immediately.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn cooldown_conflict_broken_bound_blocks_again() {
-    if !supported("cooldown_conflict_broken_bound_blocks_again") {
-        return;
-    }
-    for broken in ["witness", "reservation", "file"] {
-        let (mut pipeline, fingerprint, t1, _) =
-            refused_then_conflicted(&format!("reoffer-broken-{broken}"));
-        let quiet = pipeline.cycle(t1 + 3_600);
-        assert!(quiet.result.is_ok(), "{broken}: {:?}", quiet.result);
-        assert!(!quiet.index.bounded_sweep_had_unsettled_upload());
-        assert_eq!(quiet.cooldown_deferred, 1);
-        pipeline.make_conflict_retry_due(&fingerprint);
-        match broken {
-            "witness" => {
-                let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
-                    &snapshot_index_path(&pipeline.support, SnapshotSource::ClaudeCode),
-                    &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
-                ));
-                let mut index = ScanIndex::load(&index_path).unwrap();
-                index
-                    .quarantined_snapshot_fingerprints
-                    .get_mut(&fingerprint)
-                    .unwrap()
-                    .witness
-                    .parser_version
-                    .push_str("-older");
-                index.save(&index_path).unwrap();
-            }
-            "reservation" => {
-                let mut json = quiet.progress_json.clone();
-                json["permanent_rejections"][&fingerprint]["reoffer"] =
-                    serde_json::json!({"version": 999, "reason": "corrupt"});
-                std::fs::write(&quiet.progress_path, serde_json::to_vec(&json).unwrap()).unwrap();
-            }
-            "file" => {
-                // A byte change without changing semantic usage still invalidates
-                // the unchanged-file proof; it cannot erase the retained debt.
-                // Keep every line valid JSON for the sidecar fixture reader:
-                // trailing whitespace changes bytes, not the decoded event.
-                let transcript = std::fs::read_to_string(pipeline.transcript()).unwrap();
-                let edited = transcript.replacen('\n', " \n", 1);
-                assert_ne!(edited.len(), transcript.len());
-                std::fs::write(pipeline.transcript(), edited).unwrap();
-                write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
-            }
-            _ => unreachable!(),
-        }
-        let (broken_cycle, parsed, _) = pipeline.measured_cycle(t1 + 7_200, true);
-        assert_eq!(parsed, 1, "{broken}: ordinary invalidation reconstructs");
-        assert!(
-            broken_cycle.result.is_err(),
-            "{broken}: retained debt blocks again"
-        );
-        assert!(
-            broken_cycle.index.bounded_sweep_had_unsettled_upload(),
-            "{broken}"
-        );
-        assert_eq!(broken_cycle.cooldown_deferred, 0, "{broken}");
-        assert_eq!(
-            pipeline.server.last_terminal()["last_error_code"],
-            "server_error",
-            "{broken}"
-        );
-        assert_eq!(
-            pipeline.server.offered().len(),
-            2,
-            "{broken}: no early offer"
-        );
-        assert_eq!(
-            broken_cycle.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
-            SnapshotQuarantineDisposition::RetryPending
-        );
-        assert_eq!(
-            broken_cycle.progress.quarantined_fingerprints[&fingerprint].disposition,
-            SnapshotQuarantineDisposition::RetryPending
-        );
-        assert!(broken_cycle
-            .progress
-            .permanent_rejections
-            .contains_key(&fingerprint));
-    }
-}
-
-/// The quiet-debt disclosure/settlement applies throughout the cooldown, not
-/// only after the ordinary conflict timer would have selected the file.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn cooldown_conflict_before_ordinary_retry_is_counted_and_settles() {
-    if !supported("cooldown_conflict_before_ordinary_retry_is_counted_and_settles") {
-        return;
-    }
-    let (mut pipeline, fingerprint, t1, deadline) = refused_then_conflicted("reoffer-before-retry");
-    let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
-        &snapshot_index_path(&pipeline.support, SnapshotSource::ClaudeCode),
-        &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
-    ));
-    let mut index = ScanIndex::load(&index_path).unwrap();
-    // The ordinary timer uses wall time; keep it inside the loader's 12 h
-    // validity bound so normalization cannot silently make this a due test.
-    let retry_after = current_unix_seconds() + 3_600;
-    index
-        .quarantined_snapshot_fingerprints
-        .get_mut(&fingerprint)
-        .unwrap()
-        .retry_after_unix_seconds = retry_after;
-    index.save(&index_path).unwrap();
-    let loaded = ScanIndex::load(&index_path).unwrap();
-    assert_eq!(
-        loaded.quarantined_snapshot_fingerprints[&fingerprint].retry_after_unix_seconds,
-        retry_after
-    );
-    assert!(
-        retry_after > current_unix_seconds(),
-        "ordinary retry is not due"
-    );
-    let (quiet, parsed, bytes) = pipeline.measured_cycle(t1 + 600, true);
-    assert_eq!((parsed, bytes), (0, 0));
-    assert!(quiet.result.is_ok(), "{:?}", quiet.result);
-    assert!(!quiet.index.bounded_sweep_had_unsettled_upload());
-    assert_eq!(quiet.cooldown_deferred, 1);
-    assert_eq!(quiet.leased_offers, 0);
-    assert_eq!(pipeline.server.offered().len(), 2);
-    assert_eq!(
-        pipeline.server.last_terminal()["last_error_code"],
-        "backend_validation_error"
-    );
-    assert_eq!(
-        pipeline.server.last_terminal()["last_census_complete"],
-        true
-    );
-    assert_eq!(
-        reoffer_json(&quiet, &fingerprint)["retry_after_unix_seconds"],
-        deadline
-    );
-    for record in [
-        &quiet.index.quarantined_snapshot_fingerprints[&fingerprint],
-        &quiet.progress.quarantined_fingerprints[&fingerprint],
-    ] {
-        assert_eq!(
-            record.disposition,
-            SnapshotQuarantineDisposition::RetryPending
-        );
-        assert_eq!(
-            record.upload_body_witness.as_deref(),
-            Some(
-                quiet.progress.permanent_rejections[&fingerprint]
-                    .body_witness
-                    .as_str()
-            )
-        );
-    }
-}
-
 /// The Claude scan index this pipeline's destination uses.
 fn claude_index_path(support: &Path) -> PathBuf {
     std::fs::read_dir(support.join("snapshots/destinations"))
@@ -2052,74 +1901,17 @@ fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
         .accepted_snapshot_fingerprint_recorded(&fingerprint));
 }
 
-/// StateMissing H1 through the real replay decision, and N2: after a
-/// completed bootstrap, an unreadable backfill state arms no Claude replay
-/// in `prepare_sync_source` (the replay claim, the entries and the server
-/// all stay as they were), and the Claude census that cycle completes under
-/// the history gate clears the marker.
+/// A completed first cycle is not a kill before its first save: it publishes
+/// both an index and a prior-root witness. Deleting that index and clearing the
+/// ledger's ACKs must not turn the witnessed history into a fresh installation.
+/// A replay claim is still not server attestation (the separate StateMissing
+/// N1 test covers that); it cannot waive a missing published-root refusal.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
-fn unreadable_backfill_state_arms_no_replay_and_clears_after_a_gated_census() {
-    if !supported("unreadable_backfill_state_arms_no_replay_and_clears_after_a_gated_census") {
-        return;
-    }
-    let t0 = current_unix_seconds();
-    let mut pipeline = ReofferPipeline::new("history-unverified", Answer::Accept, t0);
-    let first = pipeline.cycle(t0);
-    assert!(first.result.is_ok(), "{:?}", first.result);
-    let offered = pipeline.server.offered().len();
-    assert!(offered > 0);
-    let state_path = crate::backfill::backfill_state_path(&pipeline.support);
-    assert!(
-        !crate::backfill::load_backfill_state(&pipeline.support).prior_history_unverified,
-        "the bootstrap completed with a readable state"
-    );
-    std::fs::write(&state_path, b"{\"completed_destination_namespaces\":")
-        .expect("corrupt the backfill state");
-    assert!(crate::backfill::load_backfill_state(&pipeline.support).prior_history_unverified);
-
-    let second = pipeline.cycle(t0 + 60);
-    assert!(second.result.is_ok(), "{:?}", second.result);
-    assert_eq!(
-        pipeline.server.offered().len(),
-        offered,
-        "no replay re-sent anything"
-    );
-    assert_eq!(
-        second.progress_json["historical_replay_generation"],
-        first.progress_json["historical_replay_generation"],
-        "no replay claimed a generation"
-    );
-    assert_eq!(
-        second.index.files.keys().collect::<Vec<_>>(),
-        first.index.files.keys().collect::<Vec<_>>(),
-        "no replay dropped the entries"
-    );
-    assert!(second
-        .index
-        .files
-        .iter()
-        .all(|(key, entry)| entry.source_file_fingerprint
-            == first.index.files[key].source_file_fingerprint));
-    assert!(
-        !crate::backfill::load_backfill_state(&pipeline.support).prior_history_unverified,
-        "N2: the gated census cleared the marker"
-    );
-}
-
-/// StateMissing N1 (b) through the real pipeline: a fresh install whose
-/// upload ledger claimed a replay generation before the scan, but was killed
-/// before its first index save and before any server answer was recorded,
-/// is still a fresh install. The next cycle uploads its history as new: it
-/// is not held, and no history cutoff is recorded.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn ledger_claim_alone_after_a_killed_first_cycle_uploads_history() {
-    if !supported("ledger_claim_alone_after_a_killed_first_cycle_uploads_history") {
+fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
+    if !supported("missing_published_index_with_claim_only_ledger_refuses_without_reread") {
         return;
     }
     let t0 = current_unix_seconds();
@@ -2128,10 +1920,23 @@ fn ledger_claim_alone_after_a_killed_first_cycle_uploads_history() {
     assert!(first.result.is_ok(), "{:?}", first.result);
     let offered = pipeline.server.offered();
     assert!(!offered.is_empty());
-    // Back to what a killed first cycle leaves: the ledger's own claim of a
-    // replay generation, saved before the scan, but no server answer, no
-    // index and no completed bootstrap.
-    // A settled bootstrap leaves no ledger file, so write the claim itself.
+    assert!(
+        first.index_path.exists(),
+        "the first cycle DID publish an index"
+    );
+    assert!(
+        !first.index.files.is_empty(),
+        "the published index holds history"
+    );
+    let prior_path = first.index_path.with_file_name(format!(
+        "{}.storage-prior",
+        first.index_path.file_name().unwrap().to_str().unwrap()
+    ));
+    let prior_bytes = std::fs::read(&prior_path).expect("published root witness");
+    assert_eq!(prior_bytes, b"scan_index_prior_root_v1\n");
+    // A settled bootstrap leaves no ledger file. Recreate a claim-only ledger,
+    // but keep the real published-root witness: this is loss AFTER publication,
+    // not a first install killed before publication.
     let mut claim = SnapshotUploadProgress::load(
         &first.progress_path,
         &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
@@ -2150,27 +1955,83 @@ fn ledger_claim_alone_after_a_killed_first_cycle_uploads_history() {
         .save(&first.progress_path)
         .expect("write the claim-only ledger");
     assert!(!claim.records_server_attested_upload());
-    std::fs::remove_file(claude_index_path(&pipeline.support)).expect("lose the index");
+    let progress_before = std::fs::read(&first.progress_path).unwrap();
+    std::fs::remove_file(&first.index_path).expect("lose the published index");
     let _ = std::fs::remove_file(crate::backfill::backfill_state_path(&pipeline.support));
-
-    let second = pipeline.cycle(t0 + 60);
-    assert!(second.result.is_ok(), "{:?}", second.result);
-    let resent = pipeline.server.offered();
-    assert_eq!(resent.len(), 2 * offered.len(), "the history is uploaded");
+    // Drop all warm process custody as a restart would; the disk witness must
+    // keep the source closed without consulting a transcript or contacting upload.
+    pipeline.daemon = test_daemon("otm_test");
+    let ((prepared, reads), records) = crate::local_resource_diagnostics::capture(|| {
+        crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+            crate::snapshots::with_transcript_io_denied(|| pipeline.prepare_cycle(t0 + 60))
+        })
+    });
+    let error = match prepared {
+        Err(error) => error,
+        Ok(_) => panic!("a missing published root must refuse before collection"),
+    };
+    assert!(format!("{error:#}").contains("scan_index_prior_state_requires_repair"));
+    let health = pipeline
+        .daemon
+        .status("token")
+        .unwrap()
+        .canonical_health
+        .unwrap();
+    let repair_code = crate::snapshots::scan_index_health::SHARD_CODE;
+    let blockers: Vec<_> = health
+        .blockers
+        .iter()
+        .filter(|b| b.code == repair_code)
+        .collect();
+    assert_eq!(blockers.len(), 1, "reuse the existing repair surface");
+    assert_eq!(blockers[0].source, "claude_code");
     assert_eq!(
-        resent[offered.len()..]
-            .iter()
-            .map(fingerprint_of)
-            .collect::<BTreeSet<_>>(),
-        offered.iter().map(fingerprint_of).collect::<BTreeSet<_>>()
+        blockers[0].clear_condition,
+        crate::snapshots::scan_index_health::SHARD_DETAIL
     );
-    let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(claude_index_path(&pipeline.support)).unwrap())
-            .unwrap();
+    let row = health
+        .sources
+        .iter()
+        .find(|s| s.app == SourceKind::ClaudeCode)
+        .unwrap();
+    assert_eq!(row.blocking_reason.as_deref(), Some(repair_code));
+    assert_eq!(row.next_action.as_deref(), Some("contact_support"));
+    assert!(health
+        .sources
+        .iter()
+        .filter(|s| s.app != SourceKind::ClaudeCode)
+        .all(|s| s.blocking_reason.as_deref() != Some(repair_code)));
+    let alarms: Vec<_> = records
+        .iter()
+        .filter(|r| r["counts"]["index_shard_unavailable_alarm"] == 1)
+        .collect();
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(alarms[0]["source"], "claude_code");
+    let counters: Vec<_> = records
+        .iter()
+        .filter(|r| r["counts"].get("scan_index_repair_required").is_some())
+        .collect();
+    assert_eq!(counters.len(), 1);
+    assert_eq!(counters[0]["source"], "claude_code");
+    assert_eq!(
+        counters[0]["counts"]["scan_index_repair_required"]["cause"],
+        "prior_state"
+    );
+    assert_eq!(
+        counters[0]["counts"]["scan_index_repair_required"]["delta"], 1,
+        "one refused-load counter increment"
+    );
+    assert!(reads.is_empty(), "no transcript acquisition while held");
     assert!(
-        saved.get("claude_history_cutoff_unix_seconds").is_none(),
-        "a fresh install records no history cutoff"
+        !first.index_path.exists(),
+        "no default index or replacement save"
     );
+    assert_eq!(std::fs::read(&prior_path).unwrap(), prior_bytes);
+    assert_eq!(
+        std::fs::read(&first.progress_path).unwrap(),
+        progress_before
+    );
+    assert_eq!(pipeline.server.offered(), offered, "no history re-uploaded");
 }
 
 /// H727-1: the M4 incident shape, through real prepare/finish (including

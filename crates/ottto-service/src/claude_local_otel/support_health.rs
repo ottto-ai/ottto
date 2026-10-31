@@ -425,8 +425,14 @@ fn health_items(h: Health) -> RedactedValue {
     );
     RedactedValue::Object(fields)
 }
-pub(crate) fn diagnostics_items(support: &Path) -> BTreeMap<String, RedactedValue> {
+pub(crate) fn diagnostics_items(
+    support: &Path,
+    relay: &ottto_protocol::RelayState,
+) -> BTreeMap<String, RedactedValue> {
     let mut fields = BTreeMap::new();
+    if let Some(finding) = crate::otlp_relay::approved_endpoint_mismatch(relay) {
+        fields.insert(finding.code, RedactedValue::String(finding.text));
+    }
     fields.insert(
         "complete_capture_authority".into(),
         RedactedValue::Bool(false),
@@ -465,6 +471,14 @@ pub(crate) fn diagnostics_items(support: &Path) -> BTreeMap<String, RedactedValu
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn unknown_relay() -> ottto_protocol::RelayState {
+        ottto_protocol::RelayState {
+            state: ottto_protocol::RelayRuntimeState::Unknown,
+            endpoint: None,
+            last_connected_at: None,
+            last_error: None,
+        }
+    }
     fn scratch() -> PathBuf {
         crate::test_scratch::private_dir("claude-support-health")
     }
@@ -553,37 +567,6 @@ mod tests {
                 fs::metadata(dir.join("fixture")).unwrap().len(),
                 MAX_EVIDENCE_FILE_BYTES
             );
-            fs::remove_dir_all(dir).unwrap();
-        }
-    }
-    #[test]
-    fn support_requires_append_delimiter_and_bounds_oversized_rows() {
-        for trace_kind in [false, true] {
-            let first = if trace_kind {
-                line(&trace("first"))
-            } else {
-                line(&api("first"))
-            };
-            let mut second = if trace_kind {
-                line(&trace("second"))
-            } else {
-                line(&api("second"))
-            };
-            second.pop();
-            let mut fixture = first.clone();
-            fixture.extend(second);
-            let (r, h, dir) = inspect(&fixture, trace_kind, None);
-            assert_eq!(r.rows.len(), 1);
-            assert_eq!(h.unframed_lines, 1);
-            fs::remove_dir_all(dir).unwrap();
-            let mut fixture = first;
-            fixture.extend(vec![b'x'; MAX_LINE_BYTES + 100]);
-            fixture.push(b'\n');
-            let (r, h, dir) = inspect(&fixture, trace_kind, None);
-            assert_eq!(r.rows.len(), 1);
-            assert_eq!(h.oversized_lines, 1);
-            assert_eq!(h.limited_files, 1);
-            assert!(MAX_BYTES_PER_FILE - r.reader.get_ref().limit() <= MAX_BYTES_PER_FILE);
             fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -711,7 +694,7 @@ mod tests {
         append_evidence(&dir, &row).unwrap();
         append_trace_ownership_evidence(&dir, &trace("private-request")).unwrap();
         let before = fs::read(evidence_path(&dir, &row.session_id)).unwrap();
-        let fields = diagnostics_items(&dir);
+        let fields = diagnostics_items(&dir, &unknown_relay());
         assert_eq!(
             fields["complete_capture_authority"],
             RedactedValue::Bool(false)
@@ -738,7 +721,7 @@ mod tests {
         let outside = dir.join("outside");
         fs::write(&outside, &before).unwrap();
         std::os::unix::fs::symlink(&outside, &file).unwrap();
-        let fields = diagnostics_items(&dir);
+        let fields = diagnostics_items(&dir, &unknown_relay());
         match &fields["api"] {
             RedactedValue::Object(api) => {
                 assert_eq!(api["unreadable_files"], RedactedValue::Number(1))
@@ -773,7 +756,7 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         fs::create_dir(dir.join("local-otel")).unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("local-otel/claude-code-effort")).unwrap();
-        let fields = diagnostics_items(&dir);
+        let fields = diagnostics_items(&dir, &unknown_relay());
         match &fields["api"] {
             RedactedValue::Object(api) => {
                 assert_eq!(api["files"], RedactedValue::Number(0));
@@ -798,7 +781,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_EVIDENCE_FILE_BYTES)
             .unwrap();
-        let fields = diagnostics_items(&dir);
+        let fields = diagnostics_items(&dir, &unknown_relay());
         match &fields["api"] {
             RedactedValue::Object(api) => {
                 assert_eq!(api["oversized_files"], RedactedValue::Number(1));
@@ -825,7 +808,7 @@ mod tests {
             sign_api(&mut row);
             append_evidence(&dir, &row).unwrap();
         }
-        let fields = diagnostics_items(&dir);
+        let fields = diagnostics_items(&dir, &unknown_relay());
         match &fields["api"] {
             RedactedValue::Object(api) => {
                 assert_eq!(

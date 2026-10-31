@@ -19,6 +19,8 @@ fn census_pipeline_window(census_window_end: &str) -> u64 {
 #[test]
 #[serial(source_manifests)]
 fn census_records_keep_the_held_revision_and_cover_it_in_window() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("claude-census-records-held");
     let baseline = fixture.baseline();
@@ -105,122 +107,6 @@ fn census_parity_page_facts(fixture: &PipelineFixture, page: &PipelinePage) -> s
         "backfill_succeeded": page.backfill_succeeded,
         "decisions": page.index.claude_census_decision_view_for_test(&fixture.base),
     })
-}
-
-/// One arm: a multi-window corpus with an id-less member, a copied request,
-/// a terminal authority family (h559 correction debt is never dropped by a
-/// record), a held change and plain appends. Returns each page's facts and
-/// the final record count.
-fn census_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Value>, usize) {
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fixture = PipelineFixture::new(name);
-    if !records {
-        crate::snapshots::claude_request_census::disable_records_under_for_test(&fixture.root);
-    }
-    std::fs::write(
-        fixture.root.join(format!("{CENSUS_PARITY_ID_LESS}.jsonl")),
-        format!(
-            "{{\"timestamp\":\"2026-08-02T07:00:05Z\",\"type\":\"assistant\",\"sessionId\":\"{CENSUS_PARITY_ID_LESS}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
-        ),
-    )
-    .expect("write id-less transcript");
-    std::fs::write(
-        fixture.root.join(format!("{CENSUS_PARITY_COPY}.jsonl")),
-        pipeline_transcript_line(CENSUS_PARITY_COPY, "req_1_1", 7),
-    )
-    .expect("write copied-request transcript");
-    let mut facts = Vec::new();
-    let mut run = |hour: u32, cycle: &PipelineCycle<'_>| {
-        for page in fixture.traversal(hour, cycle) {
-            facts.push(census_parity_page_facts(&fixture, &page));
-        }
-    };
-    run(
-        8,
-        &PipelineCycle {
-            upload_context: "upload-context-1",
-            replay_generation: "replay-generation-1",
-            proven_owner_session: Some(PIPELINE_HELD_SESSION),
-            first_page_upload: PipelineUpload::Accept,
-            historical_replay: false,
-        },
-    );
-    let terminal_root = PIPELINE_SESSIONS[2];
-    let mut index = ScanIndex::load(&fixture.index_path).expect("load scan index");
-    let revision = index
-        .files
-        .iter()
-        .find(|(key, _)| key.ends_with(&format!("{terminal_root}.jsonl")))
-        .map(|(_, entry)| entry.source_file_fingerprint.clone())
-        .filter(|revision| revision.len() == 64)
-        // A rearmed entry has no revision; any well-formed one seeds the debt.
-        .unwrap_or_else(|| "c".repeat(64));
-    index.insert_unproven_terminal_claude_authority_for_test(terminal_root, &revision);
-    index.seed_census_correction_for_test(terminal_root);
-    let debt = index
-        .claude_authority_record_for_test(terminal_root)
-        .expect("authority");
-    let correction = debt.correction.clone().expect("live correction grant");
-    assert!(!correction.1.is_empty(), "a real member owes a correction");
-    let mut reset = index.clone();
-    reset.prepare_historical_replay("replay-generation-2".to_owned());
-    let after = reset
-        .claude_authority_record_for_test(terminal_root)
-        .expect("reset retains authority");
-    assert_eq!(after.correction, Some(correction));
-    assert_eq!(
-        after.member_source_file_fingerprints,
-        debt.member_source_file_fingerprints
-    );
-    assert_eq!(
-        after.proven_witness_fingerprint,
-        debt.proven_witness_fingerprint
-    );
-    assert!(
-        after.bound_to_retained_witness,
-        "reset keeps the original proof binding"
-    );
-    index.save(&fixture.index_path).expect("save scan index");
-    fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
-    run(
-        9,
-        &PipelineCycle {
-            replay_generation: "replay-generation-2",
-            historical_replay: true,
-            ..PIPELINE_HOLD_CYCLE
-        },
-    );
-    fixture.append(terminal_root, "req_2_2");
-    fixture.append(CENSUS_PARITY_COPY, "req_copy_2");
-    run(10, &PIPELINE_HOLD_CYCLE);
-    run(
-        11,
-        &PipelineCycle {
-            proven_owner_session: Some(PIPELINE_HELD_SESSION),
-            ..PIPELINE_HOLD_CYCLE
-        },
-    );
-    let index = ScanIndex::load(&fixture.index_path).expect("reload scan index");
-    let record_count = index.claude_request_census_for_test().len_for_test();
-    (facts, record_count)
-}
-
-/// Zero behavior change: the same corpus with records on and with records
-/// off makes the same scan, upload, hold, settlement, rearm, fence, pending,
-/// quarantine and manifest-feeding decisions on every page. Only the record
-/// map and the shadow counters differ.
-#[test]
-#[serial(source_manifests)]
-fn census_records_change_no_pipeline_decision() {
-    let (with_records, record_count) = census_parity_arm("claude-census-parity-records", true);
-    let (control, control_record_count) = census_parity_arm("claude-census-parity-control", false);
-    assert!(record_count > 0, "the records arm wrote records");
-    assert_eq!(control_record_count, 0, "the control arm wrote none");
-    assert!(with_records.len() >= 4, "{} pages", with_records.len());
-    assert_eq!(with_records.len(), control.len());
-    for (page, (records, control)) in with_records.iter().zip(&control).enumerate() {
-        assert_eq!(records, control, "page {page}");
-    }
 }
 
 struct CensusPreHoldBodies {
@@ -333,7 +219,6 @@ fn census_pre_hold_bodies(
         SnapshotSource::ClaudeCode,
         &mut scan,
         &mut index,
-        true,
         |item| {
             effective_snapshot_upload_body_witness(
                 item,

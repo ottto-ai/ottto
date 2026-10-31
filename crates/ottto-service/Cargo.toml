@@ -7,6 +7,9 @@ rust-version.workspace = true
 authors.workspace = true
 build = "build.rs"
 
+[features]
+default = []
+
 [[bin]]
 name = "ottto-service"
 path = "src/main.rs"
@@ -38,6 +41,7 @@ thiserror.workspace = true
 time.workspace = true
 toml_edit.workspace = true
 unicode-normalization.workspace = true
+unicode-general-category.workspace = true
 ureq.workspace = true
 webpki-roots.workspace = true
 zeroize.workspace = true

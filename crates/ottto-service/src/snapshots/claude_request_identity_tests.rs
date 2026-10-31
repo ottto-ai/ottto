@@ -82,6 +82,7 @@ fn typed_part(part: &Value) -> SnapshotIdentityPart {
 
 fn typed_row(row: &Value) -> SnapshotModelUsage {
     SnapshotModelUsage {
+        copy_unproven: row.get("copy_unproven").and_then(Value::as_bool).unwrap_or(false),
         model: opt_string(row, "model").unwrap(),
         input_tokens: count(row, "input_tokens"),
         output_tokens: count(row, "output_tokens"),
@@ -107,6 +108,7 @@ fn typed_row(row: &Value) -> SnapshotModelUsage {
         identity_parts: row
             .get("identity_parts")
             .map(|parts| parts.as_array().unwrap().iter().map(typed_part).collect()),
+        identity_retained: row.get("identity_retained").is_some_and(|v| v == true),
         cost_usd: opt_string(row, "cost_usd"),
         input_cost_usd: opt_string(row, "input_cost_usd"),
         output_cost_usd: opt_string(row, "output_cost_usd"),
@@ -606,6 +608,17 @@ fn w0_r5_cap_fallbacks_match_bodies() {
         grow(target);
         grow(&mut built.model_usage[0]);
         let result = identity::apply(&mut built, &contributions).unwrap();
+        if tagged == "new-cap-evidence-16" {
+            // Revised cap policy: this two-hour body can retain the newest
+            // eight keys; W0's old whole-item fallback is no longer required.
+            assert!(matches!(result, Tagged::Sent { refusals: 1 }), "{result:?}");
+            assert!(built.usage_buckets[0].model_usage[0].identity_parts.is_none());
+            assert!(built.usage_buckets[1].model_usage[0].identity_parts.is_some());
+            assert_eq!(built.request_evidence.len(), 8);
+            assert_eq!(identity::semantic_leaf(&built)["refused"], true);
+            sticky_assert_reconciled(&built);
+            continue;
+        }
         let Tagged::Fallback { refusals, .. } = result else {
             panic!("{tagged}: {result:?}")
         };
@@ -866,7 +879,11 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
                     bucket_start: bucket_start.clone(),
                     row_key: row_key_from_model_usage(&row),
                     usage: holder_usage(&one, None),
-                    identity: telemetry(char::from(b'a' + login), 'd'),
+                    // All eleven keys must be valid lowercase hex. The old
+                    // a..k spelling made g..k refusal shares instead of keys.
+                    identity: RequestIdentity::Tagged(AuthorityKey {
+                        login: Some(format!("{login:064x}")), org: Some("d".repeat(64)), basis: identity::TELEMETRY,
+                    }),
                 });
             }
             rows.push(row);
@@ -895,6 +912,78 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
     );
     assert_eq!(refusals, 200);
     assert!(identity::item_bytes(&item) <= identity::MAX_ITEM_BYTES);
+}
+
+#[test]
+fn over_cap_diagnostics_increment_each_reason_and_record_last_size() {
+    use identity::OverCap;
+    let reasons = BTreeSet::from([
+        OverCap::EvidenceEntries,
+        OverCap::AuthorityKeys,
+        OverCap::PartsPerRow,
+        OverCap::PartsPerItem,
+        OverCap::Rows,
+        OverCap::Bytes,
+    ]);
+    let (_, records) = crate::local_resource_diagnostics::capture(|| {
+        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 700_000, None);
+        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 800_000, None);
+    });
+    assert_eq!(records.len(), 2);
+    let before = &records[0]["counts"]["claude_request_identity_over_cap"];
+    let after = &records[1]["counts"]["claude_request_identity_over_cap"];
+    for label in [
+        "evidence_entries",
+        "authority_keys",
+        "parts_per_row",
+        "parts_per_item",
+        "rows",
+        "bytes",
+    ] {
+        assert_eq!(
+            after[label].as_u64().unwrap(),
+            before[label].as_u64().unwrap() + 1
+        );
+    }
+    assert_eq!(
+        records[1]["counts"]["claude_request_identity_last_over_cap_item_bytes"],
+        800_000
+    );
+    assert!(serde_json::to_vec(&records[1]).unwrap().len() < 2048);
+}
+
+#[test]
+fn byte_cap_diagnostic_measures_tagged_attempt_and_preserves_full_strip() {
+    let mut item = one_row_item(&[(10, None)]);
+    let request = contribution(&item, 10, None, login_key(OWNER_A));
+    identity::apply(&mut item, std::slice::from_ref(&request)).unwrap();
+    // Unrelated body bytes can leave no room even for a single tagged bucket.
+    item.session_display_name = Some("x".repeat(identity::MAX_ITEM_BYTES));
+    let attempted_bytes = identity::item_bytes(&item);
+    let mut expected = stripped(&item);
+    expected.provenance.collector = identity::COLLECTOR.to_owned();
+    expected.request_identity_refusals = 1;
+    expected.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &expected);
+    let (result, records) = crate::local_resource_diagnostics::capture(|| {
+        identity::apply(&mut item, &[request]).unwrap()
+    });
+    let Tagged::Fallback { over_cap, refusals } = result else {
+        panic!("{result:?}");
+    };
+    assert!(over_cap.contains(&identity::OverCap::Bytes));
+    assert_eq!(refusals, 1);
+    assert_eq!(
+        serde_json::to_vec(&item).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["counts"]["claude_request_identity_last_over_cap_item_bytes"],
+        attempted_bytes
+    );
+    assert!(records[0]["counts"]["claude_request_identity_over_cap"]["bytes"]
+        .as_u64()
+        .unwrap() > 0);
 }
 
 // --- Classification ---------------------------------------------------------
@@ -1251,81 +1340,6 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
             org: Some(org.clone()),
             basis: identity::TRANSCRIPT_ORG,
         })
-    );
-}
-
-#[test]
-fn contract5_permit_needs_emission_claude_code_and_the_exact_hint_token() {
-    use identity::CohortDenial;
-    let token = Some(identity::COHORT_HINT_TOKEN);
-    assert_eq!(identity::COHORT_HINT_TOKEN, "own_request_identity_rows:v1");
-    assert!(identity::permit_when(true, SnapshotSource::ClaudeCode, token).is_ok());
-    for (offered, denial) in [
-        (None, CohortDenial::NoToken),
-        (Some(""), CohortDenial::UnknownToken),
-        // The collector name is not the hint token.
-        (Some(identity::COLLECTOR), CohortDenial::UnknownToken),
-        (Some("own_request_identity_rows:v2"), CohortDenial::UnknownToken),
-        (Some(" own_request_identity_rows:v1"), CohortDenial::UnknownToken),
-        (Some("own_request_identity_rows:v1 "), CohortDenial::UnknownToken),
-        (Some("OWN_REQUEST_IDENTITY_ROWS:V1"), CohortDenial::UnknownToken),
-    ] {
-        assert_eq!(
-            identity::permit_when(true, SnapshotSource::ClaudeCode, offered),
-            Err(denial),
-            "{offered:?}"
-        );
-    }
-    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
-        assert_eq!(
-            identity::permit_when(true, source, token),
-            Err(CohortDenial::OtherSource)
-        );
-    }
-    assert_eq!(
-        identity::permit_when(false, SnapshotSource::ClaudeCode, token),
-        Err(CohortDenial::EmissionDisabled)
-    );
-    // This build: emission is compiled on, so only the exact token permits.
-    assert!(identity::emission_permit(SnapshotSource::ClaudeCode, token).is_ok());
-    for offered in [None, Some(""), Some(" own_request_identity_rows:v1")] {
-        assert!(identity::emission_permit(SnapshotSource::ClaudeCode, offered).is_err());
-    }
-    assert_eq!(
-        identity::emission_permit(SnapshotSource::Codex, token),
-        Err(CohortDenial::OtherSource)
-    );
-}
-
-/// Each cycle's permit comes from that cycle's hint alone: a token dropped by
-/// the server denies on the next fetched cycle, with nothing carried over.
-#[test]
-fn contract5_permit_is_revoked_by_the_next_cycles_hint() {
-    let hint = |extra: &str| -> crate::snapshot_client::ActivityHintResponse {
-        serde_json::from_str(&format!(
-            r#"{{"source":"claude_code","server_time":"2026-10-14T10:00:00Z","last_data_at":null,
-                "record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,
-                "backfill_window_days":183,"recommended_scan_after":"2026-10-14T10:05:00Z"{extra}}}"#
-        ))
-        .unwrap()
-    };
-    let cycle = |hint: &crate::snapshot_client::ActivityHintResponse| {
-        identity::permit_when(
-            true,
-            SnapshotSource::ClaudeCode,
-            hint.session_request_identity_contract.as_deref(),
-        )
-        .is_ok()
-    };
-    let cycles = [
-        hint(r#","session_request_identity_contract":"own_request_identity_rows:v1""#),
-        hint(r#","session_request_identity_contract":null"#),
-        hint(r#","session_request_identity_contract":"own_request_identity_rows:v1""#),
-        hint(""),
-    ];
-    assert_eq!(
-        cycles.iter().map(cycle).collect::<Vec<_>>(),
-        [true, false, true, false]
     );
 }
 
@@ -2313,6 +2327,210 @@ fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
     }
 }
 
+/// A quiet off-page family member must not lose Full authority on a
+/// debt-free Unchanged retry. Both protected-list states use legacy money,
+/// including copied-prefix exclusion and telemetry-only usage.
+#[cfg(unix)]
+#[test]
+fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() {
+    // Like the sampled production reuse fixtures, this requires a platform
+    // whose heap layout permits retaining the Full read's native reduction.
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::claude_reemission_exclusions::ReemissionExclusions;
+    use crate::snapshots::claude_request_census::{
+        record_claude_request_census, ClaudeRequestCensusParse,
+    };
+    use crate::transcript_acquisition::{ReadMode, Scope};
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    for paused in [false, true] {
+        let (dir, _, api, trace, mut index) = legacy_fork_fixture(1);
+        index.claude_reemission_exclusions = ReemissionExclusions::parse(
+            if paused {
+                "invalid".to_string()
+            } else {
+                format!("{}\n{}", request_hash(LEGACY_PARENT), request_hash(LEGACY_CHILD))
+            }
+            .as_bytes(),
+        );
+        assert!(!claude_request_money::e2::family_applies(
+            &index,
+            LEGACY_CHILD,
+            None
+        ));
+        let quiet_path = dir.join(LEGACY_CHILD).join("subagents/agent-quiet.jsonl");
+        fs::create_dir_all(quiet_path.parent().unwrap()).unwrap();
+        fs::write(&quiet_path, "").unwrap();
+        let key = local_index_key(&quiet_path);
+        let cache = std::sync::Arc::new(sampled_scan::SharedCache::default());
+        let run = |index: ScanIndex| {
+            let mut scan = OwnedSourceScan::new(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&dir),
+                index,
+                LEGACY_WINDOW,
+                365,
+                1000,
+                true,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_sampled_acquisition(cache.clone(), Scope("unchanged-census".into()));
+            let mut mode = None;
+            loop {
+                if let Some(active) = scan.active_file.as_ref() {
+                    if local_index_key(&active.candidate.path) == key {
+                        mode = active.sampling.as_ref().map(|active| active.mode);
+                    }
+                }
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete { index, scan, .. } => break (index, scan, mode),
+                }
+            }
+        };
+        let (mut index, full, mode) = run(index);
+        assert!(matches!(mode, Some(ReadMode::Full(_))));
+        let checkpoint = cache
+            .retained_checkpoint(&key)
+            .expect("the quiet member's Full read must retain its native reduction");
+        assert!(checkpoint.audit_debt().is_none());
+        let verified = index.claude_request_census.get(&key).unwrap().clone();
+        assert!(!verified.unverified_for_test());
+        let raw = full.snapshots;
+        let mut before = raw.clone();
+        apply_claude_reported_usage_with_identity(
+            &mut before,
+            &api,
+            &trace,
+            &mut index,
+            true,
+            LEGACY_WINDOW,
+            None,
+        );
+        let expected = before
+            .iter()
+            .find(|item| item.source_session_id == LEGACY_CHILD)
+            .unwrap();
+        assert_eq!(
+            expected.usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        assert!(expected.cost.is_some());
+        assert_eq!(expected.request_count, 3); // two owned plus telemetry-only
+        assert_eq!(expected.input_tokens, 29); // 12 + 14 + 3, no copied 900
+        let witness = index.claude_usage_family_witnesses[LEGACY_CHILD].clone();
+        assert!(!witness.legacy_excluded_request_id_hashes.is_empty());
+        // Select just the quiet member again without changing its bytes,
+        // reduction, interpretation scope or prior census record.
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        let (mut index, _, mode) = run(index);
+        assert_eq!(mode, Some(ReadMode::Unchanged));
+        assert!(cache
+            .retained_checkpoint(&key)
+            .expect("the quiet member's Unchanged read must retain its native reduction")
+            .audit_debt()
+            .is_none());
+        assert!(!index
+            .claude_request_census
+            .get(&key)
+            .unwrap()
+            .unverified_for_test());
+        let saved = dir.join("index.json");
+        index.save(&saved).unwrap();
+        let mut index = ScanIndex::load(&saved).unwrap();
+        assert!(!index
+            .claude_request_census
+            .get(&key)
+            .unwrap()
+            .unverified_for_test());
+        // Exclusion-list state is pass-local, loaded independently of the index.
+        index.claude_reemission_exclusions = ReemissionExclusions::parse(
+            if paused {
+                "invalid".to_string()
+            } else {
+                format!("{}\n{}", request_hash(LEGACY_PARENT), request_hash(LEGACY_CHILD))
+            }
+            .as_bytes(),
+        );
+        let mut later = raw
+            .iter()
+            .filter(|item| item.source_session_id == LEGACY_CHILD)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(later.len(), 1, "quiet sibling has no current native body");
+        apply_claude_reported_usage_with_identity(
+            &mut later,
+            &api,
+            &trace,
+            &mut index,
+            false,
+            LEGACY_WINDOW,
+            None,
+        );
+        assert_eq!(index.claude_usage_family_witnesses[LEGACY_CHILD], witness);
+        assert_eq!(
+            later[0].usage_accounting_contract,
+            expected.usage_accounting_contract
+        );
+        assert_eq!(later[0].model_usage, expected.model_usage);
+        assert_eq!(later[0].cost, expected.cost);
+        assert_eq!(later[0].input_tokens, expected.input_tokens);
+        assert_eq!(later[0].request_count, expected.request_count);
+        // A downgraded off-page record reproduces the original money failure.
+        let fingerprint = index
+            .claude_request_census
+            .get(&key)
+            .unwrap()
+            .fingerprint_hex_for_test();
+        record_claude_request_census(
+            &mut index,
+            ClaudeRequestCensusParse {
+                path: &quiet_path,
+                index_key: &key,
+                source_file_fingerprint: &fingerprint,
+                census_window_end: LEGACY_WINDOW,
+                complete: true,
+                lossy: false,
+                source_verified: false,
+                unchanged_source: false,
+                itemless_request_hashes: vec![],
+                opened_birth: None,
+                modified_unix_seconds: 0,
+            },
+            &[],
+        );
+        let mut downgraded = raw
+            .iter()
+            .filter(|item| item.source_session_id == LEGACY_CHILD)
+            .cloned()
+            .collect::<Vec<_>>();
+        apply_claude_reported_usage_with_identity(
+            &mut downgraded,
+            &api,
+            &trace,
+            &mut index,
+            false,
+            LEGACY_WINDOW,
+            None,
+        );
+        assert!(downgraded[0].usage_accounting_contract.is_none());
+        assert_eq!(
+            downgraded[0].input_tokens, 926,
+            "native money counts the copied prefix"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 /// Exclusions the owned-request accounting cannot prove are never subtracted
 /// blindly, and an excluded request is never tagged. Each skewed item is
 /// driven through the real reported rebuild (as the pass's call site feeds
@@ -2483,244 +2701,6 @@ fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
     );
     assert_eq!(serde_json::to_vec(&unqualified).unwrap(), before);
     let _ = fs::remove_dir_all(dir);
-}
-
-/// Equal-input end-to-end resource comparison (synthetic, bounded): one
-/// 2,000-response transcript over 10 hours with 2 logins and 64 marker lines,
-/// parsed once. Legacy = today's D1 qualification; enabled = contract-5
-/// evidence + streamed tagging + D1 over the shared index + admission, as the
-/// gated scan runs them, on clones
-/// of the same parsed items and the same already-loaded sidecar reports. The
-/// transcript is deleted first, so neither path can re-read it. Released
-/// builds run only the legacy path; marker capture is test-only until the flip.
-#[test]
-fn equal_input_resource_comparison() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    use crate::retry_allocation_probe::measure;
-    let dir = temp_dir("claude-request-identity-resources");
-    let path = dir.join(format!("{ROOT}.jsonl"));
-    let mut text = String::new();
-    let mut lines = Vec::new();
-    for n in 0..2_000_u64 {
-        if n % 32 == 0 {
-            let org = if (n / 32) % 2 == 0 { ORG_1 } else { ORG_2 };
-            lines.push(json!({"timestamp": format!("2026-08-02T{:02}:00:00Z", n / 200), "type": "attachment",
-                "sessionId": ROOT, "attachment": {"type": "credential_org", "organizationUuid": org}}));
-        }
-        lines.push(json!({"timestamp": format!("2026-08-02T{:02}:{:02}:{:02}Z", n / 200, (n % 200) / 4, n % 60),
-            "type": "assistant", "sessionId": ROOT, "requestId": format!("req_{n}"),
-            "message": {"id": format!("m{n}"), "model": "claude-haiku-4-5",
-                "usage": {"input_tokens": 10 + n % 7, "output_tokens": 1}}}));
-    }
-    for line in &lines {
-        text.push_str(&line.to_string());
-        text.push('\n');
-    }
-    fs::write(&path, &text).unwrap();
-    // Parse-time capture, the only per-line work contract 5 adds.
-    let started = std::time::Instant::now();
-    let (markers, capture) = measure(|| {
-        let mut markers = None;
-        for (position, line) in lines.iter().enumerate() {
-            identity::note_marker_line(&mut markers, line, position as u64);
-        }
-        markers
-    });
-    let capture_ns = started.elapsed().as_nanos();
-    // Layout accounting is optional on unvalidated toolchains; 0 = unmeasured.
-    let marker_heap =
-        crate::heap_layout_bound::completed_bound(markers.as_ref().unwrap(), usize::MAX)
-            .unwrap_or(0);
-    let parsed = parse_claude_code_jsonl_file(&path, "2026-08-02T11:00:00Z", "fp".into()).unwrap();
-    fs::remove_file(&path).unwrap();
-    assert_eq!(parsed[0].request_count, 2_000);
-    let api = (0..2_000_u64)
-        .map(|n| {
-            let mut row = complete_api_row(ROOT, &format!("req_{n}"), n % 60, 10 + n % 7, 1, 0);
-            if n % 2 == 1 {
-                row.account_identifier_hash = Some("b".repeat(64));
-            }
-            signed(row)
-        })
-        .collect::<Vec<_>>();
-    let trace = (0..2_000_u64)
-        .map(|n| complete_trace_row(ROOT, &format!("req_{n}"), ""))
-        .collect::<Vec<_>>();
-    let (api, trace) = reports(api, trace);
-    let legacy_path = |items: &mut Vec<SnapshotItem>| {
-        claude_request_accounts::apply(items, &api, &trace);
-    };
-    let enabled_path = |items: &mut Vec<SnapshotItem>| {
-        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
-        let outcome = identity::apply_scan(items, &evidence, BTreeMap::new());
-        let mut qualification = claude_request_accounts::apply_with_shared_index(
-            items,
-            &api,
-            &trace,
-            &BTreeMap::new(),
-            &evidence,
-        );
-        drop(evidence);
-        for item in items.iter() {
-            qualification.mixed.admit_request_identity(item);
-        }
-        assert_eq!(outcome.sent, 1, "{outcome:?}");
-    };
-    let run = |path: &dyn Fn(&mut Vec<SnapshotItem>)| {
-        let mut items = parsed.clone();
-        let checks = claude_evidence_fingerprint_checks();
-        let started = std::time::Instant::now();
-        let ((), allocation) = measure(|| path(&mut items));
-        let elapsed = started.elapsed().as_nanos();
-        let after = claude_evidence_fingerprint_checks();
-        let payload = serde_json::to_vec(&items[0]).unwrap().len();
-        (
-            items,
-            elapsed,
-            (after.0 - checks.0, after.1 - checks.1),
-            allocation,
-            payload,
-        )
-    };
-    // Warm both once so neither pays first-touch costs alone.
-    let _ = (run(&legacy_path), run(&enabled_path));
-    let (legacy, legacy_ns, legacy_checks, legacy_alloc, legacy_payload) = run(&legacy_path);
-    let (enabled, enabled_ns, enabled_checks, enabled_alloc, enabled_payload) =
-        run(&enabled_path);
-    eprintln!(
-        "request identity resources: lines={} capture_ns={capture_ns} \
-         capture_allocations={} capture_retained={} marker_heap_bytes={marker_heap} \
-         legacy_ns={legacy_ns} enabled_ns={enabled_ns} \
-         fingerprint_checks_api_trace legacy={legacy_checks:?} enabled={enabled_checks:?} \
-         allocations legacy={} enabled={} requested_peak legacy={} enabled={} \
-         retained legacy={} enabled={} payload_bytes legacy={legacy_payload} \
-         enabled={enabled_payload} buckets={} size_of_item_field={} \
-         size_of_index_witness={}",
-        lines.len(),
-        capture.allocations,
-        capture.requested_live,
-        legacy_alloc.allocations,
-        enabled_alloc.allocations,
-        legacy_alloc.requested_peak,
-        enabled_alloc.requested_peak,
-        legacy_alloc.requested_live,
-        enabled_alloc.requested_live,
-        enabled[0].usage_buckets.len(),
-        std::mem::size_of::<Option<Box<identity::OrgMarkers>>>(),
-        std::mem::size_of::<Option<identity::DesktopCensusWitness>>(),
-    );
-    assert_ne!(legacy[0].provenance.collector, identity::COLLECTOR);
-    // D1 over the shared index is D1: same bytes and coverage on today's path.
-    let mut shared = parsed.clone();
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
-    let shared_coverage = claude_request_accounts::apply_with_shared_index(
-        &mut shared,
-        &api,
-        &trace,
-        &BTreeMap::new(),
-        &evidence,
-    )
-    .coverage;
-    let mut own = parsed.clone();
-    let own_coverage = claude_request_accounts::apply(&mut own, &api, &trace).coverage;
-    assert_eq!(shared_coverage, own_coverage);
-    assert_eq!(
-        serde_json::to_vec(&shared).unwrap(),
-        serde_json::to_vec(&own).unwrap()
-    );
-    assert_eq!(enabled[0].provenance.collector, identity::COLLECTOR);
-    // Each sidecar row's fingerprint is checked once per path: contract 5
-    // reuses its own login validation, and D1 leaves the tagged item alone.
-    assert_eq!(legacy_checks, (2_000, 2_000));
-    assert_eq!(enabled_checks, legacy_checks);
-    // Nothing per request is retained or materialized: the enabled path's peak
-    // stays within 64 KiB of legacy and its allocations within 5% (the rest is
-    // per item: byte-cap encoding, install and admission).
-    assert!(
-        enabled_alloc.requested_peak <= legacy_alloc.requested_peak + 64 * 1024,
-        "{enabled_alloc:?} vs {legacy_alloc:?}"
-    );
-    assert!(
-        enabled_alloc.allocations <= legacy_alloc.allocations + legacy_alloc.allocations / 20,
-        "{enabled_alloc:?} vs {legacy_alloc:?}"
-    );
-    assert!(marker_heap < 16 * 1024, "{marker_heap}");
-    assert!(enabled_payload <= identity::MAX_ITEM_BYTES);
-    assert_eq!(enabled[0].request_count, 2_000, "count conservation");
-    let _ = fs::remove_dir_all(dir);
-}
-
-/// Aggregation is bounded by rows and authority keys, not by requests: ten
-/// times the requests over the same rows and keys retain exactly the same
-/// heap, keys past the cap fold into untagged as they arrive, and a request
-/// outside the item's rows stops construction.
-#[test]
-fn grouping_retains_nothing_per_request() {
-    use crate::retry_allocation_probe::measure;
-    let (row_key, _, _) = build_row_identity("claude-haiku-4-5", &SelectorCapture::default(), None);
-    let usage = UsageTotals {
-        input_tokens: 3,
-        request_count: 1,
-        costs: UsageCosts {
-            observed: true,
-            reported: true,
-            total: Some(1_000_000),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let keys = (0..40_u8)
-        .map(|n| {
-            RequestIdentity::Tagged(AuthorityKey {
-                login: Some(format!("{n:064x}")),
-                org: None,
-                basis: identity::TELEMETRY,
-            })
-        })
-        .collect::<Vec<_>>();
-    let build = |requests: usize| {
-        measure(|| {
-            let mut grouping = identity::Grouping::new(2);
-            for n in 0..requests {
-                let bucket = if n % 2 == 0 {
-                    "2026-08-02T07:00:00Z"
-                } else {
-                    "2026-08-02T08:00:00Z"
-                };
-                let identity = match n % 50 {
-                    40 => RequestIdentity::Refused(Refusal::BadClock),
-                    41 => RequestIdentity::Missing,
-                    k if k < 40 => keys[k].clone(),
-                    _ => keys[0].clone(),
-                };
-                grouping.add(bucket, &row_key, &usage, identity.as_ref());
-            }
-            grouping
-        })
-    };
-    let (small, small_stats) = build(1_000);
-    let (large, large_stats) = build(10_000);
-    assert_eq!(small_stats.requested_live, large_stats.requested_live);
-    assert!(small_stats.requested_peak <= large_stats.requested_peak);
-    assert_eq!(large_stats.requested_peak, small_stats.requested_peak);
-    assert_ne!(small, large, "amounts still count every request");
-    // A third row the item does not carry: never reproducible, stop growing.
-    let mut overflow = identity::Grouping::new(2);
-    for bucket in [
-        "2026-08-02T07:00:00Z",
-        "2026-08-02T08:00:00Z",
-        "2026-08-02T09:00:00Z",
-    ] {
-        overflow.add(bucket, &row_key, &usage, keys[0].as_ref());
-    }
-    let mut item = one_row_item(&[(1, None)]);
-    let before = serde_json::to_vec(&item).unwrap();
-    assert_eq!(
-        identity::apply_grouped(&mut item, overflow),
-        Err(identity::Ineligible::RowsNotReproduced)
-    );
-    assert_eq!(serde_json::to_vec(&item).unwrap(), before);
 }
 
 // --- Review regressions ---------------------------------------------------------
@@ -2977,11 +2957,11 @@ fn coverage(
     ledger
 }
 
-// Released builds compile contract-5 emission on (still gated per cycle by the
-// cohort hint token) and keep `transcript_email` and its feed compiled out, and
+// Released builds capture contract 5 for Claude Code always (no cohort
+// token) and keep `transcript_email` and its feed compiled out, and
 // `transcript_sole_login` suppressed independently of the email gate.
 const _: () = assert!(
-    identity::EMISSION_ENABLED
+    identity::captures(SnapshotSource::ClaudeCode)
         && !identity::TRANSCRIPT_EMAIL_ENABLED
         && !identity::TRANSCRIPT_SOLE_LOGIN_ENABLED
 );
@@ -3549,124 +3529,6 @@ fn rows_under_another_root_own_the_request() {
             basis: identity::TRANSCRIPT_ORG,
         })
     );
-}
-
-/// A witnessed duplicate still refuses. Every pass withdraws marker-derived
-/// tags to missing or login-only, including a fully compared/open census.
-/// Usage never moves and full telemetry remains authoritative.
-#[test]
-fn transcript_markers_are_withdrawn_even_when_a_settled_census_shows_unduplicated() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    use crate::snapshots::ClaudeDuplicateCensusCounts;
-    let dir = temp_dir("claude-request-identity-ownership");
-    let org = org_hash(ORG_1);
-    let mut lines = email_session(false, false);
-    // A second request whose login-only telemetry joins the marker org.
-    lines.push(json!({"timestamp": "2026-08-02T07:00:02Z", "type": "assistant", "sessionId": ROOT,
-        "requestId": "req_2", "message": {"id": "m2", "model": "claude-haiku-4-5",
-        "usage": {"input_tokens": 20, "output_tokens": 2}}}));
-    let mut member = complete_api_row(ROOT, "req_member", 9, 10, 1, 0);
-    member.request_identity = Some(org_identity(&org));
-    let (api, trace) = reports(
-        vec![signed(member), signed(complete_api_row(ROOT, "req_2", 2, 20, 2, 0))],
-        vec![
-            complete_trace_row(ROOT, "req_member", ""),
-            complete_trace_row(ROOT, "req_2", ""),
-        ],
-    );
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
-    let before = parse_session(&dir, &lines).remove(0);
-    let run = |index: &ScanIndex, census: &ClaudeDuplicateCensusCounts, compared: bool| {
-        let mut items = parse_session(&dir, &lines);
-        let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition {
-            duplicate_census: *census,
-            transcript_ownership_complete: compared,
-            ..Default::default()
-        };
-        let ownership = identity::TranscriptOwnership::after_census(index, &disposition);
-        identity::apply_scan_with_ownership(&mut items, &evidence, BTreeMap::new(), &ownership);
-        items.remove(0)
-    };
-    let conserved = |item: &SnapshotItem| {
-        let rows = |item: &SnapshotItem| {
-            item.usage_buckets
-                .iter()
-                .flat_map(|bucket| &bucket.model_usage)
-                .chain(&item.model_usage)
-                .map(|row| (row.request_count, row.input_tokens, row.output_tokens, row.cost_usd.clone()))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(rows(item), rows(&before));
-        assert_eq!(
-            (item.input_tokens, item.output_tokens, item.request_count),
-            (before.input_tokens, before.output_tokens, before.request_count)
-        );
-        assert_eq!(item.cost, before.cost);
-    };
-    let bases = |item: &SnapshotItem| {
-        item.request_evidence
-            .iter()
-            .map(|evidence| (evidence.identity_basis.clone(), evidence.provider_workspace_hash.clone()))
-            .collect::<BTreeSet<_>>()
-    };
-    let settled = ClaudeDuplicateCensusCounts {
-        census_complete: true,
-        coverage_complete: true,
-        ..Default::default()
-    };
-    let clean = ScanIndex::default();
-
-    // Settled and unduplicated: marker tags are still withdrawn, as `apply_scan`.
-    let tagged = run(&clean, &settled, true);
-    assert_eq!(
-        bases(&tagged),
-        BTreeSet::from([(identity::TELEMETRY_LOGIN.to_string(), None)])
-    );
-    assert_eq!(tagged.request_identity_refusals, 0);
-    let mut via_default = parse_session(&dir, &lines);
-    identity::apply_scan(&mut via_default, &evidence, BTreeMap::new());
-    assert_eq!(serde_json::to_vec(&via_default[0]).unwrap(), serde_json::to_vec(&tagged).unwrap());
-    conserved(&tagged);
-
-    // A witnessed duplicate of the unrowed request refuses it, never borrows.
-    let mut duplicated = ScanIndex::default();
-    duplicated.claude_duplicate_request_owners.insert(
-        format!("{:x}", Sha256::digest(b"req_1")),
-        BTreeSet::from([
-            claude_duplicate_request_owner(ROOT, ROOT),
-            claude_duplicate_request_owner(OTHER_ROOT, OTHER_ROOT),
-        ]),
-    );
-    let refused = run(&duplicated, &settled, true);
-    assert!(refused.request_identity_refusals >= 1);
-    assert!(!bases(&refused).iter().any(|(basis, _)| basis == identity::TRANSCRIPT_ORG));
-    conserved(&refused);
-
-    // Unsettled passes: no marker reaches the wire, nothing is refused that
-    // was not, and the refusal above survives. The last case passes every
-    // census flag but left an indexed member uncompared (a quarantined
-    // original): ownership alone withdraws.
-    for (census, compared) in [
-        (ClaudeDuplicateCensusCounts::default(), false),
-        (ClaudeDuplicateCensusCounts { coverage_complete: false, ..settled }, true),
-        (ClaudeDuplicateCensusCounts { census_invalid: true, ..settled }, true),
-        (ClaudeDuplicateCensusCounts { fence_after: true, ..settled }, true),
-        (settled, false),
-    ] {
-        let withdrawn = run(&clean, &census, compared);
-        assert_eq!(
-            bases(&withdrawn),
-            BTreeSet::from([(identity::TELEMETRY_LOGIN.to_string(), None)]),
-            "{census:?} compared={compared}"
-        );
-        assert_eq!(withdrawn.request_identity_refusals, 0, "{census:?} compared={compared}");
-        conserved(&withdrawn);
-        let still_refused = run(&duplicated, &census, compared);
-        assert!(still_refused.request_identity_refusals >= 1, "{census:?} compared={compared}");
-        conserved(&still_refused);
-    }
-    let _ = fs::remove_dir_all(dir);
 }
 
 /// The open/settled result that D2 will supply cannot authorize copied
@@ -4987,3 +4849,6 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+include!("claude_request_identity_window_tests.rs");
+include!("claude_request_identity_retained_tests.rs");

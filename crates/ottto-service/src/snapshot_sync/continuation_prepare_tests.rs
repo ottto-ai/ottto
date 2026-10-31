@@ -202,7 +202,6 @@ impl ContinuationFixture {
             &self.support_dir,
             cache,
             inputs,
-            &BTreeSet::new(),
             Some(Duration::from_secs(300)),
             Instant::now() + Duration::from_secs(20),
         )
@@ -232,13 +231,22 @@ impl ContinuationFixture {
         let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
         self.ordinary_side_pass(&cache, true);
         let mut minted = self.preparation(true);
-        let mut inputs = take_continuation_inputs(&mut minted);
+        let mut inputs = take_continuation_inputs(
+            &mut minted,
+            &std::sync::Arc::default(),
+            std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+        );
         let before = self.disk();
         assert_eq!(self.prepare_on(&cache, &mut inputs).err(), Some(refusal));
         assert_eq!(self.disk(), before, "no save, no claim, no reset");
         assert!(inputs.holds_attribution(), "a refusal keeps it cached");
         assert!(self.ordinary_side_pass(&cache, true), "no gate reset");
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn continuation_preparation_for_test() -> SourcePreparation {
+    ContinuationFixture::quiescent("continuation-mint-finish").preparation(true)
 }
 
 /// K2: cached inputs for the continuation tests, with a drop sentinel (the
@@ -249,7 +257,11 @@ pub(super) fn continuation_inputs_for_test(
 ) -> (ContinuationInputs, std::sync::Arc<AgentStatusCollection>) {
     let fixture = ContinuationFixture::quiescent("continuation-inputs-for-test");
     let mut preparation = fixture.preparation(attribution);
-    let inputs = take_continuation_inputs(&mut preparation);
+    let inputs = take_continuation_inputs(
+        &mut preparation,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
     let sentinel = std::sync::Arc::clone(&preparation.scan_agent_status_collection);
     drop(preparation);
     (inputs, sentinel)
@@ -264,7 +276,11 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
         .activity_hint
         .session_attribution_hmac_key
         .is_some());
-    let inputs = take_continuation_inputs(&mut preparation);
+    let inputs = take_continuation_inputs(
+        &mut preparation,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
     assert!(
         preparation.attribution_context.is_none(),
         "moved out, not copied"
@@ -292,7 +308,11 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
 fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     let fixture = ContinuationFixture::quiescent("continuation-prepare-parity");
     let mut minted = fixture.preparation(true);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(
+        &mut minted,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
     let before = fixture.disk();
     let prepared = fixture
         .prepare(&mut inputs)
@@ -360,12 +380,12 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         .attribution_context
         .as_ref()
         .map(SessionAttributionContext::checkpoint_namespace);
-    index.activate_upload_context(cycle_upload_context(
-        minted.upload_policy,
-        checkpoint.as_deref(),
-        false,
-    ));
-    index.mark_context_curve_capability_disabled();
+    activate_source_upload_context(
+        source,
+        cycle_upload_context(minted.upload_policy, checkpoint.as_deref(), false),
+        &mut index,
+        &mut progress,
+    );
     let generation = cycle_replay_generation(source, false, &index, CONTINUATION_NAMESPACE);
     assert_eq!(prepared.replay_generation, generation);
     let now = reason_reoffer::now_unix_seconds();
@@ -411,7 +431,11 @@ fn a_pending_historical_replay_refuses_the_continuation_prepare() {
     )
     .unwrap();
     let mut minted = fixture.preparation(true);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(
+        &mut minted,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
     let before = fixture.disk();
     assert_eq!(
         fixture.prepare(&mut inputs).err(),
@@ -421,67 +445,46 @@ fn a_pending_historical_replay_refuses_the_continuation_prepare() {
     assert!(inputs.holds_attribution(), "a refusal keeps it cached");
 }
 
-/// K1 (a″): the upload-claim predicate is the ordinary selection's answer
-/// on a copy: it never changes the loaded progress.
+/// Contract-5 cutover, byte-stable keys (Lead B): a Claude cycle's sampled
+/// scope keeps the permit-era permitted `:request_identity` suffix for good,
+/// and a Codex cycle keeps its suffix-free bytes, so durable records and
+/// retained parsers written before the cutover still bind after it. Golden
+/// digests of the pre-cutover scope strings.
 #[test]
-fn the_upload_claim_predicate_is_pure_and_matches_the_ordinary_selection() {
-    let fixture = ContinuationFixture::quiescent("continuation-claim-predicate");
-    let (progress, index) = fixture.load();
-    let now = reason_reoffer::now_unix_seconds();
-    let scope = reason_reoffer::Scope {
-        index: &index,
-        now,
-        window_start_unix_seconds: now.saturating_sub(30 * 86_400),
-    };
-    for generation in [
-        cycle_replay_generation(SnapshotSource::Codex, false, &index, CONTINUATION_NAMESPACE),
-        "another-generation".to_string(),
-    ] {
-        let unchanged = progress.clone();
-        let needed = continuation_upload_claim_needed(&progress, &index, &generation, &scope);
-        assert_eq!(progress, unchanged, "pure");
-        let mut ordinary = progress.clone();
-        assert_eq!(
-            needed,
-            prepare_upload_progress_for_cycle_with_reoffer(
-                &mut ordinary,
-                &index,
-                &generation,
-                false,
-                Some(&scope)
-            )
-        );
-    }
-}
-
-/// K5.1/K5.2: a continuation page's sampled scope is the ordinary Codex
-/// page's, byte for byte: Codex never holds a request-identity permit.
-#[test]
-fn the_continuation_scope_is_the_ordinary_codex_scope() {
+fn the_always_on_sampled_scope_keeps_the_permit_era_bytes() {
+    use crate::snapshots::claude_request_identity::captures;
     let witness = [3u8; 32];
     let index_path = Path::new("/tmp/ottto-continuation-scope-index.json");
-    for token in [None, Some("claude-request-identity-cohort")] {
-        let mut hint = continuation_hint(false);
-        hint.session_request_identity_contract = token.map(str::to_owned);
-        let permit = cycle_request_identity_permit(SnapshotSource::Codex, &hint);
-        assert!(permit.is_none(), "{token:?}");
-        for curve in [false, true] {
-            let ordinary = cycle_sampled_scope(
-                &witness,
-                CONTINUATION_NAMESPACE,
-                index_path,
-                curve,
-                permit.is_some(),
-            );
-            let continuation =
-                cycle_sampled_scope(&witness, CONTINUATION_NAMESPACE, index_path, curve, false);
-            assert_eq!(ordinary.0, continuation.0);
-            // One byte of difference would make the ticket unready.
-            assert_ne!(
-                cycle_sampled_scope(&witness, CONTINUATION_NAMESPACE, index_path, curve, true).0,
-                continuation.0
-            );
-        }
+    for (source, curve, golden) in [
+        (
+            SnapshotSource::ClaudeCode,
+            false,
+            "c58cf74dc52ebcdb56cce301dde881fac71e0045ddf127d0137ed7d16b80ae55",
+        ),
+        (
+            SnapshotSource::ClaudeCode,
+            true,
+            "2d63534231ce46641c37958033fe49bdfb683d2592f1648ddd715ac412022292",
+        ),
+        (
+            SnapshotSource::Codex,
+            false,
+            "26648c9996bbbd2102f21bab2bd0a6c2fc6a522bb3b159ba6869d5c645d9df04",
+        ),
+        (
+            SnapshotSource::Codex,
+            true,
+            "a9cd90d380262e8c616ed6ff63cb6bbc1b568a8b375526a90b32a94f6537103d",
+        ),
+    ] {
+        let scope = cycle_sampled_scope(
+            &witness,
+            CONTINUATION_NAMESPACE,
+            index_path,
+            curve,
+            captures(source),
+        );
+        assert_eq!(scope.0, golden, "{source:?} curve={curve}");
     }
 }
 
@@ -491,7 +494,11 @@ fn the_continuation_scope_is_the_ordinary_codex_scope() {
 fn no_continuation_output_serializes_the_attribution_key() {
     let fixture = ContinuationFixture::quiescent("continuation-no-key-output");
     let mut minted = fixture.preparation(true);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(
+        &mut minted,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
     let prepared = fixture
         .prepare(&mut inputs)
         .unwrap_or_else(|refusal| panic!("refused: {}", refusal.label()));
@@ -673,7 +680,11 @@ fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
         let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
         assert!(fixture.ordinary_side_pass(&cache, ordinary_saved));
         let mut minted = fixture.preparation(true);
-        let mut inputs = take_continuation_inputs(&mut minted);
+        let mut inputs = take_continuation_inputs(
+            &mut minted,
+            &std::sync::Arc::default(),
+            std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+        );
         let before = fixture.disk();
         let prepared = fixture
             .prepare_on(&cache, &mut inputs)

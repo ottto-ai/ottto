@@ -619,221 +619,6 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
     }
 }
 
-/// StateMissing M1 (SOURCE d680b524) through the real `prepare_sync_source`
-/// and `finish_sync_source`, the synthetic backend recording every offered
-/// body. Beside the fixture's own session, family `R` has a root transcript
-/// and subagent files `agents`; a first cycle sends everything. Then `R.jsonl`
-/// is removed, the list is installed naming `R_<listed_member>`, or `R`
-/// itself when `listed_member` is `None`, and the saved
-/// index is corrupted, so the next load quarantines it and every file comes
-/// back new (prior history). Returns the bodies the rebuilt cycle offered and
-/// the local diagnostics it recorded.
-fn rootless_family_real_pipeline(
-    name: &str,
-    agents: &[&str],
-    listed_member: Option<&str>,
-) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
-    const FAMILY: &str = "2558a80a-f36e-4cbc-a5bb-50fc66430ba5";
-    if !crate::heap_layout_bound::layout_supported() {
-        writeln!(
-            std::io::stderr().lock(),
-            "{name}: supported_positive=UNEXECUTED layout_supported=false"
-        )
-        .unwrap();
-        return None;
-    }
-    let fixture = IdentityPipelineHome::new();
-    let project = fixture.home.join(".claude/projects/-synthetic-repo");
-    let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(170))
-        .replace_nanosecond(0)
-        .unwrap()
-        .format(&Rfc3339)
-        .unwrap();
-    let line = |agent: Option<&str>| {
-        let request = agent.unwrap_or("root");
-        serde_json::json!({"timestamp": at, "type": "assistant", "sessionId": FAMILY,
-            "agentId": agent, "isSidechain": agent.is_some(),
-            "requestId": format!("req_{request}"), "message": {"id": format!("m_{request}"),
-            "model": "claude-haiku-4-5", "usage": {"input_tokens": 10, "output_tokens": 1}}})
-        .to_string()
-            + "\n"
-    };
-    let root_file = project.join(format!("{FAMILY}.jsonl"));
-    std::fs::write(&root_file, line(None)).unwrap();
-    let subagents = project.join(FAMILY).join("subagents");
-    std::fs::create_dir_all(&subagents).unwrap();
-    for agent in agents {
-        std::fs::write(subagents.join(format!("{agent}.jsonl")), line(Some(agent))).unwrap();
-    }
-    let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
-    let cadence = IdentityPipelineCadence::new();
-    let support = fixture.base.join(format!("{name}-support"));
-    let secrets = fixture.base.join(format!("{name}-secrets"));
-    std::fs::create_dir_all(support.join("snapshots")).unwrap();
-    std::fs::create_dir_all(&secrets).unwrap();
-    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
-    let server = FinishServer::new(FinishOutcome::Accept);
-    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
-    let device = LocalDeviceBinding {
-        device_id: format!("{name}-device"),
-        machine_id: Some("otm_test".into()),
-        sources: vec!["claude_code".into()],
-    };
-    FileDeviceStore::default().save(&device).unwrap();
-    std::fs::write(
-        secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
-        "device-secret",
-    )
-    .unwrap();
-    write_native_bootstrap_sidecars(&fixture, &support);
-    let client = SnapshotApiClient::new(server.url.clone());
-    let daemon = test_daemon("otm_test");
-    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
-    let collection = || AgentStatusCollection {
-        snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
-        source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
-        codex_scan_homes: Vec::new(),
-        codex_home_bindings: Vec::new(),
-    };
-    let mut cycle = || {
-        cadence.next_due_cycle();
-        let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
-            prepare_sync_source(
-                &client,
-                &device,
-                "device-secret",
-                SnapshotSource::ClaudeCode,
-                "otm_test",
-                &fixture.home,
-                &support,
-                &daemon,
-                &mut transport,
-                daemon.snapshot_scan_account_witness().unwrap(),
-                false,
-            )
-        })
-        .unwrap()
-        .expect("real due preparation");
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
-        let index_path = preparation.index_path.clone();
-        let result = crate::agent_status_refresh::with_test_collection(collection(), || {
-            finish_sync_source(
-                preparation,
-                index,
-                scan,
-                &client,
-                &device,
-                "device-secret",
-                SnapshotSource::ClaudeCode,
-                "otm_test",
-                &fixture.home,
-                &support,
-                &daemon,
-                &mut transport,
-                &mut retry,
-            )
-        });
-        assert!(result.is_ok(), "{name}: {result:?}");
-        index_path
-    };
-    let index_path = cycle();
-    {
-        let mut offered = server.offered.lock().unwrap();
-        for agent in agents {
-            let id = format!("{FAMILY}_{agent}");
-            assert!(
-                offered
-                    .iter()
-                    .any(|item| item["source_session_id"] == id.as_str()),
-                "{name}: the first cycle sends {agent}"
-            );
-        }
-        offered.clear();
-    }
-    std::fs::remove_file(&root_file).unwrap();
-    let listed = listed_member.map_or_else(|| FAMILY.to_owned(), |stem| format!("{FAMILY}_{stem}"));
-    std::fs::write(
-        support.join("snapshots/claude_code-reemission-exclusions.txt"),
-        format!("# synthetic\n{:x}\n", Sha256::digest(listed.as_bytes())),
-    )
-    .unwrap();
-    std::fs::write(&index_path, b"{not json").unwrap();
-    let ((), lines) = crate::local_resource_diagnostics::capture(|| {
-        cycle();
-    });
-    let offered = server.offered.lock().unwrap().clone();
-    let family_offers = offered
-        .iter()
-        .filter_map(|item| item["source_session_id"].as_str())
-        .filter(|id| id.starts_with(FAMILY))
-        .collect::<Vec<_>>();
-    assert!(
-        family_offers.is_empty(),
-        "{name}: no body of the listed family is offered: {family_offers:?}"
-    );
-    assert!(
-        offered
-            .iter()
-            .any(|item| item["source_session_id"] == IDENTITY_PIPELINE_ROOT),
-        "{name}: the unlisted session's history is still offered"
-    );
-    Some((offered, lines))
-}
-
-/// The members the history gate held only through a listed family root
-/// whose root file is absent, as the real cycle's diagnostics recorded them.
-fn root_absent_family_closure_count(lines: &[serde_json::Value]) -> u64 {
-    lines
-        .iter()
-        .filter(|line| line["stage"] == "claude_reemission_family_closure_root_absent_excluded")
-        .map(|line| {
-            line["counts"]["claude_reemission_family_closure_root_absent_excluded"]
-                .as_u64()
-                .unwrap()
-        })
-        .sum()
-}
-
-/// SOURCE d680b524 (a), real prepare/finish: the list names only
-/// `R_agent-a`, `R.jsonl` is gone. No sibling is offered, whether traversal
-/// decides it after agent-a (`agent-b`) or before it (`agent-0`); the sibling
-/// counts once (agent-a is listed by its own line).
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn rootless_family_member_list_offers_no_sibling_through_the_real_pipeline() {
-    for (sibling, name) in [
-        ("agent-b", "rootless-member-after"),
-        ("agent-0", "rootless-member-before"),
-    ] {
-        let Some((_, lines)) =
-            rootless_family_real_pipeline(name, &["agent-a", sibling], Some("agent-a"))
-        else {
-            return;
-        };
-        assert_eq!(root_absent_family_closure_count(&lines), 1, "{name}");
-    }
-}
-
-/// SOURCE d680b524 (b), real prepare/finish: the list names the root `R`,
-/// `R.jsonl` is gone and only subagent files remain. None is offered, and
-/// each counts as held through the absent root.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn rootless_family_root_list_offers_no_subagent_through_the_real_pipeline() {
-    let Some((_, lines)) =
-        rootless_family_real_pipeline("rootless-root-listed", &["agent-a", "agent-b"], None)
-    else {
-        return;
-    };
-    assert_eq!(root_absent_family_closure_count(&lines), 2);
-}
-
 // Same real finish fixture; the new tests own only a test-thread observer.
 pub(crate) mod prior_index_lifetime_tests {
     include!("prior_index_lifetime_tests.rs");
@@ -866,263 +651,6 @@ pub(in crate::snapshot_sync) fn ack_post_save_failure(stage: &'static str) -> Re
         return Err(anyhow!("synthetic post-index-save failure: {stage}"));
     }
     Ok(())
-}
-
-struct AckPostSaveFailure;
-impl Drop for AckPostSaveFailure {
-    fn drop(&mut self) {
-        ACK_POST_SAVE_FAILURE.with(|slot| slot.set(None));
-        ACK_CACHE_PROBE.with(|slot| slot.set(false));
-    }
-}
-
-fn ack_finish_pipeline_case(stage: &'static str) {
-    crate::client_report::reset_for_test();
-    let fixture = IdentityPipelineHome::new();
-    let _cadence = IdentityPipelineCadence::new();
-    let support = fixture.base.join("ack-post-save-support");
-    let secrets = fixture.base.join("ack-post-save-secrets");
-    std::fs::create_dir_all(&support).unwrap();
-    std::fs::create_dir_all(&secrets).unwrap();
-    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
-    let server = FinishServer::new(FinishOutcome::Accept);
-    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
-    let device = LocalDeviceBinding {
-        device_id: "ack-post-save-device".into(),
-        machine_id: Some("otm_test".into()),
-        sources: vec!["claude_code".into()],
-    };
-    FileDeviceStore::default().save(&device).unwrap();
-    std::fs::write(
-        secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
-        "device-secret",
-    )
-    .unwrap();
-    let client = SnapshotApiClient::new(server.url.clone());
-    let daemon = test_daemon("otm_test");
-    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
-    let collection = || AgentStatusCollection {
-        snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
-        source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
-        codex_scan_homes: Vec::new(),
-        codex_home_bindings: Vec::new(),
-    };
-    let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
-        prepare_sync_source(
-            &client,
-            &device,
-            "device-secret",
-            SnapshotSource::ClaudeCode,
-            "otm_test",
-            &fixture.home,
-            &support,
-            &daemon,
-            &mut transport,
-            daemon.snapshot_scan_account_witness().unwrap(),
-            false,
-        )
-    })
-    .unwrap()
-    .expect("actual due source preparation");
-    let (mut preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
-    assert!(scan.census_complete);
-    if stage == "bootstrap_capacity" {
-        preparation.cache_observations_enabled = true;
-        ACK_CACHE_PROBE.with(|slot| slot.set(true));
-    }
-    if stage == "first_install" {
-        let template = scan.snapshots[0].clone();
-        scan.snapshots = (0..4100)
-            .map(|entity| {
-                let mut item = template.clone();
-                item.source_session_id = format!("first-install-{entity}");
-                item.snapshot_fingerprint = format!("{entity:064x}");
-                item
-            })
-            .collect();
-        assert_eq!(
-            preparation
-                .committed_index
-                .current_snapshot_fingerprints()
-                .len(),
-            0
-        );
-    }
-    // Simulate accepted siblings whose source disappeared before adoption.
-    // Neither the current scanner delta nor the selected index contains it.
-    let stale = "f".repeat(64);
-    if stage != "first_install" {
-        preparation
-            .upload_progress
-            .record_body(&stale, &"e".repeat(64));
-    }
-    if matches!(stage, "capacity" | "bootstrap_capacity") {
-        for entity in 0..5000 {
-            let fp = format!("{entity:064x}");
-            preparation.upload_progress.record_body(&fp, &fp);
-        }
-    }
-    preparation
-        .upload_progress
-        .save(&preparation.upload_progress_path)
-        .unwrap();
-    let index_path = preparation.index_path.clone();
-    let progress_path = preparation.upload_progress_path.clone();
-    let namespace = preparation.upload_destination_namespace.clone();
-    ACK_POST_SAVE_FAILURE.with(|slot| {
-        slot.set(
-            (!matches!(stage, "capacity" | "bootstrap_capacity" | "first_install"))
-                .then_some(stage),
-        )
-    });
-    let _reset = AckPostSaveFailure;
-    let result = crate::agent_status_refresh::with_test_collection(collection(), || {
-        finish_sync_source(
-            preparation,
-            index,
-            scan,
-            &client,
-            &device,
-            "device-secret",
-            SnapshotSource::ClaudeCode,
-            "otm_test",
-            &fixture.home,
-            &support,
-            &daemon,
-            &mut transport,
-            &mut retry,
-        )
-    });
-    if stage == "first_install" {
-        result.expect("actual first install over 4096 has no artificial capacity stop");
-        assert_eq!(server.offered.lock().unwrap().len(), 4100);
-        assert!(matches!(
-            source_cadences().lock().unwrap()["claude_code"].state(),
-            ottto_protocol::LocalCollectorState::Warm
-        ));
-        let saved = ScanIndex::load(&index_path).unwrap();
-        assert_eq!(saved.current_snapshot_fingerprints().len(), 4100);
-        let last = server.offered.lock().unwrap().last().unwrap()["snapshot_fingerprint"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert!(saved.accepted_snapshot_fingerprint_recorded(&last));
-        return;
-    }
-    let error = result.unwrap_err();
-    if matches!(stage, "capacity" | "bootstrap_capacity") {
-        let settlement = error
-            .downcast_ref::<ack_retention::AckSettlementRequired>()
-            .expect("actual finish preserves typed local capacity outcome");
-        if stage == "bootstrap_capacity" {
-            assert!(
-                error.chain().any(|cause| cause
-                    .to_string()
-                    .contains("cache-head bootstrap ACK settlement pending")),
-                "probe path actually stopped"
-            );
-        }
-        assert_eq!(settlement.retained_stale_ack_count, 5001);
-        assert!(settlement.deferred_entity_count > 0);
-        assert!(
-            server.offered.lock().unwrap().is_empty(),
-            "no HTTP upload attempt"
-        );
-        assert!(matches!(
-            source_cadences().lock().unwrap()["claude_code"].state(),
-            ottto_protocol::LocalCollectorState::Warm
-        ));
-        assert_eq!(
-            crate::client_report::observe()
-                .quantity(crate::client_report::ClientReportReason::NetworkError),
-            0
-        );
-        assert_eq!(
-            crate::client_report::observe()
-                .quantity(crate::client_report::ClientReportReason::RatelimitBackoff),
-            0
-        );
-        let terminal = server.terminal.lock().unwrap();
-        assert_eq!(terminal.last().unwrap()["last_error_code"], "scan_error");
-        assert_eq!(
-            terminal.last().unwrap()["last_error_message"],
-            "local snapshot ACK settlement pending"
-        );
-    } else {
-        assert!(error.to_string().contains(stage));
-    }
-    assert!(
-        ACK_POST_SAVE_FAILURE.with(|slot| slot.get().is_none()),
-        "actual exit reached"
-    );
-    let mut saved = ScanIndex::load(&index_path).unwrap();
-    assert!(saved
-        .upload_ack_retirement_handoff
-        .as_ref()
-        .unwrap()
-        .bodies
-        .contains_key(&stale));
-    let mut progress = SnapshotUploadProgress::load(
-        &progress_path,
-        &namespace,
-        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    )
-    .unwrap();
-    assert_eq!(
-        progress.accepted_fingerprints.contains(&stale),
-        !matches!(stage, "capacity" | "bootstrap_capacity"),
-        "ordinary exit keeps ACK; capacity partial save may already clean it durably"
-    );
-    progress
-        .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path)
-        .unwrap();
-    let loaded = SnapshotUploadProgress::load(
-        &progress_path,
-        &namespace,
-        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    )
-    .unwrap();
-    assert!(
-        !loaded.accepted_fingerprints.contains(&stale),
-        "{stage}: exact proof recovers cleanup"
-    );
-}
-
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests, client_report)]
-fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
-    for stage in [
-        "native_receipt",
-        "unverified_marker",
-        "backfill_completion",
-        "finish_cycle",
-    ] {
-        ack_finish_pipeline_case(stage);
-    }
-}
-
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests, client_report)]
-fn ack_capacity_real_finish_has_no_upload_loss_or_failure_backoff() {
-    ack_finish_pipeline_case("capacity");
-}
-
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests, client_report)]
-fn ack_bootstrap_capacity_real_finish_commits_census_retirement() {
-    ack_finish_pipeline_case("bootstrap_capacity");
-}
-
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests, client_report)]
-fn ack_first_install_real_finish_uploads_4100_live_entities_without_a_capacity_stop() {
-    ack_finish_pipeline_case("first_install");
 }
 
 /// #794: one scripted response per snapshot POST; an empty script accepts.
@@ -1322,6 +850,9 @@ impl AckFinishHome {
     }
 
     fn prepare(&mut self, cycle: &str) -> (SourcePreparation, ScanIndex, SourceScanResult) {
+        if crate::snapshots::ClaudeTerminalOffForTest::active() {
+            return self.terminal_off_on_prepare(cycle);
+        }
         self.cadence.next_due_cycle();
         let frame = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
             prepare_sync_source(
@@ -1342,6 +873,46 @@ impl AckFinishHome {
         .expect("actual due source preparation");
         let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
         assert!(scan.census_complete, "{cycle}: the real scan is clean");
+        assert_eq!(
+            scan.snapshots.len(),
+            1,
+            "{cycle}: the never-committed transcript is read again"
+        );
+        // Finish reads this flag only for census-dependent decisions
+        // (complete-census ACK cleanup, backfill and manifest completion).
+        // Marking it incomplete keeps the injected debt unretired.
+        scan.census_complete = false;
+        (preparation, index, scan)
+    }
+
+    fn terminal_off_on_prepare(&mut self, cycle: &str) -> (SourcePreparation, ScanIndex, SourceScanResult) {
+        assert!(
+            crate::snapshots::claude_terminal_off(),
+            "finish pipeline requires production policy"
+        );
+        self.cadence.next_due_cycle();
+        let frame = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
+            prepare_sync_source(
+                &self.client,
+                &self.device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &self.fixture.home,
+                &self.support,
+                &self.daemon,
+                &mut self.transport,
+                self.daemon.snapshot_scan_account_witness().unwrap(),
+                false,
+            )
+        })
+        .unwrap()
+        .expect("actual due source preparation");
+        let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
+        assert!(
+            !scan.census_complete,
+            "{cycle}: terminal-off retains the real scan owner"
+        );
         assert_eq!(
             scan.snapshots.len(),
             1,
@@ -1611,7 +1182,100 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
         "every file ACK transferred to the index"
     );
     assert_eq!(
+        upload_context_resend::last_counts(),
+        (0, 0),
+        "same-context retry is not a context resend"
+    );
+    assert_eq!(
         progress.accepted_fingerprints, debt_set,
         "only the unrelated debt remains"
     );
+}
+
+
+/// [behaviour] Containment contract: real finish uploads acks and settles with no manifest.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn terminal_off_real_finish_uploads_acks_and_settles_with_no_manifest() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+    let server = AckScriptedServer::new();
+    let mut home = AckFinishHome::new(&server);
+    let (preparation, index, scan) = home.prepare("terminal-off");
+    assert!(!scan.census_complete);
+    assert!(index.has_retained_traversal_for_terminal_off());
+    let fingerprints = scan
+        .snapshots
+        .iter()
+        .map(|i| i.snapshot_fingerprint.clone())
+        .collect::<BTreeSet<_>>();
+    let path = preparation.index_path.clone();
+    let paths = (
+        preparation.upload_progress_path.clone(),
+        preparation.upload_destination_namespace.clone(),
+    );
+    home.finish(preparation, index, scan).unwrap();
+    let offered = server
+        .offered_fingerprints()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        offered.len(),
+        fingerprints.len(),
+        "the ordinary terminal page uploads"
+    );
+    let fingerprints = offered;
+    let saved = ScanIndex::load(&path).unwrap();
+    assert!(saved.has_retained_traversal_for_terminal_off());
+    assert!(
+        cached_source_manifest(&paths.1, SnapshotSource::ClaudeCode).is_none(),
+        "no complete manifest, including stale/deleted incidence, can publish"
+    );
+    assert!(fingerprints
+        .iter()
+        .all(|fp| saved.accepted_snapshot_fingerprint_recorded(fp)));
+    let progress = home.progress(&paths);
+    // Successful selected-save transfers exact ACK custody into the index.
+    assert!(progress.accepted_fingerprints.is_empty());
+    let offered = server.offered.lock().unwrap();
+    assert_eq!(offered.len(), 1);
+    let item = &offered[0];
+    assert!(item.get("cache_observations").is_none());
+    assert!(item.get("context_curve").is_none());
+    let mut payload = serde_json::Map::new();
+    for key in [
+        "session_account_evidence",
+        "tool_usage",
+        "tool_usage_truncated",
+    ] {
+        if let Some(value) = item.get(key) {
+            payload.insert(key.into(), value.clone());
+        }
+    }
+    // This is the exact digest the scripted HTTP ACK sent and the client
+    // validated, folded with the production file-witness function.
+    let ack_body = format!(
+        "{:x}",
+        Sha256::digest(
+            crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()
+        )
+    );
+    assert_eq!(saved.files.len(), 1);
+    assert_eq!(
+        saved
+            .files
+            .values()
+            .next()
+            .unwrap()
+            .last_upload_body_witness,
+        Some(crate::snapshots::snapshot_file_upload_body_set_for_test(&[
+            ack_body
+        ]))
+    );
+    assert!(!crate::snapshots::claude_terminal_authority(
+        &saved,
+        true,
+        "2099-01-01T00:00:00Z"
+    ));
 }

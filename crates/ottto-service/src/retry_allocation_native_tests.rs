@@ -69,19 +69,40 @@ fn bounded_retry_envelope_receipt_node_pressure_evicts_oldest_and_keeps_recordin
     let row = seed["receipts"][0].clone();
     let nodes = crate::snapshot_retry::state_nodes(&serde_json::to_vec(&row).unwrap()).unwrap();
     let count = (crate::snapshot_retry::STATE_NODES - 5) / nodes;
-    let seeded = serde_json::to_vec(&serde_json::json!({"schema_version":1,"receipts":vec![row;count]})).unwrap();
+    let seeded =
+        serde_json::to_vec(&serde_json::json!({"schema_version":1,"receipts":vec![row;count]}))
+            .unwrap();
     assert!(seeded.len() < crate::snapshot_retry::RESPONSE_BYTES);
     crate::snapshot_retry::state_shape(&seeded).unwrap();
     std::fs::write(&path, seeded).unwrap();
     let context = crate::upload_receipts::UploadReceiptContext::default();
-    crate::upload_receipts::append_http_failure_with_context_bounded(&root.0, SourceKind::Pi, 1,
-        ottto_protocol::UploadReceiptOutcomeV1::AuthRejected, 401, None, None, &context).unwrap();
-    let receipts = crate::upload_receipts::read(&root.0, 500, None, None).unwrap().receipts;
+    crate::upload_receipts::append_http_failure_with_context_bounded(
+        &root.0,
+        SourceKind::Pi,
+        1,
+        ottto_protocol::UploadReceiptOutcomeV1::AuthRejected,
+        401,
+        None,
+        None,
+        &context,
+    )
+    .unwrap();
+    let receipts = crate::upload_receipts::read(&root.0, 500, None, None)
+        .unwrap()
+        .receipts;
     assert_eq!(receipts.len(), count);
     assert_eq!(receipts[0].http_status, Some(401));
     // A second append must advance history again, instead of freezing the ring.
-    crate::upload_receipts::append_transport_error_with_context_bounded(&root.0, SourceKind::Pi, 2, &context).unwrap();
-    let receipts = crate::upload_receipts::read(&root.0, 500, None, None).unwrap().receipts;
+    crate::upload_receipts::append_transport_error_with_context_bounded(
+        &root.0,
+        SourceKind::Pi,
+        2,
+        &context,
+    )
+    .unwrap();
+    let receipts = crate::upload_receipts::read(&root.0, 500, None, None)
+        .unwrap()
+        .receipts;
     assert_eq!(receipts.len(), count);
     assert_eq!(receipts[0].batch_item_count, 2);
     assert_eq!(receipts[1].http_status, Some(401));
@@ -172,25 +193,6 @@ fn bounded_retry_envelope_competing_state_refusal_preserves_native_files() {
         assert_eq!(std::fs::read(&f.index_path).unwrap(), before_index);
         assert_eq!(std::fs::read(&f.progress_path).unwrap(), before_progress);
     }
-}
-
-#[test]
-#[ignore = "process-wide allocation audit requires an isolated --test-threads=1 run"]
-fn bounded_retry_envelope_probe_charges_child_threads_and_realloc_overlap() {
-    // This audit is run in its own native unit-test process for a heap receipt.
-    let old = vec![0u8; 1024 * 1024];
-    let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
-        drop(old);
-        std::thread::spawn(|| {
-            let mut bytes = Vec::with_capacity(512 * 1024);
-            bytes.resize(512 * 1024, 7u8);
-            bytes.reserve_exact(512 * 1024);
-            std::hint::black_box(bytes);
-        })
-        .join()
-        .unwrap();
-    });
-    assert!(allocation.requested_peak >= 1536 * 1024);
 }
 
 struct EnvelopeTls {
@@ -301,72 +303,7 @@ fn envelope_response(status: &str, body: &[u8], extra: &str) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "process-wide allocation audit requires an isolated --test-threads=1 run"]
-fn bounded_retry_envelope_native_tls_refuses_aggregate_headers_and_decoded_body() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let tls = EnvelopeTls::new();
-    for mode in ["accepted", "headers", "malformed_headers", "gzip", "chunk"] {
-        use std::io::Write;
-        let (body, extra) = match mode {
-            "headers" => (
-                b"{\"token\":\"fresh\"}".to_vec(),
-                format!(
-                    "X-One: {}\r\nX-Two: {}\r\n",
-                    "x".repeat(9000),
-                    "y".repeat(9000)
-                ),
-            ),
-            "malformed_headers" => (b"{\"token\":\"fresh\"}".to_vec(), format!("\r\r\nX-One: {}\r\n", "x".repeat(18_000))),
-            "chunk" => (format!("{}11\r\n{{\"token\":\"fresh\"}}\r\n0\r\n\r\n", "0".repeat(1024 * 1024)).into_bytes(), "Transfer-Encoding: chunked\r\n".into()),
-            "gzip" => {
-                let body = format!(
-                    "{{\"token\":\"{}\"}}",
-                    "x".repeat(crate::snapshot_retry::TOKEN_RESPONSE_BYTES)
-                );
-                let mut compressed =
-                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-                compressed.write_all(body.as_bytes()).unwrap();
-                (
-                    compressed.finish().unwrap(),
-                    "Content-Encoding: gzip\r\n".into(),
-                )
-            }
-            _ => (
-                b"{\"token\":\"fresh\"}".to_vec(),
-                format!("X-One: {}\r\n", "x".repeat(15_000)),
-            ),
-        };
-        let (address, server) = tls.serve(vec![envelope_response("200 OK", &body, &extra)]);
-        let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
-            crate::retry_tls::with_test_config(tls.client.clone(), || {
-                let client = SnapshotApiClient::new(address);
-                let mut budget =
-                    crate::snapshot_retry::RetryBudget::after_shed(Instant::now(), Duration::ZERO)
-                        .unwrap();
-                budget.enter(Instant::now()).unwrap();
-                let result = client.issue_relay_token_bounded(
-                    &bounded_native_device(),
-                    "synthetic-secret",
-                    SnapshotSource::Pi,
-                    &budget,
-                    &mut || Ok(()),
-                );
-                assert_eq!(result.is_ok(), mode == "accepted", "{mode}");
-                assert_eq!(server.join().unwrap().len(), 1);
-            });
-        });
-        eprintln!(
-            "native_tls_{mode} requested_peak={} usable_peak={} allocations={}",
-            allocation.requested_peak, allocation.usable_peak, allocation.allocations
-        );
-        assert!(allocation.requested_peak < 20 * 1024 * 1024);
-    }
-}
-
-#[test]
-#[ignore = "process-wide allocation audit requires an isolated --test-threads=1 run"]
+#[serial(client_report)]
 fn bounded_retry_envelope_native_max_model_tls_ack_receipt_checkpoint_restart() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -376,38 +313,67 @@ fn bounded_retry_envelope_native_max_model_tls_ack_receipt_checkpoint_restart() 
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let tls = EnvelopeTls::new();
-    // Keep the existing wire contract's maximum100model rows, then find the
-    // largest admitted escaped labels in this native fixture family. This is
-    // a finite boundary fixture, not a claim over every legal shape.
+    // Exercise both the maximum page cardinality and maximum model rows,
+    // with escaped labels grown to the admission boundary. Caller-thread born
+    // allocation accounting excludes the synthetic server and parallel tests.
     let invalid = PiLiveFixture::with_models(101);
     let invalid_request = SnapshotBatchRequest {
-        schema_version: SNAPSHOT_SCHEMA_VERSION, source: "pi".into(),
-        machine_id: "a".repeat(64), collector_version: Some(collector_version()),
-        snapshots: invalid.items.clone(), upload_policy: SnapshotUploadPolicy::default(),
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: "pi".into(),
+        machine_id: "a".repeat(64),
+        collector_version: Some(collector_version()),
+        snapshots: invalid.items.clone(),
+        upload_policy: SnapshotUploadPolicy::default(),
         client_report: crate::client_report::ClientReport::empty(),
     };
     assert!(validate_snapshot_batch_request(&invalid_request).is_err());
     drop(invalid_request);
     drop(invalid);
-    let (mut low, mut high) = (0, 2048);
-    while low + 1 < high {
-        let middle = (low + high) / 2;
-        let mut fixture = PiLiveFixture::with_shape(100, middle);
-        if fixture.try_capture(Duration::ZERO).is_some() {
-            low = middle;
-        } else {
-            high = middle;
+    for (file_ceiling, models) in [(1, 100), (50, 1)] {
+        // Establish an admitted lower endpoint before growing either dimension.
+        let mut one = PiLiveFixture::with_page(1, models, 0);
+        assert!(one.try_capture(Duration::ZERO).is_some());
+        let mut files = 1;
+        for candidate in 2..=file_ceiling {
+            let mut fixture = PiLiveFixture::with_page(candidate, models, 0);
+            if fixture.try_capture(Duration::ZERO).is_some() {
+                files = candidate;
+            }
         }
-    }
-    let mut refused = PiLiveFixture::with_shape(100, high);
-    assert!(refused.try_capture(Duration::ZERO).is_none());
-    for replay in [false, true] {
-        let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
-            let mut f = PiLiveFixture::with_shape(100, low);
+        eprintln!("native_envelope_cardinality models={models} largest_admitted_files={files} searched_ceiling={file_ceiling}");
+        let (mut low, mut high) = (0, 2048);
+        while low + 1 < high {
+            let middle = (low + high) / 2;
+            let mut fixture = PiLiveFixture::with_page(files, models, middle);
+            if fixture.try_capture(Duration::ZERO).is_some() {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        let mut refused = PiLiveFixture::with_page(files, models, high);
+        assert!(refused.try_capture(Duration::ZERO).is_none());
+        for replay in [false, true] {
+            let mut f = PiLiveFixture::with_page(files, models, low);
             let mut owner = f.capture(Duration::ZERO);
+            let mut peak_bound = 0;
             let mut ack: serde_json::Value =
                 serde_json::from_str(&bounded_native_ack(&f.items[0])).unwrap();
-            ack["session_ids"] = serde_json::json!(vec![""; 43_000]);
+            ack["accepted"] = serde_json::json!(f.items.len());
+            ack["accepted_entities"] = serde_json::Value::Array(
+                f.items
+                    .iter()
+                    .map(|item| {
+                        serde_json::from_str::<serde_json::Value>(&bounded_native_ack(item))
+                            .unwrap()["accepted_entities"][0]
+                            .clone()
+                    })
+                    .collect(),
+            );
+            ack["session_ids"] = serde_json::json!([]);
+            let base_bytes = serde_json::to_vec(&ack).unwrap().len();
+            let count = (crate::snapshot_retry::RESPONSE_BYTES - 32 - base_bytes) / 3;
+            ack["session_ids"] = serde_json::json!(vec![""; count]);
             let ack = ack.to_string();
             assert!(ack.len() <= crate::snapshot_retry::RESPONSE_BYTES);
             let hint = br#"{"source":"pi","server_time":"2026-10-06T10:05:00Z","last_data_at":null,"record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":30,"recommended_scan_after":"2026-10-06T10:10:00Z"}"#;
@@ -432,28 +398,35 @@ fn bounded_retry_envelope_native_max_model_tls_ack_receipt_checkpoint_restart() 
                 ..bounded_native_device()
             };
             let mut turns = 0;
-            crate::retry_tls::with_test_config(tls.client.clone(), || {
-                owner.isolated_boundary(|page| {
-                    turns += 1;
-                    assert!(page.bound() <= 1024 * 1024);
-                    page.budget.force_gzip_for_test();
-                    let live = page.take_live_authority()?;
-                    let result = page.turn_live(
-                        &client,
-                        &device,
-                        "synthetic-secret",
-                        live.policy(),
-                        &mut || live.validate_inputs(&f.home.0),
-                    );
-                    assert!(
-                        matches!(result, Ok(SnapshotPageOutcome::Settled { conflicted: 0 })),
-                        "{result:?}"
-                    );
-                    page.restore_live_authority(live);
-                    result
+            let (_, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
+                crate::retry_tls::with_test_config(tls.client.clone(), || {
+                    owner.isolated_boundary(|page| {
+                        turns += 1;
+                        assert!(page.bound() <= 1024 * 1024);
+                        peak_bound = page.peak_bound();
+                        page.budget.force_gzip_for_test();
+                        let live = page.take_live_authority()?;
+                        let result = page.turn_live(
+                            &client,
+                            &device,
+                            "synthetic-secret",
+                            live.policy(),
+                            &mut || live.validate_inputs(&f.home.0),
+                        );
+                        assert!(
+                            matches!(result, Ok(SnapshotPageOutcome::Settled { conflicted: 0 })),
+                            "{result:?}"
+                        );
+                        page.restore_live_authority(live);
+                        result
+                    });
                 });
             });
             assert_eq!(turns, 1);
+            assert!(
+                allocation.requested_peak_with_overlap <= peak_bound,
+                "{allocation:?} > {peak_bound}"
+            );
             let trace = server.join().unwrap();
             assert_eq!(trace.len(), if replay { 7 } else { 3 });
             assert_eq!(
@@ -472,10 +445,12 @@ fn bounded_retry_envelope_native_max_model_tls_ack_receipt_checkpoint_restart() 
                 test_quarantine_witness(),
             )
             .unwrap();
-            assert!(durable.contains_body(
-                &f.items[0].snapshot_fingerprint,
-                &snapshot_upload_body_witness(&f.items[0])
-            ));
+            for item in &f.items {
+                assert!(durable.contains_body(
+                    &item.snapshot_fingerprint,
+                    &snapshot_upload_body_witness(item)
+                ));
+            }
             let mut recovered = ScanIndex::load(&f.index_path).unwrap();
             assert_eq!(
                 crate::upload_receipts::read(&f.support, 500, None, None)
@@ -495,12 +470,12 @@ fn bounded_retry_envelope_native_max_model_tls_ack_receipt_checkpoint_restart() 
             )
             .unwrap();
             assert!(scan.snapshots.is_empty());
-            eprintln!("native_envelope models=100 label_bytes_admitted={low} next_refused={high} ack_bytes={} item_json_bytes={} checkpoint_ack_restart=true", ack.len(), serde_json::to_vec(&f.items).unwrap().len());
-        });
-        eprintln!(
-            "native_envelope replay={replay} requested_peak={} usable_peak={} allocations={}",
-            allocation.requested_peak, allocation.usable_peak, allocation.allocations
+            eprintln!("native_envelope files={files} models={models} label_bytes_admitted={low} next_refused={high} ack_bytes={} ack_fill_ratio={:.6} item_json_bytes={} checkpoint_ack_restart=true", ack.len(), ack.len() as f64 / crate::snapshot_retry::RESPONSE_BYTES as f64, serde_json::to_vec(&f.items).unwrap().len());
+            eprintln!(
+            "native_envelope files={files} models={models} replay={replay} derived_peak={peak_bound} requested_peak={} usable_peak={} allocations={}",
+            allocation.requested_peak_with_overlap, allocation.usable_peak_with_overlap, allocation.allocations
         );
-        assert!(allocation.requested_peak < 20 * 1024 * 1024);
+            assert!(peak_bound <= 20 * 1024 * 1024);
+        }
     }
 }

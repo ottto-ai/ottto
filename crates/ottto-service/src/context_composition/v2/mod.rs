@@ -30,6 +30,8 @@ mod file;
 mod harvest;
 mod health;
 mod reader;
+mod recent;
+pub(crate) use recent::recent_scopes;
 mod scope;
 mod upload;
 

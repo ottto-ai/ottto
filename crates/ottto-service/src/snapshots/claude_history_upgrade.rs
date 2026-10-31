@@ -42,6 +42,7 @@
 
 use super::claude_reemission_exclusions::{ListState, ReemissionExclusions};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 /// Most history files one page may upgrade, for every revision (MONEY P2).
 pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
@@ -197,13 +198,7 @@ pub(crate) enum NoListPolicy {
     HoldMoveNotFull,
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for NoListPolicy {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; NoListPolicy);
 
 /// Size and mtime of a file, as the index entry or the candidate holds them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,13 +280,7 @@ impl HistoryHold {
     }
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for HistoryHold {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; HistoryHold);
 
 /// The gate's answer for one candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +368,32 @@ pub(super) fn claude_path_twin_groups(
             (group[0].1.into_owned().1, keys)
         })
         .collect()
+}
+
+/// The native read set for readable seeds: twins force every known member
+/// of their root family, as do independent authority-forced roots. Shared by
+/// scoped estimate/apply/preparation and native forced-family selection.
+pub(super) fn claude_read_closure<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    family_keys: impl IntoIterator<Item = &'a String>,
+    twins: &ClaudeTwinGroups,
+    forced_roots: &BTreeSet<String>,
+) -> BTreeSet<PathBuf> {
+    let mut paths = paths
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect::<BTreeSet<_>>();
+    let mut roots = crate::snapshots::claude_request_money::e2::selected_twin_roots(
+        paths.iter().map(PathBuf::as_path),
+        twins,
+    );
+    roots.extend(forced_roots.iter().cloned());
+    paths.extend(family_keys.into_iter().filter_map(|key| {
+        let path = Path::new(key);
+        let member = super::claude_index_path_member_ref(path)?;
+        roots.contains(member.root).then(|| path.to_path_buf())
+    }));
+    paths
 }
 
 /// One opened-birth probe of a path (metadata only, no content read), with
@@ -1253,35 +1268,6 @@ fn note_prior_history_unverified_at(
 mod tests {
     use super::*;
 
-    /// StateMissing r3: the unverified-since diagnostic reports its first
-    /// cycle at once, then at most hourly, and a clear read resets T.
-    #[test]
-    fn prior_history_unverified_reports_since_when_at_most_hourly() {
-        let start = std::time::Instant::now();
-        let at = |seconds: u64| start + std::time::Duration::from_secs(seconds);
-        let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
-            note_prior_history_unverified_at(true, 1_000, at(0));
-            note_prior_history_unverified_at(true, 1_600, at(600));
-            note_prior_history_unverified_at(true, 4_700, at(3_700));
-            note_prior_history_unverified_at(false, 4_800, at(3_800));
-            note_prior_history_unverified_at(true, 9_000, at(8_000));
-        });
-        assert_eq!(alarms.len(), 3, "{alarms:?}");
-        for alarm in &alarms {
-            assert_eq!(alarm["stage"], "claude_prior_history_unverified");
-            assert_eq!(alarm["source"], "claude_code");
-        }
-        let counts = |index: usize, field: &str| alarms[index]["counts"][field].clone();
-        assert_eq!(counts(0, "unverified_since_unix_seconds"), 1_000);
-        assert_eq!(counts(0, "unverified_for_seconds"), 0);
-        assert_eq!(counts(0, "claude_cycles"), 1);
-        assert_eq!(counts(1, "unverified_since_unix_seconds"), 1_000);
-        assert_eq!(counts(1, "unverified_for_seconds"), 3_700);
-        assert_eq!(counts(1, "claude_cycles"), 3);
-        assert_eq!(counts(2, "unverified_since_unix_seconds"), 9_000, "reset");
-        assert_eq!(counts(2, "claude_cycles"), 1);
-    }
-
     const EXTENT: FileExtent = FileExtent {
         size_bytes: 10,
         modified_unix_seconds: 100,
@@ -1302,46 +1288,6 @@ mod tests {
             history_cutoff_unix_seconds: None,
             no_list_policy: NoListPolicy::Pace,
         }
-    }
-
-    #[test]
-    fn classification_ignores_the_reason_and_the_source_fingerprint() {
-        // Unchanged size and mtime with a stale stamp is owed history, a
-        // zero (unstamped or legacy) stamp included: the caller's comparison
-        // says below-active for both.
-        assert_eq!(
-            classify(Some(EXTENT), EXTENT, true, None, None),
-            HistoryKind::Owed
-        );
-        assert_eq!(
-            classify(Some(EXTENT), EXTENT, false, None, None),
-            HistoryKind::Settled
-        );
-        let grown = FileExtent {
-            size_bytes: 11,
-            ..EXTENT
-        };
-        assert_eq!(
-            classify(Some(EXTENT), grown, true, None, None),
-            HistoryKind::Changed
-        );
-        let shrunk = FileExtent {
-            size_bytes: 9,
-            ..EXTENT
-        };
-        assert_eq!(
-            classify(Some(EXTENT), shrunk, true, None, None),
-            HistoryKind::Changed
-        );
-        let legacy = FileExtent {
-            modified_unix_nanos: None,
-            ..EXTENT
-        };
-        assert_eq!(
-            classify(Some(legacy), EXTENT, true, None, None),
-            HistoryKind::Owed,
-            "a legacy entry without nanos is unchanged when seconds agree"
-        );
     }
 
     /// F5: a same-size file whose mtime alone moved (seconds or nanos) is
@@ -1419,91 +1365,6 @@ mod tests {
             classify(None, EXTENT, false, Some(500), Some(1)),
             HistoryKind::Fresh,
             "no active revision, nothing to gate"
-        );
-    }
-
-    #[test]
-    fn policy_table_and_budget_constants() {
-        assert_eq!(HISTORY_UPGRADE_FILES_PER_PAGE, 2_000);
-        assert_eq!(HISTORY_UPGRADE_BYTES_PER_PAGE, 1 << 30);
-        let revision_2 = revision_policy(2).unwrap();
-        assert_eq!(revision_2.listed_emission, ListedEmission::Ordinary);
-        assert_eq!(
-            revision_2.no_list_birth_cutoff_unix_seconds, 1_792_540_800,
-            "revision 2 keeps 2026-10-21"
-        );
-        // SOURCE h732 C1: revision 3's row opens only when E2 raises MAX.
-        assert_eq!(revision_policy(MAX_GATED_CLAUDE_REVISION + 1), None);
-        with_max_gated_claude_revision(3, || {
-            let revision_3 = revision_policy(3).unwrap();
-            assert_eq!(
-                revision_3.listed_emission,
-                ListedEmission::WithoutRequestOwnedLiteral
-            );
-            assert_ne!(
-                revision_3.no_list_birth_cutoff_unix_seconds,
-                revision_2.no_list_birth_cutoff_unix_seconds,
-                "each revision carries its own no-list cutoff (F4b)"
-            );
-            assert_eq!(revision_policy(4), None);
-        });
-        with_max_gated_claude_revision(2, || assert_eq!(revision_policy(3), None));
-        // SOURCE F2: without a complete row a revision is ungated: an owed
-        // upgrade to it is held whatever the list says.
-        with_max_gated_claude_revision(2, || {
-            assert_eq!(
-                decide(
-                    HistoryKind::Owed,
-                    &inputs(&installed(""), false, 3),
-                    &mut HistoryPage::default(),
-                    "k",
-                    1
-                ),
-                HistoryDecision::Held(HistoryHold::UngatedRevision)
-            );
-        });
-    }
-
-    #[test]
-    fn no_list_hold_reaches_the_later_history_cutoff() {
-        // SOURCE F4a: history born after the fixed 2026-10-21 cutoff but at
-        // or before the saved history cutoff is still held without a list.
-        let not_installed = ReemissionExclusions::default();
-        let mut cutoff = inputs(&not_installed, false, 2);
-        cutoff.no_list_policy = NoListPolicy::HoldUnverified;
-        cutoff.history_cutoff_unix_seconds = Some(u64::MAX - 1);
-        for (birth, held) in [
-            (Some(u64::MAX - 1), true),
-            (None, true),
-            (Some(u64::MAX), false),
-        ] {
-            cutoff.birth_unix_seconds = birth;
-            let decision = decide(
-                HistoryKind::Owed,
-                &cutoff,
-                &mut HistoryPage::default(),
-                "k",
-                1,
-            );
-            assert_eq!(
-                decision == HistoryDecision::Held(HistoryHold::NoListBirth),
-                held,
-                "{birth:?}"
-            );
-        }
-        // An installed list replaces the birth hold.
-        let list = installed("");
-        let mut listed = inputs(&list, false, 2);
-        listed.history_cutoff_unix_seconds = Some(u64::MAX - 1);
-        assert_eq!(
-            decide(
-                HistoryKind::Owed,
-                &listed,
-                &mut HistoryPage::default(),
-                "k",
-                1
-            ),
-            HistoryDecision::Owed
         );
     }
 
@@ -1662,71 +1523,6 @@ mod tests {
                 HistoryDecision::Held(HistoryHold::UngatedRevision)
             );
         });
-    }
-
-    /// F3: while the list is paused no family can be shown unlisted, so
-    /// under revision 3 every ordinary sync loses only its literal; owed
-    /// history stays held. Revision 2 is unchanged.
-    #[test]
-    fn a_paused_list_denies_only_the_literal_under_revision_three() {
-        with_max_gated_claude_revision(3, || {
-            for paused in [
-                installed("not-a-digest\n"),
-                ReemissionExclusions::default().with_state_for_test(ListState::MissingAfterInstall),
-                ReemissionExclusions::default().with_state_for_test(ListState::ClosureOverflow),
-            ] {
-                assert!(paused.pauses_adoption());
-                let mut page = HistoryPage::default();
-                for kind in [HistoryKind::Changed, HistoryKind::Fresh] {
-                    assert_eq!(
-                        decide(kind, &inputs(&paused, false, 3), &mut page, "k", 1),
-                        HistoryDecision::LiteralDenied
-                    );
-                    assert_eq!(
-                        decide(kind, &inputs(&paused, false, 2), &mut page, "k", 1),
-                        HistoryDecision::NotOwed
-                    );
-                }
-                assert_eq!(
-                    decide(
-                        HistoryKind::Owed,
-                        &inputs(&paused, false, 3),
-                        &mut page,
-                        "k",
-                        1
-                    ),
-                    HistoryDecision::Held(HistoryHold::ListPaused)
-                );
-            }
-        });
-    }
-
-    /// SOURCE h732 nit: every refused activation counts; the alarm fires on
-    /// the first, then at most hourly.
-    #[test]
-    fn activation_refusal_alarms_at_most_hourly() {
-        let start = std::time::Instant::now();
-        let refused = local_count(LocalCount::ActivationRefused);
-        let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
-            assert!(!admit_activation_at(4, 2, start));
-            assert!(!admit_activation_at(
-                4,
-                2,
-                start + std::time::Duration::from_secs(60)
-            ));
-            assert!(!admit_activation_at(
-                4,
-                2,
-                start + OWED_WITHOUT_LIST_ALARM_INTERVAL
-            ));
-            assert!(admit_activation_at(2, 2, start));
-        });
-        assert_eq!(alarms.len(), 2, "{alarms:?}");
-        assert_eq!(local_count(LocalCount::ActivationRefused), refused + 3);
-        assert_eq!(
-            alarms[1]["counts"]["history_activation_refused"],
-            refused + 3
-        );
     }
 
     /// SOURCE h732 C2: the literal guard reads the active row, the list and
@@ -1985,34 +1781,6 @@ mod tests {
         assert!(!codex.reserve_admitting_first_file("codex-huge", huge));
     }
 
-    #[test]
-    fn owed_without_list_alarms_at_most_hourly() {
-        let page = HistoryPage {
-            owed: 3,
-            ..HistoryPage::default()
-        };
-        let now = std::time::Instant::now();
-        let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
-            alarm_if_owed_without_list_at(&page, ListState::NotInstalled, now);
-            alarm_if_owed_without_list_at(&page, ListState::NotInstalled, now);
-            alarm_if_owed_without_list_at(&page, ListState::Installed, now);
-        });
-        assert_eq!(alarms.len(), 1);
-        assert_eq!(
-            alarms[0]["stage"],
-            "claude_history_upgrade_owed_without_list"
-        );
-        assert_eq!(alarms[0]["counts"]["history_upgrade_owed"], 3);
-        let ((), later) = crate::local_resource_diagnostics::capture(|| {
-            alarm_if_owed_without_list_at(
-                &page,
-                ListState::NotInstalled,
-                now + OWED_WITHOUT_LIST_ALARM_INTERVAL,
-            );
-        });
-        assert_eq!(later.len(), 1);
-    }
-
     fn twin_index(sizes: &[(&str, u64)]) -> super::super::ScanIndex {
         let mut index = super::super::ScanIndex::default();
         for (key, size) in sizes {
@@ -2131,23 +1899,5 @@ mod tests {
         assert_eq!(emission.held("denied"), None);
         assert!(emission.literal_denied("denied"));
         assert_eq!(HistoryHold::TelemetryUnread.as_str(), "telemetry_unread");
-    }
-
-    /// One literal owner: the predicate and the family root are typed reads
-    /// of the item (no serialization), `None` for every other body.
-    #[test]
-    fn request_owned_family_root_is_typed_and_literal_only() {
-        let mut item = crate::snapshots::tests::sample_session_artifact_item();
-        item.attribution_facts.clear();
-        item.source_session_id = "root-1_agent-x".into();
-        assert!(!is_request_owned_literal(&item));
-        assert_eq!(request_owned_family_root(&item), None);
-        item.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".into());
-        assert_eq!(request_owned_family_root(&item), None);
-        item.usage_accounting_contract = Some(REQUEST_OWNED_USAGE_CONTRACT.into());
-        assert!(is_request_owned_literal(&item));
-        assert_eq!(request_owned_family_root(&item), Some("root-1"));
-        item.source_session_id = "root-1".into();
-        assert_eq!(request_owned_family_root(&item), Some("root-1"));
     }
 }

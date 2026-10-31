@@ -30,6 +30,7 @@ fn content_witness(scan_root: &Path, path: &Path) -> std::io::Result<(u64, Strin
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let mut file = open_candidate_beneath_root(&candidate)?;
     let metadata = file.metadata()?;
@@ -78,7 +79,7 @@ pub(super) fn record(
         // It may have shrunk between discovery's stat and this no-follow
         // sample. Leave that sighting on ordinary recovery, so a small-file
         // marker cannot suppress the parse that is now possible.
-        if size <= MAX_JSONL_FILE_BYTES {
+        if size <= MAX_CLAUDE_JSONL_FILE_BYTES {
             return;
         }
         let key = path_hash(path);
@@ -164,7 +165,7 @@ pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_a
             continue;
         }
         changed = true;
-        if size > MAX_JSONL_FILE_BYTES {
+        if size > MAX_CLAUDE_JSONL_FILE_BYTES {
             // Retried this file's discovery cap, with the new content witness.
             traversal
                 .oversized_discovery

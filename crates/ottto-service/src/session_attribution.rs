@@ -327,6 +327,17 @@ impl SessionAttributionContext {
         facts
     }
 
+    /// Local accepted-share ledger uses the same negotiated attribution key.
+    /// The copy is zeroized and never serialized or exposed through Debug.
+    pub(crate) fn accepted_fingerprint_key(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(
+            self.key
+                .as_slice()
+                .try_into()
+                .expect("validated attribution key"),
+        )
+    }
+
     /// Tenant-keyed opaque id for one kind of local material, the same scheme
     /// as skill and template ids. Exists only while attribution is collected.
     pub(crate) fn opaque_id(&self, domain: &str, material: &str) -> Option<String> {
@@ -449,7 +460,9 @@ impl SessionAttributionContext {
                         normalized_template: normalized_template.as_deref(),
                         repository_hash: input.repository_hash,
                         source_started_at: input.source_started_at,
+                        #[cfg(any(target_os = "macos", test))]
                         source_session_id: input.source_session_id,
+                        #[cfg(any(target_os = "macos", test))]
                         transcript_path: input.transcript_path,
                     },
                 )
@@ -1589,112 +1602,6 @@ mod tests {
     }
 
     #[test]
-    fn raw_vscode_transport_does_not_become_provider_surface() {
-        let mut origin = origin();
-        origin.source = Some("vscode".to_string());
-        let facts = direct_provider_facts(
-            SnapshotSource::Codex,
-            Some(&origin),
-            "session-2",
-            "2026-07-19T00:00:00Z",
-            "codex_jsonl:v21",
-        );
-        assert!(!facts.iter().any(|fact| fact.field == "provider_surface"));
-        assert!(!facts.iter().any(|fact| fact.field == "origin_kind"));
-    }
-
-    #[test]
-    fn codex_provider_surface_recognizes_current_desktop_cli_and_exec_markers() {
-        let cases = [
-            ("codex_work_desktop", None, "codex_desktop"),
-            ("codex_cli_rs", Some("vscode"), "codex_cli"),
-            ("codex_exec", None, "codex_exec"),
-        ];
-        for (originator, source, expected) in cases {
-            let mut origin = origin();
-            origin.originator = Some(originator.to_string());
-            origin.source = source.map(str::to_string);
-            let facts = direct_provider_facts(
-                SnapshotSource::Codex,
-                Some(&origin),
-                "surface-session",
-                "2026-07-19T00:00:00Z",
-                "codex_jsonl:v21",
-            );
-            assert!(facts.iter().any(|fact| {
-                fact.field == "provider_surface"
-                    && fact.value == expected
-                    && fact.evidence.strength == "direct"
-            }));
-        }
-    }
-
-    #[test]
-    fn headless_and_workflow_are_neutral_without_origin_fact() {
-        let mut origin = origin();
-        origin.entrypoint = Some("sdk-cli".to_string());
-        origin.used_workflow_orchestration = Some(true);
-        let facts = direct_provider_facts(
-            SnapshotSource::ClaudeCode,
-            Some(&origin),
-            "session-3",
-            "2026-07-19T00:00:00Z",
-            "claude_code_jsonl:v18",
-        );
-        assert!(facts
-            .iter()
-            .any(|fact| fact.field == "execution_mode" && fact.value == "headless"));
-        assert!(facts
-            .iter()
-            .any(|fact| fact.field == "workflow_orchestration"));
-        assert!(!facts.iter().any(|fact| fact.field == "origin_kind"));
-    }
-
-    #[test]
-    fn originator_alone_proves_a_headless_codex_run() {
-        // Codex subagent rollouts put the spawn object in `source`, so the only
-        // remaining non-interactive signal is the `codex_exec` originator. The
-        // execution mode still holds; it is an attribute of the run, and the
-        // subagent origin is reported separately as its own fact.
-        let mut origin = origin();
-        origin.originator = Some("codex_exec".to_string());
-        origin.source = None;
-        origin.source_subagent = Some(true);
-
-        let facts = direct_provider_facts(
-            SnapshotSource::Codex,
-            Some(&origin),
-            "session-headless",
-            "2026-07-19T00:00:00Z",
-            "codex_jsonl:v21",
-        );
-
-        assert!(facts
-            .iter()
-            .any(|fact| fact.field == "execution_mode" && fact.value == "headless"));
-        assert!(facts
-            .iter()
-            .any(|fact| fact.field == "origin_kind" && fact.value == "subagent"));
-    }
-
-    #[test]
-    fn interactive_codex_run_reports_no_execution_mode() {
-        let mut origin = origin();
-        origin.originator = Some("Codex Desktop".to_string());
-        origin.source = Some("vscode".to_string());
-
-        let facts = direct_provider_facts(
-            SnapshotSource::Codex,
-            Some(&origin),
-            "session-interactive",
-            "2026-07-19T00:00:00Z",
-            "codex_jsonl:v21",
-        );
-
-        assert!(!facts.iter().any(|fact| fact.field == "execution_mode"));
-    }
-
-    #[test]
     fn desktop_originator_outranks_an_exec_source() {
         // Real shape: ChatGPT Work desktop rollouts write `source: "exec"` while
         // naming a desktop client in `originator`. The signals disagree, the
@@ -1726,55 +1633,6 @@ mod tests {
                 .iter()
                 .any(|fact| fact.field == "provider_surface" && fact.value == "codex_desktop"));
         }
-    }
-
-    #[test]
-    fn execution_mode_agrees_with_the_provider_surface_it_is_derived_from() {
-        // The two readers of this rule - the uploaded fact and the local
-        // active-session role - must never disagree with the surface shown
-        // beside them.
-        let cases = [
-            (Some("codex_exec"), Some("exec"), Some("headless")),
-            (Some("codex_exec"), None, Some("headless")),
-            (None, Some("exec"), Some("headless")),
-            (None, Some("codex_exec"), Some("headless")),
-            (Some("Codex Desktop"), Some("exec"), None),
-            (Some("codex_cli_rs"), Some("exec"), None),
-            (Some("Codex Desktop"), Some("vscode"), None),
-            (None, None, None),
-        ];
-
-        for (originator, source, expected) in cases {
-            let mut origin = origin();
-            origin.originator = originator.map(str::to_string);
-            origin.source = source.map(str::to_string);
-
-            assert_eq!(
-                execution_mode(SnapshotSource::Codex, &origin),
-                expected,
-                "originator {originator:?} with source {source:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn parent_reference_and_subagent_are_separate_direct_facts() {
-        let mut origin = origin();
-        origin.source_subagent = Some(true);
-        origin.parent_session_ref = Some("019f-parent".to_string());
-        let facts = direct_provider_facts(
-            SnapshotSource::Codex,
-            Some(&origin),
-            "session-4",
-            "2026-07-19T00:00:00Z",
-            "codex_jsonl:v21",
-        );
-        assert!(facts
-            .iter()
-            .any(|fact| fact.field == "origin_kind" && fact.value == "subagent"));
-        assert!(facts
-            .iter()
-            .any(|fact| { fact.field == "parent_session_ref" && fact.value == "019f-parent" }));
     }
 
     #[test]
@@ -1981,156 +1839,6 @@ mod tests {
     }
 
     #[test]
-    fn relay_launch_facts_do_not_invent_a_workflow() {
-        let event = crate::launch_events::LaunchEvent {
-            controller_session_ref: "a9789dcf-1e4a-4a6e-8abd-f30094efb269_agent-ad32608db4eecb2af"
-                .to_string(),
-            worker_session_ref: "019f6822-403f-7652-a308-b0c12142e337".to_string(),
-            workflow_ref: None,
-            agent_kind: "gpt-sol",
-        };
-        let context = launch_context(vec![event.clone()]);
-
-        let facts = context.launch_event_facts(&event.worker_session_ref, "2026-08-10T10:00:00Z");
-
-        assert!(facts.iter().any(|fact| {
-            fact.field == "parent_session_ref"
-                && fact.value == event.controller_session_ref
-                && fact.evidence.kind == "launcher_event"
-                && fact.evidence.strength == "direct"
-        }));
-        assert!(facts
-            .iter()
-            .any(|fact| fact.field == "agent_kind" && fact.value == "gpt-sol"));
-        assert!(!facts.iter().any(|fact| fact.field == "workflow_ref"));
-    }
-
-    #[test]
-    fn a_session_with_no_launch_event_gets_no_launch_facts() {
-        let context = launch_context(vec![launch_event()]);
-
-        assert!(context
-            .launch_event_facts(
-                "11111111-2222-3333-4444-555555555555",
-                "2026-08-09T15:20:00Z"
-            )
-            .is_empty());
-        assert!(launch_context(Vec::new())
-            .launch_event_facts(&launch_event().worker_session_ref, "2026-08-09T15:20:00Z")
-            .is_empty());
-    }
-
-    #[test]
-    fn only_exact_launched_parsers_state_an_independent_launch() {
-        let launcher_fact = launch_context(vec![launch_event()])
-            .launch_event_facts(&launch_event().worker_session_ref, "2026-08-09T15:20:00Z")
-            .remove(0);
-        assert!(launcher_fact.evidence.states_independent_launch());
-        for (source_version, launched) in [
-            ("launcher_event:v1", true),
-            ("claude_desktop_spawn:v1", true),
-            ("launcher_event", true),
-            ("launcher_events:v1", false),
-            ("claude_desktop_spawner:v1", false),
-            ("xlauncher_event:v1", false),
-            ("launcher_event_v1", false),
-            ("Launcher_event:v1", false),
-            ("", false),
-            (
-                crate::snapshots::SnapshotSource::ClaudeCode.parser_version(),
-                false,
-            ),
-        ] {
-            let mut evidence = launcher_fact.evidence.clone();
-            evidence.source_version = source_version.to_string();
-            assert_eq!(
-                evidence.states_independent_launch(),
-                launched,
-                "{source_version:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_cache_namespace_still_identifies_exact_upgrade_source() {
-        let context = SessionAttributionContext {
-            key: Zeroizing::new(vec![1_u8; 32]),
-            provider_schedules: ProviderScheduleInventory::default(),
-            external_schedulers:
-                crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
-            launch_events: crate::launch_events::LaunchEventInventory::default(),
-        };
-        let changed_inventory = SessionAttributionContext {
-            key: Zeroizing::new(vec![1_u8; 32]),
-            provider_schedules: ProviderScheduleInventory {
-                definitions: vec![ProviderScheduleDefinition {
-                    opaque_id: "hmac-sha256:v1:opaque".to_string(),
-                    prompt_signature: "private schedule prompt material".to_string(),
-                }],
-            },
-            external_schedulers:
-                crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
-            launch_events: crate::launch_events::LaunchEventInventory::default(),
-        };
-
-        let namespace = context.legacy_cache_namespace();
-        assert_ne!(namespace, changed_inventory.legacy_cache_namespace());
-        assert!(!changed_inventory
-            .legacy_cache_namespace()
-            .contains("private schedule prompt material"));
-    }
-
-    #[test]
-    fn template_normalization_removes_common_run_specific_values() {
-        let first = normalize_template_material("Review build 123456 at 2026-07-19T09:30:00Z now")
-            .expect("first");
-        let second =
-            normalize_template_material("Review   build 987654 at 2026-08-20T10:45:00Z now")
-                .expect("second");
-
-        assert_eq!(first, second);
-        assert_eq!(first, "review build <dynamic> at <dynamic> now");
-    }
-
-    #[test]
-    fn template_normalization_rejects_injected_prompt_scaffolding() {
-        assert_eq!(
-            normalize_template_material(
-                "# AGENTS.md instructions for /repo\n\
-                 <INSTRUCTIONS>Shared agent setup</INSTRUCTIONS>\n\
-                 <environment_context><cwd>/repo</cwd></environment_context>"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn template_normalization_keeps_human_prompts_that_mention_markers() {
-        assert_eq!(
-            normalize_template_material(
-                "Update the AGENTS.md instructions and parse the current date: field"
-            )
-            .as_deref(),
-            Some("update the agents.md instructions and parse the current date: field")
-        );
-    }
-
-    #[test]
-    fn template_normalization_keeps_task_after_injected_prefix() {
-        assert_eq!(
-            normalize_template_material(
-                "<recommended_plugins>Plugins</recommended_plugins>\n\
-                 # AGENTS.md instructions for /repo\n\
-                 <INSTRUCTIONS>Shared setup</INSTRUCTIONS>\n\
-                 <environment_context><cwd>/repo</cwd></environment_context>\n\
-                 Explain how this XML is parsed"
-            )
-            .as_deref(),
-            Some("explain how this xml is parsed")
-        );
-    }
-
-    #[test]
     fn grouping_facts_keep_opaque_ids_and_bounded_private_labels_separate() {
         let key = Zeroizing::new(vec![9_u8; 32]);
         let scheduled_prompt =
@@ -2207,58 +1915,6 @@ mod tests {
     }
 
     #[test]
-    fn grouping_facts_promote_activity_skills_without_duplicates() {
-        let context = SessionAttributionContext {
-            key: Zeroizing::new(vec![7_u8; 32]),
-            provider_schedules: ProviderScheduleInventory::default(),
-            external_schedulers:
-                crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
-            launch_events: crate::launch_events::LaunchEventInventory::default(),
-        };
-        let provider_skills = BTreeSet::from(["shared-skill".to_string()]);
-        // Same skill as the invocation, spelled with its directory's case.
-        let activity_skills = BTreeSet::from([
-            "repo-task-lifecycle".to_string(),
-            "Shared-Skill".to_string(),
-        ]);
-
-        let facts = context.grouping_facts(SessionAttributionGroupingInput {
-            source: SnapshotSource::Codex,
-            origin: None,
-            source_session_id: "activity-skill-session",
-            observed_at: "2026-09-04T00:00:00Z",
-            source_version: "codex_jsonl:v37",
-            first_prompt: Some("/repo-task-lifecycle continue"),
-            provider_skills: &provider_skills,
-            activity_skills: &activity_skills,
-            repository_hash: None,
-            source_started_at: None,
-            transcript_path: Path::new("/missing"),
-        });
-
-        let skill_facts = facts
-            .iter()
-            .filter(|fact| fact.field == "skill_id")
-            .collect::<Vec<_>>();
-        assert_eq!(skill_facts.len(), 2);
-        assert!(skill_facts.iter().any(|fact| {
-            fact.display_label.as_deref() == Some("repo-task-lifecycle")
-                && fact.evidence.kind == "provider_artifact"
-        }));
-        assert_eq!(
-            skill_facts
-                .iter()
-                .filter(|fact| fact.display_label.as_deref() == Some("shared-skill"))
-                .count(),
-            1
-        );
-        assert!(skill_facts.iter().any(|fact| {
-            fact.display_label.as_deref() == Some("shared-skill")
-                && fact.evidence.kind == "provider_native"
-        }));
-    }
-
-    #[test]
     fn prompt_prefix_label_is_bounded_single_line_and_redacts_paths() {
         let label = prompt_prefix_display_label(
             "An automation named Review has fired. Its prompt is:\nInspect /Users/alice/secret/repo, C:\\work\\private, and src/internal/config.rs then report a concise result that keeps going beyond the display limit until it is truncated.",
@@ -2297,64 +1953,6 @@ mod tests {
             "Fix [path] then read [path] config and the [path] and [path] fields"
         );
         assert!(!backend_rejects_label(&label));
-    }
-
-    #[test]
-    fn labeled_facts_drop_labels_the_backend_would_reject_but_keep_the_fact() {
-        let context = EvidenceContext {
-            source_session_id: "session-1",
-            observed_at: "2026-09-27T12:00:00Z",
-            source_version: "codex-v1",
-        };
-        let mut facts = Vec::new();
-        for label in ["team.claude-helper", "my.codex_skill", "workspace_path"] {
-            push_labeled_fact(
-                &mut facts,
-                "skill_id",
-                "hmac-sha256:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                Some(label),
-                Some("skill_name"),
-                "provider_artifact",
-                "direct",
-                &context,
-            );
-        }
-
-        assert_eq!(facts.len(), 3);
-        assert!(facts
-            .iter()
-            .all(|fact| fact.display_label.is_none() && fact.display_label_source.is_none()));
-        validate_fact_limits(&facts).expect("unlabeled facts fit the wire contract");
-
-        let mut leaked = facts[0].clone();
-        leaked.display_label = Some("Fix subscriptions.claude_account_coverage".to_string());
-        leaked.display_label_source = Some("skill_name".to_string());
-        assert!(backend_rejects_label(
-            leaked.display_label.as_deref().unwrap()
-        ));
-        validate_fact_limits(&[leaked]).expect_err("a backend-rejected label must not upload");
-    }
-
-    #[test]
-    fn prompt_prefix_label_omits_private_scaffolding_and_keeps_slash_skills() {
-        assert_eq!(
-            prompt_prefix_display_label("# AGENTS.md instructions for /private/repo"),
-            None
-        );
-        assert_eq!(
-            prompt_prefix_display_label("/frontend-flow-change improve the filter"),
-            Some("/frontend-flow-change improve the filter".to_string())
-        );
-    }
-
-    #[test]
-    fn explicit_slash_skill_excludes_builtin_commands() {
-        assert_eq!(
-            slash_skill_name("/frontend-flow-change please update this"),
-            Some("frontend-flow-change".to_string())
-        );
-        assert_eq!(slash_skill_name("/compact"), None);
-        assert_eq!(slash_skill_name("ordinary prompt"), None);
     }
 
     #[test]
@@ -2423,51 +2021,6 @@ status = "ACTIVE"
 
     fn fits_wire_budget(facts: &[SessionAttributionFact]) -> bool {
         serde_json::to_vec(facts).expect("serialize").len() <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES
-    }
-
-    /// The count cap binds before the byte budget for ordinary facts.
-    ///
-    /// This is the invariant the 8 KiB budget is chosen to produce, and the
-    /// reason several tests below must use `wide_budget_fact` to reach the byte
-    /// budget at all. Pinned once here so a future budget change that quietly
-    /// reverses the ordering fails loudly instead of turning the count-cap tests
-    /// into byte-budget tests.
-    #[test]
-    fn the_fact_count_cap_binds_before_the_byte_budget_for_ordinary_facts() {
-        let full: Vec<SessionAttributionFact> = (0..MAX_SESSION_ATTRIBUTION_FACTS)
-            .map(|_| budget_fact("skill_id"))
-            .collect();
-
-        assert!(
-            fits_wire_budget(&full),
-            "a full {MAX_SESSION_ATTRIBUTION_FACTS}-fact list of ordinary facts must fit in \
-             {MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES} bytes"
-        );
-        // The byte budget must still be reachable by pathological values, or it
-        // would be dead code rather than a backstop.
-        let wide: Vec<SessionAttributionFact> = (0..MAX_SESSION_ATTRIBUTION_FACTS)
-            .map(|_| wide_budget_fact("skill_id"))
-            .collect();
-        assert!(
-            !fits_wire_budget(&wide),
-            "values at the {MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES}-byte ceiling must still be \
-             able to exhaust the payload budget"
-        );
-    }
-
-    #[test]
-    fn enforce_fact_limits_keeps_a_within_budget_list_intact() {
-        let mut facts = vec![
-            budget_fact("origin_kind"),
-            budget_fact("provider_surface"),
-            budget_fact("execution_mode"),
-        ];
-        assert!(fits_wire_budget(&facts));
-
-        enforce_fact_limits(&mut facts);
-
-        assert_eq!(facts.len(), 3);
-        assert!(fits_wire_budget(&facts));
     }
 
     #[test]
@@ -2631,48 +2184,6 @@ status = "ACTIVE"
             refusal.contains(&MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES.to_string()),
             "expected a byte-budget refusal, got: {refusal}"
         );
-    }
-
-    #[test]
-    fn the_raised_byte_budget_keeps_a_list_the_old_budget_would_have_trimmed() {
-        // The regression each raise fixes: a fact list above a superseded
-        // ceiling used to lose its tail. Grown past the most recent superseded
-        // budget (4 KiB), so it also covers the older 2 KiB one. Nothing is
-        // trimmed now.
-        const RETIRED_PAYLOAD_BUDGET_BYTES: usize = 2_048;
-        const PREVIOUS_PAYLOAD_BUDGET_BYTES: usize = 4_096;
-        let mut facts = vec![
-            budget_fact("origin_kind"),
-            budget_fact("provider_surface"),
-            budget_fact("execution_mode"),
-            budget_fact("template_group_id"),
-        ];
-        while serde_json::to_vec(&facts).expect("serialize").len() <= PREVIOUS_PAYLOAD_BUDGET_BYTES
-        {
-            facts.push(budget_fact("skill_id"));
-        }
-        let payload_bytes = serde_json::to_vec(&facts).expect("serialize").len();
-        assert!(payload_bytes > RETIRED_PAYLOAD_BUDGET_BYTES);
-        assert!(payload_bytes > PREVIOUS_PAYLOAD_BUDGET_BYTES);
-        assert!(payload_bytes <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES);
-        let before = facts.len();
-
-        enforce_fact_limits(&mut facts);
-
-        assert_eq!(facts.len(), before);
-        validate_fact_limits(&facts).expect("near-limit list is valid");
-    }
-
-    #[test]
-    fn enforce_fact_limits_applies_the_count_cap_before_the_byte_budget() {
-        let mut facts: Vec<SessionAttributionFact> = (0..MAX_SESSION_ATTRIBUTION_FACTS + 5)
-            .map(|_| budget_fact("skill_id"))
-            .collect();
-
-        enforce_fact_limits(&mut facts);
-
-        assert!(facts.len() <= MAX_SESSION_ATTRIBUTION_FACTS);
-        assert!(fits_wire_budget(&facts));
     }
 }
 

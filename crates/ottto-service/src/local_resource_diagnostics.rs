@@ -6,12 +6,184 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// One lifecycle module's cumulative process totals: `Counts` (one `u64` per
+/// field), `Event`, saturating `add`/`record`, `Counts::totals` and the
+/// test-only `observe` seam.
+macro_rules! lifetime_counters {
+    ($($field:ident: $event:ident),+ $(,)?) => {
+        lifetime_counters!(@core [] $($field: $event),+);
+    };
+    (@core [$($hook:path)?] $($field:ident: $event:ident),+) => {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ::serde::Serialize)]
+        pub(crate) struct Counts { $(pub(crate) $field: u64),+ }
+        #[derive(Clone, Copy)]
+        pub(crate) enum Event { $($event),+ }
+        const COUNT: usize = [$(stringify!($field)),+].len();
+        // Fixed static instrumentation only: no owner/cache graph fields,
+        // allocations, additional locks, identifiers or retained history.
+        static TOTALS: [::std::sync::atomic::AtomicU64; COUNT] =
+            [const { ::std::sync::atomic::AtomicU64::new(0) }; COUNT];
+        impl Counts {
+            fn from_array(values: [u64; COUNT]) -> Self {
+                Self { $($field: values[Event::$event as usize]),+ }
+            }
+            fn totals() -> Self {
+                use ::std::sync::atomic::Ordering::Relaxed;
+                Self::from_array(::std::array::from_fn(|i| TOTALS[i].load(Relaxed)))
+            }
+            #[cfg(test)]
+            pub(super) fn maximum() -> Self { Self { $($field: u64::MAX),+ } }
+        }
+        pub(crate) fn add(event: Event, amount: u64) {
+            use ::std::sync::atomic::Ordering::Relaxed;
+            $($hook(event, amount);)?
+            let _ = TOTALS[event as usize].fetch_update(Relaxed, Relaxed, |n| {
+                Some(n.saturating_add(amount))
+            });
+            #[cfg(test)]
+            TEST_EVENTS.with(|events| {
+                if let Some(mut values) = events.get() {
+                    values[event as usize] = values[event as usize].saturating_add(amount);
+                    events.set(Some(values));
+                }
+            });
+        }
+        pub(crate) fn record(event: Event) {
+            add(event, 1);
+        }
+        #[cfg(test)]
+        thread_local! {
+            static TEST_EVENTS: std::cell::Cell<Option<[u64; COUNT]>> = const { std::cell::Cell::new(None) };
+        }
+        /// Isolates assertions from concurrent fixtures without resetting or
+        /// changing the production process totals. No production observer or callback.
+        #[cfg(test)]
+        pub(crate) fn observe<T>(f: impl FnOnce() -> T) -> (T, Counts) {
+            struct Reset(Option<[u64; COUNT]>);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    TEST_EVENTS.with(|events| events.set(self.0));
+                }
+            }
+            let reset = Reset(TEST_EVENTS.with(|events| events.replace(Some([0; COUNT]))));
+            let value = f();
+            let counts = TEST_EVENTS.with(|events| Counts::from_array(events.get().unwrap()));
+            drop(reset);
+            (value, counts)
+        }
+    };
+}
+/// `lifetime_counters!` plus `Sparse` and `Counts::{add, merge, is_empty}`;
+/// each `add` first feeds `claude_reread::cache_event` (cache_lifecycle).
+macro_rules! sparse_lifetime_counters {
+    ($($field:ident: $event:ident),+ $(,)?) => {
+        lifetime_counters!(@core [super::claude_reread::cache_event] $($field: $event),+);
+        pub(crate) struct Sparse(pub(crate) Counts);
+        impl ::serde::Serialize for Sparse {
+            fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use ::serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(None)?;
+                $(if self.0.$field != 0 { map.serialize_entry(stringify!($field), &self.0.$field)?; })+
+                map.end()
+            }
+        }
+        impl Counts {
+            pub(crate) fn add(&mut self, event: Event, amount: u64) {
+                match event { $(Event::$event => self.$field = self.$field.saturating_add(amount)),+ }
+            }
+            pub(crate) fn merge(&mut self, other: Self) {
+                $(self.$field = self.$field.saturating_add(other.$field);)+
+            }
+            pub(crate) fn is_empty(&self) -> bool { $(self.$field == 0)&&+ }
+        }
+    };
+}
+
 pub(crate) mod cache_lifecycle;
 pub(crate) mod claude_absence;
 pub(crate) mod claude_contract;
 pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
+mod footprint;
+pub(crate) mod rearm_cause;
+
+#[cfg(not(test))]
+static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] };
+}
+
+/// Append-only reason labels, cumulative per process (not distinct sessions).
+/// Records each attempted over-cap body before its identities are stripped.
+pub(crate) fn claude_identity_over_cap(
+    reasons: &std::collections::BTreeSet<crate::snapshots::claude_request_identity::OverCap>,
+    item_bytes: usize,
+    components: Option<&ClaudeIdentityOverCapBytes>,
+) {
+    use crate::snapshots::claude_request_identity::OverCap;
+    const LABELS: [&str; 6] = [
+        "evidence_entries",
+        "authority_keys",
+        "parts_per_row",
+        "parts_per_item",
+        "rows",
+        "bytes",
+    ];
+    let record = |counters: &[AtomicU64; 6]| {
+        for reason in reasons {
+            let index = match reason {
+                OverCap::EvidenceEntries => 0,
+                OverCap::AuthorityKeys => 1,
+                OverCap::PartsPerRow => 2,
+                OverCap::PartsPerItem => 3,
+                OverCap::Rows => 4,
+                OverCap::Bytes => 5,
+            };
+            let _ = counters[index].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+        }
+        #[derive(Serialize)]
+        struct Counts<'a> {
+            claude_request_identity_over_cap: BTreeMap<&'static str, u64>,
+            claude_request_identity_last_over_cap_item_bytes: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            claude_request_identity_last_over_cap_components:
+                Option<&'a ClaudeIdentityOverCapBytes>,
+        }
+        traversal_point(
+            "claude_request_identity_over_cap",
+            "claude_code",
+            &Counts {
+                claude_request_identity_over_cap: LABELS
+                    .into_iter()
+                    .zip(counters.iter().map(|n| n.load(Relaxed)))
+                    .collect(),
+                claude_request_identity_last_over_cap_item_bytes: item_bytes,
+                claude_request_identity_last_over_cap_components: components,
+            },
+        );
+    };
+    #[cfg(test)]
+    CLAUDE_IDENTITY_OVER_CAP.with(record);
+    #[cfg(not(test))]
+    record(&CLAUDE_IDENTITY_OVER_CAP);
+}
+
+/// Wire bytes of the last over-cap tagged body by component, measured before
+/// its display leaves are shed; `after_shed` is what the tag selector then
+/// sees. Counts and an 8-hex entity digest only.
+#[derive(Serialize)]
+pub(crate) struct ClaudeIdentityOverCapBytes {
+    pub(crate) entity: String,
+    pub(crate) item: usize,
+    pub(crate) context_curve: usize,
+    pub(crate) cache_observations: usize,
+    pub(crate) identity: usize,
+    pub(crate) usage_buckets: usize,
+    pub(crate) rest: usize,
+    pub(crate) after_shed: usize,
+}
 
 /// Closed, content-free refusal labels; cumulative process counters on #799.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -38,8 +210,14 @@ pub(crate) enum CodexZstCause {
     HeaderUnfunded,
     #[serde(rename = "CompressedCompatibilityUnfunded")]
     CompatibilityUnfunded,
+    #[serde(rename = "CompressedAdmissionRefused")]
+    AdmissionRefused,
+    // Subset of decoder refusals: the unchanged free-only floor would fit
+    // without optional header entries. Attempts, not files or lost usage.
+    #[serde(rename = "decoder_refused_header_occupancy")]
+    DecoderRefusedHeaderOccupancy,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::CompatibilityUnfunded as usize + 1;
+const CODEX_ZST_CAUSES: usize = CodexZstCause::DecoderRefusedHeaderOccupancy as usize + 1;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
@@ -56,6 +234,44 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
             BTreeMap::from([(cause, previous.saturating_add(1))]),
         )]),
     );
+}
+
+/// Counts per observed usage line, before response deduplication and timestamp
+/// drops; rereads count again. Only the lifecycle registry atomics are updated.
+pub(crate) fn pi_cost_observations(refused: u64, rounded: u64) {
+    if refused == 0 && rounded == 0 {
+        return;
+    }
+    cache_lifecycle::add(cache_lifecycle::Event::PiCostRefusedOverflow, refused);
+    cache_lifecycle::add(cache_lifecycle::Event::PiCostPrecisionRounded, rounded);
+}
+
+/// Per-pass observations, not distinct entries/files or a lifetime counter.
+pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
+    if observations > 0 {
+        traversal_point(
+            "codex_state_only_ambiguous_identity",
+            "codex",
+            &BTreeMap::from([
+                ("codex_state_only_ambiguous_identity", observations),
+                ("codex_state_only_ambiguous_identity_tokens", tokens),
+            ]),
+        );
+    }
+}
+
+/// One terminal append call, before later policy/no-op suppression; never wire data.
+pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
+    if scanned != 0 || emitted != 0 || noops != 0 {
+        traversal_point(
+            "codex_state_only",
+            "codex",
+            &BTreeMap::from([(
+                "codex_state_only",
+                BTreeMap::from([("scanned", scanned), ("emitted", emitted), ("noops", noops)]),
+            )]),
+        );
+    }
 }
 
 /// Nonzero-only counters on the existing native_collection_page line.
@@ -131,34 +347,182 @@ pub(crate) struct LineDeliveryCounts {
 pub(crate) enum UnselectedReason {
     Age,
     Size,
+    /// The subset of size skips whose key holds a withheld-account revision.
+    WithheldOversized,
+    /// F4 kept custody because another same-member path prevents absence proof.
+    WithheldAbsenceAmbiguous = 18,
 }
-/// Claude, Codex, Pi x (age, size), drained by that source's page line.
+/// Three reasons, seven withheld events, growth, deleted tokens and audit retirement.
+const UNSELECTED_REASONS: usize = 19;
+/// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
-static LINE_UNSELECTED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
+    [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS];
 #[cfg(test)]
 thread_local! {
-    static LINE_UNSELECTED: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] };
+    static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
+        const { [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS] };
 }
-fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
+fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
     let sources = ["claude_code", "codex", "pi"];
     let Some(slot) = sources.iter().position(|s| *s == source) else {
         return 0;
     };
     #[cfg(test)]
     {
-        LINE_UNSELECTED.with(|slots| f(&slots[2 * slot + reason]))
+        LINE_UNSELECTED.with(|slots| f(&slots[UNSELECTED_REASONS * slot + reason]))
     }
     #[cfg(not(test))]
     {
-        f(&LINE_UNSELECTED[2 * slot + reason])
+        f(&LINE_UNSELECTED[UNSELECTED_REASONS * slot + reason])
     }
 }
 /// One skip decision, recorded after the gate decided; never a gate input.
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
-    line_unselected(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+    source_count(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+}
+/// One failed parking decision; no logging, resource probes or scan ownership.
+pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bool) {
+    source_count(source, 16 + usize::from(layout_supported), |slot| {
+        slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+            .unwrap_or_else(|n| n)
+    });
+}
+
+/// E3: Claude withheld-account hold events, in the slots after the reasons.
+#[derive(Clone, Copy)]
+pub(crate) enum WithheldEvent {
+    /// A held key's file was proved absent and its hold released.
+    ReleasedDeleted = 3,
+    /// A held key re-parsed: first time in this process, after an account
+    /// evidence change, or after its transcript stamp changed.
+    ReparseStart,
+    ReparseEvidence,
+    ReparseGrowth,
+    /// A parse resolved the account and released the hold.
+    ReleasedResolved,
+    /// A withheld key past the hold cap left unrecorded, and its withheld tokens.
+    UnrecordedEvents,
+    UnrecordedTokens,
+    ReleasedDeletedTokens = 11,
+    BirthClampAccepted = 15,
+}
+/// Recorded after the decision; never a gate input.
+pub(crate) fn withheld_event(event: WithheldEvent, amount: u64) {
+    source_count("claude_code", event as usize, |slot| {
+        slot.fetch_add(amount, Relaxed)
+    });
+}
+fn drain(source: &str, slots: &[(&'static str, usize)]) -> BTreeMap<&'static str, u64> {
+    slots
+        .iter()
+        .map(|&(key, slot)| (key, source_count(source, slot, |n| n.swap(0, Relaxed))))
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+pub(crate) fn audit_retired_absent(source: &str) {
+    source_count(source, 12, |slot| slot.fetch_add(1, Relaxed));
+}
+/// One aged gate retained a grown indexed file (not a unique-file count).
+pub(crate) fn discovery_retained_grown(source: &str) {
+    source_count(source, 10, |slot| slot.fetch_add(1, Relaxed));
+}
+/// Actual aged, unchanged fragment-only Tail completions; bytes exclude samples.
+pub(crate) fn codex_fragment_tail_repeat(bytes: u64) {
+    source_count("codex", 13, |slot| slot.fetch_add(1, Relaxed));
+    source_count("codex", 14, |slot| slot.fetch_add(bytes, Relaxed));
+}
+/// Post-save fate and current estimated age of this page's observed growth.
+pub(crate) fn discovery_growth_fate(
+    source: &str,
+    counts: &crate::snapshots::discovery_growth::Counts,
+) {
+    traversal_point("discovery_growth_fate", source, counts);
+}
+const WITHHELD_RELEASED: [(&str, usize); 3] =
+    [("deleted", 3), ("resolved", 7), ("deleted_tokens", 11)];
+const WITHHELD_UNRECORDED: [(&str, usize); 2] = [("events", 8), ("tokens", 9)];
+const WITHHELD_REPARSE: [(&str, usize); 3] = [("start", 4), ("evidence", 5), ("growth", 6)];
+#[cfg(test)]
+pub(crate) mod withheld_support {
+    use super::*;
+    pub(crate) fn take_withheld() -> [BTreeMap<&'static str, u64>; 3] {
+        let claude = "claude_code";
+        [
+            drain(claude, &WITHHELD_RELEASED),
+            drain(claude, &WITHHELD_REPARSE),
+            drain(claude, &WITHHELD_UNRECORDED),
+        ]
+    }
 }
 
 const SCHEMA_VERSION: u8 = 2;
+
+pub(crate) fn connection_binding_read<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    credential_file_read(result).inspect_err(|_| {
+        traversal_point(
+            "connection_binding_read",
+            "unknown",
+            &serde_json::json!({"connection_binding_unreadable": 1}),
+        );
+    })
+}
+
+#[cfg(not(test))]
+static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+#[cfg(test)]
+thread_local! {
+    static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 4] = const { [const { AtomicU64::new(0) }; 4] };
+}
+/// Observe typed cap errors before snapshot callers replace their detail.
+/// Ordinary snapshot sync and retained retry use these same authority loads.
+pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    use ottto_core::{CredentialFileCapRefused, TokenStoreError};
+    let kind = result.as_ref().err().and_then(|error| {
+        error.chain().find_map(|cause| {
+            if let Some(TokenStoreError::OversizeRefused) = cause.downcast_ref::<TokenStoreError>()
+            {
+                return Some(CredentialFileCapRefused::FileSecret);
+            }
+            cause
+                .downcast_ref::<CredentialFileCapRefused>()
+                .or_else(|| {
+                    cause
+                        .downcast_ref::<std::io::Error>()?
+                        .get_ref()?
+                        .downcast_ref::<CredentialFileCapRefused>()
+                })
+                .copied()
+        })
+    });
+    if let Some(kind) = kind {
+        let (slot, file_kind) = match kind {
+            CredentialFileCapRefused::DeviceBinding => (0, "device_binding"),
+            CredentialFileCapRefused::FileSecret => (1, "file_secret"),
+            CredentialFileCapRefused::ConnectionBinding => (2, "connection_binding"),
+            CredentialFileCapRefused::PendingDeviceCredential => (3, "pending_device_credential"),
+        };
+        let increment = |counts: &[AtomicU64; 4]| {
+            counts[slot]
+                .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+                .map_or(u64::MAX, |n| n.saturating_add(1))
+        };
+        #[cfg(not(test))]
+        let total = increment(&CREDENTIAL_FILE_CAP_REFUSED);
+        #[cfg(test)]
+        let total = CREDENTIAL_FILE_CAP_REFUSED.with(increment);
+        traversal_point(
+            "credential_file_cap_refusal",
+            "unknown",
+            &serde_json::json!({
+                "file_kind": file_kind,
+                "credential_file_cap_refused": 1,
+                "credential_file_cap_refused_total": total,
+            }),
+        );
+    }
+    result
+}
 
 /// Cumulative shared-process totals, NOT events attributed to the finishing
 /// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
@@ -290,19 +654,78 @@ fn process_sample() -> Option<ProcessSample> {
 
 #[derive(Debug)]
 pub(crate) struct Probe {
+    withheld_memo: Option<crate::snapshots::withheld_account::Memo>,
     started: Instant,
     process: Option<ProcessSample>,
     pub(crate) page_events: claude_reread::Counts,
+    pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
+    pub(crate) discovery_growth: crate::snapshots::discovery_growth::Page,
+}
+impl Drop for Probe {
+    fn drop(&mut self) {
+        rearm_cause::finish_page(self.started);
+    }
 }
 impl Probe {
+    pub(crate) fn set_withheld_memo(&mut self, memo: crate::snapshots::withheld_account::Memo) {
+        self.withheld_memo = Some(memo);
+    }
+    pub(crate) fn with_withheld_memo(
+        mut self,
+        memo: crate::snapshots::withheld_account::Memo,
+    ) -> Self {
+        self.set_withheld_memo(memo);
+        self
+    }
+    pub(crate) fn rearm_full_selected(
+        &self,
+        key: &str,
+        mode: crate::transcript_acquisition::ReadMode,
+    ) {
+        rearm_cause::selected(self.started, key, mode);
+    }
+    pub(crate) fn rearm_full_completed(
+        &self,
+        key: &str,
+        mode: crate::transcript_acquisition::ReadMode,
+        bytes: u64,
+    ) {
+        rearm_cause::completed(self.started, key, mode, bytes);
+    }
+    pub(crate) fn full_parse_reason(
+        &self,
+        mode: crate::transcript_acquisition::ReadMode,
+        reason: Option<crate::snapshots::CandidateParseReason>,
+        count: u64,
+        native_bytes: u64,
+    ) {
+        if let (crate::transcript_acquisition::ReadMode::Full(_), Some(reason)) = (mode, reason) {
+            rearm_cause::record_parse_reason(self.started, reason, count, native_bytes);
+        }
+    }
+    pub(crate) fn full_by_parse_reason(&self) -> claude_reread::FullByParseReason {
+        rearm_cause::full_by_parse_reason(self.started)
+    }
+    pub(crate) fn rearm_fulls(&self) -> rearm_cause::Counts {
+        rearm_cause::page(self.started)
+    }
     pub(crate) fn start() -> Self {
         Self {
+            withheld_memo: None,
             started: Instant::now(),
             process: process_sample(),
             page_events: Default::default(),
+            full_causes: Default::default(),
             line_delivery: None,
+            discovery_growth: Default::default(),
         }
+    }
+    fn stage_observation(&self, footprint: Option<&footprint::Stage>) -> Observation {
+        let mut observation = self.observation();
+        observation.footprint =
+            footprint.map_or_else(footprint::unavailable, footprint::Stage::finish);
+        observation
     }
     fn observation(&self) -> Observation {
         Observation::between(
@@ -339,6 +762,26 @@ impl Probe {
             line_delivery: Option<BTreeMap<&'static str, LineDeliveryCounts>>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             line_delivery_unselected: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            audit_retired_absent: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            discovery_retained: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            codex_fragment_tail_repeat: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_hold_released: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_reparse: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_birth_clamp_accepted: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_hold_unrecorded: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            withheld_memo: Option<crate::snapshots::withheld_account::Census>,
+            #[serde(flatten)]
+            withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            source_rotation_serial_fallback: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -346,13 +789,38 @@ impl Probe {
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
                 .map(|(observer, counts)| BTreeMap::from([(observer, counts)])),
-            line_delivery_unselected: [("age", 0), ("size", 1)]
-                .into_iter()
-                .map(|(key, reason)| (key, line_unselected(source, reason, |n| n.swap(0, Relaxed))))
-                .filter(|(_, count)| *count > 0)
-                .collect(),
+            line_delivery_unselected: drain(
+                source,
+                &[
+                    ("age", 0),
+                    ("size", 1),
+                    ("withheld_oversized", 2),
+                    ("withheld_absence_ambiguous", 18),
+                ],
+            ),
+            audit_retired_absent: drain(source, &[("events", 12)]),
+            discovery_retained: drain(source, &[("grown", 10)]),
+            codex_fragment_tail_repeat: drain(source, &[("files", 13), ("bytes", 14)]),
+            withheld_hold_released: drain(source, &WITHHELD_RELEASED),
+            withheld_reparse: drain(source, &WITHHELD_REPARSE),
+            withheld_birth_clamp_accepted: drain(source, &[("events", 15)]),
+            withheld_hold_unrecorded: drain(source, &WITHHELD_UNRECORDED),
+            withheld_memo: claude
+                .then(|| self.withheld_memo.as_ref().and_then(|memo| memo.census()))
+                .flatten(),
+            withheld_held: claude
+                .then(|| {
+                    self.withheld_memo
+                        .as_ref()
+                        .and_then(|memo| memo.held_gauge())
+                })
+                .flatten(),
+            source_rotation_serial_fallback: drain(
+                source,
+                &[("unsupported_layout", 16), ("bound_refused", 17)],
+            ),
             reread: if claude {
-                self.page_events.with_current()
+                self.page_events.with_current().without_terminal_rearm()
             } else {
                 Default::default()
             },
@@ -385,6 +853,34 @@ impl Probe {
     }
 }
 
+// Terminal scheduling runs after collection. Same carrier, zero scan counts,
+// no process sampling or draining another producer's identity/money counters.
+fn rearm_collection(rearm: claude_reread::Counts) {
+    #[derive(Serialize)]
+    struct Counts {
+        #[serde(flatten)]
+        collection: CollectionCounts,
+        #[serde(flatten)]
+        rearm: claude_reread::Counts,
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "native_collection_page",
+        source: Source::from_slug("claude_code"),
+        observation: Observation::between(0, None, None),
+        counts: Counts {
+            collection: CollectionCounts {
+                scanned_files: 0,
+                semantic_noops: 0,
+                sampled_acquisition: None,
+                full_causes: Default::default(),
+            },
+            rearm,
+        },
+    });
+}
+
 /// All retained account-pending families, including held/incomplete families;
 /// a conservative local-only gauge, never an authority or eviction decision.
 #[derive(Debug, Serialize)]
@@ -392,11 +888,16 @@ pub(crate) struct ClaudeAccountRetainedPending {
     pub(crate) claude_account_retained_pending_families: usize,
     /// Pretty JSON bytes of the retained field, including its field wrapper.
     pub(crate) claude_account_retained_pending_bytes: u64,
+    #[serde(flatten)]
+    pub(crate) retention: crate::snapshots::account_pending_retention::Counts,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
-    const INLINE_ONLY: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(
+            &self.full_causes.restore_outcome.miss,
+            c,
+        )?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.discovery_growth, c)
     }
 }
 
@@ -407,6 +908,8 @@ struct Observation {
     shared_process_cpu_delta_us: Option<u64>,
     process_lifetime_max_rss_bytes: Option<u64>,
     process_lifetime_max_rss_before_bytes: Option<u64>,
+    #[serde(flatten)]
+    footprint: footprint::Observation,
 }
 impl Observation {
     fn between(wall: u64, before: Option<ProcessSample>, after: Option<ProcessSample>) -> Self {
@@ -416,6 +919,7 @@ impl Observation {
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: wall,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: before
                 .zip(after)
                 .and_then(|(before, after)| after.cpu_us.checked_sub(before.cpu_us)),
@@ -428,6 +932,23 @@ impl Observation {
     }
 }
 
+/// Local prepare window, including index load/baseline work before page probes.
+/// Return values and errors pass through; unwinding closes sampling silently.
+pub(crate) fn source_prepare<T>(source: &str, inner: impl FnOnce() -> T) -> T {
+    let probe = Probe::start();
+    let footprint = footprint::Stage::begin();
+    let result = inner();
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "source_prepare",
+        source: Source::from_slug(source),
+        observation: probe.stage_observation(footprint.as_ref()),
+        counts: BTreeMap::<&str, u64>::new(),
+    });
+    result
+}
+
 /// Observe only a normally returned finish; move its value/error through unchanged.
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
 pub(crate) fn source_finish<T>(
@@ -435,13 +956,14 @@ pub(crate) fn source_finish<T>(
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let probe = Probe::start();
+    let footprint = footprint::Stage::begin();
     let result = inner();
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
         stage: "source_finish",
         source: Source::from_slug(source),
-        observation: probe.observation(),
+        observation: probe.stage_observation(footprint.as_ref()),
         counts: EmptyCounts {},
     });
     result
@@ -473,6 +995,7 @@ pub(crate) fn codex_census_fence(
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: 0,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: None,
             process_lifetime_max_rss_bytes: None,
             process_lifetime_max_rss_before_bytes: None,
@@ -519,6 +1042,12 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         counts,
     );
 }
+/// Local alarm, once per park: a held Claude key's progress audit failed its
+/// secure open 8 times in a row and is parked, its audit debt still owed.
+/// Counts only; no path, id or wire event.
+pub(crate) fn claude_held_audit_open_parked(counts: &impl Serialize) {
+    traversal_point("claude_held_audit_open_parked", "claude_code", counts);
+}
 /// Local alarm, at most hourly: a complete Claude terminal kept the retired
 /// family tombstone uncertainty fence up, because more absent witnessed roots
 /// need a tombstone than fit under the cap. Counts only; no path, id or wire
@@ -529,6 +1058,14 @@ pub(crate) fn claude_absent_family_tombstone_uncertain(counts: &impl Serialize) 
         "claude_code",
         counts,
     );
+}
+/// E7-8a shadow, once per Claude page: per-family census completion counts
+/// (`family_census_complete`, `family_census_incomplete{reason}`,
+/// `family_complete_deferred{quantum}`), `pending_census_members`, the
+/// skipped-set digest and predicate cost. Counts only; never an authority
+/// input, no path, id or wire event.
+pub(crate) fn claude_family_census_shadow(counts: &impl Serialize) {
+    traversal_point("claude_family_census_shadow", "claude_code", counts);
 }
 static HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -609,6 +1146,97 @@ pub(crate) fn claude_reemission_family_closure_root_absent_excluded(members: u64
         },
     );
 }
+static CENSUS_RETIRE_KEPT_OVERLAP_TOTAL: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// One `claude_census_retire_kept_overlap` row (E7 stopgap): a complete
+/// terminal's kept records, their hashes and those retired because the
+/// census was above 90% occupancy, with the terminal's census-full tombstone
+/// count; or the records an insert retired so it fits (admission overflow,
+/// no terminal count); or a new key refused at the live record bound.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CensusRetireKeptOverlapCounts {
+    pub(crate) records: u64,
+    pub(crate) hashes: u64,
+    pub(crate) overflow_occupancy: u64,
+    pub(crate) overflow_admission: u64,
+    /// New keys refused at the live census record bound.
+    pub(crate) record_limit_refused: u64,
+    /// The terminal's shadow `missing_over_budget`; None on admission rows.
+    pub(crate) missing_over_budget: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct CensusRetireKeptOverlap {
+    census_retire_kept_overlap_records: u64,
+    census_retire_kept_overlap_hashes: u64,
+    census_retire_kept_overflow: u64,
+    census_retire_kept_overflow_occupancy: u64,
+    census_retire_kept_overflow_admission: u64,
+    census_record_limit_refused: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    census_missing_over_budget: Option<u64>,
+    census_retire_kept_overlap_records_total: u64,
+    census_retire_kept_overlap_hashes_total: u64,
+    census_retire_kept_overflow_total: u64,
+    census_retire_kept_overflow_occupancy_total: u64,
+    census_retire_kept_overflow_admission_total: u64,
+    census_record_limit_refused_total: u64,
+}
+
+/// Local counter (E7 stopgap): aged Claude transcript census records kept
+/// because they share a request id with another unretired record, and those
+/// retired anyway: above 90% census occupancy at a terminal, or so an insert
+/// fits. `census_retire_kept_overflow` counts both reasons, `_occupancy`
+/// and `_admission` each one. `census_record_limit_refused` counts new keys
+/// refused at the live record bound. The row's counts and saturating process totals; a positive
+/// overflow or refusal (each loses money proof) also emits
+/// `claude_census_retire_kept_overlap_alarm`. Counts only; no path, id or
+/// wire event.
+pub(crate) fn claude_census_retire_kept_overlap(counts: CensusRetireKeptOverlapCounts) {
+    let add = |slot: usize, count: u64| {
+        CENSUS_RETIRE_KEPT_OVERLAP_TOTAL[slot]
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |total| Some(total.saturating_add(count)),
+            )
+            .unwrap_or(u64::MAX)
+            .saturating_add(count)
+    };
+    let overflow = counts
+        .overflow_occupancy
+        .saturating_add(counts.overflow_admission);
+    let row = CensusRetireKeptOverlap {
+        census_retire_kept_overlap_records: counts.records,
+        census_retire_kept_overlap_hashes: counts.hashes,
+        census_retire_kept_overflow: overflow,
+        census_retire_kept_overflow_occupancy: counts.overflow_occupancy,
+        census_retire_kept_overflow_admission: counts.overflow_admission,
+        census_record_limit_refused: counts.record_limit_refused,
+        census_missing_over_budget: counts.missing_over_budget,
+        census_retire_kept_overlap_records_total: add(0, counts.records),
+        census_retire_kept_overlap_hashes_total: add(1, counts.hashes),
+        census_retire_kept_overflow_total: add(2, overflow),
+        census_retire_kept_overflow_occupancy_total: add(3, counts.overflow_occupancy),
+        census_retire_kept_overflow_admission_total: add(4, counts.overflow_admission),
+        census_record_limit_refused_total: add(5, counts.record_limit_refused),
+    };
+    traversal_point("claude_census_retire_kept_overlap", "claude_code", &row);
+    if overflow > 0 || counts.record_limit_refused > 0 {
+        traversal_point(
+            "claude_census_retire_kept_overlap_alarm",
+            "claude_code",
+            &row,
+        );
+    }
+}
 /// Local alarm: the one-time Claude history re-read latched its stop until
 /// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
 /// hourly as a reminder. Counts and hashed root refs only; no wire event.
@@ -625,7 +1253,22 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
     traversal_point("durable_tail_alarm", source, counts);
 }
-fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
+/// At most once per 24 h while restart Fulls caused by a failed store write persist.
+pub(crate) fn durable_tail_restart_full_alarm(source: &str, counts: &impl Serialize) {
+    traversal_point("durable_tail_restart_full_alarm", source, counts);
+}
+pub(crate) fn codex_continuation(held: Option<&'static str>) {
+    let counts = serde_json::json!({
+        "continuation_pages_run": u8::from(held.is_none()),
+        "continuation_held": held.map(|reason| BTreeMap::from([(reason, 1u8)])).unwrap_or_default(),
+    });
+    traversal_point("codex_continuation", "codex", &counts);
+}
+pub(crate) fn codex_continuation_mint(outcome: &'static str) {
+    let counts = serde_json::json!({"continuation_mint": BTreeMap::from([(outcome, 1u8)])});
+    traversal_point("codex_continuation_mint", "codex", &counts);
+}
+pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
@@ -637,6 +1280,7 @@ fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: 0,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: None,
             process_lifetime_max_rss_bytes: None,
             process_lifetime_max_rss_before_bytes: None,
@@ -746,15 +1390,44 @@ impl NativeDecision {
             "claude_code",
             &Counts {
                 decision: self.0.get(),
-                events: self.1.get().with_current(),
+                events: self.1.get().with_current().without_terminal_rearm(),
             },
         );
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for NativeDecision {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
+crate::heap_layout_bound::no_heap!(false; NativeDecision);
+
+/// Per-page restore attempts. A miss class never authorizes a body read.
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct FullCauses {
+    pub(crate) restore_outcome: RestoreCounts,
+}
+impl FullCauses {
+    fn is_empty(&self) -> bool {
+        self.restore_outcome.restored == 0
+            && self.restore_outcome.held == 0
+            && self.restore_outcome.miss.is_empty()
+    }
+}
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct RestoreCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    restored: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    held: u64,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    miss: BTreeMap<&'static str, u64>,
+}
+impl RestoreCounts {
+    #[cfg(unix)]
+    pub(crate) fn record(&mut self, outcome: &crate::snapshots::sampled_scan::RestoreOutcome) {
+        use crate::snapshots::sampled_scan::RestoreOutcome;
+        let count = match outcome {
+            RestoreOutcome::Restored(_) => &mut self.restored,
+            RestoreOutcome::Held(_) => &mut self.held,
+            RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
+        };
+        *count = count.saturating_add(1);
     }
 }
 
@@ -766,6 +1439,8 @@ pub(crate) struct CollectionCounts {
     /// total filesystem reads: byte counts exclude failed plans, joins,
     /// discovery and sidecars. Selection counts can include failed/repeated plans.
     pub(crate) sampled_acquisition: Option<ReadCounts>,
+    #[serde(skip_serializing_if = "FullCauses::is_empty")]
+    pub(crate) full_causes: FullCauses,
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct ReadCounts {
@@ -948,12 +1623,7 @@ pub(crate) struct AcquisitionAdmission {
     pub(crate) prepare_started: usize,
     pub(crate) prepare_failed: usize,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for AcquisitionAdmission {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; AcquisitionAdmission);
 
 /// Existing audit point, using already computed final/previous fingerprints.
 /// Additive aliases retain their meaning; neither comparison is an audit-policy
@@ -981,6 +1651,7 @@ pub(crate) fn sampled_audit_comparison(
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: 0,
+            footprint: Default::default(),
             shared_process_cpu_delta_us: None,
             process_lifetime_max_rss_bytes: None,
             process_lifetime_max_rss_before_bytes: None,
@@ -995,6 +1666,10 @@ pub(crate) fn sampled_audit_comparison(
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct PageEvents {
+    #[serde(skip_serializing_if = "rearm_cause::Counts::is_empty")]
+    pub(crate) full_cause: rearm_cause::Counts,
+    #[serde(skip_serializing_if = "claude_reread::FullByParseReason::is_empty")]
+    pub(crate) full_by_parse_reason: claude_reread::FullByParseReason,
     pub(crate) full_reasons: FullReasons,
     pub(crate) priority_full_replays: usize,
     pub(crate) audits_started: usize,
@@ -1004,6 +1679,8 @@ pub(crate) struct PageEvents {
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct IndexState {
+    pub(crate) audit_quiet_retired: usize,
+    pub(crate) audit_cap_full: usize,
     pub(crate) pending_audits: usize,
     pub(crate) overdue_audits: usize,
     pub(crate) oldest_due_age_seconds: u64,
@@ -1154,7 +1831,189 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compressed_causes_have_distinct_pinned_indices() {
+        use super::CodexZstCause::*;
+        const ALL: [super::CodexZstCause; super::CODEX_ZST_CAUSES] = [
+            ReplayNotAuthorized,
+            ProofParentUnsupported,
+            ProofChildUnsupported,
+            ParentSideUnsupported,
+            DurableTailUnsupported,
+            GroupProbeUnsupported,
+            GroupReadUnsupported,
+            ParentLedgerUnbound,
+            PhysicalOffsetUnsupported,
+            HeaderUnfunded,
+            CompatibilityUnfunded,
+            AdmissionRefused,
+            DecoderRefusedHeaderOccupancy,
+        ];
+        assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
+        assert_eq!(
+            serde_json::to_value(DecoderRefusedHeaderOccupancy).unwrap(),
+            "decoder_refused_header_occupancy"
+        );
+        for (index, cause) in ALL.iter().enumerate() {
+            assert_eq!(*cause as usize, index);
+        }
+    }
+
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_counts_are_sparse_saturating_and_page_scoped() {
+        use crate::snapshots::sampled_scan::{MissClass, RestoreOutcome};
+        let mut probe = Probe::start();
+        let collection = |full_causes| CollectionCounts {
+            scanned_files: 0,
+            semantic_noops: 0,
+            sampled_acquisition: None,
+            full_causes,
+        };
+        let (_, rows) = capture(|| {
+            probe.collection("codex", collection(Default::default()));
+            probe
+                .full_causes
+                .restore_outcome
+                .record(&RestoreOutcome::Miss(MissClass::Missing));
+            probe
+                .full_causes
+                .restore_outcome
+                .record(&RestoreOutcome::Miss(MissClass::Missing));
+            probe
+                .full_causes
+                .restore_outcome
+                .record(&RestoreOutcome::Held(
+                    crate::durable_tail_store::Refusal::Unknown,
+                ));
+            let counts = std::mem::take(&mut probe.full_causes);
+            probe.collection("codex", collection(counts));
+            let counts = std::mem::take(&mut probe.full_causes);
+            probe.collection("codex", collection(counts));
+        });
+        assert!(rows[0]["counts"].get("full_causes").is_none());
+        let counts = &rows[1]["counts"]["full_causes"]["restore_outcome"];
+        assert_eq!(counts["miss"]["missing"], 2);
+        assert_eq!(counts["held"], 1);
+        assert!(counts.get("restored").is_none());
+        assert_eq!(rows[1]["schema_version"], 2);
+        assert!(rows[1]["counts"]["sampled_acquisition"].is_null());
+        assert!(rows[2]["counts"].get("full_causes").is_none());
+        let counts = &mut probe.full_causes.restore_outcome;
+        counts.held = u64::MAX;
+        counts.record(&RestoreOutcome::Held(
+            crate::durable_tail_store::Refusal::Unknown,
+        ));
+        assert_eq!(counts.held, u64::MAX);
+        counts.restored = 1;
+        let json = serde_json::to_value(&probe.full_causes).unwrap();
+        assert_eq!(json["restore_outcome"]["restored"], 1);
+    }
+
+    #[test]
+    fn connection_binding_failures_are_counted_without_sensitive_detail() {
+        let (_, lines) = capture(|| {
+            assert!(connection_binding_read(Ok::<_, anyhow::Error>(None::<()>))
+                .unwrap()
+                .is_none());
+            assert_eq!(connection_binding_read(Ok(7)).unwrap(), 7);
+            for message in [
+                "open connection binding /private/synthetic",
+                "parse connection binding https://synthetic.invalid",
+            ] {
+                let error =
+                    connection_binding_read::<()>(Err(anyhow::anyhow!(message))).unwrap_err();
+                assert_eq!(error.to_string(), message);
+            }
+            let error = anyhow::Error::new(ottto_core::CredentialFileCapRefused::ConnectionBinding);
+            assert!(connection_binding_read::<()>(Err(error)).is_err());
+        });
+        let unreadable: Vec<_> = lines
+            .iter()
+            .filter(|r| r["stage"] == "connection_binding_read")
+            .collect();
+        assert_eq!(unreadable.len(), 3);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|r| r["stage"] == "credential_file_cap_refusal")
+                .count(),
+            1
+        );
+        for line in unreadable {
+            assert_eq!(line["schema_version"], 2);
+            assert_eq!(line["source"], "unknown");
+            assert_eq!(
+                line["counts"],
+                serde_json::json!({"connection_binding_unreadable": 1})
+            );
+            let text = line.to_string();
+            assert!(!text.contains("/private") && !text.contains("synthetic.invalid"));
+        }
+    }
+
+    #[test]
+    fn typed_credential_cap_errors_use_existing_carrier_and_preserve_result() {
+        use ottto_core::{CredentialFileCapRefused, FileDeviceStore, TokenStoreError};
+        CREDENTIAL_FILE_CAP_REFUSED.with(|counts| counts.iter().for_each(|n| n.store(0, Relaxed)));
+        let path = std::env::temp_dir().join(format!("credential-carrier-{}", std::process::id()));
+        std::fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
+        let store = FileDeviceStore::new(&path);
+        let (_, lines) = capture(|| {
+            let error = credential_file_read(store.load()).unwrap_err();
+            assert!(format!("{error:#}").contains("exceeds 64 KiB"));
+            assert!(credential_file_read(store.load_with_credential_generation()).is_err());
+            assert!(
+                credential_file_read(ottto_core::FileConnectionStore::new(&path).load()).is_err()
+            );
+            assert!(credential_file_read(
+                ottto_core::FilePendingDeviceCredentialStore::new(&path).load()
+            )
+            .is_err());
+            // The core secret store preserves this typed variant across its API.
+            let secret: anyhow::Result<()> = Err(TokenStoreError::OversizeRefused.into());
+            assert!(credential_file_read(secret)
+                .unwrap_err()
+                .is::<TokenStoreError>());
+            // Growth refusals carry the same typed inner error through io::Error.
+            let growth: anyhow::Result<()> = Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                CredentialFileCapRefused::FileSecret,
+            )
+            .into());
+            assert!(credential_file_read(growth).is_err());
+            assert_eq!(credential_file_read(Ok(7)).unwrap(), 7);
+            let other: anyhow::Result<()> = Err(anyhow::anyhow!("ordinary read failure"));
+            assert!(credential_file_read(other).is_err());
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(lines.len(), 6);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(line["schema_version"], 2);
+            assert_eq!(line["stage"], "credential_file_cap_refusal");
+            assert_eq!(line["source"], "unknown");
+            assert_eq!(
+                line["counts"]["file_kind"],
+                match i {
+                    0 | 1 => "device_binding",
+                    2 => "connection_binding",
+                    3 => "pending_device_credential",
+                    _ => "file_secret",
+                }
+            );
+            assert_eq!(line["counts"]["credential_file_cap_refused"], 1);
+            assert_eq!(
+                line["counts"]["credential_file_cap_refused_total"],
+                match i {
+                    0 | 2 | 3 | 4 => 1,
+                    _ => 2,
+                }
+            );
+            assert_eq!(line["counts"].as_object().unwrap().len(), 3);
+        }
+    }
 
     #[test]
     fn history_proof_correction_deferral_is_counted() {
@@ -1234,6 +2093,8 @@ mod tests {
                 prepare_failed: usize::MAX,
             },
             page_events: PageEvents {
+                full_cause: Default::default(),
+                full_by_parse_reason: Default::default(),
                 full_reasons: FullReasons([usize::MAX / 11; 11]),
                 priority_full_replays: usize::MAX,
                 audits_started: usize::MAX,
@@ -1242,6 +2103,8 @@ mod tests {
                 max_completion_overdue_seconds: u64::MAX,
             },
             index_state_at_page_end: IndexState {
+                audit_quiet_retired: usize::MAX,
+                audit_cap_full: usize::MAX,
                 pending_audits: usize::MAX,
                 overdue_audits: usize::MAX,
                 oldest_due_age_seconds: u64::MAX,
@@ -1459,25 +2322,47 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bounded native outcome carrier measurement"]
-    fn census_fence_event_native_measurement() {
-        use crate::codex_scan_diagnostics::{
-            CensusFenceOutcome as O, CensusFencePhase as P, CensusInvalidation as I,
-        };
-        const ITERATIONS: usize = 256;
-        // Warm the existing stderr handle before measuring the event path.
-        codex_census_fence(P::Inner, O::Published, I::NotAttempted);
-        let started = Instant::now();
-        let (_, stats) = crate::retry_allocation_probe::measure(|| {
-            for _ in 0..ITERATIONS {
-                codex_census_fence(P::Inner, O::PrivateWriteFailed, I::Failed);
+    fn footprint_fields_are_stage_only_for_all_native_sources() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (result, records) = capture(|| {
+                source_prepare(source, || {
+                    source_finish(source, || Ok::<_, anyhow::Error>(17))
+                })
+            });
+            assert_eq!(result.unwrap(), 17);
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0]["stage"], "source_finish");
+            assert_eq!(records[1]["stage"], "source_prepare");
+            for record in records {
+                assert_eq!(record["source"], source);
+                assert!(record["observation"]["footprint_sample_failures"].is_u64());
+                let row = &record["observation"];
+                if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
+                    for endpoint in ["stage_start_footprint_bytes", "stage_end_footprint_bytes"] {
+                        if let Some(bytes) = row[endpoint].as_u64() {
+                            assert!(peak >= bytes);
+                        }
+                    }
+                    assert!(row["footprint_samples"].as_u64().unwrap() >= 1);
+                }
             }
+        }
+        let (_, records) = capture(|| {
+            drop(UploadCall::start("codex"));
+            traversal_point("synthetic", "pi", &BTreeMap::<&str, u64>::new());
         });
-        assert_eq!(stats.requested_live, 0);
-        assert!(stats.requested_peak_with_overlap < 2048);
-        println!("CENSUS_FENCE_OVERHEAD iterations={ITERATIONS} elapsed_us={} peak_bytes={} allocations={} live_bytes={} includes_encoding_and_existing_stderr=true",
-            started.elapsed().as_micros(), stats.requested_peak_with_overlap,
-            stats.allocations, stats.requested_live);
+        let page = serde_json::to_value(Probe::start().observation()).unwrap();
+        for row in records.iter().map(|r| &r["observation"]).chain([&page]) {
+            for field in [
+                "stage_peak_footprint_bytes",
+                "stage_start_footprint_bytes",
+                "stage_end_footprint_bytes",
+                "footprint_samples",
+                "footprint_sample_failures",
+            ] {
+                assert!(row.get(field).is_none());
+            }
+        }
     }
 
     #[test]
@@ -1558,39 +2443,51 @@ mod tests {
         assert!(records.is_empty());
     }
 
+    /// [behaviour] Full parse reasons report selections and completed bytes on the existing page event.
     #[test]
-    fn resource_reason_map_is_sparse_and_matches_existing_slots() {
-        use crate::transcript_acquisition::FullReason::*;
-        let mut counts = [0; 11];
-        counts[StateMissing.slot()] = 2;
-        counts[BoundaryChanged.slot()] = 3;
+    fn full_parse_reasons_are_sparse_page_local_counts_and_completed_bytes() {
+        use crate::snapshots::CandidateParseReason::{Rearmed, TranscriptChanged};
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        let (_, rows) = capture(|| {
+            let probe = Probe::start();
+            let full = ReadMode::Full(FullReason::StateMissing);
+            for (mode, reason, bytes) in [
+                (full, Some(Rearmed), 123),
+                (full, Some(TranscriptChanged), 456),
+                (ReadMode::Tail, Some(Rearmed), 999),
+                (ReadMode::Unchanged, Some(Rearmed), 999),
+                (full, None, 999),
+            ] {
+                probe.full_parse_reason(mode, reason, 1, 0);
+                probe.full_parse_reason(mode, reason, 0, bytes);
+            }
+            // A selected Full that has not completed contributes no bytes.
+            probe.full_parse_reason(full, Some(Rearmed), 1, 0);
+            for probe in [probe, Probe::start()] {
+                let mut reads = max_read_counts();
+                reads.page_events.full_by_parse_reason = probe.full_by_parse_reason();
+                probe.collection(
+                    "claude_code",
+                    CollectionCounts {
+                        scanned_files: 6,
+                        semantic_noops: 0,
+                        sampled_acquisition: Some(reads),
+                        full_causes: Default::default(),
+                    },
+                );
+            }
+        });
+        assert_eq!(rows[0]["stage"], "native_collection_page");
         assert_eq!(
-            serde_json::to_value(FullReasons(counts)).unwrap(),
-            serde_json::json!({"state_missing": 2, "boundary_changed": 3})
+            rows[0]["counts"]["sampled_acquisition"]["page_events"]["full_by_parse_reason"],
+            serde_json::json!({
+                "rearmed": {"count": 2, "completed_native_bytes": 123},
+                "transcript_changed": {"count": 1, "completed_native_bytes": 456},
+            })
         );
-        let all = serde_json::to_value(FullReasons([1; 11])).unwrap();
-        let keys: Vec<_> = all
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            keys,
-            [
-                "audit_due",
-                "boundary_changed",
-                "clock_changed",
-                "head_changed",
-                "invalid_checkpoint",
-                "replaced",
-                "same_size_edit",
-                "scope_changed",
-                "shrunk",
-                "state_missing",
-                "unsupported_identity"
-            ]
-        );
+        assert!(rows[1]["counts"]["sampled_acquisition"]["page_events"]
+            .get("full_by_parse_reason")
+            .is_none());
     }
 
     #[test]
@@ -1607,6 +2504,7 @@ mod tests {
                     scanned_files: 1,
                     semantic_noops: 0,
                     sampled_acquisition: None,
+                    full_causes: Default::default(),
                 },
             );
             probe.collection(
@@ -1615,6 +2513,7 @@ mod tests {
                     scanned_files: 0,
                     semantic_noops: 0,
                     sampled_acquisition: None,
+                    full_causes: Default::default(),
                 },
             );
             let scope = claude_reread::Scope::begin(true);
@@ -1645,6 +2544,88 @@ mod tests {
     }
 
     #[test]
+    fn terminal_rearm_counts_use_page_carrier_once_and_do_not_drain_other_producers() {
+        let (_, rows) = capture(|| {
+            let scope = claude_reread::Scope::begin(true);
+            claude_record_cap_half_file();
+            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
+            claude_reread::terminal_rearm(
+                claude_reread::IgnoredVeto::WithheldAccount.bit(),
+                7,
+                false,
+            );
+            claude_reread::terminal_rearm(0, 0, true);
+            // Zero deltas never manufacture a scheduling row.
+            claude_reread::terminal_rearm(0, 99, false);
+            NativeDecision::new().emit();
+            let counts = scope.finish();
+            assert_eq!(counts.rearm_structural_native_duplicate, 1);
+            assert_eq!(counts.rearm_fingerprints_preserved, 7);
+            // The ordinary page still owns its cap observation. It must not
+            // repeat terminal counters from the parent scope or kept counts.
+            let mut probe = Probe::start();
+            probe.page_events = counts;
+            probe.collection(
+                "claude_code",
+                CollectionCounts {
+                    scanned_files: 1,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            );
+            // Disabled comparison must omit these fields too.
+            claude_reread::emit_without_lease(counts);
+        });
+        assert_eq!(rows.len(), 5);
+        for row in &rows[..2] {
+            assert_eq!(row["stage"], "native_collection_page");
+            assert_eq!(row["source"], "claude_code");
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["counts"]["scanned_files"], 0);
+            assert_eq!(row["counts"]["semantic_noops"], 0);
+            assert!(row["counts"]
+                .get("claude_money_record_cap_half_files")
+                .is_none());
+        }
+        assert_eq!(
+            rows[0]["counts"]["rearm_veto_ignored"],
+            serde_json::json!({"withheld_account": 1})
+        );
+        assert_eq!(rows[0]["counts"]["rearm_fingerprints_preserved"], 7);
+        assert_eq!(rows[1]["counts"]["rearm_structural_native_duplicate"], 1);
+        assert_eq!(rows[2]["stage"], "native_comparison_decision");
+        assert_eq!(rows[2]["counts"]["claude_reread"]["owned_start_cleared"], 1);
+        assert_eq!(rows[3]["counts"]["claude_money_record_cap_half_files"], 1);
+        assert_eq!(rows[4]["stage"], "native_comparison_decision");
+        for row in &rows[2..] {
+            for key in [
+                "rearm_veto_ignored",
+                "rearm_fingerprints_preserved",
+                "rearm_structural_native_duplicate",
+            ] {
+                assert!(
+                    row["counts"].get(key).is_none(),
+                    "terminal delta repeated: {row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pi_cost_observations_update_registry_without_emitting_records() {
+        let (((), counts), rows) = capture(|| {
+            cache_lifecycle::observe(|| {
+                pi_cost_observations(0, 0);
+                pi_cost_observations(2, 3);
+            })
+        });
+        assert_eq!(counts.pi_cost_refused_overflow, 2);
+        assert_eq!(counts.pi_cost_precision_rounded, 3);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
     fn cache_lifecycle_record_is_bounded_and_explicitly_process_global() {
         let (_, records) = capture(|| {
             traversal_point(
@@ -1660,7 +2641,8 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        assert!(serde_json::to_string(record).unwrap().len() < 2048);
+        // The two Pi observation fields add 97 bytes at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2304);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);
@@ -1823,6 +2805,7 @@ mod tests {
                                 scanned_files: usize::MAX,
                                 semantic_noops: usize::MAX,
                                 sampled_acquisition: Some(max_read_counts()),
+                                full_causes: Default::default(),
                             },
                         );
                     }
@@ -1904,6 +2887,7 @@ mod tests {
                     scanned_files: usize::MAX,
                     semantic_noops: usize::MAX,
                     sampled_acquisition: Some(max_read_counts()),
+                    full_causes: Default::default(),
                 },
             );
             source_finish("secret/path/provider", || Ok(())).unwrap();
@@ -1954,4 +2938,179 @@ mod tests {
             assert_eq!(record["schema_version"], SCHEMA_VERSION);
         }
     }
+}
+#[cfg(test)]
+mod continuation_tests {
+    #[test]
+    fn continuation_mint_counts_have_closed_fixed_keys() {
+        let outcomes = [
+            "minted",
+            "inventory_incomplete",
+            "groups_completed",
+            "no_remaining",
+            "over_bound",
+        ];
+        let (_, rows) = super::capture(|| {
+            for outcome in outcomes {
+                super::codex_continuation_mint(outcome);
+            }
+        });
+        assert_eq!(rows.len(), outcomes.len());
+        for (row, outcome) in rows.iter().zip(outcomes) {
+            assert_eq!(row["stage"], "codex_continuation_mint");
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["source"], "codex");
+            assert_eq!(
+                row["counts"],
+                serde_json::json!({"continuation_mint":{outcome:1}})
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_counts_use_fixed_point_schema() {
+        let (_, rows) = super::capture(|| {
+            super::codex_continuation(None);
+            for cause in [
+                "roster_changed",
+                "context_changed",
+                "policy_changed",
+                "group_job",
+                "other",
+            ] {
+                super::codex_continuation(Some(cause));
+            }
+        });
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[0]["counts"]["continuation_pages_run"], 1);
+        assert_eq!(
+            rows[0]["counts"]["continuation_held"],
+            serde_json::json!({})
+        );
+        for row in rows {
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["source"], "codex");
+            assert_eq!(row["stage"], "codex_continuation");
+            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
+            assert_eq!(row["counts"].as_object().unwrap().len(), 2);
+            assert!(
+                row["counts"]["continuation_held"]
+                    .as_object()
+                    .unwrap()
+                    .len()
+                    <= 1
+            );
+        }
+    }
+}
+
+/// Fixed low-cardinality storage observations on the existing #799 envelope.
+pub(crate) fn scan_index_storage(
+    source: &'static str,
+    orphans: u64,
+    reserved: u64,
+    unavailable: [[u64; 6]; 3],
+) {
+    #[cfg(test)]
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| v.borrow_mut().push((orphans, unavailable, reserved)));
+
+    static TOTAL_ORPHANS: AtomicU64 = AtomicU64::new(0);
+    static ROOT_MISSING_RESERVED_ONLY: AtomicU64 = AtomicU64::new(0);
+    static UNAVAILABLE: [[AtomicU64; 6]; 3] = [const { [const { AtomicU64::new(0) }; 6] }; 3];
+    let add = |counter: &AtomicU64, n: u64| {
+        counter
+            .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(n)))
+            .unwrap_or_else(|v| v)
+            .saturating_add(n)
+    };
+    let reserved_total = add(&ROOT_MISSING_RESERVED_ONLY, reserved);
+    if reserved != 0 {
+        traversal_point(
+            "scan_index_storage",
+            source,
+            &BTreeMap::from([("root_missing_reserved_only", reserved_total)]),
+        );
+    }
+    let total = add(&TOTAL_ORPHANS, orphans);
+    for (map, counts) in unavailable.into_iter().enumerate() {
+        for (cause, n) in counts.into_iter().enumerate() {
+            let count = add(&UNAVAILABLE[map][cause], n);
+            if n != 0 {
+                traversal_point(
+                    "scan_index_storage",
+                    source,
+                    &serde_json::json!({"index_shard_unavailable": {"map": (["account_pending", "usage_pending", "request_census"][map]), "cause": ([crate::snapshots::scan_index_persistence::UnavailableCause::Missing, crate::snapshots::scan_index_persistence::UnavailableCause::Generation, crate::snapshots::scan_index_persistence::UnavailableCause::Digest, crate::snapshots::scan_index_persistence::UnavailableCause::Decode, crate::snapshots::scan_index_persistence::UnavailableCause::Descriptor, crate::snapshots::scan_index_persistence::UnavailableCause::Unsafe][cause].label()), "count": count}}),
+                );
+            }
+        }
+    }
+    if orphans != 0 {
+        traversal_point(
+            "scan_index_storage",
+            source,
+            &BTreeMap::from([("scanindex_orphan_init_discarded", total)]),
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN_INDEX_STORAGE_OBSERVATIONS: std::cell::RefCell<Vec<StorageReadObservation>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+pub(crate) fn take_scan_index_storage_observations() -> Vec<StorageReadObservation> {
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+#[cfg(test)]
+type StorageReadObservation = (u64, [[u64; 6]; 3], u64);
+
+/// One content-free alarm on entry to a shard-unavailable source episode.
+pub(crate) fn scan_index_shard_alarm(source: &'static str, unavailable: usize, transitions: u64) {
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "index_shard_unavailable_alarm": 1,
+            "unavailable_maps": unavailable,
+            "blocked_sources": 1,
+            "transitions": transitions,
+        }),
+    );
+}
+pub(crate) fn scan_index_manifest_refused(source: &'static str) {
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    let count = TOTAL
+        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .unwrap_or_else(|v| v)
+        .saturating_add(1);
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "scanindex_manifest_unavailable_refused": count,
+        }),
+    );
+}
+
+/// Per-refused-load counter, independent of the repair blocker's episode alarm.
+/// Only fixed causes and numeric counts; never include the originating error.
+pub(crate) fn scan_index_repair_required(
+    source: &str,
+    cause: crate::snapshots::scan_index_health::RepairCause,
+) {
+    static TOTALS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let count = TOTALS[cause as usize]
+        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .unwrap_or_else(|v| v)
+        .saturating_add(1);
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "scan_index_repair_required": {
+                "cause": cause.label(), "delta": 1, "count": count,
+            },
+        }),
+    );
 }

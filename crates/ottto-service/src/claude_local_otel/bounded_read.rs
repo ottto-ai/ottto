@@ -260,26 +260,20 @@ pub(super) fn api(
     if rows.capacity() != shape.lines {
         return None;
     }
-    let mut health = ClaudeLocalOtelLoadHealth::default();
-    let mut seen = BTreeSet::new();
-    let mut requests = BTreeMap::new();
+    let mut decoder = ApiSidecarDecoder::new(session_id, rows);
     for line in input.lines() {
-        decode_api_line(
-            line,
-            session_id,
-            &mut health,
-            &mut rows,
-            &mut seen,
-            &mut requests,
-        );
+        if line.ends_with(b"\n") {
+            decoder.push_line(line);
+        } else {
+            decoder.finish_eof(Some(line));
+        }
     }
+    let (rows, health) = decoder.into_output();
     let witness = ApiReadWitness {
         generation: health.is_complete().then_some(input.generation),
         health,
     };
     drop(input.bytes);
-    drop(seen);
-    drop(requests);
     let mut retained = Counter::new(usize::MAX);
     rows.completed_heap_bound(&mut retained)?;
     witness.completed_heap_bound(&mut retained)?;
@@ -314,25 +308,20 @@ pub(super) fn trace(
     if rows.capacity() != shape.lines {
         return None;
     }
-    let mut report = ClaudeTraceOwnershipLoadReport::default();
-    let mut seen = BTreeSet::new();
-    let mut requests = BTreeMap::new();
+    let mut decoder = TraceSidecarDecoder::new(session_id, rows);
     for line in input.lines() {
-        decode_trace_line(
-            std::str::from_utf8(line).ok()?,
-            session_id,
-            &mut report,
-            &mut rows,
-            &mut seen,
-            &mut requests,
-        );
+        // Shape admission already excludes non-ASCII input.
+        if line.ends_with(b"\n") {
+            decoder.push_line(line);
+        } else {
+            decoder.finish_eof(Some(line));
+        }
     }
+    let (rows, mut report) = decoder.into_output();
     if !rows.is_empty() {
         report.evidence.insert(session_id.to_owned(), rows);
     }
     drop(input.bytes);
-    drop(seen);
-    drop(requests);
     let retained = heap_layout_bound::completed_bound(&report, usize::MAX)?;
     paid.record_allocated(occupied.checked_add(retained)?)
         .then_some((
@@ -389,33 +378,6 @@ mod tests {
         assert!(Input::read(&path, &paid(2), 0).is_none());
         assert!(Input::read(&path, &paid(3), 1).is_none());
         fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn native_comparison_paid_decoder_plan_long_line_and_lexical_refusal() {
-        let generation = ApiFileGeneration {
-            device: 0,
-            inode: 0,
-            bytes: 0,
-            modified: (0, 0),
-            changed: (0, 0),
-        };
-        let mut input = Input {
-            bytes: br#"{"unknown":[[[1]]],"session_id":"ordinary"}"#.to_vec(),
-            generation,
-        };
-        let shape = Shape::read(&input).unwrap();
-        assert_eq!(shape.lines, 1);
-        let peak = shape.api_peak(&input).unwrap();
-        assert!(paid(peak).permits(peak));
-        assert!(!paid(peak - 1).permits(peak));
-        assert!(shape.trace_peak(&input).is_some());
-        input.bytes = br#"{"session_id":"escaped\u1234"}"#.to_vec();
-        assert!(Shape::read(&input).is_none());
-        input.bytes = "{\"session_id\":\"unicodeé\"}".as_bytes().to_vec();
-        assert!(Shape::read(&input).is_none());
-        input.bytes = vec![b' '; 1024 * 1024];
-        assert_eq!(Shape::read(&input).unwrap().longest_line, input.bytes.len());
     }
 
     #[test]

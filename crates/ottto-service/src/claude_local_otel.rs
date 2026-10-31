@@ -28,6 +28,13 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub(crate) mod support_health;
 
 mod bounded_read;
+#[cfg(test)]
+mod decoder_tests;
+pub(crate) mod strict_budget;
+#[cfg(test)]
+mod strict_budget_tests;
+#[cfg(test)]
+mod trace_read_bound_tests;
 
 pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
@@ -148,13 +155,7 @@ impl std::fmt::Debug for FingerprintCheck {
     }
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for FingerprintCheck {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; FingerprintCheck);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeRequestIdentityEvidence {
@@ -341,6 +342,32 @@ pub struct ClaudeTraceOwnershipLoadReport {
     pub invalid_session_rows: u64,
     pub missing_request_ids: u64,
     pub conflicting_request_ids: BTreeSet<String>,
+    pub rows_discarded: ClaudeTraceRowsDiscarded,
+}
+
+/// Strict trace reads whose decoded rows were dropped, by reason. Each such
+/// read also counts as an oversized file, so the report is never complete.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ClaudeTraceRowsDiscarded {
+    /// Reads that found bytes past the opened length (the file grew).
+    pub cap: u64,
+    /// Reads whose opened file or path changed generation while read.
+    pub generation: u64,
+    pub cap_rows: u64,
+    pub generation_rows: u64,
+}
+
+impl ClaudeTraceRowsDiscarded {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.cap += other.cap;
+        self.generation += other.generation;
+        self.cap_rows += other.cap_rows;
+        self.generation_rows += other.generation_rows;
+    }
 }
 
 impl ClaudeTraceOwnershipLoadReport {
@@ -634,6 +661,41 @@ fn identity_upgrade_replay(
     previous.request_identity = None;
     incoming.request_identity = None;
     previous == incoming
+}
+
+/// Cumulative arrival-order API projection. Keep even suppressed fingerprints:
+/// rebuilding `seen_fingerprints` from surviving rows changes replay semantics.
+#[cfg_attr(test, derive(Debug, Clone, PartialEq, Eq))]
+struct ApiSidecarDecoder<'a> {
+    session_id: &'a str,
+    rows: Vec<ClaudeLocalOtelEvidence>,
+    seen_fingerprints: BTreeSet<String>,
+    request_rows: BTreeMap<String, usize>,
+    health: ClaudeLocalOtelLoadHealth,
+}
+
+impl<'a> ApiSidecarDecoder<'a> {
+    fn new(session_id: &'a str, rows: Vec<ClaudeLocalOtelEvidence>) -> Self {
+        Self {
+            session_id,
+            rows,
+            seen_fingerprints: BTreeSet::new(),
+            request_rows: BTreeMap::new(),
+            health: ClaudeLocalOtelLoadHealth::default(),
+        }
+    }
+
+    // EOF is terminal for this view; callers retain only complete-line state
+    // when they need to extend a previously observed fragment.
+    fn finish_eof(&mut self, fragment: Option<&[u8]>) {
+        if let Some(fragment) = fragment {
+            self.push_line(fragment);
+        }
+    }
+
+    fn into_output(self) -> (Vec<ClaudeLocalOtelEvidence>, ClaudeLocalOtelLoadHealth) {
+        (self.rows, self.health)
+    }
 }
 
 /// Append one distinct request row; report a same-request fingerprint conflict.
@@ -1030,6 +1092,15 @@ fn decode_api_sidecar(
     support_dir: &Path,
     session_id: &str,
 ) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
+    // ON charges the pass-local strict allowance; OFF keeps the fixed cap.
+    let terminal_off = crate::snapshots::claude_terminal_off();
+    let cap = || {
+        if terminal_off {
+            strict_budget::allowance()
+        } else {
+            MAX_EVIDENCE_FILE_BYTES
+        }
+    };
     let path = evidence_path(support_dir, session_id);
     let mut health = ClaudeLocalOtelLoadHealth::default();
     let empty = |health| {
@@ -1056,7 +1127,7 @@ fn decode_api_sidecar(
     if !metadata.is_file() {
         anyhow::bail!("Claude effort evidence is not a regular file");
     }
-    if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+    if metadata.len() >= cap() {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1087,21 +1158,30 @@ fn decode_api_sidecar(
     if !opened.is_file() {
         anyhow::bail!("opened Claude effort evidence is not a regular file");
     }
-    if opened.len() >= MAX_EVIDENCE_FILE_BYTES {
+    if opened.len() >= cap() {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
     let before_opened = api_file_generation(&opened);
     // A concurrent writer must not defeat the existing per-file read bound.
-    let mut reader = BufReader::new((&file).take(MAX_EVIDENCE_FILE_BYTES));
-    let (rows, bytes) = decode_api_rows(&mut reader, session_id, &mut health);
+    let limit = if terminal_off {
+        cap().min(opened.len().saturating_add(1))
+    } else {
+        MAX_EVIDENCE_FILE_BYTES
+    };
+    let mut reader = BufReader::new((&file).take(limit));
+    let (rows, mut bytes) = decode_api_rows(&mut reader, session_id, &mut health);
+    if terminal_off {
+        bytes = limit - reader.get_ref().limit();
+        strict_budget::consumed(bytes);
+    }
     #[cfg(test)]
     API_AFTER_READ.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook(&path);
         }
     });
-    if bytes >= MAX_EVIDENCE_FILE_BYTES {
+    if bytes >= limit {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1131,9 +1211,8 @@ fn decode_api_rows(
     session_id: &str,
     health: &mut ClaudeLocalOtelLoadHealth,
 ) -> (Vec<ClaudeLocalOtelEvidence>, u64) {
-    let mut seen = BTreeSet::new();
-    let mut request_rows = BTreeMap::new();
-    let mut rows = Vec::new();
+    let mut decoder = ApiSidecarDecoder::new(session_id, Vec::new());
+    decoder.health = std::mem::take(health);
     let mut line = Vec::new();
     let mut bytes = 0;
     loop {
@@ -1149,54 +1228,66 @@ fn decode_api_rows(
                 });
             }
             Err(_) => {
-                health.unreadable_lines += 1;
+                decoder.health.unreadable_lines += 1;
                 break;
             }
         }
-        decode_api_line(
-            &line,
-            session_id,
-            health,
-            &mut rows,
-            &mut seen,
-            &mut request_rows,
-        );
+        if line.ends_with(b"\n") {
+            decoder.push_line(&line);
+        } else {
+            decoder.finish_eof(Some(&line));
+        }
     }
+    let (rows, decoded_health) = decoder.into_output();
+    *health = decoded_health;
     (rows, bytes)
 }
 
-// Shared canonical row decoder: the optional paid-input path only controls
-// storage/capacity; identity, validation and conflict decisions stay here.
-fn decode_api_line(
-    line: &[u8],
-    session_id: &str,
-    health: &mut ClaudeLocalOtelLoadHealth,
-    rows: &mut Vec<ClaudeLocalOtelEvidence>,
-    seen: &mut BTreeSet<String>,
-    request_rows: &mut BTreeMap<String, usize>,
-) {
-    let Ok(line) = std::str::from_utf8(line) else {
-        health.unreadable_lines += 1;
-        return;
-    };
-    let item = match serde_json::from_str::<ClaudeLocalOtelEvidence>(line) {
-        Ok(item) => item,
-        Err(_) => {
-            health.malformed_lines += 1;
+// Both whole-file and paid-input readers use this same state transition.
+impl ApiSidecarDecoder<'_> {
+    fn push_line(&mut self, line: &[u8]) {
+        let Ok(line) = std::str::from_utf8(line) else {
+            self.health.unreadable_lines += 1;
+            return;
+        };
+        let item = match serde_json::from_str::<ClaudeLocalOtelEvidence>(line) {
+            Ok(item) => item,
+            Err(_) => {
+                self.health.malformed_lines += 1;
+                return;
+            }
+        };
+        if item.session_id != self.session_id {
+            self.health.invalid_session_rows += 1;
             return;
         }
-    };
-    if item.session_id != session_id {
-        health.invalid_session_rows += 1;
-        return;
+        if item.request_id.is_empty() {
+            self.health.missing_request_ids += 1;
+        }
+        let request_id = item.request_id.clone();
+        if append_request_evidence(
+            &mut self.rows,
+            &mut self.seen_fingerprints,
+            &mut self.request_rows,
+            item,
+        ) {
+            self.health.conflicting_request_ids.insert(request_id);
+        }
     }
-    if item.request_id.is_empty() {
-        health.missing_request_ids += 1;
-    }
-    let request_id = item.request_id.clone();
-    if append_request_evidence(rows, seen, request_rows, item) {
-        health.conflicting_request_ids.insert(request_id);
-    }
+}
+
+/// Metadata-only pre-I/O charge, including an EOF/growth sentinel per file.
+pub(crate) fn strict_cohort_bytes(support_dir: &Path, root: &str) -> u64 {
+    [
+        evidence_path(support_dir, root),
+        trace_evidence_path(support_dir, root),
+    ]
+    .iter()
+    .fold(0u64, |sum, path| {
+        sum.saturating_add(
+            fs::metadata(path).map_or(MAX_EVIDENCE_FILE_BYTES, |m| m.len().saturating_add(1)),
+        )
+    })
 }
 
 pub fn load_claude_trace_ownership_evidence(
@@ -1221,36 +1312,82 @@ pub fn load_claude_trace_ownership_evidence(
             report.unreadable_lines += 1;
             continue;
         }
-        if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+        if metadata.len() >= strict_budget::allowance() {
             report.oversized_files += 1;
             continue;
         }
-        let Ok(file) = File::open(&path) else {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // A stat/open race to a FIFO must refuse without blocking at open.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let Ok(file) = options.open(&path) else {
             report.unreadable_lines += 1;
             continue;
         };
         #[cfg(test)]
         TRACE_READ_RECEIPT.with(|count| count.set(count.get() + 1));
-        let mut seen_fingerprints = BTreeSet::new();
-        let mut request_fingerprints = BTreeMap::<String, String>::new();
-        let mut rows = Vec::new();
-        for line in BufReader::new(file).lines() {
+        let Ok(opened) = file.metadata() else {
+            report.unreadable_lines += 1;
+            continue;
+        };
+        if !opened.is_file() || opened.len() >= strict_budget::allowance() {
+            report.oversized_files += 1;
+            continue;
+        }
+        // A concurrent writer must not extend the read past the opened
+        // length; one extra byte is the growth sentinel.
+        let limit = strict_budget::allowance().min(opened.len().saturating_add(1));
+        #[cfg(test)]
+        TRACE_BEFORE_READ.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(&path);
+            }
+        });
+        let mut reader = BufReader::new((&file).take(limit));
+        let mut decoder = TraceSidecarDecoder::new(&session_id, Vec::new());
+        decoder.report = report;
+        for line in reader.by_ref().lines() {
             let line = match line {
                 Ok(line) => line,
                 Err(_) => {
-                    report.unreadable_lines += 1;
+                    decoder.report.unreadable_lines += 1;
                     continue;
                 }
             };
-            decode_trace_line(
-                &line,
-                &session_id,
-                &mut report,
-                &mut rows,
-                &mut seen_fingerprints,
-                &mut request_fingerprints,
-            );
+            decoder.push_line(line.as_bytes());
         }
+        let bytes = limit - reader.get_ref().limit();
+        strict_budget::consumed(bytes);
+        #[cfg(test)]
+        TRACE_BYTES_FOR_TEST.with(|count| count.set(count.get() + bytes));
+        let generation = api_file_generation(&opened);
+        let unchanged = file.metadata().ok().and_then(|m| api_file_generation(&m)) == generation
+            && fs::metadata(&path)
+                .ok()
+                .and_then(|m| api_file_generation(&m))
+                == generation;
+        // A grown or replaced file is neither complete evidence nor a
+        // trustworthy prefix: drop its rows and fail the read's health.
+        if bytes >= limit || !unchanged {
+            let rows = decoder.rows.len() as u64;
+            let discarded = &mut decoder.report.rows_discarded;
+            if bytes >= limit {
+                discarded.cap += 1;
+                discarded.cap_rows += rows;
+            } else {
+                discarded.generation += 1;
+                discarded.generation_rows += rows;
+            }
+            decoder.rows.clear();
+            decoder.report.oversized_files += 1;
+        }
+        decoder.finish_eof(None);
+        let (rows, decoded_report) = decoder.into_output();
+        report = decoded_report;
         if !rows.is_empty() {
             report.evidence.insert(session_id, rows);
         }
@@ -1258,43 +1395,92 @@ pub fn load_claude_trace_ownership_evidence(
     report
 }
 
-fn decode_trace_line(
-    line: &str,
-    session_id: &str,
-    report: &mut ClaudeTraceOwnershipLoadReport,
-    rows: &mut Vec<ClaudeTraceOwnershipEvidence>,
-    seen_fingerprints: &mut BTreeSet<String>,
-    request_fingerprints: &mut BTreeMap<String, String>,
-) {
-    let item = match serde_json::from_str::<ClaudeTraceOwnershipEvidence>(line) {
-        Ok(item) => item,
-        Err(_) => {
-            report.malformed_lines += 1;
+/// Trace conflicts track the last export even when its fingerprint was seen.
+#[cfg_attr(test, derive(Debug, Clone, PartialEq, Eq))]
+struct TraceSidecarDecoder<'a> {
+    session_id: &'a str,
+    rows: Vec<ClaudeTraceOwnershipEvidence>,
+    seen_fingerprints: BTreeSet<String>,
+    request_fingerprints: BTreeMap<String, String>,
+    report: ClaudeTraceOwnershipLoadReport,
+}
+
+impl<'a> TraceSidecarDecoder<'a> {
+    fn new(session_id: &'a str, rows: Vec<ClaudeTraceOwnershipEvidence>) -> Self {
+        Self {
+            session_id,
+            rows,
+            seen_fingerprints: BTreeSet::new(),
+            request_fingerprints: BTreeMap::new(),
+            report: ClaudeTraceOwnershipLoadReport::default(),
+        }
+    }
+
+    fn finish_eof(&mut self, fragment: Option<&[u8]>) {
+        if let Some(fragment) = fragment {
+            self.push_line(fragment);
+        }
+    }
+
+    fn into_output(
+        self,
+    ) -> (
+        Vec<ClaudeTraceOwnershipEvidence>,
+        ClaudeTraceOwnershipLoadReport,
+    ) {
+        (self.rows, self.report)
+    }
+
+    fn push_line(&mut self, line: &[u8]) {
+        let Ok(line) = std::str::from_utf8(line) else {
+            self.report.unreadable_lines += 1;
+            return;
+        };
+        let item = match serde_json::from_str::<ClaudeTraceOwnershipEvidence>(line) {
+            Ok(item) => item,
+            Err(_) => {
+                self.report.malformed_lines += 1;
+                return;
+            }
+        };
+        if item.session_id != self.session_id {
+            self.report.invalid_session_rows += 1;
             return;
         }
-    };
-    if item.session_id != session_id {
-        report.invalid_session_rows += 1;
-        return;
-    }
-    if item.request_id.is_empty() {
-        report.missing_request_ids += 1;
-    } else if let Some(previous) =
-        request_fingerprints.insert(item.request_id.clone(), item.fingerprint.clone())
-    {
-        if previous != item.fingerprint {
-            report
-                .conflicting_request_ids
-                .insert(item.request_id.clone());
+        if item.request_id.is_empty() {
+            self.report.missing_request_ids += 1;
+        } else if let Some(previous) = self
+            .request_fingerprints
+            .insert(item.request_id.clone(), item.fingerprint.clone())
+        {
+            if previous != item.fingerprint {
+                self.report
+                    .conflicting_request_ids
+                    .insert(item.request_id.clone());
+            }
         }
-    }
-    if seen_fingerprints.insert(item.fingerprint.clone()) {
-        rows.push(item);
+        if self.seen_fingerprints.insert(item.fingerprint.clone()) {
+            self.rows.push(item);
+        }
     }
 }
 
 #[cfg(test)]
-thread_local! { static TRACE_READ_RECEIPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+type TraceBeforeReadHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+thread_local! {
+    static TRACE_BYTES_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TRACE_BEFORE_READ: std::cell::RefCell<Option<TraceBeforeReadHook>> =
+        const { std::cell::RefCell::new(None) };
+    static TRACE_READ_RECEIPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `hook` once on this thread, after the next strict trace read opens
+/// its file and before it reads, to stage a concurrent writer.
+#[cfg(test)]
+pub(crate) fn before_next_trace_read_for_test(hook: impl FnOnce(&Path) + 'static) {
+    TRACE_BEFORE_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
 
 #[cfg(test)]
 pub(crate) fn reset_evidence_read_counts_for_test() {
@@ -1401,6 +1587,26 @@ pub(crate) fn claude_sidecars_absent(support_dir: &Path, session_id: &str) -> bo
     .all(|path| {
         fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
     })
+}
+
+/// Counter label for a root whose sidecars do not pair: how many members are
+/// oversized and how many unreadable, by metadata only. A missing one is neither.
+pub(crate) fn claude_sidecar_pair_faults(support_dir: &Path, session_id: &str) -> (u64, u64) {
+    let mut faults = (0, 0);
+    for path in [
+        evidence_path(support_dir, session_id),
+        trace_evidence_path(support_dir, session_id),
+    ] {
+        match fs::metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(metadata) if metadata.is_file() && metadata.len() >= MAX_EVIDENCE_FILE_BYTES => {
+                faults.0 += 1;
+            }
+            Ok(metadata) if metadata.is_file() => {}
+            _ => faults.1 += 1,
+        }
+    }
+    faults
 }
 
 pub fn claude_trace_ownership_sidecar_fingerprint(support_dir: &Path, session_id: &str) -> String {
@@ -1944,31 +2150,6 @@ mod otlp_proto {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn append_capture_success_requires_complete_write_below_strict_cap() {
-        let row = b"{\"synthetic\":true}\n";
-        for (before, writes, succeeds) in [
-            (MAX_EVIDENCE_FILE_BYTES - row.len() as u64 - 1, true, true),
-            (MAX_EVIDENCE_FILE_BYTES - row.len() as u64, true, false),
-            (MAX_EVIDENCE_FILE_BYTES - 1, true, false),
-            (MAX_EVIDENCE_FILE_BYTES, false, false),
-            (MAX_EVIDENCE_FILE_BYTES + 1, false, false),
-        ] {
-            let mut output = Vec::new();
-            let result = append_evidence_bytes(&mut output, before, row);
-            assert_eq!(result.is_ok(), succeeds, "before={before}");
-            assert_eq!(output.as_slice(), if writes { row.as_slice() } else { &[] });
-            if writes && !succeeds {
-                // Retry at the persisted boundary must refuse without another
-                // duplicate append.
-                let size = output.len();
-                assert!(
-                    append_evidence_bytes(&mut output, before + row.len() as u64, row).is_err()
-                );
-                assert_eq!(output.len(), size);
-            }
-        }
-    }
 
     #[test]
     fn append_partial_and_zero_byte_write_errors_never_report_capture_success() {
@@ -2226,112 +2407,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_api_log_clock_both_absent_never_create_epoch_evidence() {
-        assert!(
-            clock_test_protobuf(0, 0).is_empty(),
-            "protobuf zero is absent, not epoch"
-        );
-        for event in [
-            None,
-            Some(serde_json::json!("0")),
-            Some(serde_json::json!(0)),
-            Some(Value::Null),
-        ] {
-            for observed in [
-                None,
-                Some(serde_json::json!("0")),
-                Some(serde_json::json!(0)),
-                Some(Value::Null),
-            ] {
-                assert!(
-                    clock_test_json(event.clone(), observed.clone()).is_empty(),
-                    "event={event:?}, observed={observed:?}: no usable clock"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn claude_api_log_clock_real_event_wins_even_next_to_epoch() {
-        let observed = 1_783_728_000_000_000_000_u64;
-        for event in [1_u64, observed - 1, u64::MAX] {
-            let expected = clock_test_protobuf(event, observed);
-            assert_eq!(expected.len(), 1);
-            for raw in [
-                serde_json::json!(event.to_string()),
-                serde_json::json!(event),
-            ] {
-                assert_eq!(
-                    clock_test_json(Some(raw), Some(serde_json::json!(observed.to_string()))),
-                    expected
-                );
-            }
-            assert_ne!(expected[0].observed_at, "2026-07-11T00:00:00Z");
-        }
-        assert_eq!(
-            clock_test_protobuf(1, observed)[0].observed_at,
-            "1970-01-01T00:00:00.000000001Z",
-            "only zero is absence; genuine positive instants are preserved"
-        );
-    }
-
-    #[test]
-    fn request_pair_malformed_json_identity_preserves_presence_both_origins() {
-        for key in ["user.account_uuid", "organization.id"] {
-            for malformed in [
-                serde_json::json!({"arrayValue":{"values":[]}}),
-                serde_json::json!({"kvlistValue":{"values":[]}}),
-                serde_json::json!({"bytesValue":"AA=="}),
-                serde_json::json!({}),
-                serde_json::Value::Null,
-            ] {
-                for resource_invalid in [false, true] {
-                    let mut payload: Value = serde_json::from_slice(&identity_json(
-                        &[
-                            ("user.account_uuid", ACCOUNT),
-                            ("organization.id", ORGANIZATION),
-                        ],
-                        &[
-                            ("user.account_uuid", ACCOUNT),
-                            ("organization.id", ORGANIZATION),
-                        ],
-                    ))
-                    .unwrap();
-                    let pointer = if resource_invalid {
-                        "/resourceLogs/0/resource/attributes"
-                    } else {
-                        "/resourceLogs/0/scopeLogs/0/logRecords/0/attributes"
-                    };
-                    let items = payload
-                        .pointer_mut(pointer)
-                        .unwrap()
-                        .as_array_mut()
-                        .unwrap();
-                    let item = items.iter_mut().find(|item| item["key"] == key).unwrap();
-                    item["value"] = malformed.clone();
-                    let row = api_evidence_from_json(&serde_json::to_vec(&payload).unwrap())
-                        .unwrap()
-                        .remove(0);
-                    let pair = row.request_identity.as_ref().unwrap();
-                    let attribute = if key == "user.account_uuid" {
-                        &pair.account
-                    } else {
-                        &pair.organization
-                    };
-                    assert_eq!(
-                        attribute.origin,
-                        ClaudeIdentityAttributeOrigin::ResourceAndLogRecord
-                    );
-                    assert_eq!(attribute.disposition, ClaudeIdentityDisposition::Invalid);
-                    assert_eq!(pair.disposition, ClaudeIdentityDisposition::Invalid);
-                    assert_eq!(row.input_tokens, 12);
-                    assert_eq!(row.output_tokens, 3);
-                }
-            }
-        }
-    }
-
-    #[test]
     fn request_pair_malformed_protobuf_identity_preserves_presence_both_origins() {
         use otlp_proto::any_value::Value as ProtoValue;
         for key in ["user.account_uuid", "organization.id"] {
@@ -2537,96 +2612,6 @@ mod tests {
     }
 
     #[test]
-    fn request_pair_protobuf_retains_resource_and_record_origins_and_conflict() {
-        for resource_org in [ORGANIZATION, OTHER_ORGANIZATION] {
-            let body = otlp_proto::ExportLogsServiceRequest {
-                resource_logs: vec![otlp_proto::ResourceLogs {
-                    resource: Some(otlp_proto::Resource {
-                        attributes: vec![
-                            proto_string("user.account_uuid", ACCOUNT),
-                            proto_string("organization.id", resource_org),
-                        ],
-                    }),
-                    scope_logs: vec![otlp_proto::ScopeLogs {
-                        log_records: vec![otlp_proto::LogRecord {
-                            time_unix_nano: 1_783_728_000_000_000_000,
-                            observed_time_unix_nano: 0,
-                            body: Some(otlp_proto::AnyValue {
-                                value: Some(otlp_proto::any_value::Value::StringValue(
-                                    "claude_code.api_request".into(),
-                                )),
-                            }),
-                            attributes: vec![
-                                proto_string("session.id", "identity-session"),
-                                proto_string("request_id", "identity-request"),
-                                proto_string("model", "claude-test"),
-                                proto_string("organization.id", ORGANIZATION),
-                                proto_string("input_tokens", "12"),
-                            ],
-                        }],
-                    }],
-                }],
-            }
-            .encode_to_vec();
-            let row = api_evidence_from_protobuf(&body).unwrap().remove(0);
-            let pair = row.request_identity.unwrap();
-            assert_eq!(pair.account.origin, ClaudeIdentityAttributeOrigin::Resource);
-            assert_eq!(
-                pair.organization.origin,
-                ClaudeIdentityAttributeOrigin::ResourceAndLogRecord
-            );
-            assert_eq!(
-                pair.disposition,
-                if resource_org == ORGANIZATION {
-                    ClaudeIdentityDisposition::Complete
-                } else {
-                    ClaudeIdentityDisposition::Conflict
-                }
-            );
-            assert_eq!(row.input_tokens, 12);
-        }
-    }
-
-    #[test]
-    fn request_pair_changes_sidecar_fingerprint_and_strict_request_conflict() {
-        let dir = std::env::temp_dir().join(format!("ottto-org-conflict-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        for organization in [ORGANIZATION, ORGANIZATION, OTHER_ORGANIZATION] {
-            capture_claude_api_request_logs(
-                &dir,
-                &identity_json(
-                    &[],
-                    &[
-                        ("user.account_uuid", ACCOUNT),
-                        ("organization.id", organization),
-                    ],
-                ),
-                "application/json",
-            )
-            .unwrap();
-        }
-        let report =
-            load_claude_api_request_evidence_report(&dir, ["identity-session".to_string()]);
-        let rows = &report.evidence["identity-session"];
-        assert_eq!(rows.len(), 2);
-        assert_ne!(rows[0].fingerprint, rows[1].fingerprint);
-        assert_ne!(
-            serde_json::to_vec(&rows[0]).unwrap(),
-            serde_json::to_vec(&rows[1]).unwrap()
-        );
-        assert_eq!(
-            report.health.conflicting_request_ids,
-            BTreeSet::from(["identity-request".to_string()])
-        );
-        assert!(!report.health.is_complete());
-        let bytes = fs::read_to_string(evidence_path(&dir, "identity-session")).unwrap();
-        for raw in [ACCOUNT, ORGANIZATION, OTHER_ORGANIZATION] {
-            assert!(!bytes.contains(raw));
-        }
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn request_pair_legacy_omission_is_neutral_and_byte_preserved() {
         let row = api_evidence_from_json(&identity_json(&[], &[("user.account_uuid", ACCOUNT)]))
             .unwrap()
@@ -2767,6 +2752,10 @@ mod tests {
                 BTreeSet::from(["identity-request".into()])
             );
             assert_eq!(report.evidence["identity-session"].len(), 2);
+            let persisted = fs::read_to_string(evidence_path(&dir, "identity-session")).unwrap();
+            for raw in [ACCOUNT, ORGANIZATION, OTHER_ORGANIZATION] {
+                assert!(!persisted.contains(raw));
+            }
         }
         let _ = fs::remove_dir_all(dir);
     }
@@ -3057,45 +3046,6 @@ mod tests {
             first_decimal_usd_micros(&attrs, &["carry"]),
             Some(2_000_000)
         );
-    }
-
-    #[test]
-    fn strict_api_request_loader_reports_malformed_oversized_and_conflicting_rows() {
-        let dir = std::env::temp_dir().join(format!("ottto-log-health-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        capture_claude_api_request_logs(&dir, parent_and_subagent_body(), "application/json")
-            .unwrap();
-        let mut conflicting: ClaudeLocalOtelEvidence =
-            load_claude_effort_evidence(&dir, ["sess-mixed".to_string()]).unwrap()["sess-mixed"][0]
-                .clone();
-        conflicting.model = "different-model".to_string();
-        conflicting.fingerprint = "different".to_string();
-        append_evidence(&dir, &conflicting).unwrap();
-        let path = evidence_path(&dir, "sess-mixed");
-        let mut options = OpenOptions::new();
-        options.append(true);
-        options
-            .open(&path)
-            .unwrap()
-            .write_all(b"not json\n")
-            .unwrap();
-        let report = load_claude_api_request_evidence_report(&dir, ["sess-mixed".to_string()]);
-        assert_eq!(report.health.malformed_lines, 1);
-        assert!(report.health.conflicting_request_ids.contains("req_PARENT"));
-        assert!(!report.health.is_complete());
-
-        let oversized = evidence_path(&dir, "sess-oversized");
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&oversized)
-            .unwrap();
-        file.set_len(MAX_EVIDENCE_FILE_BYTES).unwrap();
-        let report = load_claude_api_request_evidence_report(&dir, ["sess-oversized".to_string()]);
-        assert_eq!(report.health.oversized_files, 1);
-        assert!(!report.health.is_complete());
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3398,66 +3348,6 @@ mod tests {
     }
 
     #[test]
-    fn native_comparison_lazy_final_cohort_moves_early_rows_and_loads_rest_once() {
-        let (dir, rows) = decode_reuse_fixture("lazy-cohort");
-        for row in &rows {
-            let mut later = row.clone();
-            later.session_id = "later-root".into();
-            append_evidence(&dir, &with_canonical_fingerprint(later)).unwrap();
-        }
-        let cohort = BTreeSet::from([
-            "sess-mixed".to_owned(),
-            "later-root".to_owned(),
-            "missing".to_owned(),
-        ]);
-        let expected = ClaudeApiEvidenceRead::load(&dir, cohort.clone()).unwrap();
-        reset_evidence_read_counts_for_test();
-        let mut early = ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into()]).unwrap();
-        let row_owner = early.evidence["sess-mixed"].as_ptr();
-        let final_read = early.complete_permissive(&dir, &cohort).unwrap();
-        assert_eq!(final_read.evidence, expected.evidence);
-        assert_eq!(final_read.evidence["sess-mixed"].as_ptr(), row_owner);
-        assert_eq!(
-            evidence_read_counts_for_test().0,
-            2,
-            "one early open + one remaining open; missing stays missing"
-        );
-        assert_eq!(final_read.reads["missing"].health.missing_files, 1);
-        assert!(final_read.reads["missing"].generation.is_none());
-        assert!(early.evidence.is_empty() && early.reads.is_empty());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn native_comparison_lazy_final_changed_input_and_open_failure_keep_base_veto() {
-        let (dir, rows) = decode_reuse_fixture("lazy-failures");
-        let cohort = BTreeSet::from(["sess-mixed".to_owned()]);
-        let mut early = ClaudeApiEvidenceRead::load(&dir, cohort.clone()).unwrap();
-        let mut changed = rows[0].clone();
-        changed.request_id = "new-request".into();
-        append_evidence(&dir, &with_canonical_fingerprint(changed)).unwrap();
-        reset_evidence_read_counts_for_test();
-        let completed = early.complete_permissive(&dir, &cohort).unwrap();
-        assert_eq!(
-            evidence_read_counts_for_test().0,
-            1,
-            "changed early generation must reread"
-        );
-        assert_eq!(completed.evidence["sess-mixed"].len(), 3);
-        let mut early = ClaudeApiEvidenceRead::load(&dir, cohort).unwrap();
-        let bad_path = evidence_path(&dir, "unreadable");
-        fs::create_dir(&bad_path).unwrap();
-        let cohort = BTreeSet::from(["sess-mixed".to_owned(), "unreadable".to_owned()]);
-        assert!(
-            early.complete_permissive(&dir, &cohort).is_err(),
-            "a missing early lookup is not a final health permit"
-        );
-        assert!(early.evidence.is_empty() && early.reads.is_empty());
-        assert!(ClaudeApiEvidenceRead::load(&dir, cohort).is_err());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn native_comparison_lazy_strict_only_early_root_never_expands_effort_cohort() {
         let (dir, rows) = decode_reuse_fixture("lazy-strict-only");
         for row in &rows {
@@ -3572,26 +3462,6 @@ mod tests {
             read.take_strict_report(&dir, "absent").health.missing_files,
             1
         );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sidecar_decode_reuse_releases_nonpaired_rows_and_moves_paired_allocation() {
-        let (dir, rows) = decode_reuse_fixture("allocation");
-        let mut extra = rows[0].clone();
-        extra.session_id = "effort-only".into();
-        append_evidence(&dir, &extra).unwrap();
-        let mut read =
-            ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into(), "effort-only".into()]).unwrap();
-        let allocation = read.evidence["sess-mixed"].as_ptr();
-        read.retain_roots(&BTreeSet::from(["sess-mixed".into()]));
-        assert_eq!(read.evidence.len(), 1);
-        assert_eq!(read.reads.len(), 1);
-        let report = read.take_strict_report(&dir, "sess-mixed");
-        assert_eq!(report.evidence["sess-mixed"].as_ptr(), allocation);
-        assert!(read.evidence.is_empty());
-        assert!(read.reads.is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3788,59 +3658,6 @@ mod tests {
             fs::remove_dir_all(dir).unwrap();
         }
     }
-
-    #[cfg(unix)]
-    #[test]
-    fn sidecar_decode_reuse_stat_open_races_refuse_cap_and_fifo() {
-        for change in ["cap", "fifo"] {
-            let (dir, _) = decode_reuse_fixture(change);
-            API_BEFORE_OPEN.with(|h| {
-                *h.borrow_mut() = Some(Box::new(move |path| {
-                    if change == "cap" {
-                        File::options()
-                            .write(true)
-                            .open(path)
-                            .unwrap()
-                            .set_len(MAX_EVIDENCE_FILE_BYTES)
-                            .unwrap();
-                    } else {
-                        use std::os::unix::ffi::OsStrExt;
-                        fs::remove_file(path).unwrap();
-                        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-                        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-                    }
-                }))
-            });
-            let report = load_claude_api_request_evidence_report(&dir, ["sess-mixed".into()]);
-            assert!(report.evidence.is_empty());
-            assert!(!report.health.is_complete());
-            if change == "cap" {
-                assert_eq!(report.health.oversized_files, 1);
-            } else {
-                assert_eq!(report.health.unreadable_lines, 1);
-            }
-            fs::remove_dir_all(dir).unwrap();
-        }
-    }
-    #[test]
-    fn sidecar_decode_reuse_same_label_fixtures_keep_independent_evidence() {
-        let (first, rows) = decode_reuse_fixture("cap");
-        let (second, _) = decode_reuse_fixture("cap");
-        File::options()
-            .write(true)
-            .open(evidence_path(&second, "sess-mixed"))
-            .unwrap()
-            .set_len(MAX_EVIDENCE_FILE_BYTES)
-            .unwrap();
-        let first_report = load_claude_api_request_evidence_report(&first, ["sess-mixed".into()]);
-        assert!(
-            first_report.health.is_complete(),
-            "a second fixture must not delete or truncate the first"
-        );
-        assert_eq!(first_report.evidence["sess-mixed"], rows);
-        fs::remove_dir_all(first).unwrap();
-        fs::remove_dir_all(second).unwrap();
-    }
 }
 
 crate::heap_layout_bound::fields!(ClaudeApiEvidenceRead; evidence, reads);
@@ -3852,7 +3669,8 @@ crate::heap_layout_bound::fields!(ClaudeLocalOtelEvidence; capture_revision, fin
 crate::heap_layout_bound::fields!(ClaudeRequestIdentityEvidence; identity_hash_scheme, account, organization, disposition);
 crate::heap_layout_bound::fields!(ClaudeIdentityAttributeEvidence; origin, disposition, resource_hash, log_record_hash);
 crate::heap_layout_bound::fields!(ClaudeTraceOwnershipEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, agent_id, parent_agent_id, workflow_run_id, observed_at);
-crate::heap_layout_bound::fields!(ClaudeTraceOwnershipLoadReport; evidence, missing_files, malformed_lines, unreadable_lines, oversized_files, invalid_session_rows, missing_request_ids, conflicting_request_ids);
+crate::heap_layout_bound::fields!(ClaudeTraceOwnershipLoadReport; evidence, missing_files, malformed_lines, unreadable_lines, oversized_files, invalid_session_rows, missing_request_ids, conflicting_request_ids, rows_discarded);
+crate::heap_layout_bound::fields!(ClaudeTraceRowsDiscarded; cap, generation, cap_rows, generation_rows);
 
 impl crate::heap_layout_bound::HeapLayoutBound for ClaudeIdentityDisposition {
     const INLINE_ONLY: bool = true;

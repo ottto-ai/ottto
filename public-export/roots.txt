@@ -1,5 +1,7 @@
 # Tracked public repository export roots.
 .cargo/audit.toml
+.cargo/config.toml
+.github/actions/rust-setup/action.yml
 .github/dependabot.yml
 .github/workflows/ci.yml
 .github/workflows/linux-tests.yml

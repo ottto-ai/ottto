@@ -106,6 +106,7 @@ pub(in crate::snapshots) fn job_key(group: &Group) -> String {
 pub(in crate::snapshots) fn refusal_disclosure(owner: &str) -> cursor::Disclosure {
     cursor::Disclosure {
         reason: cursor::DebtReason::HeldTerminal,
+        cause: ownership::GROUP,
         ownership_incomplete_file_count: 1,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: vec![owner.to_owned()],
@@ -122,6 +123,7 @@ pub(in crate::snapshots) fn refusal_disclosure(owner: &str) -> cursor::Disclosur
 fn probe_order_disclosure(owner: &str) -> cursor::Disclosure {
     cursor::Disclosure {
         reason: cursor::DebtReason::ProbeBudgetOrder,
+        cause: ownership::GROUP,
         ownership_incomplete_file_count: 0,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: vec![owner.to_owned()],
@@ -172,6 +174,7 @@ pub(in crate::snapshots) fn disclose_strict(
     targets: DisclosureTargets<'_>,
 ) {
     targets.census.ownership_incomplete_file_count += members.len();
+    targets.census.causes.add(ownership::GROUP, members.len());
     targets
         .census
         .record_unreadable(UnreadableCause::AliasParser, 1);
@@ -334,7 +337,7 @@ impl GroupBoot {
         }
         if self.headers.len() < n {
             let member = &self.group.members[self.headers.len()];
-            let Ok((bytes, _, read)) = read_header_bytes(member) else {
+            let Ok((bytes, _, read, _)) = read_header_bytes(member) else {
                 return Boot::Strict;
             };
             self.charge = self.charge.saturating_add(read as u64);
@@ -413,7 +416,7 @@ impl GroupBoot {
             0,
             // The entry's stored ctime lets a ctime-only change keep the
             // stored fingerprint (fresh samples hashed, no re-read).
-            &index.files,
+            discovery_retention!(index),
             false,
             cache,
         ) else {
@@ -658,6 +661,7 @@ impl GroupBoot {
         parser.accumulator.codex_tier_replay = Some(replay);
         let index = inputs.index;
         Ok(Box::new(OwnedActiveFile {
+            recovered_audit_due: None,
             comparison_target: false,
             sampling: None,
             previous_snapshot_fingerprint: index.last_snapshot_fingerprint(&last),
@@ -669,6 +673,7 @@ impl GroupBoot {
             source_file_fingerprint: last.source_file_fingerprint.clone(),
             candidate: first,
             decision: CandidateDecision::Parse,
+            parse_reason: None,
             parser,
             aliases: members.clone(),
             applied_receipts: BTreeMap::new(),
@@ -681,6 +686,7 @@ impl GroupBoot {
                 key,
                 owner: group.owner,
                 home: group.home,
+                recovered: vec![None; members.len()],
                 members,
                 stamps,
                 digests,
@@ -778,6 +784,9 @@ pub(in crate::snapshots) struct GroupJob {
     pub(in crate::snapshots) home: PathBuf,
     /// Canonical order; the last member is the only one that can be live.
     pub(in crate::snapshots) members: Vec<CandidateFile>,
+    /// Each member's recovered missing-carrier deadline, taken once at job
+    /// start; runtime-only, sized at boot, settled per native entry.
+    pub(in crate::snapshots) recovered: Vec<Option<u64>>,
     /// Boot stamps of the members' opened objects, canonical order.
     pub(in crate::snapshots) stamps: Vec<OpenStamp>,
     digests: Vec<String>,
@@ -808,7 +817,7 @@ pub(in crate::snapshots) struct GroupJob {
     /// input cumulatively, so a member swap needs no walk (R2-L3).
     pub(in crate::snapshots) consumed_before: u64,
 }
-crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
+crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, recovered, stamps, digests, current,
     finished, previous_receipts, receipt_scope, legacy_expected, tee, legacy_baselines, lines,
     charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope, walked,
     consumed_before);
@@ -936,6 +945,8 @@ pub(in crate::snapshots) fn step_group(
     {
         join.set_record_start(offset);
     }
+    #[cfg(test)]
+    let before_body_read = active.parser.reader.consumed_bytes();
     let stepped = {
         let OwnedActiveFile { parser, group, .. } = &mut *active;
         match group.as_mut().and_then(|group| group.tee.as_deref_mut()) {
@@ -943,6 +954,14 @@ pub(in crate::snapshots) fn step_group(
             None => parser.step(),
         }
     };
+    #[cfg(test)]
+    terminal_contract_retry::record_group_body_bytes(
+        active
+            .parser
+            .reader
+            .consumed_bytes()
+            .saturating_sub(before_body_read),
+    );
     let complete = match stepped {
         Ok(complete) => complete,
         Err(error) => return GroupStep::Read(Err(error)),
@@ -1007,6 +1026,9 @@ fn member_eof(
             Err(_) => return Err(GroupEnd::Strict),
         }
     }
+    #[cfg(test)]
+    crate::snapshots::sampled_scan::codex_cursor::tests::GROUP_EOF_APPLIED
+        .with(|v| v.set(v.get() + 1));
     if last && paged {
         apply_live_eof_record(active);
     }
@@ -1185,7 +1207,7 @@ fn open_member(
     if last && paged {
         // The live member may have grown since boot; its line 0 must not
         // have changed (TOCTOU), and its object is fenced below.
-        let (bytes, _, read) = read_header_bytes(&member).map_err(|_| GroupEnd::Changed)?;
+        let (bytes, _, read, _) = read_header_bytes(&member).map_err(|_| GroupEnd::Changed)?;
         group.charge = group.charge.saturating_add(read as u64);
         if format!("{:x}", Sha256::digest(&bytes)) != group.digests[position] {
             return Err(GroupEnd::Changed);

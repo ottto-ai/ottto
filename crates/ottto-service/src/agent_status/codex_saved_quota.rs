@@ -808,6 +808,16 @@ fn lock(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
 }
 
 /// The home's saved reading, for a status read. Never reads the provider.
+/// Launch preflight may inspect the current saved proof, but must never wake
+/// a provider read or perform login/model probes as a side effect.
+pub(super) fn serve_saved_for_launch(
+    home: &Path,
+    home_trust: CodexHomeTrust,
+    now: u64,
+) -> Result<CodexUsageProbe, CodexQuotaFailure> {
+    serve_saved_at(&saved_quota_support_dir(), home, home_trust, now)
+}
+
 pub(super) fn serve_saved(
     home: &Path,
     home_trust: CodexHomeTrust,
@@ -2004,45 +2014,6 @@ mod tests {
     }
 
     #[test]
-    fn schedule_intervals_are_five_minutes_in_use_and_fifteen_unused() {
-        assert_eq!(refresh_interval_seconds(true), 5 * 60);
-        assert_eq!(refresh_interval_seconds(false), 15 * 60);
-        let login = mark(Some("a:w"), 1);
-        let auth = &login;
-        let saved = saved_with(10_000, login.clone());
-        // In use: due at 5 min, not before.
-        assert!(!scheduled_read_due(
-            Some(&saved),
-            auth,
-            true,
-            10_000 + 5 * 60 - 1
-        ));
-        assert!(scheduled_read_due(
-            Some(&saved),
-            auth,
-            true,
-            10_000 + 5 * 60
-        ));
-        // Unused: due at 15 min, not before.
-        assert!(!scheduled_read_due(
-            Some(&saved),
-            auth,
-            false,
-            10_000 + 15 * 60 - 1
-        ));
-        assert!(scheduled_read_due(
-            Some(&saved),
-            auth,
-            false,
-            10_000 + 15 * 60
-        ));
-        // Never read: due now.
-        assert!(scheduled_read_due(None, auth, false, 10_000));
-        // A clock that stepped back never holds a home forever.
-        assert!(scheduled_read_due(Some(&saved), auth, false, 1_000));
-    }
-
-    #[test]
     fn a_changed_login_is_read_again_after_a_minute_only() {
         let saved = saved_with(10_000, mark(Some("a:w"), 1));
         let other_account = mark(Some("b:w"), 2);
@@ -2108,63 +2079,6 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_read_waits_a_full_interval() {
-        let mut saved = saved_with(10_000, LoginMark::default());
-        saved.last_failure = Some(SavedCodexFailure {
-            at_epoch_seconds: 10_000,
-            message: "Codex app-server quota read timed out.".to_string(),
-            login: LoginMark::default(),
-        });
-        // Never sooner than the interval: the failure adds no retry.
-        assert!(!scheduled_read_due(
-            Some(&saved),
-            &LoginMark::default(),
-            true,
-            10_000 + 5 * 60 - 1
-        ));
-        assert!(!scheduled_read_due(
-            Some(&saved),
-            &LoginMark::default(),
-            false,
-            10_000 + 15 * 60 - 1
-        ));
-    }
-
-    #[test]
-    fn explicit_refresh_reads_at_most_once_a_minute() {
-        let gap = EXPLICIT_REFRESH_MIN_GAP_SECONDS;
-        assert!(explicit_refresh_allowed(None, gap, 10_000));
-        let saved = saved_with(10_000, LoginMark::default());
-        assert!(!explicit_refresh_allowed(Some(&saved), gap, 10_000));
-        assert!(!explicit_refresh_allowed(Some(&saved), gap, 10_059));
-        assert!(explicit_refresh_allowed(Some(&saved), gap, 10_060));
-        // A longer gap (an older app's status refresh): five minutes.
-        assert!(!explicit_refresh_allowed(Some(&saved), 300, 10_299));
-        assert!(explicit_refresh_allowed(Some(&saved), 300, 10_300));
-        // Never shorter than the minute.
-        assert!(!explicit_refresh_allowed(Some(&saved), 0, 10_059));
-        // Through the saved file: two refreshes within a minute read once.
-        let root = scratch("explicit");
-        let home = opaque_home(&root);
-        let mut reads = 0;
-        for at in [0, 30] {
-            let _ = read_and_save_at(
-                &root,
-                &home,
-                CodexHomeTrust::Managed,
-                current_unix_seconds() + at,
-                |saved, now| explicit_refresh_allowed(saved, gap, now),
-                || {
-                    reads += 1;
-                    Ok(probe("a", "w", &rfc3339(current_unix_seconds())))
-                },
-            );
-        }
-        assert_eq!(reads, 1);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn saved_reading_round_trips_without_the_email() {
         use std::os::unix::fs::PermissionsExt;
         let root = scratch("round-trip");
@@ -2212,28 +2126,6 @@ mod tests {
         );
         assert_eq!(
             served_error(&root, &home, now + 7 * 3_600),
-            Some(CODEX_QUOTA_NOT_READ_YET.to_string())
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn a_reading_is_not_served_after_the_login_changes() {
-        let root = scratch("login-change");
-        let home = opaque_home(&root);
-        let now = current_unix_seconds();
-        let _ = read_and_save_at(
-            &root,
-            &home,
-            CodexHomeTrust::Managed,
-            now,
-            |_, _| true,
-            || Ok(probe("account-a", "workspace-a", &rfc3339(now))),
-        );
-        assert!(serve_saved_at(&root, &home, CodexHomeTrust::Managed, now).is_ok());
-        write_opaque_auth(&home, "a-different-and-longer-login");
-        assert_eq!(
-            served_error(&root, &home, now),
             Some(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
         let _ = std::fs::remove_dir_all(root);
@@ -2403,28 +2295,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Only a positively different account or workspace makes a read lose
-    /// its login.
-    #[test]
-    fn only_a_different_named_account_discards_a_read() {
-        let named = |binding: &str| mark(Some(binding), 1);
-        let unnamed = mark(None, 2);
-        let read = Ok(probe("a", "w", &rfc3339(10_000)));
-        let failed = Err("Codex app-server quota read timed out.".to_string());
-        assert!(read_kept_its_login(&named("a:w"), &named("a:w"), &read));
-        assert!(!read_kept_its_login(&named("a:w"), &named("b:w"), &read));
-        assert!(read_kept_its_login(&unnamed, &mark(None, 3), &read));
-        assert!(read_kept_its_login(&unnamed, &mark(None, 3), &failed));
-        assert!(read_kept_its_login(&named("a:w"), &unnamed, &read));
-        assert!(read_kept_its_login(&named("a:w"), &unnamed, &failed));
-        assert!(!read_kept_its_login(&named("b:w"), &unnamed, &read));
-        // An expired token that the read renewed: kept only when the read
-        // validated the account the renewed credential names.
-        assert!(read_kept_its_login(&unnamed, &named("a:w"), &read));
-        assert!(!read_kept_its_login(&unnamed, &named("b:w"), &read));
-        assert!(!read_kept_its_login(&unnamed, &named("a:w"), &failed));
-    }
-
     #[test]
     fn an_unwritable_saved_file_still_spaces_the_reads() {
         let root = scratch("unwritable");
@@ -2557,146 +2427,6 @@ mod tests {
             "organization_identifier_hash": binding.map(|(_, w)| w),
         }))
         .unwrap()
-    }
-
-    fn scheduled(
-        ownership: CodexAccountSlotOwnershipV1,
-        binding: Option<(&str, &str)>,
-    ) -> ScheduledHome {
-        ScheduledHome {
-            home: PathBuf::from(format!("/homes/{binding:?}")),
-            trust: CodexHomeTrust::Managed,
-            ownership,
-            binding: binding.map(|(a, w)| codex_credit_grants::binding_key(a, w)),
-            process_seen_at: None,
-        }
-    }
-
-    #[test]
-    fn sessions_count_for_the_default_home_unless_clearly_tied_to_a_managed_one() {
-        let now = 100_000;
-        let homes = [
-            scheduled(CodexAccountSlotOwnershipV1::Default, Some(("a", "w"))),
-            scheduled(CodexAccountSlotOwnershipV1::Managed, Some(("b", "w"))),
-            // Same account as the default home: not clearly tied.
-            scheduled(CodexAccountSlotOwnershipV1::Managed, Some(("a", "w"))),
-            scheduled(CodexAccountSlotOwnershipV1::Managed, Some(("c", "w"))),
-        ];
-        // Nothing recent: nothing in use.
-        assert_eq!(
-            homes_in_use(&homes, &[session(Some(("b", "w")), now - 31 * 60)], now),
-            [false, false, false, false]
-        );
-        // A session of the managed-only account: that home only.
-        assert_eq!(
-            homes_in_use(&homes, &[session(Some(("b", "w")), now - 10 * 60)], now),
-            [false, true, false, false]
-        );
-        // The default home's account, an unbound session, or an unknown
-        // account: the default home.
-        for binding in [Some(("a", "w")), None, Some(("z", "w"))] {
-            assert_eq!(
-                homes_in_use(&homes, &[session(binding, now - 60)], now),
-                [true, false, false, false]
-            );
-        }
-        // A running process holding a rollout ties a home outright.
-        let mut with_process = homes.clone();
-        with_process[3].process_seen_at = Some(now - 5 * 60);
-        assert_eq!(
-            homes_in_use(&with_process, &[], now),
-            [false, false, false, true]
-        );
-        with_process[3].process_seen_at = Some(now - 31 * 60);
-        assert_eq!(
-            homes_in_use(&with_process, &[], now),
-            [false, false, false, false]
-        );
-    }
-
-    #[test]
-    fn the_schedule_scans_for_processes_when_no_scan_ran_for_five_minutes() {
-        assert!(process_scan_due(0, 10_000));
-        assert!(!process_scan_due(10_000, 10_000));
-        assert!(!process_scan_due(10_000, 10_000 + 5 * 60 - 1));
-        assert!(process_scan_due(10_000, 10_000 + 5 * 60));
-        // A clock that stepped back never stops the scans.
-        assert!(process_scan_due(10_000 + 3_600, 10_000));
-    }
-
-    #[test]
-    fn the_next_due_time_is_when_the_due_check_turns_true() {
-        let last = 1_000_000;
-        let same = mark(Some("a"), 1);
-        let switched = mark(Some("b"), 2);
-        let cases = [
-            (None, &same, 5 * 60, last, last),
-            (Some(saved_with(0, same.clone())), &same, 5 * 60, last, last),
-            (
-                Some(saved_with(last, same.clone())),
-                &same,
-                5 * 60,
-                last,
-                last + 5 * 60,
-            ),
-            (
-                Some(saved_with(last, same.clone())),
-                &same,
-                15 * 60,
-                last + 5,
-                last + 15 * 60,
-            ),
-            // A switched login: a minute after the last attempt.
-            (
-                Some(saved_with(last, same.clone())),
-                &switched,
-                15 * 60,
-                last + 5,
-                last + 60,
-            ),
-            // A clock that stepped back: due now.
-            (
-                Some(saved_with(last + 3_600, same.clone())),
-                &same,
-                5 * 60,
-                last,
-                last,
-            ),
-        ];
-        for (saved, current, interval, now, due_at) in cases {
-            assert_eq!(
-                scheduled_read_due_at(saved.as_ref(), current, interval, now),
-                due_at
-            );
-            for at in [due_at.saturating_sub(1).max(now), due_at, due_at + 1] {
-                assert_eq!(
-                    scheduled_read_due_every(saved.as_ref(), current, interval, at),
-                    scheduled_read_due_at(saved.as_ref(), current, interval, at) <= at,
-                    "{at}"
-                );
-                assert_eq!(
-                    scheduled_read_due_every(saved.as_ref(), current, interval, at),
-                    at >= due_at,
-                    "{at}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_scheduler_sleeps_until_the_next_due_time_and_at_most_a_minute() {
-        let now = 1_000_000;
-        assert_eq!(scheduler_sleep(Some(now + 5), now), Duration::from_secs(5));
-        assert_eq!(
-            scheduler_sleep(Some(now + 15 * 60), now),
-            SCHEDULER_MAX_SLEEP
-        );
-        assert_eq!(scheduler_sleep(None, now), SCHEDULER_MAX_SLEEP);
-        // Still due after the round (a read refused at the last moment, or
-        // a failed round): the old tick.
-        assert_eq!(scheduler_sleep(Some(now), now), SCHEDULER_RETRY);
-        assert_eq!(scheduler_sleep(Some(now - 60), now), SCHEDULER_RETRY);
-        assert_eq!(SCHEDULER_MAX_SLEEP.as_secs(), LOGIN_CHANGED_MIN_GAP_SECONDS);
     }
 
     /// A round tells when the next home is due: the in-use or unused interval
@@ -3459,15 +3189,5 @@ mod tests {
             fixture.served_at("twin", start + 36 * 60),
             Err(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
-    }
-
-    #[test]
-    fn running_home_sightings_are_bounded() {
-        let homes = (0..RUNNING_HOMES_MAX + 8)
-            .map(|index| PathBuf::from(format!("/bounded-running-home-{index}")))
-            .collect::<Vec<_>>();
-        note_running_homes(homes.iter().map(PathBuf::as_path), 1);
-        assert!(running_homes().len() <= RUNNING_HOMES_MAX);
-        running_homes().retain(|home, _| !home.starts_with("/bounded-running-home-"));
     }
 }

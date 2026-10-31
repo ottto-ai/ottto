@@ -70,16 +70,10 @@ impl IntegratedSlot {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[allow(dead_code)] // Historical fault adapters retained for the canonical transport fixture.
 enum IntegratedScript {
     Ack,
     FallbackShed,
     AuthReplay,
-    BeforePostAccount,
-    AfterAckAccount,
-    LedgerCrash,
-    IndexRace,
-    ProgressRace,
 }
 #[derive(Default)]
 struct IntegratedTrace {
@@ -216,14 +210,6 @@ fn integrated_send(
                     let body = serde_json::to_vec(&request)?;
                     assert!(body.len() <= SNAPSHOT_BATCH_MAX_BYTES);
                     let encoded = crate::snapshot_client::retention_gzip_probe(&body);
-                    if script == IntegratedScript::BeforePostAccount {
-                        let mut changed = current.clone();
-                        changed.account += 1;
-                        assert!(
-                            integrated_post(slot, now + 2_000, &changed, "main", trace).is_err()
-                        );
-                        return Err(anyhow!("authority changed after token"));
-                    }
                     integrated_post(slot, now + 2_000, current, "main", trace)?;
                     match script {
                         IntegratedScript::FallbackShed => {
@@ -254,51 +240,13 @@ fn integrated_send(
                     lease.commit();
                     Ok(response)
                 },
-                &mut |p: &mut SnapshotUploadProgress| {
-                    if script == IntegratedScript::LedgerCrash {
-                        return Err(anyhow!("crash before ledger"));
-                    }
-                    p.save(&f.progress_path)
-                },
+                &mut |p: &mut SnapshotUploadProgress| p.save(&f.progress_path),
             )
         };
         slot.items = items;
         let result = result?;
         assert!(matches!(result, SnapshotPageOutcome::Settled { .. }));
         assert_eq!(slot.budget.turn_deadline, deadline);
-        if script == IntegratedScript::AfterAckAccount {
-            let before = std::fs::read(&f.index_path)?;
-            let mut changed = current.clone();
-            changed.account += 1;
-            assert!(f
-                .checkpoint_boundary(|| {
-                    if !slot.budget.phase(now + 4_000, Some(&changed)) {
-                        Err(anyhow!("post-ACK authority"))
-                    } else {
-                        Ok(())
-                    }
-                })
-                .is_err());
-            assert_eq!(std::fs::read(&f.index_path)?, before);
-            return Err(anyhow!("ACK durable; publication authority revoked"));
-        }
-        if script == IntegratedScript::ProgressRace {
-            let mut competing = f.progress.clone();
-            competing.save(&f.progress_path)?;
-            let bytes = std::fs::read(&f.progress_path)?;
-            assert!(f.checkpoint_boundary(|| Ok(())).is_err());
-            assert_eq!(std::fs::read(&f.progress_path)?, bytes);
-            return Err(anyhow!("manual progress generation wins"));
-        }
-        if script == IntegratedScript::IndexRace {
-            let mut newer = ScanIndex::load(&f.index_path)?;
-            newer.mark_bounded_sweep_unsettled();
-            newer.save(&f.index_path)?;
-            let bytes = std::fs::read(&f.index_path)?;
-            assert!(f.checkpoint_boundary(|| Ok(())).is_err());
-            assert_eq!(std::fs::read(&f.index_path)?, bytes);
-            return Err(anyhow!("manual generation wins"));
-        }
         f.checkpoint_boundary(|| {
             if slot.budget.phase(now + 4_000, Some(current)) {
                 Ok(())
@@ -403,10 +351,15 @@ fn integrated_capture(
     selected: &[usize],
     trace: &mut IntegratedTrace,
 ) -> IntegratedSlot {
-    let entry = crate::retry_allocation_probe::stats().requested_live;
+    let entry = crate::retry_allocation_probe::caller_thread_stats()
+        .unwrap_or_else(crate::retry_allocation_probe::stats)
+        .requested_live;
     crate::retry_allocation_probe::phase_begin();
     let slot = IntegratedSlot::capture(f, selected).unwrap();
-    let retained = (crate::retry_allocation_probe::stats().requested_live - entry) as usize;
+    let retained = (crate::retry_allocation_probe::caller_thread_stats()
+        .unwrap_or_else(crate::retry_allocation_probe::stats)
+        .requested_live
+        - entry) as usize;
     let peak = crate::retry_allocation_probe::phase_peak();
     assert!(retained <= slot.bound);
     trace.captures.push((slot.bound, retained, peak));

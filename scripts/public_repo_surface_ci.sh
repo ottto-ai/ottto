@@ -235,7 +235,10 @@ run_step P "validate public schemas and generated registry" \
   bash -c 'jq empty connectors/registry.generated.json schemas/*.schema.json'
 run_step P "shellcheck public scripts" bash -c 'shellcheck scripts/*.sh'
 run_step P "test local autoreview helper" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_autoreview.py
+run_step P "test money equivalence decoded-body comparison" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_money_equivalence.py
+run_step P "test runtime test split" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ci_runtime_tests.py
 run_step P "test PR merge guard" bash scripts/test_pr_merge_when_mac_green.sh
+run_step P "test Mac batch helper" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_mac_batch.py
 
 run_step P "test public export check" bash scripts/test_public_repo_export_check.sh
 run_step P "run public export check" bash scripts/public_repo_export_check.sh
@@ -253,6 +256,7 @@ run_step B "test macOS release gate" bash scripts/test_macos_release_gate.sh
 run_step P "test macOS installer channel policy" bash scripts/test_macos_installer_channel_policy.sh
 run_step B "test macOS package URL scheme policy" bash scripts/test_macos_package_url_scheme_policy.sh
 run_step M "test macOS package root resolution" bash scripts/test_macos_package_root_resolution.sh
+run_step M "test macOS Companion entitlement policy" bash scripts/test_macos_companion_entitlements.sh
 run_step M "test macOS Sparkle bundle version and launch policy" bash scripts/test_macos_sparkle_bundle_version.sh
 run_step M "test macOS launch smoke" bash scripts/test_macos_launch_smoke.sh
 run_step P "test macOS stable release workflow policy" bash scripts/test_macos_stable_release_workflow.sh

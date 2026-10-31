@@ -46,6 +46,7 @@ mkdir -p \
 
 cp "$ROOT/scripts/macos_package.sh" "$repo/scripts/macos_package.sh"
 cp "$ROOT/scripts/macos_bundle_url_scheme.sh" "$repo/scripts/macos_bundle_url_scheme.sh"
+cp "$ROOT/scripts/macos_companion_entitlements.sh" "$repo/scripts/macos_companion_entitlements.sh"
 cp "$ROOT/scripts/macos_sparkle_bundle_version.sh" "$repo/scripts/macos_sparkle_bundle_version.sh"
 cat > "$repo/crates/ottto-protocol/src/lib.rs" <<'RS'
 pub const PROTOCOL_VERSION: u16 = 15;
@@ -53,6 +54,16 @@ RS
 cat > "$app_root/Package.swift" <<'SWIFT'
 // test fixture
 SWIFT
+cat > "$app_root/Companion.entitlements.plist" <<'ENTITLEMENTS'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.automation.apple-events</key>
+  <true/>
+</dict>
+</plist>
+ENTITLEMENTS
 printf '#!/usr/bin/env bash\nexit 0\n' > "$app_root/.build/release/Ottto"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$repo/target/release/ottto"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$repo/target/release/ottto-service"
@@ -134,7 +145,33 @@ cat > "$mock_bin/otool" <<'OTOOL'
 #!/usr/bin/env bash
 printf 'path @executable_path/../Frameworks\n'
 OTOOL
-for command_name in cargo codesign install_name_tool swift; do
+# Records the entitlements plist each target is signed with; -d prints it, so
+# the packager's post-sign entitlement check sees what it asked for.
+cat > "$mock_bin/codesign" <<'CODESIGN'
+#!/usr/bin/env bash
+set -euo pipefail
+entitlements=""
+display="false"
+target=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d) display="true"; shift ;;
+    --entitlements)
+      if [[ "$display" != "true" ]]; then entitlements="$2"; fi
+      shift 2
+      ;;
+    --sign|--options) shift 2 ;;
+    *) target="$1"; shift ;;
+  esac
+done
+record="$target.fixture-entitlements"
+if [[ "$display" == "true" ]]; then
+  if [[ -f "$record" ]]; then cat "$record"; fi
+  exit 0
+fi
+if [[ -n "$entitlements" ]]; then cp "$entitlements" "$record"; else rm -f "$record"; fi
+CODESIGN
+for command_name in cargo install_name_tool swift; do
   cat > "$mock_bin/$command_name" <<'NOOP'
 #!/usr/bin/env bash
 exit 0
@@ -199,6 +236,17 @@ if plutil -extract LSMultipleInstancesProhibited raw -o - "$info_plist" >/dev/nu
 fi
 if [[ "$(plutil -extract CFBundleIdentifier raw -o - "$info_plist")" != "net.ottto.Companion" ]]; then
   echo "Packaged bundle identifier changed" >&2
+  exit 1
+fi
+if [[ "$(plutil -extract NSAppleEventsUsageDescription raw -o - "$info_plist")" != \
+  "Ottto reads the folder in your selected terminal tab when you choose Terminal folder, and opens Terminal when you sign in to Claude Code." ]]; then
+  echo "Packaged Info.plist must explain the Terminal folder Apple Events use" >&2
+  exit 1
+fi
+if [[ ! -f "$output_dir/Ottto.app.fixture-entitlements" ]] || \
+  [[ -e "$output_dir/Ottto.app/Contents/Helpers/ottto.fixture-entitlements" ]] || \
+  [[ -e "$output_dir/Ottto.app/Contents/Helpers/ottto-service.fixture-entitlements" ]]; then
+  echo "Only the Companion app may be signed with the shared entitlements" >&2
   exit 1
 fi
 if ! jq -e '

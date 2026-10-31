@@ -3,6 +3,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use zeroize::Zeroize;
 
+mod session_launch;
+pub use session_launch::*;
+
 pub const PROTOCOL_VERSION: u16 = 15;
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
 
@@ -453,7 +456,8 @@ pub struct LocalHealthBlockerV1 {
     pub code: String,
     pub severity: LocalHealthSeverity,
     pub owner: String,
-    pub source: LocalHealthAuthority,
+    // Existing wire string: authority for machine blockers, slug for source blockers.
+    pub source: String,
     pub since: Rfc3339Timestamp,
     pub clear_condition: String,
 }
@@ -3016,6 +3020,14 @@ impl<'de> Deserialize<'de> for LocalControlRequest {
 
 pub fn expected_local_control_protocol_version(command: &LocalControlCommand) -> u16 {
     match command {
+        LocalControlCommand::SessionLaunchPrepare { .. }
+        | LocalControlCommand::SessionLaunchConsume { .. }
+        | LocalControlCommand::SessionLaunchReport { .. }
+        | LocalControlCommand::SessionLaunchStatus { .. }
+        | LocalControlCommand::SessionLaunchCancel { .. }
+        | LocalControlCommand::SessionLaunchRecentFolders { .. }
+        | LocalControlCommand::AccountNicknames
+        | LocalControlCommand::AccountNicknameSet { .. } => SESSION_LAUNCH_CONTROL_PROTOCOL_VERSION,
         LocalControlCommand::CloudSessionsControl { .. } => CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
         LocalControlCommand::ProviderDailyReferenceControl { .. } => {
             PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION
@@ -4067,6 +4079,56 @@ pub struct AgentProviderImpactQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum LocalControlCommand {
+    SessionLaunchPrepare {
+        schema_version: u16,
+        provider: SessionLaunchProviderV1,
+        slot_id: String,
+        expected_account_identifier_hash: String,
+        #[serde(default)]
+        expected_organization_identifier_hash: Option<String>,
+        folder: SessionLaunchFolderV1,
+        #[serde(default)]
+        terminal: Option<String>,
+    },
+    SessionLaunchConsume {
+        schema_version: u16,
+        launch_id: String,
+        secret: SecretString,
+    },
+    SessionLaunchReport {
+        schema_version: u16,
+        launch_id: String,
+        attempt_id: SecretString,
+        reason: SessionLaunchBlockReasonV1,
+    },
+    SessionLaunchStatus {
+        schema_version: u16,
+        launch_id: String,
+    },
+    SessionLaunchCancel {
+        schema_version: u16,
+        launch_id: String,
+    },
+    SessionLaunchRecentFolders {
+        schema_version: u16,
+        #[serde(default)]
+        provider: Option<SessionLaunchProviderV1>,
+        #[serde(default)]
+        slot_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+    AccountNicknames,
+    AccountNicknameSet {
+        source: SessionLaunchProviderV1,
+        account_identifier_hash: String,
+        #[serde(default)]
+        organization_identifier_hash: Option<String>,
+        #[serde(default)]
+        nickname: Option<SecretString>,
+        #[serde(default)]
+        base_revision: Option<u64>,
+    },
     Status {
         #[serde(default)]
         refresh_agent_status: bool,

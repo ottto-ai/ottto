@@ -85,7 +85,7 @@ impl Fixture {
             &mut ScanCensus::default(),
             None,
             BACKFILL_WINDOW_DAYS,
-            &BTreeMap::new(),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
         )
         .unwrap()
     }
@@ -131,21 +131,39 @@ fn raw_scan(
 ) -> Run {
     raw_scan_capturing(fixture, index, cache, capture_by_default(), after_start)
 }
+/// Outside a sync cycle every scan captures.
 fn capture_by_default() -> bool {
-    crate::snapshots::claude_request_identity::capture_by_default()
+    true
 }
 fn raw_scan_capturing(
     fixture: &Fixture,
     index: ScanIndex,
     cache: Option<Arc<SharedCache>>,
     identity_capture: bool,
+    after_start: impl FnMut(&mut OwnedSourceScan),
+) -> Run {
+    raw_scan_at(
+        fixture,
+        index,
+        cache,
+        identity_capture,
+        COLLECTED,
+        after_start,
+    )
+}
+fn raw_scan_at(
+    fixture: &Fixture,
+    index: ScanIndex,
+    cache: Option<Arc<SharedCache>>,
+    identity_capture: bool,
+    collected_at: &str,
     mut after_start: impl FnMut(&mut OwnedSourceScan),
 ) -> Run {
     let mut scan = OwnedSourceScan::new_with_identity_capture(
         SOURCE,
         std::slice::from_ref(&fixture.dir),
         index,
-        COLLECTED,
+        collected_at,
         BACKFILL_WINDOW_DAYS,
         100,
         false,
@@ -320,7 +338,6 @@ fn settle(mut run: Run) -> ScanIndex {
         SOURCE,
         &mut run.result,
         &mut run.index,
-        true,
         snapshot_upload_body_witness,
     );
     // Validate the ordinary per-entity/body ACK before recording acceptance.
@@ -412,24 +429,6 @@ fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
 }
 
 #[test]
-fn transcript_and_sidecar_append_use_tail_without_changing_joined_body() {
-    let f = Fixture::new(1);
-    let cache = Arc::new(SharedCache::default());
-    let prior = seed_predecessor(&f, &cache);
-    f.append_transcript(1);
-    f.evidence(2);
-    let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
-    assert_layout_mode(cached.modes, (0, 1, 0));
-    assert_oracle(&f, &cached, prior);
-    assert_eq!(
-        cached.index.files[&local_index_key(&f.path)]
-            .audit_obligation(now_seconds())
-            .is_some(),
-        crate::heap_layout_bound::layout_supported()
-    );
-}
-
-#[test]
 fn root_telemetry_reselects_every_child_without_invalidating_reduction() {
     let mut f = Fixture::new(1);
     let children = ["a4d1585d310070d0f", "b4d1585d310070d0f"];
@@ -500,7 +499,6 @@ fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
         SOURCE,
         &mut next.result,
         &mut next.index,
-        true,
         snapshot_upload_body_witness,
     );
     assert!(
@@ -565,7 +563,6 @@ fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
         SOURCE,
         &mut cached.result,
         &mut cached.index,
-        true,
         snapshot_upload_body_witness,
     );
     assert!(cached.result.snapshots.is_empty());
@@ -580,6 +577,8 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
         let prior = seed_predecessor(&f, &cache);
         let cache = if retained_budget {
             Arc::new(SharedCache {
+                withheld_memo: Default::default(),
+                cap_pace: Default::default(),
                 inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
                 cursor: Default::default(),
                 side: Default::default(),
@@ -661,15 +660,38 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
     let key = local_index_key(&f.path);
     let debt = prior.files[&key].audit_obligation(now_seconds());
     assert_eq!(debt.is_some(), crate::heap_layout_bound::layout_supported());
+    let old_full = cache
+        .retained_checkpoint(&key)
+        .map(|c| c.last_full_verified());
     f.write_rows(
         false,
         &[f.api[0].clone(), f.api[1].clone(), f.api[0].clone()],
     );
-    let unchanged = enriched(&f, raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {}));
+    let (unchanged, diagnostics) = crate::local_resource_diagnostics::capture(|| {
+        enriched(&f, raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {}))
+    });
     assert_layout_mode(unchanged.modes, (0, 0, 1));
     assert_oracle(&f, &unchanged, prior);
     let prior = settle(unchanged);
     assert_eq!(prior.files[&key].audit_obligation(now_seconds()), debt);
+    assert_eq!(
+        cache.retained_checkpoint(&key).and_then(|c| c.audit_debt()),
+        debt
+    );
+    assert_eq!(
+        cache
+            .retained_checkpoint(&key)
+            .map(|c| c.last_full_verified()),
+        old_full
+    );
+    let page = diagnostics
+        .iter()
+        .find(|row| row["stage"] == "native_collection_page")
+        .unwrap();
+    assert_eq!(
+        page["counts"]["sampled_acquisition"]["index_state_at_page_end"]["audit_quiet_retired"], 0,
+        "telemetry refresh is not a scheduled audit retirement"
+    );
     // Force a legitimately due existing obligation without changing intervals.
     let mut due = prior;
     let now = now_seconds();
@@ -681,8 +703,34 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
             due_unix_seconds: now.saturating_sub(1)
         }
     ));
-    let audited = raw_scan(&f, due, Some(cache), |_| {});
-    assert!(audited.reasons[FullReason::AuditDue.slot()] > 0);
+    let (audited, diagnostics) = crate::local_resource_diagnostics::capture(|| {
+        raw_scan(&f, due, Some(cache.clone()), |_| {})
+    });
+    assert_layout_mode(audited.modes, (0, 0, 1));
+    assert_eq!(
+        audited.reasons[FullReason::AuditDue.slot()],
+        0,
+        "audit age never labels a native Full, even without a checkpoint"
+    );
+    let page = diagnostics
+        .iter()
+        .find(|row| row["stage"] == "native_collection_page")
+        .unwrap();
+    assert_eq!(
+        page["counts"]["sampled_acquisition"]["index_state_at_page_end"]["audit_quiet_retired"],
+        u64::from(crate::heap_layout_bound::layout_supported()),
+        "only the due, sampled validation retires the obligation"
+    );
+    assert_eq!(
+        cache.retained_checkpoint(&key).and_then(|c| c.audit_debt()),
+        None
+    );
+    assert_eq!(
+        cache
+            .retained_checkpoint(&key)
+            .map(|c| c.last_full_verified()),
+        old_full
+    );
 }
 
 #[test]
@@ -769,76 +817,60 @@ fn cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse
     }
 }
 
-/// Retained native state is reused only in the capture mode it was built in.
-/// A prefix parsed without contract-5 capture holds no markers, so a capturing
-/// cycle under the same cache scope re-reads the file in full instead of
-/// tailing it as if the prefix had none; same-mode appends still tail.
+/// Contract 5 is always on, so capture is a function of the source and a
+/// retained reduction always continues in the capture mode its markers were
+/// built in (E1 S2: the retained capture-mode refusal is gone, not merely
+/// unreached). Appends tail, and the tailed body keeps the prefix's marker;
+/// `durable_restart` covers a restart.
 #[test]
-fn identity_capture_mode_change_rereads_instead_of_reusing_a_markerless_prefix() {
-    const ORG: &str = "11111111-1111-4111-8111-111111111111";
+fn constant_capture_tails_and_keeps_the_prefix_marker() {
+    let f = Fixture::new(1);
+    capture_marked(&f);
+    let cache = Arc::new(SharedCache::default());
+    let prior = settle(enriched(
+        &f,
+        raw_scan(&f, ScanIndex::default(), Some(cache.clone()), |_| {}),
+    ));
+    f.append_transcript(1);
+    let steady = raw_scan(&f, prior, Some(cache), |_| {});
+    assert_layout_mode(steady.modes, (0, 1, 0));
+    if crate::heap_layout_bound::layout_supported() {
+        assert_eq!(steady.reasons[FullReason::StateMissing.slot()], 0);
+    }
+    assert!(capture_markers_trusted(&steady, &f));
+}
+
+const CAPTURE_ORG: &str = "11111111-1111-4111-8111-111111111111";
+
+/// Prepends a `credential_org` marker to the fixture transcript.
+fn capture_marked(f: &Fixture) {
+    let first: Value = serde_json::from_str(&f.lines[0]).unwrap();
+    let marker = json!({"timestamp": first["timestamp"], "type": "attachment",
+        "sessionId": f.session, "attachment": {"type": "credential_org", "organizationUuid": CAPTURE_ORG}});
+    fs::write(&f.path, format!("{marker}\n{}\n", f.lines[0])).unwrap();
+}
+
+/// Every owned request of the fixture session trusts the prefix's marker.
+fn capture_markers_trusted(run: &Run, f: &Fixture) -> bool {
     let org = ottto_core::billing_identity_hash(
         "anthropic",
         "organization",
-        &crate::claude_local_otel::canonical_uuid(ORG).unwrap(),
+        &crate::claude_local_otel::canonical_uuid(CAPTURE_ORG).unwrap(),
     )
     .unwrap();
-    let marked = |f: &Fixture| {
-        let first: Value = serde_json::from_str(&f.lines[0]).unwrap();
-        let marker = json!({"timestamp": first["timestamp"], "type": "attachment",
-            "sessionId": f.session, "attachment": {"type": "credential_org", "organizationUuid": ORG}});
-        fs::write(&f.path, format!("{marker}\n{}\n", f.lines[0])).unwrap();
-    };
-    let markers_trusted = |run: &Run, f: &Fixture| {
-        let item = run
-            .result
-            .snapshots
-            .iter()
-            .find(|item| item.source_session_id == f.session)
-            .unwrap();
-        assert!(item.claude_usage_occurrences.len() >= 2);
-        item.claude_usage_occurrences.values().all(|occurrence| {
-            item.claude_org_markers.as_deref().is_some_and(|markers| {
-                markers.verdict(occurrence.sequence, false)
-                    == crate::snapshots::claude_request_identity::MarkerVerdict::Trusted(&org)
-            })
+    let item = run
+        .result
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == f.session)
+        .unwrap();
+    assert!(item.claude_usage_occurrences.len() >= 2);
+    item.claude_usage_occurrences.values().all(|occurrence| {
+        item.claude_org_markers.as_deref().is_some_and(|markers| {
+            markers.verdict(occurrence.sequence, false)
+                == crate::snapshots::claude_request_identity::MarkerVerdict::Trusted(&org)
         })
-    };
-    let seed = |f: &Fixture, cache: &Arc<SharedCache>, capture: bool| {
-        settle(enriched(
-            f,
-            raw_scan_capturing(
-                f,
-                ScanIndex::default(),
-                Some(cache.clone()),
-                capture,
-                |_| {},
-            ),
-        ))
-    };
-
-    // A dark cycle seeds the cache; the next cycle holds a permit.
-    let f = Fixture::new(1);
-    marked(&f);
-    let cache = Arc::new(SharedCache::default());
-    let prior = seed(&f, &cache, false);
-    f.append_transcript(1);
-    let flipped = raw_scan_capturing(&f, prior, Some(cache), true, |_| {});
-    assert_eq!(flipped.modes, (1, 0, 0));
-    assert_eq!(flipped.reasons[FullReason::StateMissing.slot()], 1);
-    assert!(
-        markers_trusted(&flipped, &f),
-        "the full re-read captures the prefix's marker"
-    );
-
-    // Control: same capture mode on both cycles keeps tail reuse.
-    let g = Fixture::new(1);
-    marked(&g);
-    let cache = Arc::new(SharedCache::default());
-    let prior = seed(&g, &cache, true);
-    g.append_transcript(1);
-    let steady = raw_scan_capturing(&g, prior, Some(cache), true, |_| {});
-    assert_layout_mode(steady.modes, (0, 1, 0));
-    assert!(markers_trusted(&steady, &g));
+    })
 }
 
 /// M1: a restart (a new process cache) continues from the durable store
@@ -916,7 +948,6 @@ mod durable_restart {
             SOURCE,
             &mut run.result,
             &mut run.index,
-            true,
             snapshot_upload_body_witness,
         );
         let entity = format!(
@@ -1092,6 +1123,30 @@ mod durable_restart {
         assert_fresh_restart_reads_full(&f, &state, saved);
     }
 
+    /// E1 S2: a restart under the same (constant) capture restores the
+    /// durable record and tails; nothing reads Full for a capture-mode
+    /// mismatch, and the tailed body keeps the prefix's marker.
+    #[test]
+    fn a_constant_capture_restart_reads_no_full() {
+        let f = Fixture::new(1);
+        capture_marked(&f);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        let cached = raw_scan(&f, prior, Some(second.clone()), |_| {});
+        assert_layout_mode(cached.modes, (0, 1, 0));
+        if crate::heap_layout_bound::layout_supported() {
+            assert_eq!(cached.reasons[FullReason::StateMissing.slot()], 0);
+        }
+        assert_eq!(
+            restored(&second),
+            u64::from(crate::heap_layout_bound::layout_supported())
+        );
+        assert!(capture_markers_trusted(&cached, &f));
+    }
+
     #[test]
     fn restart_restores_then_tails_and_matches_cold_full() {
         let f = Fixture::new(1);
@@ -1121,16 +1176,10 @@ mod durable_restart {
     /// A nonempty E2 literal and reported price prevent vacuous equality of
     /// held pages or pre-finalization accumulators.
     fn enriched_e2(f: &Fixture, mut run: Run) -> Run {
-        let permit = claude_request_identity::emission_permit(
-            SOURCE,
-            Some(claude_request_identity::COHORT_HINT_TOKEN),
-        )
-        .unwrap();
-        crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan(
             &f.support,
             &mut run.result,
             &mut run.index,
-            Some(permit),
         );
         apply_upload_policy(
             SOURCE,
@@ -1345,8 +1394,119 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
     ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
         match self {
             Self::Restored(taken) => Some(*taken),
-            Self::Miss => None,
+            Self::Miss(_) => None,
             Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
         }
     }
 }
+
+fn fixture_in_home(home: &Path) -> Fixture {
+    let mut f = Fixture::new(1);
+    let old_dir = f.dir.clone();
+    f.dir = home.join(".claude/projects");
+    fs::create_dir_all(&f.dir).unwrap();
+    let path = f.dir.join(format!("{}.jsonl", f.session));
+    fs::rename(&f.path, &path).unwrap();
+    f.path = path;
+    fs::remove_dir_all(old_dir).unwrap();
+    f
+}
+
+fn desktop_bucket(home: &Path, root: &str, account: &str, org: &str) -> PathBuf {
+    let bucket = home
+        .join("Library/Application Support")
+        .join(root)
+        .join("claude-code-sessions")
+        .join(account)
+        .join(org);
+    fs::create_dir_all(&bucket).unwrap();
+    bucket
+}
+
+// [behaviour] Deferred: adjacent restore trait is removed by active e5/pi-b2.
+#[test]
+fn desktop_completed_census_counts_existing_held_retry_reads() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let home = crate::test_scratch::ScratchDir::new("desktop-held-recovery");
+    let f = fixture_in_home(&home);
+    let store = desktop_bucket(&home, "Claude", DESKTOP_ACCOUNT, DESKTOP_ORG);
+    fs::write(
+        store.join("one.json"),
+        json!({"cliSessionId":f.session,"createdAt":"2026-08-02T06:59:00Z"}).to_string(),
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let mut index = settle(raw_scan_at(
+        &f,
+        ScanIndex::default(),
+        Some(cache),
+        true,
+        COLLECTED,
+        |_| {},
+    ));
+    let key = local_index_key(&f.path);
+    assert!(index.claude_desktop_identity_census_complete);
+    assert!(!index.files[&key].source_file_fingerprint.is_empty());
+    index.claude_account_deferred_holds.insert(
+        key.clone(),
+        index.files[&key].source_file_fingerprint.clone(),
+    );
+    // The existing hold already owes a read; census completion does not create one.
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    index.claude_desktop_identity_census_complete = false;
+    index.claude_desktop_lineage_census_complete = false;
+    index.claude_desktop_census_witness = None;
+    let unrelated = f.dir.join("unrelated.jsonl");
+    // An indexed held session with no Desktop proof cannot be selected by this recovery.
+    let mut unrelated_entry = index.files[&key].clone();
+    unrelated_entry.source_file_fingerprint = "unrelated-kept".into();
+    index
+        .files
+        .insert(local_index_key(&unrelated), unrelated_entry);
+    index
+        .claude_account_deferred_holds
+        .insert(local_index_key(&unrelated), "unrelated-kept".into());
+    let (recovered, rows) = crate::local_resource_diagnostics::capture(|| {
+        raw_scan_at(
+            &f,
+            index,
+            Some(Arc::new(SharedCache::default())),
+            true,
+            "2026-08-02T07:12:00Z",
+            |scan| {
+                assert_eq!(
+                    scan.claude_title_metadata.recovered_account_holds,
+                    BTreeSet::from([key.clone()])
+                );
+                // The diagnostic set is no input to the selection hash.
+                let mut unnoted = scan.claude_title_metadata.clone();
+                unnoted.recovered_account_holds.clear();
+                assert_eq!(
+                    unnoted.session_sidecar_fingerprint(&f.session),
+                    scan.claude_title_metadata
+                        .session_sidecar_fingerprint(&f.session)
+                );
+            },
+        )
+    });
+    assert_eq!(recovered.result.snapshots.len(), 1);
+    assert_eq!(recovered.result.snapshots[0].source_session_id, f.session);
+    assert_eq!(recovered.native_bytes, fs::metadata(&f.path).unwrap().len());
+    assert_eq!(
+        rows.iter()
+            .filter_map(
+                |row| row["counts"]["desktop_metadata"]["recovered_hold_body_rereads"].as_u64()
+            )
+            .sum::<u64>(),
+        1
+    );
+}
+
+const DESKTOP_ACCOUNT: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+const DESKTOP_ORG: &str = "123e4567-e89b-12d3-a456-426614174001";

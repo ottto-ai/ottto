@@ -235,7 +235,13 @@ impl Disk {
         index: &mut ScanIndex,
     ) -> ScanIndex {
         index.save(&self.index).unwrap();
-        crate::snapshots::durable_after_save(cache, &self.dir, source, index);
+        crate::snapshots::durable_after_save_and_retire(
+            cache,
+            &self.dir,
+            source,
+            index,
+            &self.index,
+        );
         ScanIndex::load(&self.index).unwrap()
     }
     fn records(&self) -> usize {
@@ -666,6 +672,16 @@ fn other_page(
     source: SnapshotSource,
     prior: ScanIndex,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    other_page_observing_raw(c, scanner, source, prior, |_| {})
+}
+
+fn other_page_observing_raw(
+    c: &Corpus,
+    scanner: &E2ScanFixture,
+    source: SnapshotSource,
+    prior: ScanIndex,
+    before_finalize: impl FnOnce(&[SnapshotItem]),
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
     let (mut index, mut scan, modes) = scanner.scan_other(
         source,
         std::slice::from_ref(&c.root),
@@ -675,6 +691,7 @@ fn other_page(
     );
     index.bind_session_accounts(source, "e2-synthetic-machine", &mut scan.snapshots, &[]);
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
+    before_finalize(&scan.snapshots);
     finalize_scan_after_policy(source, &mut scan, &mut index);
     scan.finish_codex_capture_boundary(&mut index);
     (index, scan, modes)

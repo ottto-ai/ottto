@@ -710,6 +710,8 @@ fn claude_h296_root_clocks_and_creator_conflicts_stay_separate() {
 
 #[test]
 fn claude_h296_root_production_enrichment_keeps_child_separate() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     // D1 session-account qualification and binding; E2 keeps per-request account partitions.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, api, trace) = h296_root_evidence();
@@ -746,10 +748,12 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// A cycle without the cohort permit builds today's bodies exactly; only a
-/// permitted cycle reaches contract 5.
+/// Contract 5 is always on: with no cohort token anywhere, a Claude page
+/// builds contract-5 bodies, the same bytes every run. Was
+/// `claude_contract5_bodies_need_this_cycles_cohort_permit`, whose
+/// tokenless and denied cycles kept today's (`COMPLETE`) bytes.
 #[test]
-fn claude_contract5_bodies_need_this_cycles_cohort_permit() {
+fn claude_contract5_bodies_need_no_cohort_token() {
     // D1 session-account qualification and binding; E2 keeps per-request account partitions.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_identity as identity;
@@ -764,35 +768,30 @@ fn claude_contract5_bodies_need_this_cycles_cohort_permit() {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, rows.iter().map(|row| row.to_string()+"\n").collect::<String>()).unwrap();
     }
-    let run = |permit: Option<identity::EmissionPermit>| {
+    let run = || {
         let mut index = ScanIndex::default();
         let mut scan = scan_source_roots_with_test_limit(SnapshotSource::ClaudeCode, std::slice::from_ref(&dir), &mut index, "2026-08-02T07:10:00Z", 7, 100, false).unwrap();
-        crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(&support, &mut scan, &mut index, permit);
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
         scan.snapshots
     };
     let collector = |items: &[SnapshotItem]| items.iter().find(|item| item.source_session_id == root.source_session_id).unwrap().provenance.collector.clone();
-    let claude = SnapshotSource::ClaudeCode;
-    let token = Some(identity::COHORT_HINT_TOKEN);
-    let dark = serde_json::to_vec(&run(None)).unwrap();
-    for denied in [
-        // This build: emission compiled on, but a cycle without the exact
-        // token still gets no permit.
-        identity::emission_permit(claude, None).ok(),
-        identity::emission_permit(claude, Some(" own_request_identity_rows:v1")).ok(),
-        identity::permit_when(true, claude, None).ok(),
-        identity::permit_when(true, claude, Some("own_request_identity_rows:v2")).ok(),
-        identity::permit_when(true, claude, Some(identity::COLLECTOR)).ok(),
-        identity::permit_when(true, SnapshotSource::Codex, token).ok(),
-    ] {
-        assert!(denied.is_none());
-        let items = run(denied);
-        assert_eq!(collector(&items), claude_request_accounts::COMPLETE);
-        assert_eq!(serde_json::to_vec(&items).unwrap(), dark, "denied cycles keep today's bytes");
-    }
-    let permitted = run(identity::permit_when(true, claude, token).ok());
-    assert_eq!(collector(&permitted), identity::COLLECTOR);
-    let released = run(identity::emission_permit(claude, token).ok());
-    assert_eq!(serde_json::to_vec(&released).unwrap(), serde_json::to_vec(&permitted).unwrap());
+    let first = run();
+    assert_eq!(collector(&first), identity::COLLECTOR);
+    let tagged = first
+        .iter()
+        .find(|item| item.source_session_id == root.source_session_id)
+        .unwrap();
+    assert!(
+        tagged.claude_org_markers.is_none(),
+        "fresh tags need no org marker"
+    );
+    assert!(
+        !tagged.request_evidence.is_empty(),
+        "fresh contract-5 bodies get identity tags"
+    );
+    assert_eq!(tagged.request_count, 4);
+    assert_eq!(tagged.request_identity_refusals, 0);
+    assert_eq!(serde_json::to_vec(&run()).unwrap(), serde_json::to_vec(&first).unwrap());
     fs::remove_dir_all(dir).unwrap();
 }
 

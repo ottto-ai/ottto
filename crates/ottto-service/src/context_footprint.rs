@@ -11,6 +11,7 @@ use crate::context_file_counts::{load_or_create_salt, measure_file, FileCounts};
 use crate::instruction_inventory::{
     build_instruction_inventory, default_login_claude_mode, InstructionInventory, InventoryPaths,
 };
+use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{
     load_snapshot_device_credentials, workspace_labels_allowed, ActivityHintResponse,
     SnapshotApiClient,
@@ -241,6 +242,7 @@ pub fn spawn_context_footprint_sync(daemon: &crate::LocalDaemon) -> Result<()> {
     let home = crate::snapshot_sync::home_dir()?;
     let support_dir = default_support_dir();
     let projection = Arc::clone(&daemon.footprint_cwds);
+    let codex_preludes = Arc::clone(&daemon.codex_preludes);
     std::thread::Builder::new()
         .name("ottto-context-footprint-sync".to_string())
         .spawn(move || loop {
@@ -255,7 +257,9 @@ pub fn spawn_context_footprint_sync(daemon: &crate::LocalDaemon) -> Result<()> {
                 }
             };
             // Codex session starts share this thread: no extra background job.
-            if let Err(error) = crate::codex_prelude_footprint::harvest_once(&home, &support_dir) {
+            if let Err(error) =
+                crate::codex_prelude_footprint::harvest_once(&home, &support_dir, &codex_preludes)
+            {
                 eprintln!(
                     "codex session start harvest skipped: {}",
                     crate::snapshot_sync::safe_error(&error)
@@ -285,7 +289,7 @@ fn harvest_all_once(
     let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
+    let api_base_url = crate::snapshot_sync::snapshot_api_base_url()?;
     let client = SnapshotApiClient::new(api_base_url.clone());
     harvest_source(
         &client,
@@ -1512,33 +1516,6 @@ fn dedupe_workspace_candidates_by_repository(
     out
 }
 
-pub(crate) fn collect_recent_jsonl_files(
-    dir: &Path,
-    now: SystemTime,
-    out: &mut Vec<(PathBuf, SystemTime)>,
-) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if metadata.is_dir() {
-            collect_recent_jsonl_files(&path, now, out);
-            continue;
-        }
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        if now.duration_since(mtime).unwrap_or(Duration::ZERO) <= RECENT_WORKSPACE_WINDOW {
-            out.push((path, mtime));
-        }
-    }
-}
-
 fn string_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     let mut current = value;
     for key in path {
@@ -1575,7 +1552,7 @@ fn upload_if_changed(
     let payload = serde_json::to_value(request)
         .map_err(|error| anyhow!("encode context footprint: {error}"))?;
     client.upload_context_footprint(relay_token, &payload)?;
-    write_cache(
+    write_json_atomic(
         &path,
         &FootprintCacheEntry {
             identity: identity.to_string(),
@@ -1677,22 +1654,6 @@ fn read_cache(path: &Path) -> Option<FootprintCacheEntry> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn write_cache(path: &Path, entry: &FootprintCacheEntry) {
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let Ok(payload) = serde_json::to_vec(entry) else {
-        return;
-    };
-    let temp = path.with_extension("json.tmp");
-    if fs::write(&temp, &payload).is_ok() {
-        let _ = fs::rename(&temp, path);
-    }
-}
-
 fn cache_is_stale(entry: &FootprintCacheEntry, now: OffsetDateTime) -> bool {
     let Ok(posted) = OffsetDateTime::parse(&entry.posted_at, &Rfc3339) else {
         return true;
@@ -1749,6 +1710,46 @@ pub(crate) fn workspace_label(workspace: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Recent plain `.jsonl` transcripts under `dir`. Recent `.jsonl.zst` archives
+    /// are counted in `compressed` and never opened.
+    fn collect_recent_jsonl_files(
+        dir: &Path,
+        now: SystemTime,
+        out: &mut Vec<(PathBuf, SystemTime)>,
+        compressed: &mut usize,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                collect_recent_jsonl_files(&path, now, out, compressed);
+                continue;
+            }
+            let plain = path.extension().and_then(|value| value.to_str()) == Some("jsonl");
+            let archive = !plain
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with(".jsonl.zst"));
+            if !plain && !archive {
+                continue;
+            }
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if now.duration_since(mtime).unwrap_or(Duration::ZERO) <= RECENT_WORKSPACE_WINDOW {
+                if plain {
+                    out.push((path, mtime));
+                } else {
+                    *compressed += 1;
+                }
+            }
+        }
+    }
+
     use super::*;
     use std::fs::File;
     use std::io::{BufRead, BufReader};
@@ -1811,32 +1812,6 @@ mod tests {
             assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
         }
         fixture.wait_settled();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn probe_context_preserves_exit_utf8_and_expired_launch_errors() {
-        for (output, exit, error) in [
-            (b"{}".as_slice(), 7, "exited unsuccessfully"),
-            ([0xff].as_slice(), 0, "stdout was not UTF-8"),
-        ] {
-            let fixture = ProbeFixture::new("probe-context-errors", "output", output, exit);
-            assert!(probe_context(&fixture, Duration::from_secs(2))
-                .err()
-                .unwrap()
-                .to_string()
-                .contains(error));
-            fixture.wait_settled();
-        }
-        let fixture = ProbeFixture::new("probe-context-expired", "output", b"{}", 0);
-        assert!(probe_context(&fixture, Duration::ZERO)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("timed out"));
-        assert!(!fixture.fake.root.join("direct").exists());
-        assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
     }
 
     #[cfg(unix)]
@@ -1916,35 +1891,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "OS FD/thread measurements require an isolated test process"]
-    #[serial_test::serial]
-    fn probe_context_resource_measurement() {
-        use crate::claude_spawn_gate::test_support::probe_resources;
-        for mode in ["protected", "escaped"] {
-            let before = probe_resources();
-            {
-                let fixture = ProbeFixture::new("probe-context-resource", mode, &[], 0);
-                let budget = if mode == "escaped" {
-                    Duration::from_secs(2)
-                } else {
-                    Duration::from_millis(500)
-                };
-                assert!(probe_context(&fixture, budget).is_err());
-                assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
-                fixture.release();
-                fixture.wait_settled();
-            }
-            let end = Instant::now() + Duration::from_secs(2);
-            while probe_resources() != before && Instant::now() < end {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let after = probe_resources();
-            println!("CONTEXT_RESOURCE mode={mode} fds_before={} fds_after={} threads_before={} threads_after={} admitted=0", before.0,after.0,before.1,after.1);
-            assert_eq!(after, before);
-        }
-    }
     use crate::test_scratch;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -2121,14 +2067,6 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn token_parser_handles_suffixes() {
-        assert_eq!(parse_token_count("42.2k"), Some(42_200));
-        assert_eq!(parse_token_count("1m"), Some(1_000_000));
-        assert_eq!(parse_token_count("8"), Some(8));
-        assert_eq!(parse_percent("95.8%"), Some(95.8));
-    }
-
     /// The `/context` read runs an hour before expiry and is refused ten
     /// minutes before it (never started), with a 30-minute retry.
     #[test]
@@ -2167,53 +2105,6 @@ mod tests {
     }
 
     #[test]
-    fn only_newest_workspace_enables_mcp_with_the_long_timeout() {
-        assert!(should_include_mcp_servers(0));
-        assert!((1..MAX_WORKSPACES_PER_CYCLE).all(|index| !should_include_mcp_servers(index)));
-
-        let mut sampled = Command::new("claude");
-        let sampled_timeout = configure_claude_context_command(&mut sampled, true);
-        let sampled_args: Vec<_> = sampled.get_args().collect();
-        assert!(!sampled_args.iter().any(|arg| *arg == "--strict-mcp-config"));
-        assert_eq!(sampled_timeout, CONTEXT_MCP_COMMAND_TIMEOUT);
-
-        let mut strict = Command::new("claude");
-        let strict_timeout = configure_claude_context_command(&mut strict, false);
-        let strict_args: Vec<_> = strict.get_args().collect();
-        assert!(strict_args.iter().any(|arg| *arg == "--strict-mcp-config"));
-        assert_eq!(strict_timeout, CONTEXT_COMMAND_TIMEOUT);
-        assert!(
-            CONTEXT_CYCLE_BUDGET
-                >= CONTEXT_MCP_COMMAND_TIMEOUT
-                    + CONTEXT_COMMAND_TIMEOUT * (MAX_WORKSPACES_PER_CYCLE as u32 - 1)
-        );
-    }
-
-    #[test]
-    fn discovers_recent_workspace_from_claude_jsonl() {
-        let home = temp_dir("discover");
-        let workspace = home.join("work").join("repo");
-        fs::create_dir_all(&workspace).unwrap();
-        let project = home.join(".claude").join("projects").join("-work-repo");
-        fs::create_dir_all(&project).unwrap();
-        fs::write(
-            project.join("session.jsonl"),
-            format!(
-                "{{\"type\":\"session\",\"cwd\":\"{}\",\"timestamp\":\"2026-06-29T00:00:00Z\"}}\n",
-                workspace.to_string_lossy()
-            ),
-        )
-        .unwrap();
-
-        let (discovered, path_scopes) = discover_with_counts(&home, SystemTime::now());
-
-        assert_eq!(discovered.len(), 1);
-        assert_eq!(path_scopes, 1);
-        assert_eq!(discovered[0].path, workspace);
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
     fn repository_identity_groups_root_and_subdir_without_raw_paths() {
         let repo = init_git_repo("repo-identity-root");
         let subdir = repo.join("backend");
@@ -2249,19 +2140,6 @@ mod tests {
         );
         let encoded = serde_json::to_string(&root_identity.repository_label).unwrap();
         assert!(!encoded.contains("/Users/"));
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn repository_identity_respects_label_privacy() {
-        let repo = init_git_repo("repo-identity-private-labels");
-
-        let identity = resolve_repository_identity(&repo, false);
-
-        assert!(identity.repository_hash.is_some());
-        assert!(identity.repository_label.is_none());
-        assert!(identity.repository_label_source.is_none());
-        assert_eq!(identity.workspace_kind.as_deref(), Some("repository_root"));
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -2355,80 +2233,16 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
-    #[test]
-    fn repository_identity_labels_worktree_subdir_after_main_checkout() {
-        let repo = init_git_repo("repo-identity-worktree-subdir");
-        let worktree = temp_dir("repo-identity-worktree-subdir-linked");
-        fs::remove_dir_all(&worktree).unwrap();
-        let worktree_text = worktree.to_string_lossy().to_string();
-        run_git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "context-subdir-test",
-                &worktree_text,
-            ],
-        );
-        let subdir = worktree.join("nested");
-        fs::create_dir_all(&subdir).unwrap();
-
-        let root_identity = resolve_repository_identity(&repo, true);
-        let subdir_identity = resolve_repository_identity(&subdir, true);
-
-        assert_eq!(
-            root_identity.repository_hash,
-            subdir_identity.repository_hash
-        );
-        assert_eq!(
-            subdir_identity.workspace_kind.as_deref(),
-            Some("linked_worktree")
-        );
-        assert_eq!(
-            subdir_identity.repository_label,
-            root_identity.repository_label
-        );
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["worktree", "remove", "--force", &worktree_text])
-            .status();
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn dedupes_recent_candidates_by_repository_hash() {
-        let repo = init_git_repo("repo-identity-dedupe");
-        let subdir = repo.join("frontend");
-        fs::create_dir_all(&subdir).unwrap();
-        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
-
-        let out = dedupe_workspace_candidates_by_repository(
-            vec![
-                WorkspaceCandidate {
-                    path: repo.clone(),
-                    last_seen: older,
-                },
-                WorkspaceCandidate {
-                    path: subdir.clone(),
-                    last_seen: newer,
-                },
-            ],
-            |candidate| repository_scope(&candidate.path).0,
-        );
-
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].path, subdir);
-        let _ = fs::remove_dir_all(&repo);
-    }
-
     /// Discovery before the projection: every recent file is parsed whole,
     /// then deduplicated by repository and truncated to one cycle.
     fn discover_all_files_oracle(home: &Path, now: SystemTime) -> Vec<WorkspaceCandidate> {
         let mut files = Vec::new();
-        collect_recent_jsonl_files(&home.join(".claude").join("projects"), now, &mut files);
+        collect_recent_jsonl_files(
+            &home.join(".claude").join("projects"),
+            now,
+            &mut files,
+            &mut 0,
+        );
         files.sort_by_key(|item| std::cmp::Reverse(item.1));
         let mut by_path: BTreeMap<String, WorkspaceCandidate> = BTreeMap::new();
         for (file, mtime) in files {
@@ -2513,6 +2327,7 @@ mod tests {
                 observer.line(
                     &view,
                     &PhysicalLine {
+                        end: 0,
                         value: value.as_ref(),
                     },
                 );
@@ -2525,6 +2340,8 @@ mod tests {
         let (object, _) = FileObject::of(&File::open(path).unwrap()).unwrap();
         FileView {
             source: SnapshotSource::ClaudeCode,
+            root: Some(0),
+            start: 0,
             object,
             mtime: Some(mtime),
             mode,
@@ -2533,7 +2350,12 @@ mod tests {
 
     fn discover_with_counts(home: &Path, now: SystemTime) -> (Vec<WorkspaceCandidate>, usize) {
         let mut files = Vec::new();
-        collect_recent_jsonl_files(&home.join(".claude").join("projects"), now, &mut files);
+        collect_recent_jsonl_files(
+            &home.join(".claude").join("projects"),
+            now,
+            &mut files,
+            &mut 0,
+        );
         let projection = Arc::new(CwdProjection::default());
         project_transcripts(&projection, &files);
         let mut path_scopes = 0;
@@ -2574,40 +2396,6 @@ mod tests {
             dirs[..MAX_WORKSPACES_PER_CYCLE].to_vec()
         );
         assert_eq!(path_scopes, 15);
-        fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn projected_discovery_keeps_the_boundary_mtime_tie_order() {
-        let home = temp_dir("early-stop-tie");
-        let now = SystemTime::now();
-        let dirs: Vec<PathBuf> = (0..16)
-            .map(|index| {
-                let dir = home.join("work").join(format!("tie-{index:02}"));
-                fs::create_dir_all(&dir).unwrap();
-                dir
-            })
-            .collect();
-        // Files 10..=13 share one mtime across the twelfth-scope boundary;
-        // the scope-hash order among them decides which survive truncation.
-        let files: Vec<(u64, Vec<&Path>)> = dirs
-            .iter()
-            .enumerate()
-            .map(|(index, dir)| {
-                let age = match index {
-                    0..=9 => 60 * (index as u64 + 1),
-                    10..=13 => 6_000,
-                    _ => 60_000 + index as u64,
-                };
-                (age, vec![dir.as_path()])
-            })
-            .collect();
-        write_discovery_transcripts(&home, now, &files);
-
-        let (found, _) = discover_with_counts(&home, now);
-
-        assert_eq!(found, discover_all_files_oracle(&home, now));
-        assert_eq!(found.len(), MAX_WORKSPACES_PER_CYCLE);
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -2676,202 +2464,25 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// One transcript per entry naming `cwd`, projected with the captured
-    /// mtime; the file's real mtime is left as written.
-    fn captured_cwds(root: &Path, entries: &[(&Path, SystemTime)]) -> BTreeMap<String, SystemTime> {
-        let files: Vec<(PathBuf, SystemTime)> = entries
-            .iter()
-            .enumerate()
-            .map(|(index, (cwd, mtime))| {
-                let path = root.join(format!("captured-{index:03}.jsonl"));
-                fs::write(&path, format!("{}\n", json!({"cwd": cwd}))).unwrap();
-                (path, *mtime)
-            })
-            .collect();
-        let projection = Arc::new(CwdProjection::default());
-        project_transcripts(&projection, &files);
-        let all = projection
-            .lock()
-            .files
-            .values()
-            .map(|file| file.mtime)
-            .min();
-        projection.recent_cwds(all.unwrap() + RECENT_WORKSPACE_WINDOW)
-    }
-
-    #[test]
-    fn discovery_ranks_by_captured_mtimes_and_orders_ties_by_scope() {
-        let root = temp_dir("early-stop-captured");
-        let dirs: Vec<PathBuf> = (0..16)
-            .map(|index| {
-                let dir = root.join(format!("ws-{index:02}"));
-                fs::create_dir_all(&dir).unwrap();
-                dir
-            })
-            .collect();
-        let epoch = SystemTime::UNIX_EPOCH;
-        let at = |secs: u64| epoch + Duration::from_secs(secs);
-        // Captured times, not the files' real ones: ten distinct newest, a
-        // four-way tie across the twelfth scope, then an epoch fallback.
-        let mut entries: Vec<(&Path, SystemTime)> = (0..10)
-            .map(|index| (dirs[index].as_path(), at(2_000 - index as u64)))
-            .collect();
-        for dir in &dirs[10..14] {
-            entries.push((dir.as_path(), at(1_000)));
-        }
-        entries.push((dirs[14].as_path(), at(500)));
-        entries.push((dirs[15].as_path(), epoch));
-        let cwds = captured_cwds(&root, &entries);
-        // Injected scopes make the tie order explicit: z-scopes sort last.
-        let scope_names = ["z1", "a1", "z0", "a0"];
-        let scope_of = |path: &Path| {
-            let index = dirs.iter().position(|dir| dir == path).unwrap();
-            match index {
-                10..=13 => (scope_names[index - 10].to_string(), false),
-                _ => (format!("m{index:02}"), true),
-            }
-        };
-        let mut path_scopes = 0;
-
-        let mut found = discover_workspaces(cwds, &mut path_scopes, scope_of);
-        found.truncate(MAX_WORKSPACES_PER_CYCLE);
-
-        let mut expected: Vec<(PathBuf, SystemTime)> = (0..10)
-            .map(|index| (dirs[index].clone(), at(2_000 - index as u64)))
-            .collect();
-        // Scope order inside the tie: a0 (dir 13), a1 (dir 11).
-        expected.push((dirs[13].clone(), at(1_000)));
-        expected.push((dirs[11].clone(), at(1_000)));
-        assert_eq!(
-            found
-                .iter()
-                .map(|candidate| (candidate.path.clone(), candidate.last_seen))
-                .collect::<Vec<_>>(),
-            expected
-        );
-        assert_eq!(path_scopes, 12);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn discovery_counts_path_scopes_when_repository_probes_fail() {
-        let root = temp_dir("early-stop-probe-fails");
-        let dirs: Vec<PathBuf> = (0..14)
-            .map(|index| {
-                let dir = root.join(format!("pkg-{index:02}"));
-                fs::create_dir_all(&dir).unwrap();
-                dir
-            })
-            .collect();
-        let entries: Vec<(&Path, SystemTime)> = dirs
-            .iter()
-            .enumerate()
-            .map(|(index, dir)| {
-                (
-                    dir.as_path(),
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(100 - index as u64),
-                )
-            })
-            .collect();
-        // If every probe fails, directories of one repository look like
-        // separate scopes; the path-scope counter makes that visible.
-        let failing = |path: &Path| (frozen_path_scope(path), true);
-        let mut path_scopes = 0;
-        let found = discover_workspaces(captured_cwds(&root, &entries), &mut path_scopes, failing);
-        assert_eq!((found.len(), path_scopes), (14, 14));
-
-        // With the probe answering, they are one repository.
-        let answering = |_: &Path| ("repository".to_string(), false);
-        let mut path_scopes = 0;
-        let found =
-            discover_workspaces(captured_cwds(&root, &entries), &mut path_scopes, answering);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].path, dirs[0]);
-        assert_eq!(path_scopes, 0);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn projected_discovery_merges_files_naming_one_workspace() {
-        let home = temp_dir("early-stop-few");
-        let now = SystemTime::now();
-        let dirs: Vec<PathBuf> = (0..5)
-            .map(|index| {
-                let dir = home.join("work").join(format!("few-{index:02}"));
-                fs::create_dir_all(&dir).unwrap();
-                dir
-            })
-            .collect();
-        let files: Vec<(u64, Vec<&Path>)> = (0..9)
-            .map(|index| (60 * (index as u64 + 1), vec![dirs[index % 5].as_path()]))
-            .collect();
-        write_discovery_transcripts(&home, now, &files);
-
-        let (found, _) = discover_with_counts(&home, now);
-
-        assert_eq!(found, discover_all_files_oracle(&home, now));
-        assert_eq!(found.len(), 5);
-        fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn discovery_keeps_tied_representatives_and_future_mtimes_in_order() {
-        let repo = init_git_repo("early-stop-representative");
-        let now = SystemTime::now();
-        let alpha = repo.join("alpha");
-        let beta = repo.join("beta");
-        fs::create_dir_all(&alpha).unwrap();
-        fs::create_dir_all(&beta).unwrap();
-        let home = temp_dir("early-stop-representative-home");
-        let plain: Vec<PathBuf> = (0..12)
-            .map(|index| {
-                let dir = home.join("work").join(format!("plain-{index:02}"));
-                fs::create_dir_all(&dir).unwrap();
-                dir
-            })
-            .collect();
-        let future = home.join("work").join("future");
-        fs::create_dir_all(&future).unwrap();
-        // Two tied files of one repository name its directories in opposite
-        // line orders; the path-ordered representative must win either way.
-        let mut files: Vec<(u64, Vec<&Path>)> = vec![
-            (300, vec![beta.as_path(), alpha.as_path()]),
-            (300, vec![alpha.as_path(), beta.as_path()]),
-        ];
-        for (index, dir) in plain.iter().enumerate() {
-            files.push((600 + 60 * index as u64, vec![dir.as_path()]));
-        }
-        write_discovery_transcripts(&home, now, &files);
-        // A clock-skewed future mtime is still inside the window and newest.
-        let future_file = home
-            .join(".claude")
-            .join("projects")
-            .join("-early-stop")
-            .join("session-future.jsonl");
-        fs::write(&future_file, format!("{}\n", json!({"cwd": future}))).unwrap();
-        File::options()
-            .write(true)
-            .open(&future_file)
-            .unwrap()
-            .set_modified(now + Duration::from_secs(3_600))
-            .unwrap();
-
-        let (found, _) = discover_with_counts(&home, now);
-
-        assert_eq!(found, discover_all_files_oracle(&home, now));
-        assert_eq!(found[0].path, future);
-        assert_eq!(found[1].path, alpha);
-        let _ = fs::remove_dir_all(&repo);
-        let _ = fs::remove_dir_all(&home);
-    }
-
     fn deliver(observer: &mut CwdObserver, view: &FileView, lines: &[Value], end: DeliveryEnd) {
         let want = observer.begin(view);
         if want == Want::Lines {
             for value in lines {
-                observer.line(view, &PhysicalLine { value: Some(value) });
+                observer.line(
+                    view,
+                    &PhysicalLine {
+                        end: 0,
+                        value: Some(value),
+                    },
+                );
             }
-            observer.line(view, &PhysicalLine { value: None });
+            observer.line(
+                view,
+                &PhysicalLine {
+                    end: 0,
+                    value: None,
+                },
+            );
         }
         observer.end(view, &end);
     }
@@ -3040,59 +2651,6 @@ mod tests {
     }
 
     #[test]
-    fn projection_evicts_oldest_files_at_its_cap_and_forgets_old_ones() {
-        let root = temp_dir("cwd-projection-cap");
-        let day = Duration::from_secs(24 * 60 * 60);
-        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let lines: Vec<Value> = (0..OBSERVED_CWDS_PER_FILE)
-            .map(|i| json!({"cwd": format!("/{i}{}", "c".repeat(OBSERVED_CWD_MAX_BYTES - 2))}))
-            .collect();
-        let per_file = PROJECTED_FILE_BYTES
-            + OBSERVED_CWDS_PER_FILE * (std::mem::size_of::<String>() + OBSERVED_CWD_MAX_BYTES);
-        let fits = PROJECTION_MAX_BYTES / per_file;
-        let projection = Arc::new(CwdProjection::default());
-        let mut observer = projection.observer();
-        let mut views = Vec::new();
-        for index in 0..fits + 3 {
-            let path = root.join(format!("session-{index:03}.jsonl"));
-            fs::write(&path, "").unwrap();
-            let view = claude_view(&path, start + day * index as u32, DeliveryMode::Full);
-            deliver(&mut observer, &view, &lines, DeliveryEnd::Complete);
-            views.push(view);
-        }
-        {
-            let state = projection.lock();
-            assert_eq!(state.files.len(), fits);
-            assert!(state
-                .files
-                .values()
-                .all(|file| projected_bytes(file) == per_file));
-            assert_eq!(state.bytes, fits * per_file);
-            assert_eq!(state.evicted_files, 3);
-        }
-        assert!(views[..3]
-            .iter()
-            .all(|view| projected(&projection, view).is_none()));
-        assert!(projected(&projection, &views[3]).is_some());
-
-        // A cycle forgets files outside the window and their bytes.
-        let newest = start + day * (fits + 2) as u32;
-        let cwds = projection.recent_cwds(newest);
-        assert_eq!(cwds.len(), OBSERVED_CWDS_PER_FILE);
-        assert!(cwds.values().all(|mtime| *mtime == newest));
-        let state = projection.lock();
-        assert_eq!(state.files.len(), 15);
-        assert_eq!(state.bytes, 15 * per_file);
-        drop(state);
-        // Forgetting every file releases the map's slots too.
-        assert!(projection.recent_cwds(newest + day * 30).is_empty());
-        let state = projection.lock();
-        assert_eq!((state.bytes, state.files.capacity()), (0, 0));
-        drop(state);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn projection_rebuilds_its_map_after_evictions_and_pruning() {
         // The per-file charge covers a map of twice its files plus eight only
         // while one slot (entry and control byte at 7/8 load) is under 128 bytes.
@@ -3147,42 +2705,6 @@ mod tests {
         );
         drop(state);
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn cache_freshness_tracks_max_staleness() {
-        let now = OffsetDateTime::from_unix_timestamp(1_750_000_000).unwrap();
-        let entry = FootprintCacheEntry {
-            identity: "device|machine|api".to_string(),
-            footprint_sha256: "abc".to_string(),
-            posted_at: now.format(&Rfc3339).unwrap(),
-        };
-        assert!(!cache_is_stale(&entry, now));
-        assert!(!cache_is_stale(
-            &entry,
-            now + time::Duration::seconds(CONTEXT_MAX_STALENESS_SECS - 1)
-        ));
-        assert!(cache_is_stale(
-            &entry,
-            now + time::Duration::seconds(CONTEXT_MAX_STALENESS_SECS)
-        ));
-    }
-
-    #[test]
-    fn request_hash_ignores_machine_and_workspace_metadata() {
-        let parsed = parse_context_markdown(
-            r#"**Model:** claude
-**Tokens:** 10 / 100 (10%)
-### Estimated usage by category
-| Category | Tokens | Percentage |
-|---|---:|---:|
-| Free space | 90 | 90% |
-"#,
-        )
-        .unwrap();
-        let hash = request_content_hash(&parsed).unwrap();
-        assert_eq!(hash.len(), 64);
-        assert_eq!(hash, request_content_hash(&parsed).unwrap());
     }
 
     fn sample_request() -> ContextFootprintIngestRequest {

@@ -8,18 +8,21 @@ pub(crate) const ABSENT_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 // Domain-separated SHA-256 prefixes are local lookup keys, never move proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LocationKey([u8; 16]);
-impl crate::heap_layout_bound::HeapLayoutBound for LocationKey {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; LocationKey);
 fn key(domain: &[u8], value: &str) -> LocationKey {
     let mut h = Sha256::new();
     h.update(domain);
     h.update(value.as_bytes());
     LocationKey(h.finalize()[..16].try_into().expect("digest prefix"))
+}
+impl LocationKey {
+    /// The stored digest bytes (local state encodings only, never wire).
+    pub(crate) fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+    pub(crate) fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
 }
 pub(crate) fn location_key(path: &str) -> LocationKey {
     key(b"claude-money-path-v1\0", path)
@@ -283,25 +286,6 @@ impl BirthStore {
             (Err(i), marks) => self.2.paths.insert(i, (key, marks)),
         }
     }
-    /// Set or clear one mark of a path, keeping its other marks.
-    pub(crate) fn set_money_mark(&mut self, path: &str, mark: u8, on: bool) {
-        let marks = self.money_marks(location_key(path));
-        self.set_money_marks(path, if on { marks | mark } else { marks & !mark });
-    }
-    /// Paths carrying `mark`.
-    pub(crate) fn money_mark_count(&self, mark: u8) -> u64 {
-        self.2.paths.iter().filter(|m| m.1 & mark != 0).count() as u64
-    }
-    /// E3 permit bit: it describes the stamped body of the entry a save
-    /// keeps, so a restored entry takes the committed table's bit.
-    pub(crate) fn restore_permit_mark(&mut self, path: &str, committed: &Self) {
-        if self.2.paths.is_empty() && committed.2.paths.is_empty() {
-            return;
-        }
-        let mark = super::claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
-        let on = committed.money_marks(location_key(path)) & mark != 0;
-        self.set_money_mark(path, mark, on);
-    }
     /// Keep only marks of the given (indexed) paths.
     pub(crate) fn retain_money_marks(&mut self, live: &[LocationKey]) {
         self.2
@@ -450,6 +434,57 @@ impl BirthStore {
         }
     }
 
+    /// Metadata-only validation, before any custody or generation is retired.
+    pub(in crate::snapshots) fn can_record_discovered_move(
+        &self,
+        session: &str,
+        from: &str,
+        to: &str,
+        opened: ClaudeOpenedBirth,
+    ) -> bool {
+        let Some(s) = self.get(session) else {
+            return false;
+        };
+        let source = location_key(from);
+        let Some(old) = s.4.iter().find(|o| o.0 == source) else {
+            return false;
+        };
+        s.1 == source
+            && old.1 != 0
+            && old.1 == opened.birth
+            && old.3.covers(opened)
+            && old.2 < MAX_GENERATION
+            && s.4
+                .iter()
+                .find(|o| o.0 == location_key(to))
+                .map_or(true, |o| o.1 == opened.birth && o.3.covers(opened))
+    }
+
+    /// The caller already moved custody after can_record_discovered_move, with
+    /// exclusive ownership. Existing indexed destinations may retain the same generation.
+    pub(in crate::snapshots) fn record_discovered_move(
+        &mut self,
+        session: &str,
+        from: &str,
+        to: &str,
+        opened: ClaudeOpenedBirth,
+    ) -> bool {
+        if !self.can_record_discovered_move(session, from, to, opened) {
+            return false;
+        }
+        self.record_opened(session, to, i128::from(opened.birth), opened);
+        self.record_proven_move(session, location_key(from), to)
+    }
+
+    /// Existing generation tombstones identify a custody handoff across settlement.
+    pub(in crate::snapshots) fn moved_to(&self, session: &str, from: &str) -> Option<LocationKey> {
+        let s = self.get(session)?;
+        let from = location_key(from);
+        s.4.iter()
+            .any(|o| o.0 == from && o.1 == 0 && o.2 != 0)
+            .then_some(s.1)
+    }
+
     /// Caller proves a move of the current owner at the existing read boundary.
     /// Equal minima transfer ownership too; other live twins keep their cutoff.
     pub(crate) fn record_proven_move(
@@ -539,17 +574,11 @@ impl BirthStore {
     }
     /// Observations survive partial/held save restoration independently of ACKs.
     pub(crate) fn preserve_missing_from(&mut self, previous: &Self) {
-        // A mark only adds a re-read later; keep the newer version. The
-        // permit bit is never revived here: it follows the kept entry
-        // (`restore_permit_mark`), so a consumed bit stays consumed.
+        // A mark only adds a re-read later; keep the newer version.
         self.2.version = self.2.version.max(previous.2.version);
-        let permit = super::claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
         for &(key, marks) in &previous.2.paths {
-            if marks & !permit == 0 {
-                continue;
-            }
             if let Err(i) = self.2.paths.binary_search_by_key(&key, |m| m.0) {
-                self.2.paths.insert(i, (key, marks & !permit));
+                self.2.paths.insert(i, (key, marks));
             }
         }
         for old in &previous.0 {

@@ -74,6 +74,14 @@ pub(super) struct Starting {
 }
 
 impl Starting {
+    pub(super) fn rearm_cause(&self) -> crate::local_resource_diagnostics::rearm_cause::Cause {
+        use crate::local_resource_diagnostics::rearm_cause::Cause;
+        match self.reason {
+            StartReason::NoRetainedTraversal => Cause::NoRetainedTraversal,
+            StartReason::ContextChanged => Cause::ContextChanged,
+            StartReason::TerminalUnhealthyRetry => Cause::TerminalUnhealthyRetry,
+        }
+    }
     /// Called only AFTER the existing resume/backoff early return. Thus a
     /// retained matching traversal reached the real terminal-unhealthy retry.
     pub(super) fn capture(
@@ -585,7 +593,6 @@ mod tests {
             SnapshotSource::Pi,
             &mut scan,
             &mut index,
-            true,
             |_| String::new(),
         );
         assert!(!index.bounded_sweep_had_unsettled_upload);
@@ -749,7 +756,6 @@ mod tests {
                     SnapshotSource::Pi,
                     &mut scan,
                     index,
-                    true,
                     |_| String::new(),
                 );
             }
@@ -873,9 +879,15 @@ mod tests {
 
     fn max_traversal_counts() -> ScanTraversalCounts {
         let mut value = serde_json::to_value(ScanTraversalCounts::default()).unwrap();
+        value["causes"] = json!({"contributions": vec![u64::MAX; 8]});
         for (name, value) in value.as_object_mut().unwrap() {
             if let Some(object) = value.as_object_mut() {
-                for counter in object.get_mut("counts").unwrap().as_array_mut().unwrap() {
+                let field = if name == "causes" {
+                    "contributions"
+                } else {
+                    "counts"
+                };
+                for counter in object.get_mut(field).unwrap().as_array_mut().unwrap() {
                     *counter = json!(u64::MAX);
                 }
             } else {
@@ -912,6 +924,11 @@ mod tests {
             "shared_process_cpu_delta_us",
             "process_lifetime_max_rss_bytes",
             "process_lifetime_max_rss_before_bytes",
+            "stage_peak_footprint_bytes",
+            "stage_start_footprint_bytes",
+            "stage_end_footprint_bytes",
+            "footprint_samples",
+            "footprint_sample_failures",
         ] {
             assert!(row["observation"][field].is_null());
         }

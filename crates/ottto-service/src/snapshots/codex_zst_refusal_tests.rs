@@ -60,6 +60,7 @@ pub(super) fn candidate(path: &Path) -> CandidateFile {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     }
 }
 
@@ -145,7 +146,7 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
                 &index,
                 &interpretation
             ),
-            sampled_scan::durable_tail::RestoreOutcome::Miss
+            sampled_scan::durable_tail::RestoreOutcome::Miss(_)
         ));
     });
     fs::remove_dir_all(root).unwrap();

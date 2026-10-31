@@ -167,6 +167,7 @@ pub(crate) trait Owner {
     fn outcome(&mut self, source: Self::Source, result: Result<()>);
     fn monotonic(&self) -> Duration;
     fn parked(&mut self, _bytes: usize) {}
+    fn serial_fallback(&mut self, _source: Self::Source) {}
     /// Optional process-retained graphs outside every moving/parked frame.
     /// A graph moved into a frame is charged by `bound`, never here as well.
     /// Concrete owners must use the existing requested-layout admission;
@@ -177,6 +178,10 @@ pub(crate) trait Owner {
     /// Drop the whole optional window AND its permit, including tombstones.
     /// Accounting refusal must never forget a revocation and revive a root.
     fn discard_retained(&mut self) {}
+    /// No allowance exists even for independently bounded advisory state.
+    fn retained_budget_unavailable(&mut self) {
+        self.discard_retained();
+    }
     /// One optional turn after all due siblings have been offered. Every
     /// parked source remains busy, so a retry cannot publish beneath its
     /// unfinished native parser. No new thread, timer or parser ownership.
@@ -188,7 +193,7 @@ pub(crate) trait Owner {
 /// and one recheck; persistent unknown runs the same active frame serially.
 fn retained_remainder<O: Owner>(owner: &mut O, available: Option<usize>) -> Option<(usize, usize)> {
     let Some(available) = available else {
-        owner.discard_retained();
+        owner.retained_budget_unavailable();
         return None;
     };
     if let Some(bytes) = owner.retained_bound(available).filter(|b| *b <= available) {
@@ -309,6 +314,7 @@ pub(crate) fn run<O: Owner>(owner: &mut O, sources: &[O::Source], parked_budget:
                         }
                     }
                 }
+                owner.serial_fallback(source);
             }
             // Unsupported layout, opaque state or budget exhaustion: continue
             // this SAME owned frame serially. Never restart files for a turn.
@@ -445,6 +451,12 @@ mod retained_budget_tests {
             assert!(bytes <= PARKED_BUDGET);
             self.parks.push(bytes);
         }
+        fn serial_fallback(&mut self, source: usize) {
+            crate::local_resource_diagnostics::source_rotation_serial_fallback(
+                ["claude_code", "codex"][source],
+                crate::heap_layout_bound::layout_supported(),
+            );
+        }
         fn retained_bound(&self, limit: usize) -> Option<usize> {
             if self.persistent_unknown || (self.unknown && self.carry.is_some()) {
                 return None;
@@ -455,6 +467,99 @@ mod retained_budget_tests {
         fn discard_retained(&mut self) {
             self.discards += 1;
             self.carry = None;
+        }
+    }
+
+    #[test]
+    /// [regress] Production over-limit bounds return None, not an oversized Some.
+    fn serial_fallback_counts_real_bound_refusal_and_unsupported_layout() {
+        use crate::local_resource_diagnostics::{capture, CollectionCounts, Probe};
+        // No frame/owner fields: inject only the diagnostics layout admission.
+        struct Bounded<const LAYOUT_SUPPORTED: bool>;
+        impl<const LAYOUT_SUPPORTED: bool> Owner for Bounded<LAYOUT_SUPPORTED> {
+            type Source = &'static str;
+            type Frame = Vec<u8>;
+            type Completed = ();
+            fn prepare(&mut self, _: Self::Source, _: Option<usize>) -> Result<Option<Vec<u8>>> {
+                let mut frame = Vec::with_capacity(1024);
+                frame.resize(2 * TURN_STEPS + 1, 0);
+                Ok(Some(frame))
+            }
+            fn validate(&mut self, _: &Vec<u8>) -> Result<()> {
+                Ok(())
+            }
+            fn step(&mut self, mut frame: Vec<u8>, _: Option<usize>) -> Step<Vec<u8>, ()> {
+                frame.pop();
+                if frame.is_empty() {
+                    Step::Complete(())
+                } else {
+                    Step::Pending(frame)
+                }
+            }
+            fn bound(&self, frame: &Vec<u8>, limit: usize) -> Option<usize> {
+                crate::heap_layout_bound::bound(frame, limit)
+            }
+            fn finish(&mut self, _: (), _: Option<usize>) -> Result<()> {
+                Ok(())
+            }
+            fn outcome(&mut self, _: Self::Source, result: Result<()>) {
+                result.unwrap();
+            }
+            fn monotonic(&self) -> Duration {
+                Duration::ZERO
+            }
+            fn serial_fallback(&mut self, source: Self::Source) {
+                crate::local_resource_diagnostics::source_rotation_serial_fallback(
+                    source,
+                    LAYOUT_SUPPORTED,
+                );
+            }
+        }
+        let frame = Bounded::<true>
+            .prepare("claude_code", None)
+            .unwrap()
+            .unwrap();
+        assert!(Bounded::<true>.bound(&frame, 1024).is_none());
+        assert!(Bounded::<true>.bound(&frame, 4096).is_some());
+        let emit_page = |source| {
+            Probe::start().collection(
+                source,
+                CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            );
+        };
+        // Other rotation fixtures can leave this thread's page counts pending.
+        capture(|| {
+            emit_page("claude_code");
+            emit_page("codex");
+        });
+        for (supported, budget, expected) in [
+            (true, 1024, serde_json::json!({"bound_refused": 2})),
+            (false, 1024, serde_json::json!({"unsupported_layout": 2})),
+            (true, 4096, serde_json::Value::Null),
+        ] {
+            let (_, rows) = capture(|| {
+                let sources = ["claude_code", "codex"];
+                if supported {
+                    run(&mut Bounded::<true>, &sources, budget);
+                } else {
+                    run(&mut Bounded::<false>, &sources, budget);
+                }
+                for source in ["codex", "claude_code", "claude_code"] {
+                    emit_page(source);
+                }
+            });
+            assert_eq!(rows.len(), 3, "fallback adds no emitter");
+            assert!(rows[0]["counts"]["source_rotation_serial_fallback"].is_null());
+            assert_eq!(
+                rows[1]["counts"]["source_rotation_serial_fallback"],
+                expected
+            );
+            assert!(rows[2]["counts"]["source_rotation_serial_fallback"].is_null());
         }
     }
 

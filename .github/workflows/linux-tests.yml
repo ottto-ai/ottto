@@ -1,12 +1,15 @@
 name: Linux tests
 
-# Early, free signal for the portable test surface. macOS "Rust contracts" in
-# ci.yml stays the authority: it owns clippy, layout coverage, and native
-# behavior. A green Linux run is never merge evidence on its own.
+# Early, free signal for portable tests and clippy. macOS "Rust contracts" in
+# ci.yml stays authoritative for macOS-only cfg code, layout coverage, and
+# native behavior. A green Linux run is never merge evidence on its own.
 
 on:
   pull_request:
   workflow_dispatch:
+  # Daily main run that refreshes the shared Linux cache; PR refs only restore.
+  schedule:
+    - cron: "0 4 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -22,16 +25,16 @@ jobs:
     name: Rust format (Linux)
     timeout-minutes: 10
     runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: "1.95.0"
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
 
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt
+      - name: Rust setup
+        uses: ./.github/actions/rust-setup
+        with:
+          components: rustfmt
 
       - name: Rust format
         run: cargo fmt --all --check
@@ -41,10 +44,11 @@ jobs:
 
   rust-linux:
     name: Rust tests (Linux)
-    timeout-minutes: 45
+    # Heap-layout tests run here too: the lib step took 15-27 min in trial
+    # runs against 7-12 before.
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: "1.95.0"
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
@@ -52,45 +56,45 @@ jobs:
         with:
           persist-credentials: false
 
-      # rusqlite links the system SQLite; command-environment tests probe zsh.
-      - name: Install system packages
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev zsh
-
-      # Credential-path checks reject group/world-writable ancestors such as
-      # /tmp (1777). macOS hands each user a private TMPDIR; mirror that.
-      - name: Private temp directory
-        run: |
-          set -euo pipefail
-          install -d -m 0700 "$RUNNER_TEMP/tmp"
-          echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
-
-      - name: Compiler receipt
-        run: rustc -Vv && cargo -V
-
-      # Pull request caches are scoped to their own merge ref, so a PR cannot
-      # seed another PR's restore. Fork PRs never save.
-      - name: Rust cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Cache: only main saves. A save per PR merge ref (~331 MB each) filled
+      # the 10 GB repo cache and evicted the macOS main cache. PRs restore
+      # main's entry.
+      - name: Rust setup
+        uses: ./.github/actions/rust-setup
         with:
-          shared-key: linux-tests
-          workspaces: |
-            . -> target
-            crates -> crates/target
-          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          components: clippy
+          linux-test-env: "true"
+          cache-key: linux-tests
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Runtime clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Connector clippy
+        run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      # Build every test binary first, then let main save the cache even if a
+      # test fails, so one red main test does not leave PRs building cold. The
+      # switch flips only after a complete build, so a failed, cancelled or
+      # clippy-only build never stores a partial target dir under the key.
+      # CACHE_ON_FAILURE is what rust-cache's post-if reads (v2.9.3 action.yml).
+      # A build error here does not fail the step: the test steps below rebuild
+      # and report it exactly as before.
+      - name: Build tests
+        run: |
+          build_status=0
+          cargo test --workspace --locked --no-run || build_status=$?
+          cargo test --manifest-path crates/Cargo.toml --workspace --locked --no-run || build_status=$?
+          if [ "$build_status" -eq 0 ]; then
+            echo "CACHE_ON_FAILURE=true" >> "$GITHUB_ENV"
+          fi
 
       - name: Runtime tests
         # Print a failing assertion when it happens, not only after the suite.
         # Keep going past a failing test binary so one run lists every failure.
-        run: cargo test --workspace --locked --no-fail-fast -- --nocapture
+        # Same split as the macOS job (scripts/ci_runtime_tests.py).
+        run: python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1 --no-fail-fast
 
+      # Includes ottto-connector-testkit's first_party_sources contract tests.
       - name: Connector tests
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
-
-      - name: Connector package tests
-        run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources

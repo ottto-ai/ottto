@@ -154,7 +154,7 @@ pub fn snapshot() -> Option<ControlPlaneHealth> {
 }
 
 /// Whether the published unix listener is draining, if one is bound.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn published_listener_draining() -> Option<bool> {
     match LISTENER_FD.load(Ordering::SeqCst) {
         NO_LISTENER => None,

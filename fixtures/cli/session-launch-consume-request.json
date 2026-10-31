@@ -1,0 +1,10 @@
+{
+  "request_id": "req_launch_fixture",
+  "protocol_version": 28,
+  "client_kind": "cli",
+  "token": "synthetic-control-token",
+  "command": "session_launch_consume",
+  "schema_version": 1,
+  "launch_id": "lch_synthetic",
+  "secret": "synthetic-launch-secret"
+}

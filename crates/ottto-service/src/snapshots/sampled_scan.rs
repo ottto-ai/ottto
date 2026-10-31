@@ -17,7 +17,13 @@ const STATE_BYTES: usize =
 pub(super) mod codex_cursor;
 #[cfg(unix)]
 pub(super) mod durable_tail;
+#[cfg(all(unix, test))]
+pub(crate) use durable_tail::MissClass;
+#[cfg(unix)]
+pub(crate) use durable_tail::RestoreOutcome;
 pub(super) mod side_ledger;
+#[cfg(all(test, unix))]
+pub(crate) mod transition_fixture;
 
 /// The retained-copy cache behind `SharedCache::retained`.
 pub(super) type RetainedCache = TranscriptCache<CachedJsonlReduction>;
@@ -91,8 +97,62 @@ pub(crate) enum TestLock {
     Side,
 }
 
+// RAM-only per-key cap pacing; unify with P2's shared paced_full at integration.
+// Fixed slots charge their full inline size through SharedCache, with no path heap.
+pub(super) const CAP_PACE_SECONDS: u64 = 6 * 60 * 60;
+const CAP_CLOCK_SANITY_SECONDS: u64 = 30 * 24 * 60 * 60;
+#[derive(Clone, Copy)]
+struct CapStamp {
+    key: [u8; 32],
+    at: SystemTime,
+}
+struct CapPace {
+    entries: [Option<CapStamp>; CACHE_ENTRIES],
+}
+impl Default for CapPace {
+    fn default() -> Self {
+        Self {
+            entries: [None; CACHE_ENTRIES],
+        }
+    }
+}
+impl CapPace {
+    /// (may read Full, evicted). Backwards/implausible clocks expire, never hold.
+    fn admit(&mut self, key: &str, now: SystemTime) -> (bool, bool) {
+        let key: [u8; 32] = Sha256::digest(key.as_bytes()).into();
+        if let Some(slot) = self
+            .entries
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|old| old.key == key))
+        {
+            let old = slot.expect("matched pace");
+            if now.duration_since(old.at).is_ok_and(|elapsed| {
+                elapsed.as_secs() <= CAP_CLOCK_SANITY_SECONDS
+                    && elapsed.as_secs() < CAP_PACE_SECONDS
+            }) {
+                return (false, false);
+            }
+            *slot = Some(CapStamp { key, at: now });
+            return (true, false);
+        }
+        let empty = self.entries.iter().position(Option::is_none);
+        let slot = empty.unwrap_or_else(|| {
+            self.entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.expect("full pace").at)
+                .expect("nonempty pace")
+                .0
+        });
+        self.entries[slot] = Some(CapStamp { key, at: now });
+        (true, empty.is_none())
+    }
+}
+
 pub(crate) struct SharedCache {
+    pub(crate) withheld_memo: withheld_account::Memo,
     inner: Mutex<RetainedCache>,
+    cap_pace: Mutex<CapPace>,
     /// The resumable Codex job slot and held-singleton memo. Charged once,
     /// here; copy budgets and insert admission see it through this cache.
     cursor: Mutex<codex_cursor::CursorState>,
@@ -109,7 +169,9 @@ pub(crate) struct SharedCache {
 impl Default for SharedCache {
     fn default() -> Self {
         Self {
+            withheld_memo: Default::default(),
             inner: Mutex::new(TranscriptCache::with_byte_limit(STATE_BYTES)),
+            cap_pace: Mutex::new(CapPace::default()),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
             side: Mutex::new(side_ledger::SideLedger::default()),
             #[cfg(unix)]
@@ -124,6 +186,9 @@ impl std::fmt::Debug for SharedCache {
 }
 impl HeapLayoutBound for SharedCache {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        // The shared cache owns the memo allocation header even when empty.
+        // Its optional entries are priced separately by the rotation owner.
+        self.withheld_memo.heap_bound(c)?;
         if BLOCKING_RESIDENT_MEASURE.with(std::cell::Cell::get) {
             // P1-RETAIN R0's completion measure: wait for each lock, one at a
             // time and in lock order (`retained` checks this thread holds
@@ -143,7 +208,24 @@ impl HeapLayoutBound for SharedCache {
         c.add(side_ledger::SIDE_LEDGER_BYTES)
     }
 }
+#[cfg(test)]
 impl SharedCache {
+    pub(super) fn cap_pace_for_test(&self, key: &str, now: SystemTime) -> (bool, bool, usize) {
+        let mut pace = self.cap_pace.lock().unwrap();
+        let (admitted, evicted) = pace.admit(key, now);
+        (admitted, evicted, pace.entries.iter().flatten().count())
+    }
+}
+
+impl SharedCache {
+    /// Bind before constructor-time discovery/selection, which consults CONTENT.
+    pub(crate) fn bind_withheld(&self, index: &mut ScanIndex) {
+        index.withheld_memo = self.withheld_memo.clone();
+        index
+            .withheld_memo
+            .retain_held(&index.claude_account_deferred_holds);
+    }
+
     /// The retained-copy lock. Lock order: retained, then cursor, never the
     /// reverse; never twice on one thread (both checked in debug builds).
     pub(super) fn retained(&self) -> std::sync::LockResult<RetainedGuard<'_>> {
@@ -162,15 +244,16 @@ impl SharedCache {
             ))),
         }
     }
-    /// Copy-refusal release: evicts retained copies only. The paused cursor
-    /// job, the held-singleton memo, parked records and rotation state are
-    /// charged and bounded in `heap_bound`, and survive (K6).
+    /// Copy-refusal release: evicts retained copies and optional header facts.
+    /// The paused cursor job, held-singleton memo, parked records and rotation
+    /// state are charged and bounded in `heap_bound`, and survive (K6).
     pub(super) fn clear(&self) {
         if let Ok(mut cache) = self.retained() {
             cache.clear();
         } else {
             record(Event::ClearPoisonedLock);
         }
+        self.with_cursor(|cursor| cursor.headers.clear());
     }
     /// M1: evict retained copies in victim order until they fit the state
     /// budget beside the cursor state and `pinned` bytes, measured under
@@ -359,19 +442,19 @@ impl SharedCache {
                 let live_bytes_in = live_bytes;
                 #[cfg(unix)]
                 let touched = key.clone();
-                let reserved = live_bytes
-                    .saturating_add(self.cursor_resident_for_main())
-                    .saturating_add(side_ledger::SIDE_LEDGER_BYTES);
-                let admitted = cache.insert_reserving_at_rank(
-                    key,
-                    crate::transcript_cache::Retained {
-                        checkpoint: completed.checkpoint,
-                        state,
-                    },
-                    reserved,
-                    live_bytes,
-                    completed.released,
-                );
+                let retained = crate::transcript_cache::Retained {
+                    checkpoint: completed.checkpoint,
+                    state,
+                };
+                let rank = completed.released.unwrap_or_else(|| {
+                    crate::transcript_cache::admission_rank(
+                        retained.checkpoint.modified_hint(),
+                        crate::transcript_cache::admission_now(),
+                    )
+                });
+                let reserved = self.retained_reservation(&cache, &key, &retained, live_bytes, rank);
+                let admitted =
+                    cache.insert_reserving_at_rank(key, retained, reserved, live_bytes, Some(rank));
                 self.drop_suspended_proof_if_over(&cache, live_bytes_in);
                 // M1: an admitted copy is a durable write candidate after the
                 // next successful index save (the durable lock is a leaf).
@@ -402,13 +485,17 @@ pub(super) struct Context {
     pub(super) priority_replays: usize,
     pub(super) audits_started: usize,
     pub(super) audits_completed: usize,
+    pub(super) audit_quiet_retired: usize,
+    pub(super) audit_cap_full: usize,
+    pub(super) audit_cap_delay: usize,
+    pub(super) pace_evicted: usize,
     pub(super) start_overdue_seconds: u64,
     pub(super) completion_overdue_seconds: u64,
     pub(super) admission: crate::local_resource_diagnostics::AcquisitionAdmission,
 }
 crate::heap_layout_bound::fields!(Context; cache, namespace, audit_metadata_supported, audit_slots,
     full_files, tail_files, unchanged_files, native_bytes, sample_bytes, full_reasons,
-    priority_replays, audits_started, audits_completed, start_overdue_seconds,
+    priority_replays, audits_started, audits_completed, audit_quiet_retired, audit_cap_full, audit_cap_delay, pace_evicted, start_overdue_seconds,
     completion_overdue_seconds, admission);
 
 pub(super) struct Active {
@@ -432,6 +519,32 @@ pub(super) struct Active {
 }
 crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, retained_hint,
     retained_finalization_charge, retained_usage, reinsertion);
+
+impl Context {
+    pub(super) fn cap_candidate(&mut self, key: &str) -> bool {
+        let now = cap_wall_time();
+        let (admit, evicted) = self
+            .cache
+            .cap_pace
+            .lock()
+            .map(|mut pace| pace.admit(key, now))
+            .unwrap_or((true, false));
+        self.pace_evicted += usize::from(evicted);
+        if admit {
+            self.audit_cap_full += 1;
+        } else {
+            self.audit_cap_delay += 1;
+        }
+        admit
+    }
+}
+fn cap_wall_time() -> SystemTime {
+    #[cfg(test)]
+    if let Some(now) = TEST_NOW.with(std::cell::Cell::get) {
+        return UNIX_EPOCH + std::time::Duration::from_secs(now);
+    }
+    SystemTime::now()
+}
 
 impl Context {
     pub(super) fn file_scope(
@@ -505,14 +618,19 @@ impl OwnedSourceScan {
         namespace: Scope,
     ) -> Self {
         self.durable_guard = Some(Arc::downgrade(&cache));
+        if self.source == SnapshotSource::ClaudeCode {
+            cache.bind_withheld(&mut self.index);
+            self.resource_probe
+                .set_withheld_memo(self.index.withheld_memo.clone());
+        }
         if matches!(
             self.source,
             SnapshotSource::ClaudeCode | SnapshotSource::Codex
         ) {
             sampled_audit::normalize_marker_storage(&mut self.index);
             if self.source == SnapshotSource::ClaudeCode {
-                sampled_audit::restore_held_audit_deadlines(&mut self.index, now_seconds());
-                self.prepare_held_audit_progress(now_seconds());
+                sampled_audit::restore_held_audit_deadlines(&mut self.index, self.audit_now);
+                self.prepare_held_audit_progress(self.audit_now);
             }
             let pending = self
                 .index
@@ -524,6 +642,8 @@ impl OwnedSourceScan {
             self.sampling = Some(Context {
                 cache,
                 namespace,
+                // Legacy prefix/audit scheduling and diagnostic observations
+                // keep these values; ordinary restore never gates on them.
                 audit_metadata_supported: pending <= CACHE_ENTRIES,
                 audit_slots: CACHE_ENTRIES.saturating_sub(pending),
                 full_files: 0,
@@ -535,6 +655,10 @@ impl OwnedSourceScan {
                 priority_replays: 0,
                 audits_started: 0,
                 audits_completed: 0,
+                audit_quiet_retired: 0,
+                audit_cap_full: 0,
+                audit_cap_delay: 0,
+                pace_evicted: 0,
                 start_overdue_seconds: 0,
                 completion_overdue_seconds: 0,
                 admission: Default::default(),
@@ -723,7 +847,8 @@ fn release_for_copy_refusal(
     // baseline. Its local layout refusal forbids optional copies, but
     // does not invalidate other already bounded resident reductions.
     // Acquisition/path scratch still uses the separate 1MiB reserve.
-    // Borrowed tail state and unsupported audit metadata keep a release.
+    // Borrowed tail state keeps its existing release accounting; audit
+    // population is not a cache or restore admission bound.
     let native_full_baseline = active.is_some_and(|active| {
         active
             .sampling
@@ -732,9 +857,7 @@ fn release_for_copy_refusal(
     });
     // The optional charge the residents must fit beside, and the clear's
     // cause where it cannot be fitted (no charge: clear).
-    let (charge, cause) = if !context.audit_metadata_supported {
-        (None, Event::ClearMetadataUnsupported)
-    } else if native_full_baseline {
+    let (charge, cause) = if native_full_baseline {
         if crate::heap_layout_bound::bound(context, STATE_BYTES).is_some() {
             return;
         }
@@ -873,6 +996,10 @@ fn context_overhead(context: &Context) -> Option<usize> {
         priority_replays: _,
         audits_started: _,
         audits_completed: _,
+        audit_quiet_retired: _,
+        audit_cap_full: _,
+        audit_cap_delay: _,
+        pace_evicted: _,
         start_overdue_seconds: _,
         completion_overdue_seconds: _,
         admission,
@@ -1036,7 +1163,7 @@ pub(super) fn copy_budget_step(
     active: Option<&mut OwnedActiveFile>,
     completing: bool,
 ) -> (usize, StepMeasure) {
-    let Some(context) = sampling.filter(|context| context.audit_metadata_supported) else {
+    let Some(context) = sampling else {
         return (0, StepMeasure::default());
     };
     // U1a-2a (R2-B3): main's view, any suspended proof charged as none, so
@@ -1125,6 +1252,9 @@ pub(super) fn copy_budget_step(
     let room = remaining
         .zip(used)
         .and_then(|(remaining, used)| remaining.checked_sub(used));
+    if let Some(room) = room {
+        context.cache.retire_headers_over_room(room);
+    }
     let budget = room.map_or(0, |room| room / 2);
     (
         budget,
@@ -1920,6 +2050,18 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn set_test_now(now: Option<u64>) {
     TEST_NOW.with(|clock| clock.set(now));
+}
+
+#[cfg(test)]
+pub(super) fn with_test_now<T>(now: u64, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_NOW.with(|clock| clock.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_NOW.with(|clock| clock.replace(Some(now))));
+    f()
 }
 
 pub(super) fn now_seconds() -> u64 {

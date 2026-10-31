@@ -210,16 +210,11 @@ pub(in crate::snapshots) struct PageBudget {
     /// diagnostics window (`SharedCache::cursor_diagnostics`). Boxed so the
     /// by-value scan object stays small.
     window_start: Option<Box<Counters>>,
-    /// Stage 1 (E): a continuation page (`OwnedSourceScan::new_continuation`).
-    /// It only resumes, never ticks the cursor page clock and never counts
-    /// toward E2. Inert until the continuation entry is enabled.
+    /// Resume-only frame: no selection, proof hook, side-due work or sweep.
     continuation: bool,
     /// Stage 1 (§6): a continuation page's ordinary interval
     /// (StateMissing's input); `None` is unknown coverage.
     ordinary_equivalent: Option<InlineDuration>,
-    /// Stage 1 (EOF seam): a cursor attempt committed on this scan object
-    /// and its native finish succeeded (`cursor_published`).
-    committed: bool,
     /// Stage 1 (K6): a continuation page's cooperative deadline, on the pace
     /// clock. Past it the pause arm pauses the job as at an exhausted budget,
     /// but no ticket is minted (`continuation_ticket` still requires the
@@ -231,7 +226,7 @@ pub(in crate::snapshots) struct PageBudget {
 }
 crate::heap_layout_bound::fields!(PageBudget; cursor_decoded, singleton_decoded,
     disabled_disclosed, page_noted, resume_claimed, proof_claimed, window_start, continuation,
-    ordinary_equivalent, committed, deadline, next_generation_hints);
+    ordinary_equivalent, deadline, next_generation_hints);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum StartPlan {
@@ -389,18 +384,6 @@ impl PageBudget {
             .map(|InlineDuration(duration)| duration)
     }
 
-    /// Stage 1 (EOF seam): a cursor attempt committed here and its native
-    /// finish succeeded.
-    pub(in crate::snapshots) fn note_committed(&mut self) {
-        self.committed = true;
-    }
-
-    /// Stage 1 (EOF seam): this continuation page committed its job: the
-    /// only page StateMissing may hand to `EofCompletion::new`.
-    pub(in crate::snapshots) fn continuation_committed(&self) -> bool {
-        self.continuation && self.committed
-    }
-
     /// Advance the cursor page clock once per scan object (K7, K10). The
     /// diagnostics window opens under this same lock (no extra lock).
     ///
@@ -475,12 +458,30 @@ pub(in crate::snapshots) struct OpenStamp {
 }
 crate::heap_layout_bound::fields!(OpenStamp; dev, ino, extent, modified, changed);
 
+/// The cursor/acquisition content key, without metadata-only ctime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct ContentStamp {
+    dev: u64,
+    ino: u64,
+    extent: u64,
+    modified: (i64, i64),
+}
+crate::heap_layout_bound::fields!(ContentStamp; dev, ino, extent, modified);
+impl ContentStamp {
+    pub(in crate::snapshots) fn extent(&self) -> u64 {
+        self.extent
+    }
+    pub(in crate::snapshots) fn same_content(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 impl OpenStamp {
     pub(in crate::snapshots) fn capture(file: &File) -> std::io::Result<Self> {
         Ok(Self::of(&file.metadata()?))
     }
 
-    fn of(metadata: &fs::Metadata) -> Self {
+    pub(in crate::snapshots) fn of(metadata: &fs::Metadata) -> Self {
         Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
@@ -488,6 +489,23 @@ impl OpenStamp {
             modified: (metadata.mtime(), metadata.mtime_nsec()),
             changed: (metadata.ctime(), metadata.ctime_nsec()),
         }
+    }
+
+    pub(in crate::snapshots) fn candidate(candidate: &super::super::CandidateFile) -> Option<Self> {
+        let [dev, ino] = candidate.physical_identity?;
+        Some(Self {
+            dev,
+            ino,
+            extent: candidate.size_bytes,
+            modified: (
+                (candidate.modified_unix_nanos / 1_000_000_000) as i64,
+                (candidate.modified_unix_nanos % 1_000_000_000) as i64,
+            ),
+            changed: (
+                (candidate.fingerprint_changed_nanos / 1_000_000_000) as i64,
+                (candidate.fingerprint_changed_nanos % 1_000_000_000) as i64,
+            ),
+        })
     }
 
     /// The object `path` names now, without following a final symlink.
@@ -511,7 +529,16 @@ impl OpenStamp {
     /// `transcript_acquisition::FileStamp::same_content`'s rule: the same
     /// object, extent and nanosecond mtime; never ctime.
     pub(in crate::snapshots) fn same_content(&self, other: &Self) -> bool {
-        self.same_object(other) && self.extent == other.extent && self.modified == other.modified
+        self.content_stamp().same_content(&other.content_stamp())
+    }
+
+    pub(in crate::snapshots) fn content_stamp(&self) -> ContentStamp {
+        ContentStamp {
+            dev: self.dev,
+            ino: self.ino,
+            extent: self.extent,
+            modified: self.modified,
+        }
     }
 
     /// The memo and parked wake rule, on stamps `SharedCache::retained_stamp`
@@ -832,26 +859,6 @@ impl JobMeta {
         self.fence.is_some() && self.fence == census_token(index)
     }
 
-    /// The live job's copy-budget charge without a walk (E3): the last
-    /// `completed_bound` plus every byte the reader consumed since plus the
-    /// reader buffer's capacity growth since (`buffer` is its capacity now).
-    /// Not a strict upper bound: an accumulator collection that regrows can
-    /// add more than the bytes that caused it. That slack lasts at most
-    /// `CHARGE_REFRESH_BYTES` of input and is corrected by the next walk;
-    /// the pause and completion walks are exact. None when no charge is
-    /// recorded, the reader restarted, or `CHARGE_REFRESH_BYTES` were
-    /// consumed since (the caller walks again: at most one walk per that
-    /// many bytes, never one per line). The scanner reads it through
-    /// `job_charge_estimate`, which also covers group jobs.
-    #[cfg(test)]
-    pub(in crate::snapshots) fn charge_estimate(
-        &self,
-        consumed: u64,
-        buffer: usize,
-    ) -> Option<usize> {
-        estimate_charge(self.charge, consumed, buffer, 1)
-    }
-
     /// Record a walked charge (`usize::MAX` when the walk refused) taken at
     /// reader position `consumed` with reader buffer capacity `buffer`.
     pub(in crate::snapshots) fn record_charge(
@@ -1077,38 +1084,20 @@ impl JobPace {
     }
 }
 
-impl HeapLayoutBound for JobPace {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        // A key, two `Instant`s, a `Duration` and a flag: nothing on the heap.
-        c.add(0)
-    }
-}
+// A key, two `Instant`s, a `Duration` and a flag: nothing on the heap.
+crate::heap_layout_bound::no_heap!(true; JobPace);
 
 /// A `Duration` held inline (no heap), for the page's ordinary equivalent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) struct InlineDuration(std::time::Duration);
 
-impl HeapLayoutBound for InlineDuration {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; InlineDuration);
 
 /// An `Instant` held inline (no heap), for a continuation page's deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) struct InlineInstant(std::time::Instant);
 
-impl HeapLayoutBound for InlineInstant {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; InlineInstant);
 
 /// The counting view of `candidate`'s index entries (K8): what a fresh
 /// singleton parser would be configured with now. Recorded at job start,
@@ -1321,13 +1310,10 @@ thread_local! {
     static MAIN_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// U1a-2a (R2-B3): `bound(value, limit)` as main measures it, with any
-/// suspended proof charged as `ProofHolder::None`, mirroring
-/// `state_for_main`. One walk under the same `try_lock` discipline as
-/// `bound` (a busy lock still reads as unbounded). Main's copy budget
-/// measures this, so optional proof work never shrinks it; main's
-/// admission and insert retire the proof where its room is needed
-/// (`admit_locked`, ss-6).
+/// Main copy view: omit suspended proof and optional header facts, retaining
+/// the usual lock/visit refusal. `copy_budget_step` reclaims headers beside
+/// active progress; `retire_proof_beside_copy` reclaims optional bytes before
+/// copying/shape-F allocation. Measuring alone grants no allocation authority.
 pub(in crate::snapshots) fn bound_for_main<T: HeapLayoutBound>(
     value: &T,
     limit: usize,
@@ -1479,6 +1465,26 @@ fn proof_free_room(retained: &super::RetainedCache, cursor: &CursorState, charge
                 .checked_sub(charge)
         })
         .is_some()
+}
+
+/// Diagnostic counterfactual only: retain every proof/claim/root and subtract
+/// exactly the optional header entries. Never changes admission or reclaims.
+fn decoder_fits_without_headers(
+    retained: &super::RetainedCache,
+    cursor: &CursorState,
+    charge: usize,
+) -> bool {
+    use crate::heap_layout_bound::bound;
+    (|| {
+        let headers = cursor.headers.optional_bytes().filter(|bytes| *bytes > 0)?;
+        let state = bound(cursor, STATE_BYTES.checked_add(headers)?)?.checked_sub(headers)?;
+        let resident = bound(retained, STATE_BYTES)?;
+        admission_budget()?
+            .checked_sub(state)?
+            .checked_sub(resident)?
+            .checked_sub(charge)
+    })()
+    .is_some()
 }
 
 /// U1a-2a (cc rows 2–3): drop the suspended proof when the full state (the
@@ -1909,14 +1915,8 @@ impl Default for PaceTable {
     }
 }
 
-impl HeapLayoutBound for PaceTable {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        // Fixed slots of keys, `Instant`s, `OpenStamp`s and offsets.
-        c.add(0)
-    }
-}
+// Fixed slots of keys, `Instant`s, `OpenStamp`s and offsets.
+crate::heap_layout_bound::no_heap!(true; PaceTable);
 
 /// The guard's start rule for one large ordinary start (§6 table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2162,13 +2162,7 @@ impl Default for ParentRestarts {
         Self([None; ROTATION_KEYS])
     }
 }
-impl HeapLayoutBound for ParentRestarts {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ParentRestarts);
 impl ParentRestarts {
     /// The slot of `key` (`parent_restart_key(namespace, scope)`), created as
     /// needed; refreshes `touched`. There is no reset branch: a new receipt
@@ -2249,6 +2243,7 @@ fn exact_copy(value: &str) -> String {
 static NEXT_CURSOR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub(in crate::snapshots) struct CursorState {
+    pub(in crate::snapshots) headers: codex_file_join::HeaderCache,
     slot: Slot,
     slot_key: Option<String>,
     /// Member keys of the slot's group job (empty for a singleton): selection
@@ -2302,6 +2297,7 @@ pub(in crate::snapshots) struct CursorState {
 impl Default for CursorState {
     fn default() -> Self {
         Self {
+            headers: codex_file_join::HeaderCache::default(),
             slot: Slot::Empty,
             slot_key: None,
             slot_members: BTreeSet::new(),
@@ -2332,6 +2328,7 @@ impl Default for CursorState {
 impl HeapLayoutBound for CursorState {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         let Self {
+            headers,
             slot,
             slot_key,
             slot_members,
@@ -2364,6 +2361,11 @@ impl HeapLayoutBound for CursorState {
         match slot {
             Slot::Empty | Slot::ActiveElsewhere { .. } => c.add(0)?,
             Slot::Paused(_) => c.add(*slot_charge)?,
+        }
+        if MAIN_VIEW.with(std::cell::Cell::get) {
+            codex_file_join::HeaderCache::default().charge(c)?;
+        } else {
+            headers.charge(c)?;
         }
         slot_key.heap_bound(c)?;
         slot_members.heap_bound(c)?;
@@ -2709,7 +2711,6 @@ fn accrue_equivalent(
 
 /// Why `cursor_continuation_ready` refused a ticket. Every refusal sends the
 /// next page to the ordinary cadence.
-#[cfg_attr(not(test), allow(dead_code))] // Read by StateMissing's adapter (inert).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum ReadyRefusal {
     /// The cursor state is poisoned.
@@ -2773,6 +2774,15 @@ impl SharedCache {
         job: &OwnedActiveFile,
         page: &PageBudget,
     ) -> Option<CodexCursorTicket> {
+        if job.group.is_some() {
+            if page.continuation()
+                || (page.cursor_exhausted(Limits::current())
+                    && job.cursor.as_ref().is_some_and(accelerated))
+            {
+                crate::local_resource_diagnostics::codex_continuation(Some("group_job"));
+            }
+            return None;
+        }
         let meta = job.cursor.as_ref()?;
         if !page.cursor_exhausted(Limits::current()) || !accelerated(meta) {
             return None;
@@ -2784,7 +2794,6 @@ impl SharedCache {
     /// `cursor_continuation_ready`: whether `ticket`'s attempt is still the
     /// paused job, for its namespace, in this cursor state, and accelerated.
     /// Under the cursor lock, with no IO.
-    #[cfg_attr(not(test), allow(dead_code))] // StateMissing's entry (inert).
     pub(in crate::snapshots) fn cursor_continuation_ready(
         &self,
         ticket: &CodexCursorTicket,
@@ -2795,7 +2804,7 @@ impl SharedCache {
 
     /// Stage 1 (D): the index keys of a ready ticket's job members: the only
     /// paths a continuation page selects. None unless the ticket is ready.
-    #[cfg_attr(not(test), allow(dead_code))] // StateMissing's entry (inert).
+    #[cfg(test)]
     pub(in crate::snapshots) fn continuation_members(
         &self,
         ticket: &CodexCursorTicket,
@@ -2838,16 +2847,11 @@ impl SharedCache {
     }
 }
 
-/// Stage 1 (N2): the cursor side of a continuation page, as inherent
-/// methods. StateMissing's `CursorContinuation` adapter wraps it in its own
-/// file; nothing in production builds one while continuation pages are
-/// disabled.
-#[cfg_attr(not(test), allow(dead_code))] // StateMissing's adapter (inert).
+/// Resume-only access to the held cursor; never selects or starts a job.
 pub(crate) struct CodexCursorPort {
     cache: Arc<SharedCache>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // StateMissing's adapter (inert).
 impl CodexCursorPort {
     pub(crate) fn new(cache: Arc<SharedCache>) -> Self {
         Self { cache }
@@ -2865,6 +2869,7 @@ impl CodexCursorPort {
 
     /// Hunk D: the member index keys the continuation page selects
     /// (`OwnedSourceScan::new_continuation`); None unless `ready`.
+    #[cfg(test)]
     pub(crate) fn members(&self, ticket: &CodexCursorTicket) -> Option<BTreeSet<String>> {
         self.cache.continuation_members(ticket)
     }
@@ -3287,6 +3292,8 @@ pub(in crate::snapshots) fn finish_job(
 /// onto another object than the job's (K5); the caller then ends the
 /// attempt and nothing publishes.
 pub(in crate::snapshots) fn restart_in_place(job: &mut OwnedActiveFile) -> bool {
+    #[cfg(test)]
+    tests::TIER_REPLAYS.with(|v| v.set(v.get() + 1));
     let Some((frozen, start)) = job
         .parser
         .reader
@@ -3343,6 +3350,8 @@ pub(in crate::snapshots) fn restart_in_place(job: &mut OwnedActiveFile) -> bool 
 /// completion steps.
 pub(in crate::snapshots) fn apply_eof_record(job: &mut OwnedActiveFile) {
     if eof_record_due(job) && job.parser.apply_sealed_fragment() {
+        #[cfg(test)]
+        tests::EOF_APPLIED.with(|v| v.set(v.get() + 1));
         mark_eof_applied(job);
     }
 }
@@ -3588,7 +3597,10 @@ pub(in crate::snapshots) fn group_memo_digest(
         receipt_scope.to_owned(),
         group_counting_view(members.iter().copied(), index),
         format!("{}:{}", live.dev, live.ino),
-        if codex.created_thread_census_unscoped_incomplete {
+        if members
+            .iter()
+            .any(|member| codex.created_thread_census_incomplete_for(&member.path))
+        {
             "created_incomplete".to_owned()
         } else {
             "created_complete".to_owned()
@@ -3753,6 +3765,58 @@ impl Drop for CursorCredit {
             let _held = CursorHeld::enter();
             settle_claim(&mut cursor, self.cursor, self.bytes);
         }
+    }
+}
+
+// Reserve under retained -> cursor BEFORE taking durable Stores; carry only
+// the owner across I/O. Drop Stores before release, including unwind/early exits.
+// Never account from encode/write. Free room only: no primary/proof eviction.
+static DECODER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(in crate::snapshots) struct DecoderOwner(Option<CursorCredit>);
+impl DecoderOwner {
+    pub(in crate::snapshots) fn acquire(cache: &Arc<SharedCache>, bytes: usize) -> Option<Self> {
+        debug_assert!(!super::durable_tail::stores_held(), "reserve before Stores");
+        use std::sync::atomic::Ordering::SeqCst;
+        if DECODER_LIVE.swap(true, SeqCst) {
+            return None;
+        }
+        match cache.cursor_claim(bytes, true) {
+            Some(credit) => Some(Self(Some(credit))),
+            None => {
+                DECODER_LIVE.store(false, SeqCst);
+                None
+            }
+        }
+    }
+    // Normal completion/error calls this after destroying the decoder.
+    pub(in crate::snapshots) fn release(mut self) {
+        debug_assert!(!super::durable_tail::stores_held(), "release after Stores");
+        self.refund();
+    }
+    fn refund(&mut self) {
+        if let Some(credit) = self.0.take() {
+            credit.refund();
+            DECODER_LIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+impl Drop for DecoderOwner {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            crate::local_resource_diagnostics::traversal_point(
+                "codex_zst_owner",
+                "codex",
+                &BTreeMap::from([("leaked_release", 1_u64)]),
+            );
+        }
+        if cursor_held() {
+            // Strand the charged claim and singleton; never re-lock during Drop.
+            if let Some(mut credit) = self.0.take() {
+                credit.settled = true;
+            }
+            return;
+        }
+        self.refund(); // cancellation/unwind safety net, observable as a leak
     }
 }
 
@@ -3984,6 +4048,14 @@ fn admit_locked(
     mandatory: bool,
     admitter: Admitter,
 ) -> bool {
+    let needed = !cursor.headers.is_empty() && !proof_free_room(retained, cursor, charge);
+    reclaim_headers(cursor, needed, |cursor| {
+        if admitter == Admitter::Proof {
+            proof_free_room(retained, cursor, charge)
+        } else {
+            admission_feasible(cursor, charge, mandatory)
+        }
+    });
     if admitter == Admitter::Proof {
         debug_assert!(!mandatory, "a proof admission is never mandatory");
         return !mandatory && proof_free_room(retained, cursor, charge);
@@ -4031,10 +4103,96 @@ fn admit_locked(
     }
 }
 
+// Both locks are held (retained then cursor). Never discard optional facts
+// for a hopeless claim; clearing preserves the pending eviction count.
+fn reclaim_headers(
+    cursor: &mut CursorState,
+    needed: bool,
+    feasible: impl FnOnce(&CursorState) -> bool,
+) -> bool {
+    if !needed || cursor.headers.is_empty() {
+        return false;
+    }
+    let headers = std::mem::take(&mut cursor.headers);
+    let fits = feasible(cursor);
+    cursor.headers = headers;
+    if fits {
+        cursor.headers.clear();
+    }
+    fits
+}
+
+fn optional_bytes(cursor: &CursorState) -> Option<usize> {
+    cursor
+        .headers
+        .optional_bytes()?
+        .checked_add(cursor.proof.charge())
+}
+
+// Header facts are only scalar/string graphs. Use the shared field walker
+// and budget on portable builds too; native cursor admission keeps its existing
+// layout-supported gate. Opaque or over-visit resident graphs refuse caching.
+fn header_room(retained: &super::RetainedCache, cursor: &CursorState, charge: usize) -> bool {
+    let Some(limit) = admission_budget() else {
+        return false;
+    };
+    let mut c = Counter::new(limit);
+    c.add(std::mem::size_of_val(retained) + std::mem::size_of_val(cursor))
+        .and_then(|()| retained.heap_bound(&mut c))
+        .and_then(|()| cursor.heap_bound(&mut c))
+        .and_then(|()| c.add(charge))
+        .is_some()
+}
+
 impl SharedCache {
+    pub(super) fn retained_reservation(
+        &self,
+        retained: &super::RetainedCache,
+        key: &String,
+        incoming: &crate::transcript_cache::Retained<super::CachedJsonlReduction>,
+        live: usize,
+        rank: (i64, i64),
+    ) -> usize {
+        self.with_cursor(|cursor| {
+            let reservation = |cursor: &CursorState| {
+                live.saturating_add(state_for_main(cursor).unwrap_or(STATE_BYTES))
+                    .saturating_add(super::side_ledger::SIDE_LEDGER_BYTES)
+            };
+            let needed = !cursor.headers.is_empty()
+                && !retained.insertion_fits(key, incoming, reservation(cursor), rank, false);
+            reclaim_headers(cursor, needed, |cursor| {
+                retained.insertion_fits(key, incoming, reservation(cursor), rank, true)
+            });
+            reservation(cursor)
+        })
+        .unwrap_or(STATE_BYTES)
+    }
+    pub(in crate::snapshots) fn refresh_header(
+        &self,
+        key: String,
+        header: Option<codex_file_join::CachedHeader>,
+    ) {
+        let Ok(retained) = self.retained() else {
+            self.with_cursor(|cursor| cursor.headers.refresh(key, None));
+            return;
+        };
+        self.with_cursor(|cursor| {
+            cursor.headers.refresh(key.clone(), None);
+            if let Some(header) = header {
+                if codex_file_join::HeaderCache::admission_charge(key.capacity(), &header)
+                    .is_some_and(|charge| header_room(&retained, cursor, charge))
+                {
+                    cursor.headers.refresh(key, Some(header));
+                }
+            }
+        });
+    }
     /// The cursor lock, marked held (`CursorHeld`) for `run`. Also R0's
     /// blocking resident measure (`SharedCache::heap_bound`).
-    pub(super) fn with_cursor<T>(&self, run: impl FnOnce(&mut CursorState) -> T) -> Option<T> {
+    pub(in crate::snapshots) fn with_cursor<T>(
+        &self,
+        run: impl FnOnce(&mut CursorState) -> T,
+    ) -> Option<T> {
         // Checked before locking: a relock would deadlock, not panic.
         debug_assert!(
             !cursor_held(),
@@ -4051,17 +4209,46 @@ impl SharedCache {
     /// later measurement (`cursor_resident`, another admission, a retained
     /// insert) sees it until the credit is settled. None: nothing claimed.
     fn cursor_reserve(self: &Arc<Self>, charge: usize) -> Option<CursorCredit> {
+        self.cursor_claim(charge, false)
+    }
+    fn cursor_claim(self: &Arc<Self>, charge: usize, free_only: bool) -> Option<CursorCredit> {
         let mut retained = self.retained().ok()?;
+        let mut header_occupancy_refused = false;
         let claimed = self
             .with_cursor(|cursor| {
-                if !admit_locked(&mut retained, cursor, charge, true, Admitter::Main) {
+                let admitted = if free_only {
+                    charge
+                        .checked_add(super::ENTRY_BYTES + super::side_ledger::SIDE_LEDGER_BYTES)
+                        .is_some_and(|with_floor| {
+                            // Decoders use free room only: preserve the real primary
+                            // tail floor without evicting any resident state. Header
+                            // reclamation belongs to feasible progress/retained admission.
+                            let admitted = proof_free_room(&retained, cursor, with_floor);
+                            if !admitted {
+                                header_occupancy_refused =
+                                    decoder_fits_without_headers(&retained, cursor, with_floor);
+                            }
+                            admitted
+                        })
+                } else {
+                    admit_locked(&mut retained, cursor, charge, true, Admitter::Main)
+                };
+                if !admitted {
                     return None;
                 }
                 cursor.reserved = cursor.reserved.checked_add(charge)?;
                 Some(cursor.id)
             })
-            .flatten()?;
+            .flatten();
         drop(retained);
+        // #799 logging may perform I/O: the retained and cursor guards have
+        // both ended. A refusal still creates no credit and evicts nothing.
+        if header_occupancy_refused {
+            crate::local_resource_diagnostics::codex_zst_refused(
+                crate::local_resource_diagnostics::CodexZstCause::DecoderRefusedHeaderOccupancy,
+            );
+        }
+        let claimed = claimed?;
         Some(CursorCredit {
             cache: Arc::clone(self),
             cursor: claimed,
@@ -4105,6 +4292,7 @@ impl SharedCache {
     /// it, without the suspended proof (`state_for_main`). The retained
     /// insert reserves this, then `drop_suspended_proof_if_over` retires the
     /// proof if the insert took its room.
+    #[cfg(test)]
     pub(super) fn cursor_resident_for_main(&self) -> usize {
         self.with_cursor(|cursor| state_for_main(cursor))
             .flatten()
@@ -4129,10 +4317,23 @@ impl SharedCache {
         self.with_cursor(|cursor| drop_suspended_proof_over(retained, cursor, 0, budget));
     }
 
+    pub(super) fn retire_headers_over_room(&self, room: usize) {
+        let Ok(_retained) = self.retained() else {
+            return;
+        };
+        self.with_cursor(|cursor| {
+            let bytes = optional_bytes(cursor);
+            if bytes.map_or(true, |bytes| bytes > room) {
+                cursor.headers.clear();
+            }
+        });
+    }
+
     /// U1a-2a (R2-B3, r79, fix round 2 DB1): where main allocates against
     /// its copy budget (`retire_proof_beside_copy`), both shares leave
     /// `room` bytes in main's view (`bound_for_main`). A suspended proof
-    /// larger than that would spend bytes main is about to use, so it is
+    /// plus optional header facts larger than that would spend bytes main
+    /// is about to use. Headers yield first; any remaining excess proof is
     /// retired here (retained, then cursor; the job is freed under them,
     /// its entry `seq`s kept for the index's next hook), counted
     /// `side_proof_drops`. Otherwise nothing is
@@ -4140,7 +4341,7 @@ impl SharedCache {
     /// under the locks, never skipped.
     pub(in crate::snapshots) fn retire_proof_over_room(&self, room: usize) {
         let over = match self.cursor.try_lock() {
-            Ok(cursor) => cursor.proof.charge() > room,
+            Ok(cursor) => optional_bytes(&cursor).map_or(true, |bytes| bytes > room),
             Err(std::sync::TryLockError::WouldBlock) => true,
             Err(std::sync::TryLockError::Poisoned(_)) => false,
         };
@@ -4151,6 +4352,9 @@ impl SharedCache {
             return;
         };
         self.with_cursor(|cursor| {
+            if optional_bytes(cursor).map_or(true, |bytes| bytes > room) {
+                cursor.headers.clear();
+            }
             if cursor.proof.charge() > room {
                 retire_holder(cursor);
                 record_proof_drop();
@@ -4176,13 +4380,15 @@ impl SharedCache {
         &self,
         retained: &super::RetainedCache,
         pinned: usize,
-        reachable: impl FnOnce(usize) -> bool,
+        reachable: impl Fn(usize) -> bool,
     ) -> Option<usize> {
         self.with_cursor(|cursor| {
-            let room = STATE_BYTES
-                .checked_sub(state_for_main(cursor)?)?
-                .checked_sub(pinned)
-                .filter(|room| reachable(*room))?;
+            let room = |cursor: &CursorState| STATE_BYTES.checked_sub(state_for_main(cursor)?)?
+                .checked_sub(pinned);
+            let needed = !room(cursor).zip(crate::heap_layout_bound::bound(retained, STATE_BYTES))
+                .is_some_and(|(room, copies)| copies <= room);
+            reclaim_headers(cursor, needed, |cursor| room(cursor).is_some_and(&reachable));
+            let room = room(cursor).filter(|room| reachable(*room))?;
             if retire_suspended_proof_over(retained, cursor, pinned, Some(STATE_BYTES)) {
                 crate::local_resource_diagnostics::codex_side_lifecycle::record(
                     crate::local_resource_diagnostics::codex_side_lifecycle::Event::ProofReleaseDrop,
@@ -5319,10 +5525,15 @@ impl SharedCache {
         namespace: &Scope,
         continuation: bool,
     ) -> Option<(Box<OwnedActiveFile>, CursorLease)> {
-        let (job, token) = self.with_cursor(|cursor| {
+        let mut group_held = false;
+        let claimed = self.with_cursor(|cursor| {
             let Slot::Paused(job) = &cursor.slot else {
                 return None;
             };
+            if continuation && job.group.is_some() {
+                group_held = true;
+                return None;
+            }
             let foreign = job
                 .cursor
                 .as_ref()
@@ -5359,7 +5570,11 @@ impl SharedCache {
             cursor.slot_touched = cursor.rotation.page;
             cursor.counters.jobs_resumed += 1;
             Some((job, token))
-        })??;
+        });
+        if group_held {
+            crate::local_resource_diagnostics::codex_continuation(Some("group_job"));
+        }
+        let (job, token) = claimed??;
         Some((
             job,
             CursorLease {
@@ -5758,7 +5973,9 @@ pub(in crate::snapshots) fn resume_paused_job(
             // waits if the job pauses.
             for file in job_files(&job) {
                 identified_candidates.retain(|candidate| candidate.path != file.path);
-                requeue(index, context.flags, file);
+                if !context.continuation {
+                    requeue(index, context.flags, file);
+                }
             }
             return Resumed::Active(job, lease);
         }
@@ -6193,13 +6410,7 @@ pub(in crate::snapshots) enum DebtReason {
     /// it is strict; parked until a member changes.
     ProbeBudgetOrder,
 }
-impl HeapLayoutBound for DebtReason {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; DebtReason);
 
 impl DebtReason {
     fn settleable(self) -> bool {
@@ -6213,6 +6424,7 @@ impl DebtReason {
 #[derive(Clone, Debug)]
 pub(in crate::snapshots) struct Disclosure {
     pub(in crate::snapshots) reason: DebtReason,
+    pub(in crate::snapshots) cause: usize,
     pub(in crate::snapshots) ownership_incomplete_file_count: usize,
     pub(in crate::snapshots) zero_snapshot_usage_evidence: bool,
     pub(in crate::snapshots) state_only_blocked_session_ids: Vec<String>,
@@ -6226,7 +6438,7 @@ pub(in crate::snapshots) struct Disclosure {
     /// hit (held disclosure only, never proof).
     pub(in crate::snapshots) parent_unresolvable: Option<CodexParentUnresolvable>,
 }
-crate::heap_layout_bound::fields!(Disclosure; reason, ownership_incomplete_file_count,
+crate::heap_layout_bound::fields!(Disclosure; reason, cause, ownership_incomplete_file_count,
     zero_snapshot_usage_evidence, state_only_blocked_session_ids, diagnostic_reason,
     parsed_snapshot_count, held, parent_ref, parent_unresolvable);
 
@@ -6277,6 +6489,7 @@ fn strict_disclosure(
     let owner = job.parser.accumulator.source_session_id.clone().or(owner);
     Disclosure {
         reason,
+        cause: ownership::GROUP,
         ownership_incomplete_file_count: 0,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: owner.into_iter().collect(),
@@ -6592,7 +6805,7 @@ pub(in crate::snapshots) fn memo_digest(
         // Class 7: an identity conflict on a candidate changes the blocked
         // ids of any hold, sidecar-woken or not.
         &conflicted_identities(codex, &candidate.path),
-        if codex.created_thread_census_unscoped_incomplete {
+        if codex.created_thread_census_incomplete_for(&candidate.path) {
             "created_incomplete"
         } else {
             "created_complete"
@@ -6709,6 +6922,7 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
         index.extend_codex_blocked_attribution(&index_key, blocked);
     }
     targets.pending_finalization.push(PendingIndexFinalization {
+        withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: index
             .files
@@ -6726,6 +6940,10 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
     if settleable {
         targets.census.ownership_incomplete_file_count +=
             disclosure.ownership_incomplete_file_count;
+        targets
+            .census
+            .causes
+            .add(disclosure.cause, disclosure.ownership_incomplete_file_count);
         targets.census.zero_snapshot_usage_evidence_count +=
             usize::from(disclosure.zero_snapshot_usage_evidence);
         // PR-1: the fresh finish's line and drop totals.
@@ -6769,4 +6987,122 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
 
 #[cfg(test)]
 #[path = "codex_cursor_tests.rs"]
-mod tests;
+pub(in crate::snapshots) mod tests;
+
+#[cfg(all(test, target_os = "macos"))]
+mod header_admission_tests {
+    use super::*;
+    fn populated() -> (PathBuf, Arc<SharedCache>, String) {
+        let (root, fixture) = codex_file_join::tests::fixture();
+        let paths = fixture
+            .headers
+            .iter()
+            .map(|header| local_index_key(&header.candidate.path))
+            .collect::<BTreeSet<_>>();
+        let mut inventory = codex_file_join::HeaderInventory::new(
+            &[root.join("sessions")],
+            &paths,
+            Some(&fixture.directories),
+        );
+        let cache = Arc::new(SharedCache::default());
+        while !inventory.step_cached(&CodexTitleMetadata::default(), Some(&cache)) {}
+        let key = paths.first().unwrap().clone();
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.get(&key))
+            .flatten()
+            .is_some());
+        (root, cache, key)
+    }
+    #[test]
+    fn header_byte_admission_stops_below_count_cap() {
+        let (root, cache, key) = populated();
+        let facts = cache
+            .with_cursor(|cursor| cursor.headers.get(&key))
+            .flatten()
+            .unwrap();
+        let mut refused = false;
+        for number in 0..codex_file_join::MAX_HEADER_FILES {
+            let key = format!("header-{number}");
+            cache.refresh_header(key.clone(), Some(facts.clone()));
+            if cache
+                .with_cursor(|cursor| cursor.headers.get(&key))
+                .flatten()
+                .is_none()
+            {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "byte-full must refuse below the roster count cap");
+        assert!(cache
+            .with_cursor(|cursor| state_for_main(cursor))
+            .flatten()
+            .is_some());
+        // Real cursor reservations still succeed by dropping optional facts.
+        let credit = cache
+            .cursor_reserve(8 * 1024 * 1024)
+            .expect("native progress wins");
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.is_empty())
+            .unwrap());
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn over_budget_facts_yield_for_native_admission_but_hopeless_claims_keep_them() {
+        let (root, cache, key) = populated();
+        assert!(with_test_state_budget(0, || cache.cursor_reserve(1024)).is_none());
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.get(&key))
+            .flatten()
+            .is_some());
+        cache
+            .with_cursor(|cursor| {
+                let facts = cursor.headers.get(&key).unwrap();
+                // Model a resident graph that became full after caching headers.
+                for number in 0..codex_file_join::MAX_HEADER_FILES {
+                    cursor
+                        .headers
+                        .refresh(format!("header-{number}"), Some(facts.clone()));
+                }
+                assert!(state_for_main(cursor).is_none(), "starvation precondition");
+            })
+            .unwrap();
+        let credit = cache
+            .cursor_reserve(1024)
+            .expect("headers cannot strand a cursor");
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.is_empty())
+            .unwrap());
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn optional_proof_can_reclaim_header_room() {
+        let (root, cache, key) = populated();
+        let mut retained = cache.retained().unwrap();
+        cache
+            .with_cursor(|cursor| {
+                let facts = cursor.headers.get(&key).unwrap();
+                for number in 0..codex_file_join::MAX_HEADER_FILES {
+                    cursor
+                        .headers
+                        .refresh(format!("header-{number}"), Some(facts.clone()));
+                }
+                assert!(!proof_free_room(&retained, cursor, 1024));
+                assert!(admit_locked(
+                    &mut retained,
+                    cursor,
+                    1024,
+                    false,
+                    Admitter::Proof
+                ));
+                assert!(cursor.headers.is_empty());
+            })
+            .unwrap();
+        drop(retained);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
