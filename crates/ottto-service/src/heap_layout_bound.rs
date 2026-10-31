@@ -116,6 +116,7 @@ scalar!(
     f32,
     f64,
     serde::de::IgnoredAny,
+    std::time::Instant,
     ()
 );
 impl HeapLayoutBound for String {

@@ -72,10 +72,6 @@ pub(crate) struct Counts {
     pub(crate) observation_overflow: u64,
 }
 impl Page {
-    #[cfg(test)]
-    pub(super) fn observe(&self, key: String, len: u64, modified: u64) {
-        self.observe_stamped(key, len, modified, None);
-    }
     pub(super) fn observe_stamped(
         &self,
         key: String,
@@ -161,6 +157,7 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// [behaviour] Current age is recomputed at save and fates follow selected extent.
 
     #[test]
     fn current_age_is_recomputed_at_save_and_fates_follow_selected_extent() {
@@ -218,6 +215,7 @@ mod tests {
             2
         );
     }
+    /// [behaviour] Scratch admission is bounded and never changes discovery retention.
 
     #[test]
     fn scratch_admission_is_bounded_and_never_changes_discovery_retention() {
@@ -260,5 +258,15 @@ mod tests {
                 .map(String::capacity)
                 .sum::<usize>()
         );
+    }
+}
+
+#[cfg(test)]
+mod support {
+    use super::*;
+    impl Page {
+        pub(in crate::snapshots) fn observe(&self, key: String, len: u64, modified: u64) {
+            self.observe_stamped(key, len, modified, None);
+        }
     }
 }

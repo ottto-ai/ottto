@@ -976,6 +976,7 @@ mod tests {
         index.confirmed_empty_files.insert(key);
         index
     }
+    /// [behaviour] Virtual recovery keeps grown keys observed without reading before due.
     #[test]
     fn virtual_recovery_keeps_grown_keys_observed_without_reading_before_due() {
         use crate::snapshots::claude_request_census::{

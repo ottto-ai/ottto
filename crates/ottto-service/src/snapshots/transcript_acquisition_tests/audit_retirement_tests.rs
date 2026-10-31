@@ -882,15 +882,7 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
     let key = local_index_key(&fixture.file.0);
     let checkpoint = cache.retained_checkpoint(&key).unwrap();
     let due = checkpoint.audit_debt().unwrap().due_unix_seconds;
-    let mut disposition = ClaudeUsageAuthorityDisposition::default();
-    disposition.defer_sessions(
-        held_scan
-            .snapshots
-            .iter()
-            .map(|item| item.source_session_id.clone())
-            .collect(),
-    );
-    let deferred_tokens = disposition.account_deferred_tokens(&held_scan.snapshots);
+    let deferred_tokens = crate::snapshot_sync::withheld_support::deferred_tokens(&held_scan);
     let held = index.file_snapshot_fingerprints[&key].clone();
     assert!(!held.is_empty());
     let fingerprint = index.files[&key].source_file_fingerprint.clone();
@@ -997,15 +989,7 @@ fn held_fresh_debt_at_cap_is_not_cap_full_or_a_new_marker() {
     );
     let key = local_index_key(&fixture.file.0);
     assert!(!index.files[&key].has_unverified_source());
-    let mut disposition = ClaudeUsageAuthorityDisposition::default();
-    disposition.defer_sessions(
-        held_scan
-            .snapshots
-            .iter()
-            .map(|item| item.source_session_id.clone())
-            .collect(),
-    );
-    let deferred_tokens = disposition.account_deferred_tokens(&held_scan.snapshots);
+    let deferred_tokens = crate::snapshot_sync::withheld_support::deferred_tokens(&held_scan);
     let held = index.file_snapshot_fingerprints[&key].clone();
     assert!(!held.is_empty());
     let fingerprint = index.files[&key].source_file_fingerprint.clone();
@@ -1112,15 +1096,7 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
     fixture.file.0 = held_path;
     let held_key = local_index_key(&fixture.file.0);
     assert!(!index.files[&held_key].has_unverified_source());
-    let mut disposition = ClaudeUsageAuthorityDisposition::default();
-    disposition.defer_sessions(
-        held_scan
-            .snapshots
-            .iter()
-            .map(|item| item.source_session_id.clone())
-            .collect(),
-    );
-    let deferred_tokens = disposition.account_deferred_tokens(&held_scan.snapshots);
+    let deferred_tokens = crate::snapshot_sync::withheld_support::deferred_tokens(&held_scan);
     let held = index.file_snapshot_fingerprints[&held_key].clone();
     assert!(!held.is_empty());
     let fingerprint = index.files[&held_key].source_file_fingerprint.clone();
@@ -1256,15 +1232,7 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
         assert_eq!(modes, (1, 0, 0));
         let key = local_index_key(&fixture.file.0);
         let fingerprint = index.files[&key].source_file_fingerprint.clone();
-        let mut disposition = ClaudeUsageAuthorityDisposition::default();
-        disposition.defer_sessions(
-            held_scan
-                .snapshots
-                .iter()
-                .map(|item| item.source_session_id.clone())
-                .collect(),
-        );
-        let deferred_tokens = disposition.account_deferred_tokens(&held_scan.snapshots);
+        let deferred_tokens = crate::snapshot_sync::withheld_support::deferred_tokens(&held_scan);
         let held = index.file_snapshot_fingerprints[&key].clone();
         assert!(!held.is_empty());
         assert!(index.record_claude_account_deferred_holds(
@@ -2171,14 +2139,17 @@ fn hold_only_inventory_requires_two_secure_absence_observations() {
             BACKFILL_WINDOW_DAYS,
         );
         assert!(index.files.is_empty(), "held-new has no committed entry");
+        withheld_account::support::clock(&index.withheld_memo);
         sampled_scan::set_test_now(Some(1_000));
+        withheld_account::support::clock(&index.withheld_memo);
         index.probe_absent_claude_account_deferred_holds();
         assert!(
             index.claude_account_deferred_holds.contains_key(&key),
             "one observation keeps custody"
         );
         sampled_scan::set_test_now(Some(1_600));
-        crate::local_resource_diagnostics::take_withheld_for_test();
+        crate::local_resource_diagnostics::withheld_support::take_withheld();
+        withheld_account::support::clock(&index.withheld_memo);
         index.probe_absent_claude_account_deferred_holds();
         let removed = matches!(ancestor, "present" | "missing");
         assert_eq!(
@@ -2187,7 +2158,7 @@ fn hold_only_inventory_requires_two_secure_absence_observations() {
             "{ancestor}"
         );
         assert_eq!(
-            crate::local_resource_diagnostics::take_withheld_for_test()[0],
+            crate::local_resource_diagnostics::withheld_support::take_withheld()[0],
             if removed {
                 BTreeMap::from([("deleted", 1)])
             } else {
@@ -2223,6 +2194,7 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
         NOW,
         BACKFILL_WINDOW_DAYS,
     );
+    withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
     assert_eq!(
         index.claude_account_deferred_holds.len(),
@@ -2235,9 +2207,11 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
     index
         .claude_account_deferred_holds
         .retain(|key, _| key == &eligible);
+    withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
     assert_eq!(index.claude_account_deferred_hold_count(), 1);
     sampled_scan::set_test_now(Some(sampled_scan::now_seconds() + 600));
+    withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
     sampled_scan::set_test_now(None);
     assert!(
@@ -2253,8 +2227,10 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
         );
     }
     sampled_scan::set_test_now(Some(1_000));
+    withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
     sampled_scan::set_test_now(Some(1_600));
+    withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
     let remaining = index.claude_account_deferred_hold_count();
     assert!(
@@ -2263,6 +2239,7 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
     );
     for step in 2..=80 {
         sampled_scan::set_test_now(Some(1_000 + step * 600));
+        withheld_account::support::clock(&index.withheld_memo);
         index.probe_absent_claude_account_deferred_holds();
         if index.claude_account_deferred_hold_count() == 0 {
             break;

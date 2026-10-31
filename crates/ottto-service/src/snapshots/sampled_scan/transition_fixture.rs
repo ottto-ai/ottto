@@ -24,6 +24,22 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+/// Emitted-body comparison for native scan fixtures without a transport driver.
+pub(crate) fn scan_money(
+    source: SnapshotSource,
+    scan: &super::super::SourceScanResult,
+) -> RouteResult {
+    let batches = if scan.snapshots.is_empty() {
+        Vec::new()
+    } else {
+        let mut request = super::super::tests::valid_v6_batch_request();
+        request.source = source.api_slug().into();
+        request.snapshots = scan.snapshots.clone();
+        vec![serde_json::to_vec(&request).unwrap()]
+    };
+    RouteResult::emitted(Mode::Ram, source, batches, &scan.snapshots)
+}
+
 /// Keep private acquisition internals private; sibling test adapters enter here.
 pub(crate) fn local_key(path: &Path) -> String {
     super::super::local_index_key(path)

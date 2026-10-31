@@ -4,8 +4,11 @@ use crate::source_rotation::{Owner, PaidReservation, Step, PARKED_BUDGET};
 use std::mem::size_of;
 use std::time::Duration;
 
-fn seed_held_memo() {
-    let mut index = ScanIndex::default();
+fn seed_held_memo(memo: &withheld_account::Memo) {
+    let mut index = ScanIndex {
+        withheld_memo: memo.clone(),
+        ..ScanIndex::default()
+    };
     let mut deferred = BTreeMap::new();
     for slot in 0..MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS {
         let key = format!("/opaque/owner-charge-{slot}.jsonl");
@@ -26,54 +29,58 @@ fn seed_held_memo() {
     );
 }
 
-fn assert_unavailable_population() {
+fn assert_unavailable_population(memo: &withheld_account::Memo) {
     assert_eq!(
-        serde_json::to_value(withheld_account::held_gauge()).unwrap(),
+        serde_json::to_value(memo.held_gauge()).unwrap(),
         json!({
             "withheld_held_count": MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS,
             "withheld_memo_unavailable": true
         }),
         "refusal preserves population and omits unknown tokens/ages"
     );
-    assert!(withheld_account::census().is_none());
+    assert!(memo.census().is_none());
 }
+/// [behaviour] Withheld refusal preserves a fully admitted sibling charge.
 
 #[test]
 fn withheld_refusal_preserves_a_fully_admitted_sibling_charge() {
-    seed_held_memo();
-    assert!(withheld_account::retained_bound(PARKED_BUDGET).is_some());
+    let state = withheld_account::Memo::default();
+    seed_held_memo(&state);
+    assert!(state.retained_bound(PARKED_BUDGET).is_some());
     // Include the no-remainder case: even an empty memo's conservative charge
     // must not make a fully admitted sibling trigger owner-wide discard.
     for limit in [PARKED_BUDGET, 0] {
         assert_eq!(
-            retained_with_withheld(limit, |available| {
+            retained_with_withheld(&state, limit, |available| {
                 assert_eq!(available, limit, "siblings receive the full allowance");
                 Some(available)
             }),
             Some(limit)
         );
-        assert_unavailable_population();
+        assert_unavailable_population(&state);
     }
 }
+/// [behaviour] Unsupported sibling preserves only a memo that fits the allowance.
 
 #[test]
 fn unsupported_sibling_preserves_only_a_memo_that_fits_the_allowance() {
-    seed_held_memo();
-    let memo = withheld_account::retained_bound(PARKED_BUDGET).unwrap();
-    assert_eq!(retained_with_withheld(memo, |_| None), None);
+    let state = withheld_account::Memo::default();
+    seed_held_memo(&state);
+    let memo = state.retained_bound(PARKED_BUDGET).unwrap();
+    assert_eq!(retained_with_withheld(&state, memo, |_| None), None);
     // This is the rotation's sibling-refusal cleanup, not an admission of an
     // unpriced sibling. The portable graph must survive this exact-fit case.
-    withheld_account::discard_if_refused();
-    assert_eq!(withheld_account::retained_bound(memo), Some(memo));
-    let gauge = serde_json::to_value(withheld_account::held_gauge()).unwrap();
+    state.discard_if_refused();
+    assert_eq!(state.retained_bound(memo), Some(memo));
+    let gauge = serde_json::to_value(state.held_gauge()).unwrap();
     assert_eq!(gauge["withheld_memo_unavailable"], false);
     assert_eq!(
         gauge["withheld_held_tokens"],
         MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS
     );
-    assert_eq!(retained_with_withheld(memo - 1, |_| None), None);
-    withheld_account::discard_if_refused();
-    assert_unavailable_population();
+    assert_eq!(retained_with_withheld(&state, memo - 1, |_| None), None);
+    state.discard_if_refused();
+    assert_unavailable_population(&state);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -94,6 +101,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for Frame {
 }
 
 struct Cycle {
+    memo: withheld_account::Memo,
     native: Arc<claude_native_comparison::lifecycle::Lifecycle>,
     versions: Arc<codex_version::CodexVersionFeed>,
     storage_bytes: usize,
@@ -151,10 +159,10 @@ impl Owner for Cycle {
         assert!(remaining.is_some());
         if source == Source::Holds {
             assert_eq!(self.parks, 1, "sibling still owns a real parked allocation");
-            let empty_memo = withheld_account::retained_bound(PARKED_BUDGET).unwrap();
+            let empty_memo = self.memo.retained_bound(PARKED_BUDGET).unwrap();
             let available =
                 remaining.unwrap() + self.other_bound(PARKED_BUDGET).unwrap() + empty_memo;
-            seed_held_memo();
+            seed_held_memo(&self.memo);
             let other = self.other_bound(available).unwrap();
             assert!(self.memo_charge <= available, "memo alone fits");
             assert!(other <= available, "real sibling graphs alone fit");
@@ -177,20 +185,21 @@ impl Owner for Cycle {
         self.parks += 1;
     }
     fn retained_bound(&self, limit: usize) -> Option<usize> {
-        retained_with_withheld(limit, |available| self.other_bound(available))
+        retained_with_withheld(&self.memo, limit, |available| self.other_bound(available))
     }
     fn discard_retained(&mut self) {
         self.discards += 1;
         // Match SnapshotCycleOwner's native and memo cleanup. This real native
         // policy graph would latch process_base_exit if composition refused it.
         self.native.discard_retained();
-        withheld_account::discard_if_refused();
+        self.memo.discard_if_refused();
     }
     fn retained_budget_unavailable(&mut self) {
-        withheld_account::discard_retained();
+        self.memo.discard_retained();
         self.discard_retained();
     }
 }
+/// [behaviour] Cap sized memo refusal does not base exit real native comparison.
 
 #[test]
 fn cap_sized_memo_refusal_does_not_base_exit_real_native_comparison() {
@@ -213,9 +222,11 @@ fn cap_sized_memo_refusal_does_not_base_exit_real_native_comparison() {
     let native_charge = native.retained_bound(PARKED_BUDGET).unwrap();
     assert!(native_charge > 0, "retain the real family-policy graph");
 
-    seed_held_memo();
-    let memo_charge = withheld_account::retained_bound(PARKED_BUDGET).unwrap();
+    let state = withheld_account::Memo::default();
+    seed_held_memo(&state);
+    let memo_charge = state.retained_bound(PARKED_BUDGET).unwrap();
     let mut owner = Cycle {
+        memo: state.clone(),
         native,
         versions: Arc::new(codex_version::CodexVersionFeed::new(None)),
         storage_bytes: 0,
@@ -236,7 +247,7 @@ fn cap_sized_memo_refusal_does_not_base_exit_real_native_comparison() {
     );
     // First park a frame, then let sibling completion populate the hold memo.
     // Target contention where memo alone fits but memo + native/versions do not.
-    withheld_account::discard_retained();
+    state.discard_retained();
     let queue = 2 * (size_of::<(Source, Frame, usize)>() + size_of::<Source>());
     let available = memo_charge + other / 2;
     owner.parked_charge = PARKED_BUDGET - queue - available;
@@ -248,7 +259,7 @@ fn cap_sized_memo_refusal_does_not_base_exit_real_native_comparison() {
         owner.discards, 0,
         "memo refusal must not reach owner-wide discard"
     );
-    assert_unavailable_population();
+    assert_unavailable_population(&state);
     assert_eq!(
         owner.native.retained_bound(PARKED_BUDGET),
         Some(native_charge)

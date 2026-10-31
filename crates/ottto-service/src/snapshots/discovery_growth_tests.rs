@@ -149,6 +149,7 @@ fn fate(counts: &Value, committed: u64, retained: u64) {
     );
     assert_eq!(counts["observation_overflow"], 0);
 }
+/// [behaviour] Grown refused then two unchanged passes read no extra body bytes.
 
 #[test]
 fn grown_refused_then_two_unchanged_passes_read_no_extra_body_bytes() {
@@ -167,7 +168,7 @@ fn grown_refused_then_two_unchanged_passes_read_no_extra_body_bytes() {
     // Real classify filters the withheld body, Completed restores the prior
     // committed extent, and the completion stamp controls subsequent retries.
     let mut committed =
-        crate::snapshot_sync::settle_withheld_for_test(&baseline, parsed, scan.clone());
+        crate::snapshot_sync::withheld_support::settle_withheld(&baseline, parsed, scan.clone());
     assert_eq!(committed.files[&key].size_bytes, committed_size);
     assert!(committed.claude_account_deferred_holds.contains_key(&key));
     let counts = f.save_and_report(&mut committed, &scan);
@@ -198,6 +199,7 @@ fn grown_refused_then_two_unchanged_passes_read_no_extra_body_bytes() {
         committed = ScanIndex::load(&f.root.join("index.json")).unwrap();
     }
 }
+/// [behaviour] Grown catchup reports committed only against saved extent.
 
 #[test]
 fn grown_catchup_reports_committed_only_against_saved_extent() {
@@ -215,6 +217,7 @@ fn grown_catchup_reports_committed_only_against_saved_extent() {
         json!({"le_30d":0,"d31_90":0,"gt_90d":0,"unknown":0})
     );
 }
+/// [behaviour] Oversized grown age is disclosed for every source without body reads.
 
 #[test]
 fn oversized_grown_age_is_disclosed_for_every_source_without_body_reads() {
@@ -242,7 +245,7 @@ fn oversized_grown_age_is_disclosed_for_every_source_without_body_reads() {
     }
 }
 
-/// SOURCE's rewrite control: the same inode is truncated and rewritten past
+/// [behaviour] SOURCE's rewrite control: the same inode is truncated and rewritten past
 /// the committed extent with a changed prefix. Growth retention discovers it;
 /// acquisition's existing prefix samples force the counted Full rebuild.
 #[test]
@@ -271,7 +274,7 @@ fn truncate_then_regrow_past_committed_extent_rebuilds_from_zero() {
     fate(&f.save_and_report(&mut rewritten, &scan), 1, 0);
 }
 
-/// Portable certificate/selector seam: the cursor's retained-prefix completion
+/// [behaviour] Portable certificate/selector seam: the cursor's retained-prefix completion
 /// is reproduced from a real ReadPlan seal, without a supported-layout override.
 /// The subsequent aged discovery and catch-up are ordinary production scans.
 /// Covers the in-memory seam, not the ordinary index-reload boundary: retaining
@@ -377,6 +380,28 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     assert!(
         encoded["files"][&key].get("codex_fragment").is_none(),
         "RAM only"
+    );
+    // Metadata-only change: the certified prefix still names the observed EOF,
+    // so ctime adoption must use that extent, not just the committed prefix.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(&f.path).unwrap().permissions().mode();
+    fs::set_permissions(&f.path, fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+    let (metadata_only, _) = open_and_identify_scan_candidate(
+        source,
+        candidate.clone(),
+        &mut ScanCensus::default(),
+        None,
+        7,
+        discovery_retention!(index),
+    )
+    .unwrap();
+    assert_eq!(
+        metadata_only.source_file_fingerprint,
+        candidate.source_file_fingerprint
+    );
+    assert_eq!(
+        index.candidate_decision(&metadata_only),
+        CandidateDecision::Skip
     );
     let metadata = fs::metadata(&f.path).unwrap();
     for _ in 0..2 {
@@ -571,6 +596,10 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         serde_json::to_value(&scan.snapshots).unwrap(),
         serde_json::to_value(&cold.snapshots).unwrap(),
         "catch-up body == cold Full"
+    );
+    sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+        &sampled_scan::transition_fixture::scan_money(source, &cold),
+        &sampled_scan::transition_fixture::scan_money(source, &scan),
     );
     let (_, idle, reads, _) = f.page(source, caught);
     assert!(idle.snapshots.is_empty(), "emitted once");

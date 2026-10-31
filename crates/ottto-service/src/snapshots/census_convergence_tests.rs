@@ -1120,7 +1120,7 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
         .record_claude_account_deferred_holds([(held_key, "deferred-source")], &BTreeMap::new(),));
     assert_eq!(resolved.claude_account_deferred_hold_count(), 0);
     // W4: a release on resolution is counted apart from a deletion.
-    let [released, _, _] = crate::local_resource_diagnostics::take_withheld_for_test();
+    let [released, _, _] = crate::local_resource_diagnostics::withheld_support::take_withheld();
     assert_eq!(released, BTreeMap::from([("resolved", 1)]));
 
     // Census absence prompts a rooted proof; absence of index/observation
@@ -1163,6 +1163,7 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
         &held_path,
         std::slice::from_ref(&scan_root)
     ));
+    withheld_account::support::clock(&absent.withheld_memo);
     sampled_scan::set_test_now(Some(1_000));
     absent.probe_absent_claude_account_deferred_holds();
     assert_eq!(absent.claude_account_deferred_hold_count(), 1);
@@ -1189,7 +1190,7 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     assert!(!full.record_claude_account_deferred_holds([(other_key, "other-source")], &deferred));
     assert!(!full.claude_account_deferred_holds.contains_key(other_key));
     // W3: the unrecorded key's withheld tokens are disclosed on the page line.
-    let [_, _, unrecorded] = crate::local_resource_diagnostics::take_withheld_for_test();
+    let [_, _, unrecorded] = crate::local_resource_diagnostics::withheld_support::take_withheld();
     assert_eq!(unrecorded, BTreeMap::from([("events", 1), ("tokens", 7)]));
     assert!(full.record_claude_account_deferred_holds([(held_key, "next-source")], &deferred));
     assert_eq!(

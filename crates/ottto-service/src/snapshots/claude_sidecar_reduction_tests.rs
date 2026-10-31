@@ -595,6 +595,7 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
         let prior = seed_predecessor(&f, &cache);
         let cache = if retained_budget {
             Arc::new(SharedCache {
+                withheld_memo: Default::default(),
                 cap_pace: Default::default(),
                 inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
                 cursor: Default::default(),

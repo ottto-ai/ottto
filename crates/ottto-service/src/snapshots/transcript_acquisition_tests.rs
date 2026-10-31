@@ -1171,6 +1171,7 @@ fn finish_production_scan_page(
     mut scan: OwnedSourceScan,
     source: SnapshotSource,
 ) -> ProductionScanPage {
+    withheld_account::support::clock(&scan.index.withheld_memo);
     let mut modes = (0, 0, 0);
     let mut metrics = (0, 0);
     loop {

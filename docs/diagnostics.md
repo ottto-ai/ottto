@@ -622,6 +622,14 @@ true cache loss, unsupported layouts and due audits retain their separately
 named existing Full causes and are outside this Tail-repeat counter.
 
 
+Withheld ownership debt is a **correctness hold**: it stays Unknown, remains
+discoverable while recorded, and publishes or settles nothing until resolution
+or eligible absence. The approved interim Full exception is the named, counted
+`withheld_reparse{start,evidence,growth}` path; it is unpaced because it publishes
+nothing and matches main's recovery. This is not a Full cause for arbitrary
+ownership holds. At the 4,096-hold cap new unrecorded debt stays withheld/Unknown
+without an invented age exemption; unknown identity cannot grant a memo Skip.
+
 On Claude pages, `counts.withheld_reparse` counts re-parses of keys withheld for
 an unresolved account: `start` (first in this process), `evidence` (same size,
 but the sampled content, the file object, its api/trace sidecar stamps or the
@@ -658,7 +666,9 @@ existing bounded identity samples remain. No new persisted state or read occurs.
 Known gap: APFS birth-clamp continuation accepts an object with an identical [device,inode], length, bounded samples and evidence whose birth moved down to its mtime. A reused-inode replacement crafted to match all of these (unsampled interior differing) would inherit the withheld memo until binding or real change. APFS does not reuse inode numbers in normal operation; Linux cannot produce the signature. Counted by withheld_birth_clamp_accepted.
 The effect is a withheld memo Skip until binding or a real change, never a wrong upload; no unprivileged continuity witness is available (`st_gen` needs root). No ACK, census or money credit is granted.
 
-Virtual N1 audit delay applies only to an aged grown key admitted solely by the
+The virtual N1 audit delay is a **bounded/transient scheduling hold**, ending at
+its existing due time. Unknown identity or resource refusal grants no new Skip
+or completion credit. It applies only to an aged grown key admitted solely by the
 grown-since-committed retention arm. A recent grown key keeps main's immediate
 TranscriptChanged selection. At its retained due time, the aged key takes the
 existing Audit cause. Main's #903 fixes virtual-deadline to sampled-marker
@@ -672,7 +682,9 @@ the next slot, failing toward reading rather than dropping the obligation.
 was proved absent), `deleted_tokens` (its last-known withheld tokens, when
 available), and `resolved` (a parse bound the account). A held audit obligation
 is retired only after two consecutive rooted NotFound observations at least
-600 seconds apart under the same validated parent. Each observation uses
+600 seconds apart under the same validated parent. Elapsed witness time uses
+RAM-only monotonic `Instant`, independently of wall-clock corrections; an earlier
+monotonic observation resets the sequence. Each observation uses
 `sampled_audit::proven_absent`: ENOENT of the file or a missing intermediate
 directory beneath a readable configured root. Descriptor-relative nofollow
 opens revalidate the chain before accepting absence. The existing capped memo
@@ -685,8 +697,11 @@ open failures also fail closed. The memo admits at most 32 retained parent
 descriptors and at most one eighth of the process soft descriptor limit; failure
 to query the limit refuses admission. Unadmitted keys keep their debt and retry
 on later inventory passes as admitted keys retire.
-The inventory probes at most 4,096 recorded holds, including held-new keys,
-outside aggregate terminal authority. Indexed reconciliation and removal hints
+The inventory probes at most 4,096 recorded holds at each Claude page end,
+including held-new keys, outside aggregate terminal authority. These are metadata-
+only rooted openat walks, never transcript reads. A pinned parent on a removable
+root can delay eject for at least 600 seconds. Each discovered held-file presence
+check resets its witness using one key construction and memo lookup. Indexed reconciliation and removal hints
 share this eligibility gate; generic file removal preserves account holds.
 Retirement preserves audited fingerprint incidence and existing ACK custody,
 and counts `counts.audit_retired_absent.events` when it removes audit debt and
@@ -710,9 +725,10 @@ memo details and cannot discard those admitted sibling graphs or BASE-exit
 native comparison. An unsupported sibling alone does not discard a memo that
 fits the available allowance. Persistently refused memo details remain unknown
 and require the existing counted recovery path until they can be retained.
-An empty memo releases its B-tree root and charges no heap bytes. The completed
-content witness is a fixed 64-byte value: one heap-accounting visit for the
-value itself, boxed in the memo. A compact map entry and its box fit the same
+An empty memo releases its B-tree root and optional heap charge. The existing
+transcript-cache owner shares the memo with its working index handles in all
+builds; rotation prices its optional state once. The completed content witness
+is a fixed 64-byte value boxed in the memo. A compact map entry and its box fit the same
 existing per-entry allowance; pending completion owns its value inline. `counts.withheld_held_tokens` is a gauge of the withheld
 tokens across recorded holds (each key's tokens at its last parse), and
 `counts.withheld_held_age` counts those held keys by wall-clock estimates since

@@ -825,38 +825,53 @@ struct UploadIndexSettlement {
 }
 
 #[cfg(test)]
-pub(crate) fn settle_withheld_for_test(
-    previous: &ScanIndex,
-    mut index: ScanIndex,
-    mut scan: crate::snapshots::SourceScanResult,
-) -> ScanIndex {
-    let mut disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
-    disposition.defer_sessions(
-        scan.snapshots
-            .iter()
-            .map(|item| item.source_session_id.clone())
-            .collect(),
-    );
-    let holds = LocalHoldSettlement::classify(
-        SnapshotSource::ClaudeCode,
-        &mut index,
-        &mut scan,
-        &disposition,
-    );
-    assert!(
-        scan.snapshots.is_empty(),
-        "account-held bodies stay Unknown and never enter upload"
-    );
-    let progress = SnapshotUploadProgress::new(
-        "withheld-fixture".into(),
-        crate::snapshots::snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    );
-    settle_completed_upload(index, previous, &progress, &holds).index
-}
+pub(crate) mod withheld_support {
+    use super::*;
+    pub(crate) fn settle_withheld(
+        previous: &ScanIndex,
+        mut index: ScanIndex,
+        mut scan: crate::snapshots::SourceScanResult,
+    ) -> ScanIndex {
+        let mut disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+        disposition.defer_sessions(
+            scan.snapshots
+                .iter()
+                .map(|item| item.source_session_id.clone())
+                .collect(),
+        );
+        let holds = LocalHoldSettlement::classify(
+            SnapshotSource::ClaudeCode,
+            &mut index,
+            &mut scan,
+            &disposition,
+        );
+        assert!(
+            scan.snapshots.is_empty(),
+            "account-held bodies stay Unknown and never enter upload"
+        );
+        let progress = SnapshotUploadProgress::new(
+            "withheld-fixture".into(),
+            crate::snapshots::snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        );
+        settle_completed_upload(index, previous, &progress, &holds).index
+    }
 
-#[cfg(test)]
-pub(crate) fn withheld_settled_for_test(index: &ScanIndex) -> bool {
-    upload_settled_without_account_holds(index, true)
+    pub(crate) fn withheld_settled(index: &ScanIndex) -> bool {
+        upload_settled_without_account_holds(index, true)
+    }
+
+    pub(crate) fn deferred_tokens(
+        scan: &crate::snapshots::SourceScanResult,
+    ) -> BTreeMap<String, u64> {
+        let mut disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+        disposition.defer_sessions(
+            scan.snapshots
+                .iter()
+                .map(|item| item.source_session_id.clone())
+                .collect(),
+        );
+        disposition.account_deferred_tokens(&scan.snapshots)
+    }
 }
 
 /// A persisted account hold was never uploaded, so the backfill and replay it
@@ -5058,22 +5073,29 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         self.started.elapsed()
     }
     fn retained_bound(&self, limit: usize) -> Option<usize> {
-        retained_with_withheld(limit, |limit| {
-            let versions = crate::heap_layout_bound::bound(&self.daemon.codex_versions, limit)?;
-            let native = if crate::snapshots::claude_native_comparison::enabled() {
-                self.daemon
-                    .native_comparison
-                    .retained_bound(limit.checked_sub(versions)?)?
-            } else {
-                0
-            };
-            let owned = versions.checked_add(native)?;
-            let continuation = continuation::retained_bound(limit.checked_sub(owned)?)?;
-            owned.checked_add(continuation)
-        })
+        retained_with_withheld(
+            &self.daemon.transcript_cache.withheld_memo,
+            limit,
+            |limit| {
+                let versions = crate::heap_layout_bound::bound(&self.daemon.codex_versions, limit)?;
+                let native = if crate::snapshots::claude_native_comparison::enabled() {
+                    self.daemon
+                        .native_comparison
+                        .retained_bound(limit.checked_sub(versions)?)?
+                } else {
+                    0
+                };
+                let owned = versions.checked_add(native)?;
+                let continuation = continuation::retained_bound(limit.checked_sub(owned)?)?;
+                owned.checked_add(continuation)
+            },
+        )
     }
     fn retained_budget_unavailable(&mut self) {
-        crate::snapshots::withheld_account::discard_retained();
+        self.daemon
+            .transcript_cache
+            .withheld_memo
+            .discard_retained();
         self.discard_retained();
     }
     fn discard_retained(&mut self) {
@@ -5081,7 +5103,10 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             self.daemon.native_comparison.discard_retained();
         }
         continuation::discard_retained();
-        crate::snapshots::withheld_account::discard_if_refused();
+        self.daemon
+            .transcript_cache
+            .withheld_memo
+            .discard_if_refused();
     }
     fn boundary(&mut self, busy: impl Iterator<Item = SnapshotSource>) {
         self.retry
@@ -5092,6 +5117,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
 // Existing retained graphs have priority over the advisory memo. Refusing only
 // the memo must not trigger the rotation's discard of admitted sibling graphs.
 pub(crate) fn retained_with_withheld(
+    memo: &crate::snapshots::withheld_account::Memo,
     limit: usize,
     other: impl FnOnce(usize) -> Option<usize>,
 ) -> Option<usize> {
@@ -5099,12 +5125,12 @@ pub(crate) fn retained_with_withheld(
     // Even when siblings are unsupported, price the portable memo against the
     // available allowance so their discard preserves it only if it fits.
     let remaining = limit.checked_sub(owned.unwrap_or(0))?;
-    match crate::snapshots::withheld_account::retained_bound(remaining) {
+    match memo.retained_bound(remaining) {
         Some(withheld) => owned?.checked_add(withheld),
         None => {
             // Frees all memo allocations; held population remains disclosed
             // with unavailable details and no optional memo storage to charge.
-            crate::snapshots::withheld_account::discard_if_refused();
+            memo.discard_if_refused();
             owned
         }
     }

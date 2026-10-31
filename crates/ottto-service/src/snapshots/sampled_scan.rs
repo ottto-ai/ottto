@@ -150,6 +150,7 @@ impl CapPace {
 }
 
 pub(crate) struct SharedCache {
+    pub(crate) withheld_memo: withheld_account::Memo,
     inner: Mutex<RetainedCache>,
     cap_pace: Mutex<CapPace>,
     /// The resumable Codex job slot and held-singleton memo. Charged once,
@@ -168,6 +169,7 @@ pub(crate) struct SharedCache {
 impl Default for SharedCache {
     fn default() -> Self {
         Self {
+            withheld_memo: Default::default(),
             inner: Mutex::new(TranscriptCache::with_byte_limit(STATE_BYTES)),
             cap_pace: Mutex::new(CapPace::default()),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
@@ -184,6 +186,9 @@ impl std::fmt::Debug for SharedCache {
 }
 impl HeapLayoutBound for SharedCache {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        // The shared cache owns the memo allocation header even when empty.
+        // Its optional entries are priced separately by the rotation owner.
+        self.withheld_memo.heap_bound(c)?;
         if BLOCKING_RESIDENT_MEASURE.with(std::cell::Cell::get) {
             // P1-RETAIN R0's completion measure: wait for each lock, one at a
             // time and in lock order (`retained` checks this thread holds
@@ -605,6 +610,14 @@ impl OwnedSourceScan {
         namespace: Scope,
     ) -> Self {
         self.durable_guard = Some(Arc::downgrade(&cache));
+        if self.source == SnapshotSource::ClaudeCode {
+            self.index.withheld_memo = cache.withheld_memo.clone();
+            self.index
+                .withheld_memo
+                .retain_held(&self.index.claude_account_deferred_holds);
+            self.resource_probe
+                .set_withheld_memo(self.index.withheld_memo.clone());
+        }
         if matches!(
             self.source,
             SnapshotSource::ClaudeCode | SnapshotSource::Codex

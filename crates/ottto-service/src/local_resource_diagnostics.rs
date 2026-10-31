@@ -329,13 +329,16 @@ const WITHHELD_RELEASED: [(&str, usize); 3] =
 const WITHHELD_UNRECORDED: [(&str, usize); 2] = [("events", 8), ("tokens", 9)];
 const WITHHELD_REPARSE: [(&str, usize); 3] = [("start", 4), ("evidence", 5), ("growth", 6)];
 #[cfg(test)]
-pub(crate) fn take_withheld_for_test() -> [BTreeMap<&'static str, u64>; 3] {
-    let claude = "claude_code";
-    [
-        drain(claude, &WITHHELD_RELEASED),
-        drain(claude, &WITHHELD_REPARSE),
-        drain(claude, &WITHHELD_UNRECORDED),
-    ]
+pub(crate) mod withheld_support {
+    use super::*;
+    pub(crate) fn take_withheld() -> [BTreeMap<&'static str, u64>; 3] {
+        let claude = "claude_code";
+        [
+            drain(claude, &WITHHELD_RELEASED),
+            drain(claude, &WITHHELD_REPARSE),
+            drain(claude, &WITHHELD_UNRECORDED),
+        ]
+    }
 }
 
 const SCHEMA_VERSION: u8 = 2;
@@ -536,6 +539,7 @@ fn process_sample() -> Option<ProcessSample> {
 
 #[derive(Debug)]
 pub(crate) struct Probe {
+    withheld_memo: Option<crate::snapshots::withheld_account::Memo>,
     started: Instant,
     process: Option<ProcessSample>,
     pub(crate) page_events: claude_reread::Counts,
@@ -551,6 +555,16 @@ impl Drop for Probe {
     }
 }
 impl Probe {
+    pub(crate) fn set_withheld_memo(&mut self, memo: crate::snapshots::withheld_account::Memo) {
+        self.withheld_memo = Some(memo);
+    }
+    pub(crate) fn with_withheld_memo(
+        mut self,
+        memo: crate::snapshots::withheld_account::Memo,
+    ) -> Self {
+        self.set_withheld_memo(memo);
+        self
+    }
     pub(crate) fn rearm_full_selected(
         &self,
         key: &str,
@@ -571,6 +585,7 @@ impl Probe {
     }
     pub(crate) fn start() -> Self {
         Self {
+            withheld_memo: None,
             started: Instant::now(),
             process: process_sample(),
             page_events: Default::default(),
@@ -670,10 +685,14 @@ impl Probe {
             withheld_birth_clamp_accepted: drain(source, &[("events", 15)]),
             withheld_hold_unrecorded: drain(source, &WITHHELD_UNRECORDED),
             withheld_memo: claude
-                .then(crate::snapshots::withheld_account::census)
+                .then(|| self.withheld_memo.as_ref().and_then(|memo| memo.census()))
                 .flatten(),
             withheld_held: claude
-                .then(crate::snapshots::withheld_account::held_gauge)
+                .then(|| {
+                    self.withheld_memo
+                        .as_ref()
+                        .and_then(|memo| memo.held_gauge())
+                })
                 .flatten(),
             source_rotation_serial_fallback: drain(
                 source,

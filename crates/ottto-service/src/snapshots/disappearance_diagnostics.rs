@@ -315,6 +315,7 @@ mod tests {
         file_limit: usize,
         hints: &[PathBuf],
     ) -> SourceScanResult {
+        super::super::withheld_account::support::clock(&index.withheld_memo);
         scan_source_roots_with_limit_and_attribution(
             SnapshotSource::ClaudeCode,
             &[root.to_path_buf()],
@@ -1573,7 +1574,7 @@ mod tests {
             .split_once("/// SOURCE N2:")
             .unwrap()
             .0;
-        assert!(account_retirement.contains("sampled_audit::proven_absent("));
+        assert!(account_retirement.contains("sampled_audit::absence_parent("));
         assert!(account_retirement.contains("audit_retired_absent(\"claude_code\")"));
         assert!(!account_retirement.contains("disappeared_file_count"));
         let vanished = calls("vanished");
