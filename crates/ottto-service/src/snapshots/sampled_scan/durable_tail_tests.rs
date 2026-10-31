@@ -11122,11 +11122,7 @@ fn pi_live_prepare_ledger_cap_counts_entry_cap_refusal_once() {
             .map(|n| (format!("{n:064x}"), PiUsageDedupState::default()))
             .collect();
         let view = LiveFinishView::new(
-            &accumulator,
-            &report,
-            0,
-            0,
-            false,
+            PreFinalization::new(&accumulator, &report, (0, 0, false)),
             &checkpoint,
             &chain,
             jsonl_line_cap() as u64,
@@ -11208,11 +11204,7 @@ fn non_pi_fork_live_encode_refusal_is_counted_and_writes_nothing() {
             .unwrap();
         accumulator.seen_pi_usage_keys = PiLedger::from_parts(BTreeMap::new(), true, Some(1));
         let view = LiveFinishView::new(
-            &accumulator,
-            &report,
-            0,
-            0,
-            false,
+            PreFinalization::new(&accumulator, &report, (0, 0, false)),
             &checkpoint,
             &chain,
             jsonl_line_cap() as u64,

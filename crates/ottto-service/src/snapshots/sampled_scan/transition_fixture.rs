@@ -245,10 +245,6 @@ pub(crate) fn allowlist_digest(source: SnapshotSource) -> [u8; 32] {
 }
 
 // Pure forwarders for the Pi rows (E5), which live outside `snapshots`.
-/// Pins this thread's scan clock; `None` restores real time.
-pub(crate) fn set_now(now: Option<u64>) {
-    super::set_test_now(now);
-}
 pub(crate) fn set_unverified_deadline(entry: &mut crate::snapshots::ScanIndexEntry, due: u64) {
     entry.set_unverified_deadline(due);
 }

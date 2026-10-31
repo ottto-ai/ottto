@@ -4832,6 +4832,7 @@ fn restored_behind_accepted_counts_pi_offers_or_index_regressions() {
         .unwrap();
         scan.snapshots = body.into_iter().cloned().collect();
         scan.pending_finalization.push(PendingIndexFinalization {
+            withheld_content: None,
             sampled_audit_verified: false,
             codex_pending_recovery: false,
             index_key: key.clone(),

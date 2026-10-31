@@ -34302,6 +34302,8 @@ impl OwnedSourceScan {
                                         recovered_audit_due,
                                         candidate,
                                         decision,
+                                        parse_reason: parse_reason
+                                            .filter(|_| source == SnapshotSource::ClaudeCode),
                                         previous_snapshot_fingerprint,
                                         previous_upload_body_witness,
                                         projection_adoption_required,
@@ -88742,9 +88744,9 @@ pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
 const _: () = {
     assert!(size_of::<OwnedJsonlParser>() == 5312);
     assert!(std::mem::align_of::<OwnedJsonlParser>() == 16);
-    // #876 adds CandidateFile.withheld_content_stamp (Option<String>, 24 B)
-    // to M3's 856-byte active frame; parser/custody boxing is unchanged.
-    assert!(size_of::<OwnedActiveFile>() == 880);
+    // The merged candidate, parse-reason and accepted-extent fields make the
+    // active frame 896 bytes; parser/custody boxing is unchanged.
+    assert!(size_of::<OwnedActiveFile>() == 896);
     assert!(
         size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() == 4880
     );

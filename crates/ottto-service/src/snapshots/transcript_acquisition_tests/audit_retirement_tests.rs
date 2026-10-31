@@ -2315,7 +2315,7 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
         let due = index.files[&key].unverified_deadline().unwrap();
         let state = fixture.dir.join("pi-recordless-audit-index.json");
         index.save(&state).unwrap();
-        let index = ScanIndex::load(&state).unwrap();
+        let mut index = ScanIndex::load(&state).unwrap();
         let cache = if evict {
             cache.clear();
             cache
@@ -2334,7 +2334,7 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
             &mut ScanCensus::default(),
             None,
             BACKFILL_WINDOW_DAYS,
-            &index.files,
+            &mut CandidateDiscovery::new(&mut index, None, None),
         )
         .unwrap();
         assert_eq!(

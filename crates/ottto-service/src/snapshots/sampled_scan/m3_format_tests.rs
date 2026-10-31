@@ -67,11 +67,7 @@ fn resign(bytes: &mut [u8]) {
 fn m3_p4a_source_table_admits_exact_triples_without_repinning_body() {
     let rows = crate::snapshots::durable_sources::SOURCES;
     assert_eq!(rows.len(), 3);
-    for (slot, row) in rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| row.source != DurableSource::Pi)
-    {
+    for (slot, row) in rows.iter().enumerate() {
         assert_eq!(row.source.slot(), slot);
         assert_eq!(row.tag as usize, slot + 1);
         assert_eq!(row.write_format, 3);

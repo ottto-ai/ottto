@@ -1296,7 +1296,6 @@ fn pi_appended_while_down_over_an_hour_restores_and_tails() {
         return;
     }
     const START: u64 = 1_800_000_000;
-    let _reset = Reset(|| fixture::set_now(None));
     for (name, later, pending) in [
         ("transition-pi-audit-down-2h", START + 7_200, 0),
         ("transition-pi-audit-clock-back", START - 1, 0),
@@ -1306,8 +1305,7 @@ fn pi_appended_while_down_over_an_hour_restores_and_tails() {
             crate::transcript_cache::CACHE_ENTRIES + 1,
         ),
     ] {
-        fixture::set_now(Some(START));
-        let mut f = PiDriver::warm(name, &pi_seed());
+        let mut f = fixture::with_scan_clock(START, || PiDriver::warm(name, &pi_seed()));
         f.restart();
         let tail = f.grow(&[pi_turn(
             "message",
@@ -1315,28 +1313,29 @@ fn pi_appended_while_down_over_an_hour_restores_and_tails() {
             20,
             "2026-10-27T08:00:00Z",
         )]);
-        fixture::set_now(Some(later));
-        if pending > 0 {
-            // More pending audits than slots, at keys outside discovery: the
-            // population a slot gate would read; a restore must not consult it.
-            let like = f.prior.files[&fixture::local_key(&f.path)].clone();
-            for n in 0..pending {
-                let mut entry = like.clone();
-                fixture::set_unverified_deadline(&mut entry, START);
-                let key = format!("/synthetic-pending-audits/{n}.jsonl");
-                f.prior.files.insert(key, entry);
+        fixture::with_scan_clock(later, || {
+            if pending > 0 {
+                // More pending audits than slots, at keys outside discovery: the
+                // population a slot gate would read; a restore must not consult it.
+                let like = f.prior.files[&fixture::local_key(&f.path)].clone();
+                for n in 0..pending {
+                    let mut entry = like.clone();
+                    fixture::set_unverified_deadline(&mut entry, START);
+                    let key = format!("/synthetic-pending-audits/{n}.jsonl");
+                    f.prior.files.insert(key, entry);
+                }
             }
-        }
-        let cold = f.emit_bodies(Mode::ColdFull);
-        let restored = f.emit_bodies(Mode::Restart);
-        assert_eq!(
-            (restored.modes, restored.restored),
-            ((0, 1, 0), 1),
-            "{name}: restore + Tail, no Full(AuditDue)"
-        );
-        assert_eq!(restored.io.consumed, tail, "{name}");
-        money_oracle::assert_equivalent(&cold, &restored);
-        whole_body(&cold, &restored);
+            let cold = f.emit_bodies(Mode::ColdFull);
+            let restored = f.emit_bodies(Mode::Restart);
+            assert_eq!(
+                (restored.modes, restored.restored),
+                ((0, 1, 0), 1),
+                "{name}: restore + Tail, no Full(AuditDue)"
+            );
+            assert_eq!(restored.io.consumed, tail, "{name}");
+            money_oracle::assert_equivalent(&cold, &restored);
+            whole_body(&cold, &restored);
+        });
     }
 }
 
