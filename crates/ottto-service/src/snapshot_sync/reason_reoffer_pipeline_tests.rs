@@ -2362,19 +2362,21 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
         usage_of(&baseline),
         "family total == request-owned total, counted once"
     );
-    // E2's ACK ledger names the rebuilt body uploaded on this page, not
-    // a pre-release item with the same money and identity.
+    // The durable ACK ledger is the index. finish_sync_source resets the
+    // progress file once this release page fully settles; the index keeps
+    // the exact rebuilt body uploaded on the page.
     let uploaded_on_release = &offered[release_offers_start..];
     let uploaded_fingerprints = uploaded_on_release
         .iter()
         .map(fingerprint_of)
         .collect::<BTreeSet<_>>();
+    let release_accepted = released.index.accepted_snapshot_fingerprints_for_test();
     assert_eq!(uploaded_on_release.len(), 1,
         "U10(c1): exactly one release-page upload; uploaded={uploaded_fingerprints:?} accepted={:?}",
-        released.progress.accepted_fingerprints);
-    assert!(uploaded_fingerprints.is_subset(&released.progress.accepted_fingerprints),
+        release_accepted);
+    assert!(uploaded_fingerprints.is_subset(release_accepted),
         "U10(c1): every uploaded body has its exact ACK; uploaded={uploaded_fingerprints:?} accepted={:?}",
-        released.progress.accepted_fingerprints);
+        release_accepted);
     // No Unknown -> account upgrade: a replacement carries exactly the
     // first accepted body's identity, never an account it lacked. With no
     // replacement, the server already holds that exact accepted body.
@@ -2406,7 +2408,7 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
     assert!(quiet.result.is_ok(), "{:?}", quiet.result);
     assert_eq!(pipeline.server.offered().len(), offered.len(),
         "U10(c2): quiet cycle offers nothing; release_uploaded={uploaded_fingerprints:?} release_accepted={:?} quiet_accepted={:?}",
-        released.progress.accepted_fingerprints, quiet.progress.accepted_fingerprints);
+        release_accepted, quiet.index.accepted_snapshot_fingerprints_for_test());
     assert_eq!(
         quiet.index.files[&key].effective_upload_body_witness_revision,
         settled_revision

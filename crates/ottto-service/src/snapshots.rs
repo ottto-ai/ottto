@@ -46836,6 +46836,11 @@ impl ScanIndex {
         UnsettledUploadCause::names(self.unsettled_cause_bits())
     }
 
+    #[cfg(test)]
+    pub(crate) fn accepted_snapshot_fingerprints_for_test(&self) -> &BTreeSet<String> {
+        &self.accepted_snapshot_fingerprints
+    }
+
     pub(crate) fn accepted_snapshot_fingerprint_recorded(&self, fingerprint: &str) -> bool {
         !self.decode_holds_entity(fingerprint)
             && self.accepted_snapshot_fingerprints.contains(fingerprint)
