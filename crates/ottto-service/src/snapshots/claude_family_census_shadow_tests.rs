@@ -80,7 +80,7 @@ fn freshness_touched_families_do_not_refuse_a_parkable_frame() {
     );
 }
 
-fn traversal() -> ScanTraversalCheckpoint {
+pub(super) fn traversal() -> ScanTraversalCheckpoint {
     ScanTraversalCheckpoint {
         context_fingerprint: "context".to_string(),
         census_window_end: WINDOW.to_string(),
