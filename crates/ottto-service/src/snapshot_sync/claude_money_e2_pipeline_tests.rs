@@ -266,7 +266,7 @@ impl Page {
                 .unwrap()
             });
         if let Some(accepted) = accepted {
-            accepted.invalidate_copy_derived(&stats.copy_invalidated);
+            accepted.invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated));
         }
         self.released = released;
         self.unhealthy = stats.unhealthy_root_no_fallback_requests;

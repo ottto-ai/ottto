@@ -3782,8 +3782,6 @@ pub(crate) struct ScanEvidence<'a> {
     native_originals: Option<&'a BTreeMap<String, super::SessionAccountEvidence>>,
     accepted_buckets: Option<&'a AcceptedBuckets>,
     wire_size_reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
-    /// Copy-derived rows this pass's bodies treat as never accepted.
-    copy_invalidated: std::cell::RefCell<Vec<CopyInvalidation>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -3865,11 +3863,6 @@ impl<'a> ScanEvidence<'a> {
     pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {
         self.accepted_buckets = accepted;
         self
-    }
-
-    /// The rows the ledger must tombstone (`AcceptedBuckets::invalidate_copy_derived`).
-    pub(crate) fn take_copy_invalidated(&self) -> Vec<CopyInvalidation> {
-        self.copy_invalidated.take()
     }
 
     pub(crate) fn with_wire_size_reservation(
@@ -4689,6 +4682,9 @@ pub(crate) struct ScanOutcome {
     pub(crate) sent: usize,
     pub(crate) fallback: usize,
     pub(crate) ineligible: usize,
+    /// Copy-derived accepted rows this pass's bodies treat as never accepted,
+    /// for the sync loop to tombstone through `AcceptedBuckets` before upload.
+    pub(crate) copy_invalidated: Vec<CopyInvalidation>,
 }
 
 const REPORTED: &str = "session_exclusive_reported_usage:v1";
@@ -4855,7 +4851,13 @@ pub(crate) fn apply_scan_with_ownership(
         if item.provenance.collector != "claude_code_jsonl" {
             continue;
         }
-        match tag_item(item, evidence, &mut reported, ownership) {
+        match tag_item(
+            item,
+            evidence,
+            &mut reported,
+            ownership,
+            &mut outcome.copy_invalidated,
+        ) {
             Some(Ok(Tagged::Sent { .. })) => outcome.sent += 1,
             Some(Ok(Tagged::Fallback { .. })) => outcome.fallback += 1,
             Some(Err(_)) | None => outcome.ineligible += 1,
@@ -5089,6 +5091,7 @@ fn tag_item(
     evidence: &ScanEvidence<'_>,
     reported: &mut BTreeMap<String, Grouping>,
     ownership: &TranscriptOwnership<'_>,
+    invalidated_rows: &mut Vec<CopyInvalidation>,
 ) -> Option<Result<Tagged, Ineligible>> {
     let accepted = evidence
         .accepted_buckets
@@ -5148,18 +5151,13 @@ fn tag_item(
                 item.source_last_activity_at,
             ) = lifecycle;
         } else {
-            evidence
-                .copy_invalidated
-                .borrow_mut()
-                .extend(
-                    copy_derived
-                        .into_iter()
-                        .map(|(bucket, row)| CopyInvalidation {
-                            session: item.source_session_id.clone(),
-                            bucket,
-                            row,
-                        }),
-                );
+            invalidated_rows.extend(copy_derived.into_iter().map(|(bucket, row)| {
+                CopyInvalidation {
+                    session: item.source_session_id.clone(),
+                    bucket,
+                    row,
+                }
+            }));
         }
         // A cap failure cannot authorize a uniform starting-account rewrite.
         // The budget's proved subset or full strip is the final identity body.

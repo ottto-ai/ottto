@@ -5145,6 +5145,10 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// Contract-5 only: each rebuilt item's requests, classified and folded
     /// into bounded row x authority-key groups during the rebuild.
     pub(crate) request_groupings: BTreeMap<String, claude_request_identity::Grouping>,
+    /// SOURCE 2026-10-31 (#944 xPR F5): the copy-derived accepted rows this
+    /// pass's bodies treat as never accepted. The sync loop tombstones them
+    /// through `AcceptedBuckets` and saves before any upload.
+    pub(crate) copy_invalidated: Vec<claude_request_identity::CopyInvalidation>,
     /// Contract-5 only: this terminal census compared every indexed Claude
     /// family member's current requests. Unlike fence coverage, a bound
     /// authority quarantine excuses nothing. Taken before the census prunes
