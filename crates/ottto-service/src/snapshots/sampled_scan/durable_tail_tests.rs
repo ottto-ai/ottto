@@ -11987,6 +11987,17 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     let loaded = ScanIndex::load(&index_path).unwrap();
     let interpretation = Interpretation::of(source, &key, &loaded, false, &namespace);
     let mut file = File::open(&path).unwrap();
+    assert!(matches!(
+        fresh.durable_restore(
+            source, &key, &path, &scope, &mut file, &loaded, &interpretation,
+        ),
+        RestoreOutcome::QuietPending
+    ));
+    assert_eq!(fresh.durable_counters(source).unwrap().1.body_bytes_read, 0);
+    std::io::Write::write_all(
+        &mut std::fs::OpenOptions::new().append(true).open(&path).unwrap(),
+        b"{}\n",
+    ).unwrap();
     let restored = fresh.durable_restore(
         source,
         &key,
@@ -12014,8 +12025,8 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     assert_eq!(
         parser
             .prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_000)
-            .unwrap_or_else(|_| panic!("restored quiet checkpoint must prepare")),
-        crate::transcript_acquisition::ReadMode::Unchanged
+            .unwrap_or_else(|_| panic!("restored growing checkpoint must prepare")),
+        crate::transcript_acquisition::ReadMode::Tail
     );
 }
 
