@@ -236,6 +236,9 @@ impl ScanIndex {
             .get_mut(key)
             .expect("validated entry")
             .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        if claude_terminal_off() {
+            with_open_backoff(|backoff| backoff.keys.remove(key));
+        }
         true
     }
 }
@@ -367,11 +370,20 @@ pub(super) fn progress_debt(index: &ScanIndex, key: &str, now: u64) -> Option<Au
 }
 
 pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
+    if !claude_terminal_off() {
+        return debt_for_key_main(index, key, now);
+    }
+
     index
         .files
         .get(key)
         .and_then(|entry| entry.audit_obligation(now))
-        .or_else(|| progress_debt(index, key, now))
+        .into_iter()
+        .chain(progress_debt(index, key, now))
+        .map(|debt| debt.due_unix_seconds)
+        .chain(failed_open_debt(key, now))
+        .min()
+        .map(|due_unix_seconds| AuditDebt { due_unix_seconds })
 }
 
 /// A held key the slot may serve: bounded, still awaiting restoration, and
@@ -499,9 +511,10 @@ impl OpenBackoff {
     }
     fn blocked(&self, key: &str, now: u64) -> bool {
         self.keys.get(key).is_some_and(|failure| {
-            (failure.failures >= OPEN_PARK_FAILURES
-                || (self.page < failure.retry_page
-                    && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
+            (!claude_terminal_off() || failure.failures > 0)
+                && (failure.failures >= OPEN_PARK_FAILURES
+                    || (self.page < failure.retry_page
+                        && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
                 && open_stamp(key) == failure.stamp
         })
     }
@@ -569,15 +582,44 @@ fn open_blocked(key: &str, now: u64) -> bool {
     with_open_backoff(|backoff| backoff.blocked(key, now))
 }
 
+/// All candidate admissions share this stat-wake check, before secure open.
+pub(super) fn candidate_open_blocked(key: &str, now: u64) -> bool {
+    if !claude_terminal_off() {
+        return false;
+    }
+    open_blocked(key, now)
+}
+/// Scheduling only: an existing failed-open obligation may retry when its
+/// own throttle expires; a successful ordinary open is not such a retry.
+pub(super) fn failed_open_retry_ready(key: &str, now: u64) -> bool {
+    if !claude_terminal_off() {
+        return false;
+    }
+    with_open_backoff(|memo| {
+        memo.keys.get(key).is_some_and(|f| f.failures > 0) && !memo.blocked(key, now)
+    })
+}
+pub(super) fn failed_open_debt(key: &str, now: u64) -> Option<u64> {
+    if !claude_terminal_off() {
+        return None;
+    }
+    with_open_backoff(|backoff| backoff.owed(key)).filter(|due| now >= *due)
+}
+
 /// Census-line counts: keys whose progress open failed and are still owed
 /// (backing off or parked), and the age of the oldest first failure.
 pub(super) fn held_audit_open_failed(now: u64) -> (usize, u64) {
     with_open_backoff(|backoff| {
         (
-            backoff.keys.len(),
             backoff
                 .keys
                 .values()
+                .filter(|failure| failure.failures > 0)
+                .count(),
+            backoff
+                .keys
+                .values()
+                .filter(|failure| failure.failures > 0)
                 .map(|failure| now.saturating_sub(failure.first_failed))
                 .max()
                 .unwrap_or(0),
@@ -598,18 +640,28 @@ pub(super) fn reset_open_backoff_for_test() {
 #[cfg(test)]
 mod open_backoff_tests;
 
-/// The queued progress Full for `key` passed its secure open: the slot's
-/// turn is spent, so the next preparation rotates to a fresh interval, and
-/// any failed-open backoff ends.
+/// Secure open spends this key's progress turn and clears throttling, NOT
+/// the owed verification. Another key may own the slot, so retain the exact
+/// numeric due in the bounded map until a marker/native acquisition carries
+/// it or a completed source verification retires it.
 pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
+    if !claude_terminal_off() {
+        return progress_opened_main(index, key);
+    }
+
     if let Some(slot) = index
         .held_audit_progress
         .as_mut()
         .filter(|slot| slot.key == key)
     {
         slot.attempted = true;
-        with_open_backoff(|backoff| backoff.keys.remove(key));
     }
+    with_open_backoff(|backoff| {
+        if let Some(failure) = backoff.keys.get_mut(key) {
+            failure.failures = 0;
+            failure.retry_page = backoff.page;
+        }
+    });
 }
 
 #[derive(Serialize)]
@@ -619,28 +671,57 @@ struct HeldAuditOpenParked {
     held_audit_open_failed_keys: usize,
 }
 
-/// The queued progress Full for `key` failed its secure open. Back the key
-/// off (or park it), then rotate the turn, wrapping to `key` itself when no
-/// other member is eligible, but keep the owed due: a failed open never
-/// re-arms a later deadline.
-pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
-    let Some(due) = index
-        .held_audit_progress
-        .as_ref()
-        .filter(|slot| slot.key == key && !slot.attempted)
-        .map(|slot| slot.due)
-    else {
-        return;
-    };
+// All actual failed opens of an already owed key, including constructor
+// preflight, share the bounded failure record. No census/ACK state changes.
+fn record_open_failure(key: &str, due: u64, now: u64) -> RecordedFailure {
     let (recorded, keys) =
         with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
-    if let Some(parked) = recorded.parked {
+    if let Some(parked) = recorded.parked.as_ref() {
         // Counts only; no path or id. Once per park.
         crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
             held_audit_open_failures: parked.failures,
             held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
             held_audit_open_failed_keys: keys,
         });
+    }
+    recorded
+}
+pub(super) fn candidate_open_failed(key: &str, now: u64) {
+    if !claude_terminal_off() {
+        return;
+    }
+    if let Some(due) = failed_open_debt(key, now) {
+        record_open_failure(key, due, now);
+    }
+}
+
+/// The queued progress Full for `key` failed its secure open. Back the key
+/// off (or park it), then rotate the turn, wrapping to `key` itself when no
+/// other member is eligible, but keep the owed due: a failed open never
+/// re-arms a later deadline.
+pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
+    if !claude_terminal_off() {
+        return progress_open_failed_main(index, key, now);
+    }
+
+    let Some(due) = index
+        .held_audit_progress
+        .as_ref()
+        .filter(|slot| slot.key == key && !slot.attempted)
+        .map(|slot| slot.due)
+        .or_else(|| failed_open_debt(key, now))
+    else {
+        return;
+    };
+    let recorded = record_open_failure(key, due, now);
+    // An ordinary admission can be a previously failed key while another
+    // member owns the progress slot. Its failure must not steal that turn.
+    if index
+        .held_audit_progress
+        .as_ref()
+        .is_some_and(|slot| slot.key != key)
+    {
+        return;
     }
     let previous = index.held_audit_progress.take();
     // Rule 7: an overflow-evicted key may retry, so it takes the next turn,
@@ -662,9 +743,17 @@ pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
 fn schedule_held_audit_progress(index: &mut ScanIndex, now: u64) -> Option<String> {
     with_open_backoff(|backoff| {
         backoff.page = backoff.page.saturating_add(1);
-        backoff
-            .keys
-            .retain(|key, _| awaits_hold_deadline_restoration(index, key));
+        // Restoring a plain-v2 hold changes its representation, not its
+        // failed-open obligation. Keep the same-stat park and original D
+        // until source verification discharges them (or the entry is gone).
+        backoff.keys.retain(|key, _| {
+            awaits_hold_deadline_restoration(index, key)
+                || claude_terminal_off()
+                    && index
+                        .files
+                        .get(key)
+                        .is_some_and(ScanIndexEntry::has_unverified_source)
+        });
     });
     let previous = index.held_audit_progress.clone();
     let keep = previous.as_ref().is_some_and(|slot| {
@@ -1747,6 +1836,58 @@ mod absence_non_unix_tests {
     }
 }
 
+pub(super) fn debt_for_key_main(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
+    index
+        .files
+        .get(key)
+        .and_then(|entry| entry.audit_obligation(now))
+        .or_else(|| progress_debt(index, key, now))
+}
+
+pub(super) fn progress_opened_main(index: &mut ScanIndex, key: &str) {
+    if let Some(slot) = index
+        .held_audit_progress
+        .as_mut()
+        .filter(|slot| slot.key == key)
+    {
+        slot.attempted = true;
+        with_open_backoff(|backoff| backoff.keys.remove(key));
+    }
+}
+
+pub(super) fn progress_open_failed_main(index: &mut ScanIndex, key: &str, now: u64) {
+    let Some(due) = index
+        .held_audit_progress
+        .as_ref()
+        .filter(|slot| slot.key == key && !slot.attempted)
+        .map(|slot| slot.due)
+    else {
+        return;
+    };
+    let (recorded, keys) =
+        with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
+    if let Some(parked) = recorded.parked {
+        // Counts only; no path or id. Once per park.
+        crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
+            held_audit_open_failures: parked.failures,
+            held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
+            held_audit_open_failed_keys: keys,
+        });
+    }
+    let previous = index.held_audit_progress.take();
+    // Rule 7: an overflow-evicted key may retry, so it takes the next turn,
+    // and its owed due moves into the slot: the debt is never dropped.
+    let (evicted, evicted_due) = recorded.evicted.unzip();
+    index.held_audit_progress = evicted
+        .filter(|evicted| progress_eligible(index, evicted))
+        .or_else(|| next_progress_key(index, Some(key), now))
+        .map(|next| {
+            let mut slot = progress_slot(next, due, previous.as_ref());
+            slot.due = evicted_due.map_or(slot.due, |owed| slot.due.min(owed));
+            slot
+        });
+}
+
 /// V2-only selection bookkeeping. The key keeps the index key's PL class;
 /// sizes, generations and consecutive uncertainty are N. It conveys no proof.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2487,14 +2628,15 @@ mod growth_tests {
                 Some(&resumed.v2().growth_retention),
             )
             .unwrap();
-            assert!(open_and_identify_scan_candidate_with_growth(
+            assert!(open_and_identify_scan_candidate_at(
                 SnapshotSource::ClaudeCode,
                 candidate,
                 &mut census,
                 Some(now),
                 30,
                 &resumed.files,
-                Some(&resumed.v2().growth_retention)
+                Some(&resumed.v2().growth_retention),
+                sampled_scan::now_seconds(),
             )
             .is_some());
         }
@@ -2783,7 +2925,7 @@ mod growth_tests {
             Some(&index.v2().growth_retention),
         )
         .unwrap();
-        let (candidate, _) = open_and_identify_scan_candidate_with_growth(
+        let (candidate, _) = open_and_identify_scan_candidate_at(
             SnapshotSource::ClaudeCode,
             candidate,
             &mut census,
@@ -2791,6 +2933,7 @@ mod growth_tests {
             30,
             &index.files,
             Some(&index.v2().growth_retention),
+            sampled_scan::now_seconds(),
         )
         .unwrap();
         for cause in [
@@ -2853,7 +2996,7 @@ mod growth_tests {
             Some(&index.v2().growth_retention),
         )
         .unwrap();
-        open_and_identify_scan_candidate_with_growth(
+        open_and_identify_scan_candidate_at(
             SnapshotSource::ClaudeCode,
             candidate,
             &mut census,
@@ -2861,6 +3004,7 @@ mod growth_tests {
             30,
             &index.files,
             Some(&index.v2().growth_retention),
+            sampled_scan::now_seconds(),
         )
         .unwrap()
         .0

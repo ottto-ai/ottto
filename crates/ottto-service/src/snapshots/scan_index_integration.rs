@@ -28,6 +28,25 @@ pub(super) fn read_scan_index_representation(
     source: &'static str,
     cap: Option<usize>,
 ) -> Result<ScanIndex> {
+    read_representation(path, stage, source, cap, false)
+}
+
+/// Administrative metadata inspection: no daemon recovery or filesystem writes.
+pub(super) fn read_scan_index_representation_read_only(
+    path: &Path,
+    stage: &str,
+    source: &'static str,
+) -> Result<ScanIndex> {
+    read_representation(path, stage, source, None, true)
+}
+
+fn read_representation(
+    path: &Path,
+    stage: &str,
+    source: &'static str,
+    cap: Option<usize>,
+    read_only: bool,
+) -> Result<ScanIndex> {
     let Some(binding) = scan_index_storage_binding(path) else {
         return match cap {
             Some(cap) => claude_request_census::decode_bounded_index(
@@ -38,7 +57,12 @@ pub(super) fn read_scan_index_representation(
     };
     let store =
         scan_index_persistence::LockedStore::new(path, binding.clone(), lenient_decode::FIELDS)?;
-    let (mut index, mut root) = match open_storage(&store, source)? {
+    let opened = if read_only {
+        store.open_read_only_with_map_validator(&mut lenient_decode::validate_persistence_map)?
+    } else {
+        open_storage(&store, source)?
+    };
+    let (mut index, mut root) = match opened {
         scan_index_persistence::Opened::Missing(root) => {
             debug_assert!(root.generation().is_none());
             return Err(anyhow::anyhow!("scan_index_root_disappeared"));

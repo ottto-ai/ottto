@@ -82,6 +82,7 @@ fn typed_part(part: &Value) -> SnapshotIdentityPart {
 
 fn typed_row(row: &Value) -> SnapshotModelUsage {
     SnapshotModelUsage {
+        copy_unproven: row.get("copy_unproven").and_then(Value::as_bool).unwrap_or(false),
         model: opt_string(row, "model").unwrap(),
         input_tokens: count(row, "input_tokens"),
         output_tokens: count(row, "output_tokens"),
@@ -107,6 +108,7 @@ fn typed_row(row: &Value) -> SnapshotModelUsage {
         identity_parts: row
             .get("identity_parts")
             .map(|parts| parts.as_array().unwrap().iter().map(typed_part).collect()),
+        identity_retained: row.get("identity_retained").is_some_and(|v| v == true),
         cost_usd: opt_string(row, "cost_usd"),
         input_cost_usd: opt_string(row, "input_cost_usd"),
         output_cost_usd: opt_string(row, "output_cost_usd"),
@@ -5221,3 +5223,4 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
 }
 
 include!("claude_request_identity_window_tests.rs");
+include!("claude_request_identity_retained_tests.rs");

@@ -2,7 +2,7 @@
 use super::*;
 use crate::snapshots::{
     candidate_from_traversal_path_with_growth, local_index_key,
-    open_and_identify_scan_candidate_with_growth, sampled_audit, CandidateFile, ScanCensus,
+    open_and_identify_scan_candidate_at, sampled_audit, sampled_scan, CandidateFile, ScanCensus,
     ScanTraversalPath, SnapshotSource, LOCAL_SCAN_INDEX_IDENTITY_VERSION,
 };
 use crate::transcript_acquisition::{FullReason, ReadMode};
@@ -97,7 +97,7 @@ impl Fixture {
             Some(&index.v2().growth_retention),
         )
         .unwrap();
-        open_and_identify_scan_candidate_with_growth(
+        open_and_identify_scan_candidate_at(
             SnapshotSource::ClaudeCode,
             candidate,
             &mut census,
@@ -105,6 +105,7 @@ impl Fixture {
             30,
             &index.files,
             Some(&index.v2().growth_retention),
+            sampled_scan::now_seconds(),
         )
         .unwrap()
         .0

@@ -41,17 +41,32 @@ pub(crate) struct Counts {
     /// Frozen tagged rows absent from their still-present accepted bucket.
     pub(crate) accepted_row_vanished: u64,
     pub(crate) accepted_state_unknown_cause: UnknownCauses,
+    // Option (ii), local only; omitted while zero so gate-off output is unchanged.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) retained_marker_rows: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) retained_proof_missing_received: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) retained_set_cleared: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) retained_missing_unfit: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) proved_rows_capped: u64,
 }
 impl Counts {
     pub(super) fn is_empty(&self) -> bool {
         self == &Self::default()
     }
 }
+const COUNTER_COUNT: usize = 18;
 #[cfg(not(test))]
-static COUNTERS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+static COUNTERS: [AtomicU64; COUNTER_COUNT] = [const { AtomicU64::new(0) }; COUNTER_COUNT];
 #[cfg(test)]
-thread_local! { static COUNTERS: [AtomicU64; 13] = const { [const { AtomicU64::new(0) }; 13] }; }
-fn counters<T>(f: impl FnOnce(&[AtomicU64; 13]) -> T) -> T {
+thread_local! {
+    static COUNTERS: [AtomicU64; COUNTER_COUNT] =
+        const { [const { AtomicU64::new(0) }; COUNTER_COUNT] };
+}
+fn counters<T>(f: impl FnOnce(&[AtomicU64; COUNTER_COUNT]) -> T) -> T {
     #[cfg(test)]
     {
         COUNTERS.with(f)
@@ -77,13 +92,18 @@ pub(super) fn record(counts: &Counts) {
             counts.accepted_state_unknown_cause.epoch_changed,
             counts.accepted_state_unknown_cause.untracked_session,
             counts.accepted_state_unknown_cause.incomplete,
+            counts.retained_marker_rows,
+            counts.retained_proof_missing_received,
+            counts.retained_set_cleared,
+            counts.retained_missing_unfit,
+            counts.proved_rows_capped,
         ]) {
             let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(value)));
         }
     });
 }
 pub(super) fn take_counts() -> Counts {
-    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, accepted_state_evicted, same_as_parent, differs, unpriced_part_untagged, accepted_row_vanished, no_key, epoch_changed, untracked_session, incomplete] =
+    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, accepted_state_evicted, same_as_parent, differs, unpriced_part_untagged, accepted_row_vanished, no_key, epoch_changed, untracked_session, incomplete, retained_marker_rows, retained_proof_missing_received, retained_set_cleared, retained_missing_unfit, proved_rows_capped] =
         counters(|counters| counters.each_ref().map(|counter| counter.swap(0, Relaxed)));
     Counts {
         retained_buckets,
@@ -103,6 +123,11 @@ pub(super) fn take_counts() -> Counts {
             untracked_session,
             incomplete,
         },
+        retained_marker_rows,
+        retained_proof_missing_received,
+        retained_set_cleared,
+        retained_missing_unfit,
+        proved_rows_capped,
     }
 }
 

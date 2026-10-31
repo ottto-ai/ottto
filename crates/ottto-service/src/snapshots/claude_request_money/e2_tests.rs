@@ -1054,8 +1054,25 @@ fn e2_native_resolver_owns_progressive_and_idless_decisions() {
 fn e2_diagnostic_fields_are_nonzero_only() {
     assert_eq!(serde_json::to_value(Counts::default()).unwrap(), json!({}));
     assert_eq!(
-        serde_json::to_value(Counts([1, 2, 0, 0, 0, 3, 0])).unwrap(),
+        serde_json::to_value(Counts::work([1, 2, 0, 0, 0, 3, 0])).unwrap(),
         json!({"fold_us":1,"responses":2,"side_call_root_fallback":3})
+    );
+    let tally = PrefixTally {
+        unproven_requests: 4,
+        unproven_idless: 1,
+        priced_requests: 2,
+        cost_micros: 700,
+        reused: 0,
+        ..PrefixTally::default()
+    };
+    assert_eq!(
+        serde_json::to_value(Counts::prefix(&tally)).unwrap(),
+        json!({"copy_prefix_unproven_requests":5,"copy_prefix_unproven_files":1,
+            "copy_prefix_unproven_priced_requests":2,"copy_prefix_unproven_cost_micros":700})
+    );
+    assert_eq!(
+        serde_json::to_value(Counts::removal_store(3, 0)).unwrap(),
+        json!({"copy_removal_stored":3})
     );
 }
 

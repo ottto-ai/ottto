@@ -419,7 +419,7 @@ impl SnapshotUploadProgress {
                 projected.accepted_cache_heads.insert(key, "f".repeat(64));
             }
             let before_identity = serde_json::to_value(&projected.accepted_identity_buckets)?;
-            projected.record_cache_state_with_mode(item, false, true)?;
+            projected.record_stored_state(item, false, None, true)?;
             let after_identity = serde_json::to_value(&projected.accepted_identity_buckets)?;
             if let Some(sessions) = after_identity.as_object() {
                 for (key, session) in sessions {

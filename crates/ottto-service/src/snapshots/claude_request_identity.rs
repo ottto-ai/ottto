@@ -42,6 +42,10 @@ pub(crate) use accepted::AcceptedBuckets;
 pub(crate) use budget::Measurement as CapMeasurement;
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
+/// Option (ii) activation: the exact activity-hint capability token
+/// (`session_request_identity_retained_contract`). Any other value keeps
+/// `identity_retained` off and the #909 accepted-priority body byte-identical.
+pub(crate) const IDENTITY_RETAINED_CONTRACT: &str = "session_request_identity_retained:v1";
 pub(crate) const E2_GROUPING: &str =
     "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1";
 
@@ -804,7 +808,7 @@ pub(crate) fn apply_with_reserved_bytes_for_test(
     }
     let known = accepted.get(&item.source_session_id);
     grouping.accepted_miss = accepted.miss_cause();
-    apply_grouped_with_accepted(item, grouping, known)
+    apply_grouped_with_accepted(item, grouping, known, accepted.retained_enabled())
 }
 
 /// `apply` with each request's own transcript time (`None`: auxiliary),
@@ -836,14 +840,24 @@ pub(crate) fn apply_grouped(
     item: &mut SnapshotItem,
     grouping: Grouping,
 ) -> Result<Tagged, Ineligible> {
-    apply_grouped_with_accepted(item, grouping, None)
+    apply_grouped_with_accepted(item, grouping, None, false)
 }
 
+/// `retained` is option (ii): the server retains proof per bucket row, so the
+/// accepted set is the witnessed proved-row ledger (markers) instead of an
+/// allocation priority, and fresh tags use the plain newest-first order.
 fn apply_grouped_with_accepted(
     item: &mut SnapshotItem,
     mut grouping: Grouping,
-    accepted: Option<&accepted::AcceptedSession>,
+    known: Option<&accepted::AcceptedSession>,
+    retained: bool,
 ) -> Result<Tagged, Ineligible> {
+    let retained = retained && super::claude_history_upgrade::is_request_owned_literal(item);
+    let (accepted, proved) = if retained {
+        (None, known)
+    } else {
+        (known, None)
+    };
     if let Some(ineligible) = grouping.failed {
         return Err(ineligible);
     }
@@ -901,7 +915,12 @@ fn apply_grouped_with_accepted(
             group.refused = true;
         }
     }
-    let display = |withheld: bool| Some(Box::new(account_display(&grouping, withheld)));
+    let mut deferred = defer_retained_rows(item, &mut grouping, proved);
+    // Marker bytes are constant across every tag selection; markers go on
+    // the item only after measurement, as the last change before hashing.
+    grouping.extra_wire_bytes = grouping
+        .extra_wire_bytes
+        .saturating_add(deferred.marker_bytes());
 
     let evidence = grouping
         .rows()
@@ -1024,8 +1043,12 @@ fn apply_grouped_with_accepted(
         if grouping.item_bytes(item) <= MAX_ITEM_BYTES {
             let mut counts = cap_counts(item, &grouping, accepted, None);
             unpriced.count(&mut counts);
+            deferred.drop_stripped(item, &unpriced.keys);
+            deferred.mark(item);
+            deferred.count(item, retained, &mut counts);
             budget::record(&counts);
             untag_groups(&mut grouping, &unpriced.keys);
+            deferred.restore(&mut grouping);
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
             item.claude_account_display = Some(Box::new(account_display(
                 &grouping,
@@ -1068,6 +1091,9 @@ fn apply_grouped_with_accepted(
     if let Some((kept, measurement, unpriced)) = selected {
         let mut counts = cap_counts(item, &grouping, accepted, Some(&measurement));
         unpriced.count(&mut counts);
+        deferred.drop_stripped(item, &unpriced.keys);
+        deferred.mark(item);
+        deferred.count(item, retained, &mut counts);
         budget::record(&counts);
         let mut visible = grouping;
         untag_groups(&mut visible, &unpriced.keys);
@@ -1083,6 +1109,7 @@ fn apply_grouped_with_accepted(
                 }
             }
         }
+        deferred.restore(&mut visible);
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         // account_display checks the newest request against the filtered rows.
         // Withholding only that request must not anonymize retained history.
@@ -1106,7 +1133,6 @@ fn apply_grouped_with_accepted(
                     .any(|group| group.by_key.keys().any(Option::is_some))
         })
         .count() as u64;
-    budget::record(&counts);
     let refusals = lost.max(1).saturating_add(prior_refusals);
     strip(item);
     item.provenance.collector = COLLECTOR.to_string();
@@ -1114,14 +1140,270 @@ fn apply_grouped_with_accepted(
     {
         item.provenance.collector = cycle_contract(true).to_owned();
     }
+    // Markers must fit beside the stripped body; the newest ones are kept.
+    // A dropped marker is a stripped proved row, so it counts as a refusal.
+    // Measured at the largest refusal count, so the final digits never grow,
+    // and with a final-length fingerprint.
+    let dropped = if deferred.rows.is_empty() {
+        0
+    } else {
+        item.request_identity_refusals = refusals.saturating_add(deferred.rows.len() as u64);
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        let unmarked = grouping
+            .item_bytes(item)
+            .saturating_sub(deferred.marker_bytes());
+        deferred.keep_newest(MAX_ITEM_BYTES.saturating_sub(unmarked))
+    };
+    let refusals = refusals.saturating_add(dropped);
+    deferred.mark(item);
+    deferred.count(item, retained, &mut counts);
+    budget::record(&counts);
     item.request_identity_refusals = refusals;
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
     // The rows carry no identity, so neither may the display.
-    item.claude_account_display = display(true);
+    item.claude_account_display = Some(Box::new(account_display(&grouping, true)));
     Ok(Tagged::Fallback {
         over_cap: over_cap.into_iter().collect(),
         refusals,
     })
+}
+
+/// Bytes one `identity_retained` member adds to a compact wire row.
+const MARKER_BYTES: usize = r#","identity_retained":true"#.len();
+
+/// One marked bucket row with today's identities, restored only for display.
+struct DeferredRow {
+    bucket: String,
+    row: RowKey,
+    by_key: BTreeMap<Option<AuthorityKey>, Amounts>,
+    refused: bool,
+    account: Option<String>,
+}
+
+/// Option (ii) bucket rows that defer to server-retained proof. Each is sent
+/// untagged with its full amounts plus the marker, and is not a refusal.
+#[derive(Default)]
+struct Deferred {
+    rows: Vec<DeferredRow>,
+    /// Buckets reported `retained_proof_missing` that hold fresh proof now.
+    missing: BTreeSet<String>,
+}
+
+impl Deferred {
+    fn marker_bytes(&self) -> usize {
+        self.rows
+            .iter()
+            .map(|row| {
+                MARKER_BYTES
+                    + row.account.as_ref().map_or(0, |hash| {
+                        r#","account_identifier_hash":"""#.len() + hash.len()
+                    })
+            })
+            .sum()
+    }
+
+    /// Keep newest markers while their complete wire members fit.
+    fn keep_newest(&mut self, mut available: usize) -> u64 {
+        let before = self.rows.len();
+        self.rows
+            .sort_by(|left, right| right.bucket.cmp(&left.bucket));
+        self.rows.retain(|row| {
+            let bytes = MARKER_BYTES
+                + row.account.as_ref().map_or(0, |hash| {
+                    r#","account_identifier_hash":"""#.len() + hash.len()
+                });
+            if bytes > available {
+                return false;
+            }
+            available -= bytes;
+            true
+        });
+        before.saturating_sub(self.rows.len()) as u64
+    }
+
+    fn drop_stripped(&mut self, item: &mut SnapshotItem, keys: &BTreeSet<RowKey>) {
+        let before = self.rows.len();
+        self.rows.retain(|row| !keys.contains(&row.row));
+        item.request_identity_refusals = item
+            .request_identity_refusals
+            .saturating_add((before - self.rows.len()) as u64);
+    }
+
+    fn mark(&self, item: &mut SnapshotItem) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let marked = self
+            .rows
+            .iter()
+            .map(|deferred| ((deferred.bucket.as_str(), &deferred.row), &deferred.account))
+            .collect::<BTreeMap<_, _>>();
+        for bucket in &mut item.usage_buckets {
+            for row in &mut bucket.model_usage {
+                if let Some(account) =
+                    marked.get(&(bucket.bucket_start.as_str(), &row_key_from_model_usage(row)))
+                {
+                    if row.evidence_ref.is_some() || row.identity_parts.is_some() {
+                        continue;
+                    }
+                    row.identity_retained = true;
+                    row.account_identifier_hash = (*account).clone();
+                }
+            }
+        }
+    }
+
+    fn restore(&self, grouping: &mut Grouping) {
+        for deferred in &self.rows {
+            if let Some(group) = grouping
+                .groups
+                .get_mut(&deferred.bucket)
+                .and_then(|rows| rows.get_mut(&deferred.row))
+            {
+                group.by_key = deferred.by_key.clone();
+                group.refused = deferred.refused;
+            }
+        }
+    }
+
+    /// Option (ii) counters on the final body. #909's accepted-priority
+    /// ledger state is not an input in this mode.
+    fn count(&self, item: &SnapshotItem, retained: bool, counts: &mut budget::Counts) {
+        if !retained {
+            return;
+        }
+        counts.accepted_state_unknown = 0;
+        counts.accepted_state_unknown_cause = Default::default();
+        counts.retained_marker_rows = self.rows.len() as u64;
+        counts.retained_missing_unfit = item
+            .usage_buckets
+            .iter()
+            .filter(|bucket| {
+                self.missing.contains(&bucket.bucket_start)
+                    && !bucket.model_usage.iter().any(|row| {
+                        row.evidence_ref.is_some()
+                            || row.identity_parts.as_ref().is_some_and(|parts| {
+                                parts.iter().any(|part| part.evidence_ref.is_some())
+                            })
+                    })
+            })
+            .count() as u64;
+    }
+}
+
+/// A row's fresh-tag wire form and its evidence list, exactly as `install`
+/// would emit them, so today's proof digest matches an ACKed body's.
+fn fresh_row_value(
+    row: &SnapshotModelUsage,
+    by_key: &BTreeMap<Option<AuthorityKey>, Amounts>,
+) -> Option<(Value, Value)> {
+    let evidence = by_key
+        .keys()
+        .flatten()
+        .map(AuthorityKey::evidence)
+        .collect::<BTreeSet<_>>();
+    let index = evidence
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| (entry.clone(), position as u16))
+        .collect();
+    let identity = row_identity(row, by_key, &index).ok()?;
+    let mut fresh = row.clone();
+    set_row(&mut fresh, identity, &index);
+    let evidence = evidence
+        .into_iter()
+        .map(|entry| SnapshotRequestEvidence {
+            identity_basis: entry.basis.to_string(),
+            provider_workspace_hash: entry.org,
+        })
+        .collect::<Vec<_>>();
+    Some((
+        serde_json::to_value(fresh).ok()?,
+        serde_json::to_value(evidence).ok()?,
+    ))
+}
+
+/// SOURCE option (ii), per bucket row, against the witnessed proved ledger:
+/// - today's proof equals the ACKed proof in a closed hour: marker;
+/// - today's transcript no longer proves the row (none, refused): marker;
+/// - different proof: fresh tags, counted `accepted_share_changed`;
+/// - the open hour with proof, and rows never proved: fresh tags.
+///
+/// A row is never both tagged and marked. Runs after the unsplittable-money
+/// strip, so a row that cannot carry tags today defers instead.
+fn defer_retained_rows(
+    item: &SnapshotItem,
+    grouping: &mut Grouping,
+    proved: Option<&accepted::AcceptedSession>,
+) -> Deferred {
+    let mut deferred = Deferred::default();
+    let Some(proved) = proved else {
+        return deferred;
+    };
+    let open_hour = accepted::bucket_key(&item.collected_at).map(|at| at.div_euclid(3600));
+    let mut changed = BTreeSet::new();
+    for bucket in &item.usage_buckets {
+        let Some(start) = accepted::bucket_key(&bucket.bucket_start) else {
+            continue;
+        };
+        let open = open_hour == Some(start.div_euclid(3600));
+        for row in &bucket.model_usage {
+            let key = row_key_from_model_usage(row);
+            let Some(group) = grouping
+                .groups
+                .get_mut(&bucket.bucket_start)
+                .and_then(|rows| rows.get_mut(&key))
+            else {
+                continue;
+            };
+            let proves = !group.refused
+                && !group.truncated
+                && group
+                    .by_key
+                    .iter()
+                    .any(|(key, amount)| key.is_some() && amount.counts != [0; 8]);
+            if proves && proved.proof_missing(start) {
+                deferred.missing.insert(bucket.bucket_start.clone());
+            }
+            let Some(prior) = proved.proved_row(start, &key) else {
+                // A lost replacement ACK must not erase proof the server may
+                // still hold when today's transcript can no longer prove it.
+                if !proves
+                    && (proved.replacement_unsettled(start, &key)
+                        || proved.row_shares(start, &key).iter().any(Option::is_some))
+                {
+                    group.refused = true;
+                }
+                continue;
+            };
+            if proves {
+                let today = fresh_row_value(row, &group.by_key)
+                    .and_then(|(fresh, evidence)| proved.row_proof(&fresh, &evidence));
+                if today != Some(prior) {
+                    changed.insert(bucket.bucket_start.clone());
+                    continue;
+                }
+                if open {
+                    continue;
+                }
+            }
+            let account = proved.proved_account(start, &key);
+            let by_key = std::mem::replace(
+                &mut group.by_key,
+                BTreeMap::from([(None, group.total.clone())]),
+            );
+            let refused = std::mem::replace(&mut group.refused, false);
+            deferred.rows.push(DeferredRow {
+                bucket: bucket.bucket_start.clone(),
+                row: key,
+                account,
+                by_key,
+                refused,
+            });
+        }
+    }
+    grouping.accepted_share_changed.extend(changed);
+    deferred
 }
 
 fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::AcceptedSession>) {
@@ -1215,6 +1497,7 @@ fn cap_counts(
         unpriced_part_untagged: 0,
         accepted_row_vanished: grouping.accepted_rows_vanished,
         accepted_state_unknown_cause: unknown.map(budget::UnknownCauses::one).unwrap_or_default(),
+        ..Default::default()
     }
 }
 
@@ -1638,6 +1921,7 @@ fn set_row(
     row.account_identifier_hash = None;
     row.evidence_ref = None;
     row.identity_parts = None;
+    row.identity_retained = false;
     match identity {
         RowIdentity::Untagged => {}
         RowIdentity::Single(key) => {
@@ -1693,6 +1977,7 @@ fn strip(item: &mut SnapshotItem) {
         row.account_identifier_hash = None;
         row.evidence_ref = None;
         row.identity_parts = None;
+        row.identity_retained = false;
     }
 }
 
@@ -2032,6 +2317,10 @@ fn deref(
 }
 
 fn row_leaf(row: &SnapshotModelUsage, evidence: &[SnapshotRequestEvidence]) -> Value {
+    // Option (ii): the receiver's leaf for a row deferring to retained proof.
+    if row.identity_retained {
+        return json!({"retained": true});
+    }
     if let Some(parts) = &row.identity_parts {
         let mut leaves = parts
             .iter()
@@ -2255,8 +2544,9 @@ pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
 struct AccountRun {
     position: u64,
     account: AccountPartition,
-    /// E2's decision for the first resolved usage following this marker.
-    copied: Option<bool>,
+    /// First nonzero usage following this marker: its response position and
+    /// E2 copy status. Zero-usage responses may separate it from the marker.
+    copied: Option<(u64, bool)>,
 }
 crate::heap_layout_bound::fields!(AccountRun; position, account, copied);
 
@@ -2276,9 +2566,11 @@ pub(crate) struct RequestAccounts {
     reconciled: bool,
     /// Root start known, but the native Unknown grains are not filled yet.
     root_fallback_pending: bool,
+    /// This page discarded the family trace; no account may fill its shares.
+    trace_discard_no_fallback: bool,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, trace_discard_no_fallback);
 
 /// One account policy for E2. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
@@ -2443,6 +2735,9 @@ pub(crate) fn request_accounts(
 
 impl RequestAccounts {
     pub(crate) fn account(&self, sequence: u64) -> AccountPartition {
+        if self.trace_discard_no_fallback {
+            return None;
+        }
         if self.subagent {
             return self.starting.clone().or_else(|| {
                 (!self.root_fallback_pending)
@@ -2473,7 +2768,7 @@ impl RequestAccounts {
             .iter_mut()
             .take_while(|run| run.position <= sequence)
         {
-            run.copied = Some(copied);
+            run.copied = Some((sequence, copied));
         }
         if !copied {
             self.first_retained.get_or_insert(sequence);
@@ -2497,7 +2792,7 @@ impl RequestAccounts {
         runs.iter()
             .rev()
             .find(|run| run.account.is_some())
-            .filter(|run| run.copied == Some(true))?;
+            .filter(|run| matches!(run.copied, Some((_, true))))?;
         runs.last().map(|run| run.position)
     }
 
@@ -2561,7 +2856,7 @@ impl RequestAccounts {
             let excluded = self
                 .runs
                 .iter()
-                .filter(|run| run.copied == Some(true))
+                .filter(|run| matches!(run.copied, Some((_, true))))
                 .map(|run| run.position)
                 .collect::<Vec<_>>();
             let mut own = request_accounts(
@@ -2582,13 +2877,57 @@ impl RequestAccounts {
             .inherited
             .saturating_add(std::mem::take(&mut self.skipped_inherited));
     }
+
+    /// The money owner has decided individual copies. Exclude only markers
+    /// on still-removed/held requests; an emitted unproven prefix keeps its
+    /// own markers. Build beside the original so its grains can be moved.
+    pub(crate) fn after_copy_decision(
+        &self,
+        markers: Option<&OrgMarkers>,
+        skipped: &[(u64, u64)],
+        first_retained: Option<u64>,
+    ) -> Option<Self> {
+        if self.subagent {
+            return None;
+        }
+        let excluded = self
+            .runs
+            .iter()
+            .filter(|run| {
+                let Some((response, true)) = run.copied else {
+                    return false;
+                };
+                let at = skipped.partition_point(|(_, end)| *end <= response);
+                skipped.get(at).is_some_and(|(start, _)| *start <= response)
+            })
+            .map(|run| run.position)
+            .collect::<Vec<_>>();
+        if excluded.is_empty() {
+            return None;
+        }
+        let mut own = request_accounts(
+            markers,
+            self.bound.as_ref().and_then(|key| key.login.as_deref()),
+            first_retained.or(self.first_retained),
+            false,
+            &excluded,
+        );
+        own.inherited = self.inherited;
+        own.skipped_inherited = self.skipped_inherited;
+        own.first_retained = first_retained.or(self.first_retained);
+        Some(own)
+    }
 }
 
 /// Own exact telemetry uses the existing request classifier, with the same
 /// standing as an own credential_org. Only missing evidence inherits an
 /// earlier own request, then the start/binding; every such fill is counted.
-pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
+pub(crate) fn reconcile_request_accounts(
+    items: &mut [SnapshotItem],
+    evidence: &ScanEvidence<'_>,
+) -> u64 {
     use super::claude_request_money::e2::place_request_identity;
+    let mut no_fallback_requests = 0;
     for item in items {
         let Some(mut fold) = item.claude_money.take() else {
             continue;
@@ -2600,6 +2939,37 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
         if accounts.reconciled {
             fold.accounts = Some(accounts);
             item.claude_money = Some(fold);
+            continue;
+        }
+        if evidence
+            .trace_discarded_roots
+            .contains(super::claude_snapshot_family_root_ref(item))
+        {
+            // API attachment already placed reported money. Collapse accounts
+            // in place so tokens, costs, side calls and id-less shares survive.
+            no_fallback_requests += fold
+                .entity
+                .grains
+                .values()
+                .map(|grain| grain.requests)
+                .sum::<u64>();
+            fold.entity.repartition(None);
+            accounts.trace_discard_no_fallback = true;
+            accounts.starting = None;
+            accounts.fallback = None;
+            accounts.inherited = 0;
+            accounts.skipped_inherited = 0;
+            accounts.reconciled = true;
+            for occurrence in item.claude_usage_occurrences.values_mut() {
+                occurrence.e2_inherited = Some(false);
+            }
+            fold.accounts = Some(accounts);
+            item.claude_money = Some(fold);
+            // Emission preserves a uniform wire account even for billing rows
+            // that bypass final identity grouping. Discard suppresses it too.
+            if super::set_claude_account_hash(item, None) {
+                item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+            }
             continue;
         }
         let native = accounts.clone();
@@ -2781,6 +3151,7 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
         fold.accounts = Some(accounts);
         item.claude_money = Some(fold);
     }
+    no_fallback_requests
 }
 
 /// Read retained creator bindings using the same machine/session key as the
@@ -2855,7 +3226,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         else {
             continue;
         };
-        if accounts.subagent {
+        if accounts.subagent || accounts.trace_discard_no_fallback {
             continue;
         }
         let first = item
@@ -2928,6 +3299,9 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         let Some(accounts) = fold.accounts.as_deref_mut() else {
             continue;
         };
+        if accounts.trace_discard_no_fallback {
+            continue;
+        }
         if accounts.subagent {
             accounts.starting = match roots.get(&root) {
                 Some(root) => root.starting.clone(),
@@ -3209,6 +3583,8 @@ pub(crate) struct ScanEvidence<'a> {
     request_roots: std::cell::OnceCell<Vec<(&'a str, Option<&'a str>)>>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
+    /// Cap/generation discards only; other unhealthy reads retain their policy.
+    pub(crate) trace_discarded_roots: BTreeSet<String>,
     /// Roots with a qualified witness that their telemetry writer is healthy
     /// NOW, the precondition for `Refusal::Pending`. A complete paired-sidecar
     /// load proves only what was already written, not a live writer, and no
@@ -3297,6 +3673,11 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         evidence
+    }
+
+    pub(crate) fn with_trace_discarded_roots(mut self, roots: BTreeSet<String>) -> Self {
+        self.trace_discarded_roots = roots;
+        self
     }
 
     pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {
@@ -4511,7 +4892,11 @@ fn keeps_markerless_account(item: &SnapshotItem) -> bool {
             .claude_money
             .as_deref()
             .and_then(|fold| fold.accounts.as_deref())
-            .is_some_and(|accounts| accounts.starting.is_some() && !accounts.conflict)
+            .is_some_and(|accounts| {
+                !accounts.trace_discard_no_fallback
+                    && accounts.starting.is_some()
+                    && !accounts.conflict
+            })
 }
 
 fn tag_item(
@@ -4527,6 +4912,9 @@ fn tag_item(
     let miss = evidence
         .accepted_buckets
         .map_or(accepted::UnknownCause::NoKey, AcceptedBuckets::miss_cause);
+    let retained = evidence
+        .accepted_buckets
+        .is_some_and(AcceptedBuckets::retained_enabled);
     if super::claude_request_money::e2::enabled()
         && super::claude_history_upgrade::is_request_owned_literal(item)
     {
@@ -4558,7 +4946,7 @@ fn tag_item(
             .wire_size_reservation
             .map_or(0, |reserve| reserve(item));
         grouping.accepted_miss = miss;
-        let tagged = apply_grouped_with_accepted(item, grouping, accepted);
+        let tagged = apply_grouped_with_accepted(item, grouping, accepted, retained);
         if tagged.is_err() {
             (
                 item.source_started_at,
@@ -4624,7 +5012,7 @@ fn tag_item(
     let desktop_recent = std::mem::take(&mut grouping.desktop_recent);
     let owned = !grouping.unowned_request;
     grouping.accepted_miss = miss;
-    let tagged = apply_grouped_with_accepted(item, grouping, accepted);
+    let tagged = apply_grouped_with_accepted(item, grouping, accepted, retained);
     if tagged.is_ok() && owned {
         crate::desktop_recent::publish(desktop_recent);
     }

@@ -318,3 +318,278 @@ fn held_open_backoff_overflow_evicts_oldest_and_keeps_its_due_owed() {
     );
     assert_eq!(held_audit_open_backoff_evicted(), 1);
 }
+
+/// [behaviour] Containment contract: parked open is blocked at common boundary for all candidate routes and stat wakes.
+#[test]
+fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_wakes() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+    reset_open_backoff_for_test();
+    let root = Root::new("common-boundary");
+    let path = root.0.join("a1111111-1111-4111-8111-111111111111.jsonl");
+    std::fs::write(&path, "{}\n").unwrap();
+    let key = local_index_key(&path);
+    let mut index = held_index(&root, &[&key]);
+    let candidate = candidate_from_traversal_path(
+        SnapshotSource::ClaudeCode,
+        ScanTraversalPath {
+            scan_root: root.0.to_path_buf(),
+            path: path.clone(),
+            census_member: true,
+            watcher_hint: false,
+        },
+        &mut ScanCensus::default(),
+        None,
+        183,
+        &index.files,
+    )
+    .unwrap();
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: key.clone(),
+        due: D,
+        attempted: false,
+    });
+    // Model a secure-open denial with a successful, stable stat. No chmod
+    // dependence on root/admin privileges; use the real failure recorder.
+    for n in 0..OPEN_PARK_FAILURES {
+        progress_open_failed(&mut index, &key, D + u64::from(n) * CAP);
+    }
+    let now = D + 20 * CAP;
+    assert!(candidate_open_blocked(&key, now));
+    let before = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+    for _ in 0..3 {
+        // Directory rediscovery / retained retry / grown-file admission all
+        // enter this same boundary. Even a forced verification rescue cannot
+        // bypass the park, nor count a skipped open as another failure.
+        assert!(open_and_identify_scan_candidate_at(
+            SnapshotSource::ClaudeCode,
+            candidate.clone(),
+            &mut ScanCensus::default(),
+            None,
+            183,
+            &index.files,
+            None,
+            now
+        )
+        .is_none());
+        assert!(open_and_identify_scan_candidate_with_rescue_at(
+            SnapshotSource::ClaudeCode,
+            candidate.clone(),
+            &mut ScanCensus::default(),
+            None,
+            183,
+            &index.files,
+            None,
+            true,
+            now,
+            None
+        )
+        .is_none());
+    }
+    assert_eq!(
+        START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
+        before,
+        "no open/sample/body work"
+    );
+    with_open_backoff(|memo| assert_eq!(memo.keys[&key].failures, OPEN_PARK_FAILURES));
+    assert!(awaits_hold_deadline_restoration(&index, &key));
+    assert_eq!(failed_open_debt(&key, now), Some(D));
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+    // A real stat change wakes ordinary and rescue admissions immediately.
+    std::fs::write(&path, "{ }\n").unwrap();
+    assert!(!candidate_open_blocked(&key, now));
+    assert!(open_and_identify_scan_candidate_with_rescue_at(
+        SnapshotSource::ClaudeCode,
+        candidate,
+        &mut ScanCensus::default(),
+        None,
+        183,
+        &index.files,
+        None,
+        true,
+        now,
+        None
+    )
+    .is_some());
+    progress_opened(&mut index, &key);
+    assert_eq!(
+        failed_open_debt(&key, now),
+        Some(D),
+        "open is not verification"
+    );
+    assert_eq!(held_audit_open_failed(now), (0, 0), "throttle cleared");
+    assert!(
+        awaits_hold_deadline_restoration(&index, &key),
+        "opening is no settlement or proof"
+    );
+}
+
+/// [behaviour] Containment contract: blocked due debt does not resample neighbours and stat change wakes recovery.
+#[test]
+fn blocked_due_debt_does_not_resample_neighbours_and_stat_change_wakes_recovery() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+    // Drive real constructors/pages, not only the queueing helper. A secure
+    // open denial is recorded with a readable stat, without chmod privileges.
+    for failures in [1, OPEN_PARK_FAILURES] {
+        reset_open_backoff_for_test();
+        let root = Root::new(&format!("quiet-neighbour-{failures}"));
+        let k = "a1111111-1111-4111-8111-111111111111";
+        let b = "b1111111-1111-4111-8111-111111111111";
+        let path = root.0.join(format!("{k}.jsonl"));
+        let line = |session: &str, request: &str| {
+            format!(
+                "{}\n",
+                json!({
+                    "type":"assistant", "sessionId":session,
+                    "timestamp":"2026-10-29T10:00:00Z", "requestId":request,
+                    "message":{"id":request,"model":"claude-sonnet-4-6",
+                        "usage":{"input_tokens":12,"output_tokens":4}}
+                })
+            )
+        };
+        fs::write(&path, line(k, "K")).unwrap();
+        fs::write(root.0.join(format!("{b}.jsonl")), line(b, "B")).unwrap();
+        let base = super::super::sampled_scan::now_seconds().saturating_sub(60);
+        let at = |offset: u64| {
+            OffsetDateTime::from_unix_timestamp((base + offset) as i64)
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap()
+        };
+        let walk = |index: &mut ScanIndex, at: &str| {
+            let mut scan = super::super::sampled_scan::with_test_now(
+                rfc3339_unix_seconds(at).unwrap(),
+                || {
+                    scan_source_roots(
+                        SnapshotSource::ClaudeCode,
+                        std::slice::from_ref(&root.0.to_path_buf()),
+                        index,
+                        at,
+                        183,
+                    )
+                    .unwrap()
+                },
+            );
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, index);
+            scan
+        };
+        let mut index = ScanIndex::default();
+        let initial = walk(&mut index, &at(0));
+        assert_eq!(initial.scanned_file_count, 2);
+        index.accepted_snapshot_fingerprints.extend(
+            initial
+                .snapshots
+                .iter()
+                .map(|item| item.snapshot_fingerprint.clone()),
+        );
+        let accepted = index.accepted_snapshot_fingerprints.clone();
+        let key = local_index_key(&path);
+        index.claude_request_census_mut_for_test().insert_for_test(
+            &key,
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &"ab".repeat(32),
+                0,
+                ClaudeRequestCensusShape::IdentityIncomplete,
+                vec![1],
+            )
+            .with_unverified_for_test(true),
+        );
+        let due = base - 1;
+        index.held_audit_progress = Some(HeldAuditProgress {
+            key: key.clone(),
+            due,
+            attempted: false,
+        });
+        for _ in 0..failures {
+            progress_open_failed(&mut index, &key, base);
+        }
+        assert!(candidate_open_blocked(&key, base));
+        let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+        let bytes = TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get);
+        let scope = terminal_off_rediscovery_scope(&index).unwrap();
+        let deadline = TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow()[&scope]);
+        for pass in 1..=3 {
+            let saved = root.0.join("index.json");
+            index.save(&saved).unwrap();
+            index = ScanIndex::load(&saved).unwrap();
+            let quiet = walk(&mut index, &at(pass));
+            assert_eq!(quiet.scanned_file_count, 0);
+            assert!(!quiet.census_complete);
+            assert_eq!(
+                START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
+                samples,
+                "neighbour pays no identity samples before cadence"
+            );
+            assert_eq!(
+                TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get),
+                bytes
+            );
+            with_open_backoff(|memo| {
+                assert_eq!(memo.keys[&key].failures, failures);
+                assert_eq!(memo.keys[&key].owed_due, due);
+            });
+            assert_eq!(failed_open_debt(&key, base + pass), Some(due));
+            assert_eq!(
+                TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow()[&scope]),
+                deadline
+            );
+            assert_eq!(index.accepted_snapshot_fingerprints, accepted);
+        }
+        // Stat wake is per key. D never moves later, and the now-readable
+        // due audit receives service immediately, without waiting 300s.
+        fs::write(&path, line(k, "K-readable-again-and-grown")).unwrap();
+        assert!(!candidate_open_blocked(&key, base + 4));
+        let recovered = walk(&mut index, &at(4));
+        assert_eq!(recovered.scanned_file_count, 1);
+        assert!(!recovered.census_complete);
+        assert_eq!(held_audit_open_failed(base + 4), (0, 0));
+        assert!(
+            failed_open_debt(&key, base + 4).is_none(),
+            "verified source retires D"
+        );
+        assert_eq!(
+            index.accepted_snapshot_fingerprints, accepted,
+            "no new ACK credit"
+        );
+    }
+}
+
+/// [behaviour] Containment contract: restoring held marker preserves same stat park and original due.
+#[test]
+fn restoring_held_marker_preserves_same_stat_park_and_original_due() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+
+    reset_open_backoff_for_test();
+    let root = Root::new("marker-restoration-park");
+    let path = root.0.join("parked.jsonl");
+    fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    let mut index = held_index(&root, &[&key]);
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: key.clone(),
+        due: D,
+        attempted: false,
+    });
+    for _ in 0..OPEN_PARK_FAILURES {
+        record_open_failure(&key, D, D);
+    }
+    assert!(candidate_open_blocked(&key, D));
+    assert_eq!(held_audit_open_failed(D), (1, 0));
+    assert_eq!(restore_held_audit_deadlines(&mut index, D), 1);
+    assert!(!awaits_hold_deadline_restoration(&index, &key));
+    assert!(index.files[&key].has_unverified_source());
+    for now in [D, D + CAP, D + 2 * CAP] {
+        assert_eq!(schedule_held_audit_progress(&mut index, now), None);
+        assert!(candidate_open_blocked(&key, now));
+        assert_eq!(failed_open_debt(&key, now), Some(D));
+        assert_eq!(debt_for_key(&index, &key, now).unwrap().due_unix_seconds, D);
+        assert_eq!(held_audit_open_failed(now), (1, now - D));
+        assert!(index.accepted_snapshot_fingerprints.is_empty());
+    }
+    // A real stat change clears the throttle, retaining the original debt.
+    fs::write(&path, b"{}\n{}\n").unwrap();
+    assert!(!candidate_open_blocked(&key, D + 3 * CAP));
+    assert_eq!(failed_open_debt(&key, D + 3 * CAP), Some(D));
+    assert!(index.files[&key].has_unverified_source());
+}

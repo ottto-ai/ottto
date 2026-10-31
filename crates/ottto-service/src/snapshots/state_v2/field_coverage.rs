@@ -98,6 +98,7 @@ coverage! {
     active_quarantine_witness => ("MISC", "runtime"),
     active_upload_context_fingerprint => ("FILES", "runtime"),
     file_upload_context_enabled => ("FILES", "runtime"),
+    mixed_context_view => ("FILES", "runtime"),
     context_read_counts => ("FILES", "runtime"),
     active_effective_upload_body_witness_revision => ("FILES", "runtime"),
     active_effective_upload_body_witness_revision_monotone => ("FILES", "runtime"),
@@ -126,6 +127,8 @@ coverage! {
     claude_history_emission => ("MISC", "runtime"),
     claude_money_birth_store => ("MISC", "v1_field.birth_store"),
     claude_desktop_store_inventory => ("MISC", "v1_field.claude_desktop_store_inventory"),
+    copy_unproven_enabled => ("MISC", "runtime"),
+    copy_prefix_base_upload_context => ("MISC", "runtime"),
 }
 /// [format] every scan index field and kind has one owner.
 #[test]
