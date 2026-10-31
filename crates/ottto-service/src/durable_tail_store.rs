@@ -344,7 +344,7 @@ pub(crate) struct AcquisitionFields {
 }
 
 /// Original verified wire facts survive decoding of retired body/header fields.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WireIdentity {
     encoded_len: u64,
     trailer: Digest32,
@@ -403,6 +403,29 @@ impl std::fmt::Debug for DurableRecord {
     }
 }
 
+impl std::fmt::Debug for WireIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireIdentity")
+            .field("encoded_len", &self.encoded_len)
+            .finish()
+    }
+}
+impl std::fmt::Debug for WireRecordIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireRecordIdentity")
+            .field("format", &self.format)
+            .field("encoded_len", &self.encoded_len)
+            .finish()
+    }
+}
+impl std::fmt::Debug for WireReceiptProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WireReceiptProof")
+            .field(&self.identity)
+            .finish()
+    }
+}
+
 /// Writer-owned retirement distinguishes absence/verified replacement from
 /// unknown survivors and I/O. No outcome is an ACK or a receipt.
 pub(crate) enum RetireOutcome {
@@ -442,7 +465,7 @@ fn migration_binding(original: &Digest32, current: &Expected) -> Digest32 {
 
 /// Exact encoded candidate, including the original trailer (not a re-encoding
 /// of decoded fields, which may discard retired positional values).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct WireRecordIdentity {
     key: Digest32,
     allowlist: Digest32,
@@ -483,7 +506,7 @@ struct PendingWrite {
 const _: () = assert!(std::mem::size_of::<(Digest32, PendingWrite)>() <= 320);
 
 /// Acquisition durability only; never accepted-money or replacement ACK credit.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(crate) struct WireReceiptProof {
     identity: WireRecordIdentity,
     stamp: Stamp,

@@ -15,7 +15,7 @@ pub(super) struct ResourcePause {
     next_probe: SystemTime,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RecordIdentity {
     binding: Binding,
     certificate: DurableCertificate,
@@ -69,7 +69,7 @@ impl RecordIdentity {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(crate) struct ReceiptProof {
     identity: Box<RecordIdentity>,
     stamp: Stamp,
@@ -81,6 +81,20 @@ impl ReceiptProof {
     }
     pub(crate) fn generation(&self) -> u64 {
         self.identity.generation
+    }
+}
+
+impl std::fmt::Debug for RecordIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordIdentity")
+            .field("format", &self.format)
+            .field("encoded_len", &self.encoded_len)
+            .finish()
+    }
+}
+impl std::fmt::Debug for ReceiptProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ReceiptProof").field(&self.identity).finish()
     }
 }
 
