@@ -16852,6 +16852,7 @@ impl ClaudeTitleMetadata {
                 && index.claude_desktop_census_witness.is_some();
             index.claude_desktop_store_inventory = Some(inventory);
             if !witnessed_inventory {
+                census.inventory_sweep_restart_count += 1;
                 index.claude_desktop_store_cursor = None;
                 index.claude_desktop_store_upper_bound = None;
                 index.claude_desktop_store_sweep_had_errors = false;
@@ -17412,6 +17413,7 @@ struct ClaudeDesktopStoreCensus {
     profile_read_count: usize,
     profile_new_source_read_count: usize,
     store_found_count: usize,
+    inventory_sweep_restart_count: usize,
     profile_discovery_incomplete_count: usize,
     discovered_file_count: usize,
     unreadable_path_count: usize,
