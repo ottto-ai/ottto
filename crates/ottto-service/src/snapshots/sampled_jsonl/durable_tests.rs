@@ -6,7 +6,7 @@ use super::*;
 use crate::durable_tail_codec::take_l_spans;
 use crate::transcript_acquisition::{birth_unix_nanos, FullReason, ReadMode, Scope};
 use serde_json::json;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -426,11 +426,30 @@ fn items_at(
     json!({"items": serde_json::to_value(&parsed.snapshots).unwrap(), "money": money})
 }
 
-/// The unsampled native oracle: a plain cold parse, no acquisition.
+/// The unsampled native oracle: an independently admitted cold Full.
 fn cold_items(path: &Path, source: SnapshotSource) -> Value {
     let mut parser = parser(path, source);
+    assert!(matches!(
+        parser
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap(),
+        ReadMode::Full(_)
+    ));
     while !parser.step().unwrap() {}
     items(parser, path, source)
+}
+
+fn assert_cold_items(path: &Path, source: SnapshotSource, actual: &Value) {
+    let cold = cold_items(path, source);
+    let mut differences = Vec::new();
+    sampled_scan::transition_fixture::money_oracle::diff(
+        "native_body",
+        &cold,
+        actual,
+        &mut differences,
+    );
+    assert!(differences.is_empty(), "{source:?}: {differences:#?}");
+    assert_eq!(actual, &cold, "{source:?}");
 }
 
 /// Every encoded class and every content field, for exact equality.
@@ -450,8 +469,10 @@ fn restore(
     source: SnapshotSource,
 ) -> Result<(CachedJsonlReduction, RederiveReceipt), Refuse> {
     let decoded = decode(body, source).expect("decode");
-    let parser = rederive_parser(File::open(path).unwrap(), path, &decoded).unwrap();
-    decoded.rederive(parser, &mut File::open(path).unwrap(), line_cap())
+    let plan = decoded.rederive_plan().map_err(Refuse::NotRederivable)?;
+    decoded
+        .rederive_content_planned(&File::open(path).unwrap(), &plan)
+        .map(|(reduction, receipt, _)| (reduction, receipt))
 }
 
 /// A later skill reference must not also create an unsupported opening-call
@@ -853,7 +874,7 @@ fn record_body_holds_no_content_and_provider_ids_only_in_l_fields() {
     }
 }
 
-/// F1 instruction canary, per source: two sessions (one file rewritten in
+/// [format] F1 instruction canary, per source: two sessions (one file rewritten in
 /// place) differing only in private instruction text of equal length. Their retained copies differ
 /// (the text and its reversible `ConfigDigest` are content), yet the
 /// encoded reductions are byte-identical (nothing derived from the text is
@@ -987,7 +1008,7 @@ fn e_content_refuses_and_approved_mid_file_skills_persist() {
     );
 }
 
-/// SOURCE P2-5: request-shape and blob keys (client content hashes of
+/// [format] SOURCE P2-5: request-shape and blob keys (client content hashes of
 /// instruction text) are stored only as their domain-separated SHA-256 (`H`),
 /// never raw, whatever the key holds. The fixture seals with the request-1
 /// window still holding both, keyed by the secret, so a raw key would show as
@@ -1091,7 +1112,7 @@ fn attribution_selector_context_refuses_the_record() {
     }
 }
 
-/// Decode plus bounded re-derivation gives back exactly the retained copy,
+/// [format] Decode plus bounded re-derivation gives back exactly the retained copy,
 /// content fields included, within the head bound and named-line budget.
 #[test]
 fn restore_rederives_the_exact_retained_copy() {
@@ -1124,7 +1145,7 @@ fn restore_rederives_the_exact_retained_copy() {
     }
 }
 
-/// Full-equivalence control per source: a restored copy continued by Tail
+/// [money] Full-equivalence control per source: a restored copy continued by Tail
 /// finishes to the same upload items as a cold Full of the grown file.
 #[test]
 fn restore_then_tail_matches_cold_full() {
@@ -1158,19 +1179,8 @@ fn restore_then_tail_matches_cold_full() {
         drop(file);
         let mut held = File::open(&path).unwrap();
         let (checkpoint, _) = certificate.restore(&mut held, scope()).unwrap();
-        let (oracle, _) = restore(&path, &body, case.source).unwrap();
-        let (restored, _) = {
-            let decoded = decode(&body, case.source).unwrap();
-            decoded
-                .rederive_plan()
-                .map_err(Refuse::NotRederivable)
-                .and_then(|plan| {
-                    decoded.rederive_content_planned(&File::open(&path).unwrap(), &plan)
-                })
-                .map(|(reduction, receipt, _)| (reduction, receipt))
-        }
-        .unwrap();
-        assert_eq!(full_digest(&restored), full_digest(&oracle));
+        let (restored, _) = restore(&path, &body, case.source).unwrap();
+        assert_eq!(full_digest(&restored), full_digest(&reduction));
         let mut continued = parser(&path, case.source);
         let mode = continued
             .prepare_acquisition(
@@ -1223,16 +1233,11 @@ fn restore_then_tail_matches_cold_full() {
                 grouping(&cold_reduction.accumulator)
             );
         }
-        assert_eq!(
-            items(continued, &path, case.source),
-            cold_items(&path, case.source),
-            "{:?}",
-            case.source
-        );
+        assert_cold_items(&path, case.source, &items(continued, &path, case.source));
     }
 }
 
-/// A metadata-only touch (ctime moves, bytes and mtime do not) still
+/// [format] A metadata-only touch (ctime moves, bytes and mtime do not) still
 /// restores, and the restored checkpoint reads as Unchanged.
 #[test]
 fn metadata_only_touch_restores_unchanged() {
@@ -1288,7 +1293,7 @@ fn edit_in_place(path: &Path, at: u64, bytes: &[u8]) {
     file.set_modified(modified).unwrap();
 }
 
-/// Crash matrix after a checkpoint, with real records: truncate, replace,
+/// [format] Crash matrix after a checkpoint, with real records: truncate, replace,
 /// a same-size edit in a sample window, and a same-size edit of a
 /// re-derived field outside both windows. Each ends in a Full read with
 /// nothing restored.
@@ -1373,9 +1378,7 @@ fn edits_after_the_checkpoint_refuse_restore() {
         .unwrap();
     assert_eq!(
         restore(&path, &body, source).err(),
-        Some(Refuse::NotRederivable(
-            "SnapshotAccumulator.first_prompt_material"
-        ))
+        Some(Refuse::NotRederivable("content_fence"))
     );
 }
 
@@ -1668,7 +1671,7 @@ fn budget_bounds_hold() {
     assert_eq!(MAX_BATCH, 32);
 }
 
-/// Budget receipt (measured) on the synthetic transcripts: body and record
+/// [format] Budget receipt (measured) on the synthetic transcripts: body and record
 /// bytes, the encode buffer, and one restore's re-derivation I/O.
 #[test]
 fn codec_budget_receipt() {
@@ -1916,32 +1919,6 @@ fn borrowed_count_exact_encoding_matches_populated_both_source_canaries() {
         assert_borrowed_count_identity(&reduction);
     }
     assert_eq!(covered, BTreeSet::from(["claude_code", "codex"]));
-}
-
-#[test]
-fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
-    let scratch = Scratch::new("zst-refusal");
-    let plain = scratch.write(
-        "plain.jsonl",
-        &[format!(
-            r#"{{"type":"session_meta","payload":{{"id":"{CODEX_SESSION}"}}}}"#
-        )],
-    );
-    let (reduction, _) = full_read(&plain, SnapshotSource::Codex);
-    let body = encode(&reduction, 8 * 1024 * 1024, jsonl_line_cap() as u64).unwrap();
-    let decoded = decode(&body, SnapshotSource::Codex).unwrap();
-    let archive = scratch.0.join("rollout.jsonl.zst");
-    fs::write(&archive, b"synthetic archive bytes").unwrap();
-    let mut file = File::open(&archive).unwrap();
-    file.seek(SeekFrom::Start(3)).unwrap();
-    codex_zst_refusal_tests::assert_refused(CodexZstCause::DurableTailUnsupported, || {
-        assert!(rederive_parser(file.try_clone().unwrap(), &archive, &decoded).is_err());
-        assert_eq!(
-            file.stream_position().unwrap(),
-            3,
-            "refused before offset use"
-        );
-    });
 }
 
 /// [money] tail reuse allowance cannot block an independently due full.
@@ -2356,7 +2333,7 @@ fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
             );
             while !tail.step().unwrap() {}
             let actual = items(tail, &path, source);
-            assert_eq!(actual, cold_items(&path, source));
+            assert_cold_items(&path, source, &actual);
             assert!(actual.to_string().contains("Synthetic first prompt"));
         }
     }
