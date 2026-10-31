@@ -81,7 +81,7 @@ impl SharedCache {
             }
             anyhow::ensure!(
                 records.len() < store::MAX_BATCH,
-                "state_v2_resume_pass_capacity"
+                state_v2::Hold::SaveCeiling
             );
             let planned = (|| {
                 let retained = cache.peek(key)?;
@@ -199,7 +199,7 @@ impl SharedCache {
             }
             anyhow::ensure!(
                 staged.bytes + record.len() <= store::WRITE_PASS_BYTES as u64,
-                "state_v2_resume_pass_capacity"
+                state_v2::Hold::SaveCeiling
             );
             staged.bytes += record.len();
             staged.replacements.insert(key.clone(), checkpoint);

@@ -13323,11 +13323,50 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
     let mut changed = next.clone();
     changed.generation += 1;
     changed.files.get_mut(&key).unwrap().size_bytes += 7;
-    let mut refused = Adapter::new(owner.cache.clone(), &index_path, binding).unwrap();
+    let mut refused = Adapter::new(owner.cache.clone(), &index_path, binding.clone()).unwrap();
     let plan = refused.plan(&next, &changed, &committed).unwrap();
     assert_eq!(plan.excluded, BTreeSet::from([key]));
     assert!(std::fs::metadata(
         store::store_dir_for_index(&index_path).join(checkpoint.record_name)
     )
     .is_ok());
+    drop(refused);
+    // A real native page beyond the staging batch must request the existing
+    // runtime page-reduction outcome, rather than an unrecoverable DB hold.
+    // runtime::tests::ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back
+    // owns the route's halving/reload behavior for this typed outcome.
+    for n in 0..32 {
+        let session = format!("00000000-0000-4000-8000-{n:012}");
+        std::fs::write(
+            projects.join(format!("{session}.jsonl")),
+            a1a_row(&format!("batch-{n}"), 100)
+                .replace("1338a80a-f36e-4cbc-a5bb-50fc66430ba5", &session),
+        )
+        .unwrap();
+    }
+    owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
+    let (mut page, mut scan, _) =
+        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+            owner.scan(
+                std::slice::from_ref(&projects),
+                &root,
+                prev.clone(),
+                100,
+                true,
+                &BTreeMap::new(),
+                &[],
+            )
+        });
+    a1a_wire(&root, &mut page, &mut scan);
+    assert_eq!(page.files.len(), 33, "complete native page premise");
+    page.generation = prev.generation + 1;
+    let mut oversized = Adapter::new(owner.cache.clone(), &index_path, binding).unwrap();
+    let error = oversized
+        .plan(&prev, &page, &BTreeMap::new())
+        .err()
+        .expect("oversized native batch refuses before staging");
+    assert_eq!(
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::SaveCeiling)
+    );
 }
