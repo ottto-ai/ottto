@@ -233,6 +233,109 @@ impl ParentUnresolvableCauses {
 }
 crate::heap_layout_bound::fields!(ParentUnresolvableCauses; counts);
 
+/// Local traversal event totals, never money/ownership decisions or wire data.
+/// Named fields are additive; old readers ignore this diagnostic extension.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct CapCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub boundary_overflow_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub boundary_records_cleared: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub bootstrap_overflow_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub bootstrap_records_cleared: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub parent_signature_clear_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub price_trace_row_limit_hits: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub parent_ref_refusals: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub inventory_hold_keys_discarded: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+impl CapCounts {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.boundary_overflow_events = self
+            .boundary_overflow_events
+            .saturating_add(other.boundary_overflow_events);
+        self.boundary_records_cleared = self
+            .boundary_records_cleared
+            .saturating_add(other.boundary_records_cleared);
+        self.bootstrap_overflow_events = self
+            .bootstrap_overflow_events
+            .saturating_add(other.bootstrap_overflow_events);
+        self.bootstrap_records_cleared = self
+            .bootstrap_records_cleared
+            .saturating_add(other.bootstrap_records_cleared);
+        self.parent_signature_clear_events = self
+            .parent_signature_clear_events
+            .saturating_add(other.parent_signature_clear_events);
+        self.price_trace_row_limit_hits = self
+            .price_trace_row_limit_hits
+            .saturating_add(other.price_trace_row_limit_hits);
+        self.parent_ref_refusals = self
+            .parent_ref_refusals
+            .saturating_add(other.parent_ref_refusals);
+        self.inventory_hold_keys_discarded = self
+            .inventory_hold_keys_discarded
+            .saturating_add(other.inventory_hold_keys_discarded);
+    }
+}
+crate::heap_layout_bound::fields!(CapCounts; boundary_overflow_events, boundary_records_cleared, bootstrap_overflow_events, bootstrap_records_cleared, parent_signature_clear_events, price_trace_row_limit_hits, parent_ref_refusals, inventory_hold_keys_discarded);
+
+/// Transient events ride the existing shared trace map, including side parses.
+/// Nothing is added to the accumulator's durable bytes or shape fingerprint.
+#[derive(Debug, Default)]
+pub(crate) struct CapEvents {
+    counts: [AtomicU64; 6],
+}
+#[derive(Clone, Copy)]
+pub(crate) enum CapEvent {
+    BoundaryOverflow,
+    BoundaryRecordsCleared,
+    BootstrapOverflow,
+    BootstrapRecordsCleared,
+    ParentSignatureClear,
+    PriceTraceRowLimit,
+}
+impl CapEvents {
+    pub(crate) fn record(&self, event: CapEvent, count: u64) {
+        let _ = self.counts[event as usize].fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.saturating_add(count)),
+        );
+    }
+    pub(crate) fn take(&self) -> CapCounts {
+        let take = |event: CapEvent| self.counts[event as usize].swap(0, Ordering::Relaxed);
+        CapCounts {
+            boundary_overflow_events: take(CapEvent::BoundaryOverflow),
+            boundary_records_cleared: take(CapEvent::BoundaryRecordsCleared),
+            bootstrap_overflow_events: take(CapEvent::BootstrapOverflow),
+            bootstrap_records_cleared: take(CapEvent::BootstrapRecordsCleared),
+            parent_signature_clear_events: take(CapEvent::ParentSignatureClear),
+            price_trace_row_limit_hits: take(CapEvent::PriceTraceRowLimit),
+            ..Default::default()
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for CapEvents {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self { counts: _ } = self;
+        c.add(0)
+    }
+}
+
 #[derive(Default, Serialize)]
 struct CensusLossCounts {
     discovered: u64,
@@ -785,6 +888,12 @@ impl RecoveryLineage {
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct CodexScanDiagnostics {
+    #[serde(skip_serializing_if = "CapCounts::is_empty")]
+    pub caps: CapCounts,
+    /// Current indexed files with known activity entirely before the trace window
+    /// and no applied-tier receipt. Exposure only, never a mispricing count.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub price_tier_old_files_without_receipt: u64,
     pub version: u8,
     pub generation: u64,
     pub state_titles: LoaderEvidence,
@@ -874,7 +983,7 @@ pub(crate) struct CountingV2Receipts {
 
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
-crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, identity_conflict_taxonomy, gates, unreadable_causes, parent_unresolvable, parent_restarts_in_scope, quarantine_count, sample_offset, lineage);
+crate::heap_layout_bound::fields!(CodexScanDiagnostics; caps, price_tier_old_files_without_receipt, version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, identity_conflict_taxonomy, gates, unreadable_causes, parent_unresolvable, parent_restarts_in_scope, quarantine_count, sample_offset, lineage);
 crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, tombstone_evictions_v2_only, tombstone_evictions_pre_cutover_legacy, tombstone_evictions_not_provably_pre_cutover_legacy, legacy_to_v2_after_tombstone_eviction, tombstone_count, tombstone_cap, native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, closed_filter_hit_unconfirmed, closed_filter_hit_unconfirmed_native_usage, pending_overflow_flushes, open_turn_ui_pending_sessions_this_scan, open_turn_ui_pending_events_this_scan, open_turn_ui_pending_usage_this_scan, open_turn_ui_pending_unsummable_this_scan);
 crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
@@ -989,6 +1098,17 @@ mod tests {
             ..Default::default()
         };
         // PR-P: the two parent fields at their maxima.
+        diagnostics.caps = CapCounts {
+            boundary_overflow_events: u64::MAX,
+            boundary_records_cleared: u64::MAX,
+            bootstrap_overflow_events: u64::MAX,
+            bootstrap_records_cleared: u64::MAX,
+            parent_signature_clear_events: u64::MAX,
+            price_trace_row_limit_hits: u64::MAX,
+            parent_ref_refusals: u64::MAX,
+            inventory_hold_keys_discarded: u64::MAX,
+        };
+        diagnostics.price_tier_old_files_without_receipt = u64::MAX;
         diagnostics.parent_unresolvable = ParentUnresolvableCauses::saturated();
         diagnostics.parent_restarts_in_scope = Some(u64::MAX);
         diagnostics.state_titles = evidence;

@@ -8133,6 +8133,17 @@ fn full_ref_set_holds_a_new_fork_deferred_ref_without_restart() {
         let (next, scan) = home.generation(index, &cache, n);
         assert!(session_usage(&scan, CHILD).is_empty());
         assert!(!next.codex_parent_ownership_refs.contains(PARENT));
+        // [behaviour] A refused global parent-ref request is locally visible.
+        if n == 0 {
+            assert!(
+                scan.local_codex_diagnostics
+                    .as_ref()
+                    .unwrap()
+                    .caps
+                    .parent_ref_refusals
+                    > 0
+            );
+        }
         assert_eq!(restarts_in_scope(&scan), Some(0), "generation {n}");
         assert_eq!(
             parent_causes(&scan),

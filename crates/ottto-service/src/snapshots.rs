@@ -1,7 +1,7 @@
 use crate::codex_scan_diagnostics::{
-    self, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy, IncompleteShape,
-    ParentUnresolvableCauses, RecoveryLineage, StateRowFieldDiffs, UnreadableCause,
-    UnreadableCauses, LINEAGE_SAMPLES,
+    self, CapCounts, CapEvent, CapEvents, CensusGates, CodexScanDiagnostics, FileReason,
+    IdentityConflictTaxonomy, IncompleteShape, ParentUnresolvableCauses, RecoveryLineage,
+    StateRowFieldDiffs, UnreadableCause, UnreadableCauses, LINEAGE_SAMPLES,
 };
 use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
@@ -2587,6 +2587,11 @@ struct ScanTraversalCounts {
     retired_reread_budget_refused: serde::de::IgnoredAny,
     #[serde(skip_serializing_if = "ownership::Counts::is_empty")]
     causes: ownership::Counts,
+    #[serde(
+        skip_serializing_if = "CapCounts::is_empty",
+        deserialize_with = "deserialize_lenient_default"
+    )]
+    caps: CapCounts,
 }
 
 /// Residue a generation disclosed as terminal after settling. Counts exclude
@@ -17614,8 +17619,10 @@ fn is_claude_desktop_session_id(value: &str) -> bool {
 /// turn lack a durable response-level selector join. Absence is not positive
 /// proof of standard pricing. File-owned receipts preserve previously applied
 /// decisions after traces expire without extending them to new contributions.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct CodexTurnTraceMap {
+    cap_events: CapEvents,
+    since_epoch: i64,
     priority_turns: BTreeSet<String>,
     /// A present trace DB failed to load, or its row cap was reached: absent
     /// turns are unknown, not standard (R2-H1). A paged job treats a flipped
@@ -19062,9 +19069,20 @@ impl SnapshotAccumulator {
         })
     }
 
+    fn note_codex_cap(&self, event: CapEvent, count: u64) {
+        if let Some(traces) = &self.codex_turn_traces {
+            traces.cap_events.record(event, count);
+        }
+    }
+
     fn buffer_codex_boundary_record(&mut self, value: &Value) {
         const MAX_BOUNDARY_BUFFER_RECORDS: usize = 64;
         if self.codex_boundary_buffer_len() == MAX_BOUNDARY_BUFFER_RECORDS {
+            self.note_codex_cap(CapEvent::BoundaryOverflow, 1);
+            self.note_codex_cap(
+                CapEvent::BoundaryRecordsCleared,
+                self.codex_boundary_buffer_len() as u64,
+            );
             self.clear_codex_boundary_buffer();
             self.codex_legacy_bootstrap_valid = false;
             self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
@@ -19124,6 +19142,11 @@ impl SnapshotAccumulator {
                 return;
             }
             if self.codex_legacy_bootstrap_buffer.len() == MAX_BOOTSTRAP_RECORDS {
+                self.note_codex_cap(CapEvent::BootstrapOverflow, 1);
+                self.note_codex_cap(
+                    CapEvent::BootstrapRecordsCleared,
+                    self.codex_legacy_bootstrap_buffer.len() as u64,
+                );
                 self.codex_legacy_bootstrap_buffer.clear();
                 self.codex_legacy_bootstrap_valid = false;
                 return;
@@ -19221,6 +19244,7 @@ impl SnapshotAccumulator {
             return;
         };
         if self.codex_physical_signatures.len() == MAX_CODEX_PARENT_LEDGER_SIGNATURES {
+            self.note_codex_cap(CapEvent::ParentSignatureClear, 1);
             self.codex_physical_signatures.clear();
             self.codex_physical_signatures_complete = false;
             return;
@@ -22969,7 +22993,12 @@ impl CodexProofReaders {
     /// `Memory`, before reading the line. Fix rounds 2c/3: a first header
     /// whose kept strings, or a salvage whose timestamp, is over the slack
     /// left is refused before any of it is kept: `Memory` (`step_fits`).
-    pub(in crate::snapshots) fn run(&mut self, budget: &mut u64, room: usize) -> CodexProofRun {
+    pub(in crate::snapshots) fn run(
+        &mut self,
+        budget: &mut u64,
+        room: usize,
+        traces: Option<&Arc<CodexTurnTraceMap>>,
+    ) -> CodexProofRun {
         let reserve = codex_proof_step_reserve();
         let mut walk = None;
         loop {
@@ -22993,7 +23022,20 @@ impl CodexProofReaders {
             };
             let refused = match trailing {
                 Some((at, next)) if self.parent.done || self.ring.get(next).is_some() => {
-                    self.step_child(at, next, slack, budget)
+                    // Bind instrumentation only during the parse, after admission.
+                    // Never retain/charge the shared trace map in a proof job.
+                    self.children[at]
+                        .reader
+                        .parser
+                        .accumulator
+                        .codex_turn_traces = traces.cloned();
+                    let refused = self.step_child(at, next, slack, budget);
+                    self.children[at]
+                        .reader
+                        .parser
+                        .accumulator
+                        .codex_turn_traces = None;
+                    refused
                 }
                 trailing => self.step_parent(trailing.map(|(at, _)| at), slack, budget),
             };
@@ -31409,6 +31451,11 @@ impl OwnedSourceScan {
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
                 context_read_budget.flush(index, &codex_selected_flags);
+                if let Some(traces) = &codex_turn_traces {
+                    if let Some(traversal) = index.traversal.as_mut() {
+                        traversal.counts.caps.merge(traces.cap_events.take());
+                    }
+                }
                 if codex_page.continuation() {
                     let continuation_evidence = codex_join_inventory.map(|inventory| {
                         Arc::new(Mutex::new(Some(CodexContinuationEvidence {
@@ -31442,6 +31489,7 @@ impl OwnedSourceScan {
                             &codex_parent_identities,
                             &mut codex_page,
                             sampled_scan::now_seconds(),
+                            codex_turn_traces.as_ref(),
                         );
                     }
                 }
@@ -31450,6 +31498,11 @@ impl OwnedSourceScan {
                     .is_some_and(|phase| phase.pause_before_finalization())
                 {
                     pending!();
+                }
+                if let Some(traces) = &codex_turn_traces {
+                    if let Some(traversal) = index.traversal.as_mut() {
+                        traversal.counts.caps.merge(traces.cap_events.take());
+                    }
                 }
                 let terminal_effects_allowed = source != SnapshotSource::ClaudeCode
                     || claude_terminal_authority(index, true, &census_window_end);
@@ -32144,7 +32197,34 @@ impl OwnedSourceScan {
                             && !index.bounded_sweep_had_unsettled_upload,
                     );
                 }
-                let local_diagnostics = codex_title_metadata.local_diagnostics;
+                let mut local_diagnostics = codex_title_metadata.local_diagnostics;
+                if source == SnapshotSource::Codex {
+                    let cutoff = codex_turn_traces
+                        .as_ref()
+                        .map_or(0, |traces| traces.since_epoch)
+                        as u64;
+                    local_diagnostics.price_tier_old_files_without_receipt = index
+                        .files
+                        .iter()
+                        .filter(|(key, entry)| {
+                            entry.codex_applied_tier_receipt.is_none()
+                                && index.file_snapshot_fingerprints.get(*key).is_some_and(
+                                    |fingerprints| {
+                                        !fingerprints.is_empty()
+                                            && fingerprints.iter().all(|fingerprint| {
+                                                index
+                                                    .snapshot_activity_at
+                                                    .get(fingerprint)
+                                                    .and_then(Option::as_deref)
+                                                    .and_then(rfc3339_unix_seconds)
+                                                    .is_some_and(|activity| activity < cutoff)
+                                            })
+                                    },
+                                )
+                        })
+                        .count()
+                        as u64;
+                }
                 let continuation_evidence = (codex_join_completed.is_empty()
                     && continuation_ticket.is_some())
                 .then(|| codex_join_inventory.take())
@@ -32236,6 +32316,7 @@ impl OwnedSourceScan {
                             // PR-P: traversal-cumulative per-page counts, as
                             // `unreadable_causes`.
                             parent_unresolvable: counts.parent_unresolvable,
+                            caps: counts.caps,
                             // PR-P: omitted unless established on this page.
                             parent_restarts_in_scope: codex_parent_identities.parent_restarts,
                             gates: CensusGates {
@@ -40814,6 +40895,7 @@ impl CodexTurnTraceMap {
             }
         }
         let since_epoch = codex_logs2_since_epoch(backfill_window_days);
+        map.since_epoch = since_epoch;
         for codex_dir in codex_dirs {
             // The live DB lives directly under ~/.codex; a `sqlite/` subdir copy
             // exists on some installs. Read whichever is present.
@@ -40825,6 +40907,7 @@ impl CodexTurnTraceMap {
                     &db_path,
                     since_epoch,
                     &mut map.priority_turns,
+                    &map.cap_events,
                 );
             }
         }
@@ -40847,6 +40930,7 @@ fn load_codex_logs2_priority_turns(
     path: &Path,
     since_epoch: i64,
     priority_turns: &mut BTreeSet<String>,
+    cap_events: &CapEvents,
 ) -> bool {
     if !path.exists() {
         return true;
@@ -40889,6 +40973,10 @@ fn load_codex_logs2_priority_turns(
         if let Some(turn_id) = codex_logs2_priority_turn_from_body(&body) {
             priority_turns.insert(turn_id);
         }
+    }
+    // Saturation is potential omission, not an exact excluded-trace count.
+    if read == CODEX_LOGS2_MAX_ROWS as u64 {
+        cap_events.record(CapEvent::PriceTraceRowLimit, 1);
     }
     complete && read < CODEX_LOGS2_MAX_ROWS as u64
 }
@@ -43512,6 +43600,23 @@ fn record_codex_inventory_hold(
         || hold.refused_headers.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
         || hold.outside_roster.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
     {
+        // Count distinct discarded keys across the three overlapping sets.
+        let keys = hold.owed.len()
+            + hold
+                .refused_headers
+                .keys()
+                .filter(|key| !hold.owed.contains(*key))
+                .count()
+            + hold
+                .outside_roster
+                .keys()
+                .filter(|key| !hold.owed.contains(*key) && !hold.refused_headers.contains_key(*key))
+                .count();
+        traversal.counts.caps.inventory_hold_keys_discarded = traversal
+            .counts
+            .caps
+            .inventory_hold_keys_discarded
+            .saturating_add(keys as u64);
         // Past the bound only the next walk re-selects them, as before.
         traversal.residue.codex_inventory_hold = None;
     }
@@ -51445,6 +51550,9 @@ impl ScanIndex {
         if fits {
             self.codex_parent_ownership_refs
                 .insert(resolve_codex_identity(parent));
+        } else if let Some(traversal) = self.traversal.as_mut() {
+            traversal.counts.caps.parent_ref_refusals =
+                traversal.counts.caps.parent_ref_refusals.saturating_add(1);
         }
         fits
     }
@@ -84738,7 +84846,7 @@ crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ord
 crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
-crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns, incomplete);
+crate::heap_layout_bound::fields!(CodexTurnTraceMap; cap_events, since_epoch, priority_turns, incomplete);
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
     ownership_incomplete_file_count, cause, zero_snapshot_usage_evidence, dropped_usage_record_count,
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
@@ -84769,7 +84877,7 @@ crate::heap_layout_bound::fields!(ScanIndex; withheld_memo, persistence_legacy_r
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);

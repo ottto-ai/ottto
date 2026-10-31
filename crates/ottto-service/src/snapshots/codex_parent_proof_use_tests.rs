@@ -903,9 +903,15 @@ fn job_of(parent: &Path, children: &[&Path]) -> CodexProofReaders {
     CodexProofReaders::new(PARENT.into(), parent_reader, now, children)
 }
 
-fn run_to_end(job: &mut CodexProofReaders) -> Vec<ChildResult> {
+fn run_to_end(
+    job: &mut CodexProofReaders,
+    traces: Option<&Arc<CodexTurnTraceMap>>,
+) -> Vec<ChildResult> {
     let mut budget = u64::MAX;
-    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Done);
+    assert_eq!(
+        job.run(&mut budget, usize::MAX, traces),
+        CodexProofRun::Done
+    );
     job.children
         .iter()
         .map(|child| child.result.expect("every child has a result"))
@@ -1015,7 +1021,18 @@ fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
         &[&owned.0, &held.0, &parent_exhausted.0, &child_exhausted.0],
     );
     let mut second = job_of(&parent, &[&other.0, &gap.0, &overflow.0]);
-    let results = [run_to_end(&mut first), run_to_end(&mut second)].concat();
+    let traces = Arc::new(CodexTurnTraceMap::default());
+    let results = [
+        run_to_end(&mut first, None),
+        run_to_end(&mut second, Some(&traces)),
+    ]
+    .concat();
+    // [behaviour] The existing proof overflow clears 64 logical buffered records.
+    let caps = traces.cap_events.take();
+    assert_eq!(
+        (caps.boundary_overflow_events, caps.boundary_records_cleared),
+        (1, 64)
+    );
     // P's signature 2 is its row 3 (the session_meta row is unsigned).
     let at_m2 = row_end(&parent_rows, 3);
     let at_m0 = row_end(&parent_rows, 1);
@@ -1109,7 +1126,10 @@ fn a_straddling_parent_row_pushes_no_signature() {
     write_values(&child, &values);
 
     let mut job = job_of(&parent, &[&child]);
-    assert_eq!(run_to_end(&mut job), vec![ChildResult::ParentExhausted]);
+    assert_eq!(
+        run_to_end(&mut job, None),
+        vec![ChildResult::ParentExhausted]
+    );
     assert!(job.parent.parser.reader.sealed_fragment());
     assert_eq!(
         job.parent.parser.reader.last_complete_line_end(),
@@ -1146,15 +1166,21 @@ fn a_job_reads_nothing_past_its_budget() {
 
     let mut job = job_of(&parent, &[&child]);
     let mut budget = reserve - 1;
-    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Budget);
+    assert_eq!(
+        job.run(&mut budget, usize::MAX, None),
+        CodexProofRun::Budget
+    );
     assert_eq!((budget, job.consumed), (reserve - 1, 0));
 
     let mut budget = reserve;
-    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Budget);
+    assert_eq!(
+        job.run(&mut budget, usize::MAX, None),
+        CodexProofRun::Budget
+    );
     assert!(job.consumed > 0 && budget == reserve - job.consumed);
 
     let mut budget = u64::MAX;
-    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Done);
+    assert_eq!(job.run(&mut budget, usize::MAX, None), CodexProofRun::Done);
     assert!(matches!(
         job.children[0].result,
         Some(ChildResult::Decided {
@@ -1194,7 +1220,7 @@ fn headers_seen(job: &CodexProofReaders) -> usize {
 fn one_step(job: &mut CodexProofReaders) -> (CodexProofRun, isize, bool) {
     let (before, seen) = (retained(job), headers_seen(job));
     let mut budget = codex_proof_step_reserve();
-    let run = job.run(&mut budget, usize::MAX);
+    let run = job.run(&mut budget, usize::MAX, None);
     let grew = retained(job) as isize - before as isize;
     (run, grew, headers_seen(job) != seen)
 }
@@ -1347,6 +1373,7 @@ impl Scene {
             &identities,
             page,
             now,
+            None,
         );
     }
 
