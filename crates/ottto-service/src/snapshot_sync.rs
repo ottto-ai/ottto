@@ -10605,14 +10605,14 @@ where
     }
     let response = upload(batch);
     // The callback includes local preflight and authority checks. Only a reply
-    // or a typed remote failure proves this ordinary retry reached a send.
+    // or a typed batch response proves this ordinary retry reached a send.
     if response.is_ok()
         || response.as_ref().is_err_and(|error| {
             error.downcast_ref::<BatchRejected>().is_some()
                 || error.downcast_ref::<BatchAuthorizationRejected>().is_some()
                 || error
                     .downcast_ref::<UploadFailureDiagnostics>()
-                    .is_some_and(UploadFailureDiagnostics::is_snapshot_batch)
+                    .is_some_and(UploadFailureDiagnostics::is_snapshot_batch_response)
                 || error.downcast_ref::<UploadShed>().is_some()
                 || error.downcast_ref::<SnapshotAckRejected>().is_some()
         })
@@ -18030,6 +18030,29 @@ mod tests {
         assert_eq!(reads.values().sum::<usize>(), 1);
         assert_eq!(retry.snapshots.len(), 1);
         assert_eq!(retry.snapshots[0].snapshot_fingerprint, fingerprint);
+        // The existing DNS incident class fails before a batch can be sent.
+        let unsent = upload_resumable_batches(
+            &retry.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            |_| {
+                Err(anyhow::Error::new(UploadFailureDiagnostics::for_test(
+                    "local snapshot upload",
+                    "snapshot_batch",
+                    "transport_dns",
+                    true,
+                    false,
+                )))
+            },
+            |state| state.save(&progress_path),
+        );
+        assert!(unsent.is_err());
+        assert_eq!(
+            progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
+            0
+        );
         upload_resumable_batches(
             &retry.snapshots,
             &unique_poison_scope(),

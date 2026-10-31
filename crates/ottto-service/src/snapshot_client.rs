@@ -559,9 +559,9 @@ impl UploadFailureDiagnostics {
         self.status_family
     }
 
-    /// Distinguish a page send failure from an earlier relay-token failure.
-    pub(crate) fn is_snapshot_batch(&self) -> bool {
-        self.endpoint == "snapshot_batch"
+    /// A batch HTTP response proves a send; transport/token failures do not.
+    pub(crate) fn is_snapshot_batch_response(&self) -> bool {
+        self.endpoint == "snapshot_batch" && self.http_status.is_some()
     }
 
     /// Whether a snapshot page exceeded the client or gateway read deadline.
