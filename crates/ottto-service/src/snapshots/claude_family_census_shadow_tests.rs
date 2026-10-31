@@ -101,6 +101,7 @@ fn traversal() -> ScanTraversalCheckpoint {
         oversized_discovery: BTreeMap::new(),
         counts: ScanTraversalCounts::default(),
         residue: ScanTraversalResidue::default(),
+        context_inputs: None,
     }
 }
 

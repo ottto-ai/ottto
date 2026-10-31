@@ -226,7 +226,7 @@ impl ScanIndex {
                 .is_some_and(|member| unbound.contains(member.root))
                 && !entry.source_file_fingerprint.is_empty()
             {
-                entry.source_file_fingerprint.clear();
+                evidence_owed::clear(entry, evidence_owed::Kind::Read);
                 rearmed += 1;
             }
         }

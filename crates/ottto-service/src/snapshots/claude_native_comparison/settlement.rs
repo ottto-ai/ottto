@@ -400,12 +400,19 @@ impl Completion {
             paid,
             targets: &self.target_charges,
         };
-        let counts = accumulate_claude_usage_family_pending_with_credit(
+        let counts = super::super::evidence_owed::stamped(
+            index,
             &scan.snapshots,
-            &mut index.claude_usage_family_pending,
             &scan.census_window_end,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            Some(&mut budget),
+            |index| {
+                accumulate_claude_usage_family_pending_with_credit(
+                    &scan.snapshots,
+                    &mut index.claude_usage_family_pending,
+                    &scan.census_window_end,
+                    MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+                    Some(&mut budget),
+                )
+            },
         )?;
         Ok(Some(ClaudeNativeObservations {
             counts,
@@ -1365,7 +1372,7 @@ impl SelectedFallback {
         traversal.pending_candidates = priority;
         for target in &self.targets {
             if let Some(entry) = index.files.get_mut(&local_index_key(&target.path)) {
-                entry.source_file_fingerprint.clear();
+                super::super::evidence_owed::clear(entry, super::super::evidence_owed::Kind::Read);
             }
         }
         index.mark_bounded_sweep_unsettled();

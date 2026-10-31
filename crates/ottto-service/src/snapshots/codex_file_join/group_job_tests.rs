@@ -2357,6 +2357,7 @@ fn census_traversal(census: &[&str]) -> crate::snapshots::ScanTraversalCheckpoin
         unhealthy_retry_not_before_unix_seconds: None,
         counts: crate::snapshots::ScanTraversalCounts::default(),
         residue: crate::snapshots::ScanTraversalResidue::default(),
+        context_inputs: None,
     }
 }
 

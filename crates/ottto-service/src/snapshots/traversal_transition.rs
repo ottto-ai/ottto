@@ -76,10 +76,19 @@ pub(super) struct Starting {
     pub(super) admissions_dropped: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) due_retained: usize,
+    /// Evidence owed ON: a context change that only added roots, changed the
+    /// backfill or the active upload context owes evidence instead of
+    /// clearing (1). Omitted while zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) context_change_owed: usize,
     disappearance_process_totals_v1: disappearance_diagnostics::Totals,
 }
 
 impl Starting {
+    /// This start's re-arm owes evidence (keeps the fingerprint) under ON.
+    pub(super) fn owes(&self) -> bool {
+        super::evidence_owed::owes(self.rearm_cause()) || self.context_change_owed != 0
+    }
     pub(super) fn rearm_cause(&self) -> crate::local_resource_diagnostics::rearm_cause::Cause {
         use crate::local_resource_diagnostics::rearm_cause::Cause;
         match self.reason {
@@ -143,6 +152,7 @@ impl Starting {
             stale_rearm_capped_files: 0,
             admissions_dropped: 0,
             due_retained: 0,
+            context_change_owed: 0,
         }
     }
 
@@ -423,6 +433,7 @@ mod tests {
                 member_occurrences: Default::default(),
                 invalid: false,
                 idless_revision: None,
+                identity_contract: None,
             },
         );
         index.bounded_sweep_had_unsettled_upload = true;
@@ -798,6 +809,7 @@ mod tests {
                     member_occurrences: Default::default(),
                     invalid: false,
                     idless_revision: None,
+                    identity_contract: None,
                 },
             );
             plain.bounded_sweep_had_unsettled_upload = flag;

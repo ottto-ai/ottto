@@ -35,6 +35,7 @@ fn fixture() -> ScanIndex {
             oversized_discovery: BTreeMap::new(),
             counts: ScanTraversalCounts::default(),
             residue: ScanTraversalResidue::default(),
+            context_inputs: None,
         }),
         ..ScanIndex::default()
     }

@@ -512,10 +512,37 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
             member_occurrences: BTreeMap::new(),
             invalid: false,
             idless_revision: None,
+            identity_contract: None,
         },
     );
     let latched = rearm.terminal(&mut older, &rearm.items);
     assert!(latched.rearmed_files >= 2, "main's identity contract re-arm: {latched:?}");
+}
+
+/// [regress] RF1 round 3 (C5 P6, the #893 fold: the first complete census
+/// clears every family file, ~15.6k on the M4, again on a 1-24 h backoff).
+/// OFF the fold clears exactly as main; ON it owes the same files, keeping
+/// their fingerprints, so the next walk reads nothing it can re-stamp.
+#[test]
+fn evidence_owed_first_census_fold_owes_instead_of_clearing() {
+    for on in [false, true] {
+        let _on = on.then(evidence_owed::EvidenceOwedForTest::on);
+        let rearm = Rearm::new();
+        let mut index = rearm.index();
+        let first = rearm.terminal(&mut index, &rearm.items);
+        assert!(first.counts.full_rearm, "on={on}: {first:?}");
+        if on {
+            assert_eq!(first.rearmed_files, 0, "{first:?}");
+            for key in rearm.sources.keys() {
+                let entry = &index.files[key];
+                assert!(entry.evidence_owed && entry.rearmed(), "{key}");
+                assert!(!entry.source_file_fingerprint.is_empty());
+            }
+        } else {
+            assert!(first.rearmed_files >= 2, "{first:?}");
+            assert!(index.files.values().all(|entry| !entry.evidence_owed));
+        }
+    }
 }
 
 /// A first-proof hold on a dormant owner (C1a) waits on the full re-arm, so

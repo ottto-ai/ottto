@@ -69,6 +69,7 @@ fn carry_family(index: &mut ScanIndex, root: &str, subagents: &[Option<&str>], w
         member_occurrences: BTreeMap::new(),
         invalid: false,
         idless_revision: None,
+        identity_contract: None,
     };
     let mut witness = ClaudeUsageFamilyWitness {
         evidence_fingerprint: "e".repeat(64),
@@ -4883,6 +4884,132 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         false,
         &BTreeSet::new()
     ));
+}
+
+/// [money] Q5b (Lead B S1-S6, 2026-10-31) with the latch SET: a family whose
+/// pending is stamped with the recorded, real contract re-stamps with no read
+/// and its pending equals a Full's fold, but every member stays owed so fence
+/// coverage, family proof and retirement stay vetoed (S3). A legacy (None),
+/// mixed (other contract or body-witness revision) or placeholder-recorded
+/// family reads as round 2.
+#[test]
+fn owed_evidence_q5b_stamp_restamps_under_the_latch_and_keeps_the_vetoes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _owed = evidence_owed::EvidenceOwedForTest::on();
+    let (mut fixture, window) = owed_rearmed(2, true);
+    fixture.index.claude_request_identity_contract =
+        Some(claude_request_identity::cycle_contract(true).into());
+    fixture.index.claude_request_identity_contract_changed = true;
+    let current = evidence_owed::EvidenceContract::current(&fixture.index);
+    assert!(current.is_some());
+    let mut mixed = fixture.index.clone();
+    mixed.active_effective_upload_body_witness_revision += 1;
+    let mixed = evidence_owed::EvidenceContract::current(&mixed);
+    let stamp = |index: &mut ScanIndex, stamp| {
+        for pending in index.claude_usage_family_pending.values_mut() {
+            pending.identity_contract = stamp;
+        }
+    };
+    let visit = |index: &mut ScanIndex| {
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        let parsed = owed_selected_parses(
+            index,
+            &mut evidence_owed::Page::default(),
+            &fixture.candidates,
+            &window,
+        );
+        (parsed, scope.finish().contract.evidence_owed)
+    };
+
+    let mut index = fixture.index.clone();
+    stamp(&mut index, current);
+    let before = index.claude_usage_family_pending.clone();
+    let (parsed, counts) = visit(&mut index);
+    assert_eq!(parsed, 0);
+    assert_eq!((counts.restamped_under_latch, counts.restamped), (2, 0));
+    for (root, pending) in &before {
+        let full = ClaudeUsageFamilyPending {
+            census_window_end: window.clone(),
+            ..pending.clone()
+        };
+        assert_eq!(index.claude_usage_family_pending[root], full);
+    }
+    assert!(index.claude_request_identity_contract_changed, "latch untouched");
+    assert!(index.files.values().all(|entry| entry.evidence_owed));
+    assert_eq!(
+        claude_duplicate_fence_coverage_missing_member_count(&index, &window),
+        2,
+        "S3: no fence coverage under the latch"
+    );
+    assert_eq!(
+        evidence_owed::owed_roots(&index),
+        fixture.roots.iter().cloned().collect(),
+        "S3: family proof skips owed roots"
+    );
+
+    let mut placeholder = fixture.index.clone();
+    stamp(&mut placeholder, current);
+    placeholder.claude_request_identity_contract =
+        Some(CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL.into());
+    for (name, mut index) in [
+        ("legacy", fixture.index.clone()),
+        ("mixed", {
+            let mut index = fixture.index.clone();
+            stamp(&mut index, mixed);
+            index
+        }),
+        ("placeholder", placeholder),
+    ] {
+        let (parsed, counts) = visit(&mut index);
+        assert_eq!(parsed, 2, "{name}");
+        assert_eq!(
+            (counts.refused_contract_latch, counts.restamped_under_latch),
+            (2, 0),
+            "{name}"
+        );
+    }
+}
+
+/// [regress] RF1 round 3 (C5 P4): owed Fulls share ONE per-page allowance
+/// (the paced history-upgrade re-read budget). Past it an owed read is
+/// deferred, counted, and requeued as a non-member re-read, still owed. A
+/// must-read revision (a fold correction) never re-stamps.
+#[test]
+fn owed_evidence_reads_are_capped_per_page_and_must_reads_never_restamp() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _owed = evidence_owed::EvidenceOwedForTest::on();
+    let (mut fixture, window) = owed_rearmed(3, true);
+    for entry in fixture.index.files.values_mut() {
+        entry.owed_read = entry.evidence_owed;
+    }
+    let mut index = fixture.index.clone();
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let parsed = owed_selected_parses(
+        &mut index,
+        &mut evidence_owed::Page::default(),
+        &fixture.candidates,
+        &window,
+    );
+    let counts = scope.finish().contract.evidence_owed;
+    assert_eq!((parsed, counts.read_required, counts.restamped), (3, 3, 0));
+
+    let queued = fixture.index.traversal.as_ref().unwrap().pending_candidates.len();
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let mut page = evidence_owed::Page {
+        read_cap: 1,
+        ..Default::default()
+    };
+    let parsed = owed_selected_parses(&mut fixture.index, &mut page, &fixture.candidates, &window);
+    let counts = scope.finish().contract.evidence_owed;
+    assert_eq!((parsed, counts.deferred_page_cap), (1, 2));
+    let traversal = fixture.index.traversal.as_ref().unwrap();
+    assert_eq!(traversal.pending_candidates.len(), queued + 2);
+    assert!(traversal.pending_candidates.iter().skip(queued).all(|path| !path.census_member));
+    assert!(fixture.index.files.values().all(|entry| entry.evidence_owed));
 }
 
 /// [regress] RF1 round 2 admission drop (B1 deadlock: off terminal-off any
