@@ -13190,6 +13190,9 @@ fn off_no_record_growth_uses_ordinary_full_without_store_io() {
         let (prior, quiet, modes) = scan(prior);
         assert!(quiet.snapshots.is_empty());
         assert_eq!(modes.0 + modes.1, 0);
+        // The binding OFF proof is cold growth without a durable record.
+        // Discard the initial scan's ordinary RAM reduction, as on restart.
+        owner.evict();
         std::io::Write::write_all(
             &mut std::fs::OpenOptions::new()
                 .append(true)

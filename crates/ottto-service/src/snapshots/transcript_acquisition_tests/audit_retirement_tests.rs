@@ -1761,7 +1761,12 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 assert_eq!(restart_index.files[&key].unverified_deadline(), owed_due);
                 assert!(restart_index.files[&key].audit_requires_full(START + 2 * 60 * 60));
             }
-            if fault != "legacy_index_clear" {
+            if fault == "legacy_index_clear" {
+                // Binding quiet-restore ruling: a metadata-quiet attempt exits
+                // Pending before inspecting the audit carrier. Inert growth
+                // reaches the legacy carrier refusal without changing money.
+                fixture.file.append(&json!({"type":"ignored"}));
+            } else {
                 restart_index =
                     fixture.resume_quiet_on_growth(source, restart_index, &restart, &scope.0, NOW);
             }
