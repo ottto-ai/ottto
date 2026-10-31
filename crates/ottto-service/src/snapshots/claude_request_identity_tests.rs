@@ -176,6 +176,7 @@ fn typed_item(value: &Value) -> SnapshotItem {
                 .map(|entry| SnapshotRequestEvidence {
                     identity_basis: opt_string(entry, "identity_basis").unwrap(),
                     provider_workspace_hash: opt_string(entry, "provider_workspace_hash"),
+                    account_source: None,
                 })
                 .collect()
         })
@@ -462,6 +463,7 @@ fn contributions_of(item: &SnapshotItem) -> Option<Vec<Contribution>> {
             login: login.cloned(),
             org: entry.provider_workspace_hash.clone(),
             basis: basis_token(&entry.identity_basis)?,
+            account_source: None,
         }))
     };
     let mut out = Vec::new();
@@ -595,6 +597,7 @@ fn w0_r5_cap_fallbacks_match_bodies() {
             login: Some("f".repeat(64)),
             org: Some("e".repeat(64)),
             basis: identity::TELEMETRY,
+            account_source: None,
         });
         contributions.push(extra);
         let mut built = stripped(&base);
@@ -695,6 +698,7 @@ fn telemetry(login: char, org: char) -> RequestIdentity {
         login: Some(login.to_string().repeat(64)),
         org: Some(org.to_string().repeat(64)),
         basis: identity::TELEMETRY,
+        account_source: None,
     })
 }
 
@@ -703,6 +707,7 @@ fn login_key(login: &str) -> RequestIdentity {
         login: Some(login.to_string()),
         org: Some("d".repeat(64)),
         basis: identity::TELEMETRY,
+        account_source: None,
     })
 }
 
@@ -892,6 +897,7 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
                         login: Some(format!("{login:064x}")),
                         org: Some("d".repeat(64)),
                         basis: identity::TELEMETRY,
+                        account_source: None,
                     }),
                 });
             }
@@ -1095,7 +1101,8 @@ fn classify_follows_the_session_rulings() {
         RequestIdentity::Tagged(AuthorityKey {
             login: login.clone(),
             org: Some(org_d.clone()),
-            basis: identity::TELEMETRY
+            basis: identity::TELEMETRY,
+            account_source: None,
         })
     );
     // A supplied contradictory org is never dropped to obtain login-only.
@@ -1117,7 +1124,8 @@ fn classify_follows_the_session_rulings() {
         RequestIdentity::Tagged(AuthorityKey {
             login: login.clone(),
             org: Some(org_d.clone()),
-            basis: identity::TELEMETRY_LOGIN
+            basis: identity::TELEMETRY_LOGIN,
+            account_source: None,
         })
     );
     assert_eq!(
@@ -1128,7 +1136,8 @@ fn classify_follows_the_session_rulings() {
         RequestIdentity::Tagged(AuthorityKey {
             login: login.clone(),
             org: None,
-            basis: identity::TELEMETRY_LOGIN
+            basis: identity::TELEMETRY_LOGIN,
+            account_source: None,
         })
     );
     // Original clock is required for any tag.
@@ -1181,7 +1190,8 @@ fn classify_follows_the_session_rulings() {
         RequestIdentity::Tagged(AuthorityKey {
             login: None,
             org: Some(org_e.clone()),
-            basis: identity::TRANSCRIPT_ORG
+            basis: identity::TRANSCRIPT_ORG,
+            account_source: None,
         })
     );
     for (verdict, refusal) in [
@@ -1225,11 +1235,13 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
         login: Some(LOGIN_A.to_string()),
         org: Some(org.clone()),
         basis: identity::TRANSCRIPT_SOLE_LOGIN,
+        account_source: None,
     });
     let org_only = RequestIdentity::Tagged(AuthorityKey {
         login: None,
         org: Some(org.clone()),
         basis: identity::TRANSCRIPT_ORG,
+        account_source: None,
     });
     // Production suppresses the basis until the receiver's time-scoped veto
     // is verified: a qualifying census still yields org-only.
@@ -1347,6 +1359,7 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
             login: Some(OWNER_A.to_string()),
             org: None,
             basis: identity::TELEMETRY_LOGIN,
+            account_source: None,
         })
     );
     assert_eq!(
@@ -1355,6 +1368,7 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
             login: Some(LOGIN_A.to_string()),
             org: Some(org.clone()),
             basis: identity::TRANSCRIPT_SOLE_LOGIN,
+            account_source: None,
         })
     );
     let mut terminal = facts("req_none", Some(999_000), MarkerVerdict::Trusted(&org));
@@ -1365,6 +1379,7 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
             login: None,
             org: Some(org.clone()),
             basis: identity::TRANSCRIPT_ORG,
+            account_source: None,
         })
     );
 }
@@ -2843,7 +2858,8 @@ fn only_intact_rows_establish_login_org_membership() {
         RequestIdentity::Tagged(AuthorityKey {
             login: Some("a".repeat(64)),
             org: None,
-            basis: identity::TELEMETRY_LOGIN
+            basis: identity::TELEMETRY_LOGIN,
+            account_source: None,
         })
     );
 }
@@ -3232,6 +3248,7 @@ fn transcript_email_never_binds_and_refuses_unqualified_coverage() {
             login: None,
             org: Some(org.to_string()),
             basis: identity::TRANSCRIPT_ORG,
+            account_source: None,
         })
     };
     let refused = RequestIdentity::Refused;
@@ -3392,6 +3409,7 @@ fn transcript_email_never_binds_and_refuses_unqualified_coverage() {
             login: Some(OWNER_A.to_string()),
             org: Some("d".repeat(64)),
             basis: identity::TELEMETRY,
+            account_source: None,
         })
     );
 }
@@ -3411,6 +3429,7 @@ fn status_pairings_establish_marker_org_membership_for_the_telemetry_login() {
             login: Some(OWNER_A.to_string()),
             org: org.map(str::to_string),
             basis: identity::TELEMETRY_LOGIN,
+            account_source: None,
         })
     };
     // Without existing evidence the marker org is not established (§2a.12).
@@ -3688,6 +3707,7 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
         login: None,
         org: Some(org.clone()),
         basis: identity::TRANSCRIPT_ORG,
+        account_source: None,
     });
     assert_eq!(
         reason(&ledger, &default_home),
@@ -3767,6 +3787,7 @@ fn rows_under_another_root_own_the_request() {
         login: Some(OWNER_A.to_string()),
         org: None,
         basis: identity::TELEMETRY_LOGIN,
+        account_source: None,
     });
     assert_eq!(from(ROOT, "req_own"), login_only);
     assert_eq!(from(ROOT, "req_both"), login_only);
@@ -3778,6 +3799,7 @@ fn rows_under_another_root_own_the_request() {
             login: None,
             org: Some(D64.to_string()),
             basis: identity::TRANSCRIPT_ORG,
+            account_source: None,
         })
     );
 }
@@ -3943,7 +3965,8 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
                 RequestIdentity::Tagged(AuthorityKey {
                     login: Some(OWNER_A.into()),
                     org: None,
-                    basis: identity::TELEMETRY_LOGIN
+                    basis: identity::TELEMETRY_LOGIN,
+                    account_source: None,
                 })
             );
             assert_eq!(
@@ -4834,6 +4857,7 @@ fn login_org(login: char, org: Option<char>, basis: &'static str) -> RequestIden
         login: Some(hex(login)),
         org: org.map(hex),
         basis,
+        account_source: None,
     })
 }
 
@@ -5381,6 +5405,7 @@ fn withdrawn_transcript_tags_withdraw_from_the_display() {
                 login: None,
                 org: Some(hex('e')),
                 basis: identity::TRANSCRIPT_ORG,
+                account_source: None,
             }),
             Some("2026-09-01T10:02:00Z"),
         ),
@@ -5458,6 +5483,7 @@ fn fallback_withholds_and_ineligible_items_carry_no_display() {
                 login: Some(format!("{n:064x}")),
                 org: None,
                 basis: identity::TELEMETRY,
+                account_source: None,
             }),
             at: Some("2026-09-01T10:01:00Z"),
         })

@@ -77,6 +77,22 @@ fn e2_page_counted(
     bool,
     serde_json::Value,
 ) {
+    e2_page_counted_with(dirs, support, index, None)
+}
+
+/// `e2_page_counted` under this cycle's accepted-identity state (its
+/// capabilities); `None` is the plain evidence stage.
+fn e2_page_counted_with(
+    dirs: &[PathBuf],
+    support: &Path,
+    index: &mut ScanIndex,
+    accepted: Option<&claude_request_identity::AcceptedBuckets>,
+) -> (
+    Vec<SnapshotItem>,
+    ClaudeUsageAuthorityDisposition,
+    bool,
+    serde_json::Value,
+) {
     let _resumed_prefix =
         crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     {
@@ -97,7 +113,19 @@ fn e2_page_counted(
         );
         let ((disposition, _, stats), counts) =
             claude_request_money::e2::pipeline_test_observer::capture_identity_counts(|| {
-                crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, index)
+                match accepted {
+                    None => crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+                        support, &mut scan, index,
+                    ),
+                    Some(accepted) => {
+                        crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
+                            support,
+                            &mut scan,
+                            index,
+                            Some(accepted),
+                        )
+                    }
+                }
             });
         (
             scan.snapshots,
@@ -436,6 +464,187 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
         assert_eq!(disposition.quarantined_entity_count(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
+}
+
+/// The A-to-B family (req_1-2 own A, req_3-4 own B) with the `gaps` API rows
+/// removed and the `no_account` rows naming no account, evidence-staged once
+/// per mode on the same files: `None` the plain stage, `Some(capability)`
+/// this cycle's `session_request_account_source:v1` state. Root item + counts.
+fn e2_carry_pages(
+    gaps: &[&str],
+    no_account: &[&str],
+    modes: &[Option<bool>],
+) -> Vec<(SnapshotItem, serde_json::Value)> {
+    let (dir, root, _) = claude_account_family_fixture();
+    let support = dir.join("support");
+    let (mut api, trace) = e2_family_evidence(&root);
+    for row in &mut api[2..4] {
+        row.account_identifier_hash = Some("b".repeat(64));
+        e2_resign(row);
+    }
+    for row in &mut api {
+        if no_account.contains(&row.request_id.as_str()) {
+            row.account_identifier_hash = None;
+            e2_resign(row);
+        }
+    }
+    api.retain(|row| !gaps.contains(&row.request_id.as_str()));
+    e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        &root,
+        &trace,
+    );
+    let pages = modes
+        .iter()
+        .map(|mode| {
+            let mut accepted = claude_request_identity::AcceptedBuckets::default();
+            accepted.set_account_source_enabled(*mode == Some(true));
+            let (items, _, failed, counts) = e2_page_counted_with(
+                std::slice::from_ref(&dir),
+                &support,
+                &mut ScanIndex::default(),
+                mode.map(|_| &accepted),
+            );
+            assert!(!failed);
+            let item = items
+                .into_iter()
+                .find(|item| item.source_session_id == root)
+                .unwrap();
+            (item, counts)
+        })
+        .collect();
+    fs::remove_dir_all(dir).unwrap();
+    pages
+}
+
+/// Requests per (login, account_source) over the hourly rows and parts.
+fn e2_source_counts(item: &SnapshotItem) -> BTreeMap<(Option<String>, Option<AccountSource>), u64> {
+    let source = |evidence_ref: Option<u16>| {
+        evidence_ref.and_then(|at| item.request_evidence[usize::from(at)].account_source)
+    };
+    let mut counts = BTreeMap::new();
+    for row in item
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+    {
+        let shares = match &row.identity_parts {
+            Some(parts) => parts
+                .iter()
+                .map(|part| (&part.account_identifier_hash, part.evidence_ref, part.request_count))
+                .collect::<Vec<_>>(),
+            None => vec![(&row.account_identifier_hash, row.evidence_ref, row.request_count)],
+        };
+        for (login, evidence_ref, requests) in shares {
+            *counts
+                .entry((login.clone(), source(evidence_ref)))
+                .or_default() += requests;
+        }
+    }
+    counts
+}
+
+fn e2_count(counts: &serde_json::Value, name: &str) -> u64 {
+    counts.get(name).and_then(serde_json::Value::as_u64).unwrap_or(0)
+}
+
+/// [money] Under `session_request_account_source:v1` a gap's share moves only
+/// between keys of its own item: forward to the latest own account, backward
+/// to the first, each marked. Request, token and cost totals equal the
+/// capability-off placement.
+#[test]
+fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
+    use AccountSource::{CarriedBackward, CarriedForward};
+    let a = Some(e2_account());
+    let b = Some("b".repeat(64));
+    for (gaps, expected, forward, backward, ambiguous) in [
+        (
+            &["req_2", "req_4"][..],
+            vec![
+                ((a.clone(), None), 1),
+                ((a.clone(), Some(CarriedForward)), 1),
+                ((b.clone(), None), 1),
+                ((b.clone(), Some(CarriedForward)), 1),
+            ],
+            2,
+            0,
+            // req_2 was carried from A, then B took over.
+            1,
+        ),
+        (
+            &["req_1", "req_2", "req_4"][..],
+            vec![
+                ((b.clone(), Some(CarriedBackward)), 2),
+                ((b.clone(), None), 1),
+                ((b.clone(), Some(CarriedForward)), 1),
+            ],
+            1,
+            2,
+            0,
+        ),
+    ] {
+        let pages = e2_carry_pages(gaps, &[], &[Some(false), Some(true)]);
+        let [(off, _), (on, counts)] = &pages[..] else {
+            unreachable!()
+        };
+        assert_eq!(e2_source_counts(on), BTreeMap::from_iter(expected), "{gaps:?}");
+        assert_eq!(e2_count(counts, "claude_carried_forward_requests"), forward);
+        assert_eq!(e2_count(counts, "claude_carried_backward_requests"), backward);
+        assert_eq!(e2_count(counts, "claude_carry_ambiguous_gap_requests"), ambiguous);
+        let totals = |item: &SnapshotItem| {
+            (
+                item.request_count,
+                item.input_tokens,
+                item.output_tokens,
+                item.cache_creation_5m_tokens + item.cache_creation_1h_tokens,
+                item.cost.clone(),
+                e2_source_counts(item).values().sum::<u64>(),
+            )
+        };
+        assert_eq!(totals(on), totals(off), "{gaps:?}: money never changes");
+    }
+}
+
+/// [off=main] Without the capability the stage is main's: the same bytes as
+/// the plain evidence stage, no `account_source`, main's unmarked fill.
+#[test]
+fn e2_pipeline_carry_capability_absent_keeps_main_bytes() {
+    let pages = e2_carry_pages(&["req_2", "req_4"], &[], &[None, Some(false), Some(true)]);
+    let [(plain, _), (off, _), (on, _)] = &pages[..] else {
+        unreachable!()
+    };
+    let bytes = |item: &SnapshotItem| serde_json::to_string(item).unwrap();
+    assert_eq!(bytes(plain), bytes(off));
+    assert!(!bytes(off).contains("account_source"));
+    assert_eq!(
+        e2_login_counts(off),
+        BTreeMap::from([(Some(e2_account()), 2), (Some("b".repeat(64)), 2)])
+    );
+    assert!(bytes(on).contains(r#""account_source":"carried_forward""#));
+}
+
+/// [behaviour] A telemetry row naming no account blocks the carry: it stays
+/// Unknown and is counted; the next own account seeds again.
+#[test]
+fn e2_pipeline_no_account_row_blocks_the_carry() {
+    let pages = e2_carry_pages(&["req_4"], &["req_2"], &[Some(true)]);
+    let [(on, counts)] = &pages[..] else {
+        unreachable!()
+    };
+    let b = Some("b".repeat(64));
+    assert_eq!(
+        e2_source_counts(on),
+        BTreeMap::from([
+            ((None, None), 1),
+            ((Some(e2_account()), None), 1),
+            ((b.clone(), None), 1),
+            ((b, Some(AccountSource::CarriedForward)), 1),
+        ])
+    );
+    assert_eq!(e2_count(counts, "claude_carry_blocked_no_account_requests"), 1);
+    assert_eq!(e2_count(counts, "claude_carried_forward_requests"), 1);
 }
 
 #[test]

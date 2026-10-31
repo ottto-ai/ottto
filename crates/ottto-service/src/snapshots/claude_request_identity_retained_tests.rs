@@ -80,6 +80,7 @@ fn retained_wide_open_hour(
                 login: Some(format!("{:064x}", 100 + login)),
                 org: Some("f".repeat(64)),
                 basis: identity::TELEMETRY,
+                account_source: None,
             }),
         });
     }
