@@ -40889,10 +40889,12 @@ impl CodexTitleMetadata {
     /// E2 B3b: after a home's created-thread census failed, scope a rollout to
     /// its own home only when the file -> home map is exact. Its one identity
     /// has a state row in exactly one loaded home, whose created-thread census
-    /// succeeded and which is the only loaded home containing the row's
-    /// rollout path, and discovery has walked every failing root (in its scan
-    /// roots, none pending, no namespace loss) without finding a rollout of
-    /// that identity there (a copy whose unread row could disagree). Anything
+    /// succeeded, which is the only loaded home containing the row's rollout
+    /// path and which locates it exactly (`copy_locator`). Discovery has walked
+    /// every failing root (in its scan roots, none pending, no namespace loss)
+    /// without finding a rollout of that identity there (a copy whose unread
+    /// row could disagree), and every spawn ancestor is scoped too: a spawned
+    /// child's lineage (`family_position`) reads every home's edges. Anything
     /// else stays held. Counted in `created_thread_scoped_rollouts`.
     fn scope_created_thread_census(&mut self, index: &ScanIndex, roots: &[PathBuf]) {
         let failed = &self.created_thread_census_failed_homes;
@@ -40945,14 +40947,35 @@ impl CodexTitleMetadata {
                     .count()
                     == 1;
                 if single_home
-                    && rollout.starts_with(home)
+                    && codex_root_copies::copy_locator(home, identity, thread).is_some()
                     && !in_failed_homes.contains(identity)
                     && !self.identity_conflicts.contains(identity)
-                    && codex_rollout_thread_id(rollout).as_ref() == Some(identity)
                 {
                     scoped.insert(identity.clone(), rollout.to_path_buf());
                 }
             }
+        }
+        let held_lineage = |identity: &String| {
+            let mut child = resolve_codex_identity(identity);
+            let mut seen = BTreeSet::new();
+            while let Some(parent) = self.spawn_parents.get(child.as_str()) {
+                if self.spawn_parent_conflicts.contains(child.as_str())
+                    || !seen.insert(child)
+                    || !scoped.contains_key(parent)
+                {
+                    return true;
+                }
+                child = parent.clone();
+            }
+            self.spawn_parent_conflicts.contains(child.as_str())
+        };
+        let held = scoped
+            .keys()
+            .filter(|&identity| held_lineage(identity))
+            .cloned()
+            .collect::<Vec<_>>();
+        for identity in held {
+            scoped.remove(&identity);
         }
         self.local_diagnostics.created_thread_scoped_rollouts = saturating_count_u32(scoped.len());
         self.created_thread_scoped = scoped;
@@ -78395,20 +78418,23 @@ mod tests {
 
     /// [money] E2 B3b (Lead B, 2026-10-31): one home's created-thread census
     /// fails. A rollout whose proof comes only from another, healthy home is
-    /// not held. A rollout that might depend on two homes (a copy of its id in
-    /// the failing home), one with no own-home row and one inside the failing
-    /// home stay held, and nothing is scoped until discovery has walked the
-    /// failing home's roots without loss.
+    /// not held, nor is its spawned child. A rollout that might depend on two
+    /// homes (a copy of its id in the failing home), its spawned child, one
+    /// with no own-home row and one inside the failing home stay held, and
+    /// nothing is scoped until discovery has walked the failing home's roots
+    /// without loss.
     #[test]
     fn codex_created_thread_census_failure_holds_only_files_of_the_failing_home() {
         let base = temp_dir("codex-created-thread-scoped-failure");
         let failing = base.join(".codex");
         let healthy = base.join("slot").join("home");
-        let [own, copied, rowless, inside] = [
+        let [own, copied, rowless, inside, own_child, copied_child] = [
             "01a03e99-49cf-7460-9fd7-f7dbfd2f0a01",
             "01a03e99-49cf-7460-9fd7-f7dbfd2f0a02",
             "01a03e99-49cf-7460-9fd7-f7dbfd2f0a03",
             "01a03e99-49cf-7460-9fd7-f7dbfd2f0a04",
+            "01a03e99-49cf-7460-9fd7-f7dbfd2f0a05",
+            "01a03e99-49cf-7460-9fd7-f7dbfd2f0a06",
         ];
         let rollout = |home: &Path, id: &str| {
             let path = home
@@ -78418,23 +78444,33 @@ mod tests {
             fs::write(&path, b"{}\n").expect("write scoped fixture rollout");
             path
         };
-        let [own_path, copied_path, rowless_path, inside_path, copy_in_failing] = [
-            rollout(&healthy, own),
-            rollout(&healthy, copied),
-            rollout(&healthy, rowless),
-            rollout(&failing, inside),
-            rollout(&failing, copied),
-        ];
+        let [own_path, copied_path, rowless_path, own_child_path, copied_child_path] =
+            [own, copied, rowless, own_child, copied_child].map(|id| rollout(&healthy, id));
+        let [inside_path, copy_in_failing] = [inside, copied].map(|id| rollout(&failing, id));
         fs::write(failing.join("state_5.sqlite"), b"not a sqlite database")
             .expect("write failing classification census");
         let state = Connection::open(healthy.join("state_5.sqlite")).expect("open healthy state");
         state
             .execute_batch(
                 "CREATE TABLE threads (id TEXT, title TEXT, tokens_used INTEGER, \
-                 thread_source TEXT, first_user_message TEXT, rollout_path TEXT);",
+                 thread_source TEXT, first_user_message TEXT, rollout_path TEXT); \
+                 CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT);",
             )
             .expect("create healthy state schema");
-        for (id, path) in [(own, &own_path), (copied, &copied_path)] {
+        for (parent, child) in [(own, own_child), (copied, copied_child)] {
+            state
+                .execute(
+                    "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+                    rusqlite::params![parent, child],
+                )
+                .expect("insert healthy spawn edge");
+        }
+        for (id, path) in [
+            (own, &own_path),
+            (copied, &copied_path),
+            (own_child, &own_child_path),
+            (copied_child, &copied_child_path),
+        ] {
             state
                 .execute(
                     "INSERT INTO threads VALUES (?1, NULL, 5, 'user', NULL, ?2)",
@@ -78487,15 +78523,23 @@ mod tests {
             "own-home proof is not held"
         );
         assert!(
+            !ambiguous(&metadata, &own_child_path),
+            "child of an own-home parent is not held"
+        );
+        assert!(
             ambiguous(&metadata, &copied_path),
             "copy in the failing home"
+        );
+        assert!(
+            ambiguous(&metadata, &copied_child_path),
+            "child of a held parent"
         );
         assert!(ambiguous(&metadata, &rowless_path), "no own-home row");
         assert!(
             ambiguous(&metadata, &inside_path),
             "inside the failing home"
         );
-        assert_eq!(metadata.local_diagnostics.created_thread_scoped_rollouts, 1);
+        assert_eq!(metadata.local_diagnostics.created_thread_scoped_rollouts, 2);
 
         // Until discovery has fully walked the failing home, nothing is scoped.
         let mut pending = walked.clone();
@@ -85834,10 +85878,9 @@ mod census_unreadable_tests {
             .clone();
         let key = crate::codex_scan_diagnostics::digest(&local_index_key(&path));
         let key = u64::from_be_bytes(std::array::from_fn(|byte| key[byte]));
-        assert!(
-            sample
-                .as_str()
-                .is_some_and(|sample| sample.ends_with(&format!(":other_home:jsonl:{key:016x}"))),
+        assert_eq!(
+            (&sample["root"], &sample["kind"], &sample["key"]),
+            (&json!("other_home"), &json!("jsonl"), &json!(key)),
             "{sample}"
         );
         fs::set_permissions(&root, fs::Permissions::from_mode(0o100)).unwrap();

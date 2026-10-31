@@ -177,9 +177,9 @@ impl UnreadableCauses {
     ) {
         self.record(cause, count);
         if count > 0 {
-            let site_line = std::panic::Location::caller().line();
+            let line = std::panic::Location::caller().line();
             self.samples
-                .insert(cause as usize, UnreadableSample::new(site_line, file));
+                .insert(cause as usize, UnreadableSample::new(line, file));
         }
     }
     pub(crate) fn merge(&mut self, other: Self) {
@@ -265,58 +265,40 @@ impl crate::heap_layout_bound::HeapLayoutBound for UnreadableSamples {
 /// One unreadable event: the recording call's line in the producing build
 /// (with the cause it names one call site) and, when the site names a file,
 /// that file's root class, kind and the first 8 bytes of `digest(index key)`
-/// (lineage's `file_key_digest`). Never path text. Written as one short
-/// string, `line` or `line:root:kind:key_hex`, so 32 samples stay well inside
-/// `MAX_LOCAL_DIAGNOSTIC_BYTES`.
+/// (lineage's `file_key_digest`) as a big-endian `u64`. Never path text. One
+/// flat record, so 32 samples stay inside `MAX_LOCAL_DIAGNOSTIC_BYTES`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(into = "String", try_from = "String")]
 struct UnreadableSample {
-    site_line: u32,
+    line: u32,
+    #[serde(flatten)]
     file: Option<UnreadableFile>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct UnreadableFile {
     root: UnreadableRoot,
     kind: UnreadableFileKind,
-    key_digest: [u8; 8],
+    key: u64,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum UnreadableRoot {
     DotCodex,
     /// A Codex slot home, or another source's root.
     OtherHome,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum UnreadableFileKind {
     Jsonl,
     JsonlZst,
     /// A sidecar or any other file.
     Other,
 }
-impl UnreadableRoot {
-    const ALL: [Self; 2] = [Self::DotCodex, Self::OtherHome];
-    fn name(self) -> &'static str {
-        match self {
-            Self::DotCodex => "dot_codex",
-            Self::OtherHome => "other_home",
-        }
-    }
-}
-impl UnreadableFileKind {
-    const ALL: [Self; 3] = [Self::Jsonl, Self::JsonlZst, Self::Other];
-    fn name(self) -> &'static str {
-        match self {
-            Self::Jsonl => "jsonl",
-            Self::JsonlZst => "jsonl_zst",
-            Self::Other => "other",
-        }
-    }
-}
 impl UnreadableSample {
-    fn new(site_line: u32, file: Option<(&std::path::Path, &str)>) -> Self {
+    fn new(line: u32, file: Option<(&std::path::Path, &str)>) -> Self {
         let file = file.map(|(path, index_key)| {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
-            let key_digest = digest(index_key);
+            let key = digest(index_key);
             UnreadableFile {
                 root: if path.components().any(|part| part.as_os_str() == ".codex") {
                     UnreadableRoot::DotCodex
@@ -330,52 +312,10 @@ impl UnreadableSample {
                 } else {
                     UnreadableFileKind::Other
                 },
-                key_digest: std::array::from_fn(|byte| key_digest[byte]),
+                key: u64::from_be_bytes(std::array::from_fn(|byte| key[byte])),
             }
         });
-        Self { site_line, file }
-    }
-}
-impl From<UnreadableSample> for String {
-    fn from(sample: UnreadableSample) -> Self {
-        match sample.file {
-            None => sample.site_line.to_string(),
-            Some(file) => format!(
-                "{}:{}:{}:{:016x}",
-                sample.site_line,
-                file.root.name(),
-                file.kind.name(),
-                u64::from_be_bytes(file.key_digest)
-            ),
-        }
-    }
-}
-impl TryFrom<String> for UnreadableSample {
-    type Error = &'static str;
-    fn try_from(text: String) -> Result<Self, Self::Error> {
-        let mut parts = text.split(':');
-        let site_line = parts
-            .next()
-            .and_then(|line| line.parse().ok())
-            .ok_or("unreadable sample site")?;
-        let file = match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (None, ..) => None,
-            (Some(root), Some(kind), Some(key), None) => Some(UnreadableFile {
-                root: UnreadableRoot::ALL
-                    .into_iter()
-                    .find(|known| known.name() == root)
-                    .ok_or("unreadable sample root")?,
-                kind: UnreadableFileKind::ALL
-                    .into_iter()
-                    .find(|known| known.name() == kind)
-                    .ok_or("unreadable sample kind")?,
-                key_digest: u64::from_str_radix(key, 16)
-                    .map_err(|_| "unreadable sample key")?
-                    .to_be_bytes(),
-            }),
-            _ => return Err("unreadable sample shape"),
-        };
-        Ok(Self { site_line, file })
+        Self { line, file }
     }
 }
 
@@ -1188,10 +1128,8 @@ mod tests {
         let first = kept[0].unwrap().file.unwrap();
         assert_eq!(first.root, UnreadableRoot::DotCodex);
         assert_eq!(first.kind, UnreadableFileKind::Jsonl);
-        assert_eq!(
-            first.key_digest[..],
-            digest(&private.join("a.jsonl").to_string_lossy())[..8]
-        );
+        let a_digest = digest(&private.join("a.jsonl").to_string_lossy());
+        assert_eq!(first.key.to_be_bytes()[..], a_digest[..8]);
         assert_eq!(
             kept[1].unwrap().file.unwrap().kind,
             UnreadableFileKind::JsonlZst
@@ -1201,7 +1139,7 @@ mod tests {
             UnreadableFileKind::Other
         );
         let site_only = causes.samples.0[UnreadableCause::Reduction as usize][0].unwrap();
-        assert!(site_only.file.is_none() && site_only.site_line > 0);
+        assert!(site_only.file.is_none() && site_only.line > 0);
         assert!(causes.samples.0[UnreadableCause::Directory as usize]
             .iter()
             .all(Option::is_none));
@@ -1210,8 +1148,11 @@ mod tests {
         for forbidden in ["/Users", "private", "credential", ".codex", "sessions"] {
             assert!(!text.contains(forbidden), "{forbidden}");
         }
-        let a_key = u64::from_be_bytes(first.key_digest);
-        assert!(text.contains(&format!(":dot_codex:jsonl:{a_key:016x}\"")));
+        let a_key = first.key;
+        assert!(text.contains(&format!(
+            r#""root":"dot_codex","kind":"jsonl","key":{a_key}}}"#
+        )));
+        assert!(text.contains(&format!(r#"{{"line":{}}}"#, site_only.line)));
         let back: UnreadableCauses = serde_json::from_str(&text).unwrap();
         assert_eq!(back.samples.0, causes.samples.0);
         let mut merged = back;
@@ -1345,11 +1286,11 @@ mod tests {
         diagnostics.lineage = [Some(lineage); LINEAGE_SAMPLES];
         diagnostics.unreadable_causes.samples = UnreadableSamples(
             [[Some(UnreadableSample {
-                site_line: u32::MAX,
+                line: u32::MAX,
                 file: Some(UnreadableFile {
                     root: UnreadableRoot::OtherHome,
                     kind: UnreadableFileKind::JsonlZst,
-                    key_digest: [255; 8],
+                    key: u64::MAX,
                 }),
             }); UNREADABLE_SAMPLES]; 8],
         );
