@@ -410,8 +410,6 @@ impl Drop for Family {
     }
 }
 
-// Fixture-only checkpoint custody characterization retired.
-
 #[test]
 #[ignore = "P12: needs full qualified two-phase driver; original expectations preserved"]
 fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
@@ -496,38 +494,6 @@ fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
         .index
         .claude_usage_authority_quarantine
         .contains_key(&root_session_id));
-}
-
-fn observe_base_prelude(experimental_base_exit: bool) {
-    let _scope = experimental_base_exit.then(envelope_selection_experiment::Scope::restart);
-    let mut family = Family::new();
-    let first = family.proven_and_corrected();
-    let key = family.parent_key.clone();
-    let mut child = family.child("2026-08-02T07:20:00Z", 2);
-    family.page(&mut child, true, "2026-08-02T07:20:00Z");
-    assert_eq!(family.witness(), first);
-    assert!(
-        !family.armed(&key),
-        "base re-proof re-arms the root; this is NOT the original oracle passing"
-    );
-    let mode = if experimental_base_exit {
-        "experimental_base_exit_no_reuse"
-    } else {
-        "base_control"
-    };
-    writeln!(std::io::stderr().lock(), "p12_oracle: name=member_change_after_unchanged_proof_fails_closed_until_family_reparse mode={mode} status=BLOCKED_OPTIMIZED_PRELUDE original_expected_parent_armed=true observed_parent_armed=false original_oracle_passed=false downstream_assertions_executed=false").unwrap();
-}
-#[test]
-fn p12_member_change_base_control_reveals_unmet_original_prelude() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    observe_base_prelude(false);
-}
-#[test]
-fn p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() {
-    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    observe_base_prelude(true);
 }
 
 #[test]

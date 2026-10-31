@@ -8811,13 +8811,6 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
-thread_local! {
-    // Identical-input terminal fixture keeps the pre-elimination row lifetime
-    // in its BASE arm. No production switch or persisted state is added.
-    static RETAIN_ALL_CLAUDE_PROVEN_ROWS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Replace transcript-only Claude usage with the exact union of transcript
 /// responses and locally reported API-request occurrences, but only after a
 /// complete filesystem census and an exact enhanced-trace ownership join.
@@ -9346,9 +9339,6 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             // Only page-item roots consume these rows below. Keep every
             // proven key and witness for rebind, retention and rearm.
             let retain_rows = item_roots.contains(root_session_id);
-            #[cfg(test)]
-            let retain_rows =
-                retain_rows || RETAIN_ALL_CLAUDE_PROVEN_ROWS_FOR_TEST.with(std::cell::Cell::get);
             if !retain_rows {
                 family.rows_by_member = BTreeMap::new();
             }
@@ -10538,21 +10528,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             let rearmed = full_rearm
                 || identity_contract_rearm
                 || fence_recovery_rearm
-                || {
-                    let proof_rearm = proof_candidate && !negative && !settled_unchanged_proof;
-                    #[cfg(test)]
-                    {
-                        proof_rearm
-                            && !envelope_selection_experiment::suppress_certified_negative_rearm(
-                                &root_session_id,
-                                index_key,
-                            )
-                    }
-                    #[cfg(not(test))]
-                    {
-                        proof_rearm
-                    }
-                }
+                || (proof_candidate && !negative && !settled_unchanged_proof)
                 || invalidated_witness_roots.contains(&root_session_id)
                 || changed_duplicate_owner
                 || current_member_owns_changed_request;
@@ -26884,16 +26860,6 @@ impl OwnedSourceScan {
                 );
             }
         }
-        // Nonshipping candidate: exercise target priority at the actual
-        // selection boundary, before audits, with the unchanged page cap.
-        #[cfg(test)]
-        envelope_selection_experiment::before_audit_selection(
-            source,
-            &mut traversal.pending_candidates,
-            &mut pending_paths,
-            &mut index.files,
-            selection_limit,
-        );
         // Authority deadlines are serviced independently of history admission,
         // before audits can consume the existing per-page selection allowance.
         if source == SnapshotSource::ClaudeCode {
@@ -52462,11 +52428,6 @@ pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<P
 }
 
 #[cfg(test)]
-pub(crate) mod envelope_selection_experiment {
-    include!("snapshots/envelope_selection_experiment.rs");
-}
-
-#[cfg(test)]
 mod tests {
     mod claude_file_cap_tests {
         include!("snapshots/claude_file_cap_tests.rs");
@@ -52494,9 +52455,6 @@ mod tests {
 
     mod full_rearm_progress_tests {
         include!("snapshots/full_rearm_progress_tests.rs");
-    }
-    mod p12_base_exit_tests {
-        include!("snapshots/p12_base_exit_tests.rs");
     }
     mod p12_usage_original_tests {
         include!("snapshots/p12_usage_original_tests.rs");

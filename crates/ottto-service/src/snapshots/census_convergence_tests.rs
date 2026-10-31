@@ -1409,28 +1409,12 @@ fn transcript_ownership_needs_quarantined_originals_observed() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-mod owned_held_index_allocation {
-    include!("owned_held_index_allocation_tests.rs");
-}
-
-mod authority_binding_prototype {
-    include!("authority_binding_prototype_tests.rs");
-}
-
 mod provider_envelope_experiment_tests {
     include!("provider_envelope_experiment_tests.rs");
 }
 
 mod witness_reconstruct_scope {
     include!("witness_reconstruct_scope_tests.rs");
-}
-
-#[test]
-fn p12_experimental_base_exit_duplicate_fence_full_coverage_oracle() {
-    let scope = envelope_selection_experiment::Scope::restart();
-    claude_duplicate_fence_reopens_only_after_full_coverage();
-    assert_eq!(scope.counts().rearm_suppressed, 0);
-    writeln!(std::io::stderr().lock(), "p12_oracle: name=claude_duplicate_fence_reopens_only_after_full_coverage mode=experimental_base_exit_no_reuse status=PASS original_assertions_unchanged=true eligible_reuse_proved=false").unwrap();
 }
 
 // Re-review r3 (path-(a) bridge): with the absent-family scratch refused for

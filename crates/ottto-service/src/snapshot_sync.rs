@@ -3291,11 +3291,6 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         // actually selected for this save, after any old-entry restoration.
         committable.settle_empty_claude_proof_corrections(scan);
     }
-    #[cfg(test)]
-    crate::snapshots::envelope_selection_experiment::after_selected_restore(
-        &mut committable,
-        committed_index,
-    );
     if let Some(fallback) = fallback {
         fallback.restore(&mut committable, committed_index)?;
     }
@@ -22248,9 +22243,6 @@ mod tests {
     }
     mod claude_money_e2_pipeline_tests {
         include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
-    }
-    mod p12_base_exit_tests {
-        include!("snapshot_sync/p12_base_exit_tests.rs");
     }
     mod p12_pipeline_original_tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");
