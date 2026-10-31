@@ -147,3 +147,30 @@ code. None adds a persisted field.
   pinned macOS), ON's resumed admission runs no carry batch and promotes no
   stale family to the oversized retry root, the same as main's start there.
   Pinned macOS is unchanged.
+- **R11 (exact-ACK re-read under contract debt):** the ON start's semantic
+  clear keeps a member's body when main independently accepted it and its
+  per-file receipt is current (`terminal_off_stale_member_can_skip_clear`).
+  B-P2's unACKed heads, held, listed and no-list-held members and the BASE
+  control keep the clear.
+- **R5 (held history re-read every walk round):** a bounded RAM memo
+  (10,000 path digests, FIFO, `upload_context_held_memo_evicted` diagnostic)
+  records that a file's last complete parse was history-held in exactly this
+  context (path, context, fingerprint, replay generation and epoch, body
+  revision, list state and digest, no-list policy, cutoff and move policy).
+  Only the UploadContext selection gate and the targeted `upload_context`
+  wake consult it; `file_upload_context_requires_adoption` itself is
+  unchanged. A non-held parse, a context or fingerprint change, eviction or a
+  restart forgets it. Disclosure: one extra held re-read (no upload) after a
+  restart or eviction, and about 1.3 MB extra RAM at capacity.
+- **NBF (non-blocking held keys):** a key that non-blocking settlement holds
+  keeps one immediate retry; its held re-read floors it for six hours (same
+  object, context and revision), and when the floor expires it is re-offered
+  (`held_retry_due`) and read once even if nothing else selects it, so a held
+  key is never left idle. Disclosure: at most two reads in a new hold's first
+  six hours, then at most one per six hours, counted by
+  `terminal_off_nbf_initial_retry_read`; up to six hours of added held
+  release latency, a gate before fleet default-ON. Blocking holds (B1) are
+  unchanged.
+- **R4 disclosure counter:** each ON page emits `history_upgrade_page`
+  (`admitted_files`, `budget`, `extra_files`): history files actually admitted
+  to a parser, including local work beyond the upgrade budget.

@@ -2077,3 +2077,105 @@ fn copies_read_under_a_closed_duplicate_fence_settle_after_one_walk() {
     assert_eq!(accepted_total() / APPENDED_INPUT, 1);
     let _ = fs::remove_dir_all(root);
 }
+
+/// [regress] R11: the ON semantic stale clear skips only a member main
+/// independently accepted whose per-file receipt is current (receipts come
+/// through the real validated uploader seam). Every other case keeps the
+/// clear: the BASE control, a context change, an ACK-less member, held or
+/// listed history and the no-list hold.
+#[test]
+fn terminal_off_semantic_stale_clear_skips_only_a_current_exact_ack() {
+    // Main's OFF builder accepts both members; ON then mints their receipts.
+    let (home, root, mut index) = families("r11-skip-clear", 1);
+    let _on = ClaudeTerminalOffForTest::enabled();
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-1".into());
+    expire_terminal_off_discovery_for_test(&index);
+    let mut rescan = scan_source_roots_with_limit(
+        SnapshotSource::ClaudeCode,
+        &[root.clone()],
+        &mut index,
+        COLLECTED_AT,
+        BACKFILL_WINDOW_DAYS,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        true,
+    )
+    .unwrap();
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut rescan, &mut index);
+    let candidates = index.file_upload_context_ack_candidates(&rescan.snapshots);
+    let acks = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(
+        SnapshotSource::ClaudeCode,
+        &rescan.snapshots,
+    );
+    index
+        .accepted_snapshot_fingerprints
+        .extend(acks.keys().cloned());
+    index.accept_file_upload_context_acks(&candidates, &acks);
+    index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+    let skips = |index: &ScanIndex| {
+        with_no_list_cutoff(u64::MAX, || {
+            index
+                .files
+                .iter()
+                .map(|(key, entry)| terminal_off_stale_member_can_skip_clear(index, key, entry))
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(skips(&index), [true, true], "current exact ACKs skip");
+    {
+        let _base = KeepStaleClaudeFamilyRearmForTest::new();
+        assert_eq!(skips(&index), [false, false], "BASE keeps main's re-arm");
+    }
+    let cases: [(&str, fn(&mut ScanIndex)); 5] = [
+        ("context change", |index| {
+            index.activate_file_upload_context(SnapshotSource::ClaudeCode, "ctx-2".into())
+        }),
+        ("ACK-less", |index| {
+            index.accepted_snapshot_fingerprints.clear()
+        }),
+        ("held", |index| {
+            index.claude_reemission_exclusions =
+                ReemissionExclusions::with_state(ListState::Unreadable)
+        }),
+        ("listed", |index| {
+            index.claude_reemission_exclusions =
+                ReemissionExclusions::parse(format!("{}\n", digest(&session(0))).as_bytes())
+        }),
+        ("no-list held", |index| {
+            index.claude_reemission_exclusions =
+                ReemissionExclusions::with_state(ListState::NotInstalled)
+        }),
+    ];
+    for (case, change) in cases {
+        let mut changed = index.clone();
+        change(&mut changed);
+        assert_eq!(skips(&changed), [false, false], "{case} keeps the clear");
+    }
+    let _ = fs::remove_dir_all(home);
+}
+
+/// [behaviour] R4 disclosure: ON counts the history files actually admitted
+/// to a parser and discloses those beyond the page budget; OFF emits nothing.
+#[test]
+fn terminal_off_history_page_discloses_reads_beyond_its_budget() {
+    let budget = body_witness_adoption_page_budget();
+    for on in [false, true] {
+        let _on = on.then(ClaudeTerminalOffForTest::enabled);
+        let mut page = HistoryPage::default();
+        for _ in 0..budget + 2 {
+            page.note_history_read();
+        }
+        let ((), records) =
+            crate::local_resource_diagnostics::capture(|| page.emit_page_diagnostics());
+        let counts = records
+            .iter()
+            .filter(|record| record["stage"] == "history_upgrade_page")
+            .map(|record| record["counts"]["history_upgrade_page"].clone())
+            .collect::<Vec<_>>();
+        let expected = if on {
+            vec![json!({"admitted_files": budget + 2, "budget": budget, "extra_files": 2})]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(counts, expected, "on={on}");
+    }
+}

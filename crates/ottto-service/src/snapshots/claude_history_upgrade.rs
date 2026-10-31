@@ -548,6 +548,9 @@ fn holds_until_history_cutoff(inputs: &PolicyInputs<'_>) -> bool {
 /// One page's history budget and its count-only, local diagnostics.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HistoryPage {
+    // ON-only count of history files actually admitted to a parser, including
+    // local work that bypasses the upgrade-only budget. No proof authority.
+    read_files: usize,
     files: usize,
     bytes: u64,
     reserved: BTreeSet<String>,
@@ -574,7 +577,7 @@ pub(crate) struct HistoryPage {
     birth_page_begun: bool,
 }
 
-crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index, birth_page_begun);
+crate::heap_layout_bound::fields!(HistoryPage; read_files, files, bytes, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index, birth_page_begun);
 
 impl HistoryPage {
     /// A page whose twin groups candidate selection already built.
@@ -695,6 +698,31 @@ impl HistoryPage {
     pub(super) fn note_family_closure_root_absent(&mut self) {
         self.family_closure_root_absent_excluded =
             self.family_closure_root_absent_excluded.saturating_add(1);
+    }
+
+    pub(super) fn note_history_read(&mut self) {
+        if super::claude_terminal_off() {
+            self.read_files = self.read_files.saturating_add(1);
+        }
+    }
+
+    pub(super) fn emit_page_diagnostics(&self) {
+        if !super::claude_terminal_off() {
+            return;
+        }
+        let budget = super::body_witness_adoption_page_budget();
+        crate::local_resource_diagnostics::traversal_point(
+            "history_upgrade_page",
+            "claude_code",
+            &std::collections::BTreeMap::from([(
+                "history_upgrade_page",
+                std::collections::BTreeMap::from([
+                    ("admitted_files", self.read_files),
+                    ("budget", budget),
+                    ("extra_files", self.read_files.saturating_sub(budget)),
+                ]),
+            )]),
+        );
     }
 
     /// This page admitted at least one history file to its budget.

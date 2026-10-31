@@ -133,6 +133,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for MissingCause {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ReemissionExclusions {
     digests: BTreeSet<String>,
+    // ON-only RAM scheduling scope; never serialized or used for authority.
+    held_context_digest: [u8; 32],
     state: ListState,
     /// Read only while `state` is `MissingAfterInstall`.
     missing_cause: MissingCause,
@@ -142,7 +144,7 @@ pub(crate) struct ReemissionExclusions {
     walked_roots: BTreeMap<String, MemberDirStamp>,
 }
 
-crate::heap_layout_bound::fields!(ReemissionExclusions; digests, state, missing_cause, walked_roots);
+crate::heap_layout_bound::fields!(ReemissionExclusions; digests, held_context_digest, state, missing_cause, walked_roots);
 
 impl ReemissionExclusions {
     pub(crate) fn path(support_dir: &Path) -> PathBuf {
@@ -216,8 +218,15 @@ impl ReemissionExclusions {
             }
             digests.insert(line.to_string());
         }
+        let mut held_context_digest = [0; 32];
+        if super::claude_terminal_off() {
+            for digest in &digests {
+                Self::add_held_context_digest(&mut held_context_digest, digest);
+            }
+        }
         Self {
             digests,
+            held_context_digest,
             state: ListState::Installed,
             missing_cause: MissingCause::default(),
             walked_roots: BTreeMap::new(),
@@ -227,6 +236,7 @@ impl ReemissionExclusions {
     pub(super) fn with_state(state: ListState) -> Self {
         Self {
             digests: BTreeSet::new(),
+            held_context_digest: [0; 32],
             state,
             missing_cause: MissingCause::default(),
             walked_roots: BTreeMap::new(),
@@ -245,6 +255,22 @@ impl ReemissionExclusions {
     pub(crate) fn with_state_for_test(mut self, state: ListState) -> Self {
         self.state = state;
         self
+    }
+
+    // Commutative SHA-256 set digest: load and family closure have the same
+    // scope regardless of insertion order, without rehashing the list per file.
+    fn add_held_context_digest(scope: &mut [u8; 32], digest: &str) {
+        use sha2::Digest;
+        for (byte, part) in scope
+            .iter_mut()
+            .zip(sha2::Sha256::digest(digest.as_bytes()))
+        {
+            *byte ^= part;
+        }
+    }
+
+    pub(super) fn held_context_digest(&self) -> &[u8; 32] {
+        &self.held_context_digest
     }
 
     pub(crate) fn state(&self) -> ListState {
@@ -338,6 +364,9 @@ impl ReemissionExclusions {
                 return;
             }
             self.digests.insert(root_digest.as_str().to_owned());
+            if super::claude_terminal_off() {
+                Self::add_held_context_digest(&mut self.held_context_digest, root_digest.as_str());
+            }
         }
     }
 
@@ -353,6 +382,9 @@ impl ReemissionExclusions {
             return;
         }
         self.digests.insert(root_digest.as_str().to_owned());
+        if super::claude_terminal_off() {
+            Self::add_held_context_digest(&mut self.held_context_digest, root_digest.as_str());
+        }
     }
 
     /// True when this member's own full id (`root_stem`) is listed, not only

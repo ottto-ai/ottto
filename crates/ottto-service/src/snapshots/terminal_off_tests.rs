@@ -2387,3 +2387,137 @@ fn terminal_off_start_and_resumed_admission_never_rearm_a_witness_bound_family()
         assert!(index.claude_usage_family_pending.contains_key(OFF_ROOT));
     }
 }
+
+/// [regress] R5: a complete held parse suppresses only this exact context's
+/// UploadContext re-read. A context or fingerprint change, a non-held parse
+/// and OFF all fail toward another read; the memo persists no proof, receipt
+/// or ACK.
+#[test]
+fn terminal_off_held_context_memo_forgets_changes_and_nonheld_parse_without_credit() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    let scratch = crate::test_scratch::ScratchDir::new("held-context-key");
+    let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+    fs::write(&path, freshness_line(OFF_ROOT, "held-context-key")).unwrap();
+    let mut index = off_index();
+    off_scan(&mut index, &scratch, W1, 10);
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "memo-context".into());
+    let key = local_index_key(&path);
+    let fp = index.files[&key].source_file_fingerprint.clone();
+    let before = serde_json::to_value(&index).unwrap();
+    note_terminal_off_held_context(&index, &key, &fp);
+    assert!(terminal_off_held_context_seen(&index, &key));
+    assert_eq!(
+        serde_json::to_value(&index).unwrap(),
+        before,
+        "no persisted proof, receipt or ACK"
+    );
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "other-context".into());
+    assert!(!terminal_off_held_context_seen(&index, &key));
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "memo-context".into());
+    assert!(
+        !terminal_off_held_context_seen(&index, &key),
+        "old context forgotten"
+    );
+    note_terminal_off_held_context(&index, &key, &fp);
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    assert!(!terminal_off_held_context_seen(&index, &key));
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = fp.clone();
+    assert!(
+        !terminal_off_held_context_seen(&index, &key),
+        "old fingerprint forgotten"
+    );
+    note_terminal_off_held_context(&index, &key, &fp);
+    forget_terminal_off_held_context(&key);
+    assert!(
+        !terminal_off_held_context_seen(&index, &key),
+        "non-held parse forgets"
+    );
+    {
+        let _off = ClaudeCompletionPathsForTest::enable();
+        assert!(!claude_terminal_off());
+        note_terminal_off_held_context(&index, &key, &fp);
+        assert!(!terminal_off_held_context_seen(&index, &key));
+    }
+    assert!(
+        !terminal_off_held_context_seen(&index, &key),
+        "OFF writes no memo"
+    );
+}
+
+/// [regress] NBF: a non-blocking hold (the real `into_locally_held_keys_reverted`
+/// settlement) keeps its one immediate retry; its held re-read floors the key
+/// for six hours, and at floor expiry the key is re-offered and read exactly
+/// once even when nothing else selects it, so a floored hold is never idle.
+/// Cases: a never-committed key, and a key whose hold reverts to its
+/// committed, unchanged entry (only the floor-expiry read serves it).
+#[test]
+fn terminal_off_nonblocking_hold_reads_once_per_six_hours_and_never_idles() {
+    let _on = ClaudeTerminalOffForTest::enabled();
+    let t0 = rfc3339_unix_seconds(W1).unwrap();
+    let at = |offset: u64| {
+        OffsetDateTime::from_unix_timestamp((t0 + offset) as i64)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap()
+    };
+    // Offsets from W1: retry window, inside the floor, floor expiry, +300 s, +12 h.
+    let schedule = [600, 4_200, 22_200, 22_500, 43_800];
+    for (committed, expected) in [(false, [1, 0, 1, 0, 1]), (true, [0, 0, 1, 0, 1])] {
+        let scratch = crate::test_scratch::ScratchDir::new(&format!("terminal-off-nbf-{committed}"));
+        let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+        fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
+        let key = local_index_key(&path);
+        let mut index = off_index();
+        let mut previous = index.clone();
+        if committed {
+            let baseline = off_scan(&mut index, &scratch, "2026-08-20T10:01:00Z", 1);
+            off_accept(&mut index, &baseline);
+            index.traversal = None;
+            previous = index.clone();
+            // The first held read: a re-armed member whose hold reverts to
+            // its committed entry.
+            index.files.get_mut(&key).unwrap().source_file_fingerprint.clear();
+        }
+        let early_before = nbf_initial_retry_reads_for_test();
+        let page = |index: &mut ScanIndex, previous: ScanIndex, when: &str| {
+            let (scan, reads) =
+                terminal_contract_retry::source_acquisitions(|| off_scan(index, &scratch, when, 1));
+            let read = reads.get(&path).copied().unwrap_or(0);
+            if read > 0 {
+                // Settlement holds the key again (non-progressing, non-blocking).
+                let held = scan
+                    .snapshots
+                    .iter()
+                    .map(|item| item.snapshot_fingerprint.clone())
+                    .collect::<BTreeSet<_>>();
+                *index = index.into_locally_held_keys_reverted(&previous, &held, &held);
+            }
+            assert!(index.accepted_snapshot_fingerprints.iter().all(|fp| {
+                previous.accepted_snapshot_fingerprints.contains(fp)
+            }), "a held read is never an ACK");
+            read
+        };
+        assert_eq!(page(&mut index, previous, W1), 1, "committed={committed}: first held read");
+        for (offset, expected) in schedule.into_iter().zip(expected) {
+            let previous = index.clone();
+            assert_eq!(
+                page(&mut index, previous, &at(offset)),
+                expected,
+                "committed={committed} +{offset}s"
+            );
+        }
+        // Lead B: at most one early read per new hold; floor-expiry reads are
+        // never early.
+        assert_eq!(
+            nbf_initial_retry_reads_for_test() - early_before,
+            u64::from(!committed),
+            "committed={committed}"
+        );
+        assert_eq!(index.files.contains_key(&key), committed, "custody stays as held");
+    }
+}

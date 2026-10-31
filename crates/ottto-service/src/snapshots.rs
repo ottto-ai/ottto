@@ -8205,7 +8205,17 @@ pub fn finalize_scan_after_policy_with_body_witness(
         }
         if index.finalize_claude_held_history(&pending.index_key, &pending.source_file_fingerprint)
         {
+            if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                note_terminal_off_held_context(
+                    index,
+                    &pending.index_key,
+                    &pending.source_file_fingerprint,
+                );
+            }
             continue;
+        }
+        if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+            forget_terminal_off_held_context(&pending.index_key);
         }
         let final_fingerprints = by_source_file
             .get(&pending.source_file_fingerprint)
@@ -31520,6 +31530,9 @@ impl OwnedSourceScan {
                         .terminal_dropped_usage_record_count
                         .saturating_add(census.terminal_dropped_usage_record_count);
                 }
+                if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                    history_upgrade.emit_page_diagnostics();
+                }
                 if source == SnapshotSource::Codex {
                     // Count-only attribution of why Codex files were selected
                     // on this page. No path, session, or identifier is named.
@@ -32510,7 +32523,7 @@ impl OwnedSourceScan {
                         CandidateDecision::Parse,
                         Some(CandidateParseReason::ForcedFamily),
                     ),
-                    None => index.candidate_decision_with_reason_at(&candidate, audit_now),
+                    None => terminal_off_held_retry_decision(source, index, &candidate, audit_now),
                 };
             let target_match = native_comparison
                 .as_ref()
@@ -32530,6 +32543,7 @@ impl OwnedSourceScan {
             if comparison_target {
                 decision = CandidateDecision::Parse;
             }
+            let mut history_read = false;
             // History-upgrade gate (SOURCE P1), whatever selected the file:
             // unchanged Claude history that would carry a new body-witness
             // revision passes the list, the no-list birth hold, the family
@@ -32627,6 +32641,10 @@ impl OwnedSourceScan {
                     }
                     HistoryDecision::NotOwed => {}
                 }
+                history_read = source == SnapshotSource::ClaudeCode
+                    && claude_terminal_off()
+                    && decision == CandidateDecision::Parse
+                    && matches!(history, HistoryDecision::Owed | HistoryDecision::Held(_));
             }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
@@ -33147,6 +33165,9 @@ impl OwnedSourceScan {
             if side_plan.is_none() {
                 scanned_file_count += 1;
                 if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                    if history_read {
+                        history_upgrade.note_history_read();
+                    }
                     terminal_off_discovery::served(index, &candidate, audit_now);
                 }
             }
@@ -42593,13 +42614,22 @@ fn ensure_bounded_traversal(
                 .cloned()
                 .collect()
         };
-        if !semantic.is_empty() || !unacked.is_empty() {
+        // R11: a member main independently accepted whose per-file receipt is
+        // current keeps its body; B-P2's unACKed heads are still re-armed.
+        let semantic_members: BTreeSet<_> = index
+            .files
+            .iter()
+            .filter(|(key, entry)| {
+                claude_index_path_member_ref(Path::new(key))
+                    .is_some_and(|m| semantic.contains(m.root))
+                    && !terminal_off_stale_member_can_skip_clear(index, key, entry)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if !semantic_members.is_empty() || !unacked.is_empty() {
             // Actual destination/identity-contract invalidation remains owed.
             for (key, entry) in &mut index.files {
-                if unacked.contains(key)
-                    || claude_index_path_member_ref(Path::new(key))
-                        .is_some_and(|m| semantic.contains(m.root))
-                {
+                if unacked.contains(key) || semantic_members.contains(key) {
                     transition.rearmed_index_files +=
                         usize::from(!entry.source_file_fingerprint.is_empty());
                     rearm_cause::clear(key, entry, transition.rearm_cause());
@@ -51060,6 +51090,7 @@ impl ScanIndex {
         if upload_context_adoption
             && self.file_upload_context_requires_adoption(&key)
             && !self.file_upload_context_backoff_holds(candidate)
+            && !(claude_terminal_off() && terminal_off_held_context_seen(self, &key))
         {
             return (
                 CandidateDecision::Parse,

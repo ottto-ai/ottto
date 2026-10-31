@@ -342,7 +342,7 @@ impl ScanIndex {
                 == 0
     }
 
-    fn receipt_matches(&self, key: &str, entry: &ScanIndexEntry) -> bool {
+    pub(super) fn receipt_matches(&self, key: &str, entry: &ScanIndexEntry) -> bool {
         entry
             .upload_context_receipt
             .as_ref()
