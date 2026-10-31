@@ -421,17 +421,15 @@ pub(super) fn field_write<T: Serialize + ?Sized>(
     value: &T,
     mode: Members,
 ) -> Result<()> {
-    if matches!(mode, Members::Field) {
-        return rows.put(key(kind, "", 0)?, value);
-    }
-    let json = codec::json(value, VALUE_BYTES)?;
     let entries: BTreeMap<String, Box<serde_json::value::RawValue>> = match mode {
-        Members::Map => serde_json::from_slice(&json)?,
-        Members::Set => serde_json::from_slice::<Vec<Box<serde_json::value::RawValue>>>(&json)?
-            .into_iter()
-            .map(|v| Ok((serde_json::from_str(v.get())?, v)))
-            .collect::<Result<_>>()?,
-        Members::Field => unreachable!(),
+        Members::Field => return rows.put(key(kind, "", 0)?, value),
+        Members::Map => serde_json::from_slice(&codec::json(value, VALUE_BYTES)?)?,
+        Members::Set => serde_json::from_slice::<Vec<Box<serde_json::value::RawValue>>>(
+            &codec::json(value, VALUE_BYTES)?,
+        )?
+        .into_iter()
+        .map(|v| Ok((serde_json::from_str(v.get())?, v)))
+        .collect::<Result<_>>()?,
     };
     rows.map(kind, &entries)
 }

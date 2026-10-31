@@ -338,10 +338,13 @@ fn load_with_custody<M: Mapper>(
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
                         let (mut index, mut cx) = mapper.hydrate_context(&mut session.db)?;
                         ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                        // Digest the exact persisted image: a save then also
+                        // persists whatever normalization changes.
+                        let digests = kinds::baseline(&index, &mut cx)?;
                         normalize_hydrated(&mut index)?;
                         session.stamp = session.db.stamp()?;
                         ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
-                        state.save_digests = Some(kinds::baseline(&index, &mut cx)?);
+                        state.save_digests = Some(digests);
                         session.cx = cx;
                         index.v2_mut().persistence_v2 = Some(runtime.clone());
                         telemetry::event("route", &"v2");
@@ -368,9 +371,10 @@ fn load_with_custody<M: Mapper>(
                 .context("state_v2_open_hydrate")?;
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+            let digests = kinds::baseline(&index, &mut cx)?;
             normalize_hydrated(&mut index).context("state_v2_open_normalize")?;
             db.audit_headers().context("state_v2_open_audit_headers")?;
-            state.save_digests = Some(kinds::baseline(&index, &mut cx)?);
+            state.save_digests = Some(digests);
             index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
                 active: true,
                 session: Mutex::new(Some(Session {
@@ -549,7 +553,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             Hold::DbUnavailable
         );
         index.generation = stamp.0;
-        state.save_digests = Some(kinds::baseline(index, &mut cx)?);
+        let digests = kinds::baseline(index, &mut cx)?;
         index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
             active: true,
             session: Mutex::new(Some(Session {
@@ -563,6 +567,7 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
         }));
         telemetry::pass_start();
         register(state, index)?;
+        state.save_digests = Some(digests);
         Ok(())
     })
 }
@@ -625,10 +630,8 @@ fn save_with_custody(
                 // A pass may save more than once (including claim-only saves).
                 // The preceding save dropped its baseline; read committed state.
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
-                let (mut previous, cx) = ClaudeMapper.hydrate_context(&mut session.db)?;
-                normalize_hydrated(&mut previous)?;
+                let (previous, mut cx) = ClaudeMapper.hydrate_context(&mut session.db)?;
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
-                let mut cx = cx;
                 let digests = kinds::baseline(&previous, &mut cx)?;
                 session.cx = cx;
                 digests

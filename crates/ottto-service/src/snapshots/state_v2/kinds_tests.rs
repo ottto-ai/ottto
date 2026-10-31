@@ -277,7 +277,7 @@ fn generic_erasure_extraction_visits_nested_text_keys_and_shared_evidence() {
 
 /// [format] row commitments cover scalar, member and exact opaque custody changes.
 #[test]
-fn complete_misc_dirty_plan_covers_scalar_map_ack_and_raw_hold_changes() {
+fn misc_row_digests_cover_scalar_map_ack_and_raw_hold_changes() {
     let (_scratch, mut db) = Scratch::store();
     commit_populate(&mut db, &fixture());
     let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
@@ -310,12 +310,7 @@ fn complete_misc_dirty_plan_covers_scalar_map_ack_and_raw_hold_changes() {
         BTreeSet::from([
             mapper::key("setting.upload_context_fingerprint", "", 0).unwrap(),
             mapper::key("accepted.entity", "", 0).unwrap(),
-            mapper::key(
-                "accepted.entity",
-                &"e".repeat(64),
-                1
-            )
-            .unwrap(),
+            mapper::key("accepted.entity", &"e".repeat(64), 1).unwrap(),
             mapper::key("v1_field.repair_provenance", "", 0).unwrap(),
             mapper::key("raw_hold.files", "/synthetic/held", 0).unwrap(),
         ])
@@ -429,9 +424,12 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
     assert_persisted(&mut db, &next);
     let mut unchanged = next.clone();
     let attempts = db.save_row_attempts();
+    let rows = digests.rows.len() as u64;
     let digests = super::save_graph(&mut db, &identity, digests, &mut unchanged, &mut cx).unwrap();
-    // Only backend-owned controls advance on an unchanged selected graph.
+    // Only backend-owned controls advance on an unchanged selected graph:
+    // no logical row is rewritten or deleted.
     assert_eq!(db.save_row_attempts().1, attempts.1);
+    assert!(db.save_row_attempts().0 - attempts.0 < rows);
     assert_persisted(&mut db, &unchanged);
     next = unchanged;
     assert_eq!(

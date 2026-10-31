@@ -56,7 +56,7 @@ pub(super) fn rows(
             // No changed window needs a control read or ID allocation.
             previous.ids.clone()
         } else {
-            let tx = rows.tx.as_deref_mut().expect("save transaction");
+            let tx = rows.tx.as_deref_mut().context("state_v2_save_tx")?;
             let header = tx.get(&control)?;
             controls += usize::from(header.is_none());
             let created = header.is_none();
@@ -109,7 +109,7 @@ pub(super) fn rows(
             // not logical graph rows and are never swept by row deletion.
             if created || current != plan.last().copied() || high != old_high || ids != plan {
                 mapper::put(
-                    rows.tx.as_deref_mut().expect("save transaction"),
+                    rows.tx.as_deref_mut().context("state_v2_save_tx")?,
                     &control,
                     &(plan.last().copied(), high, &plan),
                 )?;
