@@ -170,6 +170,7 @@ impl Corpus {
             modes,
             disposition: Default::default(),
             released: Default::default(),
+            unhealthy: Default::default(),
         }
     }
 
@@ -210,6 +211,7 @@ impl Corpus {
             modes,
             disposition: Default::default(),
             released: Default::default(),
+            unhealthy: Default::default(),
         }
     }
     fn reload(&self, index: &mut ScanIndex) -> ScanIndex {
@@ -234,6 +236,8 @@ struct Page {
     modes: (usize, usize, usize),
     disposition: crate::snapshots::ClaudeUsageAuthorityDisposition,
     released: e2::pipeline_test_observer::Released,
+    /// #947: requests the last enrichment left Unknown for an unhealthy root.
+    unhealthy: crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts,
 }
 impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
@@ -265,6 +269,7 @@ impl Page {
             accepted.invalidate_copy_derived(&stats.copy_invalidated);
         }
         self.released = released;
+        self.unhealthy = stats.unhealthy_root_no_fallback_requests;
         self.index
             .veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut self.scan.snapshots);
         let deferred = self.index.bind_session_accounts_with_mixed(
@@ -587,6 +592,7 @@ fn ready(
         modes: p.modes,
         disposition: p.disposition.clone(),
         released: p.released,
+        unhealthy: p.unhealthy,
     };
     send.finish();
     let (result, _, _) = upload(&send.scan.snapshots, &mut e2_progress(), ack);
@@ -615,6 +621,7 @@ fn terminal_off_on_ready(
         modes: p.modes,
         disposition: p.disposition.clone(),
         released: p.released,
+        unhealthy: p.unhealthy,
     };
     send.finish();
     let (result, _, _) = send.upload_context(&mut e2_progress(), ack);
@@ -4228,6 +4235,8 @@ fn e2_pipeline_corrected_body_freeze_is_not_copy_derived() {
 /// latest proof is the own account B, is not tombstoned while this pass
 /// cannot read the session's own evidence (a partial telemetry sidecar pair).
 /// #909 / option (ii) protection stays, counted; money and account unchanged.
+/// Composed with #947: the unhealthy root's no-fallback branch leaves every
+/// loan unread, so the row is skipped, never tombstoned.
 #[test]
 fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
     for retained in [false, true] {
@@ -4271,6 +4280,7 @@ fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
             take_identity_counts();
             page.enrich_with(&c, Some(&mut ledger));
             let counts = serde_json::to_value(take_identity_counts()).unwrap();
+            assert!(page.unhealthy.incomplete > 0, "#947's unhealthy-root branch ran");
             assert_eq!(identity_count(&counts, "copy_derived_skipped_evidence_unavailable"), 1);
             assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 0);
             assert_eq!(serde_json::to_vec(&ledger).unwrap(), saved, "no tombstone");
