@@ -5,13 +5,16 @@ const MARKER: &str = "claude_admission_reoffer_window_enabled";
 
 fn fixture() -> (crate::test_scratch::ScratchDir, ScanIndex) {
     let scratch = crate::test_scratch::ScratchDir::new("admission-reoffer-window");
+    let member = scratch.join("member.jsonl");
+    fs::write(&member, b"").unwrap();
+    let key = local_index_key(&member);
     let mut index = ScanIndex::default();
     let mut entry = manifest_index_entry(Some("entity"));
     entry.modified_unix_seconds = unix_seconds(SystemTime::now()).unwrap();
-    index.files.insert("member.jsonl".into(), entry);
+    index.files.insert(key.clone(), entry);
     index
         .file_snapshot_fingerprints
-        .insert("member.jsonl".into(), BTreeSet::from(["entity".into()]));
+        .insert(key, BTreeSet::from(["entity".into()]));
     index.quarantined_snapshot_fingerprints.insert(
         "entity".into(),
         snapshot_quarantine_record(SnapshotSource::ClaudeCode),
@@ -104,10 +107,10 @@ fn admission_window_armed_and_aged_out_retries_stay_wide() {
         snapshot_quarantine_record(SnapshotSource::ClaudeCode),
     );
     assert_eq!(window_and_context(&index, &support).0, 183);
-    index
-        .files
-        .get_mut("member.jsonl")
+    fs::File::open(support.join("member.jsonl"))
         .unwrap()
-        .modified_unix_seconds = 0;
+        .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH))
+        .unwrap();
+    // Keep the recent committed mtime: only current file metadata shows age.
     assert_eq!(window_and_context(&index, &support).0, u64::MAX);
 }

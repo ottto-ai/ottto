@@ -13,10 +13,10 @@ keeps its recovery opportunity. No persisted field or upload format is added.
 
 A pending retry outside the discovery window also keeps widening, including one
 that aged out after refusal. This uses committed file/entity incidence and the
-scanner's existing mtime cutoff. Unknown incidence or missing index metadata
-conservatively keeps the broad scan. An older committed mtime may request extra
-discovery until the file is observed again. No ACK or quarantine is settled by
-this window decision.
+scanner's existing mtime cutoff, using current file metadata. Missing metadata,
+non-files and unknown incidence conservatively keep the broad scan. This avoids
+relying on a committed mtime that could be stale after a restore or copy.
+No ACK or quarantine is settled by this window decision.
 
 The enabled path logs only counts: `armed`, `outside_or_unknown`, and
 `ordinary_inside`. Explicit historical and context-curve replays retain their

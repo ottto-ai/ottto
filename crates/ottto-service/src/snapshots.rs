@@ -48529,9 +48529,9 @@ impl ScanIndex {
                 armed += 1;
                 continue;
             }
-            // A retry can age out after its refusal. Reuse the scanner's mtime
-            // cutoff and committed incidence; unknown membership/metadata stays
-            // wide. A stale older mtime can only request extra discovery.
+            // A retry can age out after its refusal. Use the scanner's mtime
+            // cutoff on current metadata: committed mtimes can be stale after
+            // a restore/copy. Unknown incidence or metadata stays wide.
             let mut found = false;
             let outside_window = self
                 .file_snapshot_fingerprints
@@ -48541,9 +48541,14 @@ impl ScanIndex {
                         return false;
                     }
                     found = true;
-                    self.files.get(key).map_or(true, |entry| {
-                        !is_recent_enough_at(entry.modified_unix_seconds, now, window_days)
-                    })
+                    fs::symlink_metadata(key)
+                        .ok()
+                        .filter(|metadata| metadata.is_file())
+                        .and_then(|metadata| metadata.modified().ok())
+                        .and_then(unix_seconds)
+                        .map_or(true, |modified| {
+                            !is_recent_enough_at(modified, now, window_days)
+                        })
                 });
             if outside_window || !found {
                 outside += 1;
