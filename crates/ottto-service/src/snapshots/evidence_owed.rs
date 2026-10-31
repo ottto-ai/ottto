@@ -129,9 +129,38 @@ fn kept_member(
             .is_some_and(|record| record.reproduces(&entry.source_file_fingerprint, window))
 }
 
+/// The indexed members of `root`'s family, by one ordered range from the
+/// selected member's key: `<dir>/<root>.jsonl` and `<dir>/<root>/subagents/..`
+/// share the `<dir>/<root>` prefix. Never a whole-index pass per family.
+fn family<'a>(
+    index: &'a ScanIndex,
+    key: &'a str,
+    root: &'a str,
+) -> impl Iterator<Item = (&'a String, &'a ScanIndexEntry)> + 'a {
+    let prefix = key
+        .strip_suffix(".jsonl")
+        .filter(|stem| stem.ends_with(root) && stem[..stem.len() - root.len()].ends_with('/'))
+        .or_else(|| {
+            let at = key.rfind(&format!("/{root}/subagents/"))?;
+            Some(&key[..at + 1 + root.len()])
+        })
+        .unwrap_or(key);
+    index
+        .files
+        .range::<str, _>((
+            std::ops::Bound::Included(prefix),
+            std::ops::Bound::Unbounded,
+        ))
+        .take_while(move |(other, _)| other.starts_with(prefix))
+        .filter(move |(other, _)| {
+            claude_index_path_member_ref(Path::new(other.as_str()))
+                .is_some_and(|member| member.root == root)
+        })
+}
+
 /// Lead B Q1 cap room: the family's recorded requests fit the pending
 /// occurrence cap after what is already retained; admitted in selection order.
-fn cap_room(index: &ScanIndex, page: &mut Page, root: &str) -> bool {
+fn cap_room(index: &ScanIndex, page: &mut Page, key: &str, root: &str) -> bool {
     let retained = *page.retained.get_or_insert_with(|| {
         index
             .claude_usage_family_pending
@@ -140,14 +169,8 @@ fn cap_room(index: &ScanIndex, page: &mut Page, root: &str) -> bool {
             .map(BTreeMap::len)
             .fold(0_usize, usize::saturating_add)
     });
-    let requests = index
-        .files
-        .keys()
-        .filter(|key| {
-            claude_index_path_member_ref(Path::new(key.as_str()))
-                .is_some_and(|member| member.root == root)
-        })
-        .filter_map(|key| index.claude_request_census.retry_carry_record(key))
+    let requests = family(index, key, root)
+        .filter_map(|(key, _)| index.claude_request_census.retry_carry_record(key))
         .map(|record| record.request_hashes().len())
         .fold(0_usize, usize::saturating_add);
     match claude_pending_occurrence_count_after_replace(retained, 0, requests, page.cap) {
@@ -217,7 +240,7 @@ pub(super) fn resolve(
         Some(root) => match page.families.get(root) {
             Some(arm) => *arm,
             None => {
-                let arm = if cap_room(index, page, root) {
+                let arm = if cap_room(index, page, &key, root) {
                     Arm::Read
                 } else {
                     Arm::KeptOwed
@@ -268,10 +291,9 @@ fn restamp(index: &mut ScanIndex, key: &str, root: &str, member: &str, window: &
         return false;
     }
     if pending.census_window_end != window {
-        let others_owed = index.files.iter().all(|(other, entry)| {
+        let others_owed = family(index, key, root).all(|(other, entry)| {
             other == key
                 || entry.evidence_owed
-                || claude_index_path_member_ref(Path::new(other)).map_or(true, |m| m.root != root)
                 || claude_index_path_family_member(Path::new(other))
                     .is_some_and(|(_, other)| !pending.member_occurrences.contains_key(&other))
         });
