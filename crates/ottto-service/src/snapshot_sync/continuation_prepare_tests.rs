@@ -724,6 +724,6 @@ fn archive_power_policy_uses_the_native_continuation_answers() {
         (PlatformState::Unknown, false),
         (PlatformState::Refused, false),
     ] {
-        assert_eq!(archive_power_ready_with(&mut Signals(state)), expected);
+        assert_eq!(ArchiveGates::new(Signals(state)).power_ready(), expected);
     }
 }

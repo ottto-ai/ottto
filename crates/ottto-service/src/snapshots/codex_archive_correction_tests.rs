@@ -30,7 +30,7 @@ fn user_context(label: &str) -> String {
     )
 }
 fn synthetic_permission(scan: &mut OwnedSourceScan) {
-    scan.index.archive_pass.power = true;
+    archive_power(&mut scan.index.archive_pass, true);
     scan.codex_join_inventory = Some(codex_file_join::HeaderInventory::new(
         &[],
         &BTreeSet::new(),

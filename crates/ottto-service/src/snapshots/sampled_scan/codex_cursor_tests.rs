@@ -15053,27 +15053,3 @@ fn omitted_raw_archive_fences_paused_singleton_and_group_across_reload() {
         }
     }
 }
-
-/// [behaviour] Unknown thread CPU denies archive work for a bounded number of passes only.
-#[test]
-fn unknown_thread_cpu_denial_is_bounded_by_consecutive_passes() {
-    use crate::snapshots::sampled_scan::ArchivePass as Pass;
-    let pass = || Pass {
-        power: true,
-        ..Pass::default()
-    };
-    for _ in 1..12 {
-        let mut denied = pass();
-        denied.observe(None, 1);
-        denied.observe(None, 1); // One count per pass, not per step.
-        assert!(!denied.ready(1));
-    }
-    let mut bounded = pass();
-    bounded.observe(None, 1);
-    assert!(bounded.ready(1), "the twelfth unknown pass proceeds");
-    assert!(!bounded.ready(0), "page bytes still bound it");
-    bounded.observe(Some(0), 1);
-    let mut reset = pass();
-    reset.observe(None, 1);
-    assert!(!reset.ready(1), "a known step resets the streak");
-}

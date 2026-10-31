@@ -1606,6 +1606,18 @@ fn production_finish_closure_mints_a_paused_accelerated_page_with_evidence() {
             Some((world.now.get(), world.now.get() + LIFETIME)),
         )
         .unwrap();
+        // Power allowed, so only the spent CPU credit can deny the ticket.
+        struct Allowed;
+        impl PlatformGates for Allowed {
+            fn power(&mut self) -> PlatformState {
+                PlatformState::Allowed
+            }
+            fn enter_background_qos(&mut self) -> PlatformState {
+                PlatformState::Allowed
+            }
+            fn restore_qos(&mut self) {}
+        }
+        index.archive_pass.gates = crate::snapshot_sync::ArchiveGates::new(Allowed);
         index.archive_pass.power = true;
         index.archive_pass.started = true;
         index.archive_pass.observe(Some(30_000_001), 1);
