@@ -122,7 +122,14 @@ impl Memo {
         self.with_state(|state| {
             if let Some(mut entry) = state.entries.remove(&memo_key(from)) {
                 entry.absence = None;
-                state.entries.insert(memo_key(to), entry);
+                if let Some(current) = state.entries.get_mut(&memo_key(to)) {
+                    current.first_seen = current.first_seen.min(entry.first_seen);
+                    current.tokens = current.tokens.or(entry.tokens);
+                    current.seen = current.seen.take().or(entry.seen);
+                    current.absence = None;
+                } else {
+                    state.entries.insert(memo_key(to), entry);
+                }
             }
         });
     }

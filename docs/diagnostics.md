@@ -747,11 +747,17 @@ Before the age gate, bounded discovery reuses the birth/move owner's recorded
 physical generation (device/inode, birth and append-compatible extent) to move
 its hold, indexed audit debt, incidence and advisory memo to the discovered path.
 The already owned committed baseline follows that generation before held-result
-restoration; a rename grants no upload, ACK, census or absence credit. No extra
+restoration; a rename grants no upload, ACK, census or absence credit. An already
+indexed destination keeps its current checkpoint and exact incidence; the existing
+carried-ACK owner preserves prior incidence, and transferred debt resolves only
+through the normal classifier. Discovery and absence checks use bounded member
+lookups derived once per tick/page, with at most two observed paths per held
+member sufficient to detect another path. These lookups are temporary, not move
+authority or another registry. No extra
 walk, stat or transcript read proves the move: it uses the metadata the bounded
 walk already has. If the generation is unknown, replaced or ambiguous, custody
 stays at the old path. The existing observed-key view records the same-member
-presence even when age would skip it; F4 waits while bounded discovery is pending
+presence even when age would skip it; F4 waits while bounded discovery is pending or its directory-entry cap refused coverage
 or that uncertain destination remains observed. Losing proof delays resolution
 and never deletes the old debt. Hold caps and ordinary size gates remain.
 

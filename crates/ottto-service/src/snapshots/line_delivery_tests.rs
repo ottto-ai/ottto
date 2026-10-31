@@ -2160,6 +2160,44 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
             assert_eq!(scan.index.file_snapshot_fingerprints[&new_key], incidence);
             assert!(!scan.index.files.contains_key(&old_key));
             let (mut resolved, result, _) = finish(scan);
+            // Recovery control: B was already parsed/bound before the next walk
+            // could transfer A. Reuse those real results, not another fixture.
+            let mut raced = held.clone();
+            raced
+                .files
+                .insert(new_key.clone(), resolved.files[&new_key].clone());
+            raced.file_snapshot_fingerprints.insert(
+                new_key.clone(),
+                resolved.file_snapshot_fingerprints[&new_key].clone(),
+            );
+            raced.accepted_snapshot_fingerprints = resolved.accepted_snapshot_fingerprints.clone();
+            let opened = claude_context_file_birth::ClaudeOpenedBirth::from_metadata(
+                &fs::metadata(&moved).unwrap(),
+            );
+            raced.claude_money_birth_store.record_opened(
+                SESSION,
+                &new_key,
+                i128::from(opened.birth),
+                opened,
+            );
+            let recovery = make(raced, &at, 1_000);
+            assert!(!recovery
+                .index
+                .claude_account_deferred_holds
+                .contains_key(&old_key));
+            assert!(recovery
+                .index
+                .claude_account_deferred_holds
+                .contains_key(&new_key));
+            assert_eq!(
+                recovery.index.files[&new_key].last_upload_body_witness,
+                resolved.files[&new_key].last_upload_body_witness
+            );
+            assert_eq!(
+                recovery.index.file_snapshot_fingerprints[&new_key],
+                resolved.file_snapshot_fingerprints[&new_key]
+            );
+            assert!(incidence.is_subset(&recovery.index.accepted_rebuild_incidence[&new_key]));
             // Both native held restoration and partial-commit selection use the
             // moved baseline; neither may resurrect the old pathname or commit growth.
             let withheld = crate::snapshot_sync::withheld_support::settle_withheld(

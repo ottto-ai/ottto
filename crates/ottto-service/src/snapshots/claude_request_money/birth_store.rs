@@ -440,11 +440,9 @@ impl BirthStore {
         }
     }
 
-    /// Rehome custody using metadata already paid for by bounded discovery.
-    /// Reuse the physical generation: same birth/object, append-compatible size.
-    /// This is neither absence nor acceptance; an unknown/replaced object refuses.
-    pub(in crate::snapshots) fn record_discovered_move(
-        &mut self,
+    /// Metadata-only validation, before any custody or generation is retired.
+    pub(in crate::snapshots) fn can_record_discovered_move(
+        &self,
         session: &str,
         from: &str,
         to: &str,
@@ -457,17 +455,31 @@ impl BirthStore {
         let Some(old) = s.4.iter().find(|o| o.0 == source) else {
             return false;
         };
-        if s.1 != source
-            || old.1 == 0
-            || old.1 != opened.birth
-            || !old.3.covers(opened)
-            || old.2 >= MAX_GENERATION
-            || s.4.iter().any(|o| o.0 == location_key(to))
-        {
-            return false;
-        }
+        s.1 == source
+            && old.1 != 0
+            && old.1 == opened.birth
+            && old.3.covers(opened)
+            && old.2 < MAX_GENERATION
+            && s.4
+                .iter()
+                .find(|o| o.0 == location_key(to))
+                .map_or(true, |o| o.1 == opened.birth && o.3.covers(opened))
+    }
+
+    /// The caller already moved custody after can_record_discovered_move, with
+    /// exclusive ownership. Existing indexed destinations may retain the same generation.
+    pub(in crate::snapshots) fn record_discovered_move(
+        &mut self,
+        session: &str,
+        from: &str,
+        to: &str,
+        opened: ClaudeOpenedBirth,
+    ) {
         self.record_opened(session, to, i128::from(opened.birth), opened);
-        self.record_proven_move(session, source, to)
+        assert!(
+            self.record_proven_move(session, location_key(from), to),
+            "validated custody move"
+        );
     }
 
     /// Existing generation tombstones identify a custody handoff across settlement.

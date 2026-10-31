@@ -31755,6 +31755,7 @@ impl OwnedSourceScan {
                     .as_ref()
                     .zip(codex_side_pass.as_ref())
                     .map(|(context, pass)| (&*context.cache, pass.ns));
+                let account_members = index.observed_account_members();
                 for index_key in census
                     .removed_index_keys
                     .iter()
@@ -31763,7 +31764,7 @@ impl OwnedSourceScan {
                     if source == SnapshotSource::ClaudeCode
                         && index.claude_account_deferred_holds.contains_key(index_key)
                     {
-                        index.retire_absent_account_hold(index_key);
+                        index.retire_absent_account_hold(index_key, &account_members);
                         if !index.files.contains_key(index_key) {
                             index.drop_codex_proof_items(index_key, codex_side_drop);
                         }
@@ -43779,6 +43780,7 @@ fn advance_bounded_directory_traversal_with_budget(
     // silently age boundary files out while still publishing the earlier
     // `census_window_end` as its agreement scope.
     let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
+    let move_sources = index.held_move_sources();
     let mut pending = traversal.pending_candidates.iter().enumerate().fold(
         BTreeMap::new(),
         |mut pending, (i, p)| {
@@ -43914,7 +43916,12 @@ fn advance_bounded_directory_traversal_with_budget(
                 }
             };
             if source == SnapshotSource::ClaudeCode {
-                index.rehome_discovered_account_hold(&mut traversal, &path, &metadata);
+                index.rehome_discovered_account_hold(
+                    &mut traversal,
+                    &move_sources,
+                    &path,
+                    &metadata,
+                );
             }
             let retention = DiscoveryRetention {
                 growth,
@@ -44216,6 +44223,7 @@ fn reconcile_missing_index_entries_with_side(
     if page.is_empty() {
         return true;
     }
+    let account_members = index.observed_account_members();
     for key in &page {
         let observed = index
             .traversal
@@ -44225,7 +44233,7 @@ fn reconcile_missing_index_entries_with_side(
         // probes. Missing roots or unsafe ancestors keep the hold; a missing
         // intermediate component beneath the validated root proves absence.
         if !observed && index.claude_account_deferred_holds.contains_key(key) {
-            index.retire_absent_account_hold(key);
+            index.retire_absent_account_hold(key, &account_members);
             if !index.files.contains_key(key) {
                 index.drop_codex_proof_items(key, codex_side_drop);
             }
@@ -49882,85 +49890,152 @@ impl ScanIndex {
         self.claude_account_deferred_holds.len()
     }
 
+    /// Derived, bounded lookup only: the BirthStore remains the move authority.
+    /// Parse each held member once per discovery tick, not once per discovered file.
+    fn held_move_sources(&self) -> BTreeMap<String, Option<String>> {
+        let mut members = BTreeMap::new();
+        for old in self
+            .claude_account_deferred_holds
+            .keys()
+            .take(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
+        {
+            let Some((_, member)) = claude_index_path_family_member(Path::new(old)) else {
+                continue;
+            };
+            let owner = self.claude_money_birth_store.live_location(&member);
+            let slot = members.entry(member).or_insert(None);
+            if owner == Some(claude_money_birth_store::location_key(old)) {
+                *slot = Some(old.clone());
+            }
+        }
+        members
+    }
+
+    /// At most two observed paths per held member suffice to answer "another
+    /// path?" for every key. This is transient derived scratch, never move proof.
+    fn observed_account_members(&self) -> BTreeMap<String, Vec<String>> {
+        let held = self.held_move_sources();
+        let mut members: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if !held.is_empty() {
+            for key in self
+                .traversal
+                .iter()
+                .flat_map(|walk| &walk.observed_index_keys)
+            {
+                let Some((_, member)) = claude_index_path_family_member(Path::new(key)) else {
+                    continue;
+                };
+                if held.contains_key(&member) {
+                    let paths = members.entry(member).or_default();
+                    if paths.len() < 2 {
+                        paths.push(key.clone());
+                    }
+                }
+            }
+        }
+        members
+    }
+
     /// Correctness custody follows a proven physical generation before the age gate.
-    /// The existing observed-key view keeps ambiguous same-member paths visible to F4.
     fn rehome_discovered_account_hold(
         &mut self,
         walk: &mut ScanTraversalCheckpoint,
+        sources: &BTreeMap<String, Option<String>>,
         path: &Path,
         metadata: &fs::Metadata,
     ) {
-        if self.claude_account_deferred_holds.is_empty() {
-            return;
-        }
-        let key = local_index_key(path);
-        if self.claude_account_deferred_holds.contains_key(&key) {
+        if sources.is_empty() {
             return;
         }
         let Some((_, member)) = claude_index_path_family_member(path) else {
             return;
         };
-        let from = self
-            .claude_account_deferred_holds
-            .keys()
-            .take(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
-            .filter(|old| {
-                claude_index_path_family_member(Path::new(old))
-                    .is_some_and(|(_, prior)| prior == member)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for old in from {
-            // Presence is not transfer authority. Record it even when proof/age refuses.
-            walk.observed_index_keys.insert(key.clone());
-            self.withheld_memo.reset_absence(&old);
-            if walk.observed_index_keys.contains(&old)
-                || self.files.contains_key(&key)
-                || self.file_snapshot_fingerprints.contains_key(&key)
-                || self.decode_holds_file(&old)
-                || self.decode_holds_file(&key)
-                || !self.claude_money_birth_store.record_discovered_move(
-                    &member,
-                    &old,
-                    &key,
-                    claude_context_file_birth::ClaudeOpenedBirth::from_metadata(metadata),
-                )
-            {
-                continue;
-            }
-            self.rekey_account_custody(&old, &key);
-            walk.observed_index_keys.remove(&old);
-            break;
+        let Some(old) = sources.get(&member) else {
+            return;
+        };
+        let key = local_index_key(path);
+        // Ambiguous same-member presence survives even the age refusal.
+        walk.observed_index_keys.insert(key.clone());
+        let Some(old) = old
+            .as_ref()
+            .filter(|old| *old != &key && self.claude_account_deferred_holds.contains_key(*old))
+        else {
+            return;
+        };
+        self.withheld_memo.reset_absence(old);
+        let opened = claude_context_file_birth::ClaudeOpenedBirth::from_metadata(metadata);
+        if walk.observed_index_keys.contains(old)
+            || self.decode_holds_file(old)
+            || self.decode_holds_file(&key)
+            || !self
+                .claude_money_birth_store
+                .can_record_discovered_move(&member, old, &key, opened)
+        {
+            return;
         }
+        let needs_classification =
+            self.files.contains_key(&key) && !self.claude_account_deferred_holds.contains_key(&key);
+        self.rekey_account_custody(old, &key);
+        // Custody is at the destination BEFORE the owner retires the source generation.
+        self.claude_money_birth_store
+            .record_discovered_move(&member, old, &key, opened);
+        if needs_classification {
+            // An already-bound destination needs one real classification of the
+            // transferred debt; discovery itself cannot resolve it from an ACK.
+            self.forget_withheld_content(&key);
+        }
+        self.withheld_memo
+            .retain_held(&self.claude_account_deferred_holds);
+        walk.observed_index_keys.remove(old);
     }
 
     /// Move, never settle, existing custody. No transcript read or release/ACK credit.
     fn rekey_account_custody(&mut self, from: &str, to: &str) {
+        let indexed = self.files.contains_key(to);
         if let Some(entry) = self.files.remove(from) {
-            self.files.insert(to.to_owned(), entry);
+            if let Some(current) = self.files.get_mut(to) {
+                current.carry_sampled_audit(&entry);
+            } else {
+                self.files.insert(to.to_owned(), entry);
+            }
         }
         if let Some(incidence) = self.file_snapshot_fingerprints.remove(from) {
-            self.file_snapshot_fingerprints
-                .insert(to.to_owned(), incidence);
+            if indexed {
+                // The current exact set stays exact. The existing carried-ACK
+                // owner keeps prior custody without minting acceptance credit.
+                self.accepted_rebuild_incidence
+                    .entry(to.to_owned())
+                    .or_default()
+                    .extend(incidence);
+                self.accepted_incidence_pending_census = true;
+            } else {
+                self.file_snapshot_fingerprints
+                    .insert(to.to_owned(), incidence);
+            }
         }
         if let Some(incidence) = self.accepted_rebuild_incidence.remove(from) {
             self.accepted_rebuild_incidence
-                .insert(to.to_owned(), incidence);
+                .entry(to.to_owned())
+                .or_default()
+                .extend(incidence);
         }
         if let Some(disposition) = self.terminal_jsonl_dispositions.remove(from) {
             self.terminal_jsonl_dispositions
-                .insert(to.to_owned(), disposition);
+                .entry(to.to_owned())
+                .or_insert(disposition);
         }
-        if self.confirmed_empty_files.remove(from) {
+        if self.confirmed_empty_files.remove(from) && !indexed {
             self.confirmed_empty_files.insert(to.to_owned());
         }
         if let Some(record) = self.claude_request_census.take(from) {
-            self.claude_request_census.insert(to.to_owned(), record);
+            if self.claude_request_census.get(to).is_none() {
+                self.claude_request_census.insert(to.to_owned(), record);
+            }
         }
-        // The value stays owned while rekeying; admission population never grows.
         if let Some(hold) = self.claude_account_deferred_holds.remove(from) {
             self.claude_account_deferred_holds
-                .insert(to.to_owned(), hold);
+                .entry(to.to_owned())
+                .or_insert(hold);
         }
         if let Some(slot) = self
             .held_audit_progress
@@ -49975,6 +50050,11 @@ impl ScanIndex {
     /// Align the already owned committed baseline before held/partial restoration.
     /// The one move owner's generation tombstone is the authority, not a new map.
     pub(crate) fn rehome_withheld_baseline(&mut self, working: &ScanIndex) {
+        let destinations = working
+            .claude_account_deferred_holds
+            .keys()
+            .map(|key| (claude_money_birth_store::location_key(key), key))
+            .collect::<BTreeMap<_, _>>();
         let moves = self
             .claude_account_deferred_holds
             .keys()
@@ -49982,14 +50062,9 @@ impl ScanIndex {
             .filter_map(|old| {
                 let (_, member) = claude_index_path_family_member(Path::new(old))?;
                 let to = working.claude_money_birth_store.moved_to(&member, old)?;
-                let new = working
-                    .claude_account_deferred_holds
-                    .keys()
-                    .find(|key| claude_money_birth_store::location_key(key) == to)?;
-                (!working.claude_account_deferred_holds.contains_key(old)
-                    && !self.files.contains_key(new)
-                    && !self.claude_account_deferred_holds.contains_key(new))
-                .then(|| (old.clone(), new.clone()))
+                let new = *destinations.get(&to)?;
+                (!working.claude_account_deferred_holds.contains_key(old))
+                    .then(|| (old.clone(), new.clone()))
             })
             .collect::<Vec<_>>();
         for (old, new) in moves {
@@ -50006,8 +50081,9 @@ impl ScanIndex {
             .take(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
             .cloned()
             .collect::<Vec<_>>();
+        let account_members = self.observed_account_members();
         for key in held {
-            self.retire_absent_account_hold(&key);
+            self.retire_absent_account_hold(&key, &account_members);
         }
     }
 
@@ -51080,18 +51156,21 @@ impl ScanIndex {
 
     /// Retire only obligations made unfulfillable by positively proven absence.
     /// Codex protection retains the entry and its own lineage/receipt state.
-    fn retire_absent_account_hold(&mut self, key: &str) -> bool {
+    fn retire_absent_account_hold(
+        &mut self,
+        key: &str,
+        members: &BTreeMap<String, Vec<String>>,
+    ) -> bool {
         if !self.claude_account_deferred_holds.contains_key(key) {
             return false;
         }
         if self.traversal.as_ref().is_some_and(|walk| {
             !walk.pending_directories.is_empty()
+                || walk.counts.directory_entry_cap_exceeded_count != 0
                 || claude_index_path_family_member(Path::new(key)).is_some_and(|(_, member)| {
-                    walk.observed_index_keys.iter().any(|other| {
-                        other != key
-                            && claude_index_path_family_member(Path::new(other))
-                                .is_some_and(|(_, found)| found == member)
-                    })
+                    members
+                        .get(&member)
+                        .is_some_and(|paths| paths.iter().any(|other| other != key))
                 })
         }) {
             self.withheld_memo.reset_absence(key);
