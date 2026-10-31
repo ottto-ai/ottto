@@ -641,6 +641,30 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
             last_answer_unix: 0,
         },
     );
+    let reserved = identity_cache_wire_reserve(&item, &progress);
+    let mut projected = item.clone();
+    prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false, &BTreeSet::new());
+    attach_head_conflict_answers(std::slice::from_mut(&mut projected), &progress, u64::MAX);
+    assert!(projected.cache_conflict_answer.is_some());
+    assert_eq!(
+        crate::snapshots::claude_request_identity::item_bytes(&item) + reserved,
+        crate::snapshots::claude_request_identity::item_bytes(&projected),
+        "preflight reserves the complete challenge framing"
+    );
+    let mut no_answer = projected.clone();
+    no_answer.cache_conflict_answer = None;
+    assert!(
+        crate::snapshots::claude_request_identity::item_bytes(&projected)
+            > crate::snapshots::claude_request_identity::item_bytes(&no_answer)
+    );
+    let record = progress.head_conflict_challenges.get_mut(&key).unwrap();
+    record.answer_attempts = 1;
+    record.last_answer_unix = current_unix_seconds();
+    assert_eq!(
+        identity_cache_wire_reserve(&item, &progress),
+        reserved,
+        "pacing-boundary crossing cannot evade admission reserve"
+    );
     let mut withheld = vec![item.clone()];
     withheld[0].cache_base_head_etag = Some("2".repeat(64));
     withheld[0].cache_observations = None;
@@ -657,6 +681,11 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
         0
     );
     assert!(no_base[0].cache_conflict_answer.is_none());
+    progress
+        .head_conflict_challenges
+        .get_mut(&key)
+        .unwrap()
+        .answer_attempts = 0;
     let saved = progress.head_conflict_challenges.clone();
     let (foreign, _) = cycle(&mut progress, &item, 1_000, |item| {
         let mut response = conflict(item, &challenge(0xe));

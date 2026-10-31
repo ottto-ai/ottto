@@ -1322,6 +1322,9 @@ fn identity_cache_wire_reserve(
     }
     let mut projected = snapshot.clone();
     prepare_snapshot_cache_for_upload(&mut projected, progress, true, false, &BTreeSet::new());
+    // An owed answer can become eligible between admission and upload. Reserve
+    // its framing even while paced, using the real attachment/size paths.
+    attach_head_conflict_answers(std::slice::from_mut(&mut projected), progress, u64::MAX);
     crate::snapshots::claude_request_identity::item_bytes(&projected).saturating_sub(
         crate::snapshots::claude_request_identity::item_bytes(snapshot),
     )
