@@ -376,7 +376,7 @@ fn lock_owner(path: &Path) -> Result<File> {
     private_file(&path)?;
     // A flock belongs to the open file description, which a concurrent fork
     // shares until the child execs. A just-released owner can therefore look
-    // busy for a moment; wait up to BUSY before reporting it.
+    // busy for a moment; keep retrying for about BUSY before reporting it.
     let started = Instant::now();
     while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         ensure!(

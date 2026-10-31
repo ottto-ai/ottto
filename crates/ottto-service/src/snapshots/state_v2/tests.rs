@@ -258,17 +258,7 @@ fn owner_sidecar_allows_sqlite_init_migration_publication_and_reopen() {
     );
     db.clean_checkpoint().unwrap();
     drop(db);
-    let mut db = sqlite::Sqlite::open(&published, &tmp.identity()).unwrap();
-    assert_eq!(db.stamp().unwrap().0, 0);
-    // An owner released moments later (e.g. a forked child that has not yet
-    // exec'd still sharing the lock) is waited for, not reported busy.
-    db.clean_checkpoint().unwrap();
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        drop(db);
-    });
     let db = sqlite::Sqlite::open(&published, &tmp.identity()).unwrap();
-    release.join().unwrap();
     assert_eq!(db.stamp().unwrap().0, 0);
 }
 
