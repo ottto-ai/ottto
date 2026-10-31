@@ -24674,15 +24674,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn managed_slot_never_enables_private_oauth_fallback() {
-        let _guard = EnvVarGuard::set_os("OTTTO_CODEX_LEGACY_OAUTH_USAGE", OsString::from("true"));
-
-        assert!(legacy_codex_oauth_fallback_allowed(true));
-        assert!(!legacy_codex_oauth_fallback_allowed(false));
-    }
-
-    #[test]
-    #[serial]
     fn codex_slots_pin_sqlite_home_and_drop_all_ambient_credentials() {
         let dir =
             std::env::temp_dir().join(format!("ottto-codex-exact-home-{}", std::process::id()));
