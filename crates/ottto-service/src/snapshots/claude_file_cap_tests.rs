@@ -1,6 +1,4 @@
-// Synthetic real-scan admission and native parse/finalize memory receipts.
-// The memory case runs alone in a fresh process; fixture generation happens
-// in the parent. Measurements report observations, never establish a budget.
+// Synthetic real-scan admission guards.
 use super::*;
 
 const MIB: u64 = 1024 * 1024;
@@ -200,4 +198,3 @@ fn three_hundred_mib_admission_is_claude_only() {
     assert!(!scan.census_complete);
     assert!(index.files.is_empty());
 }
-

@@ -203,7 +203,6 @@ pub(crate) struct GrantsBuild {
 }
 
 impl GrantsBuild {
-    /// Test-only: adapters take the diagnostics from [`GrantsBuild::apply_to`].
     /// Write the grant section into `balance` and recompute its summaries.
     pub(crate) fn apply_to(self, balance: &mut AgentCreditBalance) -> Vec<CreditModelDiagnostic> {
         balance.grants = self.grants;
