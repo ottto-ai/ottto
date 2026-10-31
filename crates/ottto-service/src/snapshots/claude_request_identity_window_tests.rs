@@ -2623,7 +2623,11 @@ fn advertised_cap_retags_previously_stripped_accepted_body() {
                 bucket_start: bucket.bucket_start.clone(),
                 row_key: row_key_from_model_usage(row),
                 usage: holder_usage(row, None),
-                identity: login_key(A64),
+                identity: RequestIdentity::Tagged(AuthorityKey {
+                    login: None,
+                    org: Some(A64.into()),
+                    basis: identity::TRANSCRIPT_ORG,
+                }),
             });
         }
     }
