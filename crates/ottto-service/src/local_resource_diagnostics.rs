@@ -1007,6 +1007,11 @@ pub(crate) fn claude_census_retire_kept_overlap(counts: CensusRetireKeptOverlapC
         );
     }
 }
+/// Process total of new keys refused at the live census record bound
+/// (`census_record_limit_refused_total`).
+pub(crate) fn census_record_limit_refused_total() -> u64 {
+    CENSUS_RETIRE_KEPT_OVERLAP_TOTAL[5].load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Local alarm: the one-time Claude history re-read latched its stop until
 /// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
 /// hourly as a reminder. Counts and hashed root refs only; no wire event.
