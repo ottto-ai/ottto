@@ -349,8 +349,16 @@ fn accepted_plain_superset_settles_archive_dominated_without_upload() {
             "subset cannot replace or add usage"
         );
         let mut held = scan_money(SnapshotSource::Codex, &index, &result);
-        held.accepted
-            .insert("compressed-fixture".into(), accepted_body.clone());
+        held.accepted.insert(
+            "compressed-fixture".into(),
+            Accepted {
+                body: accepted_body.body.clone(),
+                witness: index.files[&plain_key]
+                    .last_upload_body_witness
+                    .clone()
+                    .unwrap(),
+            },
+        );
         money_oracle::assert_held("compressed-fixture", &prior, &held, &prior);
         money_oracle::assert_no_smaller_reemit("compressed-fixture", &prior, &held, &prior, true);
         let archive = index.files[&key].archive.as_ref().unwrap();
@@ -395,10 +403,24 @@ fn accepted_plain_superset_settles_archive_dominated_without_upload() {
             ))
         });
         assert!(quiet.snapshots.is_empty());
+        assert_eq!(
+            saved.files[&plain_key].last_snapshot_fingerprint,
+            prior_head
+        );
+        assert_eq!(saved.files[&plain_key].last_upload_body_witness, prior_body);
         let mut quiet_route = scan_money(SnapshotSource::Codex, &saved, &quiet);
-        quiet_route
-            .accepted
-            .insert("compressed-fixture".into(), accepted_body);
+        // The index stores the exact accepted witness; the historical body
+        // comes from the accepted emission, never from a new held emission.
+        quiet_route.accepted.insert(
+            "compressed-fixture".into(),
+            Accepted {
+                body: accepted_body.body,
+                witness: saved.files[&plain_key]
+                    .last_upload_body_witness
+                    .clone()
+                    .unwrap(),
+            },
+        );
         money_oracle::assert_held("compressed-fixture", &prior, &quiet_route, &prior);
         assert_eq!(decoded_archive_bytes(&rows), 0);
         assert!(saved.accepted_snapshot_fingerprints.contains(&ack));
