@@ -480,7 +480,7 @@ fn e2_carry_pages(
     // These are ordinary session requests, not a newly copied August
     // prefix. Keep the production copy-prefix seed refusal enabled.
     claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
-    let (dir, root, _) = claude_account_family_fixture();
+    let (dir, root, _) = claude_account_family_fixture(false);
     let support = dir.join("support");
     if marker {
         let path = dir.join(format!("{root}.jsonl"));
