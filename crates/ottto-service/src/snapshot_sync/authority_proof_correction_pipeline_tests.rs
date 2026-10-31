@@ -4268,9 +4268,10 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
 /// revision. It stays owed with its pre-drain pair beside the held root, and
 /// drains again once the retry re-reads it.
 /// At the production E2 gate (ON), on an owed pre-flip correction
-/// (`ApcFixture::pre_flip_grant`). Fails without 2015e841f: the restore runs
-/// before the release and carries agent b's drain, so
-/// `apc_f1_released_members_stay_owed` panics "stays owed".
+/// (`ApcFixture::pre_flip_grant`). Not a discriminator of 2015e841f on its
+/// own: if selection kept agent b's committed re-arm marker, either order
+/// re-owes it, and the page exposes no pre-release entry to tell. The last
+/// owed and permanent refusal F1 tests are the discriminators.
 #[test]
 #[serial(source_manifests)]
 fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_one() {
