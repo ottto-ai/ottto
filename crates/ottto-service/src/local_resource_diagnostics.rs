@@ -238,9 +238,13 @@ pub(crate) enum UnselectedReason {
     WithheldOversized,
     /// F4 kept custody because another same-member path prevents absence proof.
     WithheldAbsenceAmbiguous = 18,
+    /// ON strict API/trace pair deferred for the shared byte allowance.
+    StrictBudgetDeferred = 19,
+    /// ON page pair or first rotating off-page pair gets a protected read.
+    StrictBudgetProtected,
 }
 /// Three reasons, seven withheld events, growth, deleted tokens and audit retirement.
-const UNSELECTED_REASONS: usize = 19;
+const UNSELECTED_REASONS: usize = 21;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -267,6 +271,15 @@ fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) 
 /// One skip decision, recorded after the gate decided; never a gate input.
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
     source_count(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+}
+/// Drain only the ON budget slots on the existing strict-cohort line. No
+/// diagnostic payload or heap-measured report gains a field.
+pub(crate) fn take_strict_budget_counts() -> (u64, u64) {
+    let take = |reason| source_count("claude_code", reason, |slot| slot.swap(0, Relaxed));
+    (
+        take(UnselectedReason::StrictBudgetDeferred as usize),
+        take(UnselectedReason::StrictBudgetProtected as usize),
+    )
 }
 /// One failed parking decision; no logging, resource probes or scan ownership.
 pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bool) {

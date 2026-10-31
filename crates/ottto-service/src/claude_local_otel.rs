@@ -38,7 +38,7 @@ mod trace_read_bound_tests;
 
 pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
-const MAX_EVIDENCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_EVIDENCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 // Keep the usage-ledger revision: request_identity is additive local evidence,
 // and does not change the existing request ownership/counter contract.
@@ -1134,6 +1134,10 @@ fn decode_api_sidecar(
         anyhow::bail!("Claude effort evidence is not a regular file");
     }
     if metadata.len() >= cap() {
+        // ON: under the per-file cap, only the pass allowance ran out.
+        if terminal_off && metadata.len() < MAX_EVIDENCE_FILE_BYTES {
+            strict_budget::defer(session_id);
+        }
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1165,6 +1169,9 @@ fn decode_api_sidecar(
         anyhow::bail!("opened Claude effort evidence is not a regular file");
     }
     if opened.len() >= cap() {
+        if terminal_off && opened.len() < MAX_EVIDENCE_FILE_BYTES {
+            strict_budget::defer(session_id);
+        }
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1319,6 +1326,10 @@ pub fn load_claude_trace_ownership_evidence(
             continue;
         }
         if metadata.len() >= strict_budget::allowance() {
+            // ON: under the per-file cap, only the pass allowance ran out.
+            if crate::snapshots::claude_terminal_off() && metadata.len() < MAX_EVIDENCE_FILE_BYTES {
+                strict_budget::defer(&session_id);
+            }
             report.oversized_files += 1;
             continue;
         }
@@ -1341,6 +1352,12 @@ pub fn load_claude_trace_ownership_evidence(
             continue;
         };
         if !opened.is_file() || opened.len() >= strict_budget::allowance() {
+            if crate::snapshots::claude_terminal_off()
+                && opened.is_file()
+                && opened.len() < MAX_EVIDENCE_FILE_BYTES
+            {
+                strict_budget::defer(&session_id);
+            }
             report.oversized_files += 1;
             continue;
         }

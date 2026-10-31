@@ -9645,10 +9645,14 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     stats.paired_sidecar_root_count = usage_roots.len();
     // Account the actual all-pending strict cohort before its first I/O.
     // Page-local roots have priority; off-page roots rotate across passes.
-    let strict_plan = if crate::snapshots::claude_terminal_off() {
-        let page_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
+    let page_roots = if crate::snapshots::claude_terminal_off() {
+        claude_evidence_root_session_ids(&scan_result.snapshots)
             .into_iter()
-            .collect::<BTreeSet<_>>();
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let strict_plan = if crate::snapshots::claude_terminal_off() {
         strict_cohort::plan(
             support_dir,
             usage_roots,
@@ -9660,6 +9664,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             roots: usage_roots,
             deferred: BTreeSet::new(),
             deferred_bytes: 0,
+            allowance: strict_cohort::BYTES_PER_PASS,
         }
     };
     let mut deferred_roots = strict_plan.deferred.len();
@@ -9668,12 +9673,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         full_rearm_evidence_complete = false;
         identity_unhealthy_roots.extend(strict_plan.deferred.iter().cloned());
     }
+    let allowance = strict_plan.allowance;
     let usage_roots = strict_plan.roots;
-    let strict_budget = crate::snapshots::claude_terminal_off().then(|| {
-        crate::claude_local_otel::strict_budget::StrictReadBudget::new(
-            strict_cohort::BYTES_PER_PASS,
-        )
-    });
+    let mut strict_bytes = 0u64;
+    let mut offpage_bytes = 0u64;
+    let mut last_offpage: Option<String> = None;
+    let mut retry_set = false;
 
     // Effort has already updated pending-family state. Release all non-paired
     // rows before moving the selected roots into the usage aggregate.
@@ -9705,6 +9710,19 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     let mut strict_healthy_roots = BTreeSet::new();
     let mut trace_discarded_roots = BTreeSet::new();
     for root_session_id in usage_roots {
+        let page_pair = page_roots.contains(&root_session_id);
+        let strict_budget = if crate::snapshots::claude_terminal_off() {
+            Some(
+                crate::claude_local_otel::strict_budget::StrictReadBudget::new(
+                    strict_cohort::read_allowance(
+                        page_pair || last_offpage.is_none(),
+                        offpage_bytes,
+                    ),
+                ),
+            )
+        } else {
+            None
+        };
         let mut api = api_read.take_strict_report(support_dir, &root_session_id);
         let mut trace = match prepared.as_mut() {
             Some(read) => read.take_trace(support_dir, &root_session_id),
@@ -9720,7 +9738,36 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_incomplete_root_count += 1;
         }
         stats.trace_rows_discarded.add(&trace.rows_discarded);
-        if !trace.rows_discarded.is_empty() {
+        // Both budget shortfalls and #932 discards hold the accepted revision.
+        // Stop cursor advancement before the first budget-deferred off-page
+        // root: it gets the protected reservation first on the next pass.
+        if crate::snapshots::claude_terminal_off() {
+            let bytes = strict_budget.as_ref().map_or(0, |budget| budget.consumed());
+            strict_bytes = strict_bytes.saturating_add(bytes);
+            if !page_pair {
+                offpage_bytes = offpage_bytes.saturating_add(bytes);
+                if !retry_set
+                    && strict_budget
+                        .as_ref()
+                        .is_some_and(|b| b.deferred(&root_session_id))
+                {
+                    if let Some(predecessor) = last_offpage.as_deref() {
+                        strict_cohort::retry_after(
+                            support_dir,
+                            &index.claude_strict_service_scope(),
+                            predecessor,
+                        );
+                        retry_set = true;
+                    }
+                }
+                last_offpage = Some(root_session_id.clone());
+            }
+        }
+        if !trace.rows_discarded.is_empty()
+            || strict_budget
+                .as_ref()
+                .is_some_and(|budget| budget.deferred(&root_session_id))
+        {
             trace_discarded_roots.insert(root_session_id.clone());
         }
         if !api.health.is_complete() || !trace.is_complete() {
@@ -9774,10 +9821,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             trace_report.evidence.insert(root_session_id, rows);
         }
     }
-    let strict_bytes = strict_budget.as_ref().map_or(0, |b| b.consumed());
-    drop(strict_budget);
     if crate::snapshots::claude_terminal_off() {
-        eprintln!("strict_cohort_deferred roots={deferred_roots} bytes={} consumed_bytes={strict_bytes} allowance_bytes={} custody=UNPROVEN", deferred_bytes, strict_cohort::BYTES_PER_PASS);
+        let (budget_deferred_roots, budget_protected_pairs) =
+            crate::local_resource_diagnostics::take_strict_budget_counts();
+        eprintln!("strict_cohort_deferred roots={deferred_roots} bytes={} consumed_bytes={strict_bytes} allowance_bytes={allowance} budget_deferred_roots={budget_deferred_roots} budget_protected_pairs={budget_protected_pairs} custody=UNPROVEN", deferred_bytes);
     }
     // Keep global negative-dependency debt separate from per-root health:
     // page-local healthy accounting must not become an unrelated read error.
