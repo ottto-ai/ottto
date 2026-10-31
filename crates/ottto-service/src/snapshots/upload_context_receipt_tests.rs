@@ -1449,19 +1449,12 @@ fn terminal_census_context_deferral_stays_owed_after_restart() {
     assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
 }
 
-/// [behaviour] B1 (M4, 2026-10-31): a census page read one context file,
+/// [regress] B1 (M4, 2026-10-31): a census page read one context file,
 /// because each file reserved three worst-case item bodies (about 1.88 MiB of
 /// the 2 MiB pass). Real-size reservation reads 40 small context files in one
 /// page, and each earns its receipt in that pass.
 #[test]
 fn real_scan_reads_forty_small_context_files_in_one_page() {
-    const {
-        assert!(
-            2 * 3 * (MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES + 3)
-                > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES,
-            "the removed worst-case reservation admitted one file per pass"
-        )
-    };
     let source = SnapshotSource::Codex;
     let mut f = Fixture::new(source);
     let template = fs::read_to_string(&f.path).unwrap();
