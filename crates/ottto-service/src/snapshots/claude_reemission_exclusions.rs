@@ -93,13 +93,7 @@ impl ListState {
     }
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for ListState {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ListState);
 
 /// Why a list with no file reads `MissingAfterInstall` (addendum 3, SOURCE
 /// (a)): the seen-marker is present, or the backfill state's durable intent
@@ -122,13 +116,7 @@ impl MissingCause {
     }
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for MissingCause {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; MissingCause);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ReemissionExclusions {

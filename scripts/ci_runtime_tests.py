@@ -19,7 +19,8 @@ this split; now they run in different processes, so they no longer share
 in-process state such as environment variables or statics.
 
 Both groups print to this step's log as they run. The step fails if either
-group fails, or if the lib test counts show a test ran twice or not at all.
+group fails, if the lib test counts show a test ran twice or not at all, or if
+a --require-pass test did not print `test <name> ... ok`.
 
 If neither group prints anything for --idle-limit seconds (libtest itself
 reports any test running over 60 s), the step dumps what each process is
@@ -32,13 +33,14 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+
+import libtest_log
 
 SERVICE_SRC = Path("crates/ottto-service/src")
 SERIAL_ATTR = re.compile(r"^\s*#\[\s*(?:serial_test\s*::\s*)?serial\s*(?:\([^()]*\))?\s*\]\s*$")
@@ -50,13 +52,6 @@ SERIAL_LIKE = re.compile(
 SERIAL_USE = re.compile(r"^\s*use\s+serial_test::serial;\s*$")
 TEST_FN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 SKIPPABLE = re.compile(r"^\s*(?:#\[.*\]|//.*)?\s*$")
-ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-RESULT = re.compile(
-    r"^test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out"
-)
-LIB_MARKER = re.compile(r"^\s*Running unittests src/lib\.rs \(.*ottto_service-[0-9a-f]+\)")
-# Cargo right-aligns its status words to 12 columns.
-NEXT_TARGET = re.compile(r"^(?: {5}Running| {3}Doc-tests) ")
 
 
 class SetupError(Exception):
@@ -129,29 +124,6 @@ def serial_group(lib_tests: list[str], serial_fns: set[str], all_tests: list[str
     return selected
 
 
-def lib_summary(lines: list[str], whole_stream: bool) -> tuple[int, ...] | None:
-    """(passed, failed, ignored, measured, filtered) of the ottto-service lib run.
-
-    Tests that re-run the test binary print their own summaries first, so the
-    lib's is the last one before the next target starts.
-    """
-    inside = whole_stream
-    summary = None
-    for raw in lines:
-        line = ANSI.sub("", raw).rstrip("\r\n")
-        if not whole_stream:
-            if LIB_MARKER.match(line):
-                inside = True
-                continue
-            if inside and NEXT_TARGET.match(line):
-                break
-        if inside:
-            found = RESULT.match(line)
-            if found:
-                summary = tuple(int(value) for value in found.groups())
-    return summary
-
-
 def check_counts(name: str, summary: tuple[int, ...] | None, ran: int, filtered: int) -> list[str]:
     if summary is None:
         return [f"{name}: no ottto-service lib test summary"]
@@ -162,6 +134,12 @@ def check_counts(name: str, summary: tuple[int, ...] | None, ran: int, filtered:
             f"{filtered_out}; expected {ran} and {filtered}"
         ]
     return []
+
+
+def require_passed(names: list[str], lines: list[str]) -> list[str]:
+    """Problems for each of `names` whose libtest result line is not `ok`."""
+    results = libtest_log.results(lines)
+    return [f"{name}: did not pass ({results.get(name, 'not run')})" for name in names if results.get(name) != "ok"]
 
 
 def capture(command: list[str]) -> str:
@@ -222,8 +200,6 @@ def dump_stuck_state(pgids: set[int]) -> None:
             continue
         if sys.platform == "darwin":
             command = ["sample", str(pid), "2"]
-        elif shutil.which("gdb"):
-            command = ["sudo", "-n", "gdb", "-batch", "-p", str(pid), "-ex", "thread apply all bt"]
         else:
             command = ["sh", "-c", f'for t in /proc/{pid}/task/*; do echo "$t $(cat $t/comm) $(cat $t/wchan)"; done']
         try:
@@ -277,6 +253,10 @@ def main() -> int:
         "--idle-limit", type=float, default=600,
         help="seconds without output from either group before both are dumped and killed",
     )
+    parser.add_argument(
+        "--require-pass", action="append", default=[], metavar="TEST",
+        help="exact test name that must print `test <name> ... ok` (repeatable)",
+    )
     args = parser.parse_args()
 
     cargo = os.environ.get("CARGO", "cargo")
@@ -321,13 +301,18 @@ def main() -> int:
     problems = wait_groups(
         [("main group", main_run), ("serial group", serial_run)], last_output, args.idle_limit
     )
-    problems += check_counts(
-        "serial group", lib_summary(serial_run[2], whole_stream=True), len(serial), len(lib_tests) - len(serial)
-    )
-    main_summary = lib_summary(main_run[2], whole_stream=False)
+    # A killed group has no summary; the kill is the only problem to report.
+    killed = {label for label in ("main group", "serial group")
+              if any(problem.startswith(f"{label}: killed") for problem in problems)}
+    if "serial group" not in killed:
+        problems += check_counts(
+            "serial group", libtest_log.lib_summary(serial_run[2], None), len(serial), len(lib_tests) - len(serial)
+        )
+    main_summary = libtest_log.lib_summary(main_run[2], "ottto_service")
     # A fail-fast main group can stop before the lib target when an earlier one fails.
-    if main_summary is not None or main_run[0].returncode == 0:
+    if "main group" not in killed and (main_summary is not None or main_run[0].returncode == 0):
         problems += check_counts("main group", main_summary, len(lib_tests) - len(serial), len(serial))
+    problems += require_passed(args.require_pass, main_run[2] + serial_run[2])
     for problem in problems:
         print(f"ci_runtime_tests: {problem}", file=sys.stderr)
     return 1 if problems else 0

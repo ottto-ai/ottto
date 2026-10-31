@@ -28,23 +28,17 @@ fn claude_completion_paths_for_test() -> bool {
 }
 #[cfg(test)]
 pub(crate) struct ClaudeCompletionPathsForTest {
-    previous: bool,
-    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    _switch: terminal_off_policy::ThreadSwitchForTest,
 }
 #[cfg(test)]
 impl ClaudeCompletionPathsForTest {
     pub(crate) fn enable() -> Self {
-        let previous = CLAUDE_COMPLETION_PATHS_FOR_TEST.with(|slot| slot.replace(true));
         Self {
-            previous,
-            _thread: std::marker::PhantomData,
+            _switch: terminal_off_policy::ThreadSwitchForTest::set(
+                &CLAUDE_COMPLETION_PATHS_FOR_TEST,
+                true,
+            ),
         }
-    }
-}
-#[cfg(test)]
-impl Drop for ClaudeCompletionPathsForTest {
-    fn drop(&mut self) {
-        CLAUDE_COMPLETION_PATHS_FOR_TEST.with(|slot| slot.set(self.previous));
     }
 }
 
@@ -199,6 +193,30 @@ fn claude_retain_unacked_reoffer(result: &mut ScanIndex, key: &str, working: &Sc
     }
 }
 
+// Storage for a process memo: one per process, or one per test thread so
+// parallel fixtures never share it. A poisoned lock is taken with `into_inner`.
+macro_rules! process_memo {
+    (fn $with:ident, static $memo:ident: $ty:ty = $init:expr) => {
+        #[cfg(not(test))]
+        static $memo: std::sync::Mutex<$ty> = std::sync::Mutex::new($init);
+        #[cfg(test)]
+        thread_local! {
+            static $memo: std::cell::RefCell<$ty> = const { std::cell::RefCell::new($init) };
+        }
+        fn $with<T>(f: impl FnOnce(&mut $ty) -> T) -> T {
+            #[cfg(not(test))]
+            {
+                f(&mut $memo
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner))
+            }
+            #[cfg(test)]
+            $memo.with(|memo| f(&mut memo.borrow_mut()))
+        }
+    };
+}
+pub(crate) use process_memo;
+
 // B-P5: under containment neither the identity-contract latch nor
 // source-wide context adoption discharges, so an unsuppressed semantic stale
 // clear would re-arm every stale pending family at every red-retry or floor
@@ -231,24 +249,12 @@ impl TerminalOffStaleClears {
         }
     }
 }
-#[cfg(test)]
-thread_local! {
-    static TERMINAL_OFF_STALE_CLEARS: std::cell::RefCell<TerminalOffStaleClears> =
-        std::cell::RefCell::new(TerminalOffStaleClears::default());
-}
-fn with_terminal_off_stale_clears<T>(f: impl FnOnce(&mut TerminalOffStaleClears) -> T) -> T {
-    #[cfg(not(test))]
-    {
-        static MEMO: std::sync::OnceLock<std::sync::Mutex<TerminalOffStaleClears>> =
-            std::sync::OnceLock::new();
-        f(&mut MEMO
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
-    }
-    #[cfg(test)]
-    TERMINAL_OFF_STALE_CLEARS.with(|memo| f(&mut memo.borrow_mut()))
-}
+process_memo!(fn with_terminal_off_stale_clears,
+    static TERMINAL_OFF_STALE_CLEARS: TerminalOffStaleClears = TerminalOffStaleClears {
+        keys: BTreeSet::new(),
+        order: VecDeque::new(),
+        evictions: 0,
+    });
 fn terminal_off_stale_clear_key(
     index: &ScanIndex,
     context: &str,
@@ -462,24 +468,15 @@ impl TerminalOffEmptyContexts {
         self.order.push_back(key);
     }
 }
+process_memo!(fn with_terminal_off_empty_contexts,
+    static TERMINAL_OFF_EMPTY_CONTEXTS: TerminalOffEmptyContexts = TerminalOffEmptyContexts {
+        keys: BTreeSet::new(),
+        order: VecDeque::new(),
+        evictions: 0,
+    });
 #[cfg(test)]
 thread_local! {
-    static TERMINAL_OFF_EMPTY_CONTEXTS: std::cell::RefCell<TerminalOffEmptyContexts> =
-        std::cell::RefCell::new(TerminalOffEmptyContexts::default());
     static TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-fn with_terminal_off_empty_contexts<T>(f: impl FnOnce(&mut TerminalOffEmptyContexts) -> T) -> T {
-    #[cfg(not(test))]
-    {
-        static MEMO: std::sync::OnceLock<std::sync::Mutex<TerminalOffEmptyContexts>> =
-            std::sync::OnceLock::new();
-        f(&mut MEMO
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
-    }
-    #[cfg(test)]
-    TERMINAL_OFF_EMPTY_CONTEXTS.with(|memo| f(&mut memo.borrow_mut()))
 }
 fn terminal_off_empty_context_key(index: &ScanIndex, key: &str) -> Option<[u8; 32]> {
     if !claude_terminal_off() || !index.confirmed_empty_files.contains(key) {
@@ -526,30 +523,13 @@ fn note_terminal_off_empty_context(index: &ScanIndex, key: &str, parsed_fingerpr
 // Fixed-size hashed scopes retain no transcript/path strings. Eviction and a
 // process restart fail toward one metadata rewalk, never toward proof.
 const TERMINAL_OFF_REDISCOVERY_SCOPES: usize = 64;
-#[cfg(not(test))]
-static TERMINAL_OFF_REDISCOVERY: std::sync::Mutex<BTreeMap<String, u64>> =
-    std::sync::Mutex::new(BTreeMap::new());
-#[cfg(test)]
-thread_local! {
-    static TERMINAL_OFF_REDISCOVERY: std::cell::RefCell<BTreeMap<String, u64>> =
-        const { std::cell::RefCell::new(BTreeMap::new()) };
-}
+process_memo!(fn with_terminal_off_rediscovery,
+    static TERMINAL_OFF_REDISCOVERY: BTreeMap<String, u64> = BTreeMap::new());
 fn terminal_off_cadence_requested(scope: &str, now: u64) -> bool {
-    #[cfg(test)]
-    {
-        TERMINAL_OFF_REDISCOVERY.with(|m| m.borrow().get(scope).map_or(true, |due| now >= *due))
-    }
-    #[cfg(not(test))]
-    {
-        TERMINAL_OFF_REDISCOVERY
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(scope)
-            .map_or(true, |due| now >= *due)
-    }
+    with_terminal_off_rediscovery(|memo| memo.get(scope).map_or(true, |due| now >= *due))
 }
 fn terminal_off_rediscovery_due(scope: String, now: u64, force: bool) -> bool {
-    let check = |memo: &mut BTreeMap<String, u64>| {
+    with_terminal_off_rediscovery(|memo| {
         if !force && memo.get(&scope).is_some_and(|due| now < *due) {
             return false;
         }
@@ -565,24 +545,14 @@ fn terminal_off_rediscovery_due(scope: String, now: u64, force: bool) -> bool {
         }
         memo.insert(scope, now.saturating_add(300));
         true
-    };
-    #[cfg(not(test))]
-    {
-        check(
-            &mut TERMINAL_OFF_REDISCOVERY
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    }
-    #[cfg(test)]
-    TERMINAL_OFF_REDISCOVERY.with(|memo| check(&mut memo.borrow_mut()))
+    })
 }
 // Reader/identity fixture drivers model an explicitly due discovery walk,
 // rather than an idle daemon tick at the same fixed fixture timestamp.
 #[cfg(test)]
 pub(crate) fn expire_terminal_off_discovery_for_test(index: &ScanIndex) {
     if let Some(scope) = terminal_off_rediscovery_scope(index) {
-        TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow_mut().remove(&scope));
+        with_terminal_off_rediscovery(|memo| memo.remove(&scope));
     }
 }
 
@@ -609,7 +579,6 @@ fn refresh_terminal_off_discovery(
     roots: &[PathBuf],
     now: u64,
     overflow: bool,
-    at: &str,
     file_limit: usize,
 ) {
     if !claude_terminal_off() {
@@ -648,7 +617,7 @@ fn refresh_terminal_off_discovery(
     }
     let scope = terminal_off_rediscovery_scope(index).expect("retained traversal");
     let requested = changed || overflow || terminal_off_cadence_requested(&scope, now);
-    let start = terminal_off_discovery::prepare(index, now, at, requested);
+    let start = terminal_off_discovery::prepare(index, now, requested);
     if start {
         terminal_off_rediscovery_due(scope, now, true);
     }

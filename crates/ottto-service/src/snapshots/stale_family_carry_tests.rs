@@ -7,8 +7,8 @@
 // `starting` row. A BASE arm runs the same start under
 // `KeepStaleClaudeFamilyRearmForTest`, which carries nothing. Fixtures are
 // synthetic and content-free.
-use super::*;
 use super::terminal_off_tests::claude_terminal_reconstructed;
+use super::*;
 
 const CARRY_FAILED: &str = "2026-08-02T07:10:00Z";
 const CARRY_RETRY: &str = "2026-08-02T07:20:00Z";
@@ -3697,7 +3697,7 @@ fn contract_start_status_preserves_resume_placeholder_and_reowes_only_once() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
+
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     claude_request_identity::with_cycle_contract_for_test(
         claude_request_identity::E2_GROUPING,
@@ -4026,14 +4026,13 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
     );
 }
 
-
 mod terminal_off_admission_tests {
     use super::*;
 
     /// [behaviour] Containment contract: four batches resume across mid admission restart.
     #[test]
     fn terminal_off_four_batches_resume_across_mid_admission_restart() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         // 385 roots = three full 128-root batches plus one; scaled from 8,500.
         if !crate::heap_layout_bound::layout_supported() {
@@ -4166,7 +4165,7 @@ mod terminal_off_admission_tests {
     /// [behaviour] Containment contract: rejected with holds resumes but real loss retries.
     #[test]
     fn terminal_off_rejected_with_holds_resumes_but_real_loss_retries() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let mut fixture = retry_durable_fixture(1, 2);
         let root = fixture._scratch.to_path_buf();
@@ -4236,7 +4235,7 @@ mod terminal_off_admission_tests {
     /// [behaviour] Containment contract: cancel refund and passed rewind never overwrite debt.
     #[test]
     fn terminal_off_cancel_refund_and_passed_rewind_never_overwrite_debt() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let mut index = carry_index();
         let [root, child] = carry_family_keys();
@@ -4281,7 +4280,7 @@ mod terminal_off_admission_tests {
     /// [behaviour] Containment contract: hard gate rejects partial coverage even with matching certificate.
     #[test]
     fn terminal_off_hard_gate_rejects_partial_coverage_even_with_matching_certificate() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let mut index = carry_index();
         let member = carry_member(CARRY_ROOT, Some(CARRY_AGENT));
@@ -4313,7 +4312,7 @@ mod terminal_off_admission_tests {
     /// [behaviour] Containment contract: completed admission still services a new due horizon.
     #[test]
     fn terminal_off_completed_admission_still_services_a_new_due_horizon() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         let mut fixture = retry_durable_fixture(1, 2);
         let root = fixture._scratch.to_path_buf();
@@ -4378,7 +4377,7 @@ mod terminal_off_admission_tests {
     /// [behaviour] Containment contract: new due horizon advances 64 missing paths then next after reload.
     #[test]
     fn terminal_off_new_due_horizon_advances_64_missing_paths_then_next_after_reload() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+        let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
         if !crate::heap_layout_bound::layout_supported() {
             return;
@@ -4508,6 +4507,42 @@ fn stale_start_clear_cause_matches_the_actual_traversal_start_reason() {
     }
 }
 
+/// [regress] A resumed Codex page erased outstanding Claude full_cause tags.
+#[test]
+fn resumed_codex_page_preserves_claude_full_cause() {
+    use crate::transcript_acquisition::{FullReason, ReadMode};
+    let key = carry_key(CARRY_ROOT, None);
+    let mut entry = manifest_index_entry(Some("accepted"));
+    entry.source_file_fingerprint = "proven".into();
+    rearm_cause::clear(&key, &mut entry, rearm_cause::Cause::ContextChanged);
+
+    let mut codex = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        &[],
+        &mut codex,
+        CARRY_FAILED,
+        BACKFILL_WINDOW_DAYS,
+    );
+    assert_eq!(
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            &[],
+            &mut codex,
+            CARRY_FAILED,
+            BACKFILL_WINDOW_DAYS,
+        ),
+        TraversalProgress::Resumed,
+    );
+    let mode = ReadMode::Full(FullReason::StateMissing);
+    let probe = crate::local_resource_diagnostics::Probe::start();
+    probe.rearm_full_selected(&key, mode);
+    probe.rearm_full_completed(&key, mode, 123);
+    assert_eq!(
+        serde_json::to_value(probe.rearm_fulls()).unwrap(),
+        json!({"rearm_cleared{context_changed}": {"count": 1, "completed_native_bytes": 123}}),
+    );
+}
 
 const TERMINAL_OFF_DESTINATION: &str = "terminal-off-destination";
 
@@ -4562,7 +4597,10 @@ fn terminal_off_reread_stale_members(index: &mut ScanIndex) {
         (CARRY_UNWITNESSED, None),
     ] {
         let entry = index.files.get_mut(&carry_key(root, subagent)).unwrap();
-        assert!(entry.source_file_fingerprint.is_empty(), "the first start owed this read");
+        assert!(
+            entry.source_file_fingerprint.is_empty(),
+            "the first start owed this read"
+        );
         entry.source_file_fingerprint = format!("rev-{}", carry_member(root, subagent));
     }
 }
@@ -4585,7 +4623,10 @@ fn terminal_off_red_retries_rearm_once_per_generation(context: Option<&str>, lat
     drop(discarded);
     let first = terminal_off_red_retry_start(&mut index, CARRY_RETRY);
     assert_eq!(first["stale_pending_families"], 2);
-    assert_eq!(first["rearmed_index_files"], 3, "one semantic re-read per member");
+    assert_eq!(
+        first["rearmed_index_files"], 3,
+        "one semantic re-read per member"
+    );
     assert!(!index.files[&carry_key(CARRY_OTHER, None)]
         .source_file_fingerprint
         .is_empty());
@@ -4593,13 +4634,19 @@ fn terminal_off_red_retries_rearm_once_per_generation(context: Option<&str>, lat
     carry_red(&mut index, CARRY_RETRY, 2);
 
     let second = terminal_off_red_retry_start(&mut index, CARRY_SECOND_RETRY);
-    assert_eq!(second["stale_pending_families"], 2, "the families stay stale");
+    assert_eq!(
+        second["stale_pending_families"], 2,
+        "the families stay stale"
+    );
     assert_eq!(
         second["rearmed_index_files"], 0,
         "the same generation never re-arms its stale families again"
     );
     for key in terminal_off_stale_member_keys() {
-        assert!(!index.files[&key].source_file_fingerprint.is_empty(), "{key}");
+        assert!(
+            !index.files[&key].source_file_fingerprint.is_empty(),
+            "{key}"
+        );
     }
     // Containment discharged nothing: the generation is still the same.
     assert_eq!(index.upload_context_fingerprint.as_deref(), context);
@@ -4653,8 +4700,11 @@ fn terminal_off_suppressed_start_still_rearms_an_unacked_head() {
         );
     }
     // The next start in the same generation still owes the unACKed head.
-    index.files.get_mut(&unacked).unwrap().source_file_fingerprint =
-        format!("rev-{}", carry_member(CARRY_UNWITNESSED, None));
+    index
+        .files
+        .get_mut(&unacked)
+        .unwrap()
+        .source_file_fingerprint = format!("rev-{}", carry_member(CARRY_UNWITNESSED, None));
     carry_red(&mut index, CARRY_RETRY, 2);
     let again = terminal_off_red_retry_start(&mut index, CARRY_SECOND_RETRY);
     assert_eq!(again["rearmed_index_files"], 1);

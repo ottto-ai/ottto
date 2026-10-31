@@ -25,16 +25,16 @@ jobs:
     name: Rust format (Linux)
     timeout-minutes: 10
     runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: "1.95.0"
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
 
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt
+      - name: Rust setup
+        uses: ./.github/actions/rust-setup
+        with:
+          components: rustfmt
 
       - name: Rust format
         run: cargo fmt --all --check
@@ -49,7 +49,6 @@ jobs:
     timeout-minutes: 60
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: "1.95.0"
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
@@ -57,40 +56,16 @@ jobs:
         with:
           persist-credentials: false
 
-      # rusqlite links the system SQLite; command-environment tests probe zsh.
-      - name: Install system packages
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev zsh
-
-      # Credential-path checks reject group/world-writable ancestors such as
-      # /tmp (1777). macOS hands each user a private TMPDIR; mirror that.
-      # macOS TMPDIR also sits under a symlink (/var -> /private/var), and
-      # code that refuses symlinked ancestors fails only there; mirror it too.
-      - name: Private temp directory
-        run: |
-          set -euo pipefail
-          install -d -m 0700 "$RUNNER_TEMP/private/var/tmp"
-          ln -s private/var "$RUNNER_TEMP/var"
-          echo "TMPDIR=$RUNNER_TEMP/var/tmp" >> "$GITHUB_ENV"
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
-
-      - name: Compiler receipt
-        run: rustc -Vv && cargo -V
-
-      # Only main saves. A save per PR merge ref (~331 MB each) filled the 10 GB
-      # repo cache and evicted the macOS main cache. PRs restore main's entry.
-      - name: Rust cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Cache: only main saves. A save per PR merge ref (~331 MB each) filled
+      # the 10 GB repo cache and evicted the macOS main cache. PRs restore
+      # main's entry.
+      - name: Rust setup
+        uses: ./.github/actions/rust-setup
         with:
-          shared-key: linux-tests
-          workspaces: |
-            . -> target
-            crates -> target
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          components: clippy
+          linux-test-env: "true"
+          cache-key: linux-tests
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Runtime clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -120,8 +95,6 @@ jobs:
         # Same split as the macOS job (scripts/ci_runtime_tests.py).
         run: python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1 --no-fail-fast
 
+      # Includes ottto-connector-testkit's first_party_sources contract tests.
       - name: Connector tests
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
-
-      - name: Connector package tests
-        run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources

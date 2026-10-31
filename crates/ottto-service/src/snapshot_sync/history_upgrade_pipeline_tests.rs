@@ -53,6 +53,8 @@ struct HistoryCycle<'a> {
     /// the index's recorded contract untouched.
     request_identity: bool,
     shed_upload: bool,
+    /// Seed the persisted ordinary-money state left by a pre-adoption daemon.
+    seed_legacy: bool,
 }
 
 const HISTORY_BASELINE: HistoryCycle<'static> = HistoryCycle {
@@ -65,6 +67,7 @@ const HISTORY_BASELINE: HistoryCycle<'static> = HistoryCycle {
     mint_literal: false,
     request_identity: false,
     shed_upload: false,
+    seed_legacy: true,
 };
 
 struct HistoryOutcome {
@@ -188,13 +191,6 @@ impl HistoryFixture {
         cycle: HistoryCycle<'_>,
         before_evidence: impl FnOnce(&mut crate::snapshots::SourceScanResult),
     ) -> HistoryOutcome {
-        // A cycle below revision 3 stands in for a daemon from before the
-        // switch-on, whose E2 gate was off (the flip raised both together).
-        if cycle.revision < 3 {
-            return crate::snapshots::claude_request_money::e2::with_disabled(|| {
-                self.cycle_at_gate(collected_at, cycle, before_evidence)
-            });
-        }
         self.cycle_at_gate(collected_at, cycle, before_evidence)
     }
 
@@ -204,6 +200,10 @@ impl HistoryFixture {
         cycle: HistoryCycle<'_>,
         before_evidence: impl FnOnce(&mut crate::snapshots::SourceScanResult),
     ) -> HistoryOutcome {
+        // These history fixtures exercise the current request-owned reader;
+        // independent prefix-off proofs remain in e2_legacy/e2_pre_change_builder.
+        let _prefix = (cycle.revision >= 3)
+            .then(|| crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true));
         let destination = cycle.destination.unwrap_or(HISTORY_DESTINATION);
         let index_path = self.index_path_for(cycle.destination);
         let (mut index, origin) = ScanIndex::load_for_snapshot_source_with_origin(
@@ -252,6 +252,9 @@ impl HistoryFixture {
         index.activate_effective_upload_body_witness_revision(cycle.revision);
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(&self.support);
+        if cycle.seed_legacy && cycle.revision < 3 {
+            index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(index);
+        }
         crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
         if cycle.request_identity {
             index.observe_claude_request_identity_contract(true);
@@ -412,14 +415,24 @@ impl HistoryFixture {
 
     /// Every file sent and stamped at revision 1 under a fresh install.
     fn baseline(&self) -> ScanIndex {
-        let outcome = self.cycle("2026-08-02T08:00:00Z", HISTORY_BASELINE);
+        self.baseline_at(1)
+    }
+
+    fn baseline_at(&self, revision: u64) -> ScanIndex {
+        let outcome = self.cycle(
+            "2026-08-02T08:00:00Z",
+            HistoryCycle {
+                revision,
+                ..HISTORY_BASELINE
+            },
+        );
         assert_eq!(outcome.uploaded.len(), HISTORY_SESSIONS.len());
         assert!(outcome.scan.census_complete);
         assert!(outcome
             .index
             .files
             .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 1));
+            .all(|entry| entry.effective_upload_body_witness_revision == revision));
         outcome.index
     }
 
@@ -452,6 +465,12 @@ const HISTORY_REVISION_2: HistoryCycle<'static> = HistoryCycle {
     mint_literal: false,
     request_identity: false,
     shed_upload: false,
+    seed_legacy: false,
+};
+
+const HISTORY_CURRENT: HistoryCycle<'static> = HistoryCycle {
+    revision: 3,
+    ..HISTORY_REVISION_2
 };
 
 /// Primary incident shape (addendum 2) on an unverified Mac: a bootstrapped
@@ -462,12 +481,22 @@ const HISTORY_REVISION_2: HistoryCycle<'static> = HistoryCycle {
 /// with its census record, and the next two cycles do not re-read anything.
 #[test]
 fn quarantined_index_after_bootstrap_holds_all_history_without_a_list() {
+    // Positive control: the current reader uploads the same shape on a fresh destination.
+    let control = HistoryFixture::new(
+        "quarantined_index_after_bootstrap_holds_all_history_without_a_list-control",
+    );
+    let control_index = control.baseline_at(3);
+    assert_eq!(
+        control_index.current_snapshot_fingerprints().len(),
+        HISTORY_SESSIONS.len()
+    );
+
     let fixture = HistoryFixture::new("history-upgrade-quarantine");
     fixture.baseline();
     fixture.corrupt_backfill_state();
     fixture.corrupt_index();
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-        let rebuilt = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        let rebuilt = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
         assert_eq!(
             rebuilt.scan.scanned_file_count,
             HISTORY_SESSIONS.len(),
@@ -513,7 +542,7 @@ fn quarantined_index_after_bootstrap_holds_all_history_without_a_list() {
             );
         }
         for hour in [10, 11] {
-            let again = fixture.cycle(&format!("2026-08-02T{hour}:00:00Z"), HISTORY_REVISION_2);
+            let again = fixture.cycle(&format!("2026-08-02T{hour}:00:00Z"), HISTORY_CURRENT);
             assert_eq!(again.scan.scanned_file_count, 0, "no re-read storm");
             assert!(again.uploaded.is_empty());
         }
@@ -532,7 +561,7 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
     assert!(baseline.generation > 0);
     let replay = HistoryCycle {
         replay_generation: Some("history-replay-2"),
-        ..HISTORY_REVISION_2
+        ..HISTORY_CURRENT
     };
     let mut sent = Vec::new();
     crate::snapshots::with_body_witness_adoption_page_budget(1, || {
@@ -561,6 +590,15 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
 /// settles: the next cycle reads nothing.
 #[test]
 fn upload_context_change_does_not_carry_history_past_the_gate() {
+    // Positive control: the current reader uploads the same shape on a fresh destination.
+    let control =
+        HistoryFixture::new("upload_context_change_does_not_carry_history_past_the_gate-control");
+    let control_index = control.baseline_at(3);
+    assert_eq!(
+        control_index.current_snapshot_fingerprints().len(),
+        HISTORY_SESSIONS.len()
+    );
+
     let fixture = HistoryFixture::new("history-upgrade-upload-context");
     let baseline = fixture.baseline();
     // Held where no list is intended only on an unverified Mac (N1).
@@ -570,7 +608,7 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
             "2026-08-02T09:00:00Z",
             HistoryCycle {
                 upload_context: "history-context-2",
-                ..HISTORY_REVISION_2
+                ..HISTORY_CURRENT
             },
         );
         assert_eq!(changed.scan.scanned_file_count, HISTORY_SESSIONS.len());
@@ -592,7 +630,7 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
             "2026-08-02T10:00:00Z",
             HistoryCycle {
                 upload_context: "history-context-2",
-                ..HISTORY_REVISION_2
+                ..HISTORY_CURRENT
             },
         );
         assert_eq!(again.scan.scanned_file_count, 0, "parsed at most once");
@@ -604,6 +642,14 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
 /// mtime equal) is unchanged history: held, never emitted, and settled.
 #[test]
 fn rearmed_unchanged_history_is_held_and_settles() {
+    // Positive control: the current reader uploads the same shape on a fresh destination.
+    let control = HistoryFixture::new("rearmed_unchanged_history_is_held_and_settles-control");
+    let control_index = control.baseline_at(3);
+    assert_eq!(
+        control_index.current_snapshot_fingerprints().len(),
+        HISTORY_SESSIONS.len()
+    );
+
     let fixture = HistoryFixture::new("history-upgrade-rearmed");
     let mut baseline = fixture.baseline();
     for entry in baseline.files.values_mut() {
@@ -614,14 +660,14 @@ fn rearmed_unchanged_history_is_held_and_settles() {
         .expect("save re-armed index");
     fixture.corrupt_backfill_state();
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-        let rearmed = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        let rearmed = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
         assert_eq!(rearmed.scan.scanned_file_count, HISTORY_SESSIONS.len());
         assert!(rearmed.uploaded.is_empty(), "{:?}", rearmed.uploaded);
         assert!(rearmed.index.files.values().all(|entry| {
             entry.effective_upload_body_witness_revision == 1
                 && !entry.source_file_fingerprint.is_empty()
         }));
-        let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_CURRENT);
         assert_eq!(again.scan.scanned_file_count, 0);
     });
 }
@@ -637,8 +683,7 @@ fn installed_list_paces_rebuilt_history_and_denies_listed_families() {
     let mut sent = Vec::new();
     crate::snapshots::with_body_witness_adoption_page_budget(1, || {
         for hour in 9..13 {
-            let outcome =
-                fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_REVISION_2);
+            let outcome = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_CURRENT);
             sent.push(outcome.uploaded.len());
             assert!(!outcome.uploaded.contains(HISTORY_SESSIONS[0]));
         }
@@ -647,7 +692,7 @@ fn installed_list_paces_rebuilt_history_and_denies_listed_families() {
     let index = ScanIndex::load(&fixture.index_path).expect("reload");
     let listed = HistoryFixture::key(&index, HISTORY_SESSIONS[0]);
     for (key, entry) in &index.files {
-        let expected = if *key == listed { 0 } else { 2 };
+        let expected = if *key == listed { 0 } else { 3 };
         assert_eq!(entry.effective_upload_body_witness_revision, expected);
     }
 }
@@ -665,7 +710,7 @@ fn fresh_install_without_a_prior_bootstrap_ingests_new_files() {
             "2026-08-02T09:00:00Z",
             HistoryCycle {
                 bootstrapped: false,
-                ..HISTORY_REVISION_2
+                ..HISTORY_CURRENT
             },
         );
         assert_eq!(fresh.uploaded.len(), HISTORY_SESSIONS.len());
@@ -673,7 +718,7 @@ fn fresh_install_without_a_prior_bootstrap_ingests_new_files() {
             .index
             .files
             .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 2));
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
     });
 }
 
@@ -686,10 +731,13 @@ fn only_files_that_grew_after_a_rebuild_emit() {
     fixture.corrupt_backfill_state();
     fixture.corrupt_index();
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
         assert!(held.uploaded.is_empty());
+        // Repair the unreadable intent with a real list: unchanged history
+        // stays excluded; the grown, unlisted sibling can settle at revision 3.
+        fixture.install_list(&[HISTORY_SESSIONS[0], HISTORY_SESSIONS[2]]);
         fixture.append(HISTORY_SESSIONS[1], "req_1_2");
-        let grown = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        let grown = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_CURRENT);
         assert_eq!(grown.scan.scanned_file_count, 1);
         assert_eq!(
             grown.uploaded,
@@ -698,7 +746,7 @@ fn only_files_that_grew_after_a_rebuild_emit() {
         let key = HistoryFixture::key(&grown.index, HISTORY_SESSIONS[1]);
         assert_eq!(
             grown.index.files[&key].effective_upload_body_witness_revision,
-            2
+            3
         );
     });
 }
@@ -709,13 +757,21 @@ fn only_files_that_grew_after_a_rebuild_emit() {
 /// and the override witness re-arms the seven-day guard.
 #[test]
 fn user_repair_override_rebuild_keeps_history_held() {
+    // Positive control: the current reader uploads the same shape on a fresh destination.
+    let control = HistoryFixture::new("user_repair_override_rebuild_keeps_history_held-control");
+    let control_index = control.baseline_at(3);
+    assert_eq!(
+        control_index.current_snapshot_fingerprints().len(),
+        HISTORY_SESSIONS.len()
+    );
+
     use crate::snapshots::ScanIndexRebuildOverride;
     let fixture = HistoryFixture::new("history-upgrade-user-repair-override");
     fixture.baseline();
     fixture.corrupt_backfill_state();
     fixture.corrupt_index();
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
         assert!(held.uploaded.is_empty(), "{:?}", held.uploaded);
         // Budget damage keeps the identity fields strictly recoverable, so
         // the press may rebuild (SI-718-O1); syntax damage refuses it.
@@ -734,7 +790,7 @@ fn user_repair_override_rebuild_keeps_history_held() {
             ),
             ScanIndexRebuildOverride::Armed
         );
-        let overridden = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        let overridden = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_CURRENT);
         assert_eq!(
             crate::snapshots::scan_index_rebuild_manual_override_count(),
             1
@@ -767,6 +823,16 @@ fn user_repair_override_rebuild_keeps_history_held() {
 /// settlement), and held history still uploads nothing.
 #[test]
 fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
+    // Positive control: the current reader uploads the same shape on a fresh destination.
+    let control = HistoryFixture::new(
+        "user_repair_override_keeps_prior_owner_through_a_deferred_upload-control",
+    );
+    let control_index = control.baseline_at(3);
+    assert_eq!(
+        control_index.current_snapshot_fingerprints().len(),
+        HISTORY_SESSIONS.len()
+    );
+
     use crate::snapshots::ScanIndexRebuildOverride;
     let fixture = HistoryFixture::new("history-upgrade-override-identity");
     fixture.baseline();
@@ -783,7 +849,7 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
             .expect("decode saved index")
     };
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
         assert!(held.uploaded.is_empty(), "{:?}", held.uploaded);
         // A retained owner and a true contract latch beside budget damage.
         let mut value = saved(&fixture);
@@ -812,7 +878,7 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
             "2026-08-02T10:00:00Z",
             HistoryCycle {
                 upload: PipelineUpload::ServerDeferred,
-                ..HISTORY_REVISION_2
+                ..HISTORY_CURRENT
             },
         );
         assert_eq!(
@@ -825,6 +891,13 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
             overridden.uploaded
         );
         assert_eq!(overridden.corrections, 0);
+        assert_eq!(overridden.index.files.len(), HISTORY_SESSIONS.len());
+        assert!(overridden
+            .index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 0
+                && entry.last_upload_body_witness.is_none()));
         // The retained owner survived the rebuild, the scan, the partial
         // settlement and the save: it is still the authority on disk.
         let value = saved(&fixture);
@@ -833,7 +906,7 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
             serde_json::json!(owner)
         );
         // A later cycle keeps it too, and still uploads no held history.
-        let again = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_REVISION_2);
+        let again = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_CURRENT);
         assert!(again.uploaded.is_empty(), "{:?}", again.uploaded);
         assert_eq!(
             saved(&fixture)["session_account_bindings"][&owner_key]["account_identifier_hash"],
@@ -850,7 +923,7 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
 fn user_repair_override_carries_accepted_history_through_census_and_release() {
     use crate::snapshots::ScanIndexRebuildOverride;
     let fixture = HistoryFixture::new("history-override-carried-ack-release");
-    let baseline = fixture.baseline();
+    let baseline = fixture.baseline_at(3);
     let state = serde_json::to_value(&baseline).unwrap();
     let accepted = state["accepted_snapshot_fingerprints"]
         .as_array()
@@ -894,7 +967,7 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
             .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
     };
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
         assert!(held.scan.census_complete);
         assert!(held.uploaded.is_empty());
         assert_eq!(held.corrections, 0);
@@ -909,7 +982,7 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
                 .any(|line| line
                     .contains("retained_carried_entries=3 history_held_carried_entries=3"))
         );
-        let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_CURRENT);
         assert!(again.scan.census_complete);
         assert_eq!(
             again.scan.scanned_file_count, 0,
@@ -932,7 +1005,7 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
             carried
         );
         fixture.install_list(&[]);
-        let released = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_REVISION_2);
+        let released = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_CURRENT);
         assert!(released.scan.census_complete);
         assert_eq!(
             released.scan.scanned_file_count,
@@ -1009,7 +1082,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
             .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
     };
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
         assert!(held.scan.census_complete);
         assert!(held.uploaded.is_empty());
         assert_eq!(held.corrections, 0);
@@ -1018,7 +1091,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
         let carried =
             serde_json::to_value(&held.index).unwrap()["accepted_rebuild_incidence"].clone();
         assert_eq!(carried, state["file_snapshot_fingerprints"]);
-        let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_CURRENT);
         assert!(again.scan.census_complete);
         assert_eq!(
             again.scan.scanned_file_count, 0,
@@ -1040,7 +1113,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
             .map(|fp| fp.as_str().unwrap().to_owned())
             .collect::<BTreeSet<_>>();
         std::fs::remove_file(fixture.root.join(format!("{}.jsonl", HISTORY_SESSIONS[0]))).unwrap();
-        let gone = fixture.cycle("2026-08-02T10:30:00Z", HISTORY_REVISION_2);
+        let gone = fixture.cycle("2026-08-02T10:30:00Z", HISTORY_CURRENT);
         assert!(gone.scan.census_complete);
         assert!(gone.uploaded.is_empty());
         assert!(!gone.index.files.contains_key(&vanished_key));
@@ -1084,7 +1157,7 @@ fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
             revision: 3,
             upload_context: "history-context-2",
             mint_literal: true,
-            ..HISTORY_REVISION_2
+            ..HISTORY_CURRENT
         };
         let denied = history_local_count(HistoryLocalCount::ListedLiteralDenied);
         let changed = fixture.cycle("2026-08-02T09:00:00Z", revision_3);
@@ -1177,7 +1250,7 @@ fn a_re_owed_file_goes_back_through_the_gate() {
         let revision_3 = HistoryCycle {
             revision: 3,
             upload_context: "history-context-1",
-            ..HISTORY_REVISION_2
+            ..HISTORY_CURRENT
         };
         let upgraded = fixture.cycle("2026-08-02T09:00:00Z", revision_3);
         assert_eq!(upgraded.uploaded.len(), HISTORY_SESSIONS.len());
@@ -1218,7 +1291,7 @@ fn seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
     fixture.baseline();
     fixture.install_list(&[]);
     fixture.corrupt_index();
-    let rebuilt = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+    let rebuilt = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
     assert!(
         fixture
             .support
@@ -1266,7 +1339,7 @@ fn seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
     ));
     std::fs::rename(&backups[0], &older_backup).unwrap();
     assert_eq!(std::fs::read(&older_backup).unwrap(), prior_bytes);
-    let latched = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+    let latched = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_CURRENT);
     assert!(latched.uploaded.is_empty(), "{:?}", latched.uploaded);
     let newcomer = "a7777777-7777-4777-8777-777777777777";
     // Births are whole seconds; a file born in the cutoff's second is history.
@@ -1276,7 +1349,7 @@ fn seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
         history_line(newcomer, "req_new_1", 0),
     )
     .expect("write a session born after the cutoff");
-    let fresh = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_REVISION_2);
+    let fresh = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_CURRENT);
     assert_eq!(fresh.uploaded, BTreeSet::from([newcomer.to_string()]));
 }
 
@@ -1288,10 +1361,13 @@ fn held_history_never_settles_as_accepted_on_a_deferred_page() {
     let fixture = HistoryFixture::new("history-upgrade-deferred");
     fixture.baseline();
     fixture.corrupt_backfill_state();
+    // Only the unchanged siblings are excluded; a globally paused list
+    // would also deny adoption of the changed sibling's ordinary body.
+    fixture.install_list(&HISTORY_SESSIONS[..2]);
     fixture.append(HISTORY_SESSIONS[2], "req_2_2");
     let changed_context = HistoryCycle {
         upload_context: "history-context-2",
-        ..HISTORY_REVISION_2
+        ..HISTORY_CURRENT
     };
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
         let deferred = fixture.cycle(
@@ -1318,7 +1394,7 @@ fn held_history_never_settles_as_accepted_on_a_deferred_page() {
         let key = HistoryFixture::key(&completed.index, HISTORY_SESSIONS[2]);
         assert_eq!(
             completed.index.files[&key].effective_upload_body_witness_revision,
-            2
+            3
         );
     });
 }
@@ -1329,6 +1405,16 @@ fn held_history_never_settles_as_accepted_on_a_deferred_page() {
 /// marker and arms no bootstrap.
 #[test]
 fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
+    // Positive control: the current reader uploads the same shape on a fresh destination.
+    let control = HistoryFixture::new(
+        "unreadable_backfill_state_emits_no_history_from_a_rebuilt_index-control",
+    );
+    let control_index = control.baseline_at(3);
+    assert_eq!(
+        control_index.current_snapshot_fingerprints().len(),
+        HISTORY_SESSIONS.len()
+    );
+
     for (name, quarantine) in [
         ("history-upgrade-unreadable-quarantined", true),
         ("history-upgrade-unreadable-missing", false),
@@ -1346,7 +1432,7 @@ fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
                 &format!("2026-08-02T{hour:02}:00:00Z"),
                 HistoryCycle {
                     bootstrapped: false,
-                    ..HISTORY_REVISION_2
+                    ..HISTORY_CURRENT
                 },
             );
             assert!(
@@ -1355,6 +1441,13 @@ fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
                 outcome.uploaded
             );
             assert_eq!(outcome.corrections, 0);
+            assert_eq!(outcome.index.files.len(), HISTORY_SESSIONS.len());
+            assert!(outcome
+                .index
+                .files
+                .values()
+                .all(|entry| entry.effective_upload_body_witness_revision == 0
+                    && entry.last_upload_body_witness.is_none()));
         }
         let state = crate::backfill::load_backfill_state(&fixture.support);
         assert!(state.prior_history_unverified);
@@ -1373,6 +1466,15 @@ fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
 /// (`move_not_full`), also after the new destination's own bootstrap.
 #[test]
 fn new_destination_holds_history_born_before_the_claim() {
+    // Positive control: the current reader uploads the same shape on a fresh destination.
+    let control =
+        HistoryFixture::new("new_destination_holds_history_born_before_the_claim-control");
+    let control_index = control.baseline_at(3);
+    assert_eq!(
+        control_index.current_snapshot_fingerprints().len(),
+        HISTORY_SESSIONS.len()
+    );
+
     let fixture = HistoryFixture::new("history-upgrade-new-destination");
     fixture.baseline();
     // The first destination's bootstrap completes after its first cycle.
@@ -1390,10 +1492,17 @@ fn new_destination_holds_history_born_before_the_claim() {
             HistoryCycle {
                 destination: Some("history-upgrade-destination-b"),
                 bootstrapped,
-                ..HISTORY_REVISION_2
+                ..HISTORY_CURRENT
             },
         );
         assert!(moved.uploaded.is_empty(), "{:?}", moved.uploaded);
+        assert_eq!(moved.index.files.len(), HISTORY_SESSIONS.len());
+        assert!(moved
+            .index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 0
+                && entry.last_upload_body_witness.is_none()));
     }
 }
 
@@ -1425,7 +1534,7 @@ fn explicit_full_move_paces_history_born_before_the_claim() {
                             HistoryCycle {
                                 destination: Some("history-upgrade-destination-b"),
                                 bootstrapped: false,
-                                ..HISTORY_REVISION_2
+                                ..HISTORY_CURRENT
                             },
                         )
                         .uploaded
@@ -1475,7 +1584,7 @@ fn different_user_cutoff_excludes_history_without_the_gate() {
         HistoryCycle {
             destination: Some("history-upgrade-destination-b"),
             bootstrapped: false,
-            ..HISTORY_REVISION_2
+            ..HISTORY_CURRENT
         },
     );
     assert_eq!(
@@ -1523,7 +1632,7 @@ fn same_user_reclaim_is_gated(complete_bootstrap: bool) {
         HistoryCycle {
             destination: Some("history-upgrade-destination-b"),
             bootstrapped: false,
-            ..HISTORY_REVISION_2
+            ..HISTORY_CURRENT
         },
     );
     assert_eq!(
@@ -1538,7 +1647,7 @@ fn same_user_reclaim_is_gated(complete_bootstrap: bool) {
             HistoryCycle {
                 destination: Some("history-upgrade-destination-b"),
                 bootstrapped: true,
-                ..HISTORY_REVISION_2
+                ..HISTORY_CURRENT
             },
         );
     }
@@ -1569,7 +1678,7 @@ fn same_user_reclaim_is_gated(complete_bootstrap: bool) {
                     HistoryCycle {
                         destination: Some("history-upgrade-destination-c"),
                         bootstrapped: false,
-                        ..HISTORY_REVISION_2
+                        ..HISTORY_CURRENT
                     },
                 )
                 .uploaded
@@ -1752,7 +1861,7 @@ fn resumed_pre_gate_index_on_a_new_destination_records_the_cutoff() {
             "2026-08-02T09:00:00Z",
             HistoryCycle {
                 destination: destination_b,
-                ..HISTORY_REVISION_2
+                ..HISTORY_CURRENT
             },
         )
     });
@@ -1864,12 +1973,12 @@ fn session_created_after_a_pre_gate_index_last_receipt_is_uploaded() {
     .expect("write a session created while the app was down");
     let upgraded = crate::snapshots::with_no_list_cutoff(u64::MAX, || {
         crate::snapshots::with_body_witness_adoption_page_budget(0, || {
-            fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2)
+            fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT)
         })
     });
     assert_eq!(upgraded.uploaded, BTreeSet::from([newcomer.to_string()]));
     let paced = crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-        fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2)
+        fixture.cycle("2026-08-02T10:00:00Z", HISTORY_CURRENT)
     });
     assert_eq!(
         paced.uploaded.len(),
@@ -1895,14 +2004,13 @@ fn intended_list_holds_listed_families_and_paces_the_rest_after_a_quarantine() {
         .join("snapshots/claude_code-reemission-exclusions.seen")
         .exists());
     fixture.corrupt_index();
-    let latched = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+    let latched = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
     assert!(latched.uploaded.is_empty(), "{:?}", latched.uploaded);
     crate::snapshots::restart_claude_reemission_stop_for_test();
     let mut sent = Vec::new();
     crate::snapshots::with_body_witness_adoption_page_budget(1, || {
         for hour in 10..14 {
-            let outcome =
-                fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_REVISION_2);
+            let outcome = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_CURRENT);
             assert!(!outcome.uploaded.contains(HISTORY_SESSIONS[0]));
             sent.push(outcome.uploaded.len());
         }
@@ -1917,7 +2025,7 @@ fn intended_list_holds_listed_families_and_paces_the_rest_after_a_quarantine() {
 
 /// The lenient decoder's remaining budget rebuild must compose with the full
 /// prior-history gate. NewFile-shaped history is never emitted on the held
-/// paths; the allowed unlisted history is still paced at revision <= 2.
+/// paths; the allowed unlisted history remains paced by the page budget.
 #[test]
 fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
     // No intended list plus unreadable prior evidence: fail closed, not fresh.
@@ -1926,7 +2034,7 @@ fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
     fixture.corrupt_backfill_state();
     fixture.exceed_decode_hold_budget();
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-        let rebuilt = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        let rebuilt = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
         assert_eq!(rebuilt.scan.scanned_file_count, HISTORY_SESSIONS.len());
         assert!(
             rebuilt.scan.snapshots.is_empty(),
@@ -1955,7 +2063,7 @@ fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
     fixture.install_list(&[HISTORY_SESSIONS[0]]);
     fixture.cycle("2026-08-02T08:30:00Z", HISTORY_BASELINE);
     fixture.exceed_decode_hold_budget();
-    let latched = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+    let latched = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
     assert_eq!(latched.scan.scanned_file_count, HISTORY_SESSIONS.len());
     assert!(
         latched.scan.snapshots.is_empty(),
@@ -1964,16 +2072,21 @@ fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
     assert!(latched.uploaded.is_empty());
     crate::snapshots::restart_claude_reemission_stop_for_test();
     let mut sent = Vec::new();
+    let mut uploaded_history = BTreeSet::new();
     crate::snapshots::with_body_witness_adoption_page_budget(1, || {
         for hour in 10..14 {
-            let outcome =
-                fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_REVISION_2);
+            let outcome = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_CURRENT);
             assert!(!outcome.uploaded.contains(HISTORY_SESSIONS[0]));
-            assert!(outcome
-                .index
-                .files
-                .values()
-                .all(|entry| { entry.effective_upload_body_witness_revision <= 2 }));
+            uploaded_history.extend(outcome.uploaded.iter().cloned());
+            for session in HISTORY_SESSIONS {
+                let key = HistoryFixture::key(&outcome.index, session);
+                let revision = outcome.index.files[&key].effective_upload_body_witness_revision;
+                if uploaded_history.contains(session) {
+                    assert_eq!(revision, 3, "uploaded history settles: {session}");
+                } else {
+                    assert!(revision < 3, "held or still-paced history must remain owed: {session} revision={revision}");
+                }
+            }
             sent.push(outcome.uploaded.len());
         }
     });
@@ -1993,7 +2106,7 @@ fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
     .unwrap();
     fixture.exceed_decode_hold_budget();
     for hour in [9, 10] {
-        let outcome = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_REVISION_2);
+        let outcome = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_CURRENT);
         assert!(
             outcome.scan.snapshots.is_empty(),
             "missing list denies history"
@@ -2056,7 +2169,7 @@ fn rootless_family_rebuild(
     fixture.install_list(&[listed]);
     fixture.corrupt_index();
     crate::local_resource_diagnostics::capture(|| {
-        fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2)
+        fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT)
     })
 }
 
@@ -2126,10 +2239,10 @@ const E2_HISTORY_UPGRADE: HistoryCycle<'static> = HistoryCycle {
 };
 
 fn with_e2_history<T>(fixture: &HistoryFixture, f: impl FnOnce() -> T) -> T {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     fixture.install_list(&[]);
-    crate::snapshots::with_max_gated_claude_revision(3, || {
-        crate::snapshots::claude_request_money::e2::with_enabled(f)
-    })
+    crate::snapshots::with_max_gated_claude_revision(3, f)
 }
 
 fn e2_history_sidecar(support: &Path, root: &str, trace: bool) -> PathBuf {
@@ -2437,10 +2550,8 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
     // Version 2 is #825's zero-mask row, kept for version stability.
     const RELEASE: &[(u16, u8)] = &[(1, 0), (2, 0), (3, money_mark::ESTIMATED)];
     let fixture = HistoryFixture::new("e2-switch-on-once");
-    fixture.baseline();
-    let at_two = fixture.cycle("2026-08-02T08:30:00Z", HISTORY_REVISION_2);
+    let at_two = fixture.baseline_at(2);
     assert!(at_two
-        .index
         .files
         .values()
         .all(|entry| entry.effective_upload_body_witness_revision == 2));
@@ -2544,8 +2655,7 @@ fn e2_assert_ordinary_body(outcome: &HistoryOutcome, session: &str) {
 #[test]
 fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
     let fixture = HistoryFixture::new("e2-listed-ordinary");
-    fixture.baseline();
-    fixture.cycle("2026-08-02T08:30:00Z", HISTORY_REVISION_2);
+    fixture.baseline_at(2);
     with_e2_history(&fixture, || {
         fixture.install_list(&[HISTORY_SESSIONS[0]]);
         fixture.append(HISTORY_SESSIONS[0], "req_0_2");
@@ -2565,6 +2675,31 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
             changed.index.files[&unlisted].effective_upload_body_witness_revision,
             3
         );
+        // A21 (was `e2_pipeline_dark_matches_fold_absent_publication_and_selection`):
+        // the listed family's ordinary body takes the same batching, ACK
+        // progress, index and next-selection route as the unlisted literal.
+        // `cycle` already asserts the upload completed (batching and entity ACK).
+        let body = |session: &str| {
+            let items = changed
+                .scan
+                .snapshots
+                .iter()
+                .filter(|item| item.source_session_id == session)
+                .collect::<Vec<_>>();
+            assert_eq!(items.len(), 1, "one body batched for {session}");
+            items[0].snapshot_fingerprint.clone()
+        };
+        let settled = [body(HISTORY_SESSIONS[0]), body(HISTORY_SESSIONS[1])];
+        let current = changed.index.current_snapshot_fingerprints();
+        for fingerprint in &settled {
+            assert!(
+                changed
+                    .index
+                    .accepted_snapshot_fingerprint_recorded(fingerprint),
+                "accepted progress reaches the index: {fingerprint}"
+            );
+            assert!(current.contains(fingerprint), "indexed body: {fingerprint}");
+        }
         for hour in [10, 11] {
             let quiet = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), E2_HISTORY_UPGRADE);
             assert!(
@@ -2576,10 +2711,20 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
                 quiet.scan.scanned_file_count, 0,
                 "never re-read by revision 3"
             );
+            assert!(quiet.scan.snapshots.is_empty(), "nothing re-selected");
             assert_eq!(
                 quiet.index.files[&listed].effective_upload_body_witness_revision,
                 2
             );
+            for fingerprint in &settled {
+                assert!(quiet
+                    .index
+                    .accepted_snapshot_fingerprint_recorded(fingerprint));
+                assert!(quiet
+                    .index
+                    .current_snapshot_fingerprints()
+                    .contains(fingerprint));
+            }
         }
     });
 }
@@ -2590,8 +2735,10 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
 /// while the list pauses adoption), never the literal and never withheld.
 #[test]
 fn e2_missing_list_pauses_history_and_keeps_changes_on_ordinary_money() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     let fixture = HistoryFixture::new("e2-list-missing-ordinary");
-    fixture.baseline();
+    fixture.baseline_at(2);
     fixture.install_list(&[]);
     fixture.cycle("2026-08-02T08:30:00Z", HISTORY_REVISION_2);
     std::fs::remove_file(
@@ -2601,28 +2748,26 @@ fn e2_missing_list_pauses_history_and_keeps_changes_on_ordinary_money() {
     )
     .expect("lose the list");
     crate::snapshots::with_max_gated_claude_revision(3, || {
-        crate::snapshots::claude_request_money::e2::with_enabled(|| {
-            fixture.append(HISTORY_SESSIONS[1], "req_1_2");
-            let changed = fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE);
-            assert_eq!(fixture.list_status(&changed), "missing_after_install");
-            assert_eq!(
-                changed.uploaded,
-                BTreeSet::from([HISTORY_SESSIONS[1].to_string()]),
-                "only the genuine change uploads"
-            );
-            assert!(changed.uploaded_literal.is_empty());
-            assert_eq!(changed.scan.scanned_file_count, 1, "no owed file re-read");
-            e2_assert_ordinary_body(&changed, HISTORY_SESSIONS[1]);
-            assert!(changed
-                .index
-                .files
-                .values()
-                .all(|entry| entry.effective_upload_body_witness_revision == 2));
-            let quiet = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
-            assert_eq!(fixture.list_status(&quiet), "missing_after_install");
-            assert!(quiet.uploaded.is_empty(), "{:?}", quiet.uploaded);
-            assert_eq!(quiet.scan.scanned_file_count, 0);
-        })
+        fixture.append(HISTORY_SESSIONS[1], "req_1_2");
+        let changed = fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE);
+        assert_eq!(fixture.list_status(&changed), "missing_after_install");
+        assert_eq!(
+            changed.uploaded,
+            BTreeSet::from([HISTORY_SESSIONS[1].to_string()]),
+            "only the genuine change uploads"
+        );
+        assert!(changed.uploaded_literal.is_empty());
+        assert_eq!(changed.scan.scanned_file_count, 1, "no owed file re-read");
+        e2_assert_ordinary_body(&changed, HISTORY_SESSIONS[1]);
+        assert!(changed
+            .index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 2));
+        let quiet = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
+        assert_eq!(fixture.list_status(&quiet), "missing_after_install");
+        assert!(quiet.uploaded.is_empty(), "{:?}", quiet.uploaded);
+        assert_eq!(quiet.scan.scanned_file_count, 0);
     });
 }
 

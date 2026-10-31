@@ -352,9 +352,36 @@ fn settle(mut run: Run) -> ScanIndex {
     run.index
 }
 fn seed_predecessor(fixture: &Fixture, cache: &Arc<SharedCache>) -> ScanIndex {
+    seed_predecessor_from(fixture, cache, ScanIndex::default())
+}
+/// Legacy reported-usage rebuild and selectors run only on ordinary money:
+/// the real paused (fail-closed) list, read from the support directory the
+/// way a sync cycle loads it. The list is runtime-only and the raw scanner
+/// never loads it, so it rides on the input index (and on every index the
+/// scanner hands back).
+fn ordinary_money_index(fixture: &Fixture) -> ScanIndex {
+    crate::snapshots::e2_pipeline_scan_fixture::pause_adoption(&fixture.support);
+    let mut index = ScanIndex::default();
+    index.load_claude_reemission_exclusions(&fixture.support);
+    assert!(index.claude_reemission_exclusions.pauses_adoption());
+    index
+}
+fn seed_ordinary_predecessor(fixture: &Fixture, cache: &Arc<SharedCache>) -> ScanIndex {
+    let index = seed_predecessor_from(fixture, cache, ordinary_money_index(fixture));
+    assert!(
+        index.claude_reemission_exclusions.pauses_adoption(),
+        "the paused list survives the seed scan"
+    );
+    index
+}
+fn seed_predecessor_from(
+    fixture: &Fixture,
+    cache: &Arc<SharedCache>,
+    input: ScanIndex,
+) -> ScanIndex {
     let index = settle(enriched(
         fixture,
-        raw_scan(fixture, ScanIndex::default(), Some(cache.clone()), |_| {}),
+        raw_scan(fixture, input, Some(cache.clone()), |_| {}),
     ));
     let bound = cache.inner.lock().unwrap().resident_bound();
     if crate::heap_layout_bound::layout_supported() {
@@ -392,13 +419,15 @@ fn assert_layout_mode(actual: (usize, usize, usize), reuse: (usize, usize, usize
 
 #[test]
 fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
-    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to
+    // native grains, so the family reads ordinary money (paused list).
+
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
-    let prior = seed_predecessor(&f, &cache);
+    let prior = seed_ordinary_predecessor(&f, &cache);
     f.evidence(2); // Includes req_1 from before the latest transcript response.
     let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
+    assert!(cached.index.claude_reemission_exclusions.pauses_adoption());
     assert_layout_mode(cached.modes, (0, 0, 1));
     assert_eq!(
         cached.native_bytes,
@@ -538,12 +567,13 @@ fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
 
 #[test]
 fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
-    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to
+    // native grains, so the family reads ordinary money (paused list).
+
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     f.evidence(2);
-    let prior = seed_predecessor(&f, &cache);
+    let prior = seed_ordinary_predecessor(&f, &cache);
     let mut file = fs::OpenOptions::new()
         .append(true)
         .open(f.sidecar(false))
@@ -552,6 +582,7 @@ fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
     file.write_all(b"\n").unwrap();
     drop(file);
     let mut cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
+    assert!(cached.index.claude_reemission_exclusions.pauses_adoption());
     assert_layout_mode(cached.modes, (0, 0, 1));
     assert_oracle(&f, &cached, prior);
     assert!(
@@ -621,18 +652,20 @@ fn true_scope_change_at_completion_still_refuses_cached_publication() {
 
 #[test]
 fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
-    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to
+    // native grains, so the family reads ordinary money (paused list).
+
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     f.evidence(2);
-    let prior = seed_predecessor(&f, &cache);
+    let prior = seed_ordinary_predecessor(&f, &cache);
     let file = fs::OpenOptions::new()
         .write(true)
         .open(f.sidecar(false))
         .unwrap();
     file.set_len(64 * 1024 * 1024).unwrap(); // Sparse; refused before decoding.
     let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {}));
+    assert!(cached.index.claude_reemission_exclusions.pauses_adoption());
     assert_oracle(&f, &cached, prior);
     assert!(!cached.index.claude_usage_authority_quarantine.is_empty());
     let held = settle(cached);
@@ -734,12 +767,13 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
 
 #[test]
 fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
-    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to
+    // native grains, so the family reads ordinary money (paused list).
+
     for conflict in [false, true] {
         let f = Fixture::new(2);
         let cache = Arc::new(SharedCache::default());
-        let prior = seed_predecessor(&f, &cache);
+        let prior = seed_ordinary_predecessor(&f, &cache);
         if conflict {
             f.evidence(2);
             let mut row = f.api[0].clone();
@@ -754,8 +788,11 @@ fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
             f.write_rows(false, &f.api[..2]);
         }
         let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
+        assert!(cached.index.claude_reemission_exclusions.pauses_adoption());
         assert_layout_mode(cached.modes, (0, 0, 1));
         assert_oracle(&f, &cached, prior);
+        // Positive control: the refusal is observed on real bodies.
+        assert!(!cached.result.snapshots.is_empty());
         assert!(cached
             .result
             .snapshots
@@ -1206,7 +1243,6 @@ mod durable_restart {
 
     #[test]
     fn e2_restart_tail_and_quiet_late_sidecar_match_cold_full_emitted_body() {
-        let _gate = claude_request_money::e2::GateForTest::set(true);
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             for append_native in [true, false] {
                 let f = Fixture::new(if append_native { 1 } else { 2 });
@@ -1424,7 +1460,6 @@ fn desktop_bucket(home: &Path, root: &str, account: &str, org: &str) -> PathBuf 
 // [behaviour] Deferred: adjacent restore trait is removed by active e5/pi-b2.
 #[test]
 fn desktop_completed_census_counts_existing_held_retry_reads() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let home = crate::test_scratch::ScratchDir::new("desktop-held-recovery");
     let f = fixture_in_home(&home);
     let store = desktop_bucket(&home, "Claude", DESKTOP_ACCOUNT, DESKTOP_ORG);
@@ -1436,13 +1471,16 @@ fn desktop_completed_census_counts_existing_held_retry_reads() {
     let cache = Arc::new(SharedCache::default());
     let mut index = settle(raw_scan_at(
         &f,
-        ScanIndex::default(),
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default()),
         Some(cache),
         true,
         COLLECTED,
         |_| {},
     ));
     let key = local_index_key(&f.path);
+    // Ordinary money (paused list) rides on the settled index into the
+    // recovery scan below.
+    assert!(index.claude_reemission_exclusions.pauses_adoption());
     assert!(index.claude_desktop_identity_census_complete);
     assert!(!index.files[&key].source_file_fingerprint.is_empty());
     index.claude_account_deferred_holds.insert(
@@ -1492,6 +1530,10 @@ fn desktop_completed_census_counts_existing_held_retry_reads() {
             },
         )
     });
+    assert!(recovered
+        .index
+        .claude_reemission_exclusions
+        .pauses_adoption());
     assert_eq!(recovered.result.snapshots.len(), 1);
     assert_eq!(recovered.result.snapshots[0].source_session_id, f.session);
     assert_eq!(recovered.native_bytes, fs::metadata(&f.path).unwrap().len());
