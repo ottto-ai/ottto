@@ -1890,8 +1890,7 @@ whole-save refusal above 256 MiB; at page size one, `save_oversize_alarm` and
 `state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
 `account_windows_alarm` and `account_windows_retained` still report retained
-account-window pressure without capping owed history. The fixed import pause label
-`r1_staging_not_installed` means **R1 staging not installed**.
+account-window pressure without capping owed history.
 These events contain no keys, paths, restart names, reference tuples or digests.
 
 ### Option (ii): `identity_retained` bucket rows

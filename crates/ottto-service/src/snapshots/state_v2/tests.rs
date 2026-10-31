@@ -1019,25 +1019,52 @@ fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let key = traversal("first".into());
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"old");
+    let removed = traversal("removed".into());
+    put(&mut tx, &removed, b"retained");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    sqlite::set_save_ceiling(&mut db, 1024);
+    // Leave room for both the replacement and deletion, including their
+    // charged metadata, before the oversized row refuses the whole save.
+    sqlite::set_save_ceiling(&mut db, 4096);
     let mut tx = db.begin(TxnMode::Write).unwrap();
-    put(&mut tx, &key, b"new");
+    let mut before = mapper::Rows::default();
+    before.raw(key.clone(), b"old").unwrap();
+    before.raw(removed.clone(), b"retained").unwrap();
+    let mut rows = mapper::Rows {
+        tx: Some(&mut tx),
+        old: before.finish().unwrap(),
+        ..Default::default()
+    };
+    rows.raw(key.clone(), b"new").unwrap();
+    let pending = rows.finish().unwrap();
+    let header = tx.get(&key).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &header), b"new");
+    assert!(tx.get(&removed).unwrap().is_none());
     let error = tx
         .put(RowInput {
             key: &traversal("over-ceiling".into()),
             fixed: &Fixed::None,
             value_version: 1,
-            value: &serde_json::to_vec(&"x".repeat(2048)).unwrap(),
+            value: &serde_json::to_vec(&"x".repeat(8192)).unwrap(),
         })
         .unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::NotPublished);
+    drop(pending);
     assert_eq!(db.save_failure(), Some(Hold::SaveCeiling));
     assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(1));
     let mut tx = db.begin(TxnMode::Read).unwrap();
     let header = tx.get(&key).unwrap().unwrap();
     assert_eq!(value(&mut tx, &header), b"old");
+    let header = tx.get(&removed).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &header), b"retained");
+    drop(tx);
+    drop(db);
+    let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let header = tx.get(&key).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &header), b"old");
+    let header = tx.get(&removed).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &header), b"retained");
 }
 /// [format] sqlite full at a row or chunk write rolls back the complete save.
 #[test]
@@ -1050,7 +1077,12 @@ fn sqlite_full_at_row_or_chunk_write_rolls_back_the_complete_save() {
         // SQLite's own page cap stands in for a full disk.
         sqlite::cap_pages(&db);
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        put(&mut tx, &key, b"evidence");
+        let mut rows = mapper::Rows {
+            tx: Some(&mut tx),
+            ..Default::default()
+        };
+        rows.raw(key.clone(), b"evidence").unwrap();
+        let pending = rows.finish().unwrap();
         let error = if chunk_write {
             tx.put(RowInput {
                 value_version: 1,
@@ -1075,6 +1107,7 @@ fn sqlite_full_at_row_or_chunk_write_rolls_back_the_complete_save() {
         };
         assert!(sqlite::disk_full(&error));
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
+        drop(pending);
         assert_eq!(db.save_failure(), Some(Hold::SaveFull));
         assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(0));
         assert!(db
@@ -1096,8 +1129,16 @@ fn refused_commit_reopens_and_classifies_not_published() {
     let key = traversal("uncommitted".into());
     sqlite::fence_commit_writing(&db, "generation");
     let mut tx = db.begin(TxnMode::Write).unwrap();
-    put(&mut tx, &key, b"evidence");
+    let sibling = traversal("sibling".into());
+    let mut rows = mapper::Rows {
+        tx: Some(&mut tx),
+        ..Default::default()
+    };
+    rows.raw(key.clone(), b"evidence").unwrap();
+    rows.raw(sibling.clone(), b"accepted").unwrap();
+    let pending = rows.finish().unwrap();
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
+    drop(pending);
     assert!(!db.reload_required());
     assert_eq!(db.save_failure(), None);
     assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(0));
@@ -1109,8 +1150,24 @@ fn refused_commit_reopens_and_classifies_not_published() {
         .is_none());
     // The fence was connection-local: the reopened store commits the retry.
     let mut tx = db.begin(TxnMode::Write).unwrap();
-    put(&mut tx, &key, b"evidence");
+    let mut rows = mapper::Rows {
+        tx: Some(&mut tx),
+        ..Default::default()
+    };
+    rows.raw(key.clone(), b"evidence").unwrap();
+    rows.raw(sibling.clone(), b"accepted").unwrap();
+    let pending = rows.finish().unwrap();
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    // Lose all staged metadata after COMMIT and before promotion, as on crash.
+    drop(pending);
+    drop(db);
+    let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(1));
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let header = tx.get(&key).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &header), b"evidence");
+    let header = tx.get(&sibling).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &header), b"accepted");
 }
 
 fn traversal(key: String) -> RowKey {

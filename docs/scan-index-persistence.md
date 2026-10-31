@@ -581,9 +581,7 @@ committed checkpoints retain retry custody. Unknown persisted kinds are refused.
 
 WAL above 64 MiB, save payload above 32 MiB and page reduction are alarms, not
 transaction caps. WAL/FULL, fullfsync, the 16 MiB journal size limit, PASSIVE at
-8 MiB and idle TRUNCATE remain in effect. Conversion remains paused with reason
-**R1 staging not installed** until restart custody is available; omitting restart
-rows cannot enable publication or fallback to v1.
+8 MiB and idle TRUNCATE remain in effect.
 
 For an unknown field or other state-v2 load failure, an unpublished source keeps
 collecting through v1 and reports `import_paused` / `import_paused_alarm`.

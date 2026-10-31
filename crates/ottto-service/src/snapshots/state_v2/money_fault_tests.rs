@@ -189,8 +189,9 @@ fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_members
     next.generation = 2;
     for commit in [false, true] {
         let (_, mut cx) = kinds::hydrate(&mut db, money_test_support::binding()).unwrap();
+        let baseline = kinds::baseline(&prev, &mut cx).unwrap();
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        kinds::delta(&prev, &next, &mut tx, &mut cx, std::iter::empty::<String>()).unwrap();
+        kinds::delta(baseline, &next, &mut tx, &mut cx).unwrap();
         if commit {
             let outcome = tx.commit(1, 2);
             assert_eq!(outcome, DurableCommitOutcome::Committed(2));

@@ -82674,6 +82674,32 @@ mod tests {
             "an unaccepted entity keeps its committed entry so the next scan retries it"
         );
 
+        // Persist accepted siblings even when a page leaves a held file and
+        // missing prior files behind. Rebuild the next subset before saving it.
+        let retry = scanned.committable_subset_with_local_holds(
+            &committable,
+            &BTreeSet::from(["bb".to_string()]),
+            &BTreeMap::new(),
+            &BTreeSet::from(["cc".to_string()]),
+        );
+        assert_eq!(
+            retry.files["pending.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("old")
+        );
+        let accepted_retry = scanned.committable_subset(
+            &retry,
+            &BTreeSet::from(["bb".to_string(), "cc".to_string()]),
+            &BTreeMap::new(),
+        );
+        let mut removed = accepted_retry.clone();
+        removed.files.remove("accepted.jsonl");
+        state_v2::money_test_support::assert_selected_saves(
+            &committed,
+            &[committable.clone(), retry, accepted_retry, removed],
+        );
+
         // A first-time file that was not accepted has no committed entry to fall
         // back to, so it must not appear at all.
         let mut fresh = ScanIndex::default();
@@ -83159,6 +83185,15 @@ mod tests {
                 .entity_count,
             1,
             "quarantine is checkpointed but never advertised as server-held"
+        );
+        let retry = scanned.committable_subset(
+            &committable,
+            &scanned.file_snapshot_fingerprints["split.jsonl"],
+            &BTreeMap::new(),
+        );
+        state_v2::money_test_support::assert_selected_saves(
+            &ScanIndex::default(),
+            &[committable, retry],
         );
     }
 
