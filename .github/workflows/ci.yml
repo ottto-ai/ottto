@@ -26,8 +26,13 @@ on:
         description: Comparison ref (empty uses this branch PR base, otherwise main)
         type: string
         default: ""
+      scan_stack_margin:
+        description: Release-build receipt that a scan cycle with a durable restore fits the 2 MiB spawn default (synthetic inputs)
+        type: boolean
+        default: false
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.money_equivalence && '-money-equivalence' || '' }}${{ github.event_name == 'schedule' && '-cache-refresh' || '' }}${{ github.event_name == 'workflow_dispatch' && inputs.rust_test_filter != '' && !(inputs.money_equivalence) && '-rust-filter' || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.money_equivalence && '-money-equivalence' || '' }}${{ inputs.scan_stack_margin && '-scan-stack-margin' || '' }}${{ github.event_name == 'schedule' && '-cache-refresh' || '' }}${{ github.event_name == 'workflow_dispatch' && inputs.rust_test_filter != '' && !(inputs.money_equivalence || inputs.scan_stack_margin) && '-rust-filter' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -46,7 +51,7 @@ jobs:
     # the queue. Rollback: revert step 3 (Mac on PRs) FIRST, then the queue
     # rule; never leave the PR skip without the queue. Step 4 (this main-push
     # skip) can be reverted on its own at any time.
-    if: ${{ github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.rust_test_filter != '')) }}
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin || inputs.rust_test_filter != '')) }}
     # Main's own queue run takes about 38 min (runs 40321546891, 40331916601,
     # 40348583388); 40 cancelled #791 (run 40378483829). Headroom, not a target.
     timeout-minutes: 55
@@ -160,14 +165,14 @@ jobs:
   rust-partial:
     # Separate static names also preserve the full check when either job skips.
     name: Rust contracts (partial pre-check)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.rust_test_filter != '' && !(inputs.money_equivalence) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.rust_test_filter != '' && !(inputs.money_equivalence || inputs.scan_stack_margin) }}
     timeout-minutes: 55
     runs-on: macos-15
     env: *rust-contract-env
     steps: *rust-contract-steps
 
   public-surface:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence)) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}
     name: Public surface checks
     timeout-minutes: 30
     runs-on: ubuntu-24.04
@@ -199,7 +204,7 @@ jobs:
 
   dependency-review:
     name: Dependency review
-    if: ${{ github.event_name == 'pull_request' && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence)) }}
+    if: ${{ github.event_name == 'pull_request' && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
@@ -217,7 +222,7 @@ jobs:
           fail-on-severity: moderate
 
   rust-advisories:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence)) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}
     name: Rust advisory audit
     timeout-minutes: 10
     runs-on: ubuntu-24.04
@@ -240,6 +245,31 @@ jobs:
       - name: Connector advisory audit
         run: cargo audit --deny warnings
         working-directory: crates
+
+  scan-stack-margin:
+    name: Scan worker stack margin
+    # Manual dispatch only (scan_stack_margin=true), never on a pull request,
+    # push or merge queue. One standard Mac, one release test build, no
+    # matrix, retry or cache. The receipt that the scan workers' explicit
+    # stack (SNAPSHOT_SYNC_WORKER_STACK_BYTES) is headroom over a cycle that
+    # fits the 2 MiB default; an overflow aborts the test binary.
+    if: github.event_name == 'workflow_dispatch' && inputs.scan_stack_margin && !inputs.money_equivalence
+    timeout-minutes: 40
+    runs-on: macos-15
+    env:
+      RUSTUP_TOOLCHAIN: "1.95.0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Release 2 MiB receipt
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          cargo test -p ottto-service --lib --locked --release scan_worker_stack_margin_receipt -- --ignored --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/stack-margin.log"
+          grep -q '^SCAN_STACK_MARGIN_RECEIPT ' "$RUNNER_TEMP/stack-margin.log"
+          grep -q '^test result: ok\. 1 passed' "$RUNNER_TEMP/stack-margin.log"
 
   money-equivalence:
     name: Money equivalence (emitted bodies)
