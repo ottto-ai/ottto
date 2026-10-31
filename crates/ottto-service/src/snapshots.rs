@@ -27098,15 +27098,13 @@ impl OwnedSourceScan {
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
         let causes = traversal.counts.causes.page(census_unix_seconds);
         let claude_queued_family_deferred_paths = if source == SnapshotSource::ClaudeCode {
+            // Credit service at this observation, within the admission horizon.
+            // The retained census clock stays frozen for proof and completeness.
             finish_claude_retry_selection(
                 index,
                 &mut pending_paths,
                 retry_service_end,
-                if claude_terminal_off() {
-                    collected_at
-                } else {
-                    &census_window_end
-                },
+                collected_at,
             )
         } else {
             BTreeSet::new()
