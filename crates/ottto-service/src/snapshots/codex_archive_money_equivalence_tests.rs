@@ -202,9 +202,10 @@ fn stamp_matching_header_inventory_never_decodes_archives() {
     let f = correction_archive();
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut state = ScanIndex::default();
-    state
-        .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
-        .unwrap();
+    let (read, rows) = crate::local_resource_diagnostics::capture(|| {
+        state.inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
+    });
+    assert_header_validated(&read, &rows);
     let mut scan = discovered_scan(&f, state, 1);
     let mut inventory = scan.codex_join_inventory.take().unwrap();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
@@ -328,7 +329,9 @@ fn watcher_retained_refresh_and_bounded_walk_admit_exact_codex_archives() {
 /// [money] Read bound: repeated short steps under contention decode no archive.
 #[test]
 fn many_short_steps_over_contention_work_decode_no_archive() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(b"contention denies before decode");
     let mut scan = selector_scan(
         &f,
@@ -431,7 +434,9 @@ fn source_aware_events_reject_nonexact_archive_suffixes() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn compressed_only_root_read_once_and_acked_then_quiet_restart() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let mut scan = discovered_scan(&f, ScanIndex::default(), 10).with_sampled_acquisition(
         Arc::new(sampled_scan::SharedCache::default()),
@@ -479,7 +484,9 @@ fn compressed_only_root_read_once_and_acked_then_quiet_restart() {
 /// [money] Read bound: a declared >1 GiB archive is held without a decoder and restart stays quiet.
 #[test]
 fn declared_over_1gib_held_without_decoder_and_restart_is_quiet() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0xe0];
     frame.extend_from_slice(&(FIRST_READ_DECODED_LIMIT + 1).to_le_bytes());
     let f = ArchiveFixture::new(&frame);

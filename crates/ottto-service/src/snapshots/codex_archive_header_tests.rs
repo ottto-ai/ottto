@@ -45,6 +45,18 @@ fn saved_header_with_retired_cli_version_still_loads() {
     );
 }
 
+/// Diagnostic: a test that assumes a header shows why none was stored
+/// (read outcome plus `codex_zst_refused` counts).
+fn assert_header_validated(read: &anyhow::Result<HeaderRead>, rows: &[Value]) {
+    assert!(
+        matches!(read, Ok(HeaderRead::Validated(_))),
+        "header read {read:?}; codex_zst_refused={:?}",
+        rows.iter()
+            .filter_map(|r| r["counts"].get("codex_zst_refused"))
+            .collect::<Vec<_>>()
+    );
+}
+
 fn header_inventory(
     f: &ArchiveFixture,
     state: &mut ScanIndex,
@@ -59,16 +71,16 @@ fn header_inventory(
         Some(&directories),
     );
     let mut work = funded_header_work();
-    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+    let (read, rows) = crate::local_resource_diagnostics::capture(|| {
         // Selected admission acquires the header; inventory reads only its
         // same-stamp facts and never decodes.
-        state
-            .inventory_archive_header(&f.candidate(), Some(cache), &mut work)
-            .unwrap();
+        let read = state.inventory_archive_header(&f.candidate(), Some(cache), &mut work);
         while inventory.step_with_archive(&CodexTitleMetadata::default(), state, Some(cache))
             != codex_file_join::HeaderStep::Complete
         {}
+        read
     });
+    assert_header_validated(&read, &rows);
     assert!(inventory.complete);
     assert_eq!(inventory.headers.len(), 1);
     assert_eq!(inventory.headers[0].owner, "compressed-fixture");
@@ -1107,7 +1119,8 @@ fn finish_selector_with(
     mut observe: impl FnMut(&OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult) {
     let mut committed = scan.index.clone();
-    let reservation = fixture(b"{}", ".json");
+    // A valid committed index: the strict decoder refuses a bare `{}`.
+    let reservation = fixture(&serde_json::to_vec(&committed).unwrap(), ".json");
     for _ in 0..1000 {
         match scan.step(None) {
             OwnedSourceScanStep::Pending(mut next) => {
@@ -1164,7 +1177,9 @@ fn selector_archive_pass(
     ignore = "funded decoder needs validated heap layout"
 )]
 fn production_inventory_denial_holds_scoped_and_sibling_progresses() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for gate in ["battery", "admission", "cpu", "page"] {
         let f =
             ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
@@ -1270,7 +1285,9 @@ fn production_inventory_denial_holds_scoped_and_sibling_progresses() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn bound_header_marker_survives_restart_without_inventory_redecode() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let bytes = vec![b'x'; codex_file_join::MAX_HEADER_BYTES + 1];
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
@@ -1335,7 +1352,9 @@ fn large_header_rollout() -> Vec<u8> {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn bound_archive_mixed_owner_plain_publishes_identical_and_hold_stays_quiet() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap());
     let plain = f.0.with_file_name("rollout-compressed-fixture.jsonl");
     fs::write(&plain, synthetic_rollout()).unwrap();
@@ -1413,7 +1432,9 @@ fn bound_archive_mixed_owner_plain_publishes_identical_and_hold_stays_quiet() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn bound_header_survives_saved_reservation_before_first_line_crash() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut committed = ScanIndex::default();
@@ -1502,7 +1523,9 @@ fn bound_header_survives_saved_reservation_before_first_line_crash() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn inventory_bound_marker_survives_normal_save_before_full_reservation() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut scan = selector_scan(
@@ -1624,7 +1647,9 @@ fn sibling_inventory_at_population_cap_counts_shared_physical_keys_once() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn changed_archive_stamp_resets_header_bound_and_decodes_one_bounded_prefix() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for replace in [false, true] {
         let bytes = zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap();
         let f = ArchiveFixture::new(&bytes);
@@ -1675,7 +1700,9 @@ fn changed_archive_stamp_resets_header_bound_and_decodes_one_bounded_prefix() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn missing_or_malformed_header_bound_loads_false_and_reads_at_most_one_prefix() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for value in [
         None,
         Some(json!("true")),
@@ -1774,7 +1801,9 @@ fn warm_archive_evidence_changed_stamp_defers_without_unselected_header_read() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_reread() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut f =
         ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let state = f.0.parent().unwrap().to_owned();

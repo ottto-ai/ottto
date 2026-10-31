@@ -10890,14 +10890,23 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
                     created_unix_ms: None,
                 },
             );
+            // Age the file to its own birth time (already > 730 days before the
+            // test clock): an mtime before birth moves APFS birth time, which
+            // the durable certificate then refuses as a replacement.
+            let meta = fs::metadata(&path).unwrap();
+            let aged = meta.created().unwrap_or_else(|_| meta.modified().unwrap());
+            let aged_secs = aged
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             fs::OpenOptions::new()
                 .write(true)
                 .open(&path)
                 .unwrap()
-                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000))
+                .set_modified(aged)
                 .unwrap();
-            assert!(!is_recent_enough_at(1000, 1_900_000_000, 7));
-            assert!(!is_recent_enough_at(1000, 1_900_000_000, 730));
+            assert!(!is_recent_enough_at(aged_secs, 1_900_000_000, 7));
+            assert!(!is_recent_enough_at(aged_secs, 1_900_000_000, 730));
             assert_eq!(
                 length > max_jsonl_file_bytes(SnapshotSource::Codex),
                 over_cap
@@ -10972,108 +10981,112 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
                     .is_some(),
                 "unrelated plain progresses"
             );
-            // Synthetic 11c handoff: the fixture owns the obligation while
-            // admitting its aged/over-cap FD directly to the existing Tail
-            // engine. Production release/admission remains unimplemented.
-            let obligation = index
-                .files
-                .get_mut(&key)
-                .unwrap()
-                .codex_compressed_hold
-                .take();
-            assert_eq!(obligation, Some(CodexZstCause::ParentLedgerUnbound));
-            cache.clear();
-            cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, capture);
-            let mut file = File::open(&path).unwrap();
-            let interpretation =
-                Interpretation::of(SnapshotSource::Codex, &key, &index, capture, &namespace);
-            let RestoreOutcome::Restored(old) = cache.durable_restore(
-                SnapshotSource::Codex,
-                &key,
-                &path,
-                &scope,
-                &mut file,
-                &index,
-                &interpretation,
-            ) else {
-                panic!("real disk checkpoint must restore");
-            };
-            assert_eq!(old.retained.checkpoint.sealed_offset(), prefix_len);
-            let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
-            let mut parser = OwnedJsonlParser::new(
-                file,
-                &path,
-                SnapshotSource::Codex,
-                apply_codex_line,
-                None,
-                None,
-                None,
-                false,
-                false,
-            )
-            .unwrap();
-            let mode = parser
-                .prepare_acquisition(Some(old.retained), &scope, None, 1_900_000_000)
-                .unwrap();
-            assert_eq!(mode, crate::transcript_acquisition::ReadMode::Tail);
-            assert_eq!(
-                parser.reader.acquisition.as_ref().unwrap().start_offset(),
-                prefix_len
-            );
-            let mut recorder = codex_scan(&fixture, index.clone(), NOW)
-                .with_sampled_acquisition(Arc::clone(&cache), namespace.clone())
-                .sampling
-                .take()
-                .unwrap();
-            recorder.record_mode(mode, None);
-            assert_eq!((recorder.full_files, recorder.tail_files), (0, 1));
-            while !parser.step().unwrap() {}
-            assert_eq!(parser.reader.consumed_bytes(), length - prefix_len);
-            let recovered = parser
-                .finish(
-                    &identity,
+            // The release opens the aged FD uncapped; the test cap only
+            // models the over-cap window above.
+            codex_compressed_hold_tests::with_file_cap(None, || {
+                // Synthetic 11c handoff: the fixture owns the obligation while
+                // admitting its aged/over-cap FD directly to the existing Tail
+                // engine. Production release/admission remains unimplemented.
+                let obligation = index
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .codex_compressed_hold
+                    .take();
+                assert_eq!(obligation, Some(CodexZstCause::ParentLedgerUnbound));
+                cache.clear();
+                cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, capture);
+                let mut file = File::open(&path).unwrap();
+                let interpretation =
+                    Interpretation::of(SnapshotSource::Codex, &key, &index, capture, &namespace);
+                let RestoreOutcome::Restored(old) = cache.durable_restore(
+                    SnapshotSource::Codex,
+                    &key,
                     &path,
-                    NOW,
-                    "recovered-source".into(),
+                    &scope,
+                    &mut file,
+                    &index,
+                    &interpretation,
+                ) else {
+                    panic!("real disk checkpoint must restore");
+                };
+                assert_eq!(old.retained.checkpoint.sealed_offset(), prefix_len);
+                let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+                let mut parser = OwnedJsonlParser::new(
+                    file,
+                    &path,
+                    SnapshotSource::Codex,
+                    apply_codex_line,
                     None,
                     None,
                     None,
+                    false,
+                    false,
                 )
                 .unwrap();
-            let mut file = File::open(&path).unwrap();
-            let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
-            let mut full = OwnedJsonlParser::new(
-                file,
-                &path,
-                SnapshotSource::Codex,
-                apply_codex_line,
-                None,
-                None,
-                None,
-                false,
-                // Curve generation on, matching the restored checkpoint's accumulator.
-                true,
-            )
-            .unwrap();
-            while !full.step().unwrap() {}
-            let control = full
-                .finish(
-                    &identity,
+                let mode = parser
+                    .prepare_acquisition(Some(old.retained), &scope, None, 1_900_000_000)
+                    .unwrap();
+                assert_eq!(mode, crate::transcript_acquisition::ReadMode::Tail);
+                assert_eq!(
+                    parser.reader.acquisition.as_ref().unwrap().start_offset(),
+                    prefix_len
+                );
+                let mut recorder = codex_scan(&fixture, index.clone(), NOW)
+                    .with_sampled_acquisition(Arc::clone(&cache), namespace.clone())
+                    .sampling
+                    .take()
+                    .unwrap();
+                recorder.record_mode(mode, None);
+                assert_eq!((recorder.full_files, recorder.tail_files), (0, 1));
+                while !parser.step().unwrap() {}
+                assert_eq!(parser.reader.consumed_bytes(), length - prefix_len);
+                let recovered = parser
+                    .finish(
+                        &identity,
+                        &path,
+                        NOW,
+                        "recovered-source".into(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                let mut file = File::open(&path).unwrap();
+                let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+                let mut full = OwnedJsonlParser::new(
+                    file,
                     &path,
-                    NOW,
-                    "recovered-source".into(),
+                    SnapshotSource::Codex,
+                    apply_codex_line,
                     None,
                     None,
                     None,
+                    false,
+                    // Curve generation on, matching the restored checkpoint's accumulator.
+                    true,
                 )
                 .unwrap();
-            assert!(!control.snapshots.is_empty());
-            assert_eq!(
-                serde_json::to_vec(&recovered.snapshots).unwrap(),
-                serde_json::to_vec(&control.snapshots).unwrap(),
-                "exact cumulative body, no duplicated prefix"
-            );
-            assert_eq!(index.files[&key].last_upload_body_witness, witness);
+                while !full.step().unwrap() {}
+                let control = full
+                    .finish(
+                        &identity,
+                        &path,
+                        NOW,
+                        "recovered-source".into(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                assert!(!control.snapshots.is_empty());
+                assert_eq!(
+                    serde_json::to_vec(&recovered.snapshots).unwrap(),
+                    serde_json::to_vec(&control.snapshots).unwrap(),
+                    "exact cumulative body, no duplicated prefix"
+                );
+                assert_eq!(index.files[&key].last_upload_body_witness, witness);
+            });
         });
     }
 }
@@ -13923,14 +13936,23 @@ fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails
                     created_unix_ms: None,
                 },
             );
+            // Age the file to its own birth time (already > 730 days before the
+            // test clock): an mtime before birth moves APFS birth time, which
+            // the durable certificate then refuses as a replacement.
+            let meta = fs::metadata(&path).unwrap();
+            let aged = meta.created().unwrap_or_else(|_| meta.modified().unwrap());
+            let aged_secs = aged
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             fs::OpenOptions::new()
                 .write(true)
                 .open(&path)
                 .unwrap()
-                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000))
+                .set_modified(aged)
                 .unwrap();
-            assert!(!is_recent_enough_at(1000, 1_900_000_000, 7));
-            assert!(!is_recent_enough_at(1000, 1_900_000_000, 730));
+            assert!(!is_recent_enough_at(aged_secs, 1_900_000_000, 7));
+            assert!(!is_recent_enough_at(aged_secs, 1_900_000_000, 730));
             assert_eq!(
                 length > max_jsonl_file_bytes(SnapshotSource::Codex),
                 over_cap
@@ -14000,108 +14022,112 @@ fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails
                     .is_some(),
                 "unrelated plain progresses"
             );
-            // Synthetic 11c handoff: the fixture owns the obligation while
-            // admitting its aged/over-cap FD directly to the existing Tail
-            // engine. Production release/admission remains unimplemented.
-            let obligation = index
-                .files
-                .get_mut(&key)
-                .unwrap()
-                .codex_compressed_hold
-                .take();
-            assert_eq!(obligation, Some(CodexZstCause::ParentLedgerUnbound));
-            cache.clear();
-            cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, capture);
-            let mut file = File::open(&path).unwrap();
-            let interpretation =
-                Interpretation::of(SnapshotSource::Codex, &key, &index, capture, &namespace);
-            let RestoreOutcome::Restored(old) = cache.durable_restore(
-                SnapshotSource::Codex,
-                &key,
-                &path,
-                &scope,
-                &mut file,
-                &index,
-                &interpretation,
-            ) else {
-                panic!("real disk checkpoint must restore");
-            };
-            assert_eq!(old.retained.checkpoint.sealed_offset(), prefix_len);
-            let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
-            let mut parser = OwnedJsonlParser::new(
-                file,
-                &path,
-                SnapshotSource::Codex,
-                apply_codex_line,
-                None,
-                None,
-                None,
-                false,
-                false,
-            )
-            .unwrap();
-            let mode = parser
-                .prepare_acquisition(Some(old.retained), &scope, None, 1_900_000_000)
-                .unwrap();
-            assert_eq!(mode, crate::transcript_acquisition::ReadMode::Tail);
-            assert_eq!(
-                parser.reader.acquisition.as_ref().unwrap().start_offset(),
-                prefix_len
-            );
-            let mut recorder = codex_scan(&fixture, index.clone(), NOW)
-                .with_sampled_acquisition(Arc::clone(&cache), namespace.clone())
-                .sampling
-                .take()
-                .unwrap();
-            recorder.record_mode(mode, None);
-            assert_eq!((recorder.full_files, recorder.tail_files), (0, 1));
-            while !parser.step().unwrap() {}
-            assert_eq!(parser.reader.consumed_bytes(), length - prefix_len);
-            let recovered = parser
-                .finish(
-                    &identity,
+            // The release opens the aged FD uncapped; the test cap only
+            // models the over-cap window above.
+            codex_compressed_hold_tests::with_file_cap(None, || {
+                // Synthetic 11c handoff: the fixture owns the obligation while
+                // admitting its aged/over-cap FD directly to the existing Tail
+                // engine. Production release/admission remains unimplemented.
+                let obligation = index
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .codex_compressed_hold
+                    .take();
+                assert_eq!(obligation, Some(CodexZstCause::ParentLedgerUnbound));
+                cache.clear();
+                cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, capture);
+                let mut file = File::open(&path).unwrap();
+                let interpretation =
+                    Interpretation::of(SnapshotSource::Codex, &key, &index, capture, &namespace);
+                let RestoreOutcome::Restored(old) = cache.durable_restore(
+                    SnapshotSource::Codex,
+                    &key,
                     &path,
-                    NOW,
-                    "recovered-source".into(),
+                    &scope,
+                    &mut file,
+                    &index,
+                    &interpretation,
+                ) else {
+                    panic!("real disk checkpoint must restore");
+                };
+                assert_eq!(old.retained.checkpoint.sealed_offset(), prefix_len);
+                let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+                let mut parser = OwnedJsonlParser::new(
+                    file,
+                    &path,
+                    SnapshotSource::Codex,
+                    apply_codex_line,
                     None,
                     None,
                     None,
+                    false,
+                    false,
                 )
                 .unwrap();
-            let mut file = File::open(&path).unwrap();
-            let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
-            let mut full = OwnedJsonlParser::new(
-                file,
-                &path,
-                SnapshotSource::Codex,
-                apply_codex_line,
-                None,
-                None,
-                None,
-                false,
-                // Curve generation on, matching the restored checkpoint's accumulator.
-                true,
-            )
-            .unwrap();
-            while !full.step().unwrap() {}
-            let control = full
-                .finish(
-                    &identity,
+                let mode = parser
+                    .prepare_acquisition(Some(old.retained), &scope, None, 1_900_000_000)
+                    .unwrap();
+                assert_eq!(mode, crate::transcript_acquisition::ReadMode::Tail);
+                assert_eq!(
+                    parser.reader.acquisition.as_ref().unwrap().start_offset(),
+                    prefix_len
+                );
+                let mut recorder = codex_scan(&fixture, index.clone(), NOW)
+                    .with_sampled_acquisition(Arc::clone(&cache), namespace.clone())
+                    .sampling
+                    .take()
+                    .unwrap();
+                recorder.record_mode(mode, None);
+                assert_eq!((recorder.full_files, recorder.tail_files), (0, 1));
+                while !parser.step().unwrap() {}
+                assert_eq!(parser.reader.consumed_bytes(), length - prefix_len);
+                let recovered = parser
+                    .finish(
+                        &identity,
+                        &path,
+                        NOW,
+                        "recovered-source".into(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                let mut file = File::open(&path).unwrap();
+                let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+                let mut full = OwnedJsonlParser::new(
+                    file,
                     &path,
-                    NOW,
-                    "recovered-source".into(),
+                    SnapshotSource::Codex,
+                    apply_codex_line,
                     None,
                     None,
                     None,
+                    false,
+                    // Curve generation on, matching the restored checkpoint's accumulator.
+                    true,
                 )
                 .unwrap();
-            assert!(!control.snapshots.is_empty());
-            assert_eq!(
-                serde_json::to_vec(&recovered.snapshots).unwrap(),
-                serde_json::to_vec(&control.snapshots).unwrap(),
-                "exact cumulative body, no duplicated prefix"
-            );
-            assert_eq!(index.files[&key].last_upload_body_witness, witness);
+                while !full.step().unwrap() {}
+                let control = full
+                    .finish(
+                        &identity,
+                        &path,
+                        NOW,
+                        "recovered-source".into(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                assert!(!control.snapshots.is_empty());
+                assert_eq!(
+                    serde_json::to_vec(&recovered.snapshots).unwrap(),
+                    serde_json::to_vec(&control.snapshots).unwrap(),
+                    "exact cumulative body, no duplicated prefix"
+                );
+                assert_eq!(index.files[&key].last_upload_body_witness, witness);
+            });
         });
     }
 }
@@ -14691,7 +14717,24 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
                     before.last_upload_body_witness
                 );
             } else {
-                assert_eq!(emitted.len(), 1, "unit publishes once");
+                // Main's group fan-out emits one item per physical member
+                // (codex_file_join.rs:2966 "one alias per physical member"):
+                // one unit with one body identity, every raw item byte-identical
+                // except its own physical source_file_fingerprint.
+                let unique = emitted
+                    .iter()
+                    .map(|item| &item.snapshot_fingerprint)
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(unique.len(), 1, "unit publishes once");
+                let raw = |item: &SnapshotItem| {
+                    let mut value = serde_json::to_value(item).unwrap();
+                    value["source_file_fingerprint"] = serde_json::Value::Null;
+                    serde_json::to_vec(&value).unwrap()
+                };
+                assert!(
+                    emitted.iter().all(|item| raw(item) == raw(&emitted[0])),
+                    "group aliases byte-identical"
+                );
                 money_oracle::assert_equivalent(&cold, &actual);
                 assert!(emitted[0].request_count > 0);
                 let accepted = Accepted {
@@ -15072,12 +15115,43 @@ fn omitted_raw_archive_fences_paused_singleton_and_group_across_reload() {
                     let resumed = counter(&cache, |c| c.jobs_resumed);
                     let (next, control_output) = continuation_page(&fixture, index, &cache, |_| {});
                     index = next;
-                    assert_eq!(
-                        counter(&cache, |c| c.jobs_resumed),
-                        resumed + 1,
-                        "positive control: same job/context is compatible before raw reload; {}",
-                        counters(&cache)
-                    );
+                    if grouped {
+                        // #839 §7 D N3 (codex_cursor.rs:5981): a continuation page
+                        // never resumes a paused group; the group stays owed.
+                        assert_eq!(
+                            counter(&cache, |c| c.jobs_resumed),
+                            resumed,
+                            "continuation holds the paused group; {}",
+                            counters(&cache)
+                        );
+                        assert!(
+                            cache.paused_members_for_test().is_some(),
+                            "group still owed"
+                        );
+                        // The next ordinary page resumes it. An identical twin
+                        // keeps this job parked for the raw-reload fence below.
+                        let (twin, twin_index, twin_cache, _, _) =
+                            deferred_group_fixture_with_loss(false, false);
+                        let twin_resumed = counter(&twin_cache, |c| c.jobs_resumed);
+                        let (twin_index, _) =
+                            continuation_page(&twin, twin_index, &twin_cache, |_| {});
+                        assert_eq!(counter(&twin_cache, |c| c.jobs_resumed), twin_resumed);
+                        assert!(twin_cache.paused_members_for_test().is_some());
+                        let _ = page(&twin, twin_index, Some(Arc::clone(&twin_cache)));
+                        assert_eq!(
+                            counter(&twin_cache, |c| c.jobs_resumed),
+                            twin_resumed + 1,
+                            "next ordinary page resumes the owed group; {}",
+                            counters(&twin_cache)
+                        );
+                    } else {
+                        assert_eq!(
+                            counter(&cache, |c| c.jobs_resumed),
+                            resumed + 1,
+                            "positive control: same job/context is compatible before raw reload; {}",
+                            counters(&cache)
+                        );
+                    }
                     assert!(control_output.snapshots.is_empty());
                     assert!(cache.paused_members_for_test().is_some());
                     let external = crate::test_scratch::ScratchDir::new("cursor-omitted-raw-home");
