@@ -417,7 +417,7 @@ impl SnapshotUploadProgress {
         {
             return Ok(false);
         }
-        let mut live = self.custody_page.clone();
+        let mut live = recovery.custody_page().clone();
         live.extend(page.into_iter().map(cache_session_key));
         for item in &items {
             if let Some(session) = serde_json::to_value(item)?
@@ -457,11 +457,13 @@ impl SnapshotUploadProgress {
     /// Freeze the logical page's sessions before its bootstrap and batches.
     /// OFF (no ACK custody) does no work.
     pub(super) fn freeze_custody_page(&mut self, items: &[SnapshotItem]) {
-        if self.ack_recovery.is_some() {
-            self.custody_page = items
-                .iter()
-                .map(|item| cache_session_key(&item.source_session_id))
-                .collect();
+        if let Some(recovery) = self.ack_recovery.as_deref_mut() {
+            recovery.freeze_custody_page(
+                items
+                    .iter()
+                    .map(|item| cache_session_key(&item.source_session_id))
+                    .collect(),
+            );
         }
     }
 

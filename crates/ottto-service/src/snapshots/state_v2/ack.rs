@@ -41,6 +41,9 @@ pub(crate) struct ProgressRecovery {
     scope: Scope,
     path: PathBuf,
     db_path: Option<PathBuf>,
+    /// Cache-session keys of this pass's frozen logical page. ACK-custody
+    /// pruning never removes their evidence in its bootstrap or any batch.
+    custody_page: std::collections::BTreeSet<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -246,6 +249,7 @@ impl OriginalProgress {
                 },
                 path: companion,
                 db_path: None,
+                custody_page: Default::default(),
             };
             let checked = recovery.receipt_at(&recovery.scope)?;
             let progress = progress.as_deref().unwrap_or(b"{\"generation\":0}");
@@ -352,6 +356,7 @@ impl ProgressRecovery {
             },
             path: fence::sibling(path, ".v2-ack-receipt"),
             db_path: Some(fence::sibling(path, ".v2.sqlite")),
+            custody_page: Default::default(),
         };
         crate::snapshot_sync::recover_state_v2_progress(path, &recovery)
     }
@@ -369,6 +374,7 @@ impl ProgressRecovery {
             },
             path: fence::sibling(path, ".v2-ack-receipt"),
             db_path: Some(fence::sibling(path, ".v2.sqlite")),
+            custody_page: Default::default(),
         };
         crate::snapshot_sync::recover_state_v2_progress_locked(path, &recovery, owner)
     }
@@ -394,6 +400,7 @@ impl ProgressRecovery {
             },
             path: fence::sibling(index_path, ".v2-ack-receipt"),
             db_path: Some(fence::sibling(index_path, ".v2.sqlite")),
+            custody_page: Default::default(),
         }))
     }
 
@@ -511,6 +518,15 @@ impl ProgressRecovery {
         require(bytes <= MAX_PROGRESS_BYTES, "size_before_upload")
     }
 
+    /// Freeze the logical page before its bootstrap and batches.
+    pub(crate) fn freeze_custody_page(&mut self, sessions: std::collections::BTreeSet<String>) {
+        self.custody_page = sessions;
+    }
+
+    pub(crate) fn custody_page(&self) -> &std::collections::BTreeSet<String> {
+        &self.custody_page
+    }
+
     /// Settled-session cache evidence dropped to admit a page. Each pruned
     /// session re-enters through the missing-head bootstrap if it reopens.
     pub(crate) fn custody_pruned(&self, sessions: usize) {
@@ -569,7 +585,7 @@ impl ProgressRecovery {
     }
 }
 
-crate::heap_layout_bound::fields!(ProgressRecovery; scope, path, db_path);
+crate::heap_layout_bound::fields!(ProgressRecovery; scope, path, db_path, custody_page);
 crate::heap_layout_bound::fields!(Scope; identity, generation);
 impl crate::heap_layout_bound::HeapLayoutBound for Identity {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -605,6 +621,7 @@ impl ProgressRecovery {
             },
             path: fence::sibling(index_path, ".v2-ack-receipt"),
             db_path: None,
+            custody_page: Default::default(),
         }
     }
     pub(crate) fn adopt_synthetic(&self, progress: Option<&[u8]>) {
@@ -638,6 +655,7 @@ impl ProgressRecovery {
             },
             path: fence::sibling(index_path, ".v2-ack-receipt"),
             db_path: Some(fence::sibling(index_path, ".v2.sqlite")),
+            custody_page: Default::default(),
         };
         recovery.adopt(progress)?;
         Ok(recovery)
