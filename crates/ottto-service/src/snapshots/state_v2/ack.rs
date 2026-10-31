@@ -511,6 +511,33 @@ impl ProgressRecovery {
         require(bytes <= MAX_PROGRESS_BYTES, "size_before_upload")
     }
 
+    /// Settled-session cache evidence dropped to admit a page. Each pruned
+    /// session re-enters through the missing-head bootstrap if it reopens.
+    pub(crate) fn custody_pruned(&self, sessions: usize) {
+        telemetry::event("ack_custody_pruned", &sessions);
+    }
+
+    /// Live custody alone exceeds the bound: hold and alarm this route.
+    pub(crate) fn hold_custody(&self) {
+        if let Some(index) = self.index_path() {
+            super::runtime::hold_ack_custody(&index);
+        }
+    }
+
+    /// No admission, hence no POST, until the paced retry is due.
+    pub(crate) fn custody_held(&self) -> bool {
+        self.index_path()
+            .is_some_and(|index| super::runtime::ack_custody_held(&index))
+    }
+
+    fn index_path(&self) -> Option<PathBuf> {
+        let name = self.path.file_name()?.to_str()?;
+        Some(
+            self.path
+                .with_file_name(name.strip_suffix(".v2-ack-receipt")?),
+        )
+    }
+
     /// Called inside the existing progress CAS lock, after the exact response
     /// has been validated. Failure creates no index acceptance/retirement.
     pub(crate) fn before_progress_save(&self, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {

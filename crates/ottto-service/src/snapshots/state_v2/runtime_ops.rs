@@ -12,6 +12,10 @@ pub(in super::super::super) fn before_collection(index: &ScanIndex) -> Result<()
         let session = guard.as_mut().ok_or(Hold::DbUnavailable)?;
         (session.path.clone(), session.db.collection_pause_due()?)
     };
+    held(with_state(&path, |state| {
+        ensure!(!state.custody_held(), Hold::AckCustody);
+        Ok(())
+    }))?;
     if telemetry::sample_cached_graph() {
         with_state(&path, |state| {
             if let Some(cached) = &state.cached {

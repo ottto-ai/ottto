@@ -381,15 +381,82 @@ impl SnapshotUploadProgress {
     /// Reserve the current ledger plus all possible additions from this page.
     /// Keeping both predecessor and replacement values bounds mixed ACK and
     /// refusal responses without evicting accepted shares or cache evidence.
+    ///
+    /// Over the bound, cache evidence of settled sessions (no pending head
+    /// obligation, not in this page) is pruned first; such a session reopens
+    /// through the missing-head bootstrap. If live custody alone still exceeds
+    /// the bound nothing changes and the route takes a paced, alarmed hold.
     pub(super) fn admit_ack_custody<'a, T: Serialize + 'a>(
-        &self,
+        &mut self,
         items: impl IntoIterator<Item = &'a T>,
         fingerprint: &impl Fn(&T) -> &str,
         body_witness: &impl Fn(&T) -> String,
     ) -> Result<()> {
-        let Some(recovery) = &self.ack_recovery else {
+        let Some(recovery) = self.ack_recovery.clone() else {
             return Ok(());
         };
+        let items = items.into_iter().collect::<Vec<_>>();
+        let refused = |progress: &Self| -> anyhow::Error {
+            AckSettlementRequired {
+                retained_ack_count: progress.accepted_fingerprints.len(),
+                retained_stale_ack_count: progress.retained_stale_ack_count,
+                capacity: progress.ack_capacity,
+                deferred_entity_count: items.len(),
+            }
+            .into()
+        };
+        if recovery.custody_held() {
+            return Err(refused(self));
+        }
+        if recovery
+            .admit_progress_bytes(self.custody_bytes(&items, fingerprint, body_witness)?)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        let mut live = BTreeSet::new();
+        for item in &items {
+            if let Some(session) = serde_json::to_value(item)?
+                .get("source_session_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                live.insert(cache_session_key(session));
+            }
+        }
+        for file in self.pending_cache_heads.values() {
+            live.extend(file.entities.values().cloned());
+            live.extend(file.reselected_heads.keys().cloned());
+        }
+        let mut pruned = self.clone();
+        pruned
+            .accepted_cache_states
+            .retain(|key, _| live.contains(key));
+        let sessions = self.accepted_cache_states.len() - pruned.accepted_cache_states.len();
+        for key in self.accepted_cache_states.keys() {
+            if !live.contains(key) {
+                pruned.accepted_cache_heads.remove(key);
+            }
+        }
+        if sessions > 0
+            && recovery
+                .admit_progress_bytes(pruned.custody_bytes(&items, fingerprint, body_witness)?)
+                .is_ok()
+        {
+            recovery.custody_pruned(sessions);
+            *self = pruned;
+            return Ok(());
+        }
+        recovery.hold_custody();
+        Err(refused(self))
+    }
+
+    /// Conservative serialized size of this ledger after any response to items.
+    fn custody_bytes<T: Serialize>(
+        &self,
+        items: &[&T],
+        fingerprint: &impl Fn(&T) -> &str,
+        body_witness: &impl Fn(&T) -> String,
+    ) -> Result<u64> {
         let mut projected = Self::new(
             self.destination_namespace_hash.clone(),
             self.active_quarantine_witness
@@ -397,10 +464,8 @@ impl SnapshotUploadProgress {
                 .context("upload witness missing")?,
         );
         projected.accepted_identity_buckets = self.accepted_identity_buckets.clone();
-        let mut deferred = 0;
         let mut padding = 20_u64; // generation may grow to u64::MAX at save
-        for item in items {
-            deferred += 1;
+        for &item in items {
             let fp = fingerprint(item);
             let body = body_witness(item);
             let value = serde_json::to_value(item)?;
@@ -475,17 +540,7 @@ impl SnapshotUploadProgress {
         let mut length = SnapshotPackingLength { bytes: 0 };
         serde_json::to_writer_pretty(&mut length, self)?;
         serde_json::to_writer_pretty(&mut length, &projected)?;
-        recovery
-            .admit_progress_bytes((length.bytes as u64).saturating_add(padding))
-            .map_err(|_| {
-                AckSettlementRequired {
-                    retained_ack_count: self.accepted_fingerprints.len(),
-                    retained_stale_ack_count: self.retained_stale_ack_count,
-                    capacity: self.ack_capacity,
-                    deferred_entity_count: deferred,
-                }
-                .into()
-            })
+        Ok((length.bytes as u64).saturating_add(padding))
     }
 
     pub(super) fn admit_ack_batch(&self, new_acks: usize) -> Result<()> {
