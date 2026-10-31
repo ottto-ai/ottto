@@ -1395,12 +1395,7 @@ impl NativeDecision {
         );
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for NativeDecision {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; NativeDecision);
 
 /// Per-page restore attempts. A miss class never authorizes a body read.
 #[derive(Debug, Default, Serialize)]
@@ -1628,12 +1623,7 @@ pub(crate) struct AcquisitionAdmission {
     pub(crate) prepare_started: usize,
     pub(crate) prepare_failed: usize,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for AcquisitionAdmission {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; AcquisitionAdmission);
 
 /// Existing audit point, using already computed final/previous fingerprints.
 /// Additive aliases retain their meaning; neither comparison is an audit-policy
