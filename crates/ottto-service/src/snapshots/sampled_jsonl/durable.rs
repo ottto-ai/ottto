@@ -8,10 +8,11 @@
 //! where in the file each was last assigned. Growth-only M3 restore prepays a
 //! bounded native content replay and fences every X field before adoption.
 //! Empty obligations move the paid decoded graph.
-//! The native parser also serves the default-OFF M1 warm-restore route.
+//! The legacy native-parser re-derivation remains only for compatibility tests.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::fs::File;
+#[cfg(test)]
 use std::io::{Read, Seek, SeekFrom};
 
 pub(crate) mod pl_text;
@@ -503,6 +504,7 @@ impl Decoded {
     /// 0 (`rederive_parser`), and `file` for the named-line pread. Every value
     /// must hash-equal its digest. The decoded copy is consumed either way: a
     /// refusal leaves nothing behind.
+    #[cfg(test)]
     pub(crate) fn rederive(
         self,
         mut parser: OwnedJsonlParser,
@@ -586,6 +588,7 @@ impl Decoded {
 }
 
 /// Exactly one complete line: `len` bytes at `offset`, ending in a newline.
+#[cfg(test)]
 fn pread_line(file: &mut File, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
     let len = usize::try_from(len).map_err(|_| std::io::ErrorKind::InvalidInput)?;
     let mut line = vec![0; len];
