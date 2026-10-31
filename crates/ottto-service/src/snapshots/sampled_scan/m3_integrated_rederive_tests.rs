@@ -160,13 +160,12 @@ impl ColdReplay {
         local_index_key(&self.path)
     }
     fn cache(&self) -> SharedCache {
-        let cache = fixture::cache(
+        fixture::cache(
             SnapshotSource::Codex,
             &self.index_path,
             &self.namespace,
             false,
-        );
-        cache
+        )
     }
     fn append(&self) {
         writeln!(

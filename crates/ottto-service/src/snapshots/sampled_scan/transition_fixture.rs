@@ -1278,7 +1278,7 @@ pub(crate) mod native_cold {
         }
     }
 
-    pub(crate) fn parser(
+    pub(in crate::snapshots) fn parser(
         source: SnapshotSource,
         path: &Path,
         file: std::fs::File,
@@ -1286,7 +1286,7 @@ pub(crate) mod native_cold {
     ) -> OwnedJsonlParser {
         OwnedJsonlParser::new(file, path, source, apply, None, None, None, false, true).unwrap()
     }
-    pub(crate) fn finish_record(
+    pub(in crate::snapshots) fn finish_record(
         parser: &mut OwnedJsonlParser,
         scope: &Scope,
         now: u64,
