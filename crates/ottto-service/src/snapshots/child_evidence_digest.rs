@@ -3,25 +3,43 @@ use super::*;
 use crate::heap_layout_bound::{bound, HeapLayoutBound};
 
 const MEMO_BYTES: usize = 2 * 1024 * 1024;
-type FamilyDigest = (String, BTreeMap<String, String>);
+type FamilyDigest = claude_family_evidence::Dependencies;
 #[derive(Default)]
 pub(super) struct Memo {
     families: BTreeMap<String, (String, Option<FamilyDigest>)>,
-    reproof_window: Option<String>,
-    reproof_roots: BTreeSet<String>,
 }
-crate::heap_layout_bound::fields!(Memo; families, reproof_window, reproof_roots);
+crate::heap_layout_bound::fields!(Memo; families);
 
-pub(super) struct Page {
-    cache: Arc<sampled_scan::SharedCache>,
-    bytes_read: u64,
+#[derive(Clone, Copy)]
+pub(crate) struct Policy<'a> {
+    pub(crate) cache: &'a Arc<sampled_scan::SharedCache>,
+    pub(crate) enabled: bool,
 }
-impl Page {
-    pub(super) fn new(cache: Arc<sampled_scan::SharedCache>) -> Self {
+impl<'a> Policy<'a> {
+    pub(crate) fn machine(cache: &'a Arc<sampled_scan::SharedCache>) -> Self {
         Self {
             cache,
-            bytes_read: 0,
+            enabled: terminal_off_policy::child_evidence_digest(),
         }
+    }
+}
+pub(super) struct Page {
+    cache: Arc<sampled_scan::SharedCache>,
+    legacy_roots: BTreeSet<String>,
+}
+impl Page {
+    pub(super) fn new(cache: Arc<sampled_scan::SharedCache>, index: &ScanIndex) -> Self {
+        Self {
+            cache,
+            legacy_roots: index
+                .claude_account_family_witnesses
+                .keys()
+                .cloned()
+                .collect(),
+        }
+    }
+    pub(super) fn cache(&self) -> std::sync::Weak<sampled_scan::SharedCache> {
+        Arc::downgrade(&self.cache)
     }
     pub(super) fn prune(&self, index: &ScanIndex) {
         // Wait until discovery has enumerated the walk; pruning on an early
@@ -41,7 +59,6 @@ impl Page {
         if let Ok(mut memo) = self.cache.child_evidence.lock() {
             if let Some(memo) = memo.as_mut() {
                 memo.families.retain(|root, _| roots.contains(root));
-                memo.reproof_roots.retain(|root| roots.contains(root));
             }
         }
     }
@@ -58,28 +75,28 @@ impl Page {
             let memo = self.cache.child_evidence.lock().ok()?;
             if let Some((previous, digest)) = memo.as_ref().and_then(|m| m.families.get(root)) {
                 if previous == &stat {
-                    return member_digest(digest.as_ref(), &member);
+                    return digest.as_ref().map(|digest| {
+                        digest.child_digest(&member, self.legacy_roots.contains(root))
+                    });
                 }
             }
         }
-        // Observe existing loader accounting; do not install a nested allowance.
-        let before = crate::claude_local_otel::strict_budget::bytes_read();
         let api = crate::claude_local_otel::load_claude_api_request_evidence_report(
             support,
             [root.clone()],
         );
         let trace =
             crate::claude_local_otel::load_claude_trace_ownership_evidence(support, [root.clone()]);
-        self.bytes_read +=
-            crate::claude_local_otel::strict_budget::bytes_read().saturating_sub(before);
         let unhealthy = if api.health.is_complete() && trace.is_complete() {
             BTreeSet::new()
         } else {
             BTreeSet::from([root.clone()])
         };
-        let digest = claude_request_identity::ScanEvidence::new(&api, &trace, unhealthy, None)
-            .child_sidecar_fingerprints(root);
-        let result = member_digest(Some(&digest), &member);
+        let identity = claude_request_identity::ScanEvidence::new(&api, &trace, unhealthy, None);
+        let rows = api.evidence.get(root).map(Vec::as_slice).unwrap_or(&[]);
+        let digest =
+            claude_family_evidence::Projection::new(rows).child_dependencies(root, &identity);
+        let result = Some(digest.child_digest(&member, self.legacy_roots.contains(root)));
         let mut guard = self.cache.child_evidence.lock().ok()?;
         let memo = guard.get_or_insert_with(Default::default);
         memo.families.insert(root.clone(), (stat, Some(digest)));
@@ -96,48 +113,12 @@ impl Page {
         result
     }
 }
-fn member_digest(digest: Option<&FamilyDigest>, member: &str) -> Option<String> {
-    let (common, members) = digest?;
-    Some(sha256_hex(&[
-        "claude_child_consumed_sidecars:v1",
-        common,
-        members.get(member).map(String::as_str).unwrap_or(""),
-    ]))
-}
 impl HeapLayoutBound for Page {
-    fn heap_bound(&self, _: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        // The daemon owner charges the shared memo; this page owns no rows.
-        Some(())
+    fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        // The daemon owner charges the shared memo; charge this page's root view.
+        self.legacy_roots.heap_bound(counter)
     }
 }
 
-/// One fail-toward-reading reproof per family in a census window. No money or
-/// accepted body is removed; only the existing selection fingerprint is cleared.
-pub(super) fn reproof_missing_families(
-    index: &mut ScanIndex,
-    window: &str,
-    mut roots: BTreeSet<String>,
-    cache: &sampled_scan::SharedCache,
-) {
-    if let Ok(mut guard) = cache.child_evidence.lock() {
-        let memo = guard.get_or_insert_with(Default::default);
-        if memo.reproof_window.as_deref() != Some(window) {
-            memo.reproof_window = Some(window.to_owned());
-            memo.reproof_roots.clear();
-        }
-        roots.retain(|root| memo.reproof_roots.insert(root.clone()));
-    } // A poisoned memo cannot suppress the fail-toward-reading fallback.
-    for (key, entry) in &mut index.files {
-        if claude_index_path_family_member(Path::new(key))
-            .is_some_and(|(root, _)| roots.contains(&root))
-        {
-            crate::local_resource_diagnostics::claude_reread::clear(
-                crate::local_resource_diagnostics::claude_reread::ClearSite::AccountReproof,
-                !entry.source_file_fingerprint.is_empty(),
-            );
-            entry.source_file_fingerprint.clear();
-        }
-    }
-}
 #[cfg(test)]
 mod tests;

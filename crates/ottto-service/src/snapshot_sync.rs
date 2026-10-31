@@ -6763,7 +6763,9 @@ fn prepare_sync_source_inner(
             context_curve_enabled,
             request_identity_capture,
             &copy_prefix_scope,
-            Some(&daemon.transcript_cache),
+            Some(crate::snapshots::ChildEvidencePolicy::machine(
+                &daemon.transcript_cache,
+            )),
         )
         .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
         .with_codex_side_pass(codex_side_pass)
@@ -9562,6 +9564,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     ),
     crate::source_rotation::LocalRefusal,
 > {
+    let child_evidence_cache = scan_result
+        .child_evidence_cache
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade);
     // Actual native occurrences are recorded once BEFORE emission filtering.
     // The authoritative fold still sees the actual terminal census decision.
     let observations = match comparison.as_deref_mut() {
@@ -9632,7 +9638,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 index,
                 census_complete,
                 &census_window_end,
-                retained.map(|(cache, _)| cache),
+                child_evidence_cache.as_deref(),
             );
             api_read = evidence;
         }

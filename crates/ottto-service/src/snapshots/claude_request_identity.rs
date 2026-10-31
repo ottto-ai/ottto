@@ -3630,9 +3630,6 @@ pub(crate) const TELEMETRY_FLUSH_WINDOW_SECONDS: u64 = 300;
 /// Scan-local evidence shared by every item of one Claude pass.
 #[derive(Default)]
 pub(crate) struct ScanEvidence<'a> {
-    /// Borrowed from the same loader input: retain account observations even
-    /// when the request index correctly refuses conflicting duplicate ids.
-    sidecar_rows: Option<&'a BTreeMap<String, Vec<ClaudeLocalOtelEvidence>>>,
     pub(crate) requests: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeLocalOtelEvidence>>,
     pub(crate) owners: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeTraceOwnershipEvidence>>,
     /// Each request id named by loaded API or trace rows, sorted, with the
@@ -3690,7 +3687,6 @@ impl<'a> ScanEvidence<'a> {
         desktop_census: Option<DesktopCensus>,
     ) -> Self {
         let mut evidence = Self {
-            sidecar_rows: Some(&api.evidence),
             unhealthy_roots,
             desktop_census,
             sole_login_enabled: TRANSCRIPT_SOLE_LOGIN_ENABLED,
@@ -3736,94 +3732,6 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         evidence
-    }
-
-    /// Q-D3's digest of the very same extracted request/owner view consumed by
-    /// classify. Family identity and refusal state are common dependencies;
-    /// healthy requests owned by another agent are not child dependencies.
-    pub(super) fn child_sidecar_fingerprints(
-        &self,
-        root: &str,
-    ) -> (String, BTreeMap<String, String>) {
-        let rows = self
-            .sidecar_rows
-            .and_then(|rows| rows.get(root))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let accounts = rows
-            .iter()
-            .map(|row| {
-                (
-                    row.account_identity_checked,
-                    row.account_identifier_hash.as_deref(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        // An API observation without an unambiguous trace owner might belong
-        // to this child. Keep it in the common dependency until ownership is
-        // known; suppressing it would miss late identity for an existing id.
-        let unowned = rows
-            .iter()
-            .filter(|row| {
-                !matches!(
-                    self.owners.get(&(root, row.request_id.as_str())),
-                    Some(Some(_))
-                )
-            })
-            .collect::<Vec<_>>();
-        let invalid_family = self.requests.iter().any(|((session, _), row)| {
-            *session == root && row.map_or(true, |row| !super::validate_claude_api_row(row, root))
-        }) || self.owners.iter().any(|((session, _), row)| {
-            *session == root
-                && row.map_or(true, |row| {
-                    row.capture_revision != "claude_llm_request_ownership:v1"
-                        || !super::claude_trace_evidence_fingerprint_is_valid(row)
-                })
-        });
-        let common = super::sha256_hex(&[
-            "claude_child_common_evidence:v1",
-            &serde_json::to_string(&(
-                accounts,
-                &self.memberships,
-                unowned,
-                invalid_family,
-                self.unhealthy_roots.contains(root),
-            ))
-            .expect("serializable extracted evidence"),
-        ]);
-        let mut by_member = BTreeMap::<String, Vec<_>>::new();
-        for (&(session, request), owner) in &self.owners {
-            if session != root {
-                continue;
-            }
-            let Some(owner) = owner else {
-                continue;
-            };
-            let member = super::claude_trace_owner_session_id(root, &owner.agent_id);
-            by_member.entry(member).or_default().push((
-                request,
-                match self.requests.get(&(session, request)) {
-                    Some(Some(row)) => vec![*row],
-                    Some(None) => rows
-                        .iter()
-                        .filter(|row| row.request_id == request)
-                        .collect(),
-                    None => Vec::new(),
-                },
-                owner,
-            ));
-        }
-        let members = by_member
-            .into_iter()
-            .map(|(member, rows)| {
-                let digest = super::sha256_hex(&[
-                    "claude_child_request_evidence:v1",
-                    &serde_json::to_string(&rows).expect("serializable extracted requests"),
-                ]);
-                (member, digest)
-            })
-            .collect();
-        (common, members)
     }
 
     pub(crate) fn with_unhealthy_reasons(

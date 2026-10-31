@@ -57,133 +57,198 @@ fn append_pair(support: &Path, request: &str, agent: &str, account: &str) {
     }
 }
 
-fn child(stem: &str) -> ClaudeSubagentIdentity {
-    ClaudeSubagentIdentity {
-        root_session_id: "root".into(),
-        file_stem: stem.into(),
-        workflow_ref: None,
+struct Fixture {
+    _scratch: crate::test_scratch::ScratchDir,
+    transcripts: PathBuf,
+    support: PathBuf,
+    cache: Arc<sampled_scan::SharedCache>,
+}
+impl Fixture {
+    fn new() -> Self {
+        let scratch = crate::test_scratch::ScratchDir::new("d3-collector");
+        let transcripts = scratch.join("transcripts");
+        let support = scratch.join("support");
+        fs::create_dir_all(transcripts.join("root/subagents")).unwrap();
+        for (file, request) in [
+            ("root.jsonl", "req-root"),
+            ("root/subagents/agent-a.jsonl", "req-a"),
+            ("root/subagents/agent-b.jsonl", "req-b"),
+        ] {
+            fs::write(transcripts.join(file), serde_json::to_string(&json!({
+                "type":"assistant", "sessionId":"root", "requestId":request,
+                "timestamp":"2026-10-31T10:00:00Z",
+                "message":{"id":request,"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":1}}
+            })).unwrap()+"\n").unwrap();
+        }
+        for (request, agent) in [("req-root", ""), ("req-a", "a"), ("req-b", "b")] {
+            append_pair(&support, request, agent, &"a".repeat(64));
+        }
+        Self {
+            _scratch: scratch,
+            transcripts,
+            support,
+            cache: Arc::new(sampled_scan::SharedCache::default()),
+        }
+    }
+    fn run(
+        &self,
+        mut index: ScanIndex,
+        enabled: bool,
+        walk: Option<ScanTraversalCheckpoint>,
+        limit: usize,
+    ) -> (ScanIndex, Vec<SnapshotItem>, ScanTraversalCheckpoint, usize) {
+        if let Some(walk) = walk {
+            index.traversal = Some(walk);
+        }
+        let mut state = OwnedSourceScan::new_with_identity_capture_and_recovery_priority(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&self.transcripts),
+            index,
+            "2026-10-31T10:36:00Z",
+            BACKFILL_WINDOW_DAYS,
+            limit,
+            false,
+            Some(&self.support),
+            &[],
+            false,
+            false,
+            true,
+            &[],
+            Some(Policy {
+                cache: &self.cache,
+                enabled,
+            }),
+        );
+        let mut frozen = state.index.traversal.clone().unwrap();
+        frozen.pending_directories.clear();
+        frozen.pending_candidates = state
+            .identified_candidates
+            .iter()
+            .map(|candidate| ScanTraversalPath {
+                scan_root: candidate.scan_root.clone(),
+                path: candidate.path.clone(),
+                census_member: true,
+                watcher_hint: false,
+            })
+            .collect();
+        for _ in 0..10000 {
+            match state.step(None) {
+                OwnedSourceScanStep::Pending(next) => state = next,
+                OwnedSourceScanStep::Complete {
+                    mut index,
+                    mut scan,
+                    ..
+                } => {
+                    let selected = scan.scanned_file_count;
+                    crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+                        &self.support,
+                        &mut scan,
+                        &mut index,
+                    );
+                    let items = scan.snapshots.clone();
+                    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+                    return (index, items, frozen, selected);
+                }
+            }
+        }
+        panic!("small family collector did not complete");
     }
 }
-fn fingerprint(page: Option<&mut Page>, support: &Path, child: &ClaudeSubagentIdentity) -> String {
-    claude_subagent_sidecar_fingerprint(
-        Path::new("root/subagents/agent-a.jsonl"),
-        child,
-        Some(support),
-        page.and_then(|page| page.digest(Some(support), child))
-            .as_deref(),
-    )
-}
-fn page(cache: &Arc<sampled_scan::SharedCache>) -> Page {
-    Page::new(Arc::clone(cache))
-}
 
-/// [off=main] No marker means the existing stat fingerprint, with no sidecar reads.
+/// [off=main] Injected OFF uses the ordinary stat fingerprint from main.
 #[test]
-fn off_preserves_stat_selection_and_does_not_read_sidecars() {
-    let scratch = crate::test_scratch::ScratchDir::new("d3-off");
-    append_pair(&scratch, "req-a", "a", &"a".repeat(64));
-    assert!(!terminal_off_policy::child_evidence_digest());
-    crate::claude_local_otel::reset_evidence_read_counts_for_test();
-
-    let expected = claude_subagent_sidecar_fingerprint(
-        Path::new("root/subagents/agent-a.jsonl"),
-        &child("agent-a"),
-        Some(&scratch),
+fn off_preserves_the_existing_stat_fingerprint() {
+    let fixture = Fixture::new();
+    let (mut index, items, _, selected) = fixture.run(ScanIndex::default(), false, None, 100);
+    assert_eq!(selected, 3);
+    assert!(!items.is_empty());
+    let path = fixture.transcripts.join("root/subagents/agent-a.jsonl");
+    let identity = claude_subagent_identity(&path).unwrap();
+    let legacy =
+        claude_subagent_sidecar_fingerprint(&path, &identity, Some(&fixture.support), None);
+    // The production index binds the opened object plus this exact legacy input.
+    let (mut census, mut discovery) = (
+        ScanCensus::default(),
+        CandidateDiscovery::new(&mut index, None),
+    );
+    let pending = ScanTraversalPath {
+        scan_root: fixture.transcripts.clone(),
+        path: path.clone(),
+        census_member: true,
+        watcher_hint: false,
+    };
+    let mut current = candidate_from_traversal_path(
+        SnapshotSource::ClaudeCode,
+        pending,
+        &mut census,
         None,
-    );
-    assert_eq!(fingerprint(None, &scratch, &child("agent-a")), expected);
-    assert_eq!(
-        crate::claude_local_otel::evidence_read_counts_for_test(),
-        (0, 0)
-    );
-    append_pair(&scratch, "req-b", "b", &"a".repeat(64));
-    assert_ne!(fingerprint(None, &scratch, &child("agent-a")), expected);
-}
-
-/// [regress] A live root's other-agent append no longer reselects unchanged children.
-#[test]
-fn sibling_appends_stay_stable_and_unchanged_families_survive_pages() {
-    let scratch = crate::test_scratch::ScratchDir::new("d3-siblings");
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    append_pair(&scratch, "req-a", "a", &"a".repeat(64));
-    let before = fingerprint(Some(&mut page(&cache)), &scratch, &child("agent-a"));
-    append_pair(&scratch, "req-b", "b", &"a".repeat(64));
-    let mut first = page(&cache);
-    assert_eq!(
-        fingerprint(Some(&mut first), &scratch, &child("agent-a")),
-        before
-    );
-    // Actual bytes include both API and trace even with terminal_off OFF.
-    let bytes = [
-        crate::claude_local_otel::STORE_DIR,
-        "local-otel/claude-code-trace-ownership",
-    ]
-    .iter()
-    .map(|dir| {
-        fs::metadata(
-            scratch
-                .join(dir)
-                .join(format!("{:x}.jsonl", Sha256::digest(b"root"))),
-        )
-        .unwrap()
-        .len()
-    })
-    .sum::<u64>();
-    assert_eq!(first.bytes_read, bytes);
-    let mut second = page(&cache);
-    for i in 0..181 {
-        fingerprint(Some(&mut second), &scratch, &child(&format!("agent-{i}")));
-    }
-    assert_eq!(
-        second.bytes_read, 0,
-        "unchanged roots require only stat on later pages"
-    );
-    // Existing allowances may enclose fingerprinting without a nested-scope panic.
-    let _budget = crate::claude_local_otel::strict_budget::StrictReadBudget::new(64 * 1024 * 1024);
-    append_pair(&scratch, "req-c", "c", &"a".repeat(64));
-    assert_eq!(
-        fingerprint(Some(&mut page(&cache)), &scratch, &child("agent-a")),
-        before
-    );
-}
-
-/// [money] Late account evidence and this agent's request evidence must reselect it.
-#[test]
-fn consumed_account_and_request_entries_move_the_fingerprint() {
-    let scratch = crate::test_scratch::ScratchDir::new("d3-money");
-    append_pair(&scratch, "req-a", "a", &"a".repeat(64));
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let first = fingerprint(Some(&mut page(&cache)), &scratch, &child("agent-a"));
-    append_pair(&scratch, "req-b", "b", &"b".repeat(64));
-    let account_changed = fingerprint(Some(&mut page(&cache)), &scratch, &child("agent-a"));
-    assert_ne!(first, account_changed);
-    append_pair(&scratch, "req-a2", "a", &"a".repeat(64));
-    let request_changed = fingerprint(Some(&mut page(&cache)), &scratch, &child("agent-a"));
-    assert_ne!(account_changed, request_changed);
-}
-
-/// [money] Missing legacy family proof reselects once per window, retaining accepted heads.
-#[test]
-fn legacy_family_reproof_is_once_per_window_and_preserves_accepted_usage() {
-    let cache = sampled_scan::SharedCache::default();
-    let mut index = ScanIndex::default();
-    let key = "root/subagents/agent-a.jsonl".to_string();
-    let entry: ScanIndexEntry = serde_json::from_value(json!({
-        "size_bytes": 1, "modified_unix_seconds": 1,
-        "source_file_fingerprint": "selected", "last_snapshot_fingerprint": "accepted"
-    }))
+        BACKFILL_WINDOW_DAYS,
+        &mut discovery,
+    )
     .unwrap();
-    index.files.insert(key.clone(), entry);
-    let roots = BTreeSet::from(["root".to_string()]);
-    reproof_missing_families(&mut index, "window-a", roots.clone(), &cache);
-    assert!(index.files[&key].source_file_fingerprint.is_empty());
-    index.files.get_mut(&key).unwrap().source_file_fingerprint = "reproved".into();
-    reproof_missing_families(&mut index, "window-a", roots.clone(), &cache);
-    assert_eq!(index.files[&key].source_file_fingerprint, "reproved");
-    reproof_missing_families(&mut index, "window-b", roots, &cache);
-    assert!(index.files[&key].source_file_fingerprint.is_empty());
-    assert_eq!(
-        index.files[&key].last_snapshot_fingerprint.as_deref(),
-        Some("accepted")
+    prepare_owned_scan_candidate(
+        SnapshotSource::ClaudeCode,
+        &mut current,
+        &CodexTitleMetadata::default(),
+        &ClaudeTitleMetadata::default(),
+        Some(&fixture.support),
     );
+    assert_eq!(current.source_file_fingerprint, legacy);
+}
+
+/// [regress] Production ON wiring skips the unchanged child after a paired sibling append.
+#[test]
+fn sibling_append_uses_the_constructor_policy_and_keeps_the_child_body() {
+    let fixture = Fixture::new();
+    let (mut index, first, walk, _) = fixture.run(ScanIndex::default(), true, None, 100);
+    let child = first
+        .iter()
+        .find(|item| item.source_session_id.ends_with("_agent-a"))
+        .unwrap();
+    let before = snapshot_upload_body_witness(child);
+    // The measured 181-child family has no legacy family witness. Model that
+    // identity-only family rather than the separate legacy-fallback case below.
+    index.claude_account_family_witnesses.clear();
+    append_pair(&fixture.support, "req-b2", "b", &"a".repeat(64));
+    let (_, off, _, _) = fixture.run(index.clone(), false, Some(walk.clone()), 100);
+    let (_, second, _, selected) = fixture.run(index, true, Some(walk), 100);
+    assert!(selected > 0 && selected < 3);
+    assert!(second
+        .iter()
+        .any(|item| item.source_session_id.ends_with("_agent-b")));
+    assert!(!second
+        .iter()
+        .any(|item| item.source_session_id.ends_with("_agent-a")));
+    let reread = off
+        .iter()
+        .find(|item| item.source_session_id.ends_with("_agent-a"))
+        .unwrap();
+    assert_eq!(
+        snapshot_upload_body_witness(reread),
+        before,
+        "the retained ON child has the same body as main's actual sibling-triggered reread"
+    );
+}
+
+/// [money] The same legacy count projection selects siblings and preserves accepted heads on refusal.
+#[test]
+fn legacy_count_and_account_changes_reselect_through_the_application_owner() {
+    let fixture = Fixture::new();
+    let (index, _, walk, _) = fixture.run(ScanIndex::default(), true, None, 100);
+    assert!(index.claude_account_family_witnesses.contains_key("root"));
+    append_pair(&fixture.support, "req-b2", "b", &"a".repeat(64));
+    let (mut index, _, walk, selected) = fixture.run(index, true, Some(walk), 100);
+    assert_eq!(
+        selected, 3,
+        "legacy evidence_request_count is a dependency of every member"
+    );
+    let key = local_index_key(&fixture.transcripts.join("root/subagents/agent-a.jsonl"));
+    let accepted = index.files[&key].last_snapshot_fingerprint.clone();
+    // Preserve the actual witness from the prior complete application, then
+    // make one later observation conflict while only the root fits this page.
+    assert!(index.claude_account_family_witnesses.contains_key("root"));
+    append_pair(&fixture.support, "req-conflict", "b", &"b".repeat(64));
+    let (next, _, _, _) = fixture.run(std::mem::take(&mut index), true, Some(walk), 1);
+    assert!(next.files[&key].source_file_fingerprint.is_empty());
+    assert_eq!(next.files[&key].last_snapshot_fingerprint, accepted);
 }
