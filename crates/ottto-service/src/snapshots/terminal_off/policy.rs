@@ -13,18 +13,10 @@ pub(in crate::snapshots) fn marker_at(support: &Path, name: &str) -> bool {
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
 }
 
-/// Shared process pin for local sentinels. A name is statted only on its
-/// first lookup; #990/#998 can use the same helper without another pin owner.
-#[cfg(not(test))]
-pub(in crate::snapshots) fn pinned_marker(name: &'static str) -> bool {
-    static MARKERS: std::sync::Mutex<std::collections::BTreeMap<&'static str, bool>> =
-        std::sync::Mutex::new(std::collections::BTreeMap::new());
-    let mut markers = MARKERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *markers
-        .entry(name)
-        .or_insert_with(|| marker_at(&ottto_core::default_support_dir(), name))
+/// A process-pinned support-dir switch behind the caller's own lock-free
+/// cell. The owner changes the marker and restarts the daemon to apply it.
+pub(in crate::snapshots) fn pinned_marker(cell: &std::sync::OnceLock<bool>, name: &str) -> bool {
+    *cell.get_or_init(|| marker_at(&ottto_core::default_support_dir(), name))
 }
 
 pub(super) fn enabled() -> bool {
@@ -43,16 +35,14 @@ pub(super) fn enabled() -> bool {
 }
 
 /// Q-W policy is pinned at first preparation, including absent/OFF markers.
-/// The scratch-directory seam keeps fixtures isolated from the host policy.
-pub(in crate::snapshots) fn admission_reoffer_window(_support: &Path) -> bool {
+/// Fixtures read their scratch support directory, never the host policy.
+pub(in crate::snapshots) fn admission_reoffer_window(support: &Path) -> bool {
     const NAME: &str = "claude_admission_reoffer_window_enabled";
-    #[cfg(test)]
-    {
-        marker_at(_support, NAME)
-    }
-    #[cfg(not(test))]
-    {
-        pinned_marker(NAME)
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if cfg!(test) {
+        marker_at(support, NAME)
+    } else {
+        pinned_marker(&ENABLED, NAME)
     }
 }
 
