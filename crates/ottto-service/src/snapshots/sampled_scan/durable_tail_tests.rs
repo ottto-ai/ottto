@@ -255,11 +255,6 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
                 .unwrap();
         }
         let key = local_index_key(&path);
-        let limit = if phase == "decode" {
-            limit + 4 * key.len() as u64
-        } else {
-            limit
-        };
         let index_path = root.join("index.json");
         let namespace = Scope("bounded-decode".into());
         let cache = Arc::new(SharedCache::default());
@@ -299,6 +294,15 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
             1,
             "native settlement wrote each record once before effects"
         );
+        let limit = if phase == "decode" {
+            // Cold restore funds its key copies and certificate scope before
+            // asking the decoder for credit. Refuse the decoder itself.
+            limit
+                + 4 * key.len() as u64
+                + cache.retained_checkpoint(&key).unwrap().scope().0.len() as u64
+        } else {
+            limit
+        };
         cache.retained().unwrap().clear();
         let entry = serde_json::to_value(&index.files[&key]).unwrap();
         use std::io::Write;
@@ -550,6 +554,20 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
                     )
                     .unwrap()
                     .finish();
+                // The zero-overlap grant initially lives in pending. A retry
+                // behind its high water promotes that SAME grant to spent
+                // custody and refuses, without consuming another attempt.
+                assert!(matches!(
+                    cache.begin_retail(
+                        source,
+                        &key,
+                        &checkpoint,
+                        &File::open(&path).unwrap(),
+                        record_end,
+                        std::time::Instant::now()
+                    ),
+                    Err(RetailHold::Exhausted)
+                ));
                 // A recovery Full was granted but interrupted before settlement.
                 // This row exercises its bounded pace hold; expiry is covered below.
                 assert!(cache.retail_full(
@@ -677,7 +695,29 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
                     "exact accepted overlap"
                 );
             }
-            assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+            assert_eq!(
+                {
+                    let stores = cache.durable().unwrap();
+                    stores.restore_pending.len() + stores.retail_spent.len()
+                },
+                usize::from(spent),
+                "receipt consumes pending; refused spent authority survives"
+            );
+            if !spent {
+                assert_eq!(
+                    cache.durable_counters(source).unwrap().1.records_written,
+                    2,
+                    "native successor receipt consumed the zero-old-byte grant"
+                );
+                let mut disk = fixture::store(&index_path, DurableSource::ClaudeCode);
+                let record = store::tests::found(
+                    disk.read(&store::key_digest(DurableSource::ClaudeCode, &key)),
+                );
+                assert_eq!(
+                    record.record.certificate.sealed_offset,
+                    record_end + suffix_bytes
+                );
+            }
             assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
             let store::LeaseWait::Granted(lease) =
                 cache.acquire_active(source, store::ACTIVE_BYTES)
@@ -744,7 +784,8 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
             before,
             "prepare failure reads no suffix"
         );
-        assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+        assert_eq!(cache.durable().unwrap().restore_pending.len(), 1);
+        assert!(cache.durable().unwrap().retail_spent.is_empty());
         assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
         assert_eq!(scan.sampling.as_ref().unwrap().full_files, 0);
         assert_eq!(scan.sampling.as_ref().unwrap().native_bytes, 0);
@@ -824,7 +865,13 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
             };
             lease.release();
             assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
-            assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+            assert_eq!(
+                {
+                    let stores = cache.durable().unwrap();
+                    stores.restore_pending.len() + stores.retail_spent.len()
+                },
+                1
+            );
             sampled_jsonl::preparation_tests::set(None);
             continue;
         }
@@ -934,12 +981,31 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
             0,
             "exact old accepted overlap"
         );
+        assert!(
+            cache.durable().unwrap().restore_pending.is_empty(),
+            "native receipt consumed the pending grant"
+        );
+        assert!(
+            cache.durable().unwrap().retail_spent.is_empty(),
+            "zero old bytes needed no spent custody"
+        );
         assert_eq!(
-            cache.durable().unwrap().retail_spent.len(),
+            cache.durable_counters(source).unwrap().1.records_written,
+            2,
+            "initial and exact successor native receipts"
+        );
+        let mut disk = fixture::store(&index_path, DurableSource::ClaudeCode);
+        let record =
+            store::tests::found(disk.read(&store::key_digest(DurableSource::ClaudeCode, &key)));
+        assert_eq!(
+            record.record.certificate.sealed_offset,
+            record_end + suffix.len() as u64
+        );
+        assert_eq!(
+            cache.durable().unwrap().counters.retail_attempts,
             1,
             "no second Q11 grant"
         );
-        assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
         let (_, events) = crate::local_resource_diagnostics::capture(|| {
             let store::LeaseWait::Granted(lease) =
                 cache.acquire_active(source, store::ACTIVE_BYTES)
@@ -1405,8 +1471,11 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
         store::test_hooks::set_before_dir_sync(Some(Box::new(|_| panic!("disabled sync"))));
         assert_eq!(cache.reconcile_pending_key(source, &key), None);
         assert_eq!(cache.durable_hold(source, &key, &index, &mut None), None);
-        let ((mut index, degraded), events) =
-            crate::local_resource_diagnostics::capture(|| run(index));
+        let ((mut index, degraded), events) = crate::local_resource_diagnostics::capture(|| {
+            let result = run(index);
+            cache.durable_alarm(source);
+            result
+        });
         assert_eq!(
             degraded.snapshots.len(),
             1,
@@ -4238,6 +4307,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                        refusal: &str,
                        at: &str| {
                 let cache_probe = cache.clone();
+                let rediscover = at.starts_with("2028");
                 let mut scan = OwnedSourceScan::new_with_identity_capture(
                     source,
                     std::slice::from_ref(&sessions),
@@ -4248,7 +4318,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     false,
                     None,
                     &[],
-                    false,
+                    rediscover,
                     true,
                     true,
                 );
@@ -4683,6 +4753,57 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
     }
 }
 
+/// M3 writes before effects/save. Verify the native receipt and its actual v3
+/// record, then require the post-save hook to leave that exact record intact.
+fn assert_native_write_before_save(
+    cache: &SharedCache,
+    lock: &crate::locked_state_dir::LockedStateDir,
+    source: SnapshotSource,
+    index: &ScanIndex,
+    key: &str,
+) {
+    let ds = durable_source(source).unwrap();
+    let digest = store::key_digest(ds, key);
+    let (before, bytes, path) = {
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(ds).as_mut().unwrap();
+        let record = store::tests::found(slot.store.read(&digest));
+        assert_eq!(record.format, store::FORMAT_V3);
+        assert_eq!(
+            record.record.acquisition.unwrap().acquired_revision,
+            effective_revision(source)
+        );
+        assert_eq!(
+            record.record.certificate.length,
+            index.files[key].size_bytes
+        );
+        let name = digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let path = slot.dir.join(format!("{name}.rec"));
+        (
+            slot.store.counters().records_written,
+            std::fs::read(&path).unwrap(),
+            path,
+        )
+    };
+    assert_eq!(before, 1, "one native receipt before the save hook");
+    assert_eq!(
+        cache
+            .durable_write_after_save(lock, source, index)
+            .unwrap()
+            .written,
+        0,
+        "native-settled acquisition is not offered twice"
+    );
+    assert_eq!(
+        cache.durable_counters(source).unwrap().1.records_written,
+        before
+    );
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}
+
 // Movable native transition rows; no replacement money reducer/comparator.
 // Compare the exact production SnapshotBatchRequest serialization on the same physical file.
 fn a1a_wire(support: &Path, index: &mut ScanIndex, scan: &mut SourceScanResult) -> Vec<u8> {
@@ -5061,13 +5182,7 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
                 .collect(),
         );
         prior.save(&index_path).unwrap();
-        assert_eq!(
-            warm.cache
-                .durable_write_after_save(lock, source, &prior)
-                .unwrap()
-                .written,
-            1
-        );
+        assert_native_write_before_save(&warm.cache, lock, source, &prior, &key);
         let scope = warm
             .cache
             .retained_checkpoint(&key)
@@ -5411,10 +5526,23 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
             .unwrap()
             .set_modified(mtime + std::time::Duration::from_secs(2))
             .unwrap();
-        let ((held, _, mode), read) =
+        let ((mut held, mut changed, mode), read) =
             a0h_observe(|| b1g_scan(&owner, &roots, &root, &index_path, &mut committed));
-        assert_eq!(mode.0, 0, "{arm}: absent-record mtime-only");
-        assert_eq!(read, (0, 0));
+        assert_eq!(
+            mode,
+            (1, 0, 0),
+            "{arm}: absent record cannot disprove a same-size edit"
+        );
+        assert_eq!(read.1, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(changed.snapshots.len(), 1);
+        assert_eq!(changed.snapshots[0].input_tokens, 100);
+        assert_eq!(changed.snapshots[0].request_count, 1);
+        let cold = E2ScanFixture::default();
+        let (mut cold_index, mut cold_scan, _) = a0h_scan(&cold, &roots, &root, committed.clone());
+        assert_eq!(
+            a0h_wire(&root, &mut held, &mut changed),
+            a0h_wire(&root, &mut cold_index, &mut cold_scan)
+        );
         assert_eq!(
             held.files[&key].size_bytes,
             committed.files[&key].size_bytes
@@ -5670,7 +5798,6 @@ fn observe_consumed<T>(f: impl FnOnce() -> T) -> (T, u64) {
 pub(crate) struct ContinuationDurableState {
     key: String,
     digest: store::Digest32,
-    scope: Scope,
     namespace: Scope,
     dir: PathBuf,
     corrupt: Vec<store::Digest32>,
@@ -5722,7 +5849,10 @@ impl ContinuationDurableState {
         let digest = binding.key;
         let allowlist = ds.properties().allowlist();
         let record = PendingRecord {
-            acquisition: fixture_acquisition(source),
+            acquisition: Some(store::AcquisitionFields {
+                acquired_revision: effective_revision(source),
+                protocol: AcquisitionProtocol::WriteAhead,
+            }),
             binding,
             certificate: certificate(Path::new(&key), &old_scope),
             body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
@@ -5737,7 +5867,8 @@ impl ContinuationDurableState {
             record.binding.key = *key;
             pending.push(record);
         }
-        cache.durable_note_scope(source, &key, &scope);
+        // Native v3 class retirement replaces M1's scope-only deletion.
+        cache.durable_exclude_native_class(&key);
         let mut stores = cache.durable().unwrap();
         let slot = stores.slot(ds).as_mut().unwrap();
         let receipt = slot
@@ -5774,7 +5905,6 @@ impl ContinuationDurableState {
         Self {
             key,
             digest,
-            scope,
             namespace: namespace.clone(),
             dir: slot.dir.clone(),
             corrupt,
@@ -5789,10 +5919,9 @@ impl ContinuationDurableState {
         assert_eq!(slot.dir, self.dir, "ordinary directory binding");
         assert_eq!(slot.namespace, self.namespace, "ordinary namespace binding");
         assert!(!slot.identity_capture);
-        assert_eq!(
-            slot.decided.get(&self.key).and_then(ScopeDecision::scope),
-            Some(&self.scope),
-            "ordinary GC decision survives continuation"
+        assert!(
+            matches!(slot.decided.get(&self.key), Some(ScopeDecision::Excluded)),
+            "ordinary native-class GC decision survives continuation"
         );
         assert_eq!(
             store::tests::continuation_pass_state(&slot.store),
@@ -5818,10 +5947,11 @@ impl ContinuationDurableState {
             .collect::<String>();
         assert!(
             !self.dir.join(format!("{name}.rec")).exists(),
-            "retained ordinary decision rejects obsolete scope at EOF GC"
+            "retained ordinary class decision retires native v3 at EOF GC"
         );
         let (_, stats) = cache.durable_counters(SnapshotSource::Codex).unwrap();
         assert_eq!(stats.gc_records_deleted, 1);
+        assert_eq!(stats.native_class_retired, 1);
     }
 
     pub(crate) fn assert_breaker_at_eof(&self, cache: &SharedCache) {
@@ -6178,13 +6308,7 @@ impl O3Fixture {
                 .collect(),
         );
         prior.save(&index_path).unwrap();
-        assert_eq!(
-            warm.cache
-                .durable_write_after_save(lock, source, &prior)
-                .unwrap()
-                .written,
-            1
-        );
+        assert_native_write_before_save(&warm.cache, lock, source, &prior, &key);
         let record_path = {
             let mut stores = warm.cache.durable().unwrap();
             let slot = stores.slots[DurableSource::ClaudeCode.slot()]
@@ -6674,23 +6798,26 @@ fn b4_structural_transition(near_cap: bool) {
     let index_path = root.join("index.json");
     let cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(source, &index_path, &namespace, true);
-    let run = |cache: Arc<SharedCache>, index, at: &str| {
-        let scan = OwnedSourceScan::new_with_identity_capture(
-            source,
-            std::slice::from_ref(&sessions),
-            index,
-            at,
-            1,
-            100,
-            false,
-            None,
-            &[],
-            false,
-            true,
-            true,
-        )
-        .with_sampled_acquisition(cache, namespace.clone());
-        fixture::scan_reads(scan, 10_000)
+    let run = |cache: Arc<SharedCache>, mut index: ScanIndex, at: &str| {
+        index.activate_effective_upload_body_witness_revision(effective_revision(source));
+        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+            let scan = OwnedSourceScan::new_with_identity_capture(
+                source,
+                std::slice::from_ref(&sessions),
+                index,
+                at,
+                1,
+                100,
+                false,
+                None,
+                &[],
+                false,
+                true,
+                true,
+            )
+            .with_sampled_acquisition(cache, namespace.clone());
+            fixture::scan_reads(scan, 10_000)
+        })
     };
     let (mut index, mut first, _) =
         run(cache.clone(), ScanIndex::default(), "2026-10-29T12:00:00Z");
@@ -6712,13 +6839,7 @@ fn b4_structural_transition(near_cap: bool) {
         "real accepted incidence before holding growth"
     );
     index.save(&index_path).unwrap();
-    assert_eq!(
-        cache
-            .durable_write_after_save(lock, source, &index)
-            .unwrap()
-            .written,
-        1
-    );
+    assert_native_write_before_save(&cache, lock, source, &index, &key);
     cache.retained().unwrap().clear();
     let original_disk = store_snapshot(&store::store_dir_for_index(&index_path));
     let append =
@@ -6904,23 +7025,26 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
     let index_path = root.join("index.json");
     let cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(source, &index_path, &namespace, true);
-    let run = |index, at: &str| {
-        let scan = OwnedSourceScan::new_with_identity_capture(
-            source,
-            std::slice::from_ref(&sessions),
-            index,
-            at,
-            365,
-            100,
-            false,
-            None,
-            &[],
-            false,
-            true,
-            true,
-        )
-        .with_sampled_acquisition(cache.clone(), namespace.clone());
-        fixture::scan_reads(scan, 10_000)
+    let run = |mut index: ScanIndex, at: &str| {
+        index.activate_effective_upload_body_witness_revision(effective_revision(source));
+        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+            let scan = OwnedSourceScan::new_with_identity_capture(
+                source,
+                std::slice::from_ref(&sessions),
+                index,
+                at,
+                365,
+                100,
+                false,
+                None,
+                &[],
+                false,
+                true,
+                true,
+            )
+            .with_sampled_acquisition(cache.clone(), namespace.clone());
+            fixture::scan_reads(scan, 10_000)
+        })
     };
     let (mut index, mut first, _) = run(ScanIndex::default(), "2026-10-20T12:00:00Z");
     a0h_wire(&root, &mut index, &mut first);
@@ -6932,13 +7056,7 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
             .collect(),
     );
     index.save(&index_path).unwrap();
-    assert_eq!(
-        cache
-            .durable_write_after_save(lock, source, &index)
-            .unwrap()
-            .written,
-        1
-    );
+    assert_native_write_before_save(&cache, lock, source, &index, &key);
     let end = index.files[&key].size_bytes;
     let census = serde_json::to_value(&index.claude_request_census).unwrap();
     assert!(
@@ -8661,13 +8779,7 @@ fn p2_restart_restore_tail_persists_successor_and_restarts_again() {
             .collect(),
     );
     index.save(&index_path).unwrap();
-    assert_eq!(
-        warm.cache
-            .durable_write_after_save(lock, source, &index)
-            .unwrap()
-            .written,
-        1
-    );
+    assert_native_write_before_save(&warm.cache, lock, source, &index, &key);
     drop(warm);
 
     for (id, tokens, total, requests) in
@@ -8724,14 +8836,7 @@ fn p2_restart_restore_tail_persists_successor_and_restarts_again() {
                 .collect(),
         );
         index.save(&index_path).unwrap();
-        assert_eq!(
-            restarted
-                .cache
-                .durable_write_after_save(lock, source, &index)
-                .unwrap()
-                .written,
-            1
-        );
+        assert_native_write_before_save(&restarted.cache, lock, source, &index, &key);
         restarted.cache.durable_gc(lock, source, &index).unwrap();
         assert_eq!(
             ScanIndex::load(&index_path).unwrap().files[&key].size_bytes,
@@ -8753,7 +8858,7 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
         ("carry", true),
         ("capped", true),
         ("replay", true),
-        ("quiet-old-writer", false),
+        ("inert-growth", false),
     ] {
         for pin in ["v3"] {
             let root = crate::test_scratch::private_dir("ottto-a1a-transition");
@@ -8785,13 +8890,7 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                     .collect(),
             );
             index.save(&index_path).unwrap();
-            assert_eq!(
-                warm.cache
-                    .durable_write_after_save(lock, source, &index)
-                    .unwrap()
-                    .written,
-                1
-            );
+            assert_native_write_before_save(&warm.cache, lock, source, &index, &key);
 
             let sealed = warm
                 .cache
@@ -8816,6 +8915,23 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                 "warm census proof"
             );
             drop(warm);
+            if !grow {
+                let quiet = E2ScanFixture::default();
+                quiet.begin_durable(source, &root, &index_path);
+                let ((_, idle, modes), consumed) = observe_consumed(|| {
+                    a1a_scan_at(
+                        &quiet,
+                        &roots,
+                        &root,
+                        ScanIndex::load(&index_path).unwrap(),
+                        "2026-08-02T08:00:00Z",
+                    )
+                });
+                assert!(idle.snapshots.is_empty());
+                assert_eq!(modes, (0, 0, 0));
+                assert_eq!(consumed, 0);
+                assert_eq!(quiet.cache.durable_counters(source).unwrap().0.restored, 0);
+            }
             if grow {
                 std::fs::OpenOptions::new()
                     .append(true)
@@ -8823,10 +8939,18 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                     .unwrap()
                     .write_all(a1a_row("second", 200).as_bytes())
                     .unwrap();
+            } else {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"{}\n")
+                    .unwrap();
             }
+            let mut receipted = bytes;
             for restart in 0..2 {
                 let mut prior = ScanIndex::load(&index_path).unwrap();
-                if arm == "859" || arm == "quiet-old-writer" {
+                if arm == "859" || arm == "inert-growth" {
                     prior
                         .files
                         .get_mut(&key)
@@ -8914,23 +9038,30 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                 let (mut restored_index, mut restored, modes) = page;
                 assert_eq!(
                     modes,
-                    if grow { (0, 1, 0) } else { (0, 0, 1) },
+                    if restart == 0 { (0, 1, 0) } else { (0, 0, 1) },
                     "{arm} {pin} restart {restart}"
                 );
                 assert_eq!(
                     consumed,
-                    if grow {
+                    if restart != 0 {
+                        0
+                    } else if grow {
                         a1a_row("second", 200).len() as u64
                     } else {
-                        0
+                        3
                     }
                 );
-                let window = sealed.min(4096);
-                let copies = if grow { 4 } else { 2 }; // certificate, then Tail prepare's cheap guards
+                let certificate_end = if restart == 0 {
+                    sealed
+                } else {
+                    std::fs::metadata(&path).unwrap().len()
+                };
+                let window = certificate_end.min(4096);
+                let copies = if restart == 0 { 4 } else { 2 }; // certificate, then Tail prepare's cheap guards
                 assert_eq!(samples.len(), copies);
                 for pair in samples.chunks_exact(2) {
                     assert_eq!(pair[0].offset, Ok(0));
-                    assert_eq!(pair[1].offset, Ok(sealed - window));
+                    assert_eq!(pair[1].offset, Ok(certificate_end - window));
                     assert!(
                         pair.iter()
                             .all(|r| r.requested == window as usize
@@ -8940,14 +9071,14 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                 let cheap_checks: u64 = samples.iter().map(|r| r.result.unwrap() as u64).sum();
                 let certificate_checks: u64 =
                     samples[..2].iter().map(|r| r.result.unwrap() as u64).sum();
-                assert_eq!(certificate_checks, 2 * sealed.min(4096));
+                assert_eq!(certificate_checks, 2 * certificate_end.min(4096));
                 assert!(certificate_checks <= 8192);
                 assert_eq!(
                     cheap_checks - certificate_checks,
-                    if grow { 2 * window } else { 0 }
+                    if restart == 0 { 2 * window } else { 0 }
                 );
                 assert_eq!(cheap_checks, copies as u64 * window);
-                assert!(cheap_checks <= if grow { 16384 } else { 8192 });
+                assert!(cheap_checks <= if restart == 0 { 16384 } else { 8192 });
                 let counts = owner.cache.durable_counters(source).unwrap().0;
                 assert_eq!(counts.restored, 1);
                 assert_eq!(counts.durable_restore_after_selection_clear, 1);
@@ -8979,12 +9110,38 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                     a1a_wire(&root, &mut cold_index, &mut cold_scan),
                     "exact production emitted body: {arm} {pin}"
                 );
-                // First GC and second process must retain the exact old image; no write is invoked.
+                // The first Tail receipted its successor before the lost index
+                // save. The second restart must use that exact successor.
+                let successor = std::fs::read(&disk_path).unwrap();
+                assert_eq!(
+                    owner
+                        .cache
+                        .durable_counters(source)
+                        .unwrap()
+                        .1
+                        .records_written,
+                    u64::from(restart == 0)
+                );
+                if restart == 0 {
+                    assert_ne!(successor, receipted);
+                } else {
+                    assert_eq!(successor, receipted);
+                }
+                let mut disk = fixture::store(&index_path, DurableSource::ClaudeCode);
+                let record = store::tests::found(
+                    disk.read(&store::key_digest(DurableSource::ClaudeCode, &key)),
+                );
+                assert_eq!(record.format, store::FORMAT_V3);
+                assert_eq!(
+                    record.record.certificate.sealed_offset,
+                    std::fs::metadata(&path).unwrap().len()
+                );
                 owner
                     .cache
                     .durable_gc(lock, source, &restored_index)
                     .unwrap();
-                assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
+                assert_eq!(std::fs::read(&disk_path).unwrap(), successor);
+                receipted = successor;
             }
             let _ = std::fs::remove_dir_all(root);
         }
@@ -9034,13 +9191,7 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
     prior.save(&index_path).unwrap();
     assert!(!prior.files[&key].source_file_fingerprint.is_empty());
     assert!(prior.files[&key].last_upload_body_witness.is_some());
-    assert_eq!(
-        warm.cache
-            .durable_write_after_save(lock, source, &prior)
-            .unwrap()
-            .written,
-        1
-    );
+    assert_native_write_before_save(&warm.cache, lock, source, &prior, &key);
     let (disk_path, survivor) = {
         let mut stores = warm.cache.durable().unwrap();
         let slot = stores.slot(DurableSource::ClaudeCode).as_mut().unwrap();
@@ -9451,13 +9602,7 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     prior.save(&index_path).unwrap();
     assert!(!prior.files[&key].source_file_fingerprint.is_empty());
     assert!(prior.files[&key].last_upload_body_witness.is_some());
-    assert_eq!(
-        warm.cache
-            .durable_write_after_save(lock, source, &prior)
-            .unwrap()
-            .written,
-        1
-    );
+    assert_native_write_before_save(&warm.cache, lock, source, &prior, &key);
     let (disk_path, survivor) = {
         let mut stores = warm.cache.durable().unwrap();
         let slot = stores.slot(ds).as_mut().unwrap();
@@ -10027,11 +10172,12 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
                 std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_275_201),
             ))
             .unwrap();
-        // Exercise the certificate path even when the optional current census
-        // is absent. Main's independent native shrink proof otherwise bypasses
-        // the durable record (and its certificate-refusal diagnostic).
-        index.claude_request_census.remove(&key);
-        let (mut changed, body, modes) = run(cache.clone(), index, "2026-10-29T12:00:00Z");
+        // Preserve the real census: removing it forces an authority-family
+        // replay and bypasses optional restore even for the equal-size row.
+        let ((mut changed, body, modes), events) =
+            crate::local_resource_diagnostics::capture(|| {
+                run(cache.clone(), index, "2026-10-29T12:00:00Z")
+            });
         assert_eq!(body.snapshots.len(), 1, "{edit}: changed body acquired");
         assert_eq!(
             body.snapshots[0].input_tokens,
@@ -10041,14 +10187,18 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
         assert_eq!(body.unreadable_path_count, 0);
         assert!(!changed.files[&key].has_unverified_source());
         let counters = cache.durable_counters(source).unwrap().0;
-        assert_eq!(
-            counters.certificate_refused.get(if edit == "equal" {
-                "same_size_edit"
-            } else {
-                "shrunk"
-            }),
-            Some(&1)
-        );
+        if edit == "equal" {
+            assert_eq!(counters.certificate_refused.get("same_size_edit"), Some(&1));
+        } else {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e["counts"]["full_reads"]["real_edit"]["shrunk"] == 1)
+                    .count(),
+                1,
+                "independent census proves the shrink at the native Full boundary"
+            );
+        }
         assert!(
             counters.resource_full.is_empty(),
             "A2 is independent of resource fallback/pacer"

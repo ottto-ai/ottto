@@ -1561,10 +1561,20 @@ fn scan_worker_stack_margin_receipt() {
         .name("ottto-snapshot-sync".to_string())
         .stack_size(STACK_BYTES)
         .spawn(|| {
+            let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
             let (mut pipeline, _, _, deadline) =
                 refused_then_conflicted_holding("stack-margin", true);
             let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
             assert!(pipeline.durable_records() > 0, "written after the save");
+            // Scoped restore waits on a quiet file. Inert growth exercises the
+            // restore+Tail stack without changing the offered usage body.
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(pipeline.transcript())
+                .unwrap()
+                .write_all(b"{}\n")
+                .unwrap();
             let due = deadline.as_u64().unwrap() + 60;
             let (day2, _, bytes) = pipeline.measured_cycle(due, true);
             assert!(day2.result.is_ok(), "{:?}", day2.result);

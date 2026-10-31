@@ -359,17 +359,18 @@ fn cold_store_each_fence_class_and_certificate_reason_retires_before_one_full() 
             fulls, 1,
             "production scan selects exactly one Full, row {row}"
         );
-        let (_, idle, fulls) = rig.scan(cache.clone(), next);
+        let (mut settled, idle, fulls) = rig.scan(cache.clone(), next);
         assert_eq!(
             fulls, 0,
             "ordinary idle pass never repeats the Full, row {row}"
         );
         assert!(idle.snapshots.is_empty());
+        settled.save(&rig.index_path).unwrap();
         cache
             .durable_write_after_save(
                 crate::locked_state_dir::held_for(&rig.index_path).unwrap(),
                 SnapshotSource::Codex,
-                &rig.index,
+                &settled,
             )
             .unwrap();
         assert_eq!(
