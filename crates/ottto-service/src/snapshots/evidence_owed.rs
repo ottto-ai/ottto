@@ -70,50 +70,103 @@ pub(crate) fn clear(entry: &mut ScanIndexEntry, kind: Kind) {
     }
 }
 
-/// Round 3 (C5 P1): what a Claude traversal started under, persisted on its
-/// checkpoint (bounded: one count, one upload-context fingerprint and the
-/// configured roots the context fingerprint hashed).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What a Claude traversal started under, persisted on its checkpoint (ON
+/// only) so a later context change can be classified: the backfill days, the
+/// active upload-context fingerprint, the context fingerprint without roots
+/// (scanner identity, replay generation and both inputs above) and one key
+/// digest per configured root, never the root paths. Bounded by the root
+/// count. No `Debug` of the digests.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TraversalContextInputs {
-    pub(crate) backfill_window_days: u64,
-    pub(crate) active_upload_context: Option<String>,
-    pub(crate) roots: Vec<PathBuf>,
+    backfill_window_days: u64,
+    active_upload_context: Option<String>,
+    rootless: String,
+    roots: BTreeSet<crate::durable_tail_store::Digest32>,
 }
-crate::heap_layout_bound::fields!(TraversalContextInputs; backfill_window_days, active_upload_context, roots);
+crate::heap_layout_bound::fields!(TraversalContextInputs; backfill_window_days, active_upload_context, rootless, roots);
 
-/// ON, ContextChanged start: the retained traversal's fingerprint is
-/// reproduced from its own roots, backfill and upload context with today's
-/// scanner identity and replay generation, and today's roots only add to its
-/// roots. Then only roots were added, the backfill changed or the active
-/// upload context (policy) changed: unchanged files owe evidence (their upload
-/// receipts still own any upload-context read). A replay or scanner identity
-/// change, removed roots or an unrecorded start keep main's clear.
+impl std::fmt::Debug for TraversalContextInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraversalContextInputs")
+            .field("backfill_window_days", &self.backfill_window_days)
+            .field("roots", &self.roots.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TraversalContextInputs {
+    pub(super) fn capture(index: &ScanIndex, roots: &[PathBuf], backfill_window_days: u64) -> Self {
+        Self {
+            backfill_window_days,
+            active_upload_context: index.active_upload_context_fingerprint.clone(),
+            rootless: rootless_context(
+                index,
+                index.active_upload_context_fingerprint.as_deref(),
+                backfill_window_days,
+            ),
+            roots: root_digests(roots),
+        }
+    }
+}
+
+fn rootless_context(
+    index: &ScanIndex,
+    active_upload_context: Option<&str>,
+    backfill_window_days: u64,
+) -> String {
+    scan_traversal_context_fingerprint_with(
+        SnapshotSource::ClaudeCode,
+        &[],
+        active_upload_context,
+        index.historical_replay_generation.as_deref(),
+        backfill_window_days,
+    )
+}
+
+fn root_digests(roots: &[PathBuf]) -> BTreeSet<crate::durable_tail_store::Digest32> {
+    roots
+        .iter()
+        .map(|root| {
+            crate::durable_tail_store::key_digest(
+                crate::durable_tail_store::DurableSource::ClaudeCode,
+                &local_index_key(root),
+            )
+        })
+        .collect()
+}
+
+/// ON, context-changed start: the retained start's inputs, re-hashed with
+/// today's scanner identity and replay generation, still give its rootless
+/// fingerprint, and today's roots only add to its roots. Then only roots were
+/// added, the backfill changed or the active upload context (policy) changed,
+/// so unchanged files owe evidence (their upload receipts still own any
+/// upload-context read). A replay or scanner identity change, a removed root
+/// or a start without recorded inputs keeps main's clear.
 pub(super) fn context_change_owes(
     source: SnapshotSource,
     roots: &[PathBuf],
     index: &ScanIndex,
     backfill_window_days: u64,
 ) -> bool {
-    let Some(retained) = index.traversal.as_ref() else {
+    let Some(inputs) = index
+        .traversal
+        .as_ref()
+        .and_then(|retained| retained.context_inputs.as_ref())
+    else {
         return false;
     };
-    let Some(inputs) = retained.context_inputs.as_ref() else {
-        return false;
-    };
-    let current = roots.iter().collect::<BTreeSet<_>>();
+    let current = root_digests(roots);
     enabled()
         && source == SnapshotSource::ClaudeCode
-        && inputs.roots.iter().all(|root| current.contains(root))
+        && inputs.roots.is_subset(&current)
         && (inputs.backfill_window_days != backfill_window_days
             || inputs.active_upload_context != index.active_upload_context_fingerprint
             || inputs.roots.len() != current.len())
-        && scan_traversal_context_fingerprint_with(
-            source,
-            &inputs.roots,
+        && rootless_context(
+            index,
             inputs.active_upload_context.as_deref(),
-            index.historical_replay_generation.as_deref(),
             inputs.backfill_window_days,
-        ) == retained.context_fingerprint
+        ) == inputs.rootless
 }
 
 /// B-P2 under ON: an unACKed head is a real invalidation; it keeps main's
@@ -907,24 +960,39 @@ mod tests {
         );
     }
 
-    /// [regress] Round 3 (C5 P1: 57,306 files in 7 ContextChanged starts):
-    /// ON, a start whose context only added roots, changed the backfill or the
-    /// active upload context owes evidence; a replay change, removed roots, an
-    /// unrecorded start or OFF keep main's clear.
+    /// [regress] A context-changed start that only added roots, changed the
+    /// backfill or the active upload context re-armed every unchanged file:
+    /// ON owes them instead. A replay change, a removed root, a start without
+    /// recorded inputs, a non-Claude source or OFF keep main's clear, and OFF
+    /// records no inputs.
     #[test]
     fn context_change_owes_only_for_added_roots_backfill_or_upload_context() {
         let a = [PathBuf::from("/synthetic/root-a")];
         let b = PathBuf::from("/synthetic/root-b");
         let ab = [a[0].clone(), b.clone()];
+        let start = |index: &mut ScanIndex| {
+            ensure_bounded_traversal(
+                SnapshotSource::ClaudeCode,
+                &a,
+                index,
+                "2026-08-02T07:00:00Z",
+                30,
+            )
+        };
+        let mut off = ScanIndex::default();
+        start(&mut off);
+        assert!(off.traversal.as_ref().unwrap().context_inputs.is_none());
         let mut index = ScanIndex::default();
-        ensure_bounded_traversal(
-            SnapshotSource::ClaudeCode,
-            &a,
-            &mut index,
-            "2026-08-02T07:00:00Z",
-            30,
+        {
+            let _on = EvidenceOwedForTest::on();
+            start(&mut index);
+        }
+        let inputs = index.traversal.as_ref().unwrap().context_inputs.clone();
+        assert!(inputs.is_some());
+        assert!(
+            !format!("{inputs:?}").contains("synthetic"),
+            "no root bytes"
         );
-        assert!(index.traversal.as_ref().unwrap().context_inputs.is_some());
         let owes = |index: &ScanIndex, roots: &[PathBuf], days| {
             context_change_owes(SnapshotSource::ClaudeCode, roots, index, days)
         };

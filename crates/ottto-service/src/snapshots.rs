@@ -2725,10 +2725,9 @@ struct ScanTraversalCheckpoint {
     /// counts name their files instead of silently folding them into totals.
     #[serde(default, skip_serializing_if = "ScanTraversalResidue::is_empty")]
     residue: ScanTraversalResidue,
-    /// #1025 round 3 (Claude only): the backfill and active upload context
-    /// this traversal started under, so the next start can tell a context
-    /// change that owes evidence from one that must clear. Written whatever
-    /// the switch; read only by evidence owed.
+    /// Claude with evidence owed ON: what this traversal started under (no
+    /// root paths), so the next start can tell a context change that owes
+    /// evidence from one that must clear. Read only by evidence owed.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -43584,13 +43583,9 @@ fn ensure_bounded_traversal(
         unhealthy_retry_not_before_unix_seconds: None,
         counts,
         residue: ScanTraversalResidue::default(),
-        context_inputs: (source == SnapshotSource::ClaudeCode).then(|| {
-            evidence_owed::TraversalContextInputs {
-                backfill_window_days,
-                active_upload_context: index.active_upload_context_fingerprint.clone(),
-                roots: roots.to_vec(),
-            }
-        }),
+        context_inputs: (source == SnapshotSource::ClaudeCode && evidence_owed::enabled()).then(
+            || evidence_owed::TraversalContextInputs::capture(index, roots, backfill_window_days),
+        ),
     });
     if source == SnapshotSource::ClaudeCode
         && index
