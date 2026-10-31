@@ -1660,6 +1660,8 @@ impl<R: BufRead + Seek> Decoder<R> {
                                     self.history_scalar(value, upgrade_replay::State::refused())?
                                 };
                         }
+                        // OFF retains main's decode-and-drop positional slot.
+                        "reread_guard" => {}
                         "claude_desktop_store_inventory" => {
                             // No new refusal: this key was unknown to the last
                             // release. A digest is 64 bytes plus its quotes, so
