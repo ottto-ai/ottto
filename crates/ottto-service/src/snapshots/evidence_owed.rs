@@ -260,7 +260,8 @@ impl EvidenceContract {
 /// Accumulate `snapshots` into the index's pending and stamp each touched
 /// family: the current contract only if its pending was empty before or
 /// already carried that same stamp; otherwise `None` (mixed), so a stamp is
-/// never laundered. Written only with the switch ON. A durable-tail
+/// never laundered. Written with the switch OFF too (nothing reads it OFF),
+/// so the ON flip finds stamped evidence. A durable-tail
 /// restore folds here as well: its record is keyed by the recorded contract
 /// (`Interpretation::identity_contract`), so it was built under `current`.
 pub(super) fn stamped<T>(
@@ -282,9 +283,6 @@ fn stamp_families<T>(
     census_window_end: &str,
     accumulate: impl FnOnce(&mut ScanIndex) -> T,
 ) -> T {
-    if !enabled() {
-        return accumulate(index);
-    }
     let current = EvidenceContract::current(index);
     let prior = roots
         .into_iter()
