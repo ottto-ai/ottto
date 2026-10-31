@@ -296,6 +296,16 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
         crate::snapshots::state_v2::live_key_digests(&route_binding).unwrap()
     };
     assert_eq!(live().incomplete_reason, Some(IncompleteReason::Off));
+    // Pi has no key mapping: never an empty complete set that a sweep could erase by.
+    let pi = crate::snapshots::state_v2::live_key_digests(
+        &crate::snapshots::scan_index_persistence::Binding {
+            source: crate::snapshots::scan_index_persistence::Source::Pi,
+            ..route_binding.clone()
+        },
+    )
+    .unwrap();
+    assert!(!pi.complete && pi.digests.is_empty());
+    assert_eq!(pi.incomplete_reason, Some(IncompleteReason::Off));
     f.published();
     let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
     let file = serde_json::from_value(serde_json::json!({

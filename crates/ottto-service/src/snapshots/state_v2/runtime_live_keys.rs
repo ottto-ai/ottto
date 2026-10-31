@@ -48,15 +48,9 @@ pub(crate) fn live_key_digests(binding: &Binding) -> Result<LiveKeys> {
     let source = match binding.source {
         Source::Claude => DurableSource::ClaudeCode,
         Source::Codex => DurableSource::Codex,
-        // DurableSource deliberately excludes Pi: no restart records exist.
-        Source::Pi => {
-            return Ok(LiveKeys {
-                complete: true,
-                incomplete_reason: None,
-                generation: 0,
-                digests: BTreeSet::new(),
-            })
-        }
+        // No Pi key mapping yet: never vouch for an empty set (a sweep would
+        // erase every Pi record once Pi gains restart records). Map with Pi-ON.
+        Source::Pi => return Ok(LiveKeys::incomplete(IncompleteReason::Off)),
     };
     let route = {
         let states = states().lock().map_err(|_| Hold::DbUnavailable)?;
