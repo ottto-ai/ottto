@@ -5699,10 +5699,14 @@ impl SharedCache {
                     });
                 slot.skill_label_purge_complete =
                     failed == 0 && !slot.store.private_label_purge_needed(None);
-                slot.skill_label_purge_failures = if failed == 0 {
+                slot.skill_label_purge_failures = if failed > 0 {
+                    slot.skill_label_purge_failures.saturating_add(1)
+                } else if slot.skill_label_purge_complete {
                     0
                 } else {
-                    slot.skill_label_purge_failures.saturating_add(1)
+                    // A bounded partial page is progress, not a verified
+                    // successful traversal that can clear earlier failures.
+                    slot.skill_label_purge_failures
                 };
                 let alarm = slot.skill_label_purge_failures > 3;
                 for (class, count) in [
