@@ -2520,10 +2520,11 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
     }
     let before = sticky_money(&key_item);
     let mut no_hint = key_item.clone();
-    assert!(matches!(
+    assert_eq!(
         sticky_apply(&mut no_hint, &key_proof, &ledger).unwrap(),
-        Tagged::Fallback { .. }
-    ));
+        Tagged::Sent { refusals: 1 }
+    );
+    assert_eq!(sticky_money(&no_hint), before);
     let (result, alarms) = crate::local_resource_diagnostics::capture(|| {
         identity::apply_with_reserved_bytes_for_test(
             &mut key_item,
