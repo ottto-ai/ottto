@@ -222,6 +222,34 @@ fn unsupported_native_finish_keeps_legacy_path_without_a_v3_record() {
     });
 }
 
+/// [regress] a Pi layout skip is counted and alarmed as Pi, never as Codex.
+#[test]
+fn pi_layout_skip_is_not_counted_as_codex() {
+    let root = crate::test_scratch::ScratchDir::new("m3-layout-pi-skip");
+    let _writer = test_locks::hold(&root);
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(
+        SnapshotSource::Pi,
+        &root.join("index.json"),
+        &Scope("m3-layout-pi".into()),
+        false,
+    );
+    cache.durable_note_native_layout_skipped(SnapshotSource::Pi);
+    let (counts, _) = cache.durable_counters(SnapshotSource::Pi).unwrap();
+    assert_eq!(
+        counts
+            .ineligible
+            .get("native_stage_skipped.layout_unsupported.pi"),
+        Some(&1)
+    );
+    assert_eq!(
+        counts
+            .ineligible
+            .get("native_stage_skipped.layout_unsupported.codex"),
+        None
+    );
+}
+
 /// [money] selected fallback retires unsupported v3 only after carrying its debt.
 #[test]
 fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_then_retires_after_settlement() {

@@ -919,6 +919,15 @@ pub(crate) fn durable_source(source: SnapshotSource) -> Option<DurableSource> {
     DurableSource::from_snapshot(source)
 }
 
+// One key per source for the layout-skip counter and its store alarm.
+fn layout_skipped_key(source: DurableSource) -> &'static str {
+    match source {
+        DurableSource::ClaudeCode => "native_stage_skipped.layout_unsupported.claude",
+        DurableSource::Codex => "native_stage_skipped.layout_unsupported.codex",
+        DurableSource::Pi => "native_stage_skipped.layout_unsupported.pi",
+    }
+}
+
 /// S2: freeze accepted facts before working-index mutation. Unknown object
 /// identity keeps this floor; only independently proved replacement may skip it.
 #[derive(Clone, Copy)]
@@ -4968,14 +4977,11 @@ impl SharedCache {
     }
 
     pub(in crate::snapshots) fn durable_note_native_layout_skipped(&self, source: SnapshotSource) {
+        let Some(source) = durable_source(source) else {
+            return;
+        };
         if let Some(mut stores) = self.durable() {
-            Counters::bump(
-                &mut stores.counters.ineligible,
-                match source {
-                    SnapshotSource::ClaudeCode => "native_stage_skipped.layout_unsupported.claude",
-                    _ => "native_stage_skipped.layout_unsupported.codex",
-                },
-            );
+            Counters::bump(&mut stores.counters.ineligible, layout_skipped_key(source));
         }
     }
 
@@ -6038,11 +6044,7 @@ impl SharedCache {
         let skipped = stores
             .counters
             .ineligible
-            .get(if claude {
-                "native_stage_skipped.layout_unsupported.claude"
-            } else {
-                "native_stage_skipped.layout_unsupported.codex"
-            })
+            .get(layout_skipped_key(source))
             .copied()
             .unwrap_or(0);
         let unavailable = stores
