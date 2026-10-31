@@ -231,13 +231,10 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
         .contains_key(&item.snapshot_fingerprint));
 
     // The owed challenge survives a restart through the persisted ledger.
-    let root = std::env::temp_dir().join(format!(
-        "ottto-head-conflict-answer-{}-{}",
-        std::process::id(),
-        current_unix_seconds()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
+    let root = crate::test_scratch::ScratchDir::new("head-conflict-restart");
     let path = root.join("upload-progress.json");
+    // This is a copy into a new ledger, not a CAS update of cycle's file.
+    progress.generation = 0;
     progress.save(&path).unwrap();
     let mut progress = SnapshotUploadProgress::load(
         &path,
@@ -249,7 +246,7 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
         progress.head_conflict_challenges[&key].challenge,
         challenge(0xc)
     );
-    let _ = std::fs::remove_dir_all(root);
+    drop(root);
 
     // Next offer answers through the existing rescan handshake.
     let (result, answer_wire) = cycle(&mut progress, &item, 1_001, |item| {
@@ -821,7 +818,17 @@ fn released_0205_rewrite_preserves_money_ledgers_and_drops_only_recovery_metadat
         rewritten_value, known,
         "released codec preserves every known durable field"
     );
-    let mut upgraded: SnapshotUploadProgress = serde_json::from_slice(&rewritten).unwrap();
+    // Enter the real load boundary before executing another cycle: runtime
+    // quarantine witnesses are intentionally absent from every serde codec.
+    let root = crate::test_scratch::ScratchDir::new("head-conflict-downgrade");
+    let path = root.join("progress.json");
+    std::fs::write(&path, &rewritten).unwrap();
+    let mut upgraded = SnapshotUploadProgress::load(
+        &path,
+        &progress.destination_namespace_hash,
+        snapshot_quarantine_witness(SnapshotSource::Codex),
+    )
+    .unwrap();
     upgraded
         .accepted_identity_buckets
         .bind_test_key(Some([0x42; 32]));
