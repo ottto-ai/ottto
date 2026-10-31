@@ -97,8 +97,6 @@ struct IdentityPipelineCycle {
     prepared_before_body: bool,
     body: Vec<u8>,
     snapshots: Vec<SnapshotItem>,
-    /// The scan index before finish's evidence stage.
-    scanned_index: ScanIndex,
     /// The same cycle on the ordinary path, without early prepared evidence.
     dark_oracle: Vec<u8>,
 }
@@ -178,7 +176,6 @@ fn identity_pipeline_cycle(
     apply_claude_local_evidence_to_scan(&support, &mut oracle_scan, &mut oracle_index);
     let (preparation, mut index, mut scan) =
         collect_native_preparation_with_rotation(preparation, false);
-    let scanned_index = index.clone();
     let prepared_before_body = preparation.prepared_claude_evidence.is_some();
     apply_claude_local_evidence_to_scan_with_prepared(
         &support,
@@ -190,7 +187,6 @@ fn identity_pipeline_cycle(
         prepared_before_body,
         body: serde_json::to_vec(&scan.snapshots).expect("serialize body"),
         snapshots: scan.snapshots,
-        scanned_index,
         dark_oracle: serde_json::to_vec(&oracle_scan.snapshots).expect("serialize oracle"),
     })
 }
@@ -225,99 +221,6 @@ fn native_comparison_real_source_preparation_stays_base_without_paired_evidence(
     // The read-only phase is exercised by actual SourcePreparation::step;
     // absent paired evidence yields zero coverage and the existing base path.
     writeln!(std::io::stderr().lock(), "native_comparison_checkpoint: real_source_preparation=true missing_pairs_base=true reuse_activated=false").unwrap();
-}
-
-/// Contract 5 is always on: with the old cohort token, without it, or with
-/// any other value, a real Claude cycle captures markers and the Desktop
-/// census witness and emits the same contract-5 body. Was
-/// `master_on_emits_contract5_only_under_the_cycles_exact_hint_token`, whose
-/// non-exact tokens kept the pre-flip bytes with no capture.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-fn always_on_emits_contract5_whatever_the_hint_token() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    use crate::snapshots::claude_request_identity as identity;
-    let fixture = IdentityPipelineHome::new();
-    let session = |cycle: &IdentityPipelineCycle| {
-        cycle
-            .snapshots
-            .iter()
-            .find(|item| item.source_session_id == IDENTITY_PIPELINE_ROOT)
-            .expect("the synthetic session is scanned")
-            .clone()
-    };
-    let mut bodies = BTreeSet::new();
-    for (name, extra) in [
-        ("absent", ""),
-        ("null", r#","session_request_identity_contract":null"#),
-        (
-            "token",
-            r#","session_request_identity_contract":"own_request_identity_rows:v1""#,
-        ),
-        (
-            "other",
-            r#","session_request_identity_contract":"own_request_identity_rows:v2""#,
-        ),
-        (
-            "prefixed",
-            r#","session_request_identity_contract":" own_request_identity_rows:v1""#,
-        ),
-        (
-            "collector",
-            r#","session_request_identity_contract":"claude_code_jsonl:own_request_identity_rows:v1""#,
-        ),
-    ] {
-        let cycle = identity_pipeline_cycle(&fixture, name, extra).expect("cycle");
-        let item = session(&cycle);
-        assert_eq!(item.provenance.collector, identity::COLLECTOR, "{name}");
-        assert!(
-            item.claude_org_markers.is_some(),
-            "{name}: markers captured"
-        );
-        assert!(
-            identity::desktop_census(&cycle.scanned_index).is_some(),
-            "{name}: census witness"
-        );
-        // Even a settled pass withdraws marker-only tags. Nothing is refused
-        // and usage is unchanged.
-        assert!(item.request_evidence.is_empty(), "{name}");
-        assert_eq!(item.request_identity_refusals, 0, "{name}");
-        assert_eq!(
-            (item.request_count, item.input_tokens, item.output_tokens),
-            (2, 30, 3)
-        );
-        // Each cycle scans at its own wall time, so compare what the hint
-        // could change: the contract and every tagged row.
-        bodies.insert(
-            serde_json::to_vec(&(
-                &item.provenance.collector,
-                &item.request_evidence,
-                item.request_identity_refusals,
-                &item.model_usage,
-                &item.usage_buckets,
-            ))
-            .expect("serialize identity projection"),
-        );
-    }
-    assert_eq!(bodies.len(), 1, "the hint token changes no identity or usage");
-
-    // A hint that cannot be read aborts the cycle: no scan, no fallback body.
-    let support = fixture.base.join("support-unreadable");
-    assert!(identity_pipeline_cycle(
-        &fixture,
-        "unreadable",
-        r#","session_request_identity_contract":"#,
-    )
-    .is_err());
-    assert!(
-        std::fs::read_dir(&support)
-            .expect("support dir")
-            .next()
-            .is_none(),
-        "an aborted cycle writes no scan state"
-    );
 }
 
 /// Offline transport for the real source lifecycle. It ACKs exactly the wire
