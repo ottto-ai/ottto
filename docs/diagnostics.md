@@ -1397,8 +1397,7 @@ Pi inherits the accepted sampled residual (Ron's decisions, 2026-10-30 and
 until the next Full. Pi's writer is append-only, and its header rewrite reads
 Full. The shared
 `sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual` test
-pins it for Claude Code and Codex. Pi coverage of this residual is not yet
-pinned by that test.
+pins it for Claude Code, Codex and Pi.
 Age and clock changes do not invalidate checkpoints. Admission of a new sampled
 obligation follows the shared audit cap: with no slot left, an unmarked change
 reads a counted cap Full (or waits); already-marked files keep Tailing.

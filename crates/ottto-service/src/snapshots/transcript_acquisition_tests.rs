@@ -88,7 +88,7 @@ fn native_parser_with(
         match source {
             SnapshotSource::Codex => apply_codex_line,
             SnapshotSource::ClaudeCode => apply_claude_code_line,
-            _ => unreachable!(),
+            SnapshotSource::Pi => apply_pi_line,
         },
         Some(metadata),
         None,
@@ -221,7 +221,9 @@ fn oracle(fixture: &Fixture, source: SnapshotSource) -> Value {
             false,
         )
         .unwrap(),
-        _ => unreachable!(),
+        SnapshotSource::Pi => {
+            parse_pi_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
+        }
     };
     apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
     serde_json::to_value(items).unwrap()
@@ -509,12 +511,17 @@ fn sampled_native_cache_eviction_and_active_state_accounting() {
     }
 }
 
+/// [behaviour] A hidden same-width edit can leave a sampled Tail prefix stale.
 #[test]
 fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
         let fixture = Fixture::new(source);
         fixture.append(&json!({"type":"ignored", "padding":"a".repeat(12 * 1024)}));
         let model = if source == SnapshotSource::Codex {
@@ -526,19 +533,27 @@ fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
         fixture.append(&json!({"type":"ignored", "padding":"b".repeat(12 * 1024)}));
         let (old, _, _, _) = acquire(&fixture, source, None, 100);
         assert!(old.is_some());
+        fixture.append(&usage(source, 140, 1, model));
+        let unedited = oracle(&fixture, source);
         let original = fs::read_to_string(&fixture.0).unwrap();
-        let edited = original.replace("\"input_tokens\":100", "\"input_tokens\":900");
+        let field = if source == SnapshotSource::Pi {
+            "input"
+        } else {
+            "input_tokens"
+        };
+        let edited = original.replace(&format!("\"{field}\":100"), &format!("\"{field}\":900"));
         assert_ne!(original, edited);
         assert_eq!(original.len(), edited.len());
         fs::write(&fixture.0, edited).unwrap();
-        fixture.append(&usage(source, 140, 1, model));
         let (tail, mode, _, interim) = acquire(&fixture, source, old, 101);
         assert_eq!(mode, ReadMode::Tail);
-        assert_ne!(
-            interim,
-            oracle(&fixture, source),
-            "accepted sampled limitation must be visible"
-        );
+        assert_eq!(interim, unedited, "Tail retains the pre-edit prefix");
+        let full = oracle(&fixture, source);
+        if source == SnapshotSource::Pi {
+            assert_eq!(interim[0]["input_tokens"], 240);
+            assert_eq!(full[0]["input_tokens"], 1040);
+        }
+        assert_ne!(interim, full, "accepted sampled limitation must be visible");
         let (_, mode, guards, later) = acquire(&fixture, source, tail, 3700);
         assert_eq!(mode, ReadMode::Unchanged);
         assert_eq!(guards, 0);
