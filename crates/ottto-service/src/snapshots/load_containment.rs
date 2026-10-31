@@ -638,7 +638,7 @@ fn quarantine_invalid_scan_index(
     // The index is only a local incremental-scan optimization. A crash or
     // structural damage must not permanently block collection, but never
     // overwrite the unreadable witness in place.
-    let quarantine_path = crate::locked_state_dir::unique_sibling(path, "corrupt");
+    let quarantine_path = unique_checkpoint_sibling(path, "corrupt");
     let persistence_recovery =
         scan_index_integration::prepare_legacy_recovery(path, &quarantine_path)?;
     fs::rename(path, &quarantine_path).context("quarantine invalid local snapshot scan index")?;
@@ -742,8 +742,7 @@ fn override_scan_index_rebuild_loop(
     let mut stamp_attempted = false;
     let mut replaced = false;
     let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    let quarantine_path =
-        crate::locked_state_dir::unique_sibling(path, SCAN_INDEX_OVERRIDE_WITNESS_KIND);
+    let quarantine_path = unique_checkpoint_sibling(path, SCAN_INDEX_OVERRIDE_WITNESS_KIND);
     let result = (|| -> Result<()> {
         {
             let mut file = File::create(&temp_path)

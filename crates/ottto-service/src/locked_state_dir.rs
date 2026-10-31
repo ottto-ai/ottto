@@ -23,7 +23,6 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// #801's lock together with the directory it locks.
 #[derive(Debug)]
@@ -111,16 +110,6 @@ pub(crate) fn open_private_lock_file(path: &Path) -> io::Result<File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
-}
-
-/// `<stem>.<kind>.<pid>.<nanos>.json` beside `path`, for a temp, tombstone or
-/// quarantine name no other writer uses.
-pub(crate) fn unique_sibling(path: &Path, kind: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    path.with_extension(format!("{kind}.{}.{nanos}.json", std::process::id()))
 }
 
 /// Best-effort cache write: create the parent, write `<stem>.json.tmp`, rename
