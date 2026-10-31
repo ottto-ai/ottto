@@ -104,8 +104,8 @@ impl ClaudeAccountFamilyPending {
     }
 
     fn apply_checked_plan(&mut self, retained: Vec<usize>) -> Option<usize> {
-        if history_projection(self, 0..self.previous_windows.len())
-            != history_projection(self, retained.iter().copied())
+        if HistorySummary::fold(&self.previous_windows)
+            != HistorySummary::fold(retained.iter().map(|&i| &self.previous_windows[i]))
         {
             return None;
         }
@@ -188,52 +188,49 @@ fn retain_run_endpoint(
     windows.push(old);
 }
 
-/// Per-root decision summary: historical existence, the union of member keys,
-/// and each member's winning boundary/account/invalid/revision. This covers the
-/// retirement walk's absence check and timestamp competition, plus scheduling's
-/// history-nonempty predicate. References borrow existing evidence, never clone
-/// the history. Current-window gates and family-level holds are untouched.
-#[derive(Debug, PartialEq, Eq)]
-struct HistoryProjection<'a> {
+/// Per-root decision summary of the archived windows: whether any exist, the
+/// newest boundary, whether any boundary is unparsable, and each member's
+/// winning boundary/account/invalid/revision (first wins on ties). Retirement
+/// reads it with the current window; the load self-check compares it alone.
+/// Current-window gates and family-level holds are untouched.
+#[derive(Default, PartialEq, Eq)]
+pub(super) struct HistorySummary {
     history_nonempty: bool,
-    latest: BTreeMap<&'a String, (u64, &'a str, bool, Option<&'a String>)>,
+    newest_boundary: Option<u64>,
+    unparsable: bool,
+    latest: BTreeMap<String, (u64, String, bool, Option<String>)>,
 }
-fn history_projection<'a>(
-    pending: &'a ClaudeAccountFamilyPending,
-    retained: impl Iterator<Item = usize>,
-) -> Option<HistoryProjection<'a>> {
-    let mut history_nonempty = false;
-    let mut latest = BTreeMap::new();
-    for window in retained
-        .map(|i| {
-            history_nonempty = true;
-            &pending.previous_windows[i]
-        })
-        .chain(std::iter::once(&pending.current))
-    {
-        let time = rfc3339_unix_seconds(&window.census_window_end)?;
-        let projection = window.consumer_projection();
-        for (member, revision) in projection.members() {
-            if latest
-                .get(member)
-                .map_or(true, |(previous, _, _, _)| time > *previous)
-            {
-                latest.insert(
-                    member,
-                    (
-                        time,
-                        projection.account_identifier_hash,
-                        projection.invalid,
-                        revision,
-                    ),
-                );
+impl HistorySummary {
+    fn fold<'a>(windows: impl IntoIterator<Item = &'a ClaudeAccountFamilyPendingWindow>) -> Self {
+        let mut summary = Self::default();
+        for window in windows {
+            summary.history_nonempty = true;
+            let Some(time) = rfc3339_unix_seconds(&window.census_window_end) else {
+                summary.unparsable = true;
+                continue;
+            };
+            summary.newest_boundary = summary.newest_boundary.max(Some(time));
+            let projection = window.consumer_projection();
+            for (member, revision) in projection.members() {
+                if summary
+                    .latest
+                    .get(member)
+                    .map_or(true, |(previous, _, _, _)| time > *previous)
+                {
+                    summary.latest.insert(
+                        member.clone(),
+                        (
+                            time,
+                            projection.account_identifier_hash.to_owned(),
+                            projection.invalid,
+                            revision.cloned(),
+                        ),
+                    );
+                }
             }
         }
+        summary
     }
-    Some(HistoryProjection {
-        history_nonempty,
-        latest,
-    })
 }
 
 // Streaming byte counter: never materialize the encoded histories.
