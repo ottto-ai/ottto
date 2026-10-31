@@ -4414,3 +4414,217 @@ fn f1_released_account_hold_audit_clear_keeps_a_permanent_refusal_drain_owed() {
         );
     }
 }
+
+/// [regress] R2: #942 already reconciles the saved revision on main. OFF and
+/// ON must both preserve its exact no-op, debt, ACK and restart assertions.
+#[test]
+fn r2_no_op_drain_keeps_the_selected_revision_off_and_on() {
+    for terminal_on in [false, true] {
+        let _terminal = terminal_on.then(crate::snapshots::ClaudeTerminalOffForTest::enabled);
+        assert_eq!(crate::snapshots::claude_terminal_off(), terminal_on);
+        for owed in [1, 2] {
+            for accept_on_page in [false, true] {
+                let scratch = crate::test_scratch::ScratchDir::new("apc-r2-selected-body");
+                let index_path = scratch.join("index.json");
+                let progress_path = scratch.join("progress.json");
+                let transcripts = scratch.join("transcripts");
+                std::fs::create_dir(&transcripts).unwrap();
+                std::fs::write(
+                    transcripts.join(format!("{}.jsonl", apc_m2_root(0))),
+                    apc_transcript_line(&apc_m2_root(0), None, "req_r2", 1),
+                )
+                .unwrap();
+                let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+                    SnapshotSource::ClaudeCode,
+                    &[transcripts],
+                    &mut ScanIndex::default(),
+                    APC_WINDOW_END,
+                    183,
+                    APC_PAGE_FILES,
+                    false,
+                )
+                .unwrap();
+                let mut item = scan.snapshots.remove(0);
+                let (root, member, key) = (apc_m2_root(0), apc_m2_agent(0), apc_m2_agent_key(0));
+                item.source_session_id = member.clone();
+                item.snapshot_fingerprint = apc_m2_digest(3, 1);
+                let body = snapshot_upload_body_witness(&item);
+                let mut value = serde_json::to_value(apc_m2_index(1, owed, false, true)).unwrap();
+                value["files"][&key]["last_upload_body_witness"] =
+                    serde_json::json!(crate::snapshots::snapshot_file_upload_body_set_for_test(
+                        std::slice::from_ref(&body)
+                    ));
+                value["claude_usage_family_pending"][&root] = serde_json::json!({
+                    "census_window_end": APC_WINDOW_END, "member_request_id_hashes": {}, "invalid": false,
+                });
+                let mut committed: ScanIndex = serde_json::from_value(value).unwrap();
+                committed.save(&index_path).unwrap();
+                let before = committed.claude_authority_record_for_test(&root).unwrap();
+                assert!(before.family_pending_retained && before.bound_to_retained_witness);
+                let mut current = committed.clone();
+                let revision = apc_m2_digest(7, 1);
+                current.files.get_mut(&key).unwrap().source_file_fingerprint = revision.clone();
+                let candidate = crate::snapshots::ClaudeProofCorrectionCandidate::for_test(
+                    &current,
+                    &key,
+                    body.clone(),
+                );
+                let drains = current.settle_claude_proof_corrections(
+                    &committed,
+                    &[candidate],
+                    &BTreeSet::new(),
+                    &BTreeMap::new(),
+                );
+                let drained = current.claude_authority_record_for_test(&root);
+                if owed == 1 {
+                    assert!(drained.is_none(), "last-member no-op clears in memory");
+                    assert!(!current.claude_usage_family_pending_retained_for_test(&root));
+                } else {
+                    let drained = drained.unwrap();
+                    assert!(!drained.correction.unwrap().1.contains(&member));
+                    assert_eq!(drained.member_source_file_fingerprints[&member], revision);
+                }
+                let mut progress = test_upload_progress();
+                let snapshots = if accept_on_page {
+                    progress
+                        .accepted_fingerprints
+                        .insert(item.snapshot_fingerprint.clone());
+                    progress
+                        .accepted_body_witnesses
+                        .insert(item.snapshot_fingerprint.clone(), body);
+                    vec![item]
+                } else {
+                    Vec::new()
+                };
+                progress.save(&progress_path).unwrap();
+                checkpoint_partial_snapshot_index_with_audit_release(
+                    &current,
+                    &committed,
+                    &progress,
+                    &snapshots,
+                    None,
+                    &BTreeSet::new(),
+                    &index_path,
+                    &progress_path,
+                    || Ok(()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    drains,
+                )
+                .unwrap();
+                let restarted = ScanIndex::load(&index_path).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&restarted).unwrap()["accepted_snapshot_fingerprints"],
+                    serde_json::to_value(&committed).unwrap()["accepted_snapshot_fingerprints"]
+                );
+                assert_eq!(
+                    restarted.file_snapshot_fingerprints,
+                    committed.file_snapshot_fingerprints
+                );
+                if accept_on_page {
+                    assert_eq!(restarted.files[&key].source_file_fingerprint, revision);
+                    let record = restarted.claude_authority_record_for_test(&root);
+                    if owed == 1 {
+                        assert!(record.is_none());
+                    } else {
+                        let record = record.unwrap();
+                        assert!(!record.correction.unwrap().1.contains(&member));
+                        assert_eq!(record.member_source_file_fingerprints[&member], revision);
+                    }
+                } else {
+                    assert_eq!(
+                        restarted.files[&key].source_file_fingerprint,
+                        committed.files[&key].source_file_fingerprint
+                    );
+                    assert_eq!(restarted.claude_authority_record_for_test(&root), Some(before),
+                        "same proof, owed set, revision, counter, deadline and binding survive restart");
+                    assert!(progress.accepted_fingerprints.is_empty(), "no ACK credit");
+                    assert!(progress.accepted_body_witnesses.is_empty());
+                }
+                assert_eq!(
+                    std::fs::read_dir(&scratch)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt."))
+                        .count(),
+                    0
+                );
+            }
+        }
+    }
+}
+
+/// [behaviour] R3: a persisted correction with lagging member revisions pulls
+/// its family onto page zero beyond the page cap. The existing forced_family
+/// counter accounts for exactly one family-unit burst, with OFF and ON rows.
+#[test]
+fn r3_page_zero_forced_family_is_counted_and_bounded_off_and_on() {
+    for terminal_on in [false, true] {
+        let _terminal = terminal_on.then(crate::snapshots::ClaudeTerminalOffForTest::enabled);
+        assert_eq!(crate::snapshots::claude_terminal_off(), terminal_on);
+        let scratch = crate::test_scratch::ScratchDir::new("apc-r3-family-page");
+        let transcripts = scratch.join("projects");
+        let root = apc_m2_root(0);
+        let agent = format!("m2{:04x}", 0);
+        let subagents = transcripts.join(&root).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let root_path = transcripts.join(format!("{root}.jsonl"));
+        let agent_path = subagents.join(format!("agent-{agent}.jsonl"));
+        std::fs::write(&root_path, apc_transcript_line(&root, None, "req_root", 0)).unwrap();
+        std::fs::write(
+            &agent_path,
+            apc_transcript_line(&root, Some(&agent), "req_agent", 1),
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(apc_m2_index(1, 2, false, true)).unwrap();
+        // Reuse the persisted fixture's exact witness and owed correction,
+        // pointing its two members at real synthetic transcripts.
+        for field in ["files", "file_snapshot_fingerprints"] {
+            for (old, new) in [
+                (format!("/synthetic/m2/projects/{root}.jsonl"), &root_path),
+                (apc_m2_agent_key(0), &agent_path),
+            ] {
+                let entry = value[field].as_object_mut().unwrap().remove(&old).unwrap();
+                value[field][new.to_str().unwrap()] = entry;
+            }
+        }
+        let mut reader = ScanIndex::default();
+        reader.initialize_current_claude_contract_for_test();
+        value["claude_request_identity_contract"] =
+            serde_json::to_value(&reader).unwrap()["claude_request_identity_contract"].clone();
+        let mut index: ScanIndex = serde_json::from_value(value).unwrap();
+        let before = index.claude_authority_record_for_test(&root).unwrap();
+        assert!(before.bound_to_retained_witness);
+        let scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            &[transcripts],
+            &mut index,
+            APC_WINDOW_END,
+            183,
+            1,
+            false,
+        )
+        .unwrap();
+        let forced = scan.forced_family_for_test;
+        let family = BTreeSet::from([root.clone(), apc_m2_agent(0)]);
+        let parsed = scan
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            parsed, family,
+            "page zero parses every member of exactly this family"
+        );
+        assert_eq!(forced, family.len(), "one counted family-unit burst");
+        assert!(scan.scanned_file_count <= 1 + forced);
+        assert_eq!(scan.scanned_file_count, family.len());
+        let after = index.claude_authority_record_for_test(&root).unwrap();
+        assert_eq!(
+            after, before,
+            "a scan alone never drains an owed member or grants ACK credit"
+        );
+    }
+}
