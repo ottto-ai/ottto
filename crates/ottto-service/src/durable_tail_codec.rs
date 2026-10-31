@@ -341,6 +341,11 @@ impl<'a> Dec<'a> {
         }
         Ok(len)
     }
+    /// The next length, not consumed: a caller's bound before the field's
+    /// own decode asks for any allowance.
+    pub(crate) fn peek_len(&self) -> Result<usize, Corrupt> {
+        Dec::new(&self.bytes[self.at..]).take_len()
+    }
     pub(crate) fn len_prefixed(&mut self) -> Result<&'a [u8], Corrupt> {
         let len = self.take_len()?;
         self.raw(len)
@@ -576,7 +581,15 @@ impl<K: HDigestKey + Ord, V: Durable> HDigest for BTreeMap<K, V> {
         Ok(())
     }
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
-        take_h_map(d, usize::MAX)
+        let len = d.take_len()?;
+        d.tree::<K, V>(len)?;
+        let mut out = BTreeMap::new();
+        for _ in 0..len {
+            if out.insert(K::take_h(d)?, V::take(d)?).is_some() {
+                return Err(Corrupt);
+            }
+        }
+        Ok(out)
     }
     fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
         verify_h_map::<K, V>(d, usize::MAX)
@@ -587,25 +600,6 @@ impl<K: HDigestKey + Ord, V: Durable> HDigest for BTreeMap<K, V> {
         V::shape(s);
         s.push(">");
     }
-}
-
-/// The shared H-key map decoder, with a caller's pre-allocation key bound.
-pub(crate) fn take_h_map<K: HDigestKey + Ord, V: Durable>(
-    d: &mut Dec<'_>,
-    max: usize,
-) -> Result<BTreeMap<K, V>, Corrupt> {
-    let len = d.take_len()?;
-    if len > max {
-        return Err(Corrupt);
-    }
-    d.tree::<K, V>(len)?;
-    let mut out = BTreeMap::new();
-    for _ in 0..len {
-        if out.insert(K::take_h(d)?, V::take(d)?).is_some() {
-            return Err(Corrupt);
-        }
-    }
-    Ok(out)
 }
 
 pub(crate) fn verify_h_map<K: HDigestKey + Ord, V: Durable>(
