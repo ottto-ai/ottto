@@ -832,6 +832,8 @@ pub(crate) mod withheld_support {
         mut index: ScanIndex,
         mut scan: crate::snapshots::SourceScanResult,
     ) -> ScanIndex {
+        let mut previous = previous.clone();
+        previous.rehome_withheld_baseline(&index);
         let mut disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
         disposition.defer_sessions(
             scan.snapshots
@@ -853,7 +855,7 @@ pub(crate) mod withheld_support {
             "withheld-fixture".into(),
             crate::snapshots::snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
         );
-        settle_completed_upload(index, previous, &progress, &holds).index
+        settle_completed_upload(index, &previous, &progress, &holds).index
     }
 
     pub(crate) fn withheld_settled(index: &ScanIndex) -> bool {
@@ -6687,7 +6689,7 @@ fn prepare_sync_source_inner(
     } else {
         Vec::new()
     };
-    let committed_index = index.clone();
+    let mut committed_index = index.clone();
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
     // A replay re-reads everything and neither re-offers nor defers.
@@ -6762,6 +6764,7 @@ fn prepare_sync_source_inner(
         .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
         .with_codex_side_pass(codex_side_pass)
         .with_codex_versions(daemon.codex_versions.clone());
+    scan.rehome_withheld_baseline(&mut committed_index);
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
     } else if source == SnapshotSource::Codex {

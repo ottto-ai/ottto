@@ -1158,6 +1158,7 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
         1,
         "still present"
     );
+    crate::snapshots::line_delivery_tests::walk_all(&mut absent, 7);
     fs::remove_file(&held_path).unwrap();
     assert!(sampled_audit::proven_absent(
         &held_path,

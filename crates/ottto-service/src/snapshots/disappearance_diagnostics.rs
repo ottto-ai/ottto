@@ -432,9 +432,9 @@ mod tests {
         let (_, events) = observe(|| {
             advance_bounded_directory_traversal(
                 SnapshotSource::Pi,
-                index.traversal.as_mut().unwrap(),
+                &mut index,
                 BACKFILL_WINDOW_DAYS,
-                discovery_retention!(index),
+                None,
             )
         });
         assert_eq!(events, [[0; 4], [0; 4], [1, 0, 0, 0]]);
@@ -1360,9 +1360,9 @@ mod tests {
         let (_, sites) = observe_sites(|| {
             advance_bounded_directory_traversal(
                 SnapshotSource::ClaudeCode,
-                index.traversal.as_mut().unwrap(),
+                &mut index,
                 BACKFILL_WINDOW_DAYS,
-                discovery_retention!(index),
+                None,
             )
         });
         let mut expected = [[[0; OUTCOMES]; SITES]; 3];

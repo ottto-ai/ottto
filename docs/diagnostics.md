@@ -742,9 +742,20 @@ are a lower bound; after a restart each held key re-enters on its one `start`
 re-parse. A released key (resolved, deleted, or dropped from the hold map)
 leaves both. The map is charged with the memo.
 
-Known limitations: a renamed held file whose mtime is older than the window can
-lose its withheld usage; removal events and last-known tokens are counted.
-Same-size middle-only rewrites remain Ron's accepted interior-edit residual.
+A held file renamed within a configured root keeps its **correctness hold**.
+Before the age gate, bounded discovery reuses the birth/move owner's recorded
+physical generation (device/inode, birth and append-compatible extent) to move
+its hold, indexed audit debt, incidence and advisory memo to the discovered path.
+The already owned committed baseline follows that generation before held-result
+restoration; a rename grants no upload, ACK, census or absence credit. No extra
+walk, stat or transcript read proves the move: it uses the metadata the bounded
+walk already has. If the generation is unknown, replaced or ambiguous, custody
+stays at the old path. The existing observed-key view records the same-member
+presence even when age would skip it; F4 waits while bounded discovery is pending
+or that uncertain destination remains observed. Losing proof delays resolution
+and never deletes the old debt. Hold caps and ordinary size gates remain.
+
+Known limitations: same-size middle-only rewrites remain Ron's accepted interior-edit residual.
 Evidence outside stamped inputs (including API/trace metadata tokens and
 reader-health recovery) wakes only after restart: a delay while a recorded hold
 keeps the file discoverable, not an age-based drop. A never-binding account

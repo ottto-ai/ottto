@@ -440,6 +440,45 @@ impl BirthStore {
         }
     }
 
+    /// Rehome custody using metadata already paid for by bounded discovery.
+    /// Reuse the physical generation: same birth/object, append-compatible size.
+    /// This is neither absence nor acceptance; an unknown/replaced object refuses.
+    pub(in crate::snapshots) fn record_discovered_move(
+        &mut self,
+        session: &str,
+        from: &str,
+        to: &str,
+        opened: ClaudeOpenedBirth,
+    ) -> bool {
+        let Some(s) = self.get(session) else {
+            return false;
+        };
+        let source = location_key(from);
+        let Some(old) = s.4.iter().find(|o| o.0 == source) else {
+            return false;
+        };
+        if s.1 != source
+            || old.1 == 0
+            || old.1 != opened.birth
+            || !old.3.covers(opened)
+            || old.2 >= MAX_GENERATION
+            || s.4.iter().any(|o| o.0 == location_key(to))
+        {
+            return false;
+        }
+        self.record_opened(session, to, i128::from(opened.birth), opened);
+        self.record_proven_move(session, source, to)
+    }
+
+    /// Existing generation tombstones identify a custody handoff across settlement.
+    pub(in crate::snapshots) fn moved_to(&self, session: &str, from: &str) -> Option<LocationKey> {
+        let s = self.get(session)?;
+        let from = location_key(from);
+        s.4.iter()
+            .any(|o| o.0 == from && o.1 == 0 && o.2 != 0)
+            .then_some(s.1)
+    }
+
     /// Caller proves a move of the current owner at the existing read boundary.
     /// Equal minima transfer ownership too; other live twins keep their cutoff.
     pub(crate) fn record_proven_move(

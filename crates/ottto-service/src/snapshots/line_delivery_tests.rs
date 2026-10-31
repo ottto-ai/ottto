@@ -1041,12 +1041,7 @@ fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
             .pending_directories
             .is_empty()
         {
-            advance_bounded_directory_traversal(
-                SnapshotSource::ClaudeCode,
-                index.traversal.as_mut().unwrap(),
-                30,
-                discovery_retention!(index),
-            );
+            advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, &mut index, 30, None);
         }
         let counts = &index.traversal.as_ref().unwrap().counts;
         let decided = (
@@ -1090,12 +1085,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(
-            SnapshotSource::Codex,
-            index.traversal.as_mut().unwrap(),
-            30,
-            discovery_retention!(index),
-        );
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 30, None);
     }
     unselected_page("codex");
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1144,7 +1134,7 @@ fn withhold(index: &mut ScanIndex, path: &Path) {
         .insert(local_index_key(path), "held-source".into());
 }
 
-fn walk_all(index: &mut ScanIndex, days: u64) {
+pub(in crate::snapshots) fn walk_all(index: &mut ScanIndex, days: u64) {
     while !index
         .traversal
         .as_ref()
@@ -1152,12 +1142,7 @@ fn walk_all(index: &mut ScanIndex, days: u64) {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(
-            SnapshotSource::ClaudeCode,
-            index.traversal.as_mut().unwrap(),
-            days,
-            discovery_retention!(index),
-        );
+        advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, index, days, None);
     }
 }
 
@@ -1350,12 +1335,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
             .pending_directories
             .is_empty()
         {
-            advance_bounded_directory_traversal(
-                source,
-                index.traversal.as_mut().unwrap(),
-                7,
-                discovery_retention!(index),
-            );
+            advance_bounded_directory_traversal(source, &mut index, 7, None);
         }
         assert_eq!(candidates(&index), vec![path("grown"), path("held")]);
         assert_eq!(
@@ -1501,12 +1481,7 @@ fn codex_roster_retains_aged_indexed_growth() {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(
-            SnapshotSource::Codex,
-            index.traversal.as_mut().unwrap(),
-            7,
-            discovery_retention!(index),
-        );
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None);
     }
     discovery_page("codex");
     // Match the existing roster fixture's directory-change granularity.
@@ -2062,6 +2037,191 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
     assert_eq!(recorder.events(), Vec::new(), "aged and no longer held");
     assert_eq!(again.scanned_file_count, 0);
     assert!(!after.files.contains_key(&key), "ordinary aging retires it");
+}
+
+/// [money] M3: grown held usage survives an aged in-root rename; unknown generation keeps debt.
+#[test]
+#[cfg(unix)]
+fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() {
+    use sampled_scan::transition_fixture::{money_oracle, scan_money, Accepted};
+    for known_generation in [true, false] {
+        let root = Root::new("ld-held-rename-money");
+        let original = root
+            .projects()
+            .join("original")
+            .join(format!("{SESSION}.jsonl"));
+        let moved = root
+            .projects()
+            .join("moved")
+            .join(format!("{SESSION}.jsonl"));
+        fs::create_dir_all(original.parent().unwrap()).unwrap();
+        fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        let old_key = local_index_key(&original);
+        let new_key = local_index_key(&moved);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let source = SnapshotSource::ClaudeCode;
+        let make = |mut index: ScanIndex, at: &str, days| {
+            cache.bind_withheld(&mut index);
+            OwnedSourceScan::new(
+                source,
+                &[root.projects()],
+                index,
+                at,
+                days,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_sampled_acquisition(
+                cache.clone(),
+                crate::transcript_acquisition::Scope("held-rename-money".into()),
+            )
+        };
+        let now = OffsetDateTime::now_utc();
+        let today = now.format(&Rfc3339).unwrap();
+        sampled_scan::set_test_now(Some(now.unix_timestamp() as u64));
+        append(&original, &assistant_line("rename-accepted"));
+        let (baseline, first, _) = finish(make(ScanIndex::default(), &today, 7));
+        let mut prior = scan_money(source, &first);
+        prior.accepted = first
+            .snapshots
+            .iter()
+            .map(|item| {
+                (
+                    item.source_session_id.clone(),
+                    Accepted {
+                        body: prior.snapshots[&item.source_session_id].clone(),
+                        witness: snapshot_upload_body_witness(item),
+                    },
+                )
+            })
+            .collect();
+        assert!(
+            !prior.accepted.is_empty(),
+            "positive accepted money is the floor"
+        );
+        append(&original, &assistant_line("rename-held"));
+        let (mut parsed, second, _) = finish(make(baseline.clone(), &today, 7));
+        parsed.accepted_snapshot_fingerprints = baseline.accepted_snapshot_fingerprints.clone();
+        let mut held =
+            crate::snapshot_sync::withheld_support::settle_withheld(&baseline, parsed, second);
+        assert_eq!(held.claude_account_deferred_hold_count(), 1);
+        let incidence = held.file_snapshot_fingerprints[&old_key].clone();
+        let committed_size = held.files[&old_key].size_bytes;
+        // Growth is unread when the pathname changes; rename preserves mtime.
+        append(&original, &assistant_line("rename-unread"));
+        let modified = fs::metadata(&original).unwrap().modified().unwrap();
+        let (_, cold_scan, _) = finish(OwnedSourceScan::new(
+            source,
+            &[root.projects()],
+            ScanIndex::default(),
+            &today,
+            7,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        ));
+        let cold = scan_money(source, &cold_scan);
+        if !known_generation {
+            // Real legacy/unknown owner state, using its existing observation API.
+            let birth = claude_context_file_birth::ClaudeOpenedBirth::from_metadata(
+                &fs::metadata(&original).unwrap(),
+            )
+            .birth;
+            held.claude_money_birth_store = Default::default();
+            held.claude_money_birth_store
+                .record_observation(SESSION, &old_key, i128::from(birth));
+        }
+        fs::rename(&original, &moved).unwrap();
+        assert_eq!(fs::metadata(&moved).unwrap().modified().unwrap(), modified);
+        let checkpoint = root.0.join("held-rename-index.json");
+        held.save(&checkpoint).unwrap();
+        held = ScanIndex::load(&checkpoint).unwrap();
+        let aged = now + time::Duration::days(731); // beyond min(requested=1000, 730 days)
+        let at = aged.format(&Rfc3339).unwrap();
+        sampled_scan::set_test_now(Some(aged.unix_timestamp() as u64));
+        let scan = make(held.clone(), &at, 1_000);
+        if known_generation {
+            assert!(scan
+                .index
+                .claude_account_deferred_holds
+                .contains_key(&new_key));
+            assert!(!scan
+                .index
+                .claude_account_deferred_holds
+                .contains_key(&old_key));
+            assert_eq!(scan.index.files[&new_key].size_bytes, committed_size);
+            assert_eq!(scan.index.file_snapshot_fingerprints[&new_key], incidence);
+            assert!(!scan.index.files.contains_key(&old_key));
+            let (mut resolved, result, _) = finish(scan);
+            // Both native held restoration and partial-commit selection use the
+            // moved baseline; neither may resurrect the old pathname or commit growth.
+            let withheld = crate::snapshot_sync::withheld_support::settle_withheld(
+                &held,
+                resolved.clone(),
+                result.clone(),
+            );
+            assert_eq!(withheld.files[&new_key].size_bytes, committed_size);
+            assert_eq!(withheld.file_snapshot_fingerprints[&new_key], incidence);
+            assert!(withheld
+                .claude_account_deferred_holds
+                .contains_key(&new_key));
+            assert!(!withheld.files.contains_key(&old_key));
+            let mut committed = held.clone();
+            committed.rehome_withheld_baseline(&resolved);
+            let partial =
+                resolved.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+            assert_eq!(partial.files[&new_key].size_bytes, committed_size);
+            assert!(!partial.files.contains_key(&old_key));
+            money_oracle::assert_equivalent(&cold, &scan_money(source, &result));
+            assert_eq!(
+                result
+                    .snapshots
+                    .iter()
+                    .filter(|item| item.source_session_id == SESSION)
+                    .count(),
+                1
+            );
+            assert!(result.completed_parses().all(|(key, _)| key == new_key));
+            assert!(resolved
+                .record_claude_account_deferred_holds(result.completed_parses(), &BTreeMap::new()));
+            assert!(resolved.claude_account_deferred_holds.is_empty());
+            let entry = &resolved.files[&new_key];
+            if entry.has_unverified_source() {
+                let fingerprint = entry.source_file_fingerprint.clone();
+                assert!(resolved.complete_full_audit(&new_key, &fingerprint));
+            }
+            let (_, quiet, _) = finish(make(resolved, &at, 1_000));
+            assert!(
+                quiet.snapshots.is_empty(),
+                "accepted moved usage emits once"
+            );
+        } else {
+            let (mut kept, result, _) = finish(scan);
+            for offset in [0, 600, 1_200] {
+                if offset != 0 {
+                    sampled_scan::set_test_now(Some(aged.unix_timestamp() as u64 + offset));
+                    let (next, quiet, _) = finish(make(kept, &at, 1_000));
+                    kept = next;
+                    assert!(quiet.snapshots.is_empty());
+                }
+                let mut route = scan_money(source, &result);
+                route.accepted = prior.accepted.clone();
+                money_oracle::assert_held(SESSION, &prior, &route, &cold);
+                assert!(kept.claude_account_deferred_holds.contains_key(&old_key));
+                assert_eq!(kept.files[&old_key].size_bytes, committed_size);
+                assert_eq!(kept.file_snapshot_fingerprints[&old_key], incidence);
+                assert!(!kept.claude_account_deferred_holds.contains_key(&new_key));
+            }
+        }
+        sampled_scan::set_test_now(None);
+    }
 }
 
 /// [behaviour] Option C (Lead A, round 2) and fixture (c): within a process a held key

@@ -116,6 +116,16 @@ impl Memo {
     fn with_state<R>(&self, f: impl FnOnce(&mut State) -> R) -> Option<R> {
         self.with_mutex(|state| state.lock().ok().map(|mut state| f(&mut state)))
     }
+    /// Same capped entry, now owned by the proven physical generation's new path.
+    /// Moving custody grants no release counter or acceptance credit.
+    pub(super) fn rekey(&self, from: &str, to: &str) {
+        self.with_state(|state| {
+            if let Some(mut entry) = state.entries.remove(&memo_key(from)) {
+                entry.absence = None;
+                state.entries.insert(memo_key(to), entry);
+            }
+        });
+    }
     pub(super) fn reset_absence(&self, key: &str) {
         self.with_state(|state| {
             if let Some(entry) = state.entries.get_mut(&memo_key(key)) {
@@ -642,6 +652,7 @@ mod tests {
                 "2026-10-07T12:00:00Z",
                 7,
             );
+            crate::snapshots::line_delivery_tests::walk_all(&mut index, 7);
             sampled_scan::set_test_now(Some(1_000));
             index.probe_absent_claude_account_deferred_holds();
             assert_eq!(index.claude_account_deferred_hold_count(), 1);
@@ -790,6 +801,7 @@ mod tests {
             "2026-10-07T12:00:00Z",
             7,
         );
+        crate::snapshots::line_delivery_tests::walk_all(&mut index, 7);
         index.probe_absent_claude_account_deferred_holds();
         assert_eq!(index.claude_account_deferred_hold_count(), 1);
         super::sampled_scan::set_test_now(Some(191 * DAY + 600));

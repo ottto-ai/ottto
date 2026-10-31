@@ -1939,9 +1939,9 @@ fn terminal_off_new_round_observes_targeted_pending_and_floor_blocked_presence()
         .discovered_file_count;
     advance_bounded_directory_traversal(
         SnapshotSource::ClaudeCode,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(index),
+        None,
     );
     for key in [&pending_key, &held_key] {
         assert!(index

@@ -26765,6 +26765,10 @@ impl OwnedSourceScan {
         }
     }
 
+    pub(crate) fn rehome_withheld_baseline(&self, baseline: &mut ScanIndex) {
+        baseline.rehome_withheld_baseline(&self.index);
+    }
+
     /// Stage 1 (K6): the cooperative deadline of a continuation page, on the
     /// pace clock; ignored on an ordinary page. Past it the page pauses its
     /// job at the next `step()` return without minting a ticket.
@@ -26911,14 +26915,14 @@ impl OwnedSourceScan {
             );
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
-            advance_bounded_directory_traversal(
-                source,
-                traversal,
-                backfill_window_days,
-                discovery_retention!(index, &resource_probe.discovery_growth),
-            );
-            release_codex_inventory_hold(source, traversal);
         }
+        advance_bounded_directory_traversal(
+            source,
+            index,
+            backfill_window_days,
+            Some(&resource_probe.discovery_growth),
+        );
+        release_codex_inventory_hold(source, index.traversal.as_mut().expect("traversal"));
         if source == SnapshotSource::Codex {
             // L-SB: an index from before blocked-set attribution moves its
             // whole blocked set to `legacy` once.
@@ -43737,26 +43741,30 @@ fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTrav
 
 fn advance_bounded_directory_traversal(
     source: SnapshotSource,
-    traversal: &mut ScanTraversalCheckpoint,
+    index: &mut ScanIndex,
     backfill_window_days: u64,
-    retention: DiscoveryRetention<'_>,
+    growth: Option<&discovery_growth::Page>,
 ) {
     advance_bounded_directory_traversal_with_budget(
         source,
-        traversal,
+        index,
         backfill_window_days,
         MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK,
-        retention,
+        growth,
     );
 }
 
 fn advance_bounded_directory_traversal_with_budget(
     source: SnapshotSource,
-    traversal: &mut ScanTraversalCheckpoint,
+    index: &mut ScanIndex,
     backfill_window_days: u64,
     max_entries: usize,
-    retention: DiscoveryRetention<'_>,
+    growth: Option<&discovery_growth::Page>,
 ) {
+    let mut traversal = index
+        .traversal
+        .take()
+        .expect("bounded traversal initialized");
     let walk_issues = |counts: &ScanTraversalCounts| {
         (
             counts.directory_entry_cap_exceeded_count,
@@ -43905,6 +43913,13 @@ fn advance_bounded_directory_traversal_with_budget(
                     continue;
                 }
             };
+            if source == SnapshotSource::ClaudeCode {
+                index.rehome_discovered_account_hold(&mut traversal, &path, &metadata);
+            }
+            let retention = DiscoveryRetention {
+                growth,
+                ..discovery_retention!(index)
+            };
             let modified_unix_seconds = metadata
                 .modified()
                 .ok()
@@ -43934,7 +43949,7 @@ fn advance_bounded_directory_traversal_with_budget(
             }
             let walk_path = if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
                 terminal_off_discovery::walk_path(
-                    traversal,
+                    &traversal,
                     &path,
                     &metadata,
                     pending.contains_key(&path),
@@ -43990,6 +44005,7 @@ fn advance_bounded_directory_traversal_with_budget(
             census.invalidate_walk();
         }
     }
+    index.traversal = Some(traversal);
 }
 
 /// A Claude transcript that is NotFound while its parent is still a real
@@ -49866,6 +49882,121 @@ impl ScanIndex {
         self.claude_account_deferred_holds.len()
     }
 
+    /// Correctness custody follows a proven physical generation before the age gate.
+    /// The existing observed-key view keeps ambiguous same-member paths visible to F4.
+    fn rehome_discovered_account_hold(
+        &mut self,
+        walk: &mut ScanTraversalCheckpoint,
+        path: &Path,
+        metadata: &fs::Metadata,
+    ) {
+        if self.claude_account_deferred_holds.is_empty() {
+            return;
+        }
+        let key = local_index_key(path);
+        if self.claude_account_deferred_holds.contains_key(&key) {
+            return;
+        }
+        let Some((_, member)) = claude_index_path_family_member(path) else {
+            return;
+        };
+        let from = self
+            .claude_account_deferred_holds
+            .keys()
+            .take(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
+            .filter(|old| {
+                claude_index_path_family_member(Path::new(old))
+                    .is_some_and(|(_, prior)| prior == member)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for old in from {
+            // Presence is not transfer authority. Record it even when proof/age refuses.
+            walk.observed_index_keys.insert(key.clone());
+            self.withheld_memo.reset_absence(&old);
+            if walk.observed_index_keys.contains(&old)
+                || self.files.contains_key(&key)
+                || self.file_snapshot_fingerprints.contains_key(&key)
+                || self.decode_holds_file(&old)
+                || self.decode_holds_file(&key)
+                || !self.claude_money_birth_store.record_discovered_move(
+                    &member,
+                    &old,
+                    &key,
+                    claude_context_file_birth::ClaudeOpenedBirth::from_metadata(metadata),
+                )
+            {
+                continue;
+            }
+            self.rekey_account_custody(&old, &key);
+            walk.observed_index_keys.remove(&old);
+            break;
+        }
+    }
+
+    /// Move, never settle, existing custody. No transcript read or release/ACK credit.
+    fn rekey_account_custody(&mut self, from: &str, to: &str) {
+        if let Some(entry) = self.files.remove(from) {
+            self.files.insert(to.to_owned(), entry);
+        }
+        if let Some(incidence) = self.file_snapshot_fingerprints.remove(from) {
+            self.file_snapshot_fingerprints
+                .insert(to.to_owned(), incidence);
+        }
+        if let Some(incidence) = self.accepted_rebuild_incidence.remove(from) {
+            self.accepted_rebuild_incidence
+                .insert(to.to_owned(), incidence);
+        }
+        if let Some(disposition) = self.terminal_jsonl_dispositions.remove(from) {
+            self.terminal_jsonl_dispositions
+                .insert(to.to_owned(), disposition);
+        }
+        if self.confirmed_empty_files.remove(from) {
+            self.confirmed_empty_files.insert(to.to_owned());
+        }
+        if let Some(record) = self.claude_request_census.take(from) {
+            self.claude_request_census.insert(to.to_owned(), record);
+        }
+        // The value stays owned while rekeying; admission population never grows.
+        if let Some(hold) = self.claude_account_deferred_holds.remove(from) {
+            self.claude_account_deferred_holds
+                .insert(to.to_owned(), hold);
+        }
+        if let Some(slot) = self
+            .held_audit_progress
+            .as_mut()
+            .filter(|slot| slot.key == from)
+        {
+            slot.key = to.to_owned();
+        }
+        self.withheld_memo.rekey(from, to);
+    }
+
+    /// Align the already owned committed baseline before held/partial restoration.
+    /// The one move owner's generation tombstone is the authority, not a new map.
+    pub(crate) fn rehome_withheld_baseline(&mut self, working: &ScanIndex) {
+        let moves = self
+            .claude_account_deferred_holds
+            .keys()
+            .take(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
+            .filter_map(|old| {
+                let (_, member) = claude_index_path_family_member(Path::new(old))?;
+                let to = working.claude_money_birth_store.moved_to(&member, old)?;
+                let new = working
+                    .claude_account_deferred_holds
+                    .keys()
+                    .find(|key| claude_money_birth_store::location_key(key) == to)?;
+                (!working.claude_account_deferred_holds.contains_key(old)
+                    && !self.files.contains_key(new)
+                    && !self.claude_account_deferred_holds.contains_key(new))
+                .then(|| (old.clone(), new.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (old, new) in moves {
+            self.rekey_account_custody(&old, &new);
+        }
+    }
+
     /// Inventory includes hold-only keys and needs no census completion credit.
     /// Every caller of retirement uses the same stable-parent eligibility gate.
     fn probe_absent_claude_account_deferred_holds(&mut self) {
@@ -50951,6 +51082,19 @@ impl ScanIndex {
     /// Codex protection retains the entry and its own lineage/receipt state.
     fn retire_absent_account_hold(&mut self, key: &str) -> bool {
         if !self.claude_account_deferred_holds.contains_key(key) {
+            return false;
+        }
+        if self.traversal.as_ref().is_some_and(|walk| {
+            !walk.pending_directories.is_empty()
+                || claude_index_path_family_member(Path::new(key)).is_some_and(|(_, member)| {
+                    walk.observed_index_keys.iter().any(|other| {
+                        other != key
+                            && claude_index_path_family_member(Path::new(other))
+                                .is_some_and(|(_, found)| found == member)
+                    })
+                })
+        }) {
+            self.withheld_memo.reset_absence(key);
             return false;
         }
         let parent = self
@@ -57412,14 +57556,15 @@ mod tests {
             "2026-07-31T00:00:00Z",
             BACKFILL_WINDOW_DAYS,
         );
-        let traversal = index.traversal.as_mut().expect("traversal");
         advance_bounded_directory_traversal_with_budget(
             SnapshotSource::Pi,
-            traversal,
+            &mut index,
             BACKFILL_WINDOW_DAYS,
             3,
-            discovery_retention!(index),
+            None,
         );
+        let traversal = index.traversal.as_mut().expect("traversal");
+
         assert_eq!(traversal.counts.directory_entry_cap_exceeded_count, 1);
         assert!(traversal.pending_candidates.is_empty());
         assert!(traversal.counts.has_errors());
@@ -94539,12 +94684,7 @@ mod census_unreadable_tests {
             "2026-10-12T00:00:00Z",
             30,
         );
-        advance_bounded_directory_traversal(
-            SnapshotSource::Codex,
-            index.traversal.as_mut().unwrap(),
-            30,
-            discovery_retention!(index),
-        );
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 30, None);
         assert_eq!(
             projection(&index.traversal.as_ref().unwrap().counts)["counts"],
             json!([0, 1, 0, 0, 0, 0, 0, 0])

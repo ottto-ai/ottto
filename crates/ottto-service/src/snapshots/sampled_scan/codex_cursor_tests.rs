@@ -1901,13 +1901,14 @@ fn singleton_aggregate_page_budget_defers_via_pending_keeps_hint() {
         NOW,
         BACKFILL_WINDOW_DAYS,
     );
-    let traversal = index.traversal.as_mut().unwrap();
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        traversal,
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(index),
+        None,
     );
+    let traversal = index.traversal.as_mut().unwrap();
+
     for pending in &mut traversal.pending_candidates {
         pending.watcher_hint = true;
     }
@@ -3572,13 +3573,14 @@ fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
         NOW,
         BACKFILL_WINDOW_DAYS,
     );
-    let walked = index.traversal.as_mut().unwrap();
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        walked,
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(index),
+        None,
     );
+    let walked = index.traversal.as_mut().unwrap();
+
     let processed = fixture.file(SESSION);
     let pending = fixture.file(SESSION_B);
     let unobserved = fixture.file(SESSION_C);
@@ -3886,9 +3888,9 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
     );
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(index),
+        None,
     );
     let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
         "type": "session_meta", "payload": {"id": SESSION_B}}));
@@ -3989,9 +3991,9 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
     );
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(index),
+        None,
     );
     // SESSION already finished its census read; growth must not re-enroll it.
     index
@@ -4148,9 +4150,9 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
     );
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(index),
+        None,
     );
     let flags = |index: &ScanIndex, path: &PathBuf| {
         index
@@ -4198,9 +4200,9 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         .is_empty());
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(index),
+        None,
     );
     assert!(index
         .traversal
@@ -4248,9 +4250,9 @@ fn new_date_directory_session_bypasses_2800_owed_rereads_within_two_pages() {
     );
     advance_bounded_directory_traversal(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(index),
+        None,
     );
     let budget = fixture.len(SESSION) * 4;
     cache.clear();
