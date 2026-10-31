@@ -9990,8 +9990,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     disposition.mixed_uploads = qualification.mixed;
     // Request identity is not the session owner: admit only this scan's
     // exact contract-5 bodies, never rewriting a retained owner.
+    // Nor is an unhealthy read's cleared account: admit this scan's exact
+    // Unknown bodies so a bound session uploads them (Lead B Addendum 4).
     for item in &scan_result.snapshots {
         disposition.mixed_uploads.admit_request_identity(item);
+        disposition.mixed_uploads.admit_unhealthy_unknown(item);
     }
     stats.identity_complete_session_count = scan_result
         .snapshots

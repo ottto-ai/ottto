@@ -956,10 +956,24 @@ fn e2_bound_trace_case(
     assert_eq!(serde_json::to_value(stats.unhealthy_root_no_fallback_requests).unwrap(), expected);
     assert_eq!(stats.trace_discard_no_fallback_requests, if discarded { requests } else { 0 },
         "#932's scalar equals the discarded reason");
+    // The production account owner after this page: a body with no login on
+    // the session bound to A is held unless this scan admitted it.
+    let mut bound = items.clone();
+    let held = index.bind_session_accounts_with_mixed(
+        SnapshotSource::ClaudeCode,
+        "e2-identity-machine",
+        &mut bound,
+        &[],
+        &disposition.mixed_uploads,
+    );
     if discarded {
         // Deferred: no revision replaces the accepted body, so the server
         // keeps its tags and no other account (A or None) receives this hour.
         e2_assert_family_deferred(&items, &disposition);
+        if billing != "subscription" {
+            // Only the root is bound (to A).
+            assert_eq!(held, BTreeSet::from([root.clone()]), "#932's discard keeps main's account hold");
+        }
         assert_eq!(stats.trace_discard_deferred_items, 2);
         let line = serde_json::to_value(&stats).unwrap();
         assert_eq!(line["trace_discard_deferred_items"], 2);
@@ -973,6 +987,11 @@ fn e2_bound_trace_case(
     } else {
         // Never A, never B/C: every request share is Unknown, uploaded now.
         e2_bound_trace_assert_logins(&items, &root, None, None);
+        if billing != "subscription" {
+            // Lead B Addendum 4 (option 1): no account hold; still Unknown.
+            assert!(held.is_empty(), "0 holds: {held:?}");
+            e2_bound_trace_assert_logins(&bound, &root, None, None);
+        }
         assert_eq!(disposition.quarantined_entity_count(), 0, "Unknown, not deferred");
         assert_eq!(stats.trace_discard_deferred_items, 0);
         assert!(stats.trace_rows_discarded.is_empty(), "{mode} is not a discard");
@@ -1100,7 +1119,10 @@ fn e2_pipeline_external_billing_malformed_trace_clears_wire_account() {
     e2_bound_trace_case("malformed", false, "external", false, false);
 }
 
-/// [money] Lead B C2, mixed billing (only req_3/req_4 API-key billed).
+/// [money] Lead B C2 + Addendum 4 (option 1), mixed billing (only req_3/req_4
+/// API-key billed): the bound session uploads Unknown on the same page with
+/// 0 account holds, decision-2 refusals (none: such a body never enters the
+/// #909 ledger) and unchanged totals.
 #[test]
 fn e2_pipeline_mixed_billing_malformed_trace_clears_wire_account() {
     e2_bound_trace_case("malformed", false, "mixed", false, false);

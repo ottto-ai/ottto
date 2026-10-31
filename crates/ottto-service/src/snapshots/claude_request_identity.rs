@@ -251,6 +251,12 @@ impl UnhealthyRootReason {
         }
     }
 }
+impl crate::heap_layout_bound::HeapLayoutBound for UnhealthyRootReason {
+    const INLINE_ONLY: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
 
 /// Owned form of `IdentityRef`, for tests and the W0 builder oracle.
 #[cfg(test)]
@@ -2596,9 +2602,9 @@ pub(crate) struct RequestAccounts {
     reconciled: bool,
     /// Root start known, but the native Unknown grains are not filled yet.
     root_fallback_pending: bool,
-    /// This page could not read the family's strict sidecar evidence; no
-    /// account may fill its shares (SOURCE: unhealthy root is all-Unknown).
-    unhealthy_no_fallback: bool,
+    /// This page could not read the family's strict sidecar evidence (why);
+    /// no account may fill its shares (SOURCE: unhealthy root is all-Unknown).
+    unhealthy_no_fallback: Option<UnhealthyRootReason>,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
 crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, unhealthy_no_fallback);
@@ -2766,7 +2772,7 @@ pub(crate) fn request_accounts(
 
 impl RequestAccounts {
     pub(crate) fn account(&self, sequence: u64) -> AccountPartition {
-        if self.unhealthy_no_fallback {
+        if self.unhealthy_no_fallback.is_some() {
             return None;
         }
         if self.subagent {
@@ -2981,8 +2987,9 @@ pub(crate) fn reconcile_request_accounts(
             // evidence for requests whose own proof could not be read: collapse
             // the partitions in place so tokens, costs, side calls and id-less
             // shares survive with no account. Durable bindings are untouched.
+            let reason = evidence.unhealthy_reason(root);
             no_fallback.add(
-                evidence.unhealthy_reason(root),
+                reason,
                 fold.entity
                     .grains
                     .values()
@@ -2990,7 +2997,7 @@ pub(crate) fn reconcile_request_accounts(
                     .fold(0_u64, u64::saturating_add),
             );
             fold.entity.repartition(None);
-            accounts.unhealthy_no_fallback = true;
+            accounts.unhealthy_no_fallback = Some(reason);
             accounts.starting = None;
             accounts.fallback = None;
             accounts.inherited = 0;
@@ -3191,6 +3198,17 @@ pub(crate) fn reconcile_request_accounts(
     no_fallback
 }
 
+/// Lead B Addendum 4 (option 1): an item whose account this page cleared for a
+/// non-discard unhealthy read uploads Unknown now instead of being held by its
+/// bound session. A discarded family keeps #932's hold.
+pub(crate) fn uploads_unhealthy_unknown(item: &SnapshotItem) -> bool {
+    item.claude_money
+        .as_deref()
+        .and_then(|fold| fold.accounts.as_deref())
+        .and_then(|accounts| accounts.unhealthy_no_fallback)
+        .is_some_and(|reason| reason != UnhealthyRootReason::Discarded)
+}
+
 /// Read retained creator bindings using the same machine/session key as the
 /// account owner. No transcript read, new index field, or current-login guess.
 pub(crate) fn retain_root_accounts(items: &mut [SnapshotItem], index: &ScanIndex, machine: &str) {
@@ -3264,7 +3282,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
             continue;
         };
         // An unhealthy family lends no start to its children or twins.
-        if accounts.subagent || accounts.unhealthy_no_fallback {
+        if accounts.subagent || accounts.unhealthy_no_fallback.is_some() {
             continue;
         }
         let first = item
@@ -3337,7 +3355,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         let Some(accounts) = fold.accounts.as_deref_mut() else {
             continue;
         };
-        if accounts.unhealthy_no_fallback {
+        if accounts.unhealthy_no_fallback.is_some() {
             continue;
         }
         if accounts.subagent {
@@ -4942,7 +4960,9 @@ fn keeps_markerless_account(item: &SnapshotItem) -> bool {
             .as_deref()
             .and_then(|fold| fold.accounts.as_deref())
             .is_some_and(|accounts| {
-                !accounts.unhealthy_no_fallback && accounts.starting.is_some() && !accounts.conflict
+                accounts.unhealthy_no_fallback.is_none()
+                    && accounts.starting.is_some()
+                    && !accounts.conflict
             })
 }
 

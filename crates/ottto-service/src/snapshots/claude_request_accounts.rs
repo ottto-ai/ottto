@@ -36,6 +36,26 @@ pub(crate) struct MixedUploads {
     bodies: BTreeMap<String, (String, String)>,
     /// Contract-5 bodies tagged in this scan, bound the same way.
     request_identity: BTreeMap<String, (String, String)>,
+    /// Bodies left with no account by a non-discard unhealthy read this scan
+    /// (Lead B Addendum 4): they upload Unknown, bound the same way.
+    unhealthy_unknown: BTreeMap<String, (String, String)>,
+}
+
+/// This scan's exact semantic and upload body for `item`.
+fn bound_body(item: &SnapshotItem) -> (String, String) {
+    (
+        item.snapshot_fingerprint.clone(),
+        super::snapshot_upload_body_witness(item),
+    )
+}
+
+/// `item` is still exactly the body admitted as `bound`.
+fn is_bound_body(bound: Option<&(String, String)>, item: &SnapshotItem) -> bool {
+    bound.is_some_and(|(semantic, body)| {
+        item.snapshot_fingerprint == *semantic
+            && snapshot_fingerprint(SnapshotSource::ClaudeCode, item) == *semantic
+            && super::snapshot_upload_body_witness(item) == *body
+    })
 }
 
 impl MixedUploads {
@@ -45,13 +65,18 @@ impl MixedUploads {
         #[cfg(test)]
         let identity_collector = super::claude_request_identity::cycle_contract(true);
         if item.provenance.collector == identity_collector {
-            self.request_identity.insert(
-                item.source_session_id.clone(),
-                (
-                    item.snapshot_fingerprint.clone(),
-                    super::snapshot_upload_body_witness(item),
-                ),
-            );
+            self.request_identity
+                .insert(item.source_session_id.clone(), bound_body(item));
+        }
+    }
+
+    /// Call before the E2 fold is released: it names the unhealthy reason.
+    pub(crate) fn admit_unhealthy_unknown(&mut self, item: &SnapshotItem) {
+        if super::claude_request_identity::uploads_unhealthy_unknown(item)
+            && super::exact_session_account_hash(item).is_none()
+        {
+            self.unhealthy_unknown
+                .insert(item.source_session_id.clone(), bound_body(item));
         }
     }
 
@@ -60,25 +85,17 @@ impl MixedUploads {
         let identity_collector = super::claude_request_identity::COLLECTOR;
         #[cfg(test)]
         let identity_collector = super::claude_request_identity::cycle_contract(true);
-        self.request_identity
-            .get(&item.source_session_id)
-            .is_some_and(|(semantic, body)| {
-                item.provenance.collector == identity_collector
-                    && item.snapshot_fingerprint == *semantic
-                    && snapshot_fingerprint(SnapshotSource::ClaudeCode, item) == *semantic
-                    && super::snapshot_upload_body_witness(item) == *body
-            })
+        item.provenance.collector == identity_collector
+            && is_bound_body(self.request_identity.get(&item.source_session_id), item)
+    }
+
+    pub(super) fn permits_unhealthy_unknown(&self, item: &SnapshotItem) -> bool {
+        is_bound_body(self.unhealthy_unknown.get(&item.source_session_id), item)
     }
 
     pub(super) fn permits(&self, item: &SnapshotItem) -> bool {
-        self.bodies
-            .get(&item.source_session_id)
-            .is_some_and(|(semantic, body)| {
-                item.provenance.collector == MIXED
-                    && item.snapshot_fingerprint == *semantic
-                    && snapshot_fingerprint(SnapshotSource::ClaudeCode, item) == *semantic
-                    && super::snapshot_upload_body_witness(item) == *body
-            })
+        item.provenance.collector == MIXED
+            && is_bound_body(self.bodies.get(&item.source_session_id), item)
     }
 }
 
@@ -209,13 +226,10 @@ fn qualify_all(
                 item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
             }
             if qualified {
-                result.mixed.bodies.insert(
-                    item.source_session_id.clone(),
-                    (
-                        item.snapshot_fingerprint.clone(),
-                        super::snapshot_upload_body_witness(item),
-                    ),
-                );
+                result
+                    .mixed
+                    .bodies
+                    .insert(item.source_session_id.clone(), bound_body(item));
             }
             if qualified {
                 continue;
