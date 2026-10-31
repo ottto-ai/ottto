@@ -34477,8 +34477,6 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]
-                        let mut restored_plan = None;
-                        #[cfg(unix)]
                         let mut restored_durable = false;
                         #[cfg(unix)]
                         let (mut retained, taken_admission, debt) = match retained {
@@ -34507,9 +34505,9 @@ impl OwnedSourceScan {
                                 resource_probe.full_causes.restore_outcome.record(&restore);
                                 match restore {
                                     sampled_scan::durable_tail::RestoreOutcome::Restored(
-                                        mut taken,
+                                        taken,
                                         lease,
-                                    ) => 'restored_transfer: {
+                                    ) => {
                                         preparation_lease = Some(lease);
                                         restored_durable = restart_restore::enabled();
                                         retained_offset =
@@ -34519,60 +34517,6 @@ impl OwnedSourceScan {
                                             taken.finalization_charge,
                                             taken.retained.state.usage_witness(),
                                         );
-                                        // The cold transfer still owns its paid lease. Plan
-                                        // once, and attach Q11 before any prepare rejection
-                                        // can return this Taken to ordinary RAM reuse.
-                                        if restored_durable && source == SnapshotSource::ClaudeCode {
-                                            let plan = match crate::transcript_acquisition::ReadPlan::prepare(
-                                                parser.reader.reader.get_mut(),
-                                                Some(&taken.retained.checkpoint),
-                                                &scope,
-                                                debt,
-                                                sampled_scan::now_seconds(),
-                                            ) {
-                                                Ok(plan) => plan,
-                                                Err(_) => {
-                                                    // No plan means no reusable cold transfer.
-                                                    // Drop the graph before releasing its funding;
-                                                    // leave the committed record available to retry.
-                                                    drop(taken);
-                                                    preparation_lease.take().expect("cold transfer lease").release();
-                                                    claude_request_census::retain_held(index, &candidate);
-                                                    census.record_unreadable(UnreadableCause::Reduction, 1);
-                                                    pending!();
-                                                }
-                                            };
-                                            if plan.mode() == crate::transcript_acquisition::ReadMode::Tail {
-                                                let accepted_end = durable_accepted.expect("restored floor").end;
-                                                match context.cache.begin_retail(
-                                                    source, &key, &taken.retained.checkpoint,
-                                                    parser.reader.reader.get_ref(), accepted_end,
-                                                    std::time::Instant::now(),
-                                                ) {
-                                                    Ok(attempt) => taken.durable.put_retail(attempt),
-                                                    Err(reason) => {
-                                                        let full = matches!(reason,
-                                                            sampled_scan::durable_tail::RetailHold::Exhausted |
-                                                            sampled_scan::durable_tail::RetailHold::AccountingLost)
-                                                            && context.cache.retail_full(&key, parser.reader.reader.get_ref(), accepted_end, SystemTime::now());
-                                                        // A refused grant must never leave a
-                                                        // guardless graph in the warm cache.
-                                                        drop(taken);
-                                                        preparation_lease.take().expect("cold transfer lease").release();
-                                                        if full {
-                                                            paced_full_granted = true;
-                                                            break 'restored_transfer (None, None, debt);
-                                                        } else {
-                                                            context.cache.durable_retail_hold(source, reason, index, &candidate);
-                                                            pending!();
-                                                        }
-                                                    }
-                                                }
-                                                // A successful Tail keeps its guard on Taken;
-                                                // the same plan enters native preparation below.
-                                            }
-                                            restored_plan = Some(plan);
-                                        }
                                         (Some(taken), Some(admission), debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::FloorHeld => {
@@ -34732,8 +34676,6 @@ impl OwnedSourceScan {
                             }
                             retained => (retained, taken_admission, debt),
                         };
-                        #[cfg(not(unix))]
-                        let restored_plan = None;
                         // The cap funds NEW obligations, never a global restore
                         // gate. Marked files Tail; quiet debt-free copies reuse.
                         let mut cap_full = false;
@@ -34776,12 +34718,6 @@ impl OwnedSourceScan {
                         // original back with its receipt debt and funding.
                         if !allow_sample {
                             if let Some(taken) = retained.take() {
-                                // A returned copy cannot supply a Tail plan to
-                                // the fresh Full prepared without that copy.
-                                #[cfg(unix)]
-                                {
-                                    restored_plan = None;
-                                }
                                 if restart_restore::enabled()
                                     && source == SnapshotSource::ClaudeCode
                                 {
@@ -34793,7 +34729,77 @@ impl OwnedSourceScan {
                                 );
                             }
                         }
-                        let old = retained;
+                        let mut old = retained;
+                        #[cfg(unix)]
+                        let restored_plan = 'cold_plan: {
+                            // Eligibility and the audit cap must settle before
+                            // spending Q11. The paid transfer still owns Taken;
+                            // attach its guard before fallible owned preparation.
+                            if restored_durable && source == SnapshotSource::ClaudeCode {
+                                let Some(taken) = old.as_mut() else {
+                                    break 'cold_plan None;
+                                };
+                                let plan = match crate::transcript_acquisition::ReadPlan::prepare(
+                                    parser.reader.reader.get_mut(),
+                                    Some(&taken.retained.checkpoint),
+                                    &scope,
+                                    debt,
+                                    sampled_scan::now_seconds(),
+                                ) {
+                                    Ok(plan) => plan,
+                                    Err(_) => {
+                                        drop(old.take());
+                                        preparation_lease
+                                            .take()
+                                            .expect("cold transfer lease")
+                                            .release();
+                                        claude_request_census::retain_held(index, &candidate);
+                                        census.record_unreadable(UnreadableCause::Reduction, 1);
+                                        pending!();
+                                    }
+                                };
+                                if plan.mode() == crate::transcript_acquisition::ReadMode::Tail {
+                                    let accepted_end =
+                                        durable_accepted.expect("restored floor").end;
+                                    match context.cache.begin_retail(
+                                        source,
+                                        &key,
+                                        &taken.retained.checkpoint,
+                                        parser.reader.reader.get_ref(),
+                                        accepted_end,
+                                        std::time::Instant::now(),
+                                    ) {
+                                        Ok(attempt) => taken.durable.put_retail(attempt),
+                                        Err(reason) => {
+                                            let full = matches!(reason,
+                                                sampled_scan::durable_tail::RetailHold::Exhausted |
+                                                sampled_scan::durable_tail::RetailHold::AccountingLost)
+                                                && context.cache.retail_full(&key, parser.reader.reader.get_ref(), accepted_end, SystemTime::now());
+                                            // A refused grant cannot leave a guardless
+                                            // graph in RAM. Release graph before funding.
+                                            drop(old.take());
+                                            preparation_lease
+                                                .take()
+                                                .expect("cold transfer lease")
+                                                .release();
+                                            if full {
+                                                paced_full_granted = true;
+                                                break 'cold_plan None;
+                                            }
+                                            context.cache.durable_retail_hold(
+                                                source, reason, index, &candidate,
+                                            );
+                                            pending!();
+                                        }
+                                    }
+                                }
+                                Some(plan)
+                            } else {
+                                None
+                            }
+                        };
+                        #[cfg(not(unix))]
+                        let restored_plan = None;
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);
                         let mode = match parser.prepare_acquisition_owned_planned(
