@@ -572,7 +572,7 @@ impl DurableTailStore {
             if self.disabled.is_some() {
                 return Err(io::Error::other("store disabled"));
             }
-            if !self.check_resources(writer, 0) {
+            if !self.check_resources(writer, 0)? {
                 return Err(io::Error::from_raw_os_error(libc::ENOSPC));
             }
             let size = header_len(header.format, header.binding.source, &header.allowlist)
@@ -958,19 +958,23 @@ impl DurableTailStore {
     pub(crate) fn resource_paused(&self) -> bool {
         self.resource_pause.is_some()
     }
-    pub(crate) fn check_resources(&mut self, writer: &dyn SingleWriter, index_len: u64) -> bool {
+    pub(crate) fn check_resources(
+        &mut self,
+        writer: &dyn SingleWriter,
+        index_len: u64,
+    ) -> io::Result<bool> {
         if self.check_writer(writer).is_err() || self.disabled.is_some() {
-            return false;
+            return Ok(false);
         }
         let now = SystemTime::now();
         if let Some(pause) = self.resource_pause.as_mut() {
             if now < pause.next_probe {
                 self.counters.resource_pause_skipped += 1;
-                return false;
+                return Ok(false);
             }
             pause.next_probe = now + PAUSE_RECHECK;
         } else if self.resource_checked {
-            return self.resource_granted;
+            return Ok(self.resource_granted);
         }
         self.counters.resource_pause_checks += 1;
         let dir = if self.dir.exists() {
@@ -979,7 +983,8 @@ impl DurableTailStore {
             self.dir.parent().unwrap_or(&self.dir)
         };
         // One statvfs reserves a whole bounded pass, not one syscall per record.
-        let enough = above_floor(dir, WRITE_PASS_BYTES as u64, index_len).unwrap_or(false);
+        let enough = above_floor(dir, WRITE_PASS_BYTES as u64, index_len)
+            .inspect_err(|_| self.counters.store_write_failed[2] += 1)?;
         self.resource_checked = true;
         self.resource_granted = enough;
         if !enough {
@@ -988,7 +993,7 @@ impl DurableTailStore {
                 self.counters.budget_refused += 1;
             }
             self.pause_resources();
-            return false;
+            return Ok(false);
         }
         if let Some(pause) = self.resource_pause.take() {
             self.counters.resource_paused_seconds =
@@ -997,7 +1002,7 @@ impl DurableTailStore {
                         .map_or(0, |age| age.as_secs()),
                 );
         }
-        true
+        Ok(true)
     }
     pub(crate) fn note_degraded_publish(&mut self) {
         self.counters.durable_write_failed_published += 1;

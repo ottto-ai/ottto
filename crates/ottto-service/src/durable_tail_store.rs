@@ -1710,7 +1710,7 @@ impl DurableTailStore {
         if !self.usable(Some(writer)) {
             return Ok(receipt);
         }
-        if !self.check_resources(writer, index_length) {
+        if !self.check_resources(writer, index_length)? {
             receipt
                 .deferred_keys
                 .extend(pending.iter().map(|record| record.binding.key));

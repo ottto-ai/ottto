@@ -759,8 +759,10 @@ impl SharedCache {
             };
             let index_len =
                 std::fs::metadata(&slot.index_path).map_or(0, |metadata| metadata.len());
-            if !slot.store.check_resources(writer, index_len) {
-                return PrepareOutcome::Degraded(Degraded::Paused);
+            match slot.store.check_resources(writer, index_len) {
+                Ok(true) => {}
+                Ok(false) => return PrepareOutcome::Degraded(Degraded::Paused),
+                Err(_) => return PrepareOutcome::Degraded(Degraded::Refused),
             }
             if (!view.accumulator.activity_skills.is_empty()
                 || !view.accumulator.provider_skills.is_empty())
