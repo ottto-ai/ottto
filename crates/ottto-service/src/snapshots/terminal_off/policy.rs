@@ -3,7 +3,6 @@
 use std::path::Path;
 
 pub(super) const NAME: &str = "claude_terminal_off_enabled";
-#[cfg(test)]
 fn enabled_at(support: &Path) -> bool {
     marker_at(support, NAME)
 }
@@ -14,18 +13,10 @@ pub(in crate::snapshots) fn marker_at(support: &Path, name: &str) -> bool {
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
 }
 
-/// Shared process pin for local sentinels. A name is statted only on its
-/// first lookup; #990/#998 can use the same helper without another pin owner.
-#[cfg(not(test))]
-pub(in crate::snapshots) fn pinned_marker(name: &'static str) -> bool {
-    static MARKERS: std::sync::Mutex<std::collections::BTreeMap<&'static str, bool>> =
-        std::sync::Mutex::new(std::collections::BTreeMap::new());
-    let mut markers = MARKERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *markers
-        .entry(name)
-        .or_insert_with(|| marker_at(&ottto_core::default_support_dir(), name))
+/// A process-pinned support-dir switch behind the caller's own lock-free
+/// cell. The owner changes the marker and restarts the daemon to apply it.
+pub(in crate::snapshots) fn pinned_marker(cell: &std::sync::OnceLock<bool>, name: &str) -> bool {
+    *cell.get_or_init(|| marker_at(&ottto_core::default_support_dir(), name))
 }
 
 pub(super) fn enabled() -> bool {
@@ -35,20 +26,15 @@ pub(super) fn enabled() -> bool {
     }
     #[cfg(not(test))]
     {
-        pinned_marker(NAME)
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
     }
 }
 
-/// Q-D3 opt-in. No marker changes or daemon restarts are performed by agents.
+/// Machine policy only; callers inject this value through the scan seam.
 pub(in crate::snapshots) fn child_evidence_digest() -> bool {
-    #[cfg(test)]
-    {
-        false
-    }
-    #[cfg(not(test))]
-    {
-        pinned_marker("claude_child_evidence_digest_enabled")
-    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    pinned_marker(&ENABLED, "claude_child_evidence_digest_enabled")
 }
 
 #[cfg(test)]

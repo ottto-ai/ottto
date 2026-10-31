@@ -1174,8 +1174,9 @@ fn decode_api_sidecar(
     if terminal_off {
         bytes = limit - reader.get_ref().limit();
     }
-    // OFF also feeds the loader byte receipt; it installs no allowance.
-    strict_budget::consumed(bytes);
+    if terminal_off {
+        strict_budget::consumed(bytes);
+    }
     #[cfg(test)]
     API_AFTER_READ.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {

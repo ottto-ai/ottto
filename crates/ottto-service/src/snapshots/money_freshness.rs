@@ -99,12 +99,12 @@ mod tests;
 pub(super) fn enabled() -> bool {
     #[cfg(not(test))]
     {
-        !super::terminal_off_policy::pinned_marker("money_freshness_disabled")
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
     }
     #[cfg(test)]
     ENABLED.with(std::cell::Cell::get)
 }
-#[cfg(test)]
 fn enabled_at(support: &std::path::Path) -> bool {
     !super::terminal_off_policy::marker_at(support, "money_freshness_disabled")
 }
