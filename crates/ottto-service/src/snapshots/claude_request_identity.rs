@@ -5133,8 +5133,8 @@ fn keeps_markerless_account(item: &SnapshotItem) -> bool {
 /// Tag `item`; with `session_history_segments:v1` on and an oversized body,
 /// first cut its settled history and tag every piece from the whole-session
 /// grouping (carry already ran over the whole session). Each segment's
-/// accepted hints are its own entry per bucket, else the live entry's (C2);
-/// retained proof is its own entry's only (C4). Any piece failing keeps the
+/// accepted hints are its own entry per bucket, else the live entry's;
+/// retained proof is its own entry's only. Any piece failing keeps the
 /// whole body on today's path. Segments wait on the live body for the page.
 fn apply_cut(
     item: &mut SnapshotItem,

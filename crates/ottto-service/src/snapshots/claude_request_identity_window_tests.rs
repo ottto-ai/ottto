@@ -2577,8 +2577,8 @@ fn settled_history_cut_keeps_whole_session_placement() {
 }
 
 /// [money] #909 ledger across the cut. Cut-time tags equal the unsegmented
-/// tags from the same live ledger (per-bucket fallback, C2); after the group
-/// ACK each segment entry and the live entry keep their own buckets (C1),
+/// tags from the same live ledger (per-bucket fallback); after the group
+/// ACK each segment entry and the live entry keep their own buckets,
 /// and tags stay equal.
 #[test]
 fn settled_history_cut_tags_from_own_entry_then_live() {

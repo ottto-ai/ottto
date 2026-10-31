@@ -2346,7 +2346,7 @@ impl SnapshotUploadProgress {
         else {
             return Ok(());
         };
-        // Settled-history segments key their own sibling entries (C1).
+        // Settled-history segments key their own sibling entries.
         let segment = value["history_segment"].is_object();
         let ledger = if segment {
             &mut self.accepted_identity_segments
@@ -3435,6 +3435,9 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     durable
         .accepted_identity_buckets
         .adopt_runtime_from(&progress.accepted_identity_buckets);
+    durable
+        .accepted_identity_segments
+        .adopt_runtime_from(&progress.accepted_identity_segments);
     if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
@@ -10932,7 +10935,7 @@ where
             .filter(|entity| entity.unchanged_basis.is_none())
             .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
             .collect::<BTreeMap<_, _>>();
-        // Settled-history groups settle whole (Lead B C3): a member stays
+        // Settled-history groups settle whole: a member stays
         // unsettled, and is offered again with its group, unless every
         // member on this page settled. Segments record before their live body.
         let groups = history_groups(items, indices)?;

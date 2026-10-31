@@ -553,7 +553,7 @@ fn group_page(progress: &mut SnapshotUploadProgress, items: &[Value], conflicted
     .unwrap();
 }
 
-/// [money] Lead B C3: a settled-history group settles whole. With the live
+/// [money] A settled-history group settles whole. With the live
 /// ACK lost (conflicted), nothing of the group is recorded or settled, so
 /// the moved bucket stays protected by the live entry and the segment is
 /// offered again; once the whole group ACKs, the segment records into its own
@@ -659,4 +659,42 @@ fn segment_hints_persist_in_a_sibling_field_older_decoders_ignore() {
         older.accepted_body_witnesses,
         progress.accepted_body_witnesses
     );
+}
+
+/// [off=main][regress] Each pass binds the attribution key on both ledgers;
+/// the partial checkpoint re-reads progress from disk (no key) and must adopt
+/// that runtime state for both before comparing, even with the sibling empty
+/// and the capability off.
+#[test]
+fn partial_checkpoint_adopts_both_ledgers_runtime_state() {
+    let scratch = crate::test_scratch::ScratchDir::new("segments-partial-checkpoint");
+    let mut progress = SnapshotUploadProgress::new(
+        "a".repeat(64),
+        crate::snapshots::snapshot_quarantine_witness_for_context(
+            SnapshotSource::ClaudeCode,
+            &"d".repeat(64),
+        ),
+    );
+    for ledger in [
+        &mut progress.accepted_identity_buckets,
+        &mut progress.accepted_identity_segments,
+    ] {
+        ledger.bind_test_key(Some([0x42; 32]));
+    }
+    let progress_path = scratch.join("progress.json");
+    let index_path = scratch.join("index.json");
+    progress.save(&progress_path).unwrap();
+    let index = ScanIndex::default();
+    checkpoint_partial_snapshot_index(
+        &index,
+        &index,
+        &progress,
+        &[],
+        None,
+        &BTreeSet::new(),
+        &index_path,
+        &progress_path,
+        || Ok(()),
+    )
+    .unwrap();
 }

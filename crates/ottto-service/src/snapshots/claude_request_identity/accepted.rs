@@ -11,9 +11,8 @@ pub(crate) const MAX_SESSIONS: usize = 16;
 pub(crate) const MAX_BUCKETS: usize = 5_000;
 const MAX_SHARES: usize = 1_536;
 pub(crate) const MAX_PROVED_ROWS: usize = 1_024;
-/// Stated design maximum of settled-history segment entries (rule 9 heap
-/// bound). Above it only an alarm counts: segment entries are never evicted
-/// by count or recency, only with their session's retirement (Lead B Q2).
+/// Stated design maximum of settled-history segment entries (heap bound). Above it only an alarm counts: segment entries are never evicted
+/// by count or recency, only with their session's retirement.
 pub(crate) const SEGMENT_DESIGN_MAX: usize = 64;
 /// Tombstone for a proof superseded before upload: a keyed digest is never zero.
 const REPLACED_PROOF: [u8; 16] = [0; 16];
@@ -1050,9 +1049,9 @@ impl AcceptedBuckets {
     }
 }
 /// A segment's accepted hints for its `buckets`: per bucket its own entry
-/// when that holds the bucket, else the live entry's shares (Lead B C2).
+/// when that holds the bucket, else the live entry's shares.
 /// Retained proof comes from its own entry only: until the segment entity
-/// has its own accepted proof it sends full identity rows (C4).
+/// has its own accepted proof it sends full identity rows.
 pub(crate) fn segment_view(
     own: Option<&AcceptedSession>,
     live: Option<&AcceptedSession>,
@@ -1709,7 +1708,7 @@ mod segment_tests {
         json!({"history_segment": {"of": LIVE}})
     }
 
-    /// [money] Lead B C2/C4: a segment's own entry wins per bucket; a bucket
+    /// [money] A segment's own entry wins per bucket; a bucket
     /// it lacks (late in its window, or a lost live ACK) takes the live
     /// entry's shares; retained proof is the segment's own only.
     #[test]
@@ -1738,7 +1737,7 @@ mod segment_tests {
         assert!(segment_view(None, None, &[old]).is_none());
     }
 
-    /// [money] Lead B Q2: segment entries are never evicted by count (only an
+    /// [money] Segment entries are never evicted by count (only an
     /// alarm above the design maximum) and leave only with their session's
     /// cut: a live body past their window keeps them, a live body whose cut
     /// is lower (or absent) retires them.
