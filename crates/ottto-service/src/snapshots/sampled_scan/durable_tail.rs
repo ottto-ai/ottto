@@ -1010,7 +1010,7 @@ impl SharedCache {
         let decoded = codec::decode(&record.record.body, source).map_err(|_| Failure::Corrupt)?;
         if decoded
             .cutover()
-            .is_some_and(|stored| stored != codex_counting_version::cutover_unix_ms())
+            .is_some_and(|stored| stored != Some(codex_counting_version::cutover_unix_ms()))
         {
             return Err(Failure::Ineligible(store::Ineligible::Scope));
         }
