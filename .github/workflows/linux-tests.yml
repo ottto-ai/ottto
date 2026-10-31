@@ -98,3 +98,6 @@ jobs:
       # Includes ottto-connector-testkit's first_party_sources contract tests.
       - name: Connector tests
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
+
+      - name: Archive marker historical writer roundtrip
+        run: python3 scripts/test_codex_zst_downgrade.py --r1 9bc637c2c0e05391b61ef93d7e0e7608424ceb6b

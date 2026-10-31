@@ -86,6 +86,7 @@ macro_rules! scan_index_fields {
             claude_money_birth_store => Misc (misc check_field Field) ["v1_field.birth_store"] side,
             claude_desktop_store_inventory => Misc (misc check_field Field) ["v1_field.claude_desktop_store_inventory"] side,
             claude_copy_removals => Misc (misc check_field Field) ["v1_field.claude_copy_removals"] side,
+            archive_pass => Misc (runtime none) [] side,
             decode_holds => Misc (hook none) ["v1_field.repair_provenance", "raw_hold.files", "raw_hold.growth_retention", "raw_hold.claude_account_family_witnesses", "raw_hold.claude_account_family_pending", "raw_hold.claude_usage_family_witnesses", "raw_hold.claude_usage_family_pending", "raw_hold.claude_usage_authority_quarantine", "raw_hold.quarantined_snapshot_fingerprints"] side,
             files => Files (map check_map) ["file.progress"] own,
             terminal_jsonl_dispositions => Files (map check_map) ["file.terminal"] side,

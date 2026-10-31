@@ -99,3 +99,5 @@ const UPLOAD_STALENESS_SECS: i64 = 7 * 24 * 60 * 60;
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use harvest::{set_utility_qos, thread_cpu_micros};

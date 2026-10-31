@@ -185,39 +185,79 @@ pub(crate) struct ClaudeIdentityOverCapBytes {
     pub(crate) after_shed: usize,
 }
 
-/// Closed, content-free refusal labels; cumulative process counters on #799.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+/// Persisted via ArchiveDisposition: never rename/remove; retain retired variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedReplayNotAuthorized")]
-    ReplayNotAuthorized,
+    ReplayNotAuthorized = 0,
     #[serde(rename = "CompressedProofParentUnsupported")]
-    ProofParentUnsupported,
+    ProofParentUnsupported = 1,
     #[serde(rename = "CompressedProofChildUnsupported")]
-    ProofChildUnsupported,
+    ProofChildUnsupported = 2,
     #[serde(rename = "CompressedParentSideUnsupported")]
-    ParentSideUnsupported,
+    ParentSideUnsupported = 3,
     #[serde(rename = "CompressedDurableTailUnsupported")]
-    DurableTailUnsupported,
+    DurableTailUnsupported = 4,
     #[serde(rename = "CompressedGroupProbeUnsupported")]
-    GroupProbeUnsupported,
+    GroupProbeUnsupported = 5,
     #[serde(rename = "CompressedGroupReadUnsupported")]
-    GroupReadUnsupported,
+    GroupReadUnsupported = 6,
     #[serde(rename = "CompressedParentLedgerUnbound")]
-    ParentLedgerUnbound,
+    ParentLedgerUnbound = 7,
     #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
-    PhysicalOffsetUnsupported,
-    #[serde(rename = "CompressedHeaderUnfunded")]
-    HeaderUnfunded,
-    #[serde(rename = "CompressedCompatibilityUnfunded")]
-    CompatibilityUnfunded,
+    PhysicalOffsetUnsupported = 8,
+    #[serde(rename = "CompressedCompatibilityUnsupported")]
+    CompatibilityUnsupported = 9,
     #[serde(rename = "CompressedAdmissionRefused")]
-    AdmissionRefused,
-    // Subset of decoder refusals: the unchanged free-only floor would fit
-    // without optional header entries. Attempts, not files or lost usage.
+    AdmissionRefused = 10,
+    #[serde(rename = "CompressedDecodeFailed")]
+    DecodeFailed = 11,
+    #[serde(rename = "CompressedOwnerUnproven")]
+    OwnerUnproven = 12,
+    #[serde(rename = "CompressedOutputHeld")]
+    OutputHeld = 13,
+    #[serde(rename = "CompressedSettlementStuck")]
+    SettlementStuck = 14,
+    #[serde(rename = "CompressedConstructorUnfunded")]
+    ConstructorUnfunded = 15,
+    #[serde(rename = "CompressedDecodedOverLimit")]
+    DecodedOverLimit = 16,
+    #[serde(rename = "CompressedParserStateRequired")]
+    ParserStateRequired = 17,
+    #[serde(rename = "CompressedHeaderInvalid")]
+    HeaderInvalid = 18,
+    #[serde(rename = "decode_budget")]
+    DecodeBudget = 19,
+    #[serde(rename = "admission_starved")]
+    AdmissionStarved = 20,
+    #[serde(rename = "CompressedCorrectionUnapplied")]
+    CorrectionUnapplied = 21,
+    #[serde(rename = "CompressedHeaderUnfunded")]
+    HeaderUnfunded = 22,
+    #[serde(rename = "CompressedCompatibilityUnfunded")]
+    CompatibilityUnfunded = 23,
+    // Optional plain header occupancy refused an otherwise fundable decoder.
     #[serde(rename = "decoder_refused_header_occupancy")]
-    DecoderRefusedHeaderOccupancy,
+    DecoderRefusedHeaderOccupancy = 24,
+    #[serde(rename = "CompressedFamilyUnproven")]
+    FamilyUnproven = 25,
+    #[serde(rename = "ArchiveEquivalenceUnproven")]
+    ArchiveEquivalenceUnproven = 26,
+    #[serde(rename = "CompressedCatchupTooLarge")]
+    CatchupTooLarge = 27,
+    #[serde(rename = "archive_dominated")]
+    ArchiveDominated = 28,
+    #[doc(hidden)]
+    #[serde(skip)]
+    __Count = 29,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::DecoderRefusedHeaderOccupancy as usize + 1;
+impl std::fmt::Display for CodexZstCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for CodexZstCause {}
+const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
@@ -271,6 +311,45 @@ pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
                 BTreeMap::from([("scanned", scanned), ("emitted", emitted), ("noops", noops)]),
             )]),
         );
+    }
+}
+
+thread_local! {
+    static CODEX_ZST_HELD: std::cell::Cell<[Option<(CodexZstCause, u64)>; CODEX_ZST_CAUSES]> = const { std::cell::Cell::new([None; CODEX_ZST_CAUSES]) };
+}
+pub(crate) fn codex_zst_held(cause: CodexZstCause) {
+    CODEX_ZST_HELD.with(|slot| {
+        let mut counts = slot.get();
+        counts[cause as usize] = Some((
+            cause,
+            counts[cause as usize].map_or(1, |(_, n)| n.saturating_add(1)),
+        ));
+        slot.set(counts);
+    });
+}
+pub(crate) fn flush_codex_zst_held() {
+    CODEX_ZST_HELD.with(|slot| {
+        let counts = slot
+            .replace([None; CODEX_ZST_CAUSES])
+            .into_iter()
+            .flatten()
+            .collect::<BTreeMap<_, _>>();
+        if !counts.is_empty() {
+            traversal_point(
+                "codex_zst_held",
+                "codex",
+                &BTreeMap::from([("codex_zst_held", counts)]),
+            );
+        }
+    });
+}
+
+/// Flush on every attempt exit, including refusal/unwind and a one-shot thread.
+/// Nested scopes are safe: draining replaces the batch before emitting it.
+pub(crate) struct CodexHeldScope;
+impl Drop for CodexHeldScope {
+    fn drop(&mut self) {
+        flush_codex_zst_held();
     }
 }
 
@@ -1865,18 +1944,43 @@ mod tests {
             GroupReadUnsupported,
             ParentLedgerUnbound,
             PhysicalOffsetUnsupported,
+            CompatibilityUnsupported,
+            AdmissionRefused,
+            DecodeFailed,
+            OwnerUnproven,
+            OutputHeld,
+            SettlementStuck,
+            ConstructorUnfunded,
+            DecodedOverLimit,
+            ParserStateRequired,
+            HeaderInvalid,
+            DecodeBudget,
+            AdmissionStarved,
+            CorrectionUnapplied,
             HeaderUnfunded,
             CompatibilityUnfunded,
-            AdmissionRefused,
             DecoderRefusedHeaderOccupancy,
+            FamilyUnproven,
+            ArchiveEquivalenceUnproven,
+            CatchupTooLarge,
+            ArchiveDominated,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         assert_eq!(
             serde_json::to_value(DecoderRefusedHeaderOccupancy).unwrap(),
             "decoder_refused_header_occupancy"
         );
+        let mut labels = std::collections::BTreeSet::new();
+        assert_eq!(ArchiveDominated as usize + 1, super::CODEX_ZST_CAUSES);
+
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);
+            let label = serde_json::to_string(cause).unwrap();
+            assert!(labels.insert(label.clone()), "unique persisted label");
+            assert_eq!(
+                serde_json::from_str::<super::CodexZstCause>(&label).unwrap(),
+                *cause
+            );
         }
     }
 
@@ -3210,3 +3314,5 @@ pub(crate) fn state_v2_memory() -> StateV2Memory {
 pub(crate) fn state_v2_cpu_us() -> Option<u64> {
     process_sample().map(|p| p.cpu_us)
 }
+
+crate::heap_layout_bound::no_heap!(true; CodexZstCause);

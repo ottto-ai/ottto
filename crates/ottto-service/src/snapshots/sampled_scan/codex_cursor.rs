@@ -70,6 +70,7 @@ const WAITER_FORGET_PAGES: u64 = 64;
 const ROTATION_KEYS: usize = 64;
 /// Owners with B's blocked-owner provenance (§d.1.3, L-1).
 const JOIN_OWNERS: usize = 64;
+const ARCHIVE_PASS_CPU_MICROS: u64 = 30_000_000;
 /// Bumped when a join or singleton proof rule changes; it is part of every
 /// memo key, so a bump wakes every memoized hold without a timed retry.
 /// U1a-2a (D6(a)): also part of `codex_parent_proof_scope`.
@@ -265,6 +266,62 @@ pub(in crate::snapshots) enum StartRefusal {
     InputsUnavailable,
     /// The held file's stamp could not be read: a retryable read failure.
     Unstartable,
+}
+
+/// Archive catch-up pacing for one ordinary page and its continuation
+/// pages: RAM-only on `ScanIndex`, carried by the continuation inputs, never
+/// durable authority. A refusal never resets it; unknown CPU denies, as
+/// continuation treats any non-`Allowed` platform answer.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ArchivePass {
+    pub(crate) started: bool,
+    pub(crate) cpu: u64,
+    pub(crate) work: u64,
+    pub(crate) power: bool,
+    /// Continuation's platform gates; a pass and its pages share them.
+    pub(crate) gates: crate::snapshot_sync::ArchiveGates,
+}
+crate::heap_layout_bound::fields!(ArchivePass; started, cpu, work, power; shared gates);
+
+impl ArchivePass {
+    /// A new ordinary pass: fresh counters and the prepare-time power gate;
+    /// the cached-archive walk position and the gates carry over.
+    pub(crate) fn prepare(&mut self) {
+        let Self {
+            started,
+            cpu,
+            work,
+            power,
+            gates,
+        } = self;
+        (*started, *cpu, *work) = (
+            false,
+            if crate::context_composition::thread_cpu_micros().is_some() {
+                0
+            } else {
+                u64::MAX
+            },
+            0,
+        );
+        *power = gates.power_ready();
+    }
+
+    /// Archive work may start now: prepare-time and live power, the pass's
+    /// CPU and work (continuation's contention threshold), and `remaining`
+    /// page bytes.
+    pub(crate) fn ready(&self, remaining: u64) -> bool {
+        self.power
+            && self.gates.power_ready()
+            && self.cpu < ARCHIVE_PASS_CPU_MICROS
+            && remaining > 0
+            && crate::snapshot_sync::archive_work_ready(self.work)
+    }
+}
+
+impl PageBudget {
+    pub(in crate::snapshots) fn archive_ready(&self, pass: &ArchivePass) -> bool {
+        pass.ready(self.singleton_remaining(Limits::current()))
+    }
 }
 
 impl PageBudget {
@@ -3741,7 +3798,7 @@ impl CursorCredit {
     }
 
     /// Return the claim. Never call it while holding the cursor lock.
-    fn refund(mut self) {
+    pub(in crate::snapshots) fn refund(mut self) {
         self.settled = true;
         let (id, bytes) = (self.cursor, self.bytes);
         self.cache
@@ -4211,7 +4268,11 @@ impl SharedCache {
     fn cursor_reserve(self: &Arc<Self>, charge: usize) -> Option<CursorCredit> {
         self.cursor_claim(charge, false)
     }
-    fn cursor_claim(self: &Arc<Self>, charge: usize, free_only: bool) -> Option<CursorCredit> {
+    pub(in crate::snapshots) fn cursor_claim(
+        self: &Arc<Self>,
+        charge: usize,
+        free_only: bool,
+    ) -> Option<CursorCredit> {
         let mut retained = self.retained().ok()?;
         let mut header_occupancy_refused = false;
         let claimed = self

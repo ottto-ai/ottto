@@ -64,6 +64,15 @@ impl FileStamp {
         })
     }
 
+    /// Archive completion keeps only the same_content witness, never ctime.
+    pub(crate) fn content_only(mut self) -> Self {
+        #[cfg(unix)]
+        {
+            self.changed = (0, 0);
+        }
+        self
+    }
+
     pub(crate) fn same_object(&self, other: &Self) -> bool {
         #[cfg(unix)]
         {

@@ -179,14 +179,14 @@ pub(super) trait CursorContinuation {
 /// A platform answer. Anything but `Allowed` falls back to the ordinary
 /// cadence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PlatformState {
+pub(crate) enum PlatformState {
     Allowed,
     Refused,
     Unknown,
 }
 
 /// Mandatory platform gates for a continuation page (hunk F).
-pub(super) trait PlatformGates {
+pub(crate) trait PlatformGates {
     /// On mains power with Low Power Mode off.
     fn power(&mut self) -> PlatformState;
     /// Lower this thread to background QoS for the page. `Allowed` means it

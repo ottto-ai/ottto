@@ -15,6 +15,7 @@ const STATE_BYTES: usize =
     CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - AUDIT_AND_SCRATCH_BYTES;
 
 pub(super) mod codex_cursor;
+pub(crate) use codex_cursor::ArchivePass;
 #[cfg(unix)]
 pub(super) mod durable_tail;
 #[cfg(all(unix, test))]
@@ -2104,21 +2105,66 @@ fn lineage_retainable(accumulator: &SnapshotAccumulator) -> bool {
     today || in_file_fork
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(super) struct ParserOptions<'a> {
+    pub(super) source: SnapshotSource,
+    pub(super) metadata: &'a CodexTitleMetadata,
+    pub(super) traces: Option<Arc<CodexTurnTraceMap>>,
+    pub(super) parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    pub(super) artifacts: bool,
+    pub(super) curve: bool,
+    pub(super) identity_capture: bool,
+    pub(super) cache: Option<&'a Arc<SharedCache>>,
+}
+
 pub(super) fn new_source_parser(
     file: File,
     candidate: &CandidateFile,
-    source: SnapshotSource,
-    metadata: &CodexTitleMetadata,
-    traces: Option<Arc<CodexTurnTraceMap>>,
-    parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    artifacts: bool,
-    curve: bool,
-    identity_capture: bool,
-    index: &ScanIndex,
+    index: &mut ScanIndex,
+    options: ParserOptions<'_>,
 ) -> Result<OwnedJsonlParser> {
-    let mut parser = OwnedJsonlParser::new(
-        file,
+    let ParserOptions {
+        source,
+        metadata,
+        traces,
+        parents,
+        artifacts,
+        curve,
+        identity_capture,
+        cache,
+    } = options;
+    let input = if source == SnapshotSource::Codex
+        && is_compressed_codex_rollout(Some(&candidate.path), None)
+    {
+        crate::context_composition::set_utility_qos();
+        let key = local_index_key(&candidate.path);
+        let previous = index.files.get(&key).and_then(|e| e.archive.as_deref());
+        anyhow::ensure!(
+            !previous.is_some_and(|a| a.quiet(&file)),
+            "compressed rollout already attempted"
+        );
+        let input = cache
+            .map(|cache| OpenedInput::funded(file, cache))
+            .transpose()?
+            .flatten()
+            .ok_or(codex_compressed_input::ArchiveAdmissionYield)?;
+        let evidence = match codex_compressed_input::ArchiveEvidence::begin(
+            input.get_ref(),
+            &candidate.path,
+            previous,
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                input.close();
+                return Err(error.into());
+            }
+        };
+        index.files.entry(key).or_default().archive = Some(Box::new(evidence));
+        input
+    } else {
+        OpenedInput::plain(file)
+    };
+    let mut parser = OwnedJsonlParser::new_opened(
+        input,
         &candidate.path,
         source,
         match source {
@@ -2132,6 +2178,7 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
     )?;
+    parser.reader.capture_header = parser.reader.reader.is_compressed();
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
         configure_tier_replay(&mut parser, candidate, index);
