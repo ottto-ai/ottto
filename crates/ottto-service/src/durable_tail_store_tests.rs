@@ -4692,9 +4692,9 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
     // Historical readable records are identified without repairing their mode.
     let old = binding("old", "scope", ("old", None));
     let mut historical = pending(old.clone(), certificate(&path), 1);
-    historical.allowlist = parse_hex_digest(
-        "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
-    ).unwrap();
+    historical.allowlist =
+        parse_hex_digest("8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c")
+            .unwrap();
     let old_file = record_file(&store, &old.key);
     let old_bytes = pinned_v1_bytes(&historical, 1);
     put_record(&old_file, &old_bytes);

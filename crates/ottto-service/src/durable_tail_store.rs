@@ -982,8 +982,7 @@ impl DurableTailStore {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(_) => return Err(Refusal::Undecodable),
             };
-            if !metadata.is_dir() || metadata.uid() != our_uid()
-                || metadata.mode() & 0o777 != 0o700
+            if !metadata.is_dir() || metadata.uid() != our_uid() || metadata.mode() & 0o777 != 0o700
             {
                 return Err(Refusal::Undecodable);
             }
@@ -2376,7 +2375,9 @@ impl DurableTailStore {
                 page.visited += 1;
                 match entry {
                     Ok(entry) => {
-                        if let Some(key) = entry.file_name().to_str()
+                        if let Some(key) = entry
+                            .file_name()
+                            .to_str()
                             .and_then(|name| name.strip_suffix(RECORD_SUFFIX))
                             .and_then(parse_hex_digest)
                         {
@@ -2388,7 +2389,12 @@ impl DurableTailStore {
             }
             self.private_purge_page = Some(page);
         }
-        Ok(self.private_purge_page.as_ref().expect("privacy page").keys.clone())
+        Ok(self
+            .private_purge_page
+            .as_ref()
+            .expect("privacy page")
+            .keys
+            .clone())
     }
 
     pub(crate) fn private_label_purge_needed(&self, keep: Option<&BTreeSet<Digest32>>) -> bool {
@@ -2452,11 +2458,17 @@ impl DurableTailStore {
         let keys = self.private_label_candidates()?;
         let mut remaining = BTreeSet::new();
         let mut report = PrivateLabelPurge {
-            visited: self.private_purge_page.as_ref().map_or(0, |page| page.visited),
+            visited: self
+                .private_purge_page
+                .as_ref()
+                .map_or(0, |page| page.visited),
             scanned: 0,
             verified: 0,
             erased: 0,
-            refused: self.private_purge_page.as_ref().map_or(0, |page| page.refused),
+            refused: self
+                .private_purge_page
+                .as_ref()
+                .map_or(0, |page| page.refused),
         };
         let mut erased = 0;
         for key in &keys {
@@ -2508,7 +2520,10 @@ impl DurableTailStore {
         report.erased = erased;
         if known.is_none() {
             self.private_purge_dirty |= report.refused > 0 || !remaining.is_empty();
-            let complete = self.private_purge_page.take().is_some_and(|page| page.complete);
+            let complete = self
+                .private_purge_page
+                .take()
+                .is_some_and(|page| page.complete);
             if !complete {
                 // Keep the live directory cursor; do not rescan earlier names.
                 return Ok(report);
