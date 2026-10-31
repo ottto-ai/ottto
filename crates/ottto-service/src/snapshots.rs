@@ -31860,7 +31860,9 @@ impl OwnedSourceScan {
                             .origin
                             .as_ref()
                             .and_then(|origin| origin.admission.as_ref())
-                            .map_or(true, |state| claude_terminal_off() && state.complete));
+                            .map_or(true, |state| {
+                                state.complete && (evidence_owed::enabled() || claude_terminal_off())
+                            }));
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 // E7-8a: count-only per-family completion, from the page's
                 // settled state before any terminal effect. Acts on nothing.
@@ -43013,12 +43015,16 @@ fn ensure_bounded_traversal(
         let mut admission = None;
         let mut covered_roots = None;
         let mut stale_carry_rejection_counts = StaleCarryRejectionCounts::default();
+        let owed_route = evidence_owed::enabled();
         let carry = if streaming_carry {
             // Existing scheduling debt survives even if the whole set now fits.
             // Re-price its batch, but do not discard unoffered service cursors.
+            // Evidence owed ON: an unfinished admission no longer forces the
+            // batch path. The owed resolver pages the stale set instead.
             let whole = if prior_admission
                 .as_ref()
                 .is_some_and(|state| !state.complete)
+                && !owed_route
             {
                 Err(ClaudeRetryAdmissionRefusal::Structure)
             } else {
@@ -43031,6 +43037,12 @@ fn ensure_bounded_traversal(
             };
             match whole {
                 Ok(carry) => carry,
+                Err(refusal) if owed_route => {
+                    // No new batch admission: every stale root returns to the
+                    // re-arm below and the resolver; carry credits nothing.
+                    stale_carry_rejection_counts.reject(refusal.into(), stale_pending_roots.len());
+                    ClaudeStaleFamilyCarry::default()
+                }
                 Err(refusal) => {
                     let due = claude_retry_due_family_exists(index, collected_at);
                     if matches!(refusal, ClaudeRetryAdmissionRefusal::Structure)
@@ -43251,6 +43263,18 @@ fn ensure_bounded_traversal(
         transition.rearmed_index_files = rearmed_file_count;
         transition.carried_pending_families = carried_roots.len();
         transition.carried_index_files = carried_file_count;
+        if owed_route {
+            // An unfinished admission keeps only its unoffered due cursor
+            // (its existing owner serves it); otherwise it is dropped.
+            if let Some(state) = prior_admission.as_ref().filter(|state| !state.complete) {
+                if evidence_owed::due_unoffered(index, state, collected_at) {
+                    admission = Some(evidence_owed::due_only(state));
+                    transition.due_retained = 1;
+                } else {
+                    transition.admissions_dropped = 1;
+                }
+            }
+        }
         index.claude_stale_family_carry = ClaudeStaleFamilyCarry {
             origin: Some(ClaudeStaleFamilyCarryOrigin {
                 context_fingerprint: context_fingerprint.clone(),

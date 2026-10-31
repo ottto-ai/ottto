@@ -70,6 +70,12 @@ pub(super) struct Starting {
     pub(super) stale_rearm_capped_families: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub(super) stale_rearm_capped_files: usize,
+    /// Evidence owed ON: an unfinished retry admission this start dropped,
+    /// and one kept as its due cursor only. Omitted while zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) admissions_dropped: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) due_retained: usize,
     disappearance_process_totals_v1: disappearance_diagnostics::Totals,
 }
 
@@ -135,6 +141,8 @@ impl Starting {
             rearm_window_rearmed_families: 0,
             stale_rearm_capped_families: 0,
             stale_rearm_capped_files: 0,
+            admissions_dropped: 0,
+            due_retained: 0,
         }
     }
 

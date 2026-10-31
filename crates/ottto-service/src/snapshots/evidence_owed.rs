@@ -319,6 +319,35 @@ fn record_hashes(hashes: &BTreeSet<String>) -> Option<Vec<u64>> {
     Some(prefixes)
 }
 
+/// The admission drop (RF1 #992 rev F2): an unfinished admission still owes
+/// due paths its existing selector has not offered.
+pub(super) fn due_unoffered(
+    index: &ScanIndex,
+    state: &ClaudeRetryAdmission,
+    collected_at: &str,
+) -> bool {
+    let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
+    index
+        .files
+        .keys()
+        .any(|key| claude_retry_path_due(state, &index.claude_usage_authority_quarantine, key, now))
+}
+
+/// Only the due cursor stays: the root walk is settled, no root is carried.
+/// It completes when that service finishes; the next start then drops it.
+pub(super) fn due_only(state: &ClaudeRetryAdmission) -> ClaudeRetryAdmission {
+    ClaudeRetryAdmission {
+        after_root: Some(state.upper_root.clone()),
+        roots_complete: true,
+        complete: false,
+        progressed: false,
+        oversized_root: None,
+        oversized_after_path: None,
+        storage_deferred: false,
+        ..state.clone()
+    }
+}
+
 /// GUARD: an indexed family this census did not prove stays owed; only a
 /// completed family proof retires pending.
 pub(super) fn owed_at_completion(
