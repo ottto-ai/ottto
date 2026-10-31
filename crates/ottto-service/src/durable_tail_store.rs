@@ -1844,9 +1844,9 @@ impl DurableTailStore {
         let (mut on_disk, mut unlisted) = self
             .scan_disk()
             .inspect_err(|_| self.counters.store_write_failed[1] += 1)?;
-        // Native staging and this post-save batch share the pass allowance.
-        // A declined native record must not bypass it through its RAM offer.
-        let mut attempted = self.stream_records + receipt.completed.len();
+        // Only this batch consumes its bounded receipt/ack capacity. Settled
+        // native writes share the byte allowance, not the custody count.
+        let mut attempted = receipt.completed.len();
         let mut encoded_pass_bytes = self.stream_bytes;
         for (record, content, prior, verified_prior) in dirty {
             if attempted >= MAX_BATCH {
@@ -1890,6 +1890,9 @@ impl DurableTailStore {
             {
                 receipt.deferred += 1;
                 receipt.deferred_keys.push(key);
+                // This key is fully accounted for by deferred_keys. The
+                // receipt's refusal field gates retirement of written siblings.
+                self.counters.budget_refused += 1;
                 continue;
             }
             let ack_bytes = if self.source == DurableSource::ClaudeCode {

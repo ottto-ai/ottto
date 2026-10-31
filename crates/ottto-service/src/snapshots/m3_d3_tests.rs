@@ -1477,7 +1477,7 @@ fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
     }
 }
 
-/// [money] m3 codex native pass budget is counted not persisted without hold or debt.
+/// [money] m3 codex native pass writes beyond receipt capacity when bytes fit.
 #[test]
 fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
@@ -1504,11 +1504,11 @@ fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
         );
     }
     let (counts, disk) = rig.counters();
-    assert_eq!(disk.records_written, 32);
-    assert_eq!(disk.budget_refused, 1);
+    assert_eq!(disk.records_written, 33);
+    assert_eq!(disk.budget_refused, 0);
     assert_eq!(disk.store_faults, 0);
     assert_eq!(disk.receipt_pending_records, 0);
-    assert_eq!(counts.not_persisted.get("wa.pass_budget"), Some(&1));
+    assert_eq!(counts.not_persisted.get("wa.pass_budget"), None);
     assert!(!pass.disabled());
 }
 
