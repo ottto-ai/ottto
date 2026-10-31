@@ -593,13 +593,65 @@ fn terminal_off_context_change_and_contract_debt_still_select() {
         "2026-08-20T10:22:00Z",
         BACKFILL_WINDOW_DAYS,
     );
-    assert!(index.files[&local_index_key(&path)]
-        .source_file_fingerprint
-        .is_empty());
+    // Lead B Ask 1 (R11): exact ACK settles the money, so the contract clear
+    // keeps this file's body; the new context stays owed and still selects it
+    // through the paced UploadContext path.
+    let key = local_index_key(&path);
+    assert!(!index.files[&key].source_file_fingerprint.is_empty());
+    assert!(index.file_upload_context_requires_adoption(&key));
     assert!(
         index.claude_request_identity_contract_changed,
         "suppressed full replay never spends the latch"
     );
+    // The paced pass, with the per-file context production activates every
+    // cycle: the body is re-emitted and ACKed under the NEW context, money
+    // unchanged.
+    index.activate_file_upload_context(SnapshotSource::ClaudeCode, "new-destination".into());
+    let paced = off_scan(&mut index, &scratch, "2026-08-20T10:23:00Z", 10);
+    assert_eq!(paced.scanned_file_count, 1);
+    let candidates = index.file_upload_context_ack_candidates(&paced.snapshots);
+    let acks = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(
+        SnapshotSource::ClaudeCode,
+        &paced.snapshots,
+    );
+    index.accept_file_upload_context_acks(&candidates, &acks);
+    assert_eq!(
+        index.files[&key]
+            .upload_context_receipt
+            .as_ref()
+            .map(|receipt| receipt.context_fingerprint.as_str()),
+        Some("new-destination"),
+        "the context change reaches the wire"
+    );
+    assert!(!index.file_upload_context_requires_adoption(&key));
+    // Main's money comparison (`usage_totals_equal`), per emitted item in
+    // session order, plus each item's row costs.
+    let money = |result: &SourceScanResult| {
+        let mut items = result
+            .snapshots
+            .iter()
+            .map(|item| {
+                let mut costs = item
+                    .model_usage
+                    .iter()
+                    .map(|row| row.cost_usd.clone())
+                    .collect::<Vec<_>>();
+                costs.sort();
+                (item.source_session_id.clone(), usage_totals_from_item(item), costs)
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.0.cmp(&right.0));
+        items
+    };
+    let (before, after) = (money(&first), money(&paced));
+    assert_eq!(before.len(), after.len());
+    for ((session, totals, costs), (paced_session, paced_totals, paced_costs)) in
+        before.iter().zip(&after)
+    {
+        assert_eq!(session, paced_session);
+        assert!(usage_totals_equal(totals, paced_totals), "{session} tokens");
+        assert_eq!(costs, paced_costs, "{session} costs");
+    }
 }
 
 /// [format] Process-local containment state preserves persisted bytes and recovery safety.
