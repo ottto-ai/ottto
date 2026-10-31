@@ -487,13 +487,17 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
         ] {
             let (mut rig, record) = lossy_shrink_rig();
             let key = rig.key(SESSION_A);
-            let revision = rig.index.files[&key].effective_upload_body_witness_revision;
             let entry = rig.index.files.get_mut(&key).unwrap();
             match control {
                 "verified_extent" => {
                     entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into())
                 }
-                "future_revision" => entry.effective_upload_body_witness_revision = revision + 1,
+                "future_revision" => {
+                    entry.effective_upload_body_witness_revision =
+                        crate::snapshot_sync::effective_upload_body_witness_revision(
+                            SnapshotSource::ClaudeCode,
+                        ) + 1;
+                }
                 "not_due" => entry.set_unverified_deadline(
                     now_unix() + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS / 2,
                 ),
