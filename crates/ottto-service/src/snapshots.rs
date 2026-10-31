@@ -45,6 +45,7 @@ macro_rules! discovery_retention {
             account_holds: &$index.claude_account_deferred_holds,
             memo: Some(&$index.withheld_memo),
             growth: None,
+            retry_allowed: $index.archive_pass.ready(1),
         }
     };
 }
@@ -44867,11 +44868,10 @@ fn candidate_from_traversal_path_at(
 ) -> Option<CandidateFile> {
     if source == SnapshotSource::Codex {
         let key = local_index_key(&pending.path);
-        if let Some(entry) =
-            discovery.index.files.get(&key).filter(|e| {
-                e.codex_compressed_hold.is_some() && !e.custody_retry_due(&pending.path)
-            })
-        {
+        if let Some(entry) = discovery.index.files.get(&key).filter(|e| {
+            e.codex_compressed_hold.is_some()
+                && (!discovery.index.archive_pass.ready(1) || !e.custody_retry_due(&pending.path))
+        }) {
             census.observed_index_keys.insert(key);
             if codex_archive_path(&pending.path) {
                 census.archive_residue(
@@ -45311,6 +45311,9 @@ struct DiscoveryRetention<'a> {
     memo: Option<&'a withheld_account::Memo>,
     /// Bounded page diagnostics only; never a retention/selection input.
     growth: Option<&'a discovery_growth::Page>,
+    /// The reader's existing admission permission; owing custody alone cannot
+    /// grant an open on a page which cannot acquire it.
+    retry_allowed: bool,
 }
 
 impl<'a> DiscoveryRetention<'a> {
@@ -45407,6 +45410,7 @@ mod discovery_support {
                 account_holds: &NONE,
                 memo: None,
                 growth: None,
+                retry_allowed: false,
             }
         }
     }
@@ -45690,7 +45694,8 @@ fn open_and_identify_scan_candidate_with_rescue_at(
         && files
             .get(&local_index_key(&candidate.path))
             .is_some_and(|entry| {
-                entry.codex_compressed_hold.is_some() && !entry.custody_retry_due(&candidate.path)
+                entry.codex_compressed_hold.is_some()
+                    && (!retention.retry_allowed || !entry.custody_retry_due(&candidate.path))
             })
     {
         return None;
@@ -45780,7 +45785,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
         .and_then(|entry| entry.archive.as_ref().map(|archive| (entry, archive)))
         .filter(|(entry, archive)| {
             source == SnapshotSource::Codex
-                && !entry.custody_retry_due(&candidate.path)
+                && (!retention.retry_allowed || !entry.custody_retry_due(&candidate.path))
                 && archive.quiet(&opened_file)
         })
     {

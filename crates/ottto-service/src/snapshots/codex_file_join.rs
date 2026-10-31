@@ -756,7 +756,9 @@ impl HeaderInventory {
     /// roster-sized allocation. Refusal retains the existing inventory debt.
     fn family_bound(&self, index: Option<&ScanIndex>) -> Option<usize> {
         use crate::heap_layout_bound::Counter;
-        let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        // Measure the refused proposal too; this allocates no family scratch.
+        // Admission still uses the unchanged common parked-state budget.
+        let mut cost = Counter::new(usize::MAX);
         cost.add(self.feed_peak)?;
         cost.add(self.decode_peak)?;
         cost.add(self.custody_peak)?;
@@ -829,6 +831,20 @@ impl HeaderInventory {
             for key in index.files.keys() {
                 cost.add(key.len().checked_mul(5)?)?;
             }
+        }
+        if cost.bytes > crate::source_rotation::PARKED_BUDGET {
+            crate::local_resource_diagnostics::traversal_point(
+                "codex_zst_held",
+                "codex",
+                &BTreeMap::from([
+                    ("archive_classification_required_bytes", cost.bytes as u64),
+                    (
+                        "archive_classification_cap_bytes",
+                        crate::source_rotation::PARKED_BUDGET as u64,
+                    ),
+                ]),
+            );
+            return None;
         }
         Some(cost.bytes)
     }

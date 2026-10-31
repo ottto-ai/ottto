@@ -203,10 +203,11 @@ impl ScanIndex {
     ) -> Result<Admission> {
         let key = local_index_key(&candidate.path);
         let ids = codex_session_id_candidates_from_path(&candidate.path);
-        let custody_retry = self
-            .files
-            .get(&key)
-            .is_some_and(|e| e.custody_retry_due(&candidate.path));
+        let custody_retry = cache.is_some()
+            && self
+                .files
+                .get(&key)
+                .is_some_and(|e| e.custody_retry_due(&candidate.path));
         if let Some(cause) = self
             .files
             .get(&key)
@@ -229,8 +230,14 @@ impl ScanIndex {
         }
         let retry =
             prior.is_some_and(|a| matches!(a.disposition, ArchiveDisposition::Pending { .. }));
+        if retry && cache.is_none() {
+            return Ok(Admission::Held(CodexZstCause::OutputHeld));
+        }
         // One funded inventory result; no candidate-level roster/index walks.
         let Some(inventory) = inventory.filter(|i| i.classified_archive(&key)) else {
+            if let Some(cache) = cache {
+                cache.archive_yield(&key);
+            }
             return Ok(Admission::Deferred(CodexZstCause::AdmissionRefused));
         };
         let family = inventory.archive_class(&key).sibling;
