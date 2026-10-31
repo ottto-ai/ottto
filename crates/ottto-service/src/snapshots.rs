@@ -53366,7 +53366,7 @@ mod tests {
 
     #[test]
     fn e2_deferred_retry_root_keeps_service_debt_and_committed_fingerprints() {
-        claude_request_money::e2::with_enabled(|| {
+        {
             let root = "11111111-1111-4111-8111-111111111111";
             let project = PathBuf::from("/synthetic/projects/p");
             let root_path = project.join(format!("{root}.jsonl"));
@@ -53493,7 +53493,7 @@ mod tests {
                 index.files[&healthy_key].source_file_fingerprint,
                 fingerprints[&healthy_key]
             );
-        });
+        };
     }
 
     #[test]

@@ -2132,9 +2132,7 @@ const E2_HISTORY_UPGRADE: HistoryCycle<'static> = HistoryCycle {
 
 fn with_e2_history<T>(fixture: &HistoryFixture, f: impl FnOnce() -> T) -> T {
     fixture.install_list(&[]);
-    crate::snapshots::with_max_gated_claude_revision(3, || {
-        crate::snapshots::claude_request_money::e2::with_enabled(f)
-    })
+    crate::snapshots::with_max_gated_claude_revision(3, || f())
 }
 
 fn e2_history_sidecar(support: &Path, root: &str, trace: bool) -> PathBuf {
@@ -2606,28 +2604,26 @@ fn e2_missing_list_pauses_history_and_keeps_changes_on_ordinary_money() {
     )
     .expect("lose the list");
     crate::snapshots::with_max_gated_claude_revision(3, || {
-        crate::snapshots::claude_request_money::e2::with_enabled(|| {
-            fixture.append(HISTORY_SESSIONS[1], "req_1_2");
-            let changed = fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE);
-            assert_eq!(fixture.list_status(&changed), "missing_after_install");
-            assert_eq!(
-                changed.uploaded,
-                BTreeSet::from([HISTORY_SESSIONS[1].to_string()]),
-                "only the genuine change uploads"
-            );
-            assert!(changed.uploaded_literal.is_empty());
-            assert_eq!(changed.scan.scanned_file_count, 1, "no owed file re-read");
-            e2_assert_ordinary_body(&changed, HISTORY_SESSIONS[1]);
-            assert!(changed
-                .index
-                .files
-                .values()
-                .all(|entry| entry.effective_upload_body_witness_revision == 2));
-            let quiet = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
-            assert_eq!(fixture.list_status(&quiet), "missing_after_install");
-            assert!(quiet.uploaded.is_empty(), "{:?}", quiet.uploaded);
-            assert_eq!(quiet.scan.scanned_file_count, 0);
-        })
+        fixture.append(HISTORY_SESSIONS[1], "req_1_2");
+        let changed = fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE);
+        assert_eq!(fixture.list_status(&changed), "missing_after_install");
+        assert_eq!(
+            changed.uploaded,
+            BTreeSet::from([HISTORY_SESSIONS[1].to_string()]),
+            "only the genuine change uploads"
+        );
+        assert!(changed.uploaded_literal.is_empty());
+        assert_eq!(changed.scan.scanned_file_count, 1, "no owed file re-read");
+        e2_assert_ordinary_body(&changed, HISTORY_SESSIONS[1]);
+        assert!(changed
+            .index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 2));
+        let quiet = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
+        assert_eq!(fixture.list_status(&quiet), "missing_after_install");
+        assert!(quiet.uploaded.is_empty(), "{:?}", quiet.uploaded);
+        assert_eq!(quiet.scan.scanned_file_count, 0);
     });
 }
 

@@ -1682,7 +1682,7 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
         // Keep the migration traversal red so G's accepted pending remains
         // available for the next start; only this unrelated file is repaired.
         RearmFixture::append(&c1b_terminal_path(&fixture), "not-json\n");
-        let _b = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+
         crate::snapshots::claude_request_identity::with_cycle_contract_for_test(
             crate::snapshots::claude_request_identity::E2_GROUPING,
             || {

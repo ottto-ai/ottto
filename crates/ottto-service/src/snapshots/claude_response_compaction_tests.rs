@@ -996,7 +996,7 @@ fn x_out_e2_fold_worst_shapes_stay_within_e() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let _gate = claude_request_money::e2::GateForTest::set(true);
+
     const RESPONSES: usize = 256;
     const START: i64 = 1_790_000_000;
     let hour = |index: usize| {

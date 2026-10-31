@@ -650,7 +650,7 @@ fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
     if !c1a_layout_supported("oversized-e2-hold-floor") {
         return;
     }
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+
     let _manifests = SourceManifestTestGuard::new();
     let mut fixture = c1a_fixture("oversized-e2-hold-floor");
     fixture.owned_base_preparation = true;

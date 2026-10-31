@@ -238,7 +238,6 @@ pub(super) fn native_fixture(path: &Path) {
 /// invalidates the existing record on the real post-save write path.
 #[test]
 fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
-    let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::private_dir("ottto-dt-owed");
     let lock = test_locks::hold(&root);
     let source = SnapshotSource::ClaudeCode;

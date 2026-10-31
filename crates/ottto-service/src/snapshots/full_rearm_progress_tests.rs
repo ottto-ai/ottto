@@ -1338,7 +1338,6 @@ fn always_on_veto_state(rearm: &Rearm, index: &ScanIndex, items: &[SnapshotItem]
 /// first skips: no fingerprint is cleared, nothing reads Full.
 #[test]
 fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let contract = claude_request_identity::E2_GROUPING;
     claude_request_identity::with_cycle_contract_for_test(contract, || {
         let rearm = Rearm::new();

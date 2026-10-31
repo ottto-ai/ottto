@@ -1207,7 +1207,6 @@ mod durable_restart {
 
     #[test]
     fn e2_restart_tail_and_quiet_late_sidecar_match_cold_full_emitted_body() {
-        let _gate = claude_request_money::e2::GateForTest::set(true);
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             for append_native in [true, false] {
                 let f = Fixture::new(if append_native { 1 } else { 2 });

@@ -77,7 +77,7 @@ fn e2_page_counted(
     bool,
     serde_json::Value,
 ) {
-    claude_request_money::e2::with_enabled(|| {
+    {
         let mut scan = scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
             dirs,
@@ -103,7 +103,7 @@ fn e2_page_counted(
             stats.effort_evidence_load_failed,
             counts,
         )
-    })
+    }
 }
 
 fn e2_rows(item: &SnapshotItem) -> impl Iterator<Item = &SnapshotModelUsage> {
@@ -487,7 +487,10 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     let display = item.claude_account_display.as_deref().unwrap();
     assert_eq!(display.current.status, "unknown");
     assert_eq!(display.current.account_identifier_hash, None);
-    assert_eq!(display.current.unknown_reason.as_deref(), Some("identity_withheld"));
+    assert_eq!(
+        display.current.unknown_reason.as_deref(),
+        Some("identity_withheld")
+    );
     assert_eq!(item.request_identity_refusals, 1);
     assert_eq!(counts["claude_identity_conflict_fallbacks"], 1);
     assert_eq!(disposition.quarantined_entity_count(), 0);
@@ -503,7 +506,7 @@ fn e2_page_with_stats(
     ClaudeUsageAuthorityDisposition,
     crate::snapshot_sync::ClaudeLocalEvidenceStats,
 ) {
-    claude_request_money::e2::with_enabled(|| {
+    {
         let mut index = ScanIndex::default();
         let mut scan = scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -520,18 +523,29 @@ fn e2_page_with_stats(
             &index,
             "e2-identity-machine",
         );
-        let (disposition, _, stats) =
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, &mut index);
+        let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+            support, &mut scan, &mut index,
+        );
         (scan.snapshots, disposition, stats)
-    })
+    }
 }
 
 /// A discard defers the whole family: its items stay on the page withheld
 /// and held, so the production upload filter sends nothing of it.
-fn e2_assert_family_deferred(items: &[SnapshotItem], disposition: &ClaudeUsageAuthorityDisposition) {
-    assert_eq!(items.len(), 2, "root and child stay on the page for the hold");
+fn e2_assert_family_deferred(
+    items: &[SnapshotItem],
+    disposition: &ClaudeUsageAuthorityDisposition,
+) {
+    assert_eq!(
+        items.len(),
+        2,
+        "root and child stay on the page for the hold"
+    );
     for item in items {
-        assert!(!e2_is_literal(item), "no body is emitted for a deferred item");
+        assert!(
+            !e2_is_literal(item),
+            "no body is emitted for a deferred item"
+        );
         assert!(
             disposition
                 .quarantined_source_session_ids
@@ -541,7 +555,10 @@ fn e2_assert_family_deferred(items: &[SnapshotItem], disposition: &ClaudeUsageAu
     }
     let mut uploadable = items.to_vec();
     disposition.retain_uploadable(&mut uploadable);
-    assert!(uploadable.is_empty(), "nothing of the family uploads this page");
+    assert!(
+        uploadable.is_empty(),
+        "nothing of the family uploads this page"
+    );
 }
 
 /// A strict trace read dropped because the sidecar grew mid-read leaves every
@@ -600,8 +617,7 @@ fn e2_pipeline_discarded_trace_read_leaves_requests_unbound_never_another_accoun
             let allowed = Some(login.repeat(64));
             for row in e2_rows(item) {
                 assert!(
-                    row.account_identifier_hash.is_none()
-                        || row.account_identifier_hash == allowed,
+                    row.account_identifier_hash.is_none() || row.account_identifier_hash == allowed,
                     "never another item's account"
                 );
             }
@@ -647,7 +663,7 @@ fn e2_bound_trace_page(
     ClaudeUsageAuthorityDisposition,
     crate::snapshot_sync::ClaudeLocalEvidenceStats,
 ) {
-    claude_request_money::e2::with_enabled(|| {
+    {
         // Sidecar changes must select the root and child even when their
         // transcript bytes are unchanged (notably malformed -> clean).
         let mut scan = scan_source_roots_with_test_limit_and_claude_support(
@@ -717,13 +733,22 @@ fn e2_bound_trace_page(
             "the durable creator binding A is untouched"
         );
         (scan.snapshots, disposition, stats)
-    })
+    }
 }
 
-fn e2_bound_trace_assert_logins(items: &[SnapshotItem], root: &str, root_login: Option<String>, child_login: Option<String>) {
+fn e2_bound_trace_assert_logins(
+    items: &[SnapshotItem],
+    root: &str,
+    root_login: Option<String>,
+    child_login: Option<String>,
+) {
     assert_eq!(items.len(), 2, "root and child both emit");
     for item in items {
-        let login = if item.source_session_id == root { root_login.clone() } else { child_login.clone() };
+        let login = if item.source_session_id == root {
+            root_login.clone()
+        } else {
+            child_login.clone()
+        };
         let requests = if item.source_session_id == root { 4 } else { 1 };
         assert!(e2_is_literal(item));
         assert_eq!(item.request_count, requests);
@@ -830,7 +855,12 @@ fn e2_bound_trace_case(
         e2_resign(&mut api[4]);
     }
     e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
-    e2_write_rows(&support, "local-otel/claude-code-trace-ownership", &root, &trace);
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        &root,
+        &trace,
+    );
     let path = support
         .join("local-otel/claude-code-trace-ownership")
         .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
@@ -986,7 +1016,10 @@ fn e2_bound_trace_case(
             "absent while empty"
         );
         assert_eq!(stats.trace_rows_discarded.cap, u64::from(mode == "cap"));
-        assert_eq!(stats.trace_rows_discarded.generation, u64::from(mode == "generation"));
+        assert_eq!(
+            stats.trace_rows_discarded.generation,
+            u64::from(mode == "generation")
+        );
     } else {
         // Never A, never B/C: every request share is Unknown, uploaded now.
         e2_bound_trace_assert_logins(&items, &root, None, None);

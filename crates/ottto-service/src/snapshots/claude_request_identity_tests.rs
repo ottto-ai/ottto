@@ -82,7 +82,10 @@ fn typed_part(part: &Value) -> SnapshotIdentityPart {
 
 fn typed_row(row: &Value) -> SnapshotModelUsage {
     SnapshotModelUsage {
-        copy_unproven: row.get("copy_unproven").and_then(Value::as_bool).unwrap_or(false),
+        copy_unproven: row
+            .get("copy_unproven")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         model: opt_string(row, "model").unwrap(),
         input_tokens: count(row, "input_tokens"),
         output_tokens: count(row, "output_tokens"),
@@ -612,8 +615,12 @@ fn w0_r5_cap_fallbacks_match_bodies() {
             // Revised cap policy: this two-hour body can retain the newest
             // eight keys; W0's old whole-item fallback is no longer required.
             assert!(matches!(result, Tagged::Sent { refusals: 1 }), "{result:?}");
-            assert!(built.usage_buckets[0].model_usage[0].identity_parts.is_none());
-            assert!(built.usage_buckets[1].model_usage[0].identity_parts.is_some());
+            assert!(built.usage_buckets[0].model_usage[0]
+                .identity_parts
+                .is_none());
+            assert!(built.usage_buckets[1].model_usage[0]
+                .identity_parts
+                .is_some());
             assert_eq!(built.request_evidence.len(), 8);
             assert_eq!(identity::semantic_leaf(&built)["refused"], true);
             sticky_assert_reconciled(&built);
@@ -882,7 +889,9 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
                     // All eleven keys must be valid lowercase hex. The old
                     // a..k spelling made g..k refusal shares instead of keys.
                     identity: RequestIdentity::Tagged(AuthorityKey {
-                        login: Some(format!("{login:064x}")), org: Some("d".repeat(64)), basis: identity::TELEMETRY,
+                        login: Some(format!("{login:064x}")),
+                        org: Some("d".repeat(64)),
+                        basis: identity::TELEMETRY,
                     }),
                 });
             }
@@ -981,9 +990,12 @@ fn byte_cap_diagnostic_measures_tagged_attempt_and_preserves_full_strip() {
         records[0]["counts"]["claude_request_identity_last_over_cap_item_bytes"],
         attempted_bytes
     );
-    assert!(records[0]["counts"]["claude_request_identity_over_cap"]["bytes"]
-        .as_u64()
-        .unwrap() > 0);
+    assert!(
+        records[0]["counts"]["claude_request_identity_over_cap"]["bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 }
 
 // --- Classification ---------------------------------------------------------
@@ -1164,11 +1176,7 @@ fn classify_follows_the_session_rulings() {
     assert_eq!(
         identity::classify(
             &evidence,
-            &facts(
-                "req_old",
-                Some(999_000),
-                MarkerVerdict::Trusted(&org_e)
-            )
+            &facts("req_old", Some(999_000), MarkerVerdict::Trusted(&org_e))
         ),
         RequestIdentity::Tagged(AuthorityKey {
             login: None,
@@ -1209,11 +1217,7 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
         )]),
     };
     let desktop = |evidence: &ScanEvidence<'_>, desktop: bool| {
-        let mut request = facts(
-            "req_old",
-            Some(999_000),
-            MarkerVerdict::Trusted(&org),
-        );
+        let mut request = facts("req_old", Some(999_000), MarkerVerdict::Trusted(&org));
         request.desktop = desktop;
         identity::classify(evidence, &request)
     };
@@ -1235,7 +1239,11 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
         BTreeSet::new(),
         Some(census(999_500, &[LOGIN_A])),
     );
-    assert_eq!(desktop(&suppressed, true), org_only, "sole login suppressed");
+    assert_eq!(
+        desktop(&suppressed, true),
+        org_only,
+        "sole login suppressed"
+    );
     let fresh = ScanEvidence::new(
         &api,
         &trace,
@@ -1290,7 +1298,10 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
         complete_trace_row(ROOT, "req_dup", ""),
         forged,
     ];
-    let (api, trace) = reports(vec![complete_api_row(ROOT, "req_paired", 1, 10, 1, 0)], trace);
+    let (api, trace) = reports(
+        vec![complete_api_row(ROOT, "req_paired", 1, 10, 1, 0)],
+        trace,
+    );
     let census = DesktopCensus {
         completed_at_unix_seconds: 999_500,
         logins_by_org: BTreeMap::from([(org.clone(), BTreeSet::from([LOGIN_A.to_string()]))]),
@@ -1306,13 +1317,28 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
     let refused = RequestIdentity::Refused;
     // Foreign: another child's request, a parent's request seen from a
     // child, or an owner record that fails its own integrity checks.
-    assert_eq!(classify("req_sibling", ROOT), refused(Refusal::ForeignOwner));
-    assert_eq!(classify("req_unpaired", &child), refused(Refusal::ForeignOwner));
+    assert_eq!(
+        classify("req_sibling", ROOT),
+        refused(Refusal::ForeignOwner)
+    );
+    assert_eq!(
+        classify("req_unpaired", &child),
+        refused(Refusal::ForeignOwner)
+    );
     assert_eq!(classify("req_forged", ROOT), refused(Refusal::ForeignOwner));
     // Incomplete: the owner is this session but its telemetry row is missing.
-    assert_eq!(classify("req_unpaired", ROOT), refused(Refusal::IncompleteEvidence));
-    assert_eq!(classify("req_sibling", &child), refused(Refusal::IncompleteEvidence));
-    assert_eq!(classify("req_dup", ROOT), refused(Refusal::ConflictingDuplicate));
+    assert_eq!(
+        classify("req_unpaired", ROOT),
+        refused(Refusal::IncompleteEvidence)
+    );
+    assert_eq!(
+        classify("req_sibling", &child),
+        refused(Refusal::IncompleteEvidence)
+    );
+    assert_eq!(
+        classify("req_dup", ROOT),
+        refused(Refusal::ConflictingDuplicate)
+    );
     // Controls: a valid paired owner keeps telemetry; no owner keeps the
     // transcript bases.
     assert_eq!(
@@ -1446,7 +1472,8 @@ fn desktop_census_witness_follows_the_store_inventory_through_retry_backoff() {
         let metadata = ClaudeTitleMetadata::load_from_store_dirs_with_index(
             store_dirs,
             &mut index,
-            "2027-01-15T08:00:00Z", true,
+            "2027-01-15T08:00:00Z",
+            true,
         );
         assert!(metadata.sidecar_census_incomplete);
         assert_eq!(
@@ -1458,7 +1485,10 @@ fn desktop_census_witness_follows_the_store_inventory_through_retry_backoff() {
     };
     let unchanged = backed_off(&swept);
     assert!(unchanged.claude_desktop_census_witness.is_some());
-    assert!(identity::desktop_census_at(&unchanged, NOW).is_some(), "control");
+    assert!(
+        identity::desktop_census_at(&unchanged, NOW).is_some(),
+        "control"
+    );
     for changed in [
         BTreeSet::from([
             PathBuf::from("/synthetic/store-a"),
@@ -1469,7 +1499,11 @@ fn desktop_census_witness_follows_the_store_inventory_through_retry_backoff() {
     ] {
         let index = backed_off(&changed);
         assert_eq!(index.claude_desktop_census_witness, None, "{changed:?}");
-        assert_eq!(identity::desktop_census_at(&index, NOW), None, "{changed:?}");
+        assert_eq!(
+            identity::desktop_census_at(&index, NOW),
+            None,
+            "{changed:?}"
+        );
     }
 }
 
@@ -2207,7 +2241,10 @@ fn legacy_fork_fixture(
     };
     let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
         evidence: BTreeMap::from([
-            (LEGACY_PARENT.to_string(), trace(LEGACY_PARENT, &parent_rows)),
+            (
+                LEGACY_PARENT.to_string(),
+                trace(LEGACY_PARENT, &parent_rows),
+            ),
             (LEGACY_CHILD.to_string(), trace(LEGACY_CHILD, &child_rows)),
         ]),
         ..Default::default()
@@ -2258,8 +2295,10 @@ fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
             Some(&evidence),
         );
         assert!(
-            items.iter().all(|item| item.usage_accounting_contract.as_deref()
-                == Some("session_exclusive_reported_usage:v1")),
+            items
+                .iter()
+                .all(|item| item.usage_accounting_contract.as_deref()
+                    == Some("session_exclusive_reported_usage:v1")),
             "aux={aux}"
         );
         assert_eq!(
@@ -2321,7 +2360,10 @@ fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
             .unwrap()
             .contains(&parent_login));
         let (parent_logins, parent_untagged) = identity_shares(&items[0]);
-        assert_eq!(parent_logins, BTreeMap::from([(parent_login.clone(), (2, 0))]));
+        assert_eq!(
+            parent_logins,
+            BTreeMap::from([(parent_login.clone(), (2, 0))])
+        );
         assert_eq!(parent_untagged, (0, 0));
         let _ = fs::remove_dir_all(dir);
     }
@@ -2343,14 +2385,18 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
         record_claude_request_census, ClaudeRequestCensusParse,
     };
     use crate::transcript_acquisition::{ReadMode, Scope};
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+
     for paused in [false, true] {
         let (dir, _, api, trace, mut index) = legacy_fork_fixture(1);
         index.claude_reemission_exclusions = ReemissionExclusions::parse(
             if paused {
                 "invalid".to_string()
             } else {
-                format!("{}\n{}", request_hash(LEGACY_PARENT), request_hash(LEGACY_CHILD))
+                format!(
+                    "{}\n{}",
+                    request_hash(LEGACY_PARENT),
+                    request_hash(LEGACY_CHILD)
+                )
             }
             .as_bytes(),
         );
@@ -2457,7 +2503,11 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
             if paused {
                 "invalid".to_string()
             } else {
-                format!("{}\n{}", request_hash(LEGACY_PARENT), request_hash(LEGACY_CHILD))
+                format!(
+                    "{}\n{}",
+                    request_hash(LEGACY_PARENT),
+                    request_hash(LEGACY_CHILD)
+                )
             }
             .as_bytes(),
         );
@@ -2616,12 +2666,14 @@ fn legacy_exclusion_skew_never_tags_or_borrows_the_parent() {
     item.request_count += 1;
     refused(item, grouping, "count mismatch");
     let (mut item, grouping) = rebuild(&exact).unwrap();
-    item.claude_usage_request_ids.insert("req_unadmitted".into());
+    item.claude_usage_request_ids
+        .insert("req_unadmitted".into());
     // One unadmitted id makes the count coincide (4 == 4): the 0.1.172 guard
     // still admits that, exactly as it did, with only the rebuild's own rows.
     assert!(!grouping.owned_reported_requests(&item));
     assert!(grouping.reported_requests_admissible(&item));
-    item.claude_usage_request_ids.insert("req_unadmitted_2".into());
+    item.claude_usage_request_ids
+        .insert("req_unadmitted_2".into());
     refused(item, grouping, "unadmitted transcript requests");
 
     // A grouping that admitted the excluded prefix (as a regressed rebuild
@@ -2709,11 +2761,7 @@ fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
 fn transcript_bases_need_the_original_clock() {
     let (api, trace) = reports(Vec::new(), Vec::new());
     let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
-    let mut carried = facts(
-        "req_old",
-        Some(999_000),
-        MarkerVerdict::Trusted(D64),
-    );
+    let mut carried = facts("req_old", Some(999_000), MarkerVerdict::Trusted(D64));
     carried.event_clock_complete = false;
     assert_eq!(
         identity::classify(&evidence, &carried),
@@ -2727,7 +2775,10 @@ fn transcript_bases_need_the_original_clock() {
     // Without any transcript evidence the request is simply missing.
     let mut plain = facts("req_old", None, MarkerVerdict::None);
     plain.event_clock_complete = false;
-    assert_eq!(identity::classify(&evidence, &plain), RequestIdentity::Missing);
+    assert_eq!(
+        identity::classify(&evidence, &plain),
+        RequestIdentity::Missing
+    );
 }
 
 #[test]
@@ -2747,7 +2798,10 @@ fn only_intact_rows_establish_login_org_membership() {
     let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
     assert!(evidence.memberships.is_empty());
     assert_eq!(
-        identity::classify(&evidence, &facts("req_forged", Some(900_000), MarkerVerdict::None)),
+        identity::classify(
+            &evidence,
+            &facts("req_forged", Some(900_000), MarkerVerdict::None)
+        ),
         RequestIdentity::Refused(Refusal::InvalidEvidence)
     );
     assert_eq!(
@@ -2766,14 +2820,20 @@ fn only_intact_rows_establish_login_org_membership() {
 #[test]
 fn sidecar_absence_is_distinguished_from_failure() {
     let support = temp_dir("claude-request-identity-sidecars");
-    assert!(crate::claude_local_otel::claude_sidecars_absent(&support, ROOT));
+    assert!(crate::claude_local_otel::claude_sidecars_absent(
+        &support, ROOT
+    ));
     let digest = format!("{:x}", Sha256::digest(ROOT.as_bytes()));
-    let stores = fs::read_dir(&support).map(|entries| entries.count()).unwrap_or(0);
+    let stores = fs::read_dir(&support)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
     assert_eq!(stores, 0);
     // A directory where the trace sidecar should be is a failure, not absence.
     let trace_dir = crate::claude_local_otel::claude_trace_ownership_evidence_dir(&support);
     fs::create_dir_all(trace_dir.join(format!("{digest}.jsonl"))).unwrap();
-    assert!(!crate::claude_local_otel::claude_sidecars_absent(&support, ROOT));
+    assert!(!crate::claude_local_otel::claude_sidecars_absent(
+        &support, ROOT
+    ));
     let _ = fs::remove_dir_all(support);
 }
 
@@ -2795,7 +2855,11 @@ fn bound_case(
         provider_workspace_hash: creator.map(|_| "d".repeat(64)),
         identity_hash_scheme: "provider-sha256:v1",
         evidence_source: "claude_desktop_original:v1",
-        identity_disposition: Some(if creator.is_some() { "complete" } else { "missing" }),
+        identity_disposition: Some(if creator.is_some() {
+            "complete"
+        } else {
+            "missing"
+        }),
         source_created_at: None,
     });
     let api = (1..=4)
@@ -2875,11 +2939,19 @@ fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let login_b = "b".repeat(64);
     for mixed in [true, false] {
-        for (creator, admitted) in [(None, true), (Some(OWNER_A), true), (Some(login_b.as_str()), false)] {
+        for (creator, admitted) in [
+            (None, true),
+            (Some(OWNER_A), true),
+            (Some(login_b.as_str()), false),
+        ] {
             let (dir, mut items, capability) = bound_case(mixed, creator);
-            let (deferred, _, rows_unchanged) = bind_owner_a(&mut items, &capability, true, "machine");
+            let (deferred, _, rows_unchanged) =
+                bind_owner_a(&mut items, &capability, true, "machine");
             assert_eq!(deferred, !admitted, "mixed={mixed} creator={creator:?}");
-            assert!(rows_unchanged, "creator metadata never rewrites request identities");
+            assert!(
+                rows_unchanged,
+                "creator metadata never rewrites request identities"
+            );
             let _ = fs::remove_dir_all(dir);
         }
     }
@@ -2898,16 +2970,26 @@ fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
     changed[0].usage_buckets[0].model_usage[0].evidence_ref = Some(1);
     assert!(defers(changed, &capability), "evidence ref changed");
     let mut changed = items.clone();
-    changed[0].session_account_evidence.as_mut().unwrap().account_identifier_hash =
-        Some(OWNER_A.to_string());
-    assert!(defers(changed, &capability), "creator changed after admission");
+    changed[0]
+        .session_account_evidence
+        .as_mut()
+        .unwrap()
+        .account_identifier_hash = Some(OWNER_A.to_string());
+    assert!(
+        defers(changed, &capability),
+        "creator changed after admission"
+    );
     let mut other = items.clone();
     other[0].source_session_id = format!("{}_agent-a4d1585d310070d0f", other[0].source_session_id);
     assert!(defers(other, &capability), "another session or child");
     let mut forged = items.clone();
     forged[0].provenance.collector = identity::COLLECTOR.to_string();
     forged[0].request_evidence.clear();
-    for row in forged[0].usage_buckets.iter_mut().flat_map(|b| b.model_usage.iter_mut()) {
+    for row in forged[0]
+        .usage_buckets
+        .iter_mut()
+        .flat_map(|b| b.model_usage.iter_mut())
+    {
         row.evidence_ref = None;
     }
     assert!(defers(forged, &capability), "collector-only body");
@@ -2917,16 +2999,26 @@ fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
         let bound = machine != "machine";
         let (deferred, bindings, _) = bind_owner_a(&mut unbound, &capability, bound, machine);
         assert!(!deferred);
-        assert_eq!(bindings.len(), usize::from(bound), "{machine}: no owner acquired");
+        assert_eq!(
+            bindings.len(),
+            usize::from(bound),
+            "{machine}: no owner acquired"
+        );
     }
     let _ = fs::remove_dir_all(dir);
 
     // Mixed: changed parts after admission lose the exception.
     let (dir, mut items, capability) = bound_case(true, None);
-    let parts = items[0].usage_buckets[0].model_usage[0].identity_parts.as_mut().unwrap();
+    let parts = items[0].usage_buckets[0].model_usage[0]
+        .identity_parts
+        .as_mut()
+        .unwrap();
     parts[0].input_tokens += 1;
     parts[1].input_tokens -= 1;
-    assert!(bind_owner_a(&mut items, &capability, true, "machine").0, "parts changed");
+    assert!(
+        bind_owner_a(&mut items, &capability, true, "machine").0,
+        "parts changed"
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -3073,7 +3165,10 @@ fn transcript_email_never_binds_and_refuses_unqualified_coverage() {
         );
     }
     assert_eq!(
-        classify(&with(Some(switched)), request(Some(start), 999_000, Some(&home), org_e)),
+        classify(
+            &with(Some(switched)),
+            request(Some(start), 999_000, Some(&home), org_e)
+        ),
         refused(Refusal::ContradictoryOrg)
     );
     // Enabled-feed failures refuse; none falls back to org-only.
@@ -3134,7 +3229,10 @@ fn transcript_email_never_binds_and_refuses_unqualified_coverage() {
         ("feed failed or absent", None),
     ] {
         assert_eq!(
-            classify(&with(ledger), request(Some(start), 999_000, Some(&home), org_e)),
+            classify(
+                &with(ledger),
+                request(Some(start), 999_000, Some(&home), org_e)
+            ),
             refused(Refusal::CoverageUnavailable),
             "{case}"
         );
@@ -3198,15 +3296,21 @@ fn email_session(email_first: bool, flip: bool) -> Vec<Value> {
         lines.push(context_line.clone());
     }
     if flip {
-        lines.push(json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment",
+        lines.push(
+            json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment",
             "sessionId": ROOT, "attachment": {"type": "session_context",
-            "context": {"userEmail": "other@example.invalid"}}}));
+            "context": {"userEmail": "other@example.invalid"}}}),
+        );
     }
-    lines.push(json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
-        "attachment": {"type": "credential_org", "organizationUuid": ORG_1}}));
-    lines.push(json!({"timestamp": "2026-08-02T07:00:01Z", "type": "assistant", "sessionId": ROOT,
+    lines.push(
+        json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
+        "attachment": {"type": "credential_org", "organizationUuid": ORG_1}}),
+    );
+    lines.push(
+        json!({"timestamp": "2026-08-02T07:00:01Z", "type": "assistant", "sessionId": ROOT,
         "requestId": "req_1", "message": {"id": "m1", "model": "claude-haiku-4-5",
-        "usage": {"input_tokens": 10, "output_tokens": 1}}}));
+        "usage": {"input_tokens": 10, "output_tokens": 1}}}),
+    );
     if !email_first {
         lines.push(context_line);
     }
@@ -3298,7 +3402,10 @@ fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conse
             .collect::<Vec<_>>()
     };
     assert_eq!(rows(item), rows(&before));
-    let home_hex = home.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let home_hex = home
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     for absent in ["example.invalid", home_hex.as_str(), slot.to_str().unwrap()] {
         assert!(!text.contains(absent), "{absent}");
     }
@@ -3355,7 +3462,10 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
     // Desktop-pair fill), no login, no org-only evidence, usage and money kept.
     let assert_refused = |case: &str, (before, item): (SnapshotItem, SnapshotItem)| {
         assert!(item.request_identity_refusals >= 1, "{case}");
-        assert!(!serde_json::to_string(&item).unwrap().contains(LOGIN_A), "{case}");
+        assert!(
+            !serde_json::to_string(&item).unwrap().contains(LOGIN_A),
+            "{case}"
+        );
         assert!(
             item.request_evidence
                 .iter()
@@ -3364,7 +3474,11 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
         );
         assert_eq!(
             (item.input_tokens, item.output_tokens, item.request_count),
-            (before.input_tokens, before.output_tokens, before.request_count),
+            (
+                before.input_tokens,
+                before.output_tokens,
+                before.request_count
+            ),
             "{case}"
         );
         assert_eq!(item.cost, before.cost, "{case}");
@@ -3404,7 +3518,10 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
         RequestIdentity::Refused(Refusal::CoverageUnavailable)
     );
     assert_refused("removed slot", scan(&slot, &ledger));
-    assert_withdrawn("never-registered control after removal", scan(&loose, &ledger));
+    assert_withdrawn(
+        "never-registered control after removal",
+        scan(&loose, &ledger),
+    );
     // Re-registered: no history, still refused; removed again: still lost.
     ledger.retain(BTreeSet::from([home]), Some(request_at + 900));
     assert_refused("re-registered slot", scan(&slot, &ledger));
@@ -3418,8 +3535,14 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
     // First pass after the request: an earlier removal may have been missed.
     let mut late = Ledger::default();
     late.retain(BTreeSet::new(), Some(request_at + 60));
-    assert_refused("registration known only after the window", scan(&slot, &late));
-    assert_refused("loose folder before registration was known", scan(&loose, &late));
+    assert_refused(
+        "registration known only after the window",
+        scan(&slot, &late),
+    );
+    assert_refused(
+        "loose folder before registration was known",
+        scan(&loose, &late),
+    );
     let mut undated = Ledger::default();
     undated.retain(BTreeSet::new(), None);
     assert_refused("registration start unknown", scan(&loose, &undated));
@@ -3434,7 +3557,10 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
         churn.retain(BTreeSet::new(), Some(request_at + 600));
     }
     assert!(churn.retained_bytes() <= crate::claude_status_coverage::MAX_BYTES);
-    assert_eq!(churn.registration(&home_key(&loose), from), Registration::Unknown);
+    assert_eq!(
+        churn.registration(&home_key(&loose), from),
+        Registration::Unknown
+    );
     assert_refused("overflowed loss record, removed slot", scan(&slot, &churn));
     assert_refused("overflowed loss record, loose folder", scan(&loose, &churn));
 
@@ -3445,7 +3571,11 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
         org: Some(org.clone()),
         basis: identity::TRANSCRIPT_ORG,
     });
-    assert_eq!(reason(&ledger, &default_home), org_only, "shared default folder");
+    assert_eq!(
+        reason(&ledger, &default_home),
+        org_only,
+        "shared default folder"
+    );
     let (api2, trace2) = reports(Vec::new(), Vec::new());
     let evidence = ScanEvidence::new(&api2, &trace2, BTreeSet::new(), None)
         .with_status_coverage(Some(ledger.clone()));
@@ -3509,7 +3639,10 @@ fn rows_under_another_root_own_the_request() {
     // The copy under ROOT: its own markers never claim another root's request.
     assert_eq!(from(ROOT, "req_foreign"), refused(Refusal::ForeignOwner));
     assert_eq!(from(ROOT, "req_traced"), refused(Refusal::ForeignOwner));
-    assert_eq!(from(ROOT, "req_two"), refused(Refusal::ConflictingDuplicate));
+    assert_eq!(
+        from(ROOT, "req_two"),
+        refused(Refusal::ConflictingDuplicate)
+    );
     // Controls: each root's own rows decide its own requests, and a request
     // no root's rows name keeps the transcript bases.
     let login_only = RequestIdentity::Tagged(AuthorityKey {
@@ -3545,8 +3678,10 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
     // The current census may not have observed its other holder yet.
     // Keep one unchanged selector context so withdrawn marker usage and a
     // foreign-owner refusal must merge within the same bucket row.
-    let mut lines = vec![json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
-        "attachment": {"type": "credential_org", "organizationUuid": ORG_1}})];
+    let mut lines = vec![
+        json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
+        "attachment": {"type": "credential_org", "organizationUuid": ORG_1}}),
+    ];
     for n in 1..=5 {
         lines.push(owned_response(
             &format!("req_{n}"),
@@ -3588,7 +3723,10 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
     );
     let restarted: ScanIndex =
         serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
-    assert_eq!(restarted.claude_duplicate_request_owners, saved.claude_duplicate_request_owners);
+    assert_eq!(
+        restarted.claude_duplicate_request_owners,
+        saved.claude_duplicate_request_owners
+    );
     // There is deliberately no D2 switch in this prerequisite. Legacy/OFF
     // and future D2-open inputs reach the same unconditional boundary.
     for (state, index, census, compared) in [
@@ -4102,8 +4240,13 @@ fn zero_usage_record_keeps_a_foreign_owned_request_refused() {
 fn desktop_recent_follows_each_request_entrypoint_and_governing_org() {
     let dir = temp_dir("desktop-recent-transitions");
     let mut lines = vec![marker(ORG_1)];
-    for (n, entrypoint) in ["claude-desktop", "cli", "claude-desktop", "cli"].iter().enumerate() {
-        if n == 2 { lines.push(marker(ORG_2)); }
+    for (n, entrypoint) in ["claude-desktop", "cli", "claude-desktop", "cli"]
+        .iter()
+        .enumerate()
+    {
+        if n == 2 {
+            lines.push(marker(ORG_2));
+        }
         lines.push(json!({"type": "assistant", "sessionId": ROOT,
             "timestamp": format!("2026-08-02T07:00:{:02}Z", 10 + n),
             "entrypoint": entrypoint, "requestId": format!("req_{n}"),
@@ -4112,12 +4255,18 @@ fn desktop_recent_follows_each_request_entrypoint_and_governing_org() {
         }));
     }
     let mut item = parse_session(&dir, &lines).remove(0);
-    assert_eq!(item.origin.as_ref().unwrap().entrypoint.as_deref(), Some("claude-desktop"));
+    assert_eq!(
+        item.origin.as_ref().unwrap().entrypoint.as_deref(),
+        Some("claude-desktop")
+    );
     item.session_account_evidence = Some(SessionAccountEvidence {
-        provider: "anthropic", account_identifier_hash: Some(LOGIN_A.into()),
+        provider: "anthropic",
+        account_identifier_hash: Some(LOGIN_A.into()),
         provider_workspace_hash: Some(org_hash(ORG_1)),
-        identity_hash_scheme: "provider-sha256:v1", evidence_source: "claude_desktop_original:v1",
-        identity_disposition: Some("complete"), source_created_at: Some("2026-08-02T07:00:00Z".into()),
+        identity_hash_scheme: "provider-sha256:v1",
+        evidence_source: "claude_desktop_original:v1",
+        identity_disposition: Some("complete"),
+        source_created_at: Some("2026-08-02T07:00:00Z".into()),
     });
     let (api, trace) = reports(Vec::new(), Vec::new());
     let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
@@ -4125,40 +4274,83 @@ fn desktop_recent_follows_each_request_entrypoint_and_governing_org() {
         let mut sink = identity::RequestSink::for_item(&evidence, item, usize::MAX).unwrap();
         for (request_id, occurrence) in &item.claude_usage_occurrences {
             let (row_key, _, _) = build_row_identity(
-                occurrence.model.as_deref().unwrap(), &occurrence.selector,
-                occurrence.reasoning_effort.as_deref());
-            sink.add(item, identity::Request {
-                request_id, occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
-                timestamp: occurrence.timestamp.as_deref().unwrap(),
-                bucket_start: "2026-08-02T07:00:00Z", row_key: &row_key, usage: &occurrence.usage,
-            });
+                occurrence.model.as_deref().unwrap(),
+                &occurrence.selector,
+                occurrence.reasoning_effort.as_deref(),
+            );
+            sink.add(
+                item,
+                identity::Request {
+                    request_id,
+                    occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
+                    timestamp: occurrence.timestamp.as_deref().unwrap(),
+                    bucket_start: "2026-08-02T07:00:00Z",
+                    row_key: &row_key,
+                    usage: &occurrence.usage,
+                },
+            );
         }
         sink.finish()
     };
-    let at = |seconds| OffsetDateTime::parse(&format!("2026-08-02T07:00:{seconds:02}Z"), &Rfc3339).ok();
+    let at =
+        |seconds| OffsetDateTime::parse(&format!("2026-08-02T07:00:{seconds:02}Z"), &Rfc3339).ok();
     let grouping = collect(&item);
-    assert_eq!(grouping.desktop_recent().at(LOGIN_A, &org_hash(ORG_1)), at(10));
-    assert_eq!(grouping.desktop_recent().at(LOGIN_A, &org_hash(ORG_2)), at(12));
+    assert_eq!(
+        grouping.desktop_recent().at(LOGIN_A, &org_hash(ORG_1)),
+        at(10)
+    );
+    assert_eq!(
+        grouping.desktop_recent().at(LOGIN_A, &org_hash(ORG_2)),
+        at(12)
+    );
     // No native account, ambiguous/imported ownership, or old/future clocks cannot qualify.
     for disposition in ["missing", "conflict"] {
         let mut refused = item.clone();
-        refused.session_account_evidence.as_mut().unwrap().identity_disposition = Some(disposition);
-        assert_eq!(collect(&refused).desktop_recent(), &crate::desktop_recent::RecentActivity::default());
+        refused
+            .session_account_evidence
+            .as_mut()
+            .unwrap()
+            .identity_disposition = Some(disposition);
+        assert_eq!(
+            collect(&refused).desktop_recent(),
+            &crate::desktop_recent::RecentActivity::default()
+        );
     }
     let mut no_owner = item.clone();
     no_owner.session_account_evidence = None;
-    assert_eq!(collect(&no_owner).desktop_recent(), &crate::desktop_recent::RecentActivity::default());
+    assert_eq!(
+        collect(&no_owner).desktop_recent(),
+        &crate::desktop_recent::RecentActivity::default()
+    );
     let mut expired = item.clone();
     expired.collected_at = "2026-08-02T07:16:00Z".into();
-    assert_eq!(collect(&expired).desktop_recent(), &crate::desktop_recent::RecentActivity::default());
+    assert_eq!(
+        collect(&expired).desktop_recent(),
+        &crate::desktop_recent::RecentActivity::default()
+    );
     let mut future = item.clone();
     future.collected_at = "2026-08-02T07:00:00Z".into();
-    assert_eq!(collect(&future).desktop_recent(), &crate::desktop_recent::RecentActivity::default());
+    assert_eq!(
+        collect(&future).desktop_recent(),
+        &crate::desktop_recent::RecentActivity::default()
+    );
     // The account binding is copied exactly, never inferred from the org.
     let mut other = item.clone();
-    other.session_account_evidence.as_mut().unwrap().account_identifier_hash = Some(D64.into());
-    assert_eq!(collect(&other).desktop_recent().at(LOGIN_A, &org_hash(ORG_1)), None);
-    assert_eq!(collect(&other).desktop_recent().at(D64, &org_hash(ORG_1)), at(10));
+    other
+        .session_account_evidence
+        .as_mut()
+        .unwrap()
+        .account_identifier_hash = Some(D64.into());
+    assert_eq!(
+        collect(&other)
+            .desktop_recent()
+            .at(LOGIN_A, &org_hash(ORG_1)),
+        None
+    );
+    assert_eq!(
+        collect(&other).desktop_recent().at(D64, &org_hash(ORG_1)),
+        at(10)
+    );
     // Local bookkeeping cannot change serialized telemetry or diagnostics.
     let wire = serde_json::to_string(&item).unwrap();
     assert!(!wire.contains("desktop_request") && !wire.contains("desktop_recent"));
@@ -4170,13 +4362,20 @@ fn desktop_recent_cli_to_desktop_and_missing_entrypoint_fail_closed() {
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
     accumulator.claude_request_identity_capture = true;
     apply_claude_code_line(&marker(ORG_1), &mut accumulator);
-    for (n, entrypoint) in [Some("cli"), Some("claude-desktop"), None].iter().enumerate() {
-        if n == 1 { apply_claude_code_line(&marker(ORG_2), &mut accumulator); }
+    for (n, entrypoint) in [Some("cli"), Some("claude-desktop"), None]
+        .iter()
+        .enumerate()
+    {
+        if n == 1 {
+            apply_claude_code_line(&marker(ORG_2), &mut accumulator);
+        }
         let mut line = json!({"type": "assistant", "sessionId": ROOT,
             "timestamp": format!("2026-08-02T07:00:{n:02}Z"),
             "requestId": format!("req_{n}"), "message": {"id": format!("msg_{n}"),
             "model": "claude-haiku-4-5", "usage": {"input_tokens": 10, "output_tokens": 1}}});
-        if let Some(entrypoint) = entrypoint { line["entrypoint"] = json!(entrypoint); }
+        if let Some(entrypoint) = entrypoint {
+            line["entrypoint"] = json!(entrypoint);
+        }
         apply_claude_code_line(&line, &mut accumulator);
     }
     accumulator.finalize_claude_responses();
@@ -4184,26 +4383,48 @@ fn desktop_recent_cli_to_desktop_and_missing_entrypoint_fail_closed() {
     assert!(accumulator.claude_usage_occurrences["req_1"].desktop_request);
     assert!(!accumulator.claude_usage_occurrences["req_2"].desktop_request);
     assert_eq!(accumulator.origin.entrypoint.as_deref(), Some("cli"));
-    let mut item = accumulator.into_items(
-        Path::new("/synthetic/session.jsonl"), "2026-08-02T07:01:00Z", "fp".into(), None).remove(0);
+    let mut item = accumulator
+        .into_items(
+            Path::new("/synthetic/session.jsonl"),
+            "2026-08-02T07:01:00Z",
+            "fp".into(),
+            None,
+        )
+        .remove(0);
     item.session_account_evidence = Some(SessionAccountEvidence {
-        provider: "anthropic", account_identifier_hash: Some(LOGIN_A.into()),
-        provider_workspace_hash: Some(org_hash(ORG_1)), identity_hash_scheme: "provider-sha256:v1",
-        evidence_source: "claude_desktop_original:v1", identity_disposition: Some("complete"),
+        provider: "anthropic",
+        account_identifier_hash: Some(LOGIN_A.into()),
+        provider_workspace_hash: Some(org_hash(ORG_1)),
+        identity_hash_scheme: "provider-sha256:v1",
+        evidence_source: "claude_desktop_original:v1",
+        identity_disposition: Some("complete"),
         source_created_at: Some("2026-08-02T06:59:00Z".into()),
     });
     let (api, trace) = reports(Vec::new(), Vec::new());
     let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
     let mut sink = identity::RequestSink::for_item(&evidence, &item, usize::MAX).unwrap();
     for (request_id, occurrence) in &item.claude_usage_occurrences {
-        let (key, _, _) = build_row_identity(occurrence.model.as_deref().unwrap(), &occurrence.selector, None);
-        sink.add(&item, identity::Request { request_id,
-            occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
-            timestamp: occurrence.timestamp.as_deref().unwrap(), bucket_start: "2026-08-02T07:00:00Z",
-            row_key: &key, usage: &occurrence.usage });
+        let (key, _, _) = build_row_identity(
+            occurrence.model.as_deref().unwrap(),
+            &occurrence.selector,
+            None,
+        );
+        sink.add(
+            &item,
+            identity::Request {
+                request_id,
+                occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
+                timestamp: occurrence.timestamp.as_deref().unwrap(),
+                bucket_start: "2026-08-02T07:00:00Z",
+                row_key: &key,
+                usage: &occurrence.usage,
+            },
+        );
     }
-    assert_eq!(sink.finish().desktop_recent().at(LOGIN_A, &org_hash(ORG_2)),
-        OffsetDateTime::parse("2026-08-02T07:00:01Z", &Rfc3339).ok());
+    assert_eq!(
+        sink.finish().desktop_recent().at(LOGIN_A, &org_hash(ORG_2)),
+        OffsetDateTime::parse("2026-08-02T07:00:01Z", &Rfc3339).ok()
+    );
 }
 
 /// Same order as the daemon: save native originals, apply request enrichment
@@ -4222,64 +4443,130 @@ fn desktop_recent_survives_same_account_org_switch_through_enrichment_and_both_f
     let org2 = org_hash(ORG_2);
     let mut lines = vec![marker(ORG_1)];
     for (n, at) in [(1, first), (2, second)] {
-        if n == 2 { lines.push(marker(ORG_2)); }
+        if n == 2 {
+            lines.push(marker(ORG_2));
+        }
         lines.push(json!({"type":"assistant", "sessionId":ROOT,
             "entrypoint":"claude-desktop", "timestamp":stamp(at),
             "requestId":format!("req_{n}"), "message":{"id":format!("msg_{n}"),
             "model":"claude-haiku-4-5", "usage":{"input_tokens":10,"output_tokens":1}}}));
     }
     let path = dir.join(format!("{ROOT}.jsonl"));
-    fs::write(&path, lines.iter().map(|v| v.to_string()+"\n").collect::<String>()).unwrap();
-    let mut item = parse_claude_code_jsonl_file(&path, &stamp(now), "fp".into()).unwrap().remove(0);
+    fs::write(
+        &path,
+        lines
+            .iter()
+            .map(|v| v.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    let mut item = parse_claude_code_jsonl_file(&path, &stamp(now), "fp".into())
+        .unwrap()
+        .remove(0);
     item.session_account_evidence = Some(SessionAccountEvidence {
-        provider: "anthropic", account_identifier_hash: Some(account.clone()),
-        provider_workspace_hash: Some(org1.clone()), identity_hash_scheme: "provider-sha256:v1",
-        evidence_source: "claude_desktop_original:v1", identity_disposition: Some("complete"),
+        provider: "anthropic",
+        account_identifier_hash: Some(account.clone()),
+        provider_workspace_hash: Some(org1.clone()),
+        identity_hash_scheme: "provider-sha256:v1",
+        evidence_source: "claude_desktop_original:v1",
+        identity_disposition: Some("complete"),
         source_created_at: Some(stamp(first - time::Duration::seconds(1))),
     });
-    let originals = BTreeMap::from([(ROOT.to_string(), item.session_account_evidence.clone().unwrap())]);
-    let api_rows = [("req_1", &org1), ("req_2", &org2)].into_iter().enumerate().map(|(i,(request,org))| {
-        let mut row = complete_api_row(ROOT, request, i as u64+1, 10, 1, 0);
-        row.account_identifier_hash = Some(account.clone());
-        let mut identity = org_identity(org);
-        identity.account.log_record_hash = Some(account.clone());
-        row.request_identity = Some(identity);
-        signed(row)
-    }).collect::<Vec<_>>();
-    let (api, trace) = reports(api_rows, vec![complete_trace_row(ROOT,"req_1",""),complete_trace_row(ROOT,"req_2","")]);
+    let originals = BTreeMap::from([(
+        ROOT.to_string(),
+        item.session_account_evidence.clone().unwrap(),
+    )]);
+    let api_rows = [("req_1", &org1), ("req_2", &org2)]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (request, org))| {
+            let mut row = complete_api_row(ROOT, request, i as u64 + 1, 10, 1, 0);
+            row.account_identifier_hash = Some(account.clone());
+            let mut identity = org_identity(org);
+            identity.account.log_record_hash = Some(account.clone());
+            row.request_identity = Some(identity);
+            signed(row)
+        })
+        .collect::<Vec<_>>();
+    let (api, trace) = reports(
+        api_rows,
+        vec![
+            complete_trace_row(ROOT, "req_1", ""),
+            complete_trace_row(ROOT, "req_2", ""),
+        ],
+    );
     let mut index = ScanIndex::default();
     let mut enriched = vec![item];
-    apply_claude_effort_evidence_with_index(&mut enriched, &api.evidence, &mut index, false, &stamp(now));
-    assert_eq!(enriched[0].session_account_evidence.as_ref().unwrap().identity_disposition, Some("conflict"), "existing billing veto remains");
-    let evidence = ScanEvidence::new(&api,&trace,BTreeSet::new(),None).with_native_originals(&originals);
+    apply_claude_effort_evidence_with_index(
+        &mut enriched,
+        &api.evidence,
+        &mut index,
+        false,
+        &stamp(now),
+    );
+    assert_eq!(
+        enriched[0]
+            .session_account_evidence
+            .as_ref()
+            .unwrap()
+            .identity_disposition,
+        Some("conflict"),
+        "existing billing veto remains"
+    );
+    let evidence =
+        ScanEvidence::new(&api, &trace, BTreeSet::new(), None).with_native_originals(&originals);
     for reported in [false, true] {
         let mut items = enriched.clone();
         let mut groupings = BTreeMap::new();
         if reported {
             let item = &mut items[0];
-            let mut sink = identity::RequestSink::for_item(&evidence,item,usize::MAX).unwrap();
-            assert!(rebuild_claude_reported_usage(item, &api.evidence[ROOT], &BTreeSet::new(), Some(&mut sink)));
+            let mut sink = identity::RequestSink::for_item(&evidence, item, usize::MAX).unwrap();
+            assert!(rebuild_claude_reported_usage(
+                item,
+                &api.evidence[ROOT],
+                &BTreeSet::new(),
+                Some(&mut sink)
+            ));
             item.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".into());
-            groupings.insert(ROOT.to_string(),sink.finish());
+            groupings.insert(ROOT.to_string(), sink.finish());
         }
-        let result = identity::apply_scan(&mut items,&evidence,groupings);
-        assert_eq!(result.sent,1,"reported={reported}: {result:?}");
-        assert_eq!(items[0].session_account_evidence.as_ref().unwrap().identity_disposition,Some("conflict"));
+        let result = identity::apply_scan(&mut items, &evidence, groupings);
+        assert_eq!(result.sent, 1, "reported={reported}: {result:?}");
+        assert_eq!(
+            items[0]
+                .session_account_evidence
+                .as_ref()
+                .unwrap()
+                .identity_disposition,
+            Some("conflict")
+        );
         let activity = crate::desktop_recent::saved();
-        assert_eq!(activity.at(&account,&org1),Some(first));
-        assert_eq!(activity.at(&account,&org2),Some(second));
+        assert_eq!(activity.at(&account, &org1), Some(first));
+        assert_eq!(activity.at(&account, &org2), Some(second));
     }
     // Config selection is the existing health observation, independent of
     // which snapshot upload carries the two exact rows.
-    let mut health: ottto_protocol::AgentStatusSnapshot = serde_json::from_str(include_str!("../../../../fixtures/agent-status/display-carrier.json")).unwrap();
+    let mut health: ottto_protocol::AgentStatusSnapshot = serde_json::from_str(include_str!(
+        "../../../../fixtures/agent-status/display-carrier.json"
+    ))
+    .unwrap();
     health.plan_observations = vec![serde_json::from_value(json!({
         "confidence":"high", "auth_mode":"claude_desktop", "evidence_method":"claude_desktop_session_bucket",
         "account_identifier_hash":account, "is_current":true})).unwrap()];
     let mut response = vec![health.clone()];
-    response[0].plan_observations = [&org1,&org2].into_iter().map(|org| serde_json::from_value(json!({
-        "confidence":"high", "account_identifier_hash":account,"organization_identifier_hash":org})).unwrap()).collect();
-    crate::desktop_recent::overlay(&mut response,&health,now);
-    assert!(response[0].plan_observations.iter().all(|o|o.desktop_recent_at.is_some()));
+    response[0].plan_observations = [&org1, &org2]
+        .into_iter()
+        .map(|org| {
+            serde_json::from_value(json!({
+        "confidence":"high", "account_identifier_hash":account,"organization_identifier_hash":org}))
+            .unwrap()
+        })
+        .collect();
+    crate::desktop_recent::overlay(&mut response, &health, now);
+    assert!(response[0]
+        .plan_observations
+        .iter()
+        .all(|o| o.desktop_recent_at.is_some()));
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -4291,36 +4578,76 @@ fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without
     let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
     let at = now - time::Duration::seconds(30);
     let stamp = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
-    let lines = [marker(ORG_1),json!({"type":"assistant","sessionId":ROOT,
+    let lines = [
+        marker(ORG_1),
+        json!({"type":"assistant","sessionId":ROOT,
         "entrypoint":"claude-desktop","timestamp":stamp(at),"requestId":"req_foreign",
-        "message":{"id":"msg_foreign","model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":1}}})];
+        "message":{"id":"msg_foreign","model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":1}}}),
+    ];
     let path = dir.join(format!("{ROOT}.jsonl"));
-    fs::write(&path,lines.iter().map(|v|v.to_string()+"\n").collect::<String>()).unwrap();
-    let base = parse_claude_code_jsonl_file(&path,&stamp(now),"fp".into()).unwrap().remove(0);
-    for (case,account) in [("foreign","f3".repeat(32)),("conflict","f4".repeat(32)),("account","f5".repeat(32))] {
+    fs::write(
+        &path,
+        lines
+            .iter()
+            .map(|v| v.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    let base = parse_claude_code_jsonl_file(&path, &stamp(now), "fp".into())
+        .unwrap()
+        .remove(0);
+    for (case, account) in [
+        ("foreign", "f3".repeat(32)),
+        ("conflict", "f4".repeat(32)),
+        ("account", "f5".repeat(32)),
+    ] {
         let mut item = base.clone();
         item.session_account_evidence = Some(SessionAccountEvidence {
-            provider:"anthropic",account_identifier_hash:Some(account.clone()),provider_workspace_hash:Some(org_hash(ORG_1)),
-            identity_hash_scheme:"provider-sha256:v1",evidence_source:"claude_desktop_original:v1",
-            identity_disposition:Some("complete"),source_created_at:Some(stamp(at-time::Duration::seconds(1))),
+            provider: "anthropic",
+            account_identifier_hash: Some(account.clone()),
+            provider_workspace_hash: Some(org_hash(ORG_1)),
+            identity_hash_scheme: "provider-sha256:v1",
+            evidence_source: "claude_desktop_original:v1",
+            identity_disposition: Some("complete"),
+            source_created_at: Some(stamp(at - time::Duration::seconds(1))),
         });
         let mut api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
         let mut trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
-        if case=="foreign" {
-            trace.evidence.insert(OTHER_ROOT.into(),vec![complete_trace_row(OTHER_ROOT,"req_foreign","")]);
+        if case == "foreign" {
+            trace.evidence.insert(
+                OTHER_ROOT.into(),
+                vec![complete_trace_row(OTHER_ROOT, "req_foreign", "")],
+            );
         } else {
-            let mut row = complete_api_row(ROOT,"req_foreign",1,10,1,0);
-            row.account_identifier_hash = Some(if case=="account" {D64.into()} else {account.clone()});
-            api.evidence.insert(ROOT.into(),vec![signed(row)]);
-            let owner = complete_trace_row(ROOT,"req_foreign","");
-            trace.evidence.insert(ROOT.into(),if case=="conflict" {vec![owner.clone(),owner]} else {vec![owner]});
+            let mut row = complete_api_row(ROOT, "req_foreign", 1, 10, 1, 0);
+            row.account_identifier_hash = Some(if case == "account" {
+                D64.into()
+            } else {
+                account.clone()
+            });
+            api.evidence.insert(ROOT.into(), vec![signed(row)]);
+            let owner = complete_trace_row(ROOT, "req_foreign", "");
+            trace.evidence.insert(
+                ROOT.into(),
+                if case == "conflict" {
+                    vec![owner.clone(), owner]
+                } else {
+                    vec![owner]
+                },
+            );
         }
-        let evidence = ScanEvidence::new(&api,&trace,BTreeSet::new(),None);
+        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
         let mut items = vec![item];
-        let result = identity::apply_scan(&mut items,&evidence,BTreeMap::new());
-        assert_eq!(result.sent,1,"{case}: {result:?}");
-        assert_eq!(crate::desktop_recent::saved().at(&account,&org_hash(ORG_1)),None,"{case}");
-        if case!="account" { assert!(items[0].request_identity_refusals>0,"{case}"); }
+        let result = identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+        assert_eq!(result.sent, 1, "{case}: {result:?}");
+        assert_eq!(
+            crate::desktop_recent::saved().at(&account, &org_hash(ORG_1)),
+            None,
+            "{case}"
+        );
+        if case != "account" {
+            assert!(items[0].request_identity_refusals > 0, "{case}");
+        }
     }
     fs::remove_dir_all(dir).unwrap();
 }
@@ -4466,7 +4793,9 @@ fn uses(display: &identity::AccountDisplay) -> Vec<Use> {
         .collect()
 }
 
-fn current_of(display: &identity::AccountDisplay) -> (&str, Option<&str>, Option<&str>, Option<&str>, Option<&str>) {
+fn current_of(
+    display: &identity::AccountDisplay,
+) -> (&str, Option<&str>, Option<&str>, Option<&str>, Option<&str>) {
     let current = &display.current;
     (
         current.status.as_str(),
@@ -4487,15 +4816,39 @@ fn owned(value: &str) -> Option<String> {
 fn current_account_follows_the_newest_request_not_its_hour_bucket() {
     let requests = || {
         vec![
-            display_request(Some("max"), HOUR_10, 10, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:05:00.100Z")),
-            display_request(Some("max"), HOUR_10, 20, login_org('b', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:20:00Z")),
-            display_request(Some("max"), HOUR_10, 30, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:40:00.250Z")),
+            display_request(
+                Some("max"),
+                HOUR_10,
+                10,
+                login_org('a', Some('d'), identity::TELEMETRY),
+                Some("2026-09-01T10:05:00.100Z"),
+            ),
+            display_request(
+                Some("max"),
+                HOUR_10,
+                20,
+                login_org('b', Some('d'), identity::TELEMETRY),
+                Some("2026-09-01T10:20:00Z"),
+            ),
+            display_request(
+                Some("max"),
+                HOUR_10,
+                30,
+                login_org('a', Some('d'), identity::TELEMETRY),
+                Some("2026-09-01T10:40:00.250Z"),
+            ),
         ]
     };
     let (_, display) = displayed(&requests());
     assert_eq!(
         current_of(&display),
-        ("known", Some(hex('a').as_str()), Some(hex('d').as_str()), Some("max"), None)
+        (
+            "known",
+            Some(hex('a').as_str()),
+            Some(hex('d').as_str()),
+            Some("max"),
+            None
+        )
     );
     assert_eq!(
         display.current.latest_request_at.as_deref(),
@@ -4504,8 +4857,24 @@ fn current_account_follows_the_newest_request_not_its_hour_bucket() {
     assert_eq!(
         uses(&display),
         vec![
-            (owned(&hex('a')), owned(&hex('d')), owned("max"), 2, 40, owned("2026-09-01T10:40:00.25Z"), true),
-            (owned(&hex('b')), owned(&hex('d')), owned("max"), 1, 20, owned("2026-09-01T10:20:00Z"), false),
+            (
+                owned(&hex('a')),
+                owned(&hex('d')),
+                owned("max"),
+                2,
+                40,
+                owned("2026-09-01T10:40:00.25Z"),
+                true
+            ),
+            (
+                owned(&hex('b')),
+                owned(&hex('d')),
+                owned("max"),
+                1,
+                20,
+                owned("2026-09-01T10:20:00Z"),
+                false
+            ),
         ]
     );
     // Every input order folds to the same display.
@@ -4533,13 +4902,37 @@ fn current_account_follows_the_newest_request_not_its_hour_bucket() {
 #[test]
 fn a_newer_unidentified_request_clears_the_current_account() {
     let (item, display) = displayed(&[
-        display_request(Some("max"), HOUR_10, 500, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:05:00Z")),
-        display_request(Some("max"), HOUR_10, 7, RequestIdentity::Missing, Some("2026-09-01T10:06:00Z")),
-        display_request(Some("max"), HOUR_11, 9, RequestIdentity::Refused(Refusal::Pending), Some("2026-09-01T11:00:00Z")),
+        display_request(
+            Some("max"),
+            HOUR_10,
+            500,
+            login_org('a', Some('d'), identity::TELEMETRY),
+            Some("2026-09-01T10:05:00Z"),
+        ),
+        display_request(
+            Some("max"),
+            HOUR_10,
+            7,
+            RequestIdentity::Missing,
+            Some("2026-09-01T10:06:00Z"),
+        ),
+        display_request(
+            Some("max"),
+            HOUR_11,
+            9,
+            RequestIdentity::Refused(Refusal::Pending),
+            Some("2026-09-01T11:00:00Z"),
+        ),
     ]);
     assert_eq!(
         current_of(&display),
-        ("unknown", None, None, None, Some("latest_request_unidentified"))
+        (
+            "unknown",
+            None,
+            None,
+            None,
+            Some("latest_request_unidentified")
+        )
     );
     assert_eq!(
         display.current.latest_request_at.as_deref(),
@@ -4548,14 +4941,46 @@ fn a_newer_unidentified_request_clears_the_current_account() {
     assert_eq!(
         uses(&display),
         vec![
-            (None, None, owned("max"), 2, 16, owned("2026-09-01T11:00:00Z"), false),
-            (owned(&hex('a')), owned(&hex('d')), owned("max"), 1, 500, owned("2026-09-01T10:05:00Z"), false),
+            (
+                None,
+                None,
+                owned("max"),
+                2,
+                16,
+                owned("2026-09-01T11:00:00Z"),
+                false
+            ),
+            (
+                owned(&hex('a')),
+                owned(&hex('d')),
+                owned("max"),
+                1,
+                500,
+                owned("2026-09-01T10:05:00Z"),
+                false
+            ),
         ]
     );
-    let row_requests: u64 = item.usage_buckets.iter().flat_map(|b| &b.model_usage).map(|r| r.request_count).sum();
-    let row_input: u64 = item.usage_buckets.iter().flat_map(|b| &b.model_usage).map(|r| r.input_tokens).sum();
-    assert_eq!(display.history.iter().map(|u| u.request_count).sum::<u64>(), row_requests);
-    assert_eq!(display.history.iter().map(|u| u.input_tokens).sum::<u64>(), row_input);
+    let row_requests: u64 = item
+        .usage_buckets
+        .iter()
+        .flat_map(|b| &b.model_usage)
+        .map(|r| r.request_count)
+        .sum();
+    let row_input: u64 = item
+        .usage_buckets
+        .iter()
+        .flat_map(|b| &b.model_usage)
+        .map(|r| r.input_tokens)
+        .sum();
+    assert_eq!(
+        display.history.iter().map(|u| u.request_count).sum::<u64>(),
+        row_requests
+    );
+    assert_eq!(
+        display.history.iter().map(|u| u.input_tokens).sum::<u64>(),
+        row_input
+    );
 }
 
 /// Requests at the same newest instant that disagree on any of account,
@@ -4564,24 +4989,86 @@ fn a_newer_unidentified_request_clears_the_current_account() {
 fn equal_newest_times_with_different_triples_are_unknown() {
     const AT: Option<&str> = Some("2026-09-01T10:30:00Z");
     for (case, second) in [
-        ("account", display_request(Some("max"), HOUR_10, 2, login_org('b', Some('d'), identity::TELEMETRY), AT)),
-        ("workspace", display_request(Some("max"), HOUR_10, 2, login_org('a', Some('e'), identity::TELEMETRY), AT)),
-        ("plan", display_request(Some("pro"), HOUR_10, 2, login_org('a', Some('d'), identity::TELEMETRY), AT)),
-        ("unidentified", display_request(Some("max"), HOUR_10, 2, RequestIdentity::Missing, AT)),
+        (
+            "account",
+            display_request(
+                Some("max"),
+                HOUR_10,
+                2,
+                login_org('b', Some('d'), identity::TELEMETRY),
+                AT,
+            ),
+        ),
+        (
+            "workspace",
+            display_request(
+                Some("max"),
+                HOUR_10,
+                2,
+                login_org('a', Some('e'), identity::TELEMETRY),
+                AT,
+            ),
+        ),
+        (
+            "plan",
+            display_request(
+                Some("pro"),
+                HOUR_10,
+                2,
+                login_org('a', Some('d'), identity::TELEMETRY),
+                AT,
+            ),
+        ),
+        (
+            "unidentified",
+            display_request(Some("max"), HOUR_10, 2, RequestIdentity::Missing, AT),
+        ),
     ] {
         let (_, display) = displayed(&[
-            display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), AT),
+            display_request(
+                Some("max"),
+                HOUR_10,
+                1,
+                login_org('a', Some('d'), identity::TELEMETRY),
+                AT,
+            ),
             second,
-            display_request(Some("max"), HOUR_10, 4, login_org('c', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:29:59.999Z")),
+            display_request(
+                Some("max"),
+                HOUR_10,
+                4,
+                login_org('c', Some('d'), identity::TELEMETRY),
+                Some("2026-09-01T10:29:59.999Z"),
+            ),
         ]);
         assert_eq!(display.current.status, "unknown", "{case}");
-        let reason = if case == "unidentified" { "latest_request_unidentified" } else { "conflicting_latest_requests" };
-        assert_eq!(display.current.unknown_reason.as_deref(), Some(reason), "{case}");
+        let reason = if case == "unidentified" {
+            "latest_request_unidentified"
+        } else {
+            "conflicting_latest_requests"
+        };
+        assert_eq!(
+            display.current.unknown_reason.as_deref(),
+            Some(reason),
+            "{case}"
+        );
     }
     // The same triple twice at the newest instant is still that triple.
     let (_, display) = displayed(&[
-        display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), AT),
-        display_request(Some("max"), HOUR_10, 2, login_org('a', Some('d'), identity::TELEMETRY), AT),
+        display_request(
+            Some("max"),
+            HOUR_10,
+            1,
+            login_org('a', Some('d'), identity::TELEMETRY),
+            AT,
+        ),
+        display_request(
+            Some("max"),
+            HOUR_10,
+            2,
+            login_org('a', Some('d'), identity::TELEMETRY),
+            AT,
+        ),
     ]);
     assert_eq!(display.current.account_identifier_hash, owned(&hex('a')));
 }
@@ -4598,12 +5085,31 @@ fn newer_request_replaces_conflicting_latest_ties() {
         let latest = display_request(plan, HOUR_10, 4, identity, Some("2026-09-01T10:31:00Z"));
         let expected = displayed(std::slice::from_ref(&latest)).1.current;
         let (_, actual) = displayed(&[
-            display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:30:00Z")),
-            display_request(Some("max"), HOUR_10, 2, login_org('b', Some('e'), identity::TELEMETRY), Some("2026-09-01T10:30:00Z")),
+            display_request(
+                Some("max"),
+                HOUR_10,
+                1,
+                login_org('a', Some('d'), identity::TELEMETRY),
+                Some("2026-09-01T10:30:00Z"),
+            ),
+            display_request(
+                Some("max"),
+                HOUR_10,
+                2,
+                login_org('b', Some('e'), identity::TELEMETRY),
+                Some("2026-09-01T10:30:00Z"),
+            ),
             latest,
         ]);
         assert_eq!(actual.current, expected);
-        assert_eq!(actual.history.iter().map(|entry| entry.request_count).sum::<u64>(), 3);
+        assert_eq!(
+            actual
+                .history
+                .iter()
+                .map(|entry| entry.request_count)
+                .sum::<u64>(),
+            3
+        );
     }
 }
 
@@ -4613,10 +5119,34 @@ fn newer_request_replaces_conflicting_latest_ties() {
 #[test]
 fn one_login_keeps_each_workspace_and_plan_apart() {
     let (_, display) = displayed(&[
-        display_request(Some("team"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:01:00Z")),
-        display_request(Some("team"), HOUR_10, 2, login_org('a', Some('e'), identity::TELEMETRY), Some("2026-09-01T10:02:00Z")),
-        display_request(Some("max"), HOUR_11, 4, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T11:03:00Z")),
-        display_request(Some("max"), HOUR_11, 8, login_org('a', None, identity::TELEMETRY_LOGIN), Some("2026-09-01T11:04:00Z")),
+        display_request(
+            Some("team"),
+            HOUR_10,
+            1,
+            login_org('a', Some('d'), identity::TELEMETRY),
+            Some("2026-09-01T10:01:00Z"),
+        ),
+        display_request(
+            Some("team"),
+            HOUR_10,
+            2,
+            login_org('a', Some('e'), identity::TELEMETRY),
+            Some("2026-09-01T10:02:00Z"),
+        ),
+        display_request(
+            Some("max"),
+            HOUR_11,
+            4,
+            login_org('a', Some('d'), identity::TELEMETRY),
+            Some("2026-09-01T11:03:00Z"),
+        ),
+        display_request(
+            Some("max"),
+            HOUR_11,
+            8,
+            login_org('a', None, identity::TELEMETRY_LOGIN),
+            Some("2026-09-01T11:04:00Z"),
+        ),
     ]);
     assert_eq!(
         current_of(&display),
@@ -4625,10 +5155,42 @@ fn one_login_keeps_each_workspace_and_plan_apart() {
     assert_eq!(
         uses(&display),
         vec![
-            (owned(&hex('a')), None, owned("max"), 1, 8, owned("2026-09-01T11:04:00Z"), true),
-            (owned(&hex('a')), owned(&hex('d')), owned("max"), 1, 4, owned("2026-09-01T11:03:00Z"), false),
-            (owned(&hex('a')), owned(&hex('e')), owned("team"), 1, 2, owned("2026-09-01T10:02:00Z"), false),
-            (owned(&hex('a')), owned(&hex('d')), owned("team"), 1, 1, owned("2026-09-01T10:01:00Z"), false),
+            (
+                owned(&hex('a')),
+                None,
+                owned("max"),
+                1,
+                8,
+                owned("2026-09-01T11:04:00Z"),
+                true
+            ),
+            (
+                owned(&hex('a')),
+                owned(&hex('d')),
+                owned("max"),
+                1,
+                4,
+                owned("2026-09-01T11:03:00Z"),
+                false
+            ),
+            (
+                owned(&hex('a')),
+                owned(&hex('e')),
+                owned("team"),
+                1,
+                2,
+                owned("2026-09-01T10:02:00Z"),
+                false
+            ),
+            (
+                owned(&hex('a')),
+                owned(&hex('d')),
+                owned("team"),
+                1,
+                1,
+                owned("2026-09-01T10:01:00Z"),
+                false
+            ),
         ]
     );
 }
@@ -4639,34 +5201,89 @@ fn one_login_keeps_each_workspace_and_plan_apart() {
 #[test]
 fn missing_clocks_and_auxiliary_requests_never_decide_the_current_account() {
     let (_, display) = displayed(&[
-        display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:01:00Z")),
-        display_request(Some("max"), HOUR_10, 2, login_org('a', Some('d'), identity::TELEMETRY), Some("")),
+        display_request(
+            Some("max"),
+            HOUR_10,
+            1,
+            login_org('a', Some('d'), identity::TELEMETRY),
+            Some("2026-09-01T10:01:00Z"),
+        ),
+        display_request(
+            Some("max"),
+            HOUR_10,
+            2,
+            login_org('a', Some('d'), identity::TELEMETRY),
+            Some(""),
+        ),
     ]);
     assert_eq!(
         current_of(&display),
-        ("unknown", None, None, None, Some("request_order_unavailable"))
+        (
+            "unknown",
+            None,
+            None,
+            None,
+            Some("request_order_unavailable")
+        )
     );
 
     let (_, display) = displayed(&[
-        display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:01:00Z")),
+        display_request(
+            Some("max"),
+            HOUR_10,
+            1,
+            login_org('a', Some('d'), identity::TELEMETRY),
+            Some("2026-09-01T10:01:00Z"),
+        ),
         // Auxiliary, unidentified and observed later.
         display_request(Some("max"), HOUR_11, 2, RequestIdentity::Missing, None),
         // Auxiliary on another account.
-        display_request(Some("max"), HOUR_11, 4, login_org('b', Some('d'), identity::TELEMETRY), None),
+        display_request(
+            Some("max"),
+            HOUR_11,
+            4,
+            login_org('b', Some('d'), identity::TELEMETRY),
+            None,
+        ),
     ]);
     assert_eq!(display.current.account_identifier_hash, owned(&hex('a')));
     assert_eq!(
         uses(&display),
         vec![
-            (owned(&hex('a')), owned(&hex('d')), owned("max"), 1, 1, owned("2026-09-01T10:01:00Z"), true),
+            (
+                owned(&hex('a')),
+                owned(&hex('d')),
+                owned("max"),
+                1,
+                1,
+                owned("2026-09-01T10:01:00Z"),
+                true
+            ),
             (None, None, owned("max"), 1, 2, None, false),
-            (owned(&hex('b')), owned(&hex('d')), owned("max"), 1, 4, None, false),
+            (
+                owned(&hex('b')),
+                owned(&hex('d')),
+                owned("max"),
+                1,
+                4,
+                None,
+                false
+            ),
         ]
     );
 
     // Only auxiliary requests: nothing is provably newest.
-    let (_, display) = displayed(&[display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), None)]);
-    assert_eq!(display.current.unknown_reason.as_deref(), Some("request_order_unavailable"));
+    let (_, display) = displayed(&[display_request(
+        Some("max"),
+        HOUR_10,
+        1,
+        login_org('a', Some('d'), identity::TELEMETRY),
+        None,
+    )]);
+    assert_eq!(
+        display.current.unknown_reason.as_deref(),
+        Some("request_order_unavailable")
+    );
     assert_eq!(display.current.latest_request_at, None);
 }
 
@@ -4676,18 +5293,56 @@ fn missing_clocks_and_auxiliary_requests_never_decide_the_current_account() {
 #[test]
 fn withdrawn_transcript_tags_withdraw_from_the_display() {
     let (item, display) = displayed(&[
-        display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY_LOGIN), Some("2026-09-01T10:01:00Z")),
-        display_request(Some("max"), HOUR_10, 2, RequestIdentity::Tagged(AuthorityKey { login: None, org: Some(hex('e')), basis: identity::TRANSCRIPT_ORG }), Some("2026-09-01T10:02:00Z")),
+        display_request(
+            Some("max"),
+            HOUR_10,
+            1,
+            login_org('a', Some('d'), identity::TELEMETRY_LOGIN),
+            Some("2026-09-01T10:01:00Z"),
+        ),
+        display_request(
+            Some("max"),
+            HOUR_10,
+            2,
+            RequestIdentity::Tagged(AuthorityKey {
+                login: None,
+                org: Some(hex('e')),
+                basis: identity::TRANSCRIPT_ORG,
+            }),
+            Some("2026-09-01T10:02:00Z"),
+        ),
     ]);
-    assert_eq!(display.current.unknown_reason.as_deref(), Some("latest_request_unidentified"));
+    assert_eq!(
+        display.current.unknown_reason.as_deref(),
+        Some("latest_request_unidentified")
+    );
     assert_eq!(
         uses(&display),
         vec![
-            (None, None, owned("max"), 1, 2, owned("2026-09-01T10:02:00Z"), false),
-            (owned(&hex('a')), None, owned("max"), 1, 1, owned("2026-09-01T10:01:00Z"), false),
+            (
+                None,
+                None,
+                owned("max"),
+                1,
+                2,
+                owned("2026-09-01T10:02:00Z"),
+                false
+            ),
+            (
+                owned(&hex('a')),
+                None,
+                owned("max"),
+                1,
+                1,
+                owned("2026-09-01T10:01:00Z"),
+                false
+            ),
         ]
     );
-    assert!(item.request_evidence.iter().all(|entry| entry.provider_workspace_hash.is_none()));
+    assert!(item
+        .request_evidence
+        .iter()
+        .all(|entry| entry.provider_workspace_hash.is_none()));
 }
 
 /// A row whose money cannot be split is untagged on the wire, so its newest
@@ -4696,12 +5351,21 @@ fn withdrawn_transcript_tags_withdraw_from_the_display() {
 fn an_unsplittable_row_untags_its_newest_request() {
     let mut item = one_row_item(&[(10, Some("1")), (20, None)]);
     let requests = vec![
-        (contribution(&item, 10, Some("1"), login_key(OWNER_A)), Some("2026-09-01T10:01:00Z")),
-        (contribution(&item, 20, None, login_key(OWNER_A)), Some("2026-09-01T10:02:00Z")),
+        (
+            contribution(&item, 10, Some("1"), login_key(OWNER_A)),
+            Some("2026-09-01T10:01:00Z"),
+        ),
+        (
+            contribution(&item, 20, None, login_key(OWNER_A)),
+            Some("2026-09-01T10:02:00Z"),
+        ),
     ];
     identity::apply_timed(&mut item, &requests).unwrap();
     let display = item.claude_account_display.as_deref().unwrap();
-    assert_eq!(display.current.unknown_reason.as_deref(), Some("latest_request_unidentified"));
+    assert_eq!(
+        display.current.unknown_reason.as_deref(),
+        Some("latest_request_unidentified")
+    );
     assert_eq!(display.history.len(), 1);
     assert_eq!(display.history[0].account_identifier_hash, None);
     assert_eq!(display.history[0].request_count, 2);
@@ -4713,28 +5377,37 @@ fn an_unsplittable_row_untags_its_newest_request() {
 #[test]
 fn fallback_withholds_and_ineligible_items_carry_no_display() {
     let requests = (0..17_u8)
-        .map(|n| {
-            DisplayRequest {
-                plan: Some("max"),
-                bucket: HOUR_10,
-                tokens: 1,
-                identity: RequestIdentity::Tagged(AuthorityKey {
-                    login: Some(format!("{n:064x}")),
-                    org: None,
-                    basis: identity::TELEMETRY,
-                }),
-                at: Some("2026-09-01T10:01:00Z"),
-            }
+        .map(|n| DisplayRequest {
+            plan: Some("max"),
+            bucket: HOUR_10,
+            tokens: 1,
+            identity: RequestIdentity::Tagged(AuthorityKey {
+                login: Some(format!("{n:064x}")),
+                org: None,
+                basis: identity::TELEMETRY,
+            }),
+            at: Some("2026-09-01T10:01:00Z"),
         })
         .collect::<Vec<_>>();
     let (mut item, contributions) = display_item(&requests);
     let result = identity::apply_timed(&mut item, &contributions).unwrap();
     assert!(matches!(result, Tagged::Fallback { .. }), "{result:?}");
     let display = item.claude_account_display.as_deref().unwrap();
-    assert_eq!(display.current.unknown_reason.as_deref(), Some("identity_withheld"));
+    assert_eq!(
+        display.current.unknown_reason.as_deref(),
+        Some("identity_withheld")
+    );
     assert_eq!(
         uses(display),
-        vec![(None, None, owned("max"), 17, 17, owned("2026-09-01T10:01:00Z"), false)]
+        vec![(
+            None,
+            None,
+            owned("max"),
+            17,
+            17,
+            owned("2026-09-01T10:01:00Z"),
+            false
+        )]
     );
 
     // Rows the requests do not reproduce: today's path, no display.
@@ -4747,15 +5420,33 @@ fn fallback_withholds_and_ineligible_items_carry_no_display() {
 
     // Same requests with and without times: identical wire and fingerprint.
     let two = [
-        display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:01:00Z")),
-        display_request(Some("pro"), HOUR_11, 2, login_org('b', Some('d'), identity::TELEMETRY), Some("2026-09-01T11:01:00Z")),
+        display_request(
+            Some("max"),
+            HOUR_10,
+            1,
+            login_org('a', Some('d'), identity::TELEMETRY),
+            Some("2026-09-01T10:01:00Z"),
+        ),
+        display_request(
+            Some("pro"),
+            HOUR_11,
+            2,
+            login_org('b', Some('d'), identity::TELEMETRY),
+            Some("2026-09-01T11:01:00Z"),
+        ),
     ];
     let (mut timed, contributions) = display_item(&two);
     let mut untimed = timed.clone();
     identity::apply_timed(&mut timed, &contributions).unwrap();
-    let plain = contributions.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
+    let plain = contributions
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect::<Vec<_>>();
     identity::apply(&mut untimed, &plain).unwrap();
-    assert_eq!(serde_json::to_vec(&timed).unwrap(), serde_json::to_vec(&untimed).unwrap());
+    assert_eq!(
+        serde_json::to_vec(&timed).unwrap(),
+        serde_json::to_vec(&untimed).unwrap()
+    );
     assert_eq!(timed.snapshot_fingerprint, untimed.snapshot_fingerprint);
     let wire = serde_json::to_string(&timed).unwrap();
     assert!(!wire.contains("latest_request_at") && !wire.contains("last_used_at"));
@@ -4765,7 +5456,6 @@ fn fallback_withholds_and_ineligible_items_carry_no_display() {
 /// current, and a response without a complete event clock proves no order.
 #[test]
 fn transcript_path_current_account_is_the_newest_parsed_request() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     let (dir, root, mut items) = claude_account_family_fixture();
     items.truncate(1);
     let api = (1..=4)

@@ -107,7 +107,7 @@ fn e2_body_of_previously_proven_family_is_not_a_demotion() {
         // reported rebuild is skipped for it, and it is not a demotion: it
         // reaches upload selection whatever the reports' health.
         let mut proven = proven_family();
-        claude_request_money::e2::with_enabled(|| {
+        {
             let (mut child, disposition) = child_page(&mut proven, healthy);
             assert!(
                 child[0].claude_money.is_some(),
@@ -159,7 +159,7 @@ fn e2_body_of_previously_proven_family_is_not_a_demotion() {
             assert!(withheld.account_deferred_fingerprints(&child).is_empty());
             withheld.retain_uploadable(&mut child);
             assert!(child.is_empty());
-        });
+        };
     }
 }
 

@@ -15,7 +15,7 @@ const ROOT: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const COPY: &str = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const AT: &str = "2026-08-02T07:00:10Z";
 fn with_e2<T>(f: impl FnOnce() -> T) -> T {
-    crate::snapshots::with_max_gated_claude_revision(3, || e2::with_enabled(f))
+    crate::snapshots::with_max_gated_claude_revision(3, || f())
 }
 fn nanos(at: &str) -> i128 {
     OffsetDateTime::parse(at, &Rfc3339)
@@ -53,14 +53,14 @@ impl Corpus {
         let support = base.join("support");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&support).unwrap();
-        if e2::enabled() {
-            std::fs::create_dir_all(support.join("snapshots")).unwrap();
-            std::fs::write(
-                support.join("snapshots/claude_code-reemission-exclusions.txt"),
-                "# installed synthetic list, no protected sessions\n",
-            )
-            .unwrap();
-        }
+
+        std::fs::create_dir_all(support.join("snapshots")).unwrap();
+        std::fs::write(
+            support.join("snapshots/claude_code-reemission-exclusions.txt"),
+            "# installed synthetic list, no protected sessions\n",
+        )
+        .unwrap();
+
         Self {
             base,
             root,
@@ -145,11 +145,7 @@ impl Corpus {
             return self.terminal_off_on_raw(scanner, index, limit, sampled, hints);
         }
         index.activate_upload_context("e2-synthetic-destination".into());
-        index.activate_effective_upload_body_witness_revision(if e2::enabled() {
-            3
-        } else {
-            effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
-        });
+        index.activate_effective_upload_body_witness_revision(3);
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(&self.support);
         let committed = index.clone();
@@ -2039,7 +2035,6 @@ fn settle_in(
     c.reload_in(&mut settled.index, index_name)
 }
 
-
 fn body<'a>(page: &'a Page, session: &str) -> Option<&'a SnapshotItem> {
     page.scan
         .snapshots
@@ -3346,10 +3341,14 @@ fn e2_pipeline_resumed_switch_off_matches_pre_change_builder_demo_family() {
             let mut reference = ScanIndex::default();
             let mut progress = e2_progress();
             let mut reference_progress = e2_progress();
-            let sessions = [ROOT, COPY, THIRD,
+            let sessions = [
+                ROOT,
+                COPY,
+                THIRD,
                 "5338a80a-f36e-4cbc-a5bb-50fc66430ba5",
                 "6338a80a-f36e-4cbc-a5bb-50fc66430ba5",
-                "7338a80a-f36e-4cbc-a5bb-50fc66430ba5"];
+                "7338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+            ];
             let mut lines = vec![A, B];
             let mut own_clocks = Vec::new();
             let mut own_ids = Vec::new();
@@ -3361,21 +3360,44 @@ fn e2_pipeline_resumed_switch_off_matches_pre_change_builder_demo_family() {
                 if n > 0 {
                     lines.push((&own_ids[n], &own_clocks[n], RESUME_WRITER));
                 }
-                c.write_at(&file(session), &resumed(session, &lines),
-                    &format!("2026-08-02T07:{:02}:00Z", n * 3));
+                c.write_at(
+                    &file(session),
+                    &resumed(session, &lines),
+                    &format!("2026-08-02T07:{:02}:00Z", n * 3),
+                );
                 // An advertised wire capability cannot bypass the local OFF.
                 current.copy_unproven_enabled = true;
                 reference.copy_unproven_enabled = true;
-                let mut actual = ready(&c, &E2ScanFixture::capturing_identity(), current.clone(), 100, sampled);
-                let mut expected = e2::with_pre_change_builder(||
-                    ready(&c, &E2ScanFixture::capturing_identity(), reference.clone(), 100, sampled));
-                assert_eq!(body(&actual, session).unwrap().request_count, (n + 2) as u64);
-                assert_eq!(canonical(&actual.scan.snapshots), canonical(&expected.scan.snapshots));
+                let mut actual = ready(
+                    &c,
+                    &E2ScanFixture::capturing_identity(),
+                    current.clone(),
+                    100,
+                    sampled,
+                );
+                let mut expected = e2::with_pre_change_builder(|| {
+                    ready(
+                        &c,
+                        &E2ScanFixture::capturing_identity(),
+                        reference.clone(),
+                        100,
+                        sampled,
+                    )
+                });
+                assert_eq!(
+                    body(&actual, session).unwrap().request_count,
+                    (n + 2) as u64
+                );
+                assert_eq!(
+                    canonical(&actual.scan.snapshots),
+                    canonical(&expected.scan.snapshots)
+                );
                 actual.finish();
                 expected.finish();
                 assert_eq!(actual.receipt(), expected.receipt());
                 let (a, bytes, order) = upload(&actual.scan.snapshots, &mut progress, ack);
-                let (b, expected_bytes, expected_order) = upload(&expected.scan.snapshots, &mut reference_progress, ack);
+                let (b, expected_bytes, expected_order) =
+                    upload(&expected.scan.snapshots, &mut reference_progress, ack);
                 assert_eq!(a.unwrap(), b.unwrap());
                 assert_eq!(bytes, expected_bytes);
                 assert_eq!(order, expected_order);
@@ -3385,8 +3407,13 @@ fn e2_pipeline_resumed_switch_off_matches_pre_change_builder_demo_family() {
                 current = settle(&c, &current, actual, &mut progress);
                 // Independent generations need independent index files; the
                 // source paths and uploaded bodies remain identical.
-                reference = settle_in(&c, &reference, expected, &mut reference_progress,
-                    "pre-change-scan-index.json");
+                reference = settle_in(
+                    &c,
+                    &reference,
+                    expected,
+                    &mut reference_progress,
+                    "pre-change-scan-index.json",
+                );
             }
         }
     });
@@ -3398,18 +3425,27 @@ fn e2_pipeline_switch_off_ignores_saved_removals_and_pending_holds() {
         let mut c = Corpus::new("e2-copy-switch-off-saved");
         let mut prior = demo_family(&mut c, &mut e2_progress());
         let key = crate::snapshots::claude_money_birth_store::location_key(
-            &c.root.join(file(COPY)).to_string_lossy());
+            &c.root.join(file(COPY)).to_string_lossy(),
+        );
         assert!(prior.claude_copy_removals.advance_hold(key));
         let saved = serde_json::to_value(&prior.claude_copy_removals).unwrap();
         let _off = e2::ResumedPrefixForTest::set(false);
         e2::take_diag();
         let mut actual = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
-        let mut expected = e2::with_pre_change_builder(||
-            ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false));
-        assert_eq!(canonical(&actual.scan.snapshots), canonical(&expected.scan.snapshots));
-        actual.finish(); expected.finish();
+        let mut expected = e2::with_pre_change_builder(|| {
+            ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false)
+        });
+        assert_eq!(
+            canonical(&actual.scan.snapshots),
+            canonical(&expected.scan.snapshots)
+        );
+        actual.finish();
+        expected.finish();
         assert_eq!(actual.receipt(), expected.receipt());
-        assert_eq!(serde_json::to_value(&actual.index.claude_copy_removals).unwrap(), saved);
+        assert_eq!(
+            serde_json::to_value(&actual.index.claude_copy_removals).unwrap(),
+            saved
+        );
         assert_eq!(copy_diag(&PREFIX_KEYS), [0; 5]);
     });
 }
@@ -3422,21 +3458,44 @@ fn e2_pipeline_resumed_switch_counts_removed_partial_dollars_and_own_turns() {
         let old = ScanIndex::default();
         let original = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
         let prior = settle(&c, &old, original, &mut e2_progress());
-        c.write_at(&file(COPY), &resumed(COPY, &[A, B, C]), "2026-08-02T07:03:00Z");
-        c.evidence_for(COPY, &[api_for(COPY, "a", 10, 100),
-            api_for(COPY, "b", 10, 200), api_for(COPY, "c", 10, 400)], &[]);
+        c.write_at(
+            &file(COPY),
+            &resumed(COPY, &[A, B, C]),
+            "2026-08-02T07:03:00Z",
+        );
+        c.evidence_for(
+            COPY,
+            &[
+                api_for(COPY, "a", 10, 100),
+                api_for(COPY, "b", 10, 200),
+                api_for(COPY, "c", 10, 400),
+            ],
+            &[],
+        );
         e2::take_diag();
         let on = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
         assert_eq!(body(&on, COPY).unwrap().removed_request_count, Some(2));
-        assert_eq!(copy_diag(&["copy_prefix_removed_priced_requests",
-            "copy_prefix_removed_cost_micros", "copy_prefix_own_requests",
-            "copy_prefix_families_corrected"]), [2, 300, 1, 1]);
+        assert_eq!(
+            copy_diag(&[
+                "copy_prefix_removed_priced_requests",
+                "copy_prefix_removed_cost_micros",
+                "copy_prefix_own_requests",
+                "copy_prefix_families_corrected"
+            ]),
+            [2, 300, 1, 1]
+        );
         let _off = e2::ResumedPrefixForTest::set(false);
         let off = ready(&c, &E2ScanFixture::default(), prior, 100, false);
         assert_eq!(body(&off, COPY).unwrap().request_count, 3);
-        assert_eq!(copy_diag(&["copy_prefix_removed_priced_requests",
-            "copy_prefix_removed_cost_micros", "copy_prefix_own_requests",
-            "copy_prefix_families_corrected"]), [0; 4]);
+        assert_eq!(
+            copy_diag(&[
+                "copy_prefix_removed_priced_requests",
+                "copy_prefix_removed_cost_micros",
+                "copy_prefix_own_requests",
+                "copy_prefix_families_corrected"
+            ]),
+            [0; 4]
+        );
     });
 }
 
@@ -3447,25 +3506,47 @@ fn corrected_family_counter_excludes_history_vetoed_literals() {
         let mut prior = demo_family(&mut c, &mut e2_progress());
         prior.activate_effective_upload_body_witness_revision(3);
         let path = c.root.join(file(THIRD));
-        assert!(prior.re_owe_effective_upload_body_witness_revision(
-            path.to_string_lossy().as_ref(), 2));
+        assert!(
+            prior.re_owe_effective_upload_body_witness_revision(path.to_string_lossy().as_ref(), 2)
+        );
         // Read the owed member through the normal scanner, then use the
         // production late telemetry hold. This isolates the counter's final
         // emission decision from candidate-admission and page-budget rules.
         let scanner = E2ScanFixture::default();
         let mut page = c.raw(&scanner, prior, 100, false, &[]);
-        assert!(scanner.paths().contains(&path), "the owed member was actually read");
-        page.scan.snapshots.retain(|item| item.source_session_id == THIRD);
-        assert_eq!(page.scan.snapshots.len(), 1, "actual native read of the held member");
-        assert_eq!(page.index.hold_claude_history_for_unread_telemetry(), 1,
-            "one permitted owed member is now held by the production emission seam");
+        assert!(
+            scanner.paths().contains(&path),
+            "the owed member was actually read"
+        );
+        page.scan
+            .snapshots
+            .retain(|item| item.source_session_id == THIRD);
+        assert_eq!(
+            page.scan.snapshots.len(),
+            1,
+            "actual native read of the held member"
+        );
+        assert_eq!(
+            page.index.hold_claude_history_for_unread_telemetry(),
+            1,
+            "one permitted owed member is now held by the production emission seam"
+        );
         e2::take_diag();
         page.enrich(&c);
-        assert_eq!(page.released.removed_requests, 3, "the literal actually removed its proven prefix");
+        assert_eq!(
+            page.released.removed_requests, 3,
+            "the literal actually removed its proven prefix"
+        );
         assert_eq!(copy_diag(&["copy_prefix_families_corrected"]), [0]);
-        assert!(body(&page, THIRD).is_none(), "history-held literal is vetoed");
+        assert!(
+            body(&page, THIRD).is_none(),
+            "history-held literal is vetoed"
+        );
         page.finish();
-        assert!(body(&page, THIRD).is_none(), "finalization cannot restore the vetoed literal");
+        assert!(
+            body(&page, THIRD).is_none(),
+            "finalization cannot restore the vetoed literal"
+        );
     });
 }
 
@@ -3840,45 +3921,111 @@ fn e2_pipeline_lost_removal_metadata_rederives_or_emits_flagged_without_delaying
     }
 }
 
-
 #[test]
 fn e2_pipeline_copy_unproven_wire_is_capability_gated_and_partitions_own_rows() {
     for sampled in [false, true] {
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-copy-wire-gate");
-        let scanner = E2ScanFixture::default();
-        c.root(ROOT, &resumed(ROOT, &[A, B]));
-        let old = ScanIndex::default();
-        let original = ready(&c, &scanner, old.clone(), 100, sampled);
-        let mut prior = settle(&c, &old, original, &mut e2_progress());
-        e2::pipeline_test_observer::retire_census(&mut prior, &file(ROOT));
-        c.write_at(&file(COPY), &resumed(COPY, &[A, B, C]), "2026-08-02T07:03:00Z");
-        // Same bucket/model/account: the prefix must not contaminate own rows,
-        // including shared telemetry placement memo entries.
-        c.evidence_for(COPY, &[api_for(COPY, "a", 10, 250), api_for(COPY, "c", 10, 400)], &[]);
-        let off = ready(&c, &scanner, prior.clone(), 100, sampled);
-        let off_body = body(&off, COPY).unwrap();
-        let legacy = serde_json::to_value(off_body).unwrap();
-        assert!(legacy.get("copy_unproven_counts").is_none());
-        assert!(off_body.usage_buckets.iter().flat_map(|b| &b.model_usage).all(|r| !r.copy_unproven));
-        assert!(!serde_json::to_string(&legacy).unwrap().contains("copy_unproven"));
-        let again = ready(&c, &scanner, prior.clone(), 100, sampled);
-        assert_eq!(canonical(off_body), canonical(body(&again, COPY).unwrap()), "gate-off unchanged input preserves complete body bytes");
-        assert_eq!(off_body.snapshot_fingerprint, body(&again, COPY).unwrap().snapshot_fingerprint);
-        prior.copy_unproven_enabled = true;
-        e2::take_diag();
-        let on = ready(&c, &scanner, prior, 100, sampled);
-        let on_body = body(&on, COPY).unwrap();
-        assert_eq!((on_body.request_count, on_body.input_tokens, &on_body.cost), (off_body.request_count, off_body.input_tokens, &off_body.cost));
-        assert_eq!(on_body.copy_unproven_counts, Some(crate::snapshots::CopyUnprovenCounts { rows: 2, requests: 2 }));
-        let rows = on_body.usage_buckets.iter().flat_map(|b| &b.model_usage).collect::<Vec<_>>();
-        assert_eq!(rows.iter().filter(|r| r.copy_unproven).map(|r| r.request_count).sum::<u64>(), 2);
-        assert_eq!(rows.iter().filter(|r| !r.copy_unproven).map(|r| r.request_count).sum::<u64>(), 1);
-        assert!(rows.iter().all(|r| !r.selector_context.contains_key("__ottto_copy_unproven")));
-        assert_ne!(crate::snapshots::snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, on_body),
-            crate::snapshots::snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, off_body));
-        assert_eq!(copy_diag(&["copy_prefix_unproven_rows", "copy_prefix_unproven", "copy_prefix_unproven_cost_micros"]), [2, 2, 250]);
-    });
+        with_e2(|| {
+            let mut c = Corpus::new("e2-pipeline-copy-wire-gate");
+            let scanner = E2ScanFixture::default();
+            c.root(ROOT, &resumed(ROOT, &[A, B]));
+            let old = ScanIndex::default();
+            let original = ready(&c, &scanner, old.clone(), 100, sampled);
+            let mut prior = settle(&c, &old, original, &mut e2_progress());
+            e2::pipeline_test_observer::retire_census(&mut prior, &file(ROOT));
+            c.write_at(
+                &file(COPY),
+                &resumed(COPY, &[A, B, C]),
+                "2026-08-02T07:03:00Z",
+            );
+            // Same bucket/model/account: the prefix must not contaminate own rows,
+            // including shared telemetry placement memo entries.
+            c.evidence_for(
+                COPY,
+                &[api_for(COPY, "a", 10, 250), api_for(COPY, "c", 10, 400)],
+                &[],
+            );
+            let off = ready(&c, &scanner, prior.clone(), 100, sampled);
+            let off_body = body(&off, COPY).unwrap();
+            let legacy = serde_json::to_value(off_body).unwrap();
+            assert!(legacy.get("copy_unproven_counts").is_none());
+            assert!(off_body
+                .usage_buckets
+                .iter()
+                .flat_map(|b| &b.model_usage)
+                .all(|r| !r.copy_unproven));
+            assert!(!serde_json::to_string(&legacy)
+                .unwrap()
+                .contains("copy_unproven"));
+            let again = ready(&c, &scanner, prior.clone(), 100, sampled);
+            assert_eq!(
+                canonical(off_body),
+                canonical(body(&again, COPY).unwrap()),
+                "gate-off unchanged input preserves complete body bytes"
+            );
+            assert_eq!(
+                off_body.snapshot_fingerprint,
+                body(&again, COPY).unwrap().snapshot_fingerprint
+            );
+            prior.copy_unproven_enabled = true;
+            e2::take_diag();
+            let on = ready(&c, &scanner, prior, 100, sampled);
+            let on_body = body(&on, COPY).unwrap();
+            assert_eq!(
+                (on_body.request_count, on_body.input_tokens, &on_body.cost),
+                (
+                    off_body.request_count,
+                    off_body.input_tokens,
+                    &off_body.cost
+                )
+            );
+            assert_eq!(
+                on_body.copy_unproven_counts,
+                Some(crate::snapshots::CopyUnprovenCounts {
+                    rows: 2,
+                    requests: 2
+                })
+            );
+            let rows = on_body
+                .usage_buckets
+                .iter()
+                .flat_map(|b| &b.model_usage)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r.copy_unproven)
+                    .map(|r| r.request_count)
+                    .sum::<u64>(),
+                2
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| !r.copy_unproven)
+                    .map(|r| r.request_count)
+                    .sum::<u64>(),
+                1
+            );
+            assert!(rows
+                .iter()
+                .all(|r| !r.selector_context.contains_key("__ottto_copy_unproven")));
+            assert_ne!(
+                crate::snapshots::snapshot_semantic_component_hashes(
+                    SnapshotSource::ClaudeCode,
+                    on_body
+                ),
+                crate::snapshots::snapshot_semantic_component_hashes(
+                    SnapshotSource::ClaudeCode,
+                    off_body
+                )
+            );
+            assert_eq!(
+                copy_diag(&[
+                    "copy_prefix_unproven_rows",
+                    "copy_prefix_unproven",
+                    "copy_prefix_unproven_cost_micros"
+                ]),
+                [2, 2, 250]
+            );
+        });
     }
 }
 
@@ -3887,8 +4034,10 @@ fn e2_pipeline_proven_prefix_markers_never_lend_identity_to_retained_requests() 
     // Full proof, partial proof, an emitted prefix's own marker, and id-less
     // prefix usage all pass through production identity reconciliation.
     for (partial, retained_marker, idless) in [
-        (false, false, false), (true, false, false),
-        (true, true, false), (true, false, true),
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
     ] {
         with_e2(|| {
             let mut c = Corpus::new("e2-pipeline-copy-marker-exclusion");
@@ -3899,18 +4048,31 @@ fn e2_pipeline_proven_prefix_markers_never_lend_identity_to_retained_requests() 
             let prior = settle(&c, &old, page, &mut e2_progress());
             let org_a = "11111111-1111-4111-8111-111111111111";
             let org_b = "22222222-2222-4222-8222-222222222222";
-            let marker = |org: &str| json!({"type":"attachment", "sessionId":COPY,
-                "attachment":{"type":"credential_org","organizationUuid":org}}).to_string() + "\n";
+            let marker = |org: &str| {
+                json!({"type":"attachment", "sessionId":COPY,
+                "attachment":{"type":"credential_org","organizationUuid":org}})
+                .to_string()
+                    + "\n"
+            };
             // A real terminal org change carries a new session_context.
             // Blank context proves a switch without asserting email identity.
-            let switched_b = || json!({"type":"attachment", "sessionId":COPY,
-                "attachment":{"type":"session_context", "context":{}}}).to_string() + "\n" + &marker(org_b);
+            let switched_b = || {
+                json!({"type":"attachment", "sessionId":COPY,
+                "attachment":{"type":"session_context", "context":{}}})
+                .to_string()
+                    + "\n"
+                    + &marker(org_b)
+            };
             let mut text = marker(org_a) + &resumed(COPY, &[A]);
             if partial {
-                if retained_marker { text += &switched_b(); }
-                let mut b: serde_json::Value = serde_json::from_str(
-                    &line_by(COPY, B.0, B.1, 10, RESUME_WRITER)).unwrap();
-                if idless { b.as_object_mut().unwrap().remove("requestId"); }
+                if retained_marker {
+                    text += &switched_b();
+                }
+                let mut b: serde_json::Value =
+                    serde_json::from_str(&line_by(COPY, B.0, B.1, 10, RESUME_WRITER)).unwrap();
+                if idless {
+                    b.as_object_mut().unwrap().remove("requestId");
+                }
                 text += &(b.to_string() + "\n");
             }
             text += &resumed(COPY, &[C]);
@@ -3920,25 +4082,36 @@ fn e2_pipeline_proven_prefix_markers_never_lend_identity_to_retained_requests() 
             c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
             let page = ready(&c, &scanner, prior, 100, false);
             let copy = body(&page, COPY).expect("retained usage publishes");
-            assert_eq!((copy.request_count, copy.removed_request_count),
-                (if partial { 3 } else { 2 }, Some(1)));
+            assert_eq!(
+                (copy.request_count, copy.removed_request_count),
+                (if partial { 3 } else { 2 }, Some(1))
+            );
             let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
             let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
             let mut shares = BTreeMap::<String, u64>::new();
             for row in &copy.model_usage {
                 if let Some(parts) = &row.identity_parts {
                     for part in parts {
-                        if let Some(org) = part.evidence_ref.and_then(|at|
-                            copy.request_evidence[usize::from(at)].provider_workspace_hash.as_ref()) {
+                        if let Some(org) = part.evidence_ref.and_then(|at| {
+                            copy.request_evidence[usize::from(at)]
+                                .provider_workspace_hash
+                                .as_ref()
+                        }) {
                             *shares.entry(org.clone()).or_default() += part.request_count;
                         }
                     }
-                } else if let Some(org) = row.evidence_ref.and_then(|at|
-                    copy.request_evidence[usize::from(at)].provider_workspace_hash.as_ref()) {
+                } else if let Some(org) = row.evidence_ref.and_then(|at| {
+                    copy.request_evidence[usize::from(at)]
+                        .provider_workspace_hash
+                        .as_ref()
+                }) {
                     *shares.entry(org.clone()).or_default() += row.request_count;
                 }
             }
-            assert!(!shares.contains_key(&a), "removed marker cannot lend account identity");
+            assert!(
+                !shares.contains_key(&a),
+                "removed marker cannot lend account identity"
+            );
             assert_eq!(shares.get(&b), Some(&if retained_marker { 3 } else { 1 }));
             assert_eq!(copy.input_tokens, if partial { 30 } else { 20 });
         });
@@ -3953,18 +4126,36 @@ fn e2_pipeline_recorded_removals_survive_repeated_walk_deadlines_with_live_proof
         let mut progress = e2_progress();
         let mut prior = demo_family(&mut c, &mut progress);
         for pass in 1..=3 {
-            append(&c.root.join(file(THIRD)), &line_by(THIRD, &format!("own-{pass}"),
-                &format!("2026-08-02T07:06:2{pass}Z"), 10, RESUME_WRITER));
+            append(
+                &c.root.join(file(THIRD)),
+                &line_by(
+                    THIRD,
+                    &format!("own-{pass}"),
+                    &format!("2026-08-02T07:06:2{pass}Z"),
+                    10,
+                    RESUME_WRITER,
+                ),
+            );
             let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
             e2::take_diag();
             crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
                 page.enrich(&c);
             });
             let third = body(&page, THIRD).unwrap();
-            assert_eq!((third.request_count, third.removed_request_count),
-                (1 + pass, Some(3)), "a timeout never restores a validated stored removal");
-            assert_eq!(copy_diag(&["copy_removal_reused", "copy_prefix_held_requests",
-                "copy_prefix_hold_expired", "copy_prefix_unproven"]), [3, 0, 0, 0]);
+            assert_eq!(
+                (third.request_count, third.removed_request_count),
+                (1 + pass, Some(3)),
+                "a timeout never restores a validated stored removal"
+            );
+            assert_eq!(
+                copy_diag(&[
+                    "copy_removal_reused",
+                    "copy_prefix_held_requests",
+                    "copy_prefix_hold_expired",
+                    "copy_prefix_unproven"
+                ]),
+                [3, 0, 0, 0]
+            );
             prior = settle(&c, &prior, page, &mut progress);
         }
     });
@@ -3982,25 +4173,37 @@ fn e2_pipeline_zero_usage_prefix_responses_neither_lend_markers_nor_hold_own_tur
             let prior = settle(&c, &old, page, &mut e2_progress());
             let org = "11111111-1111-4111-8111-111111111111";
             let marker = json!({"type":"attachment", "sessionId":COPY,
-                "attachment":{"type":"credential_org","organizationUuid":org}}).to_string() + "\n";
-            let mut zero: serde_json::Value = serde_json::from_str(
-                &line_by(COPY, "zero", B.1, 0, RESUME_WRITER)).unwrap();
-            if zero_before_proven { zero["timestamp"] = json!("2026-08-02T07:00:05Z"); }
+                "attachment":{"type":"credential_org","organizationUuid":org}})
+            .to_string()
+                + "\n";
+            let mut zero: serde_json::Value =
+                serde_json::from_str(&line_by(COPY, "zero", B.1, 0, RESUME_WRITER)).unwrap();
+            if zero_before_proven {
+                zero["timestamp"] = json!("2026-08-02T07:00:05Z");
+            }
             zero["message"]["usage"] = json!({"input_tokens":0,"output_tokens":0});
             let zero = zero.to_string() + "\n";
-            let text = marker + &if zero_before_proven {
-                zero + &resumed(COPY, &[A, C])
-            } else {
-                resumed(COPY, &[A]) + &zero + &resumed(COPY, &[C])
-            };
+            let text = marker
+                + &if zero_before_proven {
+                    zero + &resumed(COPY, &[A, C])
+                } else {
+                    resumed(COPY, &[A]) + &zero + &resumed(COPY, &[C])
+                };
             c.write_at(&file(COPY), &text, "2026-08-02T07:03:00Z");
             e2::take_diag();
             let page = ready(&c, &scanner, prior, 100, false);
             let copy = body(&page, COPY).expect("zero-usage prefix never withholds own turns");
-            assert_eq!((copy.request_count, copy.removed_request_count), (1, Some(1)));
+            assert_eq!(
+                (copy.request_count, copy.removed_request_count),
+                (1, Some(1))
+            );
             let org = ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap();
-            assert!(copy.request_evidence.iter().all(|e| e.provider_workspace_hash.as_ref() != Some(&org)),
-                "the removed marker cannot lend identity across a zero-usage response");
+            assert!(
+                copy.request_evidence
+                    .iter()
+                    .all(|e| e.provider_workspace_hash.as_ref() != Some(&org)),
+                "the removed marker cannot lend identity across a zero-usage response"
+            );
             assert_eq!(copy_diag(&["copy_prefix_unproven"]), [0]);
         });
     }
@@ -4009,36 +4212,75 @@ fn e2_pipeline_zero_usage_prefix_responses_neither_lend_markers_nor_hold_own_tur
 #[test]
 fn e2_pipeline_rewritten_prefix_clears_retry_debt_but_preserves_recorded_removals() {
     for empty in [false, true] {
-    with_e2(|| {
-        use crate::snapshots::claude_money_birth_store::location_key;
-        let mut c = Corpus::new("e2-pipeline-rewritten-prefix-debt");
-        let scanner = E2ScanFixture::default();
-        let mut progress = e2_progress();
-        let mut prior = demo_family(&mut c, &mut progress);
-        let key = location_key(&c.root.join(file(THIRD)).to_string_lossy());
-        let recorded = prior.claude_copy_removals.get(key).to_vec();
-        assert_eq!(recorded.iter().map(|(_, hashes)| hashes.len()).sum::<usize>(), 3);
-        c.write_at(&file(THIRD), &resumed(THIRD, &[A, B, C,
-            ("unresolved", "2026-08-02T07:05:00Z", RESUME_WRITER), D]), "2026-08-02T07:06:00Z");
-        let mut held = c.raw(&scanner, prior.clone(), 100, false, &[]);
-        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| { held.enrich(&c); });
-        assert_eq!(body(&held, THIRD).map(|b| (b.request_count, b.removed_request_count)), Some((1, Some(3))));
-        prior = settle(&c, &prior, held, &mut progress);
-        assert!(prior.claude_copy_removals.pending(key));
-        c.write_at(&file(THIRD), &if empty { String::new() } else { resumed(THIRD, &[D]) }, "2026-08-02T07:06:00Z");
-        let rewritten = ready(&c, &scanner, prior.clone(), 100, false);
-        assert_eq!(body(&rewritten, THIRD).map(|b| (b.request_count, b.removed_request_count)), if empty { None } else { Some((1, Some(0))) });
-        assert!(!rewritten.index.claude_copy_removals.pending(key));
-        assert_eq!(rewritten.index.claude_copy_removals.get(key), recorded.as_slice());
-        prior = settle(&c, &prior, rewritten, &mut progress);
-        assert!(!prior.claude_copy_removals.pending(key));
-        assert_eq!(prior.claude_copy_removals.get(key), recorded.as_slice());
-        let quiet = ready(&c, &scanner, prior, 100, false);
-        assert!(body(&quiet, THIRD).is_none(), "resolved debt cannot force indefinite reads after ACK/restart");
-    });
+        with_e2(|| {
+            use crate::snapshots::claude_money_birth_store::location_key;
+            let mut c = Corpus::new("e2-pipeline-rewritten-prefix-debt");
+            let scanner = E2ScanFixture::default();
+            let mut progress = e2_progress();
+            let mut prior = demo_family(&mut c, &mut progress);
+            let key = location_key(&c.root.join(file(THIRD)).to_string_lossy());
+            let recorded = prior.claude_copy_removals.get(key).to_vec();
+            assert_eq!(
+                recorded
+                    .iter()
+                    .map(|(_, hashes)| hashes.len())
+                    .sum::<usize>(),
+                3
+            );
+            c.write_at(
+                &file(THIRD),
+                &resumed(
+                    THIRD,
+                    &[
+                        A,
+                        B,
+                        C,
+                        ("unresolved", "2026-08-02T07:05:00Z", RESUME_WRITER),
+                        D,
+                    ],
+                ),
+                "2026-08-02T07:06:00Z",
+            );
+            let mut held = c.raw(&scanner, prior.clone(), 100, false, &[]);
+            crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+                held.enrich(&c);
+            });
+            assert_eq!(
+                body(&held, THIRD).map(|b| (b.request_count, b.removed_request_count)),
+                Some((1, Some(3)))
+            );
+            prior = settle(&c, &prior, held, &mut progress);
+            assert!(prior.claude_copy_removals.pending(key));
+            c.write_at(
+                &file(THIRD),
+                &if empty {
+                    String::new()
+                } else {
+                    resumed(THIRD, &[D])
+                },
+                "2026-08-02T07:06:00Z",
+            );
+            let rewritten = ready(&c, &scanner, prior.clone(), 100, false);
+            assert_eq!(
+                body(&rewritten, THIRD).map(|b| (b.request_count, b.removed_request_count)),
+                if empty { None } else { Some((1, Some(0))) }
+            );
+            assert!(!rewritten.index.claude_copy_removals.pending(key));
+            assert_eq!(
+                rewritten.index.claude_copy_removals.get(key),
+                recorded.as_slice()
+            );
+            prior = settle(&c, &prior, rewritten, &mut progress);
+            assert!(!prior.claude_copy_removals.pending(key));
+            assert_eq!(prior.claude_copy_removals.get(key), recorded.as_slice());
+            let quiet = ready(&c, &scanner, prior, 100, false);
+            assert!(
+                body(&quiet, THIRD).is_none(),
+                "resolved debt cannot force indefinite reads after ACK/restart"
+            );
+        });
     }
 }
-
 
 /// [money] Containment retains token, cost, account and exact ACK custody.
 #[test]

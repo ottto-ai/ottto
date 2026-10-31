@@ -1394,7 +1394,11 @@ impl ApcFixture {
         panic!("the generation ends within {APC_MAX_PAGES} bounded pages");
     }
 
-    fn terminal_off_on_generation(&self, hour: u32, upload: impl Fn(usize) -> ApcUpload) -> Vec<ApcPage> {
+    fn terminal_off_on_generation(
+        &self,
+        hour: u32,
+        upload: impl Fn(usize) -> ApcUpload,
+    ) -> Vec<ApcPage> {
         let mut pages = Vec::new();
         for number in 0..APC_MAX_PAGES {
             let mode = upload(number);
@@ -1544,8 +1548,6 @@ impl ApcFixture {
         assert!(last.record().is_none());
         ApcEstablished { proven, heads }
     }
-
-
 
     fn restore_historical_proof(&self, correction: bool) -> String {
         let mut index = ScanIndex::load(&self.index_path).expect("load historical fixture input");
@@ -1775,9 +1777,15 @@ impl ApcFixture {
             &apc_note_line(APC_ROOT, 0),
         );
         index.bind_pre_flip_claude_correction_for_test(APC_ROOT);
-        index.save(&self.index_path).expect("save the pre-flip index");
+        index
+            .save(&self.index_path)
+            .expect("save the pre-flip index");
         let seeded = ScanIndex::load(&self.index_path).expect("reload the pre-flip index");
-        assert_eq!(self.quarantined_index_count(), 0, "the seeded index is valid");
+        assert_eq!(
+            self.quarantined_index_count(),
+            0,
+            "the seeded index is valid"
+        );
         let record = seeded
             .claude_authority_record_for_test(APC_ROOT)
             .expect("the pre-flip record reloads");
@@ -3579,7 +3587,7 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         fixture.reach_grant().1
     };
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+
     let mut reads = BTreeMap::<String, usize>::new();
     let mut acked = BTreeSet::new();
     let mut cleared_hour = None;
@@ -3691,7 +3699,7 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
     drop(gate_off);
 
     // After the flip: the family returns.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+
     std::fs::write(&api, &healthy_api).expect("repair the API sidecar");
     for (path, bytes) in &members {
         std::fs::write(path, bytes).expect("restore the family member");
@@ -3745,7 +3753,6 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
         );
     }
 }
-
 
 /// [money] Containment retains token, cost, account and exact ACK custody.
 #[test]
