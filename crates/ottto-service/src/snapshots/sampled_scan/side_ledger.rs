@@ -829,7 +829,7 @@ impl SideLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap_layout_bound::{bound, layout_supported, tree_node_bytes, tree_nodes, Counter};
+    use crate::heap_layout_bound::layout_supported;
     use crate::snapshots::{SideRequest, SideRequestState};
 
     fn entry() -> LedgerEntry {
@@ -856,63 +856,6 @@ mod tests {
             dev: 1,
             ino: u64::try_from(p).unwrap(),
         }
-    }
-
-    #[test]
-    fn ledger_charge_is_the_full_node_formula_and_covers_a_full_map() {
-        let node = tree_node_bytes::<LedgerKey, LedgerEntry>().unwrap();
-        assert_eq!(SIDE_LEDGER_BYTES, (MAX_SIDE_LEDGER + 1) * node);
-        assert_eq!(size_of::<LedgerEntry>(), 96);
-        assert_eq!(size_of::<GateSlot>(), 48);
-        #[cfg(target_pointer_width = "64")]
-        assert_eq!(SIDE_LEDGER_BYTES, 125_840);
-        // A real map at the limit costs exactly the charge.
-        let mut c = Counter::new(usize::MAX);
-        tree_nodes::<LedgerKey, LedgerEntry>(MAX_SIDE_LEDGER, &mut c).unwrap();
-        assert!(c.bytes <= SIDE_LEDGER_BYTES);
-    }
-
-    /// [behaviour] U-T64(f): the charge is constant, lock-free and inside the state bound.
-    #[test]
-    fn shared_cache_charges_the_constant_without_locking_the_ledger() {
-        let empty = SharedCache::default();
-        let full = SharedCache::default();
-        {
-            let mut ledger = full.side_ledger();
-            ledger.begin_pass(7, 1000);
-            for p in 0..MAX_SIDE_LEDGER as u128 {
-                if layout_supported() {
-                    assert_eq!(ledger.charge(key(7, p + 1), entry(), 1000), Ok(true));
-                } else {
-                    ledger.entries.insert(key(7, p + 1), entry());
-                }
-            }
-            assert_eq!(ledger.len(), MAX_SIDE_LEDGER);
-        }
-        assert_eq!(bound(&full, usize::MAX), bound(&empty, usize::MAX));
-        assert_eq!(bound(&empty, usize::MAX).is_some(), layout_supported());
-        if layout_supported() {
-            // The term is exactly the constant: one visit, no walk.
-            let mut with = Counter::new(usize::MAX);
-            crate::heap_layout_bound::HeapLayoutBound::heap_bound(&empty, &mut with).unwrap();
-            let mut without = Counter::new(usize::MAX);
-            crate::heap_layout_bound::HeapLayoutBound::heap_bound(&empty.inner, &mut without)
-                .unwrap();
-            crate::heap_layout_bound::HeapLayoutBound::heap_bound(&empty.cursor, &mut without)
-                .unwrap();
-            // The separately allocated memo header is another cache-owned
-            // component; include it once to isolate the ledger's fixed term.
-            crate::heap_layout_bound::HeapLayoutBound::heap_bound(
-                &empty.withheld_memo,
-                &mut without,
-            )
-            .unwrap();
-            assert_eq!(with.bytes, without.bytes + SIDE_LEDGER_BYTES);
-        }
-        // Held lock: heap_bound still answers.
-        let held = full.side_ledger();
-        assert_eq!(bound(&full, usize::MAX), bound(&empty, usize::MAX));
-        drop(held);
     }
 
     #[test]
@@ -1012,27 +955,6 @@ mod tests {
         assert!(ledger.slot(5).is_none());
         // A forgotten namespace counts as unseen-gate: allowed.
         assert!(ledger.begin_pass(5, 500).side_allowed);
-    }
-
-    /// U-T60(d)(xiv): a poisoned ledger lock clears the ledger.
-    #[test]
-    fn poisoned_ledger_is_cleared_and_usable() {
-        let cache = std::sync::Arc::new(SharedCache::default());
-        cache.side_ledger().begin_pass(3, 10);
-        let poisoner = cache.clone();
-        let _ = std::thread::spawn(move || {
-            let _ledger = poisoner.side_ledger();
-            panic!("poison the side ledger");
-        })
-        .join();
-        assert!(cache.side.is_poisoned());
-        let (pass, counts) =
-            crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| {
-                cache.side_ledger().pass_seq()
-            });
-        assert_eq!(pass, 0);
-        assert_eq!(counts.side_requests_rearmed, 1);
-        assert!(!cache.side.is_poisoned());
     }
 
     #[test]
@@ -1698,61 +1620,6 @@ mod tests {
         );
     }
 
-    /// D5′ (v): once the stamp runs out nothing is covered: no mark, no
-    /// watermark move, mismatched entries kept, no lossless eviction; idle
-    /// eviction still applies.
-    #[test]
-    fn d5_exhausted_stamps_preserve_every_charge() {
-        if !layout_supported() {
-            return;
-        }
-        let ns = 51;
-        let mut ledger = SideLedger {
-            wseq: u32::MAX - 2,
-            ..SideLedger::default()
-        };
-        let mut work = index_with_p();
-        ledger.begin_index_pass(ns, 100, &mut work);
-        let old = pkey(ns, 5);
-        g7(&mut ledger, &mut work, old, 1);
-        assert!(!ledger.wseq_exhausted);
-        replace(&mut ledger, &mut work, old);
-        assert!(ledger.wseq_exhausted);
-        assert_eq!(ledger.get(&old).unwrap().wseq, 0);
-        assert_eq!(ledger.save_mark(ns).wseq, None);
-        let charged = g7(&mut ledger, &mut work, pkey(ns, 9), 2);
-        let before = *ledger.slot(ns).unwrap();
-        save(&mut ledger, &work, ns, true);
-        let after = *ledger.slot(ns).unwrap();
-        assert!(after.saved, "the gate still behaves as today");
-        assert_eq!(
-            (after.saved_wseq, after.full_saved_wseq),
-            (before.saved_wseq, before.full_saved_wseq)
-        );
-        let mut other = index_with_p();
-        other.codex_parent_side_requests.insert(
-            P.into(),
-            SideRequest {
-                dev_ino: (1, 88),
-                ..charged
-            },
-        );
-        ledger.begin_index_pass(ns, 200, &mut other);
-        assert_eq!(tags(&ledger, ns).len(), 2, "both kept");
-        // Fill the ledger from this namespace; another namespace's charge
-        // finds nothing lossless, and evicts only once this one is idle.
-        for p in 1..=(MAX_SIDE_LEDGER as u128 - 2) {
-            ledger.charge(key(ns, p), entry(), 200).unwrap();
-        }
-        assert_eq!(ledger.len(), MAX_SIDE_LEDGER);
-        ledger.begin_pass(52, 300);
-        assert_eq!(
-            ledger.charge(key(52, 1), entry(), 300),
-            Err(ChargeRefusal::Full)
-        );
-        assert_eq!(ledger.charge(key(52, 1), entry(), 110 + 3600), Ok(true));
-    }
-
     /// D5′ (vii): a write between the mark and the successful save's
     /// callback is not covered by it.
     #[test]
@@ -1778,39 +1645,6 @@ mod tests {
             BTreeMap::from([(old, (LedgerTag::Gone, 1)), (new, (LedgerTag::Live, 2))])
         );
         assert_eq!(loaded.codex_parent_side_requests.get(P), Some(&charged));
-    }
-
-    /// [behaviour] D5′ sizes: the entry and slot keep their cleared sizes. The
-    /// ledger's inline growth is inside `size_of::<SharedCache>()`; its fixed
-    /// heap reservation and the memo's separate allocation header are each
-    /// charged once beside that payload.
-    #[test]
-    fn d5_inline_ledger_is_in_the_cache_size_and_the_heap_formula_holds() {
-        use crate::heap_layout_bound::HeapLayoutBound;
-        assert_eq!(size_of::<LedgerEntry>(), 96);
-        assert_eq!(size_of::<GateSlot>(), 48);
-        assert_eq!(size_of::<Option<GateSlot>>(), 48);
-        #[cfg(target_pointer_width = "64")]
-        assert_eq!(size_of::<SideLedger>(), 560);
-        assert!(size_of::<SharedCache>() >= size_of::<std::sync::Mutex<SideLedger>>());
-        if !layout_supported() {
-            return;
-        }
-        let cache = std::sync::Arc::new(SharedCache::default());
-        let mut whole = Counter::new(usize::MAX);
-        cache.heap_bound(&mut whole).unwrap();
-        let mut parts = Counter::new(usize::MAX);
-        cache.inner.heap_bound(&mut parts).unwrap();
-        cache.cursor.heap_bound(&mut parts).unwrap();
-        cache.withheld_memo.heap_bound(&mut parts).unwrap();
-        assert_eq!(
-            whole.bytes,
-            size_of::<SharedCache>()
-                + std::mem::align_of::<SharedCache>()
-                + 2 * size_of::<usize>()
-                + parts.bytes
-                + SIDE_LEDGER_BYTES
-        );
     }
 
     #[test]

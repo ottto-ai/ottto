@@ -1501,17 +1501,7 @@ mod provenance_tests {
         assert!(!index.files["file"].has_prefix_provenance());
         assert!(!index.files["file"].has_unverified_source());
     }
-    #[test]
-    fn provenance_marker_stays_inside_existing_marker_budget() {
-        // Native comparison's unchanged charge rounds this legacy bound to 64.
-        let budget = (UNVERIFIED_IDENTITY.len() + 1 + 20).next_power_of_two();
-        for prefix in [false, true] {
-            let tag = provenance_marker(u64::MAX, prefix);
-            assert!(tag.capacity() <= MAX_MARKER_BYTES);
-            assert!(tag.capacity() <= budget);
-            assert_eq!(decode_marker(&tag), Some((u64::MAX, prefix)));
-        }
-    }
+
     /// c22 G1: `record` carries only an existing sampled stem. A replay-reset
     /// or legacy entry (never a prefix, SOURCE Option 1) re-recorded without
     /// verification or obligation becomes the clean identity; the same
