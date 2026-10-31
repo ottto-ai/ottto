@@ -2433,7 +2433,9 @@ impl DurableTailStore {
             }
             self.private_purge_after = None;
             if std::mem::take(&mut self.private_purge_dirty) {
-                report.refused += 1;
+                // Earlier pages may owe retry, but a failure on this page is
+                // already counted. Never count the same refusal twice.
+                report.refused = report.refused.max(1);
                 return Ok(report);
             }
         }
