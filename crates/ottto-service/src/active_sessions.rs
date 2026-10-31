@@ -103,7 +103,7 @@ pub fn clear_active_sessions(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn reconcile_with_registrations(
     support_dir: &Path,
     source: SnapshotSource,

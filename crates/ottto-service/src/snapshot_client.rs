@@ -2290,7 +2290,6 @@ impl SnapshotApiClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn record_composition_start_verdicts(
         &self,
         request: &SnapshotBatchRequest,
@@ -2397,7 +2396,6 @@ impl SnapshotApiClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn record_batch_http_failure(
         &self,
         request: &SnapshotBatchRequest,

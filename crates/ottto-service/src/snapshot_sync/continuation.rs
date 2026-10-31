@@ -154,7 +154,7 @@ pub(super) enum PageEnd {
     Deferred,
     /// The lease was lost, the page was dropped, or the process is stopping.
     /// Nothing was saved.
-    #[allow(dead_code)] // No stop signal reaches a page yet; the fakes use it.
+    #[allow(dead_code, reason = "no stop signal reaches pages yet; fakes use it")]
     Cancelled,
     /// A local error (a failed load, a worker that panicked or could not
     /// keep its invariants). Nothing was saved.
@@ -1004,7 +1004,7 @@ impl CursorContinuation for CodexContinuation<'_> {
         ordinary_equivalent: Option<Duration>,
     ) -> PageEnd {
         // One variant outside tests: the fakes' synthetic ticket is the other.
-        #[allow(clippy::infallible_destructuring_match)]
+        #[allow(clippy::infallible_destructuring_match, reason = "fakes add a variant")]
         let page = match ticket.0 {
             CursorParts::Codex(page) => page,
             #[cfg(test)]
@@ -1056,7 +1056,6 @@ fn page_end(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn page_on_worker(
     cache: &Arc<SharedCache>,
     home: &Path,

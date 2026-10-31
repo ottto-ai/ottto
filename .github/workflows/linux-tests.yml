@@ -56,6 +56,8 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          # The PR merge commit plus its base parent, for the lint ratchet.
+          fetch-depth: 2
 
       # rusqlite links the system SQLite; command-environment tests probe zsh.
       - name: Install system packages
@@ -89,8 +91,20 @@ jobs:
             crates -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # On pull requests the same step also runs the lint ratchet against the
+      # merge commit's base parent: no added allow(dead_code)/allow(unused..)
+      # or blanket #![allow], and a "Reuse:" line in the PR body.
       - name: Runtime clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          ratchet=0
+          if [ "$EVENT_NAME" = pull_request ]; then
+            bash scripts/lint_ratchet.sh HEAD^1 || ratchet=1
+          fi
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          exit "$ratchet"
 
       - name: Connector clippy
         run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings

@@ -199,7 +199,7 @@ impl LiveRetryOwner {
     pub(super) fn allowance(&self) -> usize {
         self.retry.allowance()
     }
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "15 args; no options struct yet")]
     pub(super) fn capture_after_shed(
         &mut self,
         live: LiveAuthority,

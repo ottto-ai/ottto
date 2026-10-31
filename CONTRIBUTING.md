@@ -13,6 +13,13 @@ adapters.
 - Keep public docs standalone; they must not require private repository context.
 - Update tests and docs when behavior, CLI contracts, schemas, connector
   manifests, release metadata, or support workflows change.
+- A pull request that changes Rust code carries a `Reuse:` line in its
+  description: what you searched for and which existing code you reused or
+  extended. Do not add `allow(dead_code)`, `allow(unused...)`, a blanket
+  `#![allow(...)]` or `cfg_attr(not(test), allow(...))`; a needed suppression is
+  `#[expect(<lint>, reason = "...")]` on the smallest item. The Linux clippy step
+  checks both (`scripts/lint_ratchet.sh`); after fixing the description, push a
+  commit, because a re-run reads the original one.
 
 ## Local Checks
 

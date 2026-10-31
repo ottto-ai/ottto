@@ -4057,7 +4057,7 @@ struct BackendControlTokenValidationResponse {
     token_id: Option<String>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn telemetry_control(
     daemon: &LocalDaemon,
     action: TelemetryControlAction,
@@ -4083,7 +4083,7 @@ fn telemetry_control(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
 fn telemetry_control_with_detector(
     daemon: &LocalDaemon,
     action: TelemetryControlAction,
@@ -4761,7 +4761,7 @@ fn cloud_sessions_control(
     Ok(result)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn cloud_sessions_control_with_stores(
     action: CloudSessionsControlAction,
     control_token: SecretString,
@@ -5055,7 +5055,7 @@ fn provider_daily_reference_control(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
 fn provider_daily_reference_control_with_stores(
     action: ProviderDailyReferenceControlAction,
     control_token: SecretString,
@@ -9859,9 +9859,9 @@ struct SetupRunCredentials {
 #[derive(Debug, Deserialize)]
 struct SetupRunDisconnectResponse {
     setup_run_id: String,
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "part of the server response shape; not read")]
     run_status: String,
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "part of the server response shape; not read")]
     client_disconnected: bool,
     disconnected_at: String,
     /// True only when the server authenticated the release proof and revoked
@@ -16077,7 +16077,7 @@ fn pi_passive_placeholder_smoke(local_session_observed: Option<bool>) -> SmokeRe
 }
 
 /// Build a route result for the passive (no-live-smoke) verification path.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
 fn pi_route_passive_result(
     route: &PiModelRoute,
     status: SourceVerificationStatus,
@@ -17260,7 +17260,7 @@ fn wait_for_setup_run_verification_with_base_timeout(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn verification_result(
     source: SourceKind,
     status: SourceVerificationStatus,
@@ -17287,7 +17287,7 @@ fn verification_result(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
 fn verification_result_with_config(
     source: SourceKind,
     config: SourceConfigState,

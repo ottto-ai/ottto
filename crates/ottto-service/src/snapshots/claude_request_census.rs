@@ -2706,7 +2706,7 @@ fn decode_hashes(value: &str) -> Option<Vec<u64>> {
 /// response, recognized-usage drop or over-cap line. `itemless_request_hashes`
 /// are `claude_buffered_request_hashes`, used only when the parse yields no
 /// item.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 pub(crate) fn claude_request_census_record(
     path_owner: &(String, String),
     items: &[SnapshotItem],
@@ -3383,7 +3383,6 @@ fn serialized_bytes(census: &ClaudeRequestCensus) -> usize {
 /// Per-key answer for Context 2c and D2's posture seam. D1 computes it only in
 /// tests; nothing in production reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum ClaudeCensusMemberStatus {
     /// The predicate holds, the own record is Exact or Empty from a verified
     /// parse, the own family is not census-unknown, and no hash of the record
@@ -3736,7 +3735,7 @@ impl ClaudeRequestCensusJoin {
             && counts.duplicate_owner_entries <= MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code, reason = "only tests call it so far"))]
     pub(crate) fn member_status(
         &self,
         index: &ScanIndex,

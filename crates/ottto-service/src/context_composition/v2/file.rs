@@ -127,7 +127,6 @@ impl LineSink<'_> {
     /// `codex_cell`). Each share counts under its own kind, part and file;
     /// the tool totals count it under the add-on tool behind it, else the
     /// call's own tool, once per call for each tool.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn result(
         &mut self,
         state: &mut ParseState,
@@ -183,7 +182,7 @@ impl LineSink<'_> {
 
     /// One entered item. A copied line only stays resident for this
     /// session's own requests: it adds residency, nothing else.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
     pub(super) fn record(
         &mut self,
         state: &mut ParseState,
@@ -253,7 +252,7 @@ pub(super) struct ReadError {
 }
 
 /// Read complete lines from `offset` to `end` (the length at open).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 pub(super) fn read_lines(
     file: File,
     offset: u64,

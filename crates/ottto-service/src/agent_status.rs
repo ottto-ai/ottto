@@ -6649,7 +6649,7 @@ fn claude_local_plan_facts_contradict(
     }
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err, reason = "Err is the full slot status")]
 fn custom_claude_snapshot_from_usage(
     resolved: ResolvedClaudeSlot,
     outcome: ClaudeOAuthUsageOutcome,
@@ -7755,7 +7755,7 @@ fn claude_slot_approval_blocked_status(
 /// Claude account file names another account than the approved one, return
 /// the identity-mismatch status instead. `Ok` carries the expected binding
 /// (when the slot has one) for the post-resolution check.
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err, reason = "Err is the full slot status")]
 fn claude_slot_pre_collection_gate(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
@@ -7825,7 +7825,7 @@ fn claude_slot_approvals() -> BTreeMap<String, ottto_core::ClaudeSlotApproval> {
 
 /// Gate after the exact slot resolved, before its usage call. A slot without
 /// any approval records this first verified identity (trust on first use).
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err, reason = "Err is the full slot status")]
 fn claude_slot_post_resolution_gate(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     expected: Option<ClaudeSlotAccountBinding>,
@@ -13218,7 +13218,7 @@ fn claude_oauth_usage_caller_auth_hold<'a>(
 /// The account-wide counters and open verdict are untouched: one credential's
 /// rejection must not stop a different credential for the same account. A
 /// caller whose streak is older than the cool-down starts a new streak.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn claude_oauth_usage_breaker_after_auth_failure(
     previous: Option<ClaudeOAuthUsageBreaker>,
     caller: &ClaudeOAuthUsageCaller,
@@ -31464,7 +31464,7 @@ for line in sys.stdin:
         // A daemon from before caller attribution reads the new file: the
         // schema version is unchanged and the additive fields are ignored.
         #[derive(Deserialize)]
-        #[allow(dead_code)]
+        #[allow(dead_code, reason = "old file shape; fields only deserialized")]
         struct PreAttributionBreaker {
             schema_version: u16,
             account_identifier_hash: String,

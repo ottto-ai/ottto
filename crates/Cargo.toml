@@ -5,6 +5,13 @@ members = [
   "ottto-connector-testkit",
 ]
 
+# Same lint floor as the runtime workspace (../Cargo.toml).
+[workspace.lints.clippy]
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
 # Optimise dependencies (not workspace crates) in test builds; debug
 # assertions and overflow checks stay on.
 [profile.test.package."*"]

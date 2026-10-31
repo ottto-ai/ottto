@@ -2690,7 +2690,7 @@ struct CycleError {
     health_uploaded: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn collect_enabled_cycle(
     grants: &CloudSessionGrantStore,
     checkpoints: &CloudSessionCheckpointStore,
@@ -4347,7 +4347,7 @@ fn collect_composed_cloud_sessions_once(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
 fn collect_composed_cloud_sessions_once_with<FLoadCredentials, FComposeTransport>(
     grants: &CloudSessionGrantStore,
     checkpoints: &CloudSessionCheckpointStore,

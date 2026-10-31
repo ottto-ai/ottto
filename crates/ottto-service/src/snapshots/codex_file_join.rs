@@ -869,7 +869,6 @@ impl TierReplay {
             }
         }
     }
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn selector(
         &mut self,
         value: &Value,

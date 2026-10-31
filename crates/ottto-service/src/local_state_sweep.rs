@@ -301,7 +301,6 @@ mod process_table {
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
-    #[allow(dead_code)] // Mirrors the C layout; only some fields are read.
     pub(super) struct ShortBsdInfo {
         pub(super) pid: u32,
         pub(super) ppid: u32,
@@ -749,7 +748,7 @@ struct Identity {
 }
 
 impl Identity {
-    #[allow(clippy::unnecessary_cast)]
+    #[allow(clippy::unnecessary_cast, reason = "stat field types differ by OS")]
     fn from_stat(stat: &libc::stat) -> Self {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let birthtime = Some((stat.st_birthtime as i64, stat.st_birthtime_nsec as i64));
@@ -768,17 +767,17 @@ impl Identity {
         }
     }
 
-    #[allow(clippy::unnecessary_cast)]
+    #[allow(clippy::unnecessary_cast, reason = "u16 mode_t on macOS, u32 on Linux")]
     fn file_type(&self) -> u32 {
         self.mode & libc::S_IFMT as u32
     }
 
-    #[allow(clippy::unnecessary_cast)]
+    #[allow(clippy::unnecessary_cast, reason = "u16 mode_t on macOS, u32 on Linux")]
     fn is_regular(&self) -> bool {
         self.file_type() == libc::S_IFREG as u32
     }
 
-    #[allow(clippy::unnecessary_cast)]
+    #[allow(clippy::unnecessary_cast, reason = "u16 mode_t on macOS, u32 on Linux")]
     fn is_directory(&self) -> bool {
         self.file_type() == libc::S_IFDIR as u32
     }

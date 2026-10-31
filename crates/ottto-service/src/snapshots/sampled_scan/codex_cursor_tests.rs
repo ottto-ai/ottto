@@ -10500,7 +10500,7 @@ fn finish_page(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
 /// One continuation page of the paused job whose member index keys are
 /// `members`, over `root` (`days`, `curve` as the ordinary pages used),
 /// standing for `ordinary` of the ordinary cadence (§6).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "test helper, 9 case inputs")]
 fn continuation_page_in(
     root: &Path,
     index: ScanIndex,

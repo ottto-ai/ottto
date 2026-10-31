@@ -1124,7 +1124,7 @@ fn harvest_stdio(
 }
 
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn harvest_stdio_bounded(
     command: &str,
     args: &[String],
@@ -2084,7 +2084,7 @@ fn harvest_all_once(
 /// The hash is recorded only after a successful upload so a failed POST retries.
 /// Discovery and the per-server handshakes are best-effort: a failed handshake
 /// yields an unreachable server, not an aborted harvest.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn harvest_source(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
