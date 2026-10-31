@@ -1,6 +1,5 @@
 //! The complete semantic adapter has one context and one transaction boundary.
 //! A context belongs to the committed graph; discard it after any failed write.
-//! NoResumeHooks keeps conversion paused until the R1 owner adapter is installed.
 use super::*;
 use anyhow::{bail, ensure};
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,10 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Default)]
 pub(super) struct KindCx {
     pub(super) binding: Option<super::super::scan_index_persistence::Binding>,
-    pub(super) committed: BTreeMap<String, kinds_files::ResumeCheckpoint>,
-    pub(super) prepared: Option<resume::Prepared>,
     pub(super) ambiguous: bool,
-    pub(super) require_preflight: bool,
     pub(super) misc_rows: BTreeMap<RowKey, (Header, bool)>,
     /// Original field presence, obtained before any v1 normalization.
     pub(super) presence: BTreeMap<String, bool>,
@@ -29,7 +25,7 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
             );
         }
         kinds_misc::populate(index, tx, cx)?;
-        kinds_files::populate(index, tx, cx)?;
+        kinds_files::populate(index, tx)?;
         kinds_accounts::populate(index, tx, cx)?;
         kinds_census::populate(index, tx, cx)
     })();
@@ -50,13 +46,6 @@ pub(super) fn hydrate<S: Store>(
 pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,
     binding: super::super::scan_index_persistence::Binding,
-) -> Result<(ScanIndex, KindCx)> {
-    hydrate_txn_with_hooks(tx, binding, &mut kinds_files::NoResumeHooks)
-}
-pub(super) fn hydrate_txn_with_hooks(
-    tx: &mut dyn Transaction,
-    binding: super::super::scan_index_persistence::Binding,
-    hooks: &mut dyn resume::ResumeHooks,
 ) -> Result<(ScanIndex, KindCx)> {
     let identity_header = tx
         .get(&RowKey::Meta("identity".into()))?
@@ -101,10 +90,9 @@ pub(super) fn hydrate_txn_with_hooks(
         ..Default::default()
     };
     kinds_misc::hydrate_txn(tx, &mut index, &mut cx)?;
-    kinds_files::hydrate_txn(tx, &mut index, &mut cx)?;
+    kinds_files::hydrate_txn(tx, &mut index)?;
     kinds_accounts::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_census::hydrate_txn(tx, &mut index, &mut cx)?;
-    hooks.on_open(index.generation, &cx.committed)?;
     cx.valid = true;
     Ok((index, cx))
 }
@@ -122,7 +110,7 @@ pub(super) fn delta(
     let result = (|| {
         cx.plan_delta(dirty_misc)?;
         kinds_misc::delta(prev, next, tx, cx)?;
-        kinds_files::delta(prev, next, tx, cx)?;
+        kinds_files::delta(prev, next, tx)?;
         kinds_accounts::delta(prev, next, tx, cx)?;
         kinds_census::delta(prev, next, tx, cx)
     })();
@@ -132,14 +120,12 @@ pub(super) fn delta(
 
 /// Execute the complete dirty delta under the source/checkpoint owner lock.
 /// The caller has already merged CAS state and applied any retirement decisions.
-/// R1 planning, preflight and durable staging all precede BEGIN IMMEDIATE.
 pub(super) fn save_graph(
     store: &mut sqlite::Sqlite,
     identity: &Identity,
     prev: &ScanIndex,
     next: &mut ScanIndex,
     committed: &mut KindCx,
-    hooks: &mut dyn kinds_files::ResumeHooks,
 ) -> Result<()> {
     ensure!(
         committed.valid && !committed.ambiguous,
@@ -155,17 +141,8 @@ pub(super) fn save_graph(
         );
         next.generation = prev.generation.checked_add(1).ok_or(Hold::DbUnavailable)?;
         super::super::lenient_decode::check_held_output(next)?;
-        let reserved = pending.prepare_plan(prev, next, hooks)?;
-        ensure!(reserved <= 256 * 1024 * 1024, Hold::SaveCeiling);
-        let planned = pending.prepared_checkpoints().cloned();
-        pending.prepared = None;
-        let staging = hooks.preflight_selected(prev, next, &pending.committed)?;
-        ensure!(staging <= reserved, "state_v2_resume_staging_admission");
-        pending.preflight_reserved(prev, next, hooks, staging)?;
-        pending.check_planned_checkpoints(planned.as_ref())?;
         let dirty = kinds_misc::dirty_fields(prev, next)?;
         let mut tx = store.begin(TxnMode::Write)?;
-        tx.charge_staging(staging)?;
         delta(prev, next, &mut tx, &mut pending, dirty)?;
         let outcome = tx.commit(prev.generation, next.generation);
         published = !matches!(outcome, DurableCommitOutcome::NotPublished);
@@ -182,7 +159,6 @@ pub(super) fn save_graph(
                     value: &control_json(&generation)?,
                 })?;
                 pending.misc_rows.insert(key, (header, true));
-                pending.post_commit(&DurableCommitOutcome::Committed(generation), hooks)?;
                 let mut count = 0_u64;
                 let mut windows = 0_u64;
                 let mut max = 0_u64;
@@ -216,16 +192,9 @@ pub(super) fn save_graph(
     if result.is_ok() {
         *committed = pending;
     } else {
-        // No callback or GC on definite rollback, Published or Ambiguous.
         // No speculative encoder metadata survives any failed attempt.
         committed.ambiguous = true;
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(|e| e.is::<resume::StageExcluded>())
-        {
-            *next = prev.clone();
-        } else if !published {
+        if !published {
             next.generation = prev.generation;
         }
     }

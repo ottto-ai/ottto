@@ -1,8 +1,4 @@
-//! Claude's private, default-off state store. Storage rows convey custody, never
-//! acquisition, acceptance, or retirement authority.
-//!
-//! Keep the engine boundary here: callers must not depend on SQLite handles,
-//! statements, SQL, or checkpoint tuples.
+//! Restart records are R1's; joined by key digest, never referenced here.
 use super::ScanIndex;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -31,7 +27,6 @@ mod kinds_census;
 mod kinds_files;
 mod kinds_misc;
 mod mapper;
-pub(crate) mod resume;
 mod sqlite;
 use kinds::KindCx;
 
@@ -510,9 +505,7 @@ impl StorageLimits {
 // ACK recovery owns no routing or import decisions.
 pub(crate) mod ack;
 // OPS-only maintenance and counts/bytes/times diagnostics seams.
-pub(super) use runtime::{
-    before_collection, resume_key_retained, resume_selection_held, retain_resume_exclusions,
-};
+pub(super) use runtime::before_collection;
 
 #[cfg(test)]
 mod money_fault_tests;

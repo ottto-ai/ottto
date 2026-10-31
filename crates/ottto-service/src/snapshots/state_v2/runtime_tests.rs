@@ -198,48 +198,6 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     assert!(guard_external(&live.path, Some(runtime), index.generation).is_err());
     assert_eq!(fs::read(&live.path).unwrap(), fence);
 }
-/// Stands in only for the R1 staging hook production does not install yet
-/// (conversion preflight). Inventory, rows, hydration and saves stay native.
-struct R1Installed;
-impl Mapper for R1Installed {
-    fn references(
-        header: &Header,
-        value: &dyn Value,
-        refs: &mut dyn FnMut(&RowKey) -> Result<()>,
-    ) -> Result<()> {
-        ClaudeMapper::references(header, value, refs)
-    }
-    fn private_paths(
-        header: &Header,
-        value: &dyn Value,
-        paths: &mut dyn FnMut(&str) -> Result<()>,
-    ) -> Result<()> {
-        ClaudeMapper::private_paths(header, value, paths)
-    }
-    fn inventory_context(
-        &self,
-        path: &Path,
-    ) -> std::result::Result<Option<import::Original>, Pause> {
-        ClaudeMapper.inventory_context(path)
-    }
-    fn preflight(&self, _: &ScanIndex) -> std::result::Result<(), Pause> {
-        Ok(())
-    }
-    fn import_generation(&self, index: &ScanIndex) -> Result<u64> {
-        ClaudeMapper.import_generation(index)
-    }
-    fn import_graph<S: Store>(
-        &self,
-        store: &mut S,
-        index: &ScanIndex,
-        original: Option<&import::Original>,
-    ) -> Result<KindCx> {
-        ClaudeMapper.import_graph(store, index, original)
-    }
-    fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
-        ClaudeMapper.hydrate_context(store)
-    }
-}
 /// [format] f5 missing v1 garbled fences never authenticate final db.
 #[test]
 fn f5_missing_v1_garbled_fences_never_authenticate_final_db() {
@@ -382,19 +340,22 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
 #[test]
 fn publication_pending_pause_does_not_touch_v1_and_off_cancels_inventory_slot() {
     let f = Fixture::new();
-    let bytes = serde_json::to_vec(&ScanIndex::default()).unwrap();
+    let mut raw = serde_json::to_value(ScanIndex::default()).unwrap();
+    raw["future_money"] = serde_json::json!({"owed": 1});
+    let bytes = serde_json::to_vec(&raw).unwrap();
     fs::write(&f.path, &bytes).unwrap();
     assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
     let mut index = ScanIndex::default();
     import_with(&f.path, &mut index, &ClaudeMapper).unwrap();
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
-    // With the conversion hook installed, only the OFF load cancels the slot.
+    // An OFF load cancels a valid unpublished inventory slot.
+    let bytes = serde_json::to_vec(&ScanIndex::default()).unwrap();
     let f = Fixture::new();
     fs::write(&f.path, &bytes).unwrap();
-    assert!(load_with(&f.path, true, &R1Installed).unwrap().is_none());
-    assert!(load_with(&f.path, false, &R1Installed).unwrap().is_none());
-    import_with(&f.path, &mut index, &R1Installed).unwrap();
+    assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
+    assert!(load_with(&f.path, false, &ClaudeMapper).unwrap().is_none());
+    import_with(&f.path, &mut index, &ClaudeMapper).unwrap();
     assert!(index.v2().persistence_v2.is_none());
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
 }
@@ -546,10 +507,10 @@ fn newly_adopted_import_can_save_without_an_intervening_load() {
     let f = Fixture::new();
     fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
     // Use the real inventory/import/publication path so import seals the
-    // external progress receipt; R1Installed only passes conversion preflight.
+    // external progress receipt through the production mapper.
     assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
     let mut index = ScanIndex::default();
-    import_with(&f.path, &mut index, &R1Installed).unwrap();
+    import_with(&f.path, &mut index, &ClaudeMapper).unwrap();
     assert!(index.v2().persistence_v2.is_some());
     assert!(fence::sibling(&f.path, ".v2-ack-receipt").is_file());
     assert_eq!(index.generation, 1);
@@ -569,9 +530,9 @@ fn import_without_original_inventory_refuses_publication() {
     let f = Fixture::new();
     let bytes = b"synthetic-v1-authority";
     fs::write(&f.path, bytes).unwrap();
-    assert!(load_with(&f.path, true, &R1Installed).unwrap().is_none());
+    assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
     let mut index = ScanIndex::default();
-    import_with(&f.path, &mut index, &R1Installed).unwrap();
+    import_with(&f.path, &mut index, &ClaudeMapper).unwrap();
     assert!(index.v2().persistence_v2.is_none());
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     for (suffix, _, _) in fence::ARTIFACTS
@@ -1274,88 +1235,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
 }
 
-/// [regress] reloading after R1 staging failure preserves exclusion before transcript parsing.
-#[test]
-fn resume_exclusion_survives_reload_and_skips_transcript_before_parse() {
-    for forced_family in [false, true] {
-        let f = Fixture::new();
-        f.published();
-        let roots = f.support.join("transcripts");
-        fs::create_dir(&roots).unwrap();
-        let root_id = "11111111-1111-4111-8111-111111111111";
-        let transcript = roots.join(format!("{root_id}.jsonl"));
-        fs::write(&transcript, b"invalid json\n").unwrap();
-        let key = super::super::super::local_index_key(&transcript);
-        let _index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
-        with_state(&f.path, |state| {
-            state
-                .resume_excluded
-                .insert(key.clone(), ResumeExclusion::new(G, 0));
-            state.cached = None;
-            Ok(())
-        })
-        .unwrap();
-        let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
-        if forced_family {
-            assert!(super::super::super::claude_index_path_family_member(&transcript).is_some());
-            index.claude_usage_authority_quarantine.insert(
-                root_id.into(),
-                serde_json::from_value(serde_json::json!({
-                    "contract":"synthetic-contract", "proven_witness_fingerprint":"a".repeat(64),
-                    "member_source_file_fingerprints":{}, "retry_after_unix_seconds":0
-                }))
-                .unwrap(),
-            );
-        }
-        let (scan, records) = crate::local_resource_diagnostics::capture(|| {
-            super::super::super::scan_source_roots_with_test_limit(
-                super::super::super::SnapshotSource::ClaudeCode,
-                std::slice::from_ref(&roots),
-                &mut index,
-                "2026-10-31T12:00:00Z",
-                30,
-                10,
-                false,
-            )
-            .unwrap()
-        });
-        assert!(records.iter().any(|row| row["source"] == "claude_code"
-            && row["counts"]["latest"]["v2_resume_stage_excluded"] == 1));
-        assert!(scan.snapshots.is_empty());
-        assert_eq!(scan.scanned_file_count, 0);
-        assert_eq!(scan.malformed_json_line_count, 0);
-        assert!(!index.files.contains_key(&key));
-    }
-}
-
-/// [regress] N3: a failure while retaining R1 exclusions holds the route for
-/// the collection guard, never selecting through an empty continuation.
-#[test]
-fn resume_exclusion_failure_is_a_collection_hold() {
-    let f = Fixture::new();
-    f.published();
-    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
-    super::before_collection(&index).unwrap();
-    // A holder panicked: this route's state is poisoned.
-    let _ = std::panic::catch_unwind(|| {
-        with_state(&f.path, |_| -> Result<()> {
-            panic!("synthetic route-state panic")
-        })
-    });
-    retain_resume_exclusions(&mut index, &[]);
-    // A fresh route slot isolates the hold to the retained-exclusion failure.
-    states().lock().unwrap().remove(&f.path);
-    assert_eq!(
-        super::before_collection(&index)
-            .unwrap_err()
-            .downcast_ref::<Hold>(),
-        Some(&Hold::DbUnavailable)
-    );
-    assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &index)().is_err());
-}
-
-/// [regress] R1 backoff keeps aged keys and owed debt discoverable, counts growth,
-/// alarms on repeated/long exclusions, and permits the next normal read.
+/// [money] aged growing keys remain readable and retain owed custody.
 #[test]
 fn excluded_key_age_growth_alarm_and_retry_keep_owed_debt() {
     use crate::snapshots::{local_index_key, scan_source_roots_with_test_limit, SnapshotSource};
@@ -1380,13 +1260,6 @@ fn excluded_key_age_growth_alarm_and_retry_keep_owed_debt() {
     let progress = br#"{"generation":0}"#;
     let mut index = super::super::money_test_support::publish(&seed, &f.path, progress);
     let fence_before = fs::read(&f.path).unwrap();
-    with_state(&f.path, |state| {
-        state
-            .resume_excluded
-            .insert(key.clone(), ResumeExclusion::new(index.generation, 4));
-        Ok(())
-    })
-    .unwrap();
     let scan = |index: &mut ScanIndex| {
         scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -1399,79 +1272,18 @@ fn excluded_key_age_growth_alarm_and_retry_keep_owed_debt() {
         )
         .unwrap()
     };
-    let (_, records) = crate::local_resource_diagnostics::capture(|| {
-        for _ in 0..3 {
-            let result = scan(&mut index);
-            assert_eq!(result.scanned_file_count, 0);
-            assert_eq!(result.malformed_json_line_count, 0);
-            assert_eq!(index.files[&key].size_bytes, 4);
-            assert_eq!(
-                index.accepted_rebuild_incidence[&key],
-                BTreeSet::from(["owed".into()])
-            );
-            assert_eq!(fs::read(&f.path).unwrap(), fence_before);
-        }
-    });
-    assert!(records
-        .iter()
-        .any(|row| row["counts"]["latest"]["v2_resume_excluded_growth_bytes"] == 9));
-    assert!(records
-        .iter()
-        .any(|row| row["counts"]["latest"]["v2_resume_stage_excluded_alarm"] == 1));
-    with_state(&f.path, |state| {
-        let excluded = state.resume_excluded.get_mut(&key).unwrap();
-        excluded.passes = 0;
-        excluded.first_seen = Instant::now() - Duration::from_secs(6 * 3600 + 1);
-        Ok(())
-    })
-    .unwrap();
-    let (_, records) = crate::local_resource_diagnostics::capture(|| scan(&mut index));
-    assert!(records
-        .iter()
-        .any(|row| row["counts"]["latest"]["v2_resume_stage_excluded_alarm"] == 1));
-    with_state(&f.path, |state| {
-        state.resume_excluded.get_mut(&key).unwrap().retry_at = Instant::now();
-        Ok(())
-    })
-    .unwrap();
     let result = scan(&mut index);
     assert_eq!(
         result.malformed_json_line_count, 1,
         "a due aged key gets a normal read"
     );
     assert!(index.files.contains_key(&key));
+    assert_eq!(index.files[&key].size_bytes, 4);
+    assert_eq!(fs::read(&f.path).unwrap(), fence_before);
     assert_eq!(
         index.accepted_rebuild_incidence[&key],
         BTreeSet::from(["owed".into()])
     );
-}
-
-/// [regress] N2: once alarmed, a deterministically failing staging key
-/// retries at the shared growth-full pace, slower than before the alarm.
-#[test]
-fn alarmed_resume_exclusion_backs_off_to_growth_full_interval() {
-    let now = Instant::now();
-    let growth_full = Duration::from_secs(super::super::super::sampled_audit::GROWTH_FULL_INTERVAL);
-    let mut excluded = ResumeExclusion::new(G, 0);
-    assert!(!excluded.alarmed(now));
-    let early = excluded.backoff(now);
-    // Repeated failed passes reach the shared alarm predicate (bounded, so a
-    // missing pass trigger fails instead of hanging).
-    for _ in 0..64 {
-        if excluded.alarmed(now) {
-            break;
-        }
-        excluded.passes += 1;
-    }
-    assert!(excluded.alarmed(now));
-    assert_eq!(excluded.backoff(now), growth_full);
-    assert!(early < growth_full);
-    // Age alone alarms too: a week after first_seen, with no repeated pass.
-    let aged = ResumeExclusion::new(G, 0);
-    let later = aged.first_seen + Duration::from_secs(7 * 24 * 3600);
-    assert_eq!(aged.passes, 0);
-    assert!(!aged.alarmed(aged.first_seen));
-    assert_eq!(aged.backoff(later), growth_full);
 }
 
 /// [off=main] a bound v1-only source never opens, creates or migrates SQLite custody.

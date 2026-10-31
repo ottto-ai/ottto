@@ -1126,7 +1126,7 @@ impl Sqlite {
     }
 }
 impl Sqlite {
-    /// Authenticate the exact committed generation before restart staging.
+    /// Authenticate the exact committed generation before saving.
     /// The caller retains source ownership through COMMIT.
     pub(super) fn validate_save(&mut self, identity: &Identity, generation: u64) -> Result<()> {
         self.save_failure = None;
@@ -1178,13 +1178,6 @@ pub(super) fn disk_full(error: &anyhow::Error) -> bool {
 const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
 const SAVE_CEILING_BYTES: u64 = 256 * 1024 * 1024;
 impl Txn<'_> {
-    /// R1 files are staged before BEGIN; their bytes still belong to this save.
-    pub(super) fn charge_staging(&mut self, bytes: u64) -> Result<()> {
-        ensure!(self.write && !self.failed, "state_v2_transaction_refused");
-        let result = self.charge(bytes, 0, 0);
-        self.failed |= result.is_err();
-        result
-    }
     fn charge(&mut self, bytes: u64, rows: u64, pages: u64) -> Result<()> {
         if self.store.import {
             return Ok(());

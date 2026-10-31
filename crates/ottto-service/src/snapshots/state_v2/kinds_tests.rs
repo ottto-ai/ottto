@@ -136,6 +136,7 @@ fn all_groups_share_one_snapshot_and_roundtrip_real_v1_without_losing_context_or
     let expected = 1 + index.claude_usage_family_pending.len();
     assert_eq!(owners, expected);
 }
+
 /// [format] incomplete census group cannot escape as a partially hydrated graph.
 #[test]
 fn incomplete_census_group_cannot_escape_as_a_partially_hydrated_graph() {
@@ -146,20 +147,6 @@ fn incomplete_census_group_cannot_escape_as_a_partially_hydrated_graph() {
         .unwrap();
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     assert!(hydrate(&mut db, Scratch::binding()).is_err());
-}
-/// [format] noop resume adapter cannot publish new file progress.
-#[test]
-fn noop_resume_adapter_cannot_publish_new_file_progress() {
-    let prev = ScanIndex::default();
-    let next = fixture();
-    let mut cx = KindCx {
-        binding: Some(Scratch::binding()),
-        ..Default::default()
-    };
-    assert!(cx
-        .preflight(&prev, &next, &mut kinds_files::NoResumeHooks)
-        .is_err());
-    assert!(cx.prepared.is_none());
 }
 
 struct Stored(Vec<u8>);
@@ -259,48 +246,6 @@ fn generic_erasure_extraction_visits_nested_text_keys_and_shared_evidence() {
     }
 }
 
-/// R1's observable side effects: immutable staging, and the generation after
-/// which it may garbage-collect superseded records (None = no GC).
-#[derive(Default)]
-struct SaveHooks {
-    staged: bool,
-    gc_after: Option<u64>,
-}
-impl kinds_files::ResumeHooks for SaveHooks {
-    fn plan(
-        &mut self,
-        _: &ScanIndex,
-        _: &ScanIndex,
-        _: &BTreeMap<String, kinds_files::ResumeCheckpoint>,
-    ) -> Result<kinds_files::StagedCheckpoints> {
-        Ok(Default::default())
-    }
-    fn preflight_selected(
-        &mut self,
-        _: &ScanIndex,
-        _: &ScanIndex,
-        _: &BTreeMap<String, kinds_files::ResumeCheckpoint>,
-    ) -> Result<u64> {
-        Ok(0)
-    }
-    fn stage(
-        &mut self,
-        _: &ScanIndex,
-        _: &ScanIndex,
-        _: &BTreeMap<String, kinds_files::ResumeCheckpoint>,
-    ) -> Result<kinds_files::StagedCheckpoints> {
-        self.staged = true;
-        Ok(Default::default())
-    }
-    fn post_commit(
-        &mut self,
-        generation: u64,
-        _: &BTreeMap<String, kinds_files::ResumeCheckpoint>,
-    ) -> Result<()> {
-        self.gc_after = Some(generation);
-        Ok(())
-    }
-}
 /// [format] complete misc dirty plan covers scalar map ack and raw hold changes.
 #[test]
 fn complete_misc_dirty_plan_covers_scalar_map_ack_and_raw_hold_changes() {
@@ -417,8 +362,7 @@ fn growth_raw_hold_survives_composed_hydration_and_cas_cannot_release_it() {
     }
 }
 
-/// [format] a committed save GCs only after its durable generation; a save
-/// that fails at the page cap never GCs and leaves the committed graph.
+/// [format] committed saves publish their generation; page-cap failures keep the committed graph.
 #[test]
 fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
     let (_scratch, mut db) = Scratch::live_store();
@@ -427,19 +371,16 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     let mut next = prev.clone();
     next.upload_context_fingerprint = Some("new-context".into());
-    let mut hooks = SaveHooks::default();
-    save_graph(&mut db, &identity, &prev, &mut next, &mut cx, &mut hooks).unwrap();
+    save_graph(&mut db, &identity, &prev, &mut next, &mut cx).unwrap();
     assert_eq!(
         db.read_control::<u64>("generation").unwrap(),
         Some(next.generation)
     );
-    assert_eq!(hooks.gc_after, Some(next.generation));
     let (current, _) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert_eq!(
         current.upload_context_fingerprint,
         next.upload_context_fingerprint
     );
-    let mut hooks = SaveHooks::default();
     let mut retry = current.clone();
     retry.upload_context_fingerprint = Some("never-committed".into());
     // Enough new rows that the save must grow the file past SQLite's page cap.
@@ -449,8 +390,7 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
             .insert(format!("{n:064x}"));
     }
     sqlite::cap_pages(&db);
-    assert!(save_graph(&mut db, &identity, &current, &mut retry, &mut cx, &mut hooks).is_err());
-    assert_eq!(hooks.gc_after, None);
+    assert!(save_graph(&mut db, &identity, &current, &mut retry, &mut cx).is_err());
     assert!(!cx.valid && cx.ambiguous);
     assert_eq!(
         hydrate(&mut db, Scratch::binding())
@@ -462,7 +402,7 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
 }
 
 /// [regress] A refused COMMIT is a definite rollback: save_graph refuses with
-/// ReloadRequired (no save hold), never calls post_commit, keeps the prior
+/// ReloadRequired (no save hold), keeps the prior
 /// generation and graph, and a fresh save then commits.
 #[test]
 fn refused_commit_refuses_reload_required_without_post_commit() {
@@ -473,11 +413,8 @@ fn refused_commit_refuses_reload_required_without_post_commit() {
     let mut next = current.clone();
     next.upload_context_fingerprint = Some("never-committed".into());
     sqlite::fence_commit_writing(&db, "generation");
-    let mut hooks = SaveHooks::default();
-    let error =
-        save_graph(&mut db, &identity, &current, &mut next, &mut cx, &mut hooks).unwrap_err();
+    let error = save_graph(&mut db, &identity, &current, &mut next, &mut cx).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
-    assert_eq!(hooks.gc_after, None);
     assert!(!cx.valid && cx.ambiguous);
     assert_eq!(next.generation, current.generation);
     assert!(!db.reload_required());
@@ -489,14 +426,10 @@ fn refused_commit_refuses_reload_required_without_post_commit() {
     );
     let mut next = hydrated.clone();
     next.upload_context_fingerprint = Some("committed".into());
-    save_graph(
-        &mut db, &identity, &hydrated, &mut next, &mut cx, &mut hooks,
-    )
-    .unwrap();
-    assert_eq!(hooks.gc_after, Some(next.generation));
+    save_graph(&mut db, &identity, &hydrated, &mut next, &mut cx).unwrap();
 }
 
-/// [format] stale generation or future writer refuses before restart side effects.
+/// [format] stale generation or future writer refuses before saving.
 #[test]
 fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
     for future_writer in [false, true] {
@@ -510,9 +443,7 @@ fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
         } else {
             prev.generation += 1;
         }
-        let mut hooks = SaveHooks::default();
-        assert!(save_graph(&mut db, &identity, &prev, &mut next, &mut cx, &mut hooks).is_err());
-        assert!(!hooks.staged && hooks.gc_after.is_none());
+        assert!(save_graph(&mut db, &identity, &prev, &mut next, &mut cx).is_err());
         assert!(!cx.valid && cx.ambiguous);
     }
 }
@@ -545,8 +476,6 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
                 p.current.census_window_end = boundary.into();
             }
         }
-        cx.preflight(&prev, &next, &mut kinds_files::NoResumeHooks)
-            .unwrap();
         let mut tx = db.begin(TxnMode::Write).unwrap();
         delta(&prev, &next, &mut tx, &mut cx, std::iter::empty::<String>()).unwrap();
         let key = mapper::key("account.current", "synthetic-family", 1).unwrap();
@@ -559,8 +488,6 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
         }
         let outcome = tx.commit(prev.generation, next.generation);
         assert_eq!(outcome, DurableCommitOutcome::Committed(next.generation));
-        cx.post_commit(&outcome, &mut kinds_files::NoResumeHooks)
-            .unwrap();
         let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
         assert_eq!(
             serde_json::to_vec(&restored).unwrap(),
@@ -570,104 +497,15 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
     }
 }
 
-/// [money] an R1 exclusion discards every speculative settlement and preserves owed custody.
+/// [money] a refused COMMIT preserves unsettled custody through subsequent independent saves.
 #[test]
 fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
-    #[derive(Default)]
-    struct Hooks {
-        opened: bool,
-        exclude: bool,
-    }
-    impl resume::ResumeHooks for Hooks {
-        fn on_open(
-            &mut self,
-            generation: u64,
-            _: &BTreeMap<String, resume::ResumeCheckpoint>,
-        ) -> Result<()> {
-            assert_eq!(generation, 2);
-            self.opened = true;
-            Ok(())
-        }
-        fn plan(
-            &mut self,
-            prev: &ScanIndex,
-            next: &ScanIndex,
-            current: &BTreeMap<String, resume::ResumeCheckpoint>,
-        ) -> Result<resume::StagedCheckpoints> {
-            let _ = current;
-            let mut staged = resume::StagedCheckpoints {
-                bytes: 1,
-                ..Default::default()
-            };
-            for (key, entry) in &next.files {
-                if prev.files.get(key).map(serde_json::to_vec).transpose()?
-                    != Some(serde_json::to_vec(entry)?)
-                {
-                    staged.replacements.insert(
-                        key.clone(),
-                        super::super::money_test_support::checkpoint(
-                            key,
-                            entry,
-                            next.generation,
-                            Scratch::binding(),
-                        ),
-                    );
-                }
-            }
-            Ok(staged)
-        }
-        fn preflight_selected(
-            &mut self,
-            _: &ScanIndex,
-            _: &ScanIndex,
-            _: &BTreeMap<String, resume::ResumeCheckpoint>,
-        ) -> Result<u64> {
-            Ok(1)
-        }
-        fn stage(
-            &mut self,
-            prev: &ScanIndex,
-            next: &ScanIndex,
-            current: &BTreeMap<String, resume::ResumeCheckpoint>,
-        ) -> Result<resume::StagedCheckpoints> {
-            if self.exclude {
-                Ok(resume::StagedCheckpoints {
-                    excluded: BTreeSet::from(["synthetic-file".into()]),
-                    ..Default::default()
-                })
-            } else {
-                self.plan(prev, next, current)
-            }
-        }
-    }
     let (_scratch, mut db) = Scratch::live_store();
     let mut prev = fixture();
     prev.accepted_rebuild_incidence
         .insert("synthetic-file".into(), BTreeSet::from(["owed".into()]));
     commit_populate(&mut db, &prev);
-    let prior_ref = super::super::money_test_support::checkpoint(
-        "synthetic-file",
-        &prev.files["synthetic-file"],
-        1,
-        Scratch::binding(),
-    );
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    mapper::map_delta(
-        &mut tx,
-        "resume.checkpoint",
-        &BTreeMap::new(),
-        &BTreeMap::from([("synthetic-file".to_owned(), prior_ref.clone())]),
-    )
-    .unwrap();
-    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    let mut hooks = Hooks {
-        exclude: true,
-        ..Default::default()
-    };
-    let (prev, mut cx) = hydrate_txn_with_hooks(&mut tx, Scratch::binding(), &mut hooks).unwrap();
-    drop(tx);
-    assert!(hooks.opened);
+    let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
     let mut next = prev.clone();
     next.generation += 1;
     next.files.get_mut("synthetic-file").unwrap().size_bytes += 7;
@@ -693,16 +531,12 @@ fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
     });
     next.upload_context_fingerprint = Some("independent-change".into());
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
-    let error = save_graph(&mut db, &identity, &prev, &mut next, &mut cx, &mut hooks).unwrap_err();
-    assert!(error.is::<resume::StageExcluded>());
-    assert_eq!(
-        serde_json::to_vec(&next).unwrap(),
-        serde_json::to_vec(&prev).unwrap()
-    );
+    sqlite::fence_commit_writing(&db, "generation");
+    let error = save_graph(&mut db, &identity, &prev, &mut next, &mut cx).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
     assert_eq!(next.v2().growth_retention, prev.v2().growth_retention);
     assert!(cx.ambiguous);
     let (restored, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    assert_eq!(cx.committed["synthetic-file"], prior_ref);
     assert_eq!(
         serde_json::to_vec(&restored).unwrap(),
         serde_json::to_vec(&prev).unwrap()
@@ -714,19 +548,9 @@ fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
         "independent-file".into(),
         selected.files["synthetic-file"].clone(),
     );
-    save_graph(
-        &mut db,
-        &identity,
-        &restored,
-        &mut selected,
-        &mut cx,
-        &mut Hooks::default(),
-    )
-    .unwrap();
+    save_graph(&mut db, &identity, &restored, &mut selected, &mut cx).unwrap();
     let (reopened, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    assert_eq!(cx.committed["synthetic-file"], prior_ref);
     assert!(reopened.files.contains_key("independent-file"));
-    assert!(cx.committed.contains_key("independent-file"));
     assert_eq!(
         reopened.upload_context_fingerprint.as_deref(),
         Some("independent-change")
@@ -742,24 +566,11 @@ fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
     assert!(reopened.upload_ack_retirement_handoff.is_none());
     let mut advanced = reopened.clone();
     advanced.files.get_mut("synthetic-file").unwrap().size_bytes += 1;
-    save_graph(
-        &mut db,
-        &identity,
-        &reopened,
-        &mut advanced,
-        &mut cx,
-        &mut Hooks::default(),
-    )
-    .unwrap();
-    let (final_graph, final_cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    save_graph(&mut db, &identity, &reopened, &mut advanced, &mut cx).unwrap();
+    let (final_graph, _) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert_eq!(
         final_graph.files["synthetic-file"].size_bytes,
         prev.files["synthetic-file"].size_bytes + 1
-    );
-    assert_ne!(final_cx.committed["synthetic-file"], prior_ref);
-    assert_eq!(
-        final_cx.committed["synthetic-file"].committed_bytes,
-        final_graph.files["synthetic-file"].size_bytes
     );
     assert_eq!(
         final_graph.accepted_rebuild_incidence,
