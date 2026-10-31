@@ -1517,3 +1517,481 @@ fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
         );
     });
 }
+
+/// [format] One-shot CI recipe: retain untouched records from the real v1 writer.
+#[test]
+fn generate_53d05a43_v1_goldens() {
+    use crate::durable_tail_store::{
+        self as store, Binding, DurableSource, DurableTailStore, PendingRecord,
+    };
+    use crate::snapshots::codex_counting_version::{self, AckEvidence, TestCutover};
+    use crate::snapshots::sampled_scan::durable_tail::Interpretation;
+    use sha2::{Digest, Sha256};
+
+    const SOURCE_SHA: &str = "53d05a4304f2e87effbaa48661e10286bff01c58";
+    const ROOT: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    const AT: &str = "2026-08-02T07:00:10Z";
+    const CODEX_AT: &str = "2026-10-27T07:00:00Z";
+    fn sha(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    fn write_json(path: &Path, value: &Value) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec_pretty(value).unwrap();
+        bytes.push(b'\n');
+        fs::write(path, &bytes).unwrap();
+        bytes
+    }
+    // Same physical rows as the native transition fixture, through its parser.
+    fn codex_rows(turn: &str, tokens: u64) -> Vec<String> {
+        let usage = json!({"input_tokens":tokens,"cached_input_tokens":0,"output_tokens":2,
+            "reasoning_output_tokens":0,"total_tokens":tokens+2});
+        [
+            json!({"type":"event_msg","timestamp":"2026-10-27T07:00:01Z","payload":{"type":"task_started","turn_id":turn}}),
+            json!({"type":"token_usage_record","timestamp":"2026-10-27T07:00:02Z","payload":{"thread_id":ROOT,"turn_id":turn,"response_id":turn,"usage":usage,"thread_token_usage":usage}}),
+            json!({"type":"event_msg","timestamp":"2026-10-27T07:00:03Z","payload":{"type":"token_count","info":{"model":"gpt-5.2","last_token_usage":usage,"total_token_usage":usage}}}),
+            json!({"type":"event_msg","timestamp":"2026-10-27T07:00:04Z","payload":{"type":"task_complete","turn_id":turn}}),
+        ].iter().map(Value::to_string).collect()
+    }
+
+    let out = PathBuf::from(std::env::var_os("GOLDENS_OUT").expect("GOLDENS_OUT must be set"));
+    let generator_commit = std::env::var("GENERATOR_COMMIT").expect("GENERATOR_COMMIT must be set");
+    assert_eq!(generator_commit.len(), 40);
+    assert!(generator_commit.bytes().all(|b| b.is_ascii_hexdigit()));
+    fs::create_dir_all(out.join("inputs")).unwrap();
+    fs::create_dir_all(out.join("expected")).unwrap();
+    let mut cases = Vec::new();
+    for (case, source) in [
+        ("claude-three-request", SnapshotSource::ClaudeCode),
+        ("claude-selector-unequal", SnapshotSource::ClaudeCode),
+        ("codex-legacy-acked", SnapshotSource::Codex),
+        ("codex-v2-24b", SnapshotSource::Codex),
+    ] {
+        let claude = source == SnapshotSource::ClaudeCode;
+        let legacy = case == "codex-legacy-acked";
+        let selector = case == "claude-selector-unequal";
+        let scratch = Scratch::new(case);
+        fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).unwrap();
+        let lock = crate::locked_state_dir::LockedStateDir::acquire(&scratch.0).unwrap();
+        let index_path = scratch.0.join("index.json");
+        let mut lines = if claude {
+            [10, 20, 30].into_iter().enumerate().map(|(i, tokens)| {
+                let request = format!("r{}", i + 1);
+                json!({"type":"assistant","sessionId":ROOT,"version":"2.1.309",
+                    "timestamp":AT,"requestId":request,
+                    "message":{"id":format!("msg-{request}"),"model":"claude-haiku-4-5",
+                        "usage":{"input_tokens":tokens,"output_tokens":tokens,
+                            "cache_read_input_tokens":3,"cache_creation_input_tokens":7,
+                            "cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":2}}}}).to_string()
+            }).collect::<Vec<_>>()
+        } else {
+            let mut header = json!({"type":"session_meta","timestamp":CODEX_AT,
+                "payload":{"id":ROOT,"timestamp":CODEX_AT}});
+            if !legacy {
+                header["payload"]["cli_version"] = json!("0.148.9");
+            }
+            let mut rows = vec![header.to_string()];
+            rows.extend(codex_rows(if legacy { "turn-a" } else { "initial" }, 10));
+            rows
+        };
+        let path = scratch.write(&format!("{ROOT}.jsonl"), &lines);
+        let key = local_index_key(&path);
+        let namespace = Scope("synthetic-v1-goldens".into());
+        let mut index = ScanIndex::default();
+        let mut prior_ack = Value::Null;
+        let mut evidence_rows = Vec::new();
+        // Legacy is first parsed and ACKed before cutover, then re-read with
+        // the actual compiled cutover and that saved index's ACK evidence.
+        for pass in 0..=usize::from(legacy) {
+            let cutover = if legacy && pass == 0 {
+                i64::MAX
+            } else {
+                codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS.unwrap()
+            };
+            let _cutover = TestCutover::set(cutover);
+            if pass == 1 {
+                lines.extend(codex_rows("turn-b", 20));
+                fs::write(&path, lines.join("\n") + "\n").unwrap();
+            }
+            let text = fs::read(&path).unwrap();
+            let fingerprint = format!("sha256:{}", sha(&text));
+            let ack = AckEvidence::of_view(index.files.values());
+            if legacy && pass == 1 {
+                assert_eq!(ack, AckEvidence::LegacyAcked);
+            }
+            let before = json!({"generation":index.generation,
+                "entry":index.files.get(&key),"ack_evidence":ack});
+            let (mut reduction, checkpoint, mut parsed) =
+                claude_history_upgrade::with_staged_births_for_test(
+                    BTreeMap::from([(key.clone(), 1_785_654_000_000_000_000)]),
+                    || {
+                        let mut p = parser(&path, source);
+                        if !claude {
+                            codex_counting_version::configure(
+                                &mut p.accumulator,
+                                ack,
+                                Some(cutover),
+                            );
+                            let (previous, required) =
+                                codex_file_join::receipt_state(index.files.get(&key));
+                            p.accumulator.codex_tier_replay =
+                                Some(codex_file_join::TierReplay::new(
+                                    previous,
+                                    required,
+                                    namespace.0.clone(),
+                                ));
+                        }
+                        assert!(matches!(
+                            p.prepare_acquisition(None, &scope(), None, NOW).unwrap(),
+                            ReadMode::Full(_)
+                        ));
+                        while !p.step().unwrap() {}
+                        let reduction = p.reduction_copy();
+                        let checkpoint = match p.certify_without_retention(&scope(), NOW).unwrap() {
+                            SideCertificate::Certified { completed, .. } => completed.checkpoint,
+                            _ => panic!("synthetic full read must certify"),
+                        };
+                        let identity =
+                            opened_object_identity(source, &mut File::open(&path).unwrap())
+                                .unwrap();
+                        let parsed = p
+                            .finish_with_repository_identity(
+                                &identity,
+                                &path,
+                                COLLECTED,
+                                fingerprint.clone(),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                            .unwrap();
+                        (reduction, checkpoint, parsed)
+                    },
+                );
+            assert_eq!(parsed.snapshots.len(), 1);
+            assert_eq!(parsed.recognized_usage_drop_count, 0);
+            let v2 = !claude && !legacy;
+            assert_eq!(reduction.accumulator.codex_counting_v2(), v2);
+            let mut counting_receipts =
+                crate::codex_scan_diagnostics::CountingV2Receipts::default();
+            if let Some(counting) = &reduction.accumulator.codex_counting {
+                counting.fold_receipts(&mut counting_receipts);
+                if v2 {
+                    assert_eq!(counting_receipts.native_counted, 1);
+                } else {
+                    assert_eq!(counting_receipts.v2_sessions, 0);
+                }
+            }
+            if claude {
+                let mut read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
+                evidence_rows = [10, 20, 30]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, tokens)| {
+                        let request = format!("r{}", i + 1);
+                        let cost = (i as u64 + 1) * 100;
+                        let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence {
+                            capture_revision: "claude_api_request:v2".into(),
+                            session_id: ROOT.into(),
+                            request_id: request.clone(),
+                            client_request_id: format!("client-{request}"),
+                            observed_at: AT.into(),
+                            model: "claude-haiku-4-5".into(),
+                            effort: "high".into(),
+                            query_source: "user".into(),
+                            app_version: "2.1.309".into(),
+                            event_sequence: Some(cost + 1),
+                            cost_usd_micros: Some(cost),
+                            input_tokens: tokens,
+                            output_tokens: tokens,
+                            cache_read_tokens: 3,
+                            cache_creation_tokens: 7,
+                            cache_creation_5m_tokens: 5,
+                            cache_creation_1h_tokens: 2,
+                            request_count: 1,
+                            ..Default::default()
+                        };
+                        row.fingerprint =
+                            format!("sha256:{}", sha(&serde_json::to_vec(&row).unwrap()));
+                        row
+                    })
+                    .collect();
+                read.evidence.insert(ROOT.into(), evidence_rows.clone());
+                claude_request_money::e2::decide_page_copies(&mut parsed.snapshots, &index);
+                claude_request_money::e2::attach_page(&mut parsed.snapshots, &read);
+                let fold = parsed.snapshots[0]
+                    .claude_money
+                    .as_ref()
+                    .expect("populated native fold");
+                assert_eq!(
+                    fold.entity
+                        .grains
+                        .values()
+                        .map(|g| g.cost_micros)
+                        .sum::<u64>(),
+                    600
+                );
+            }
+            let item = &mut parsed.snapshots[0];
+            assert_eq!(item.source_session_id, ROOT);
+            if claude {
+                let start = item
+                    .session_start
+                    .as_ref()
+                    .expect("closed three-request start window");
+                assert_eq!(start.opening_request_count, Some(3));
+                assert_eq!(start.request_2_context_tokens, Some(30));
+                assert_eq!(start.request_3_context_tokens, Some(40));
+                assert_eq!(start.opening_output_tokens, Some(30));
+            } else if !legacy {
+                assert_eq!(
+                    item.session_start
+                        .as_ref()
+                        .unwrap()
+                        .client_version
+                        .as_deref(),
+                    Some("0.148.9")
+                );
+            }
+            let (input, output, requests) = if claude {
+                (60, 60, 3)
+            } else if legacy && pass == 1 {
+                (30, 4, 2)
+            } else {
+                (10, 2, 1)
+            };
+            assert_eq!(
+                (item.input_tokens, item.output_tokens, item.request_count),
+                (input, output, requests)
+            );
+            item.snapshot_fingerprint = snapshot_fingerprint(source, item);
+            let members = BTreeSet::from([item.snapshot_fingerprint.clone()]);
+            let witnesses = BTreeSet::from([snapshot_upload_body_witness(item)]);
+            let metadata = fs::metadata(&path).unwrap();
+            let tier_receipt = reduction
+                .accumulator
+                .codex_tier_replay
+                .clone()
+                .and_then(|replay| replay.finish().unwrap());
+            let entry: ScanIndexEntry = serde_json::from_value(json!({
+                "size_bytes":metadata.len(),"modified_unix_seconds":metadata.mtime().max(0) as u64,
+                "modified_unix_nanos":metadata.mtime_nsec(),"source_file_fingerprint":fingerprint,
+                "last_snapshot_fingerprint":snapshot_file_entity_set_hex(&members),
+                "last_upload_body_witness":snapshot_file_upload_body_set_hex(&witnesses),
+                "effective_upload_body_witness_revision":crate::snapshot_sync::effective_upload_body_witness_revision(source),
+                "codex_counting_v2":v2,"codex_counting_owner":if claude { None } else { Some(ROOT) },
+                "codex_applied_tier_receipt":tier_receipt,"codex_captured_tier_receipt":tier_receipt
+            })).unwrap();
+            index.files.insert(key.clone(), entry);
+            index
+                .file_snapshot_fingerprints
+                .insert(key.clone(), members.clone());
+            index.record_accepted_snapshot_fingerprints(&members);
+            assert!(index.accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint));
+            if legacy && pass == 0 {
+                index.save(&index_path).unwrap();
+                prior_ack = json!({"cutover_unix_ms":cutover,"generation":index.generation,
+                    "entry":index.files[&key],"accepted":members});
+                continue;
+            }
+            let empty_body = encode(&reduction, store::RECORD_BYTES, line_cap()).unwrap();
+            if selector {
+                assert!(reduction.accumulator.current_selector.is_empty());
+                reduction.accumulator.current_selector.insert(
+                    "service_tier",
+                    "priority".into(),
+                    "derived_from_logs_2",
+                );
+            }
+            let body = encode(&reduction, store::RECORD_BYTES, line_cap()).unwrap();
+            verify(&body).unwrap();
+            let decoded = decode(&body, source).unwrap();
+            let selector_span = if selector {
+                let capture = &reduction.accumulator.current_selector;
+                assert_eq!(decoded.reduction.accumulator.current_selector, *capture);
+                assert_eq!(
+                    capture.context.get("service_tier").map(String::as_str),
+                    Some("priority")
+                );
+                assert_eq!(
+                    capture.sources.get("service_tier").map(String::as_str),
+                    Some("derived_from_logs_2")
+                );
+                let mut e = Enc::bytes(1024);
+                capture.put(&mut e).unwrap();
+                let selected = e.into_bytes();
+                let offsets = body
+                    .windows(selected.len())
+                    .enumerate()
+                    .filter_map(|(at, window)| (window == selected).then_some(at))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    offsets.len(),
+                    1,
+                    "selected nonempty capture has one exact span"
+                );
+                let at = offsets[0];
+                let mut e = Enc::bytes(1024);
+                SelectorCapture::default().put(&mut e).unwrap();
+                let mut replaced = body[..at].to_vec();
+                replaced.extend(e.into_bytes());
+                replaced.extend_from_slice(&body[at + selected.len()..]);
+                assert_eq!(
+                    replaced, empty_body,
+                    "span is exactly current_selector's insertion"
+                );
+                let mut e = Enc::bytes(1024);
+                capture.context.put(&mut e).unwrap();
+                let context_len = e.position().unwrap();
+                capture.sources.put(&mut e).unwrap();
+                assert_eq!(e.into_bytes(), selected);
+                let offset = store::HEADER_BYTES + at;
+                json!({"offset":offset,"length":selected.len(),"body_offset":at,
+                    "field":"SnapshotAccumulator.current_selector",
+                    "context":{"offset":offset,"length":context_len},
+                    "sources":{"offset":offset+context_len,"length":selected.len()-context_len}})
+            } else {
+                Value::Null
+            };
+            let pre_save =
+                json!({"generation":index.generation,"entry":index.files[&key],"accepted":members});
+            index.save(&index_path).unwrap();
+            let entry = &index.files[&key];
+            assert!(entry.last_upload_body_witness.is_some());
+            let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+            let ds = if claude {
+                DurableSource::ClaudeCode
+            } else {
+                DurableSource::Codex
+            };
+            let allowlist = allowlist_digest(source);
+            assert_eq!(
+                hex(&allowlist),
+                if claude {
+                    "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c"
+                } else {
+                    "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1"
+                }
+            );
+            let binding = Binding {
+                source: ds,
+                key: store::key_digest(ds, &key),
+                context: store::context_digest(
+                    &namespace.0,
+                    index.active_upload_context_fingerprint.as_deref(),
+                ),
+                scope: store::replay_scope_digest(
+                    &store::scope_digest(
+                        &scope().0,
+                        &allowlist,
+                        &interpretation.identity_contract,
+                        &interpretation.counting_view,
+                    ),
+                    crate::snapshot_sync::effective_upload_body_witness_revision(source),
+                    index.active_effective_upload_body_witness_revision,
+                    if claude {
+                        index.claude_money_birth_store.money_rule_version()
+                    } else {
+                        0
+                    },
+                    claude && claude_request_money::e2::enabled(),
+                ),
+                entry: store::replay_entry_digest(
+                    &store::entry_digest(
+                        &entry.source_file_fingerprint,
+                        entry.last_upload_body_witness.as_deref(),
+                    ),
+                    entry.effective_upload_body_witness_revision,
+                    if claude {
+                        index
+                            .claude_money_birth_store
+                            .money_marks(claude_money_birth_store::location_key(&key))
+                    } else {
+                        0
+                    },
+                ),
+            };
+            let certificate = checkpoint
+                .durable_certificate(birth_unix_nanos(&metadata))
+                .unwrap();
+            let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+            assert_eq!(
+                disk.write_after_save(
+                    &lock,
+                    index.generation,
+                    vec![PendingRecord {
+                        binding: binding.clone(),
+                        certificate,
+                        body: body.clone(),
+                        allowlist,
+                    }]
+                )
+                .unwrap()
+                .written,
+                1
+            );
+            let record = fs::read(disk.dir().join(format!("{}.rec", hex(&binding.key)))).unwrap();
+            assert_eq!(&record[store::HEADER_BYTES..record.len() - 32], body);
+            assert_eq!(u16::from_le_bytes(record[8..10].try_into().unwrap()), 1);
+            assert_eq!(record[42], if claude { 1 } else { 2 });
+            assert_eq!(
+                u64::from_le_bytes(record[171..179].try_into().unwrap()),
+                index.generation
+            );
+            let facts = json!({"source_session_id":ROOT,"input_tokens":input,"output_tokens":output,
+                "request_count":requests,"counting_version":if claude { "not_applicable" } else if legacy { "Legacy" } else { "V2" },
+                "cache_read_tokens":if claude { 9 } else { 0 },
+                "cache_creation_5m_tokens":if claude { 15 } else { 0 },
+                "cache_creation_1h_tokens":if claude { 6 } else { 0 },
+                "telemetry_cost_micros":if claude { Some(600) } else { None },
+                "opening_request_count":if claude { Some(3) } else { None },
+                "request_2_context_tokens":if claude { Some(30) } else { None },
+                "request_3_context_tokens":if claude { Some(40) } else { None },
+                "opening_output_tokens":if claude { Some(30) } else { None },
+                "cli_version":if !claude && !legacy { Some("0.148.9") } else { None },
+                "selector_context":if selector { json!({"service_tier":"priority"}) } else { json!({}) },
+                "selector_sources":if selector { json!({"service_tier":"derived_from_logs_2"}) } else { json!({}) },
+                "accepted_body_witness":true,"tier_replay_present":!claude});
+            assert_eq!(item.cache_read_tokens, if claude { 9 } else { 0 });
+            assert_eq!(item.cache_creation_5m_tokens, if claude { 15 } else { 0 });
+            assert_eq!(item.cache_creation_1h_tokens, if claude { 6 } else { 0 });
+            if !claude {
+                assert!(decoded.reduction.accumulator.codex_tier_replay.is_some());
+            }
+            let expected = json!({"schema_version":1,"case_id":case,"facts":facts,
+                "scope_inputs":{"file_scope":scope().0,"namespace":namespace.0,
+                    "identity_contract":interpretation.identity_contract,"counting_view":interpretation.counting_view,
+                    "fixture_birth_unix_nanos":1_785_654_000_000_000_000u64,
+                    "index_key_recipe":"local_index_key of the synthetic transcript in the CI scratch directory",
+                    "fingerprint_recipe":"sha256 of inputs JSONL bytes"},
+                "pre_read":before,"pre_save":pre_save,"post_save":{"generation":index.generation,"entry":entry,"accepted":members},
+                "prior_legacy_ack":prior_ack,"api_evidence":evidence_rows,"counting_receipts":counting_receipts,
+                "binding":{"key":hex(&binding.key),"context":hex(&binding.context),
+                    "scope":hex(&binding.scope),"entry":hex(&binding.entry)},"selector_span":selector_span});
+            let record_path = format!("{case}.rec");
+            let input_path = format!("inputs/{case}.jsonl");
+            let expected_path = format!("expected/{case}.json");
+            fs::write(out.join(&record_path), &record).unwrap();
+            fs::write(out.join(&input_path), &text).unwrap();
+            let expected_bytes = write_json(&out.join(&expected_path), &expected);
+            cases.push(json!({"case_id":case,"path":record_path,"byte_length":record.len(),"sha256":sha(&record),
+                "envelope_version":1,"source_tag":if claude { 1 } else { 2 },"historical_allowlist":hex(&allowlist),
+                "index_generation":index.generation,
+                "input":{"path":input_path,"byte_length":text.len(),"sha256":sha(&text)},
+                "expected":{"path":expected_path,"byte_length":expected_bytes.len(),"sha256":sha(&expected_bytes)},
+                "expected_facts":facts,"selector_span":selector_span}));
+        }
+    }
+    assert_eq!(cases.len(), 4);
+    write_json(
+        &out.join("MANIFEST.json"),
+        &json!({"schema_version":1,"source_sha":SOURCE_SHA,
+        "generator_commit":generator_commit,"repo":"ottto-ai/ottto","workflow_path":".github/workflows/linux-tests.yml",
+        "run_id":null,"run_attempt":null,"run_url":null,"artifact":{"id":null,"name":null},
+        "rustc":null,"toolchain":null,"runner_os":null,"runner_arch":null,"cases":cases}),
+    );
+}
