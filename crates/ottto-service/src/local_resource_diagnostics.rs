@@ -2360,10 +2360,27 @@ mod tests {
             (
                 "process_retained_cache_lifecycle_totals",
                 "unknown",
-                serde_json::to_value(cache_lifecycle::Counts::maximum()).unwrap(),
-                capture(cache_lifecycle_totals).1,
-            ),
-            (
+                &cache_lifecycle::Counts::maximum(),
+            );
+        });
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["stage"], "process_retained_cache_lifecycle_totals");
+        assert_eq!(record["source"], "unknown");
+        assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
+        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
+        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
+        // The two Pi observation fields add 97 bytes at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2304);
+        let (_, actual) = capture(cache_lifecycle_totals);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0]["stage"], record["stage"]);
+    }
+
+    #[test]
+    fn codex_memo_lifecycle_record_is_bounded_and_explicitly_process_global() {
+        let (_, records) = capture(|| {
+            traversal_point(
                 "process_codex_memo_lifecycle_totals",
                 "codex",
                 serde_json::to_value(codex_memo_lifecycle::Record::maximum()).unwrap(),
@@ -2443,6 +2460,50 @@ mod tests {
             }
         }
         write_line("{}", &mut FailedSink);
+    }
+
+    #[test]
+    #[ignore = "bounded native measurement; process allocation scope needs serial isolation"]
+    fn measure_local_resource_probe_overhead() {
+        const ITERATIONS: u64 = 1000;
+        for stage in ["native_collection_page", "source_finish"] {
+            let process_before = process_sample();
+            let wall = Instant::now();
+            let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
+                for _ in 0..ITERATIONS {
+                    if stage == "source_finish" {
+                        source_finish("claude_code", || Ok(())).unwrap();
+                    } else {
+                        Probe::start().collection(
+                            "claude_code",
+                            CollectionCounts {
+                                scanned_files: usize::MAX,
+                                semantic_noops: usize::MAX,
+                                sampled_acquisition: Some(max_read_counts()),
+                                full_causes: Default::default(),
+                            },
+                        );
+                    }
+                }
+            });
+            let wall_us = wall.elapsed().as_micros();
+            let cpu_us = Observation::between(0, process_before, process_sample())
+                .shared_process_cpu_delta_us;
+            println!(
+                "RESOURCE_PROBE_OVERHEAD {}",
+                serde_json::json!({
+                    "stage": stage, "iterations": ITERATIONS, "wall_us": wall_us,
+                    "wall_us_per_record": wall_us as f64 / ITERATIONS as f64,
+                    "shared_process_cpu_us": cpu_us,
+                    "shared_process_cpu_us_per_record": cpu_us.map(|cpu| cpu as f64 / ITERATIONS as f64),
+                    "probe_inline_bytes": std::mem::size_of::<Probe>(),
+                    "upload_call_inline_bytes": std::mem::size_of::<UploadCall>(),
+                    "scope_requested_allocation_peak_bytes": allocation.requested_peak,
+                    "scope_requested_allocation_live_bytes": allocation.requested_live,
+                    "includes_two_os_samples_json_encoding_and_existing_stderr_write": true,
+                })
+            );
+        }
     }
 
     #[test]

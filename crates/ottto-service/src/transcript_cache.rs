@@ -584,6 +584,41 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        ignore = "needs macOS heap layout"
+    )]
+    fn insertion_preflight_matches_real_rank_and_reservation_outcomes() {
+        for reserved in [0, 32 * 1024, 96 * 1024, 128 * 1024] {
+            for rank in [(9, 0), (10, 0), (20, 0), (30, 0)] {
+                let mut cache = TranscriptCache::new(128 * 1024, 8192, 2);
+                for (key, rank) in [("old", (10, 0)), ("newer", (20, 0))] {
+                    assert!(cache.insert_reserving_at_rank(
+                        key.into(),
+                        retained("state".into()),
+                        0,
+                        0,
+                        Some(rank)
+                    ));
+                }
+                let incoming = retained("incoming".into());
+                let key = String::from("new");
+                if reserved == 0 {
+                    assert!(
+                        cache.insertion_fits(&key, &incoming, reserved, rank, false),
+                        "count pressure alone must not evict optional headers"
+                    );
+                }
+                let predicted = cache.insertion_fits(&key, &incoming, reserved, rank, true);
+                assert_eq!(
+                    predicted,
+                    cache.insert_reserving_at_rank(key, incoming, reserved, 0, Some(rank)),
+                    "{reserved} {rank:?}"
+                );
+            }
+        }
+    }
+    #[test]
     fn cache_lifecycle_counts_real_transfers_refusals_and_eviction_causes() {
         use crate::local_resource_diagnostics::cache_lifecycle::observe;
         let (_, counts) = observe(|| {
@@ -776,6 +811,37 @@ mod tests {
         ));
         value.lock().unwrap().reserve(1024 * 1024);
         assert!(cache.take("shared").is_none());
+    }
+
+    /// P1-RETAIN R0: `entry_slot_bytes` is exactly what one entry adds to the
+    /// cache's bound beyond its `heap_bytes`, and what removing it frees.
+    #[test]
+    fn entry_slot_bytes_equals_the_measured_bound_delta_of_one_insert_and_one_remove() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let at = std::time::Duration::from_secs(100);
+        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 8);
+        assert!(cache.insert_at("resident".into(), retained_at("r".into(), Some(10)), 0, at));
+        for key in ["k", "a-much-longer-key-with-more-heap"] {
+            let before = cache.resident_bound().unwrap();
+            let key = String::from(key);
+            let capacity = key.capacity();
+            assert!(cache.insert_at(key.clone(), retained_at("x".repeat(300), Some(20)), 0, at));
+            let heap_bytes = cache.entries[&key].heap_bytes;
+            let slot = entry_slot_bytes::<String>(capacity).unwrap();
+            let after = cache.resident_bound().unwrap();
+            assert_eq!(after - before, slot + heap_bytes, "insert {key}");
+            cache.remove(&key);
+            assert_eq!(cache.resident_bound().unwrap(), before, "remove {key}");
+        }
+        assert!(entry_overhead::<String>() > 0);
+        assert_eq!(
+            entry_overhead::<String>(),
+            std::mem::size_of::<Entry<String>>()
+                - std::mem::size_of::<String>()
+                - std::mem::size_of::<Checkpoint>()
+        );
     }
 
     /// P1-RETAIN R0 releases through M1's `release_older_until` (c22 integ1

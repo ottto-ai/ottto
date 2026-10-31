@@ -559,3 +559,310 @@ fn cursor_and_lock_shed_codes_are_retried_in_place_through_the_client() {
 }
 
 // --- T4: one real Claude prepare/finish cycle against a loopback backend ---
+
+struct InplaceRetryServer {
+    url: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    batch_posts: Arc<Mutex<Vec<Vec<String>>>>,
+    terminal: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl InplaceRetryServer {
+    /// Accepts every snapshot. With `shed_first_batch`, the first batch POST
+    /// is answered `503` with `Retry-After: 1`, the cursor-allocation class.
+    fn new(shed_first_batch: bool) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let batch_posts = Arc::new(Mutex::new(Vec::new()));
+        let posts = batch_posts.clone();
+        let terminal = Arc::new(Mutex::new(Vec::new()));
+        let statuses = terminal.clone();
+        let worker = std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("synthetic in-place retry accept: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let request = read_complete_http_request(&mut stream);
+                assert!(http_request_complete(request.as_bytes()));
+                let raw = request.split_once("\r\n\r\n").unwrap().1;
+                let value: serde_json::Value = if raw.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(raw).unwrap()
+                };
+                let response = if request.contains("/relay-token") {
+                    serde_json::json!({"token":"synthetic-inplace-token","expires_at":"2099-01-01T00:00:00Z"})
+                } else if request.contains("/activity-hints") {
+                    serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
+                        "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
+                        "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
+                        "recommended_scan_after":"2099-01-01T00:00:00Z"})
+                } else if request.contains("/agent-status/snapshots") {
+                    serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["claude_code"]})
+                } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
+                    let fingerprints = items
+                        .iter()
+                        .map(|item| item["snapshot_fingerprint"].as_str().unwrap().to_string())
+                        .collect::<Vec<_>>();
+                    let first = {
+                        let mut posts = posts.lock().unwrap();
+                        posts.push(fingerprints);
+                        posts.len() == 1
+                    };
+                    if shed_first_batch && first {
+                        let body = r#"{"detail":"cursor_allocation_timeout"}"#;
+                        write!(
+                            stream,
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .unwrap();
+                        continue;
+                    }
+                    let entities = items
+                        .iter()
+                        .map(|item| {
+                            let mut payload = serde_json::Map::new();
+                            for key in [
+                                "session_account_evidence",
+                                "tool_usage",
+                                "tool_usage_truncated",
+                            ] {
+                                if let Some(value) = item.get(key) {
+                                    payload.insert(key.into(), value.clone());
+                                }
+                            }
+                            let exclusive = item
+                                .get("usage_accounting_contract")
+                                .and_then(|v| v.as_str())
+                                == Some("session_exclusive_reported_usage:v1");
+                            let version = item
+                                .get("session_account_evidence")
+                                .is_some()
+                                .then_some(if exclusive { 8u64 } else { 7u64 });
+                            let digest = format!(
+                                "{:x}",
+                                Sha256::digest(
+                                    crate::canonical_json::canonicalize(
+                                        &serde_json::Value::Object(payload)
+                                    )
+                                    .unwrap()
+                                )
+                            );
+                            serde_json::json!({"source_session_id":item["source_session_id"],
+                                "snapshot_fingerprint":item["snapshot_fingerprint"],"occurrence_count":1,
+                                "body_witness_version":version,"body_witness_digest":version.map(|_|digest)})
+                        })
+                        .collect::<Vec<_>>();
+                    serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
+                        "session_ids":[],"disabled":false,"disabled_reason":null,
+                        "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":entities,
+                        "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]})
+                } else {
+                    if value["report_kind"] == "scan_status" {
+                        statuses.lock().unwrap().push(value.clone());
+                    }
+                    serde_json::json!({"accepted":true,"source":"claude_code","machine_id":"otm_test","disabled":false})
+                };
+                let body = response.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        Self {
+            url,
+            stop,
+            worker: Some(worker),
+            batch_posts,
+            terminal,
+        }
+    }
+}
+
+impl Drop for InplaceRetryServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let result = self.worker.take().unwrap().join();
+        if !std::thread::panicking() {
+            result.unwrap();
+        }
+    }
+}
+
+struct InplaceRetryCycle {
+    finished_ok: bool,
+    batch_posts: Vec<Vec<String>>,
+    offered: BTreeSet<String>,
+    accepted: BTreeSet<String>,
+    waits: Vec<Duration>,
+    sweep_unsettled: bool,
+    last_error_code: Option<serde_json::Value>,
+}
+
+/// One real `prepare_sync_source` + `finish_sync_source` Claude cycle on a
+/// fresh synthetic home, then what its durable index and the backend saw.
+fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
+    let fixture = IdentityPipelineHome::new();
+    let cadence = IdentityPipelineCadence::new();
+    let support = fixture.base.join("inplace-retry-support");
+    let secrets = fixture.base.join("inplace-retry-secrets");
+    std::fs::create_dir_all(&support).unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+    let server = InplaceRetryServer::new(shed_first_batch);
+    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
+    let device = LocalDeviceBinding {
+        device_id: "inplace-retry-device".into(),
+        machine_id: Some("otm_test".into()),
+        sources: vec!["claude_code".into()],
+    };
+    FileDeviceStore::default().save(&device).unwrap();
+    std::fs::write(
+        secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        "device-secret",
+    )
+    .unwrap();
+    let client = SnapshotApiClient::new(server.url.clone());
+    let daemon = test_daemon("otm_test");
+    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+    let collection = || AgentStatusCollection {
+        snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+        source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+        codex_scan_homes: Vec::new(),
+        codex_home_bindings: Vec::new(),
+    };
+    cadence.next_due_cycle();
+    let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+        prepare_sync_source(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::ClaudeCode,
+            "otm_test",
+            &fixture.home,
+            &support,
+            &daemon,
+            &mut transport,
+            daemon.snapshot_scan_account_witness().unwrap(),
+            false,
+        )
+    })
+    .unwrap()
+    .expect("a due Claude cycle prepares a scan");
+    let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+    assert!(!scan.snapshots.is_empty(), "the synthetic session uploads");
+    let index_path = preparation.index_path.clone();
+    let (result, waits) = with_inplace_retry_test_clock(None, || {
+        crate::agent_status_refresh::with_test_collection(collection(), || {
+            finish_sync_source(
+                preparation,
+                index,
+                scan,
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                &mut retry,
+            )
+        })
+    });
+    let saved = ScanIndex::load(&index_path).unwrap();
+    let batch_posts = server.batch_posts.lock().unwrap().clone();
+    let offered = batch_posts
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let last_error_code = server
+        .terminal
+        .lock()
+        .unwrap()
+        .last()
+        .map(|status| status["last_error_code"].clone());
+    InplaceRetryCycle {
+        finished_ok: result.is_ok(),
+        accepted: offered
+            .iter()
+            .filter(|fingerprint| saved.accepted_snapshot_fingerprint_recorded(fingerprint))
+            .cloned()
+            .collect(),
+        offered,
+        batch_posts,
+        waits,
+        sweep_unsettled: saved.bounded_sweep_had_unsettled_upload(),
+        last_error_code,
+    }
+}
+
+/// T4: a Claude cycle whose first batch is shed with `Retry-After: 1` and
+/// recovered in place saves exactly what a clean cycle saves: every offered
+/// body ACKed, no unsettled-upload mark on the bounded sweep, and the same
+/// terminal status. Without the resend the shed abandons the page and marks
+/// the sweep, which withholds the census and forces a clean follow-up.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+#[serial(source_upload_deadlines)]
+fn sync_cycle_with_recovered_shed_leaves_sweep_settled() {
+    if !crate::heap_layout_bound::layout_supported() {
+        writeln!(
+            std::io::stderr().lock(),
+            "inplace_retry_sync_cycle: supported_positive=UNEXECUTED layout_supported=false"
+        )
+        .unwrap();
+        return;
+    }
+    clear_source_upload_deadlines_for_test();
+    let clean = inplace_retry_claude_cycle(false);
+    assert!(!clean.batch_posts.is_empty());
+    assert!(clean.waits.is_empty());
+    assert_eq!(clean.accepted, clean.offered);
+
+    let recovered = inplace_retry_claude_cycle(true);
+    clear_source_upload_deadlines_for_test();
+
+    assert_eq!(
+        recovered.batch_posts.len(),
+        clean.batch_posts.len() + 1,
+        "exactly one in-place resend"
+    );
+    assert_eq!(
+        recovered.batch_posts[0], recovered.batch_posts[1],
+        "the resend is the shed page"
+    );
+    assert_eq!(recovered.waits.len(), 1);
+    assert_eq!(
+        recovered.accepted, recovered.offered,
+        "every offered body is ACKed after the resend"
+    );
+    assert!(
+        !recovered.sweep_unsettled,
+        "a recovered page never marks the bounded sweep unsettled"
+    );
+    assert_eq!(recovered.sweep_unsettled, clean.sweep_unsettled);
+    assert_eq!(recovered.finished_ok, clean.finished_ok);
+    assert_eq!(recovered.last_error_code, clean.last_error_code);
+}
