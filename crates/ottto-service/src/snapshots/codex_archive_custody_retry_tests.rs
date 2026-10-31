@@ -372,7 +372,7 @@ fn unresolved_archive_parent_uses_plain_native_loss_and_counted_retry() {
     fs::remove_file(&plain).unwrap();
     let (mut index, result, _, ends) =
         archive_pass_with(&f, ScanIndex::default(), true, None, &[], |scan| {
-            scan.codex_parent_ownership_ledgers = Some(ledgers);
+            scan.codex_parent_ownership_ledgers = Some(ledgers.clone());
         });
     assert!(result.snapshots.is_empty());
     assert!(result.ownership_incomplete_file_count > 0);
@@ -407,5 +407,38 @@ fn unresolved_archive_parent_uses_plain_native_loss_and_counted_retry() {
     assert!(quiet.snapshots.is_empty());
     assert_eq!(decoded_archive_bytes(&diagnostics), 0);
     retry_due(&mut index, &key);
-    assert!(index.files[&key].custody_retry_due(&f.0));
+    let (retried, loss, diagnostics, ends) =
+        archive_pass_with(&f, checkpoint(&index), true, None, &[], |scan| {
+            scan.codex_parent_ownership_ledgers = Some(ledgers);
+        });
+    // This is the ordinary due-Pending path, not terminal-custody eligibility.
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|r| r["stage"] == "codex_zst_input")
+            .count(),
+        1
+    );
+    assert_pending(&retried, &f.0, 2);
+    assert!(loss.snapshots.is_empty());
+    assert!(retried.accepted_snapshot_fingerprints.is_empty());
+    assert!(retried.files[&key]
+        .archive
+        .as_ref()
+        .unwrap()
+        .body_witness
+        .is_none());
+    assert_eq!(
+        loss.local_codex_diagnostics
+            .as_ref()
+            .unwrap()
+            .parent_unresolvable
+            .counts()[CodexParentUnresolvable::Absent.index()],
+        1
+    );
+    assert!(!ends
+        .0
+        .lock()
+        .unwrap()
+        .contains(&super::super::line_delivery::DeliveryEnd::Complete));
 }

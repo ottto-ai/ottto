@@ -797,12 +797,73 @@ impl HeaderInventory {
         let table_phase = base.checked_add(fact_bytes)?.checked_add(table_bytes)?;
         let result_phase = base.checked_add(table_bytes)?.checked_add(result_bytes)?;
         let mut peak = fact_phase.max(table_phase).max(result_phase);
+        // The compact result stays live while custody maps/sets are populated.
+        // Fund their resident bytes and every prospective insertion before any
+        // mutation. The old owner set also lives through collect/assignment.
+        let mut application_phase = 0;
+        if !self.archive_classes.is_empty() {
+            use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+            let owner_node = crate::heap_layout_bound::tree_node_bytes::<String, ()>()?;
+            let hold_node = crate::heap_layout_bound::tree_node_bytes::<String, bool>()?;
+            let mut cost = Counter::new(usize::MAX);
+            cost.add(base)?;
+            self.archive_classes.completed_heap_bound(&mut cost)?;
+            self.family_held.completed_heap_bound(&mut cost)?;
+            self.deferred_archives.completed_heap_bound(&mut cost)?;
+            self.held_owners.completed_heap_bound(&mut cost)?;
+            if index.is_none() {
+                let mut added = owner_node; // new owner-set root
+                for (key, class) in &self.archive_classes {
+                    if class.sibling
+                        && !self.held_archives.contains(key)
+                        && !self.family_held.contains_key(key)
+                    {
+                        added = added.checked_add(hold_node)?.checked_add(key.len())?;
+                    } else if !class.sibling
+                        && class.deferred
+                        && !self.deferred_archives.contains(key)
+                    {
+                        added = added.checked_add(owner_node)?.checked_add(key.len())?;
+                    }
+                }
+                // Candidate owners may overlap: charging each is a conservative
+                // bound, without another owner table or an unfunded collection.
+                for key in self
+                    .first_read_archives
+                    .iter()
+                    .filter(|key| {
+                        !self.family_held.contains_key(*key) && !self.archive_class(key).sibling
+                    })
+                    .chain(&self.deferred_archives)
+                    .chain(&self.held_archives)
+                    .chain(
+                        self.archive_classes
+                            .iter()
+                            .filter(|(key, class)| {
+                                !class.sibling
+                                    && class.deferred
+                                    && !self.deferred_archives.contains(key)
+                            })
+                            .map(|(key, _)| key),
+                    )
+                {
+                    for owner in archive_owners(key) {
+                        added = added
+                            .checked_add(owner_node)?
+                            .checked_add(owner.capacity())?;
+                    }
+                }
+                cost.add(added)?;
+            }
+            application_phase = cost.bytes;
+            peak = peak.max(application_phase);
+        }
         let mut carrier_phase = 0;
         if let Some(index) = index {
             // Classification scratch is released before the retained-carrier
-            // lookup is built. Only the compact results coexist with it.
-            carrier_phase = base
-                .checked_add(result_bytes)?
+            // lookup is built. Compact results and applied custody coexist with it.
+            carrier_phase = application_phase
+                .max(base.checked_add(result_bytes)?)
                 .checked_add(
                     index
                         .files
@@ -815,7 +876,7 @@ impl HeaderInventory {
                         .keys()
                         .try_fold(0usize, |n, key| n.checked_add(key.len().checked_mul(5)?))?,
                 )?;
-            peak = self.family_peak.max(carrier_phase);
+            peak = peak.max(self.family_peak).max(carrier_phase);
         }
         crate::local_resource_diagnostics::traversal_point(
             "codex_zst_held",
@@ -824,6 +885,10 @@ impl HeaderInventory {
                 ("archive_classification_fact_bytes", fact_phase as u64),
                 ("archive_classification_table_bytes", table_phase as u64),
                 ("archive_classification_result_bytes", result_phase as u64),
+                (
+                    "archive_classification_application_bytes",
+                    application_phase as u64,
+                ),
                 ("archive_classification_carrier_bytes", carrier_phase as u64),
                 ("archive_classification_required_bytes", peak as u64),
                 (
@@ -957,7 +1022,12 @@ impl HeaderInventory {
             true
         });
         self.archive_classes = classes;
-        self.family_peak = peak;
+        let Some((applied_peak, _)) = self.family_bound(None) else {
+            self.archive_classes = Vec::new();
+            crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::AdmissionRefused);
+            return;
+        };
+        self.family_peak = peak.max(applied_peak);
         for (key, class) in &self.archive_classes {
             if class.sibling {
                 // An already-held physical peer supplies negative evidence;
