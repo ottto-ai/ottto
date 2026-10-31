@@ -4787,6 +4787,7 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
         &mut items,
         &ScanIndex::default(),
         crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded,
+        &mut Default::default(),
     );
     assert!(items
         .iter()

@@ -3843,9 +3843,13 @@ pub(crate) fn finish_page(
     items: &mut Vec<SnapshotItem>,
     index: &ScanIndex,
     telemetry: TelemetryRead,
+    hold_reasons: &mut BTreeMap<&'static str, u64>,
 ) -> BTreeSet<String> {
     if !index.persistence_available() {
-        let held = items.iter().map(|i| i.source_session_id.clone()).collect();
+        let held: BTreeSet<_> = items.iter().map(|i| i.source_session_id.clone()).collect();
+        if !held.is_empty() {
+            *hold_reasons.entry("index_unavailable").or_default() += held.len() as u64;
+        }
         items.clear();
         return held;
     }
@@ -4050,6 +4054,16 @@ pub(crate) fn finish_page(
             }
         }
         if !emitted {
+            let reason = if held.contains(item.source_session_id.as_str()) {
+                "absent_twin"
+            } else if entity.held {
+                "request_owned_held"
+            } else if !entity.certificate_ok {
+                "uncertified"
+            } else {
+                "emission_rejected"
+            };
+            *hold_reasons.entry(reason).or_default() += 1;
             withheld.insert(item.source_session_id.clone());
         }
         if let Some(fold) = item.claude_money.as_deref_mut() {

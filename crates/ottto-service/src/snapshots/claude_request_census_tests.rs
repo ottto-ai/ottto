@@ -1260,17 +1260,28 @@ fn census_retired_record_survives_an_unchanged_reparse() {
 fn census_records_keep_ids_of_zero_usage_only_transcripts() {
     let scratch = crate::test_scratch::ScratchDir::new("census-zero-usage-only");
     let root = scratch.join("projects");
-    census_write(
-        &root,
-        "census-api-errors.jsonl",
-        &[census_response(
+    // [money] Observed shape: one ID-bearing zero and eight unflagged,
+    // synthetic ID-less zeros. The available overlap ID must survive.
+    let mut errors = vec![census_response(
+        "census-api-errors",
+        Some("req_shared_err"),
+        "msg_err_1",
+        1,
+        0,
+    )];
+    for second in 2..=9 {
+        let mut row: serde_json::Value = serde_json::from_str(&census_response(
             "census-api-errors",
-            Some("req_shared_err"),
-            "msg_err_1",
-            1,
+            None,
+            &format!("msg_err_{second}"),
+            second,
             0,
-        )],
-    );
+        ))
+        .unwrap();
+        row["message"]["model"] = serde_json::json!("<synthetic>");
+        errors.push(format!("{row}\n"));
+    }
+    census_write(&root, "census-api-errors.jsonl", &errors);
     census_write(
         &root,
         "census-peer.jsonl",
