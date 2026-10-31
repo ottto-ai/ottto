@@ -2986,6 +2986,9 @@ mod growth_tests {
         assert_eq!(serde_json::to_vec(&restart(&index)).unwrap(), before);
         let mut census = ScanCensus::default();
         let now = unix_seconds(SystemTime::now()).unwrap() + 40 * 86400;
+        // Main's #876 retains an indexed grown file across the window
+        // (DiscoveryRetention::owes_stamped / codex_fragment::grown); OFF
+        // selects it exactly as main does, without any v2 growth custody.
         assert!(candidate_from_traversal_path(
             SnapshotSource::ClaudeCode,
             fixture.pending(),
@@ -2995,7 +2998,7 @@ mod growth_tests {
             // v2 growth follows the index (production derivation).
             &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
         )
-        .is_none());
+        .is_some());
         assert!(reconcile_missing_index_entries_with_limit(&mut index, 1));
         assert!(!index.files.contains_key(&fixture.key));
     }
