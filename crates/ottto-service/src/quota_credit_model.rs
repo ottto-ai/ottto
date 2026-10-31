@@ -166,10 +166,6 @@ pub(crate) enum ListObservation {
         provider: Provider,
         provider_count: Option<u64>,
     },
-    /// The provider/plan has no per-grant details. No adapter reports this
-    /// yet, so it is test-only until one does.
-    #[cfg(test)]
-    NotSupported { provider: Provider },
 }
 
 /// A model rule that refused or shaped a value. Field paths only, never the
@@ -207,12 +203,6 @@ pub(crate) struct GrantsBuild {
 }
 
 impl GrantsBuild {
-    /// Test-only: adapters take the diagnostics from [`GrantsBuild::apply_to`].
-    #[cfg(test)]
-    pub(crate) fn diagnostics(&self) -> &[CreditModelDiagnostic] {
-        &self.diagnostics
-    }
-
     /// Write the grant section into `balance` and recompute its summaries.
     pub(crate) fn apply_to(self, balance: &mut AgentCreditBalance) -> Vec<CreditModelDiagnostic> {
         balance.grants = self.grants;
@@ -255,14 +245,6 @@ pub(crate) fn build_grants(obs: ListObservation) -> GrantsBuild {
                 grant_count: bounded_grant_count(provider_count, &mut diagnostics),
                 provider: Some(provider),
                 diagnostics,
-                ..GrantsBuild::default()
-            };
-        }
-        #[cfg(test)]
-        ListObservation::NotSupported { provider } => {
-            return GrantsBuild {
-                grants_state: Some(CreditGrantsState::NotSupported),
-                provider: Some(provider),
                 ..GrantsBuild::default()
             };
         }
