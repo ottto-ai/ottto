@@ -3516,7 +3516,29 @@ impl SharedCache {
         interpretation: &Interpretation<'_>,
     ) -> RestoreOutcome {
         if !restart_restore::enabled() {
-            return RestoreOutcome::Miss(MissClass::Missing);
+            let Some(source) = durable_source(snapshot_source) else {
+                return RestoreOutcome::Miss(MissClass::Unavailable);
+            };
+            let Ok(root) = self.durable.lock() else {
+                return RestoreOutcome::Miss(MissClass::Unavailable);
+            };
+            // Pass registration replaces main's slot fact without opening or
+            // allocating a store. Preserve its pre-I/O and no-record decisions.
+            let has_slot = root.passes[source.slot()].is_some();
+            let entry = index.files.get(key);
+            return RestoreOutcome::Miss(if entry.is_none() && !has_slot {
+                MissClass::NoEntry
+            } else if entry.is_some_and(|entry| entry.source_file_fingerprint.is_empty()) {
+                MissClass::SelectionCleared
+            } else if index.effective_upload_body_witness_revision_requires_adoption(key) {
+                MissClass::HistoryOwed
+            } else if entry.is_none() {
+                MissClass::NoEntry
+            } else if has_slot {
+                MissClass::Missing
+            } else {
+                MissClass::Unavailable
+            });
         }
         let floor_behind = interpretation
             .accepted
