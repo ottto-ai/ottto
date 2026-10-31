@@ -54,7 +54,7 @@ pub(crate) const E2_GROUPING: &str =
 /// otherwise (records written by permit-era builds without a permit).
 #[cfg(not(test))]
 pub(crate) const fn cycle_contract(captured: bool) -> &'static str {
-    compiled_cycle_contract(captured, super::claude_request_money::e2::GATE)
+    compiled_cycle_contract(captured, true)
 }
 
 // Durable grouping version shares the existing identity-contract rearm. The
@@ -1061,8 +1061,19 @@ fn apply_grouped_with_accepted(
     // below must satisfy the same wire bounds and reconciliation rules.
     install(item, &evidence, top_identities, bucket_identities, refusals);
     let attempted_bytes = grouping.item_bytes(item);
-    if attempted_bytes > MAX_ITEM_BYTES {
-        over_cap.insert(OverCap::Bytes);
+    let components = (attempted_bytes > MAX_ITEM_BYTES)
+        .then(|| shed_display_leaves(item, &grouping, attempted_bytes));
+    if let Some(bytes) = &components {
+        if bytes.after_shed > MAX_ITEM_BYTES {
+            over_cap.insert(OverCap::Bytes);
+        } else if over_cap.is_empty() {
+            // Shedding alone fit: record it, since no strip will.
+            crate::local_resource_diagnostics::claude_identity_over_cap(
+                &over_cap,
+                attempted_bytes,
+                Some(bytes),
+            );
+        }
     }
     let unpriced = over_cap
         .is_empty()
@@ -1090,7 +1101,11 @@ fn apply_grouped_with_accepted(
         }
         over_cap.insert(OverCap::Bytes);
     }
-    crate::local_resource_diagnostics::claude_identity_over_cap(&over_cap, attempted_bytes);
+    crate::local_resource_diagnostics::claude_identity_over_cap(
+        &over_cap,
+        attempted_bytes,
+        components.as_ref(),
+    );
     let attempted_counts = cap_counts(item, &grouping, accepted, None);
     let accepted_tagged_attempted = item
         .usage_buckets
@@ -1992,6 +2007,63 @@ fn set_row(
                     .collect(),
             );
         }
+    }
+}
+
+/// Money identity outranks display data (#909 P0): an over-cap tagged body
+/// first sheds context-curve points, then cache observations from the end of
+/// the patch, and only then may the selector strip tags. Returns the pre-shed component bytes
+/// (counts only) and the bytes after shedding.
+fn shed_display_leaves(
+    item: &mut SnapshotItem,
+    grouping: &Grouping,
+    attempted: usize,
+) -> crate::local_resource_diagnostics::ClaudeIdentityOverCapBytes {
+    let mut probe = item.clone();
+    probe.context_curve = None;
+    let without_curve = grouping.item_bytes(&probe);
+    probe.cache_observations = None;
+    let without_cache = grouping.item_bytes(&probe);
+    strip(&mut probe);
+    let untagged = grouping.item_bytes(&probe);
+    probe.usage_buckets.clear();
+    let rest = grouping.item_bytes(&probe);
+    drop(probe);
+    let fits = |item: &SnapshotItem| grouping.item_bytes(item) <= MAX_ITEM_BYTES;
+    if without_curve > MAX_ITEM_BYTES {
+        // No curve can fit: go straight to the unavailable curve without
+        // measuring the whole body once per pruned point.
+        super::fit_context_curve(item, |_| false);
+    } else {
+        super::fit_context_curve(item, fits);
+    }
+    while !fits(item) {
+        let Some(cache) = item.cache_observations.as_mut() else {
+            break;
+        };
+        if cache.operations.pop().is_none() {
+            break;
+        }
+        // The receiver keeps accepted rows on a partial patch. The omitted
+        // count is unknown: an exact one could become null against an ACKed
+        // predecessor at upload and grow past the measured bytes.
+        cache.coverage = "partial".into();
+        cache.omitted_observation_count = None;
+    }
+    crate::local_resource_diagnostics::ClaudeIdentityOverCapBytes {
+        // SHA-256(session id)[:8], the investigation reports' entity digest.
+        entity: format!(
+            "{:x}",
+            sha2::Sha256::digest(item.source_session_id.as_bytes())
+        )[..8]
+            .to_owned(),
+        item: attempted,
+        context_curve: attempted.saturating_sub(without_curve),
+        cache_observations: without_curve.saturating_sub(without_cache),
+        identity: without_cache.saturating_sub(untagged),
+        usage_buckets: untagged.saturating_sub(rest),
+        rest,
+        after_shed: grouping.item_bytes(item),
     }
 }
 
@@ -3214,9 +3286,6 @@ pub(crate) fn unhealthy_cleared_account(item: &SnapshotItem) -> Option<&str> {
 /// Read retained creator bindings using the same machine/session key as the
 /// account owner. No transcript read, new index field, or current-login guess.
 pub(crate) fn retain_root_accounts(items: &mut [SnapshotItem], index: &ScanIndex, machine: &str) {
-    if !super::claude_request_money::e2::enabled() {
-        return;
-    }
     for item in items {
         if item
             .claude_money
@@ -4525,8 +4594,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 MarkerVerdict::Trusted(org) => org,
                 _ => return,
             },
-            None if super::claude_request_money::e2::enabled()
-                && keeps_markerless_account(item)
+            None if keeps_markerless_account(item)
                 && super::exact_session_account_hash(item).as_deref() == Some(account) =>
             {
                 let Some(org) = owner
@@ -4755,9 +4823,7 @@ pub(crate) struct RequestOwnedOriginals(
 
 pub(crate) fn capture_request_owned_originals(items: &[SnapshotItem]) -> RequestOwnedOriginals {
     let mut originals = RequestOwnedOriginals::default();
-    if !super::claude_request_money::e2::enabled() {
-        return originals;
-    }
+
     for item in items {
         if item.claude_money.is_none()
             || !item
@@ -4796,9 +4862,7 @@ pub(crate) fn stage_request_owned_activity(
     originals: &RequestOwnedOriginals,
 ) -> RequestOwnedActivity {
     let mut page = RequestOwnedActivity::default();
-    if !super::claude_request_money::e2::enabled() {
-        return page;
-    }
+
     for item in items {
         if item.claude_money.is_none()
             || !item
@@ -4982,9 +5046,7 @@ fn tag_item(
     let retained = evidence
         .accepted_buckets
         .is_some_and(AcceptedBuckets::retained_enabled);
-    if super::claude_request_money::e2::enabled()
-        && super::claude_history_upgrade::is_request_owned_literal(item)
-    {
+    if super::claude_history_upgrade::is_request_owned_literal(item) {
         if item
             .model_usage
             .iter()

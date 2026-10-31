@@ -8,13 +8,7 @@ pub(crate) const ABSENT_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 // Domain-separated SHA-256 prefixes are local lookup keys, never move proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LocationKey([u8; 16]);
-impl crate::heap_layout_bound::HeapLayoutBound for LocationKey {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; LocationKey);
 fn key(domain: &[u8], value: &str) -> LocationKey {
     let mut h = Sha256::new();
     h.update(domain);
