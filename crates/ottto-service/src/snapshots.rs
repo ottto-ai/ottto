@@ -26788,13 +26788,7 @@ impl OwnedSourceScan {
             index.record_started_claude_request_identity_contract(claude_request_identity_capture);
         }
         if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
-            refresh_terminal_off_discovery(
-                index,
-                roots,
-                audit_now,
-                watcher_overflowed,
-                file_limit,
-            );
+            refresh_terminal_off_discovery(index, roots, audit_now, watcher_overflowed, file_limit);
         }
         let next_generation_hints;
         {
