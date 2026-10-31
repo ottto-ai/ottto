@@ -198,6 +198,70 @@ fn claude_p92_clock_qualification_and_all_bucket_coverage() {
         "earlier bucket cannot be skipped"
     );
     assert_eq!(items[1].request_count, 1);
+    // Root transcript (was `claude_h296_root_requires_original_clocks_in_every_hour_before_fold`):
+    // original clocks in every hour before the fold, on the non-sidechain file.
+    {
+        let path = dir.join(format!("{root}.jsonl"));
+        let first: Value =
+            serde_json::from_str(fs::read_to_string(&path).unwrap().lines().next().unwrap())
+                .unwrap();
+        let mut later = first.clone();
+        later["requestId"] = json!("req_later");
+        later["timestamp"] = json!("2026-08-02T08:20:00Z");
+        let parse = |records: &[Value]| {
+            fs::write(
+                &path,
+                records
+                    .iter()
+                    .map(|r| r.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+            crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+                &path,
+                "2026-08-02T09:00:00Z",
+                "f".repeat(64),
+            )
+            .unwrap()
+            .remove(0)
+        };
+        let mut item = parse(&[first.clone(), later.clone()]);
+        let api = [
+            complete_api_row(&root, "req_1", 1, 10, 10, 0),
+            complete_api_row(&root, "req_later", 2, 10, 10, 0),
+        ];
+        let trace = [
+            complete_trace_row(&root, "req_1", ""),
+            complete_trace_row(&root, "req_later", ""),
+        ];
+        assert!(d1_subagent_account_specimen(&mut item, &api, &trace));
+        assert_eq!(item.usage_buckets.len(), 2);
+        output("native-root-multihour.json", &item);
+        item.claude_usage_occurrences
+            .get_mut("req_1")
+            .unwrap()
+            .event_clock_complete = false;
+        assert!(
+            !d1_subagent_account_specimen(&mut item, &api, &trace),
+            "earliest hour cannot borrow the later stamp"
+        );
+        let mut partial = first.clone();
+        partial.as_object_mut().unwrap().remove("timestamp");
+        partial["message"]["usage"]["output_tokens"] = json!(11);
+        let mut folded = parse(&[first.clone(), partial]);
+        assert!(
+            !d1_subagent_account_specimen(&mut folded, &api[..1], &trace[..1]),
+            "unstamped progressive partial cannot borrow the first clock"
+        );
+        let mut iterations = first;
+        iterations["message"]["usage"]["iterations"] =
+            json!([{"input_tokens":10,"output_tokens":1},{"input_tokens":10,"output_tokens":1}]);
+        let mut collapsed = parse(&[iterations]);
+        assert!(
+            !d1_subagent_account_specimen(&mut collapsed, &api[..1], &trace[..1]),
+            "collapsed calls require exact count/index coverage"
+        );
+    }
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -636,76 +700,6 @@ fn h296_trace_refingerprint(row: &mut crate::claude_local_otel::ClaudeTraceOwner
 }
 
 #[test]
-fn claude_h296_root_and_child_have_independent_exact_request_logins() {
-    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
-
-    let (dir, root, mut api, trace) = h296_root_evidence();
-    let child_path = dir
-        .join(&root.source_session_id)
-        .join("subagents/agent-a4d1585d310070d0f.jsonl");
-    let child = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
-        &child_path,
-        "2026-08-02T07:01:00Z",
-        "child-fp".into(),
-    )
-    .unwrap()
-    .remove(0);
-    let child_row = api
-        .evidence
-        .get_mut(&root.source_session_id)
-        .unwrap()
-        .last_mut()
-        .unwrap();
-    child_row.account_identifier_hash = Some("b".repeat(64));
-    child_row.fingerprint.clear();
-    child_row.fingerprint = format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&child_row).unwrap())
-    );
-    let mut items = [root.clone(), child];
-    let creator = items[0].session_account_evidence.clone();
-    let usage = (
-        items[0].input_tokens,
-        items[0].output_tokens,
-        items[0].request_count,
-        items[0].cost.clone(),
-    );
-    let result = claude_request_accounts::apply(&mut items, &api, &trace);
-    assert_eq!(
-        result.coverage,
-        [claude_request_accounts::Coverage::Complete; 2]
-    );
-    assert_eq!(exact_session_account_hash(&items[0]), Some("a".repeat(64)));
-    assert_eq!(exact_session_account_hash(&items[1]), Some("b".repeat(64)));
-    assert_eq!(
-        items[0].request_count, 4,
-        "child-owned request never contributes to root"
-    );
-    assert_eq!(items[0].session_account_evidence, creator);
-    assert_eq!(
-        (
-            items[0].input_tokens,
-            items[0].output_tokens,
-            items[0].request_count,
-            items[0].cost.clone()
-        ),
-        usage
-    );
-    assert!(items
-        .iter()
-        .all(|item| item.provenance.collector == claude_request_accounts::COMPLETE));
-    output("native-root-complete.json", &items[0]);
-    let bytes = serde_json::to_vec(&items[0]).unwrap();
-    claude_request_accounts::apply(&mut items, &api, &trace);
-    assert_eq!(
-        serde_json::to_vec(&items[0]).unwrap(),
-        bytes,
-        "exact proof re-evaluation is a no-op"
-    );
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
 fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
     let (dir, original, api, trace) = h296_root_evidence();
     for case in [
@@ -797,107 +791,6 @@ fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
         );
         if case == "partial" {
             output("native-root-unknown.json", &item);
-        }
-    }
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn claude_h296_root_clocks_and_creator_conflicts_stay_separate() {
-    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
-
-    let (dir, original, api, trace) = h296_root_evidence();
-    for case in [
-        "missing_clock",
-        "observer_fallback",
-        "hour_minimum",
-        "missing_hour",
-        "creator_conflict",
-        "creator_other_account",
-        "unsupported_route",
-        "multiple_logins",
-    ] {
-        let mut item = original.clone();
-        let mut api = api.clone();
-        match case {
-            "missing_clock" => {
-                item.claude_usage_occurrences
-                    .get_mut("req_1")
-                    .unwrap()
-                    .timestamp = None
-            }
-            "observer_fallback" => {
-                item.claude_usage_occurrences
-                    .get_mut("req_1")
-                    .unwrap()
-                    .event_clock_complete = false
-            }
-            "hour_minimum" => {
-                item.usage_buckets[0].first_activity_at = Some("2026-08-02T07:00:01Z".into())
-            }
-            "missing_hour" => item.usage_buckets.clear(),
-            "creator_conflict" | "creator_other_account" => {
-                item.session_account_evidence = Some(SessionAccountEvidence {
-                    provider: "anthropic",
-                    account_identifier_hash: Some("b".repeat(64)),
-                    provider_workspace_hash: Some("c".repeat(64)),
-                    identity_hash_scheme: "provider-sha256:v1",
-                    evidence_source: "claude_desktop_original:v1",
-                    identity_disposition: Some(if case == "creator_conflict" {
-                        "conflict"
-                    } else {
-                        "complete"
-                    }),
-                    source_created_at: Some("2026-08-02T06:59:00Z".into()),
-                });
-            }
-            "unsupported_route" => item.model_usage[0].billing_channel = Some("api".into()),
-            "multiple_logins" => {
-                let row = &mut api.evidence.get_mut(&item.source_session_id).unwrap()[0];
-                row.account_identifier_hash = Some("b".repeat(64));
-                row.fingerprint.clear();
-                row.fingerprint = format!(
-                    "sha256:{:x}",
-                    Sha256::digest(serde_json::to_vec(&row).unwrap())
-                );
-            }
-            _ => unreachable!(),
-        }
-        let creator = item.session_account_evidence.clone();
-        let usage = (
-            item.input_tokens,
-            item.output_tokens,
-            item.request_count,
-            item.cost.clone(),
-        );
-        let result = claude_request_accounts::apply(std::slice::from_mut(&mut item), &api, &trace);
-        assert_ne!(
-            result.coverage,
-            [claude_request_accounts::Coverage::Complete],
-            "{case}"
-        );
-        assert_eq!(
-            item.provenance.collector,
-            claude_request_accounts::UNKNOWN,
-            "{case}"
-        );
-        assert_eq!(item.session_account_evidence, creator, "{case}");
-        assert_eq!(
-            (
-                item.input_tokens,
-                item.output_tokens,
-                item.request_count,
-                item.cost.clone()
-            ),
-            usage,
-            "{case}"
-        );
-        if case == "observer_fallback" {
-            assert_eq!(
-                exact_session_account_hash(&item),
-                Some("a".repeat(64)),
-                "clock loss does not erase independently proved account"
-            );
         }
     }
     fs::remove_dir_all(dir).unwrap();
@@ -1007,161 +900,81 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
         "qualification is not an ACK"
     );
     output("native-root-production.json", qualified);
-    fs::remove_dir_all(dir).unwrap();
-}
-
-/// Contract 5 is always on: with no cohort token anywhere, a Claude page
-/// builds contract-5 bodies, the same bytes every run. Was
-/// `claude_contract5_bodies_need_this_cycles_cohort_permit`, whose
-/// tokenless and denied cycles kept today's (`COMPLETE`) bytes.
-#[test]
-fn claude_contract5_bodies_need_no_cohort_token() {
-    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
-
-    use crate::snapshots::claude_request_identity as identity;
-    let (dir, root, api, trace) = h296_root_evidence();
-    let support = dir.join("support");
-    let digest = format!("{:x}", Sha256::digest(root.source_session_id.as_bytes()));
-    for (kind, rows) in [
-        (
-            "claude-code-effort",
-            api.evidence[&root.source_session_id]
-                .iter()
-                .map(|row| serde_json::to_value(row).unwrap())
-                .collect::<Vec<_>>(),
-        ),
-        (
-            "claude-code-trace-ownership",
-            trace.evidence[&root.source_session_id]
-                .iter()
-                .map(|row| serde_json::to_value(row).unwrap())
-                .collect::<Vec<_>>(),
-        ),
-    ] {
-        let path = support
-            .join("local-otel")
-            .join(kind)
-            .join(format!("{digest}.jsonl"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            path,
-            rows.iter()
-                .map(|row| row.to_string() + "\n")
-                .collect::<String>(),
+    // Root and child keep independent exact logins under direct D1
+    // qualification (was `claude_h296_root_and_child_have_independent_exact_request_logins`),
+    // on the same h296 rows with the root parsed as ordinary (listed) money.
+    {
+        let mut api = api.clone();
+        let mut ordinary_root = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &dir.join(format!("{}.jsonl", root.source_session_id)),
+            "2026-08-02T07:01:00Z",
+            "parent-fp".into(),
         )
-        .unwrap();
-    }
-    let run = || {
-        let mut index =
-            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
-        let mut scan = scan_source_roots_with_test_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&dir),
-            &mut index,
-            "2026-08-02T07:10:00Z",
-            7,
-            100,
-            false,
+        .unwrap()
+        .remove(0);
+        ordinary_root.source_file_fingerprint = Some("e".repeat(64));
+        let child_path = dir
+            .join(&root.source_session_id)
+            .join("subagents/agent-a4d1585d310070d0f.jsonl");
+        let child = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &child_path,
+            "2026-08-02T07:01:00Z",
+            "child-fp".into(),
         )
-        .unwrap();
-        crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
-        scan.snapshots
-    };
-    let collector = |items: &[SnapshotItem]| {
-        items
-            .iter()
-            .find(|item| item.source_session_id == root.source_session_id)
+        .unwrap()
+        .remove(0);
+        let child_row = api
+            .evidence
+            .get_mut(&root.source_session_id)
             .unwrap()
-            .provenance
-            .collector
-            .clone()
-    };
-    let first = run();
-    assert_eq!(collector(&first), identity::COLLECTOR);
-    let tagged = first
-        .iter()
-        .find(|item| item.source_session_id == root.source_session_id)
-        .unwrap();
-    assert!(
-        tagged.claude_org_markers.is_none(),
-        "fresh tags need no org marker"
-    );
-    assert!(
-        !tagged.request_evidence.is_empty(),
-        "fresh contract-5 bodies get identity tags"
-    );
-    assert_eq!(tagged.request_count, 4);
-    assert_eq!(tagged.request_identity_refusals, 0);
-    assert_eq!(
-        serde_json::to_vec(&run()).unwrap(),
-        serde_json::to_vec(&first).unwrap()
-    );
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn claude_h296_root_requires_original_clocks_in_every_hour_before_fold() {
-    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
-
-    let (dir, root, _) = claude_account_family_fixture(true);
-    let path = dir.join(format!("{root}.jsonl"));
-    let first: Value =
-        serde_json::from_str(fs::read_to_string(&path).unwrap().lines().next().unwrap()).unwrap();
-    let mut later = first.clone();
-    later["requestId"] = json!("req_later");
-    later["timestamp"] = json!("2026-08-02T08:20:00Z");
-    let parse = |records: &[Value]| {
-        fs::write(
-            &path,
-            records
-                .iter()
-                .map(|r| r.to_string() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
-        crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
-            &path,
-            "2026-08-02T09:00:00Z",
-            "f".repeat(64),
-        )
-        .unwrap()
-        .remove(0)
-    };
-    let mut item = parse(&[first.clone(), later.clone()]);
-    let api = [
-        complete_api_row(&root, "req_1", 1, 10, 10, 0),
-        complete_api_row(&root, "req_later", 2, 10, 10, 0),
-    ];
-    let trace = [
-        complete_trace_row(&root, "req_1", ""),
-        complete_trace_row(&root, "req_later", ""),
-    ];
-    assert!(d1_subagent_account_specimen(&mut item, &api, &trace));
-    assert_eq!(item.usage_buckets.len(), 2);
-    output("native-root-multihour.json", &item);
-    item.claude_usage_occurrences
-        .get_mut("req_1")
-        .unwrap()
-        .event_clock_complete = false;
-    assert!(
-        !d1_subagent_account_specimen(&mut item, &api, &trace),
-        "earliest hour cannot borrow the later stamp"
-    );
-    let mut partial = first.clone();
-    partial.as_object_mut().unwrap().remove("timestamp");
-    partial["message"]["usage"]["output_tokens"] = json!(11);
-    let mut folded = parse(&[first.clone(), partial]);
-    assert!(
-        !d1_subagent_account_specimen(&mut folded, &api[..1], &trace[..1]),
-        "unstamped progressive partial cannot borrow the first clock"
-    );
-    let mut iterations = first;
-    iterations["message"]["usage"]["iterations"] =
-        json!([{"input_tokens":10,"output_tokens":1},{"input_tokens":10,"output_tokens":1}]);
-    let mut collapsed = parse(&[iterations]);
-    assert!(
-        !d1_subagent_account_specimen(&mut collapsed, &api[..1], &trace[..1]),
-        "collapsed calls require exact count/index coverage"
-    );
+            .last_mut()
+            .unwrap();
+        child_row.account_identifier_hash = Some("b".repeat(64));
+        child_row.fingerprint.clear();
+        child_row.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&child_row).unwrap())
+        );
+        let mut items = [ordinary_root, child];
+        let creator = items[0].session_account_evidence.clone();
+        let usage = (
+            items[0].input_tokens,
+            items[0].output_tokens,
+            items[0].request_count,
+            items[0].cost.clone(),
+        );
+        let result = claude_request_accounts::apply(&mut items, &api, &trace);
+        assert_eq!(
+            result.coverage,
+            [claude_request_accounts::Coverage::Complete; 2]
+        );
+        assert_eq!(exact_session_account_hash(&items[0]), Some("a".repeat(64)));
+        assert_eq!(exact_session_account_hash(&items[1]), Some("b".repeat(64)));
+        assert_eq!(
+            items[0].request_count, 4,
+            "child-owned request never contributes to root"
+        );
+        assert_eq!(items[0].session_account_evidence, creator);
+        assert_eq!(
+            (
+                items[0].input_tokens,
+                items[0].output_tokens,
+                items[0].request_count,
+                items[0].cost.clone()
+            ),
+            usage
+        );
+        assert!(items
+            .iter()
+            .all(|item| item.provenance.collector == claude_request_accounts::COMPLETE));
+        output("native-root-complete.json", &items[0]);
+        let bytes = serde_json::to_vec(&items[0]).unwrap();
+        claude_request_accounts::apply(&mut items, &api, &trace);
+        assert_eq!(
+            serde_json::to_vec(&items[0]).unwrap(),
+            bytes,
+            "exact proof re-evaluation is a no-op"
+        );
+    }
     fs::remove_dir_all(dir).unwrap();
 }

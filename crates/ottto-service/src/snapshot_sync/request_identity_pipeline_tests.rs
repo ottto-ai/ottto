@@ -322,6 +322,56 @@ fn always_on_emits_contract5_whatever_the_hint_token() {
             .is_none(),
         "an aborted cycle writes no scan state"
     );
+
+    // Telemetry-owned tags need no org marker and no cohort token, and are
+    // the same every run (was `claude_contract5_bodies_need_no_cohort_token`).
+    let transcript = fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+    let unmarked = std::fs::read_to_string(&transcript)
+        .expect("read synthetic transcript")
+        .lines()
+        .filter(|line| !line.contains("credential_org"))
+        .map(|line| line.to_owned() + "\n")
+        .collect::<String>();
+    std::fs::write(&transcript, unmarked).expect("drop the org marker");
+    let mut telemetry_bodies = BTreeSet::new();
+    for name in ["telemetry-first", "telemetry-again"] {
+        write_native_bootstrap_sidecars(&fixture, &fixture.base.join(format!("support-{name}")));
+        let cycle = identity_pipeline_cycle(&fixture, name, "").expect("cycle");
+        let item = session(&cycle);
+        assert_eq!(item.provenance.collector, identity::COLLECTOR, "{name}");
+        assert!(
+            item.claude_org_markers.is_none(),
+            "{name}: fresh tags need no org marker"
+        );
+        assert!(
+            !item.request_evidence.is_empty(),
+            "{name}: fresh contract-5 bodies get identity tags"
+        );
+        assert_eq!(item.request_identity_refusals, 0, "{name}");
+        assert_eq!(
+            (item.request_count, item.input_tokens, item.output_tokens),
+            (2, 30, 3),
+            "{name}"
+        );
+        telemetry_bodies.insert(
+            serde_json::to_vec(&(
+                &item.provenance.collector,
+                &item.request_evidence,
+                item.request_identity_refusals,
+                &item.model_usage,
+                &item.usage_buckets,
+            ))
+            .expect("serialize identity projection"),
+        );
+    }
+    assert_eq!(
+        telemetry_bodies.len(),
+        1,
+        "telemetry-owned tags are the same every run"
+    );
 }
 
 /// Offline transport for the real source lifecycle. It ACKs exactly the wire

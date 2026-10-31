@@ -129,11 +129,9 @@ struct RearmPage {
     offered: BTreeSet<String>,
     /// Bodies the server acknowledged.
     uploaded: BTreeSet<String>,
-    native_correction_candidates: usize,
     native_receipts: usize,
     native_lease_allowed: bool,
     transcript_ownership_complete: bool,
-    native_census_complete_before_fold: bool,
 }
 
 /// The converged state that both re-arm rules reach after the first proof
@@ -552,7 +550,6 @@ impl RearmFixture {
                 })
             };
         let comparison_before_fold = comparison_requested(&comparison_completion);
-        let native_census_complete_before_fold = scan.census_complete;
         if self.owned_base_preparation {
             // Native acquisition result BEFORE fold/finalizer/filter. Its
             // caller-supplied event time is independent of the body's field.
@@ -622,9 +619,6 @@ impl RearmFixture {
         if comparison_completion.is_some() {
             writeln!(std::io::stderr().lock(), "native_comparison_incremental_owner: before_fold_requested={comparison_before_fold:?} after_fold_requested={comparison_after_fold:?} before_upload_requested={comparison_before_upload:?} limit={} normal_terminal_retired_before_upload=true fallback_terminal_moved_not_cloned=true total_existing_finish_peak_proved=false rss_measured=false", crate::source_rotation::PARKED_BUDGET).unwrap();
         }
-        let native_correction_candidates = comparison_completion.as_ref().map_or(0, |comparison| {
-            comparison.pending_native_correction_count_for_test()
-        });
         let native_lease_allowed = native_preparation
             .as_ref()
             .and_then(|frame| frame.native_comparison_lease.as_ref())
@@ -824,11 +818,9 @@ impl RearmFixture {
                 held: holds.held_fingerprints,
                 offered,
                 uploaded,
-                native_correction_candidates,
                 native_receipts,
                 native_lease_allowed,
                 transcript_ownership_complete,
-                native_census_complete_before_fold,
             };
         }
         assert_eq!(
@@ -947,11 +939,9 @@ impl RearmFixture {
             held: holds.held_fingerprints,
             offered,
             uploaded,
-            native_correction_candidates,
             native_receipts,
             native_lease_allowed,
             transcript_ownership_complete,
-            native_census_complete_before_fold,
         }
     }
 
@@ -1337,102 +1327,6 @@ fn native_comparison_original_novel_import_oracle() {
     writeln!(std::io::stderr().lock(), "native_comparison_original_novel_import: original_body_ran=true original_passed=true page_files=2 actual_SourcePreparation=true actual_existing_frame_budget=true exact_body_ACK_validator=true").unwrap();
 }
 
-fn native_comparison_interrupted_correction_is_terminal_base(upload: RearmUpload) {
-    let mode = match upload {
-        RearmUpload::Shed => "shed",
-        RearmUpload::AckLost => "pending_ack",
-        RearmUpload::Accept => unreachable!(),
-    };
-    if !crate::heap_layout_bound::layout_supported() {
-        writeln!(std::io::stderr().lock(), "native_comparison_interrupted_correction: mode={mode} supported_positive=UNEXECUTED interrupted_body_ran=false terminal_base_proved=false").unwrap();
-        return;
-    }
-    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let fixture = RearmFixture::new(if upload == RearmUpload::Shed {
-        "native-receipt-shed"
-    } else {
-        "native-receipt-pending-ack"
-    });
-    // The real initial bounded native census mints P and the save bootstraps
-    // permission. No index entry, Skip or allowed bit is seeded here.
-    let first = fixture.generation(8);
-    let terminal = first.last().unwrap();
-    assert!(terminal.scan.census_complete && terminal.fully_settled);
-    assert_eq!(
-        RearmFixture::family_rearm_debt(&terminal.index),
-        rearm_family_sessions().len()
-    );
-    assert!(fixture.native_lifecycle.retained_valid_for_test());
-    let root_key = RearmFixture::family_keys(&terminal.index)[REARM_ROOT].clone();
-    let before = serde_json::to_vec(&terminal.index.files[&root_key]).unwrap();
-    let interrupted = fixture.page("2026-08-02T09:00:00Z", upload);
-    assert!(
-        interrupted.native_lease_allowed,
-        "actual native conjunction+save, never forced permission"
-    );
-    assert!(
-        interrupted.native_correction_candidates > 0,
-        "actual frozen-P corrective native parse before the interruption"
-    );
-    assert!(!interrupted.offered.is_empty());
-    assert!(interrupted.uploaded.is_empty() && !interrupted.fully_settled);
-    assert_eq!(
-        interrupted.native_receipts, 0,
-        "offered/shed/pending ACK never mint"
-    );
-    assert_eq!(
-        serde_json::to_vec(&interrupted.index.files[&root_key]).unwrap(),
-        before,
-        "actual locked partial save preserves the previous selected body/rearm debt"
-    );
-    assert!(interrupted.index.bounded_sweep_had_unsettled_upload());
-    assert!(
-        !fixture.native_lifecycle.retained_valid_for_test(),
-        "abandoned error frame revokes its permit/window"
-    );
-    let followup = fixture.generation(10);
-    assert!(
-        !followup.last().unwrap().scan.census_complete,
-        "finishing the interrupted traversal still owes the existing clean-followup census"
-    );
-    assert!(followup.iter().all(|page| !page.native_lease_allowed));
-    assert!(followup.iter().all(|page| page.native_receipts == 0));
-    assert!(!fixture.native_lifecycle.retained_valid_for_test());
-    // A real fresh walk clears the existing unsettled marker at its ordinary
-    // constructor. Do not reset traversal state or promote the incomplete one.
-    let followup = fixture.generation(11);
-    let terminal = followup.last().unwrap();
-    assert!(terminal.scan.census_complete);
-    assert!(followup.iter().all(|page| !page.native_lease_allowed),
-        "an interrupted window cannot renew permission before another terminal native conjunction and save");
-    assert_eq!(terminal.native_receipts, 0);
-    assert!(
-        terminal.index.files[&root_key]
-            .source_file_fingerprint
-            .is_empty(),
-        "without a valid same-window correction receipt the actual terminal fold uses base rearm"
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_interrupted_correction: mode={mode} interrupted_body_ran=true actual_SourcePreparation=true actual_frame_bound=true actual_upload_callback=true actual_partial_CAS_save=true offered_without_ACK=true minted=0 old_body_debt_preserved=true permit_revoked=true actual_followup_terminal_base=true page_files=2 installed_performance_proof=false").unwrap();
-}
-
-#[test]
-#[serial(source_manifests)]
-// A shed page records RatelimitBackoff in the shared client_report counters.
-#[serial(client_report)]
-fn native_comparison_shed_corrective_parse_partial_save_and_terminal_use_base() {
-    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-
-    native_comparison_interrupted_correction_is_terminal_base(RearmUpload::Shed);
-}
-
-#[test]
-#[serial(source_manifests)]
-fn native_comparison_pending_ack_corrective_parse_partial_save_and_terminal_use_base() {
-    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-
-    native_comparison_interrupted_correction_is_terminal_base(RearmUpload::AckLost);
-}
-
 // Separate naturally bootstrapped selected histories, sharing the SAME immutable
 // physical source/sidecar revisions. No index/permit/certificate is copied.
 fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture {
@@ -1523,6 +1417,40 @@ fn native_comparison_assert_old_bindings(before: &serde_json::Value, index: &Sca
         for (key, binding) in bindings {
             assert_eq!(&saved["session_account_bindings"][key], binding);
         }
+    }
+}
+
+/// Every family member's latest finalized effective body has its own strict
+/// ACK at its native read time, and the selected group is derived from it.
+fn native_comparison_assert_ack_conservation(
+    fixture: &RearmFixture,
+    selected: &serde_json::Value,
+) {
+    use sha2::{Digest, Sha256};
+    let trace = fixture.body_trace.borrow();
+    for (session, witness) in &trace.finalizer_witnesses {
+        if !rearm_family_sessions().contains(session) {
+            continue;
+        }
+        assert_eq!(
+            trace.finalizer_bodies[session]["collected_at"], trace.native_read_times[session],
+            "finalized body time is independently recorded native read-event time"
+        );
+        assert_eq!(
+            trace.strict_ack_witnesses.get(session),
+            Some(witness),
+            "latest effective body has its OWN strict ACK, including prior exact no-op"
+        );
+        let mut hash = Sha256::new();
+        for value in ["snapshot_file_upload_body_set:v1", witness.as_str()] {
+            hash.update((value.len() as u32).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        assert_eq!(
+            selected[session]["selected_witness"],
+            format!("{:x}", hash.finalize()),
+            "selected group is derived from own ACKed effective body"
+        );
     }
 }
 
@@ -1754,6 +1682,9 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     // The deferred-only contract applies to families that fit a native page.
     // The ORIGINAL two required oracles remain at REARM_PAGE_FILES=2.
     fixture.native_file_limit = 4;
+    // Transferred from E2-052: trace every finalized and ACKed body so the
+    // own-ACK conservation check below runs on this copy-hit history.
+    fixture.owned_base_preparation = true;
     fixture.establish();
     assert_eq!(rearm_reads(&fixture.generation(10)), 0);
     const COPY: &str = "e5555555-5555-4555-8555-555555555555";
@@ -1882,6 +1813,13 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
         RearmFixture::family_rearm_debt(&followup.last().unwrap().index),
         0
     );
+    // Transferred from E2-052: the followup settles, and every member's
+    // latest effective body has its own strict ACK.
+    assert!(followup.last().unwrap().fully_settled);
+    native_comparison_assert_ack_conservation(
+        &fixture,
+        &native_comparison_selected_family(&followup.last().unwrap().index),
+    );
     let quiet = fixture.generation(completion_hour + 2);
     assert_eq!(
         rearm_reads(&quiet),
@@ -1968,6 +1906,9 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
                 );
             }
             assert!(!page.uploaded.contains(&copy.snapshot_fingerprint));
+            // Transferred from the retired corrective-parse interruption
+            // variants (E2-043/044): an offered, unACKed page never mints.
+            assert_eq!(page.native_receipts, 0, "offered/shed/pending ACK never mint");
             assert_eq!(copy.first_turn_context_tokens, None);
             assert_eq!(copy.peak_context_fill_tokens, None);
             assert_eq!(copy.last_turn_context_tokens, None);
@@ -2067,31 +2008,6 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
     writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} body_ran=true N_defer_Nplus1_BASE_offer=true restart_between_N_Nplus1_checked={restart} exact_BASE_owner_outcome_checked={restart} actual_copy_offer=true actual_terminal_native_fold=true partial_CAS_save=true unACKed_copy_not_committed=true prior_bindings_preserved=true no_borrowed_posture=true eventual_exact_ACK=true").unwrap();
 }
 
-#[test]
-#[serial(source_manifests)]
-// A shed page records RatelimitBackoff in the shared client_report counters.
-#[serial(client_report)]
-fn native_comparison_copy_offer_shed_partial_save_recovers() {
-    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-
-    native_comparison_copy_offer_interruption(RearmUpload::Shed, false);
-}
-#[test]
-#[serial(source_manifests)]
-fn native_comparison_copy_offer_ack_loss_partial_save_recovers() {
-    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-
-    native_comparison_copy_offer_interruption(RearmUpload::AckLost, false);
-}
-#[test]
-#[serial(source_manifests)]
-// A shed page records RatelimitBackoff in the shared client_report counters.
-#[serial(client_report)]
-fn native_comparison_copy_offer_shed_restart_recovers() {
-    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-
-    native_comparison_copy_offer_interruption(RearmUpload::Shed, true);
-}
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_copy_offer_ack_loss_restart_recovers() {
@@ -2199,340 +2115,4 @@ fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
         "exact own C5 head, bytes, identity basis and per-request tags equal base"
     );
     writeln!(std::io::stderr().lock(), "native_comparison_own_C5: body_ran=true actual_hint_capture_and_emission=true own_telemetry_tags_positive=true base_exact_bytes_equal=true no_borrowed_identity=true transcript_settled_false=true exact_wire_ACK_save=true").unwrap();
-}
-
-/// One representative matched-source usefulness run. Padding is ignored
-/// progress metadata: accounting/evidence bytes and the original oracles are
-/// unchanged. Logical native bytes are not physical SSD I/O or RSS savings.
-#[test]
-#[serial(source_manifests)]
-fn native_comparison_deferred_policy_resource_usefulness() {
-    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
-
-    if !crate::heap_layout_bound::layout_supported() {
-        eprintln!("native_comparison_deferred_usefulness: supported_positive=UNEXECUTED");
-        return;
-    }
-    fn family_bytes(fixture: &RearmFixture, pages: &[RearmPage]) -> u64 {
-        pages
-            .iter()
-            .map(|page| {
-                let mut bytes = 0;
-                if page.parsed.contains(REARM_ROOT) {
-                    bytes += std::fs::metadata(fixture.root.join(format!("{REARM_ROOT}.jsonl")))
-                        .unwrap()
-                        .len();
-                }
-                for agent in REARM_AGENTS {
-                    if page.parsed.contains(&rearm_member_session(Some(agent))) {
-                        bytes += std::fs::metadata(
-                            fixture
-                                .root
-                                .join(REARM_ROOT)
-                                .join("subagents")
-                                .join(format!("agent-{agent}.jsonl")),
-                        )
-                        .unwrap()
-                        .len();
-                    }
-                }
-                bytes
-            })
-            .sum()
-    }
-    let _manifests = SourceManifestTestGuard::new();
-    let mut base = RearmFixture::ordinary("native-deferred-usefulness");
-    base.native_file_limit = 4;
-    // Use the SAME production SourcePreparation constructor and explicit
-    // capture=false input on BASE and candidate. The legacy test convenience
-    // scanner uses cfg(test) capture=true, which is a different input contract.
-    // Matching capture alone did not resolve the selected-witness diagnostic;
-    // retain this faithful BASE input. SOURCE/SI qualify only additive curve
-    // phase differences; all semantic/identity and per-mode ACK checks stay exact.
-    base.owned_base_preparation = true;
-    let candidate = native_comparison_independent_history(&base);
-    // 8 MiB of valid non-usage progress rows, streamed rather than one giant
-    // line. No provider data, live corpus read, parser limit or cap change.
-    {
-        use std::io::Write;
-        let path = base.root.join(format!("{REARM_ROOT}.jsonl"));
-        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-        let line = format!(
-            "{{\"type\":\"progress\",\"padding\":\"{}\"}}\n",
-            "x".repeat(32768)
-        );
-        for _ in 0..256 {
-            file.write_all(line.as_bytes()).unwrap();
-        }
-    }
-    let established = base.establish();
-    {
-        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        assert_eq!(candidate.establish().heads, established.heads);
-        assert_eq!(rearm_reads(&candidate.generation(10)), 0);
-    }
-    let mut base_quiet_reads = 0;
-    let mut base_quiet_bytes = 0;
-    for hour in 11..14 {
-        let pages = base.generation(hour);
-        base_quiet_reads += rearm_reads(&pages);
-        base_quiet_bytes += family_bytes(&base, &pages);
-    }
-    let mut candidate_quiet_reads = 0;
-    let mut candidate_quiet_bytes = 0;
-    {
-        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        for hour in 11..14 {
-            let pages = candidate.generation(hour);
-            candidate_quiet_reads += rearm_reads(&pages);
-            candidate_quiet_bytes += family_bytes(&candidate, &pages);
-        }
-    }
-    assert_eq!(candidate_quiet_reads, 0);
-    assert_eq!(candidate_quiet_bytes, 0);
-    assert!(base_quiet_reads >= 9 && base_quiet_bytes > 24_000_000);
-    const COPY: &str = "c8888888-8888-4888-8888-888888888888";
-    let copy_path = native_comparison_add_import(&base, COPY, "req_root_1");
-    let base_hit = base.generation(14);
-    let candidate_hit = {
-        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        candidate.generation(14)
-    };
-    let mut deferrals = 0;
-    let mut consecutive = 0;
-    let mut max_consecutive = 0;
-    for page in &candidate_hit {
-        let copy_offered = page.scan.snapshots.iter().any(|item| {
-            item.source_session_id == COPY && page.offered.contains(&item.snapshot_fingerprint)
-        });
-        let deferred = page.parsed.contains(COPY) && !copy_offered;
-        if deferred {
-            deferrals += 1;
-            consecutive += 1;
-        } else {
-            consecutive = 0;
-        }
-        max_consecutive = max_consecutive.max(consecutive);
-    }
-    assert_eq!(deferrals, 1);
-    assert_eq!(max_consecutive, 1);
-    let copy_parses = |pages: &[RearmPage]| {
-        pages
-            .iter()
-            .filter(|page| page.parsed.contains(COPY))
-            .count()
-    };
-    let base_copy_parses = copy_parses(&base_hit);
-    let candidate_copy_parses = copy_parses(&candidate_hit);
-    assert_eq!(candidate_copy_parses, base_copy_parses + 1);
-    // Include BOTH normal followups in the cost comparison; do not hide the
-    // extra post-hit parse/rearm or compare mismatched recovery frontiers.
-    let base_followup = base.generation(15);
-    let followup = {
-        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        candidate.generation(15)
-    };
-    assert!(followup.last().unwrap().fully_settled);
-    for (label, pages) in [
-        ("base_hit", &base_hit),
-        ("candidate_hit", &candidate_hit),
-        ("base_followup", &base_followup),
-        ("candidate_followup", &followup),
-    ] {
-        for item in pages
-            .iter()
-            .flat_map(|page| &page.scan.snapshots)
-            .filter(|item| rearm_family_sessions().contains(&item.source_session_id))
-        {
-            eprintln!("native_comparison_selected_witness_diagnostic: phase={label} source={} body_witness={} context_curve={} cache={} tools={} creator={}",
-                item.source_session_id, snapshot_upload_body_witness(item),
-                serde_json::to_string(&item.context_curve).unwrap(), item.cache_observations.is_some(), item.tool_usage.is_some(), item.session_account_evidence.is_some());
-        }
-    }
-    // Original strict cross-mode additive-equality diagnostic: FAIL/SUPERSEDED
-    // for phase-specific curves only. The qualified observation-time and
-    // native-census contract in docs/development/native-comparison-driver.md
-    // requires the exact checks and bounded ordering diagnostic below.
-    let selected_base = native_comparison_selected_family(&base_followup.last().unwrap().index);
-    let selected_candidate = native_comparison_selected_family(&followup.last().unwrap().index);
-    eprintln!("native_comparison_additive_original: equal={} disposition=SUPERSEDED_additive_only semantic_identity_equality_required=true", selected_base == selected_candidate);
-    fn latest_bodies(fixture: &RearmFixture) -> BTreeMap<String, serde_json::Value> {
-        fixture
-            .body_trace
-            .borrow()
-            .finalizer_bodies
-            .iter()
-            .filter(|(session, _)| rearm_family_sessions().contains(*session))
-            .map(|(session, body)| (session.clone(), body.clone()))
-            .collect()
-    }
-    fn assert_ack_conservation(fixture: &RearmFixture, selected: &serde_json::Value) {
-        use sha2::{Digest, Sha256};
-        let trace = fixture.body_trace.borrow();
-        for (session, witness) in &trace.finalizer_witnesses {
-            if !rearm_family_sessions().contains(session) {
-                continue;
-            }
-            assert_eq!(
-                trace.finalizer_bodies[session]["collected_at"], trace.native_read_times[session],
-                "finalized body time is independently recorded native read-event time"
-            );
-            assert_eq!(
-                trace.strict_ack_witnesses.get(session),
-                Some(witness),
-                "latest effective body has its OWN strict ACK, including prior exact no-op"
-            );
-            let mut hash = Sha256::new();
-            for value in ["snapshot_file_upload_body_set:v1", witness.as_str()] {
-                hash.update((value.len() as u32).to_be_bytes());
-                hash.update(value.as_bytes());
-            }
-            assert_eq!(
-                selected[session]["selected_witness"],
-                format!("{:x}", hash.finalize()),
-                "selected group is derived from own ACKed effective body"
-            );
-        }
-    }
-    assert_ack_conservation(&base, &selected_base);
-    assert_ack_conservation(&candidate, &selected_candidate);
-    let base_bodies = latest_bodies(&base);
-    let candidate_bodies = latest_bodies(&candidate);
-    assert_eq!(
-        base_bodies.keys().collect::<Vec<_>>(),
-        candidate_bodies.keys().collect::<Vec<_>>()
-    );
-    for (session, base_body) in &base_bodies {
-        let mut base_without_curve = base_body.clone();
-        let mut candidate_without_curve = candidate_bodies[session].clone();
-        let base_curve = base_without_curve
-            .as_object_mut()
-            .unwrap()
-            .remove("context_curve");
-        let candidate_curve = candidate_without_curve
-            .as_object_mut()
-            .unwrap()
-            .remove("context_curve");
-        // Observation-time contract: independently assert read time above;
-        // only this comparison projection omits it, never the wire or witness.
-        base_without_curve
-            .as_object_mut()
-            .unwrap()
-            .remove("collected_at");
-        candidate_without_curve
-            .as_object_mut()
-            .unwrap()
-            .remove("collected_at");
-        assert_eq!(
-            base_without_curve, candidate_without_curve,
-            "all non-curve fields except qualified observation time match"
-        );
-        let base_points = base_curve
-            .as_ref()
-            .and_then(|value| value["points"].as_array());
-        let candidate_points = candidate_curve
-            .as_ref()
-            .and_then(|value| value["points"].as_array());
-        for point in base_points.into_iter().flatten() {
-            assert!(
-                candidate_points.is_some_and(|points| points.contains(point)),
-                "candidate retains each exact BASE owned point"
-            );
-        }
-    }
-    // Do not force a cursor, census flag, source revision or larger page. Use
-    // the SAME ordinary BASE scanner. Three observed repeats are a bounded
-    // diagnostic, not a claim that repeated retries constitute progress.
-    let mut natural_convergence = false;
-    for hour in 16..19 {
-        let pages = base.generation(hour);
-        let current = latest_bodies(&base);
-        let selected = native_comparison_selected_family(&pages.last().unwrap().index);
-        let without_read_time = |bodies: &BTreeMap<String, serde_json::Value>| {
-            bodies
-                .iter()
-                .map(|(session, body)| {
-                    let mut value = body.clone();
-                    value.as_object_mut().unwrap().remove("collected_at");
-                    (session.clone(), value)
-                })
-                .collect::<BTreeMap<_, _>>()
-        };
-        let matches = without_read_time(&current) == without_read_time(&candidate_bodies)
-            && selected == selected_candidate;
-        if !matches {
-            let terminal = pages.len() - 1;
-            for session in rearm_family_sessions() {
-                let position = pages
-                    .iter()
-                    .position(|page| page.parsed.contains(&session))
-                    .expect("ordinary BASE reparses same member");
-                assert!(
-                    position < terminal,
-                    "ordering qualification requires A finalized BEFORE terminal"
-                );
-                assert!(
-                    !pages[position].native_census_complete_before_fold,
-                    "actual native read is nonterminal"
-                );
-                eprintln!("native_comparison_ordering_bound: ordinary_base_hour={hour} member={session} page={position} terminal_page={terminal} actual_census_complete_at_read=false finalized_before_terminal=true");
-            }
-            assert_ack_conservation(&base, &selected);
-        }
-        eprintln!("native_comparison_same_census_convergence: ordinary_base_hour={hour} matches_candidate={matches} native_pages={} family_on_terminal={} selected={selected}", pages.len(), pages.last().is_some_and(|page| rearm_family_sessions().iter().all(|session| page.parsed.contains(session))));
-        if matches {
-            assert_ack_conservation(&base, &selected);
-            natural_convergence = true;
-            break;
-        }
-    }
-    eprintln!("native_comparison_curve_qualification: condition4={} actual_native_census_earned=true semantic_identity_equal=true own_ACK_conservation=true monotone_owned_points=true original_literal_additive_equality=FAIL_SUPERSEDED no_wire_normalization=true", if natural_convergence { "PASS" } else { "UNMET-BY-BASE-ORDERING" });
-    let base_copy_reads_all = base_copy_parses + copy_parses(&base_followup);
-    let candidate_copy_reads_all = candidate_copy_parses + copy_parses(&followup);
-    let hit_extra_bytes = family_bytes(&candidate, &candidate_hit)
-        .saturating_add(family_bytes(&candidate, &followup))
-        .saturating_sub(
-            family_bytes(&base, &base_hit).saturating_add(family_bytes(&base, &base_followup)),
-        )
-        + (candidate_copy_reads_all.saturating_sub(base_copy_reads_all) as u64)
-            * std::fs::metadata(&copy_path).unwrap().len();
-    let offered_cost = |groups: &[&[RearmPage]]| {
-        groups
-            .iter()
-            .flat_map(|pages| pages.iter())
-            .flat_map(|page| {
-                page.scan
-                    .snapshots
-                    .iter()
-                    .filter(|item| page.offered.contains(&item.snapshot_fingerprint))
-            })
-            .fold((0u64, 0u64), |(count, bytes), item| {
-                (
-                    count + 1,
-                    bytes + serde_json::to_vec(item).unwrap().len() as u64,
-                )
-            })
-    };
-    let base_offers = offered_cost(&[base_hit.as_slice(), base_followup.as_slice()]);
-    let candidate_offers = offered_cost(&[candidate_hit.as_slice(), followup.as_slice()]);
-    eprintln!("native_comparison_curve_upload_cost: base_bodies={} base_item_wire_bytes={} candidate_bodies={} candidate_item_wire_bytes={} extra_bodies={} extra_item_wire_bytes={} network_latency_UNMEASURED=true three_extra_BASE_qualification_passes_not_counted_as_savings=true", base_offers.0, base_offers.1, candidate_offers.0, candidate_offers.1, candidate_offers.0.saturating_sub(base_offers.0), candidate_offers.1.saturating_sub(base_offers.1));
-    let saved_bytes = base_quiet_bytes.saturating_sub(candidate_quiet_bytes);
-    assert!(
-        saved_bytes > hit_extra_bytes,
-        "net-negative native-read policy is not accepted"
-    );
-    // scanned_file_count counts native parser/acquisition entries, including
-    // pages later held by the fold. Count ALL files over the same quiet + hit
-    // + followup frontier, so the extra deferred-copy parse and recovery are
-    // charged to the candidate. Process CPU time also includes unrelated test
-    // threads and runner contention; it cannot establish this work invariant.
-    let base_total_reads = base_quiet_reads + rearm_reads(&base_hit) + rearm_reads(&base_followup);
-    let candidate_total_reads =
-        candidate_quiet_reads + rearm_reads(&candidate_hit) + rearm_reads(&followup);
-    assert!(
-        candidate_total_reads < base_total_reads,
-        "deferred policy including recovery must perform strictly fewer native parses"
-    );
-
-    eprintln!("native_comparison_deferred_usefulness: quiet_base_reads={base_quiet_reads} quiet_candidate_reads={candidate_quiet_reads} quiet_base_logical_native_bytes={base_quiet_bytes} quiet_candidate_logical_native_bytes={candidate_quiet_bytes} base_total_reads={base_total_reads} candidate_total_reads={candidate_total_reads} base_copy_reads_including_followup={base_copy_reads_all} candidate_copy_reads_including_followup={candidate_copy_reads_all} deferrals={deferrals} max_consecutive_deferrals={max_consecutive} base_copy_parses={base_copy_parses} candidate_copy_parses={candidate_copy_parses} hit_extra_logical_bytes={hit_extra_bytes} net_logical_bytes_saved={} full_2000family_admission=UNPROVED installed_RSS_savings=UNPROVED", saved_bytes - hit_extra_bytes);
 }

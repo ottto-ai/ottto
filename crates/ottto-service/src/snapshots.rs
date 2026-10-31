@@ -63781,51 +63781,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_cache_split_new_family_proves_at_healthy_terminal() {
-        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-
-        let (root, parent, mut items) = cache_split_fixture();
-        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-            evidence: BTreeMap::from([(parent.clone(), vec![cache_split_api_row(&parent, true)])]),
-            health: Default::default(),
-        };
-        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
-            evidence: BTreeMap::from([(
-                parent.clone(),
-                vec![complete_trace_row(&parent, "req_cache_split", "")],
-            )]),
-            ..Default::default()
-        };
-        let mut index =
-            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
-        index.files.insert(
-            local_index_key(&root.join(format!("{parent}.jsonl"))),
-            manifest_index_entry(None),
-        );
-        apply_claude_reported_usage_with_index(
-            &mut items,
-            &api_report,
-            &trace_report,
-            &mut index,
-            true,
-            "2026-08-02T07:10:00Z",
-        );
-        assert_eq!(
-            items[0].usage_accounting_contract.as_deref(),
-            Some("session_exclusive_reported_usage:v1")
-        );
-        assert!(index.claude_usage_family_witnesses.contains_key(&parent));
-        assert_eq!(items[0].cache_creation_5m_tokens, 2014);
-        assert_eq!(items[0].unattributed_total_tokens, 0);
-        assert_eq!(
-            items[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
-            Some("0.0001")
-        );
-        validate_snapshot_item(0, &items[0]).unwrap();
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn claude_pending_usage_occurrence_limit_is_replacement_aware() {
         assert_eq!(
             claude_pending_occurrence_count_after_replace(
@@ -65592,210 +65547,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_d1_subagent_own_request_qualification() {
-        // Legacy session-account wire shape; E2 emits request-owned account partitions.
-
-        let (dir, root, items) = claude_account_family_fixture(true);
-        let child = items[1].clone();
-        let make_api = |request: &str, seq: u64, account: &str| {
-            let mut row = complete_api_row(&root, request, seq, 10, 1, 0);
-            row.account_identifier_hash = Some(account.to_string());
-            row.fingerprint.clear();
-            row.fingerprint = format!(
-                "sha256:{:x}",
-                Sha256::digest(serde_json::to_vec(&row).unwrap())
-            );
-            row
-        };
-        let a = "a".repeat(64);
-        let b = "b".repeat(64);
-        let c = "c".repeat(64);
-        let api = vec![
-            make_api("req_1", 1, &a),
-            make_api("req_2", 2, &a),
-            make_api("req_3", 3, &a),
-            make_api("req_4", 4, &a),
-            make_api("req_5", 5, &b),
-            make_api("aux", 6, &c),
-        ];
-        let trace = vec![complete_trace_row(&root, "req_5", "a4d1585d310070d0f")];
-        let evidence = BTreeMap::from([(root.clone(), api.clone())]);
-        let mut current = vec![child.clone()];
-        let mut index =
-            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
-        apply_claude_effort_evidence_with_index(
-            &mut current,
-            &evidence,
-            &mut index,
-            false,
-            "2026-08-02T07:01:00Z",
-        );
-        assert!(current[0]
-            .model_usage
-            .iter()
-            .all(|r| r.account_identifier_hash.is_none()));
-        assert!(index.claude_account_family_witnesses.is_empty());
-        let out = std::env::var_os("OTTTO_D1_TEST_OUTPUT_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| dir.join("native-proof"));
-        fs::create_dir_all(&out).unwrap();
-        let mut before = child.clone();
-        before.source_file_fingerprint = Some("c".repeat(64));
-        for row in before.model_usage.iter_mut().chain(
-            before
-                .usage_buckets
-                .iter_mut()
-                .flat_map(|b| b.model_usage.iter_mut()),
-        ) {
-            row.cost_usd = Some("2.00".into());
-        }
-        before.cost = Some(SnapshotCost {
-            total_cost_usd: Some("2.00".into()),
-            input_cost_usd: None,
-            output_cost_usd: None,
-            cache_read_cost_usd: None,
-            cache_creation_cost_usd: None,
-            evidence_source: "synthetic_reported".into(),
-        });
-        before.session_account_evidence = Some(SessionAccountEvidence {
-            provider: "anthropic",
-            account_identifier_hash: None,
-            provider_workspace_hash: None,
-            identity_hash_scheme: "provider-sha256:v1",
-            evidence_source: "claude_desktop_original:v1",
-            identity_disposition: Some("missing"),
-            source_created_at: None,
-        });
-        before.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &before);
-        let before_wire = serde_json::to_value(&before).unwrap();
-        let mut after = before.clone();
-
-        assert!(d1_subagent_account_specimen(&mut after, &api, &trace));
-        assert!(after
-            .model_usage
-            .iter()
-            .chain(
-                after
-                    .usage_buckets
-                    .iter()
-                    .flat_map(|b| b.model_usage.iter())
-            )
-            .all(|r| r.account_identifier_hash.as_deref() == Some(b.as_str())));
-        let mut comparison = after.clone();
-        set_session_account_hash(&mut comparison, None);
-        comparison.snapshot_fingerprint = before.snapshot_fingerprint.clone();
-        comparison.provenance.collector = before.provenance.collector.clone();
-        assert_eq!(
-            serde_json::to_value(&comparison).unwrap(),
-            before_wire,
-            "identity-only specimen preserves every other field"
-        );
-        assert!(after.usage_accounting_contract.is_none());
-        assert_eq!(
-            after.session_account_evidence,
-            before.session_account_evidence
-        );
-        let mut checks = vec![
-            json!({"case":"mixed_root_single_child","baseline_unknown":true,"candidate_account":"own_B","money_preserved":true,"no_family_witness":true}),
-        ];
-        for name in [
-            "missing_api",
-            "unchecked",
-            "missing_hash",
-            "duplicate_api",
-            "conflicting_api",
-            "wrong_api_root",
-            "invalid_fingerprint",
-            "missing_trace",
-            "wrong_trace_owner",
-            "trace_client_mismatch",
-            "known_account_conflict",
-            "cloud_destination",
-            "request_count_mismatch",
-            "malformed_account",
-        ] {
-            let mut candidate = before.clone();
-            let mut rows = api.clone();
-            let mut witnesses = trace.clone();
-            match name {
-                "missing_api" => {
-                    rows.retain(|r| r.request_id != "req_5");
-                }
-                "unchecked" => rows[4].account_identity_checked = false,
-                "missing_hash" => rows[4].account_identifier_hash = None,
-                "duplicate_api" => rows.push(rows[4].clone()),
-                "conflicting_api" => rows.push(make_api("req_5", 5, &c)),
-                "wrong_api_root" => rows[4].session_id = "foreign-root".into(),
-                "invalid_fingerprint" => rows[4].fingerprint = "bad".into(),
-                "missing_trace" => witnesses.clear(),
-                "wrong_trace_owner" => {
-                    witnesses[0] = complete_trace_row(&root, "req_5", "different-child")
-                }
-                "trace_client_mismatch" => witnesses[0].client_request_id = "other-client".into(),
-                "known_account_conflict" => set_session_account_hash(&mut candidate, Some(&a)),
-                "cloud_destination" => {
-                    candidate.usage_buckets[0].model_usage[0].gateway_provider =
-                        Some("vertex".into())
-                }
-                "request_count_mismatch" => candidate.request_count = 2,
-                "malformed_account" => rows[4].account_identifier_hash = Some("ABC".into()),
-                _ => unreachable!(),
-            }
-            if name != "invalid_fingerprint" {
-                for row in &mut rows {
-                    row.fingerprint.clear();
-                    row.fingerprint = format!(
-                        "sha256:{:x}",
-                        Sha256::digest(serde_json::to_vec(&row).unwrap())
-                    );
-                }
-            }
-            for witness in &mut witnesses {
-                witness.fingerprint.clear();
-                witness.fingerprint = format!(
-                    "sha256:{:x}",
-                    Sha256::digest(serde_json::to_vec(&witness).unwrap())
-                );
-            }
-            let exact = serde_json::to_value(&candidate).unwrap();
-            assert!(
-                !d1_subagent_account_specimen(&mut candidate, &rows, &witnesses),
-                "{name}"
-            );
-            assert_eq!(
-                candidate.provenance.collector,
-                claude_request_accounts::UNKNOWN
-            );
-            candidate.provenance.collector = before.provenance.collector.clone();
-            candidate.snapshot_fingerprint = before.snapshot_fingerprint.clone();
-            assert_eq!(
-                serde_json::to_value(&candidate).unwrap(),
-                exact,
-                "{name} must not erase facts"
-            );
-            checks.push(json!({"case":name,"refused_without_mutation":true}));
-        }
-        let mut unknown = after.clone();
-        assert!(!d1_subagent_account_specimen(&mut unknown, &[], &[]));
-        for (name, item) in [
-            ("before", before),
-            ("positive", after),
-            ("unknown", unknown),
-        ] {
-            let mut request = valid_v6_batch_request();
-            request.source = "claude_code".into();
-            request.snapshots = vec![item];
-            fs::write(
-                out.join(format!("native-subagent-{name}.json")),
-                serde_json::to_vec_pretty(&request).unwrap(),
-            )
-            .unwrap();
-        }
-        fs::write(out.join("native-preparation.json"),serde_json::to_vec_pretty(&json!({"cases":checks,"actual_producer_guard":true,"no_family_accounting_promotion":true,"no_subscription_inferred":true})).unwrap()).unwrap();
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn claude_d1_subagent_coverage_lifecycle_and_shapes() {
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
 
@@ -65912,94 +65663,275 @@ mod tests {
                 original[field]
             );
         }
-        fs::remove_dir_all(dir).unwrap();
-    }
 
-    #[test]
-    fn claude_d1_multiple_requests_typed_identity_and_unreadable_import() {
-        // Legacy session-account wire shape; E2 emits request-owned account partitions.
-
-        let (dir, root, items) = claude_account_family_fixture(true);
-        let path = dir
-            .join(&root)
-            .join("subagents/agent-a4d1585d310070d0f.jsonl");
-        let first = String::from_utf8(fs::read(&path).unwrap()).unwrap();
-        fs::write(&path, format!("{first}{}", first.replace("req_5", "req_6"))).unwrap();
-        let child = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
-            &path,
-            "2026-08-02T07:01:00Z",
-            "d".repeat(64),
-        )
-        .unwrap()
-        .remove(0);
-        assert_eq!(child.request_count, 2);
-        let mut api = vec![
-            complete_api_row(&root, "req_5", 5, 10, 1, 0),
-            complete_api_row(&root, "req_6", 6, 10, 1, 0),
-        ];
-        let trace = vec![
-            complete_trace_row(&root, "req_5", "a4d1585d310070d0f"),
-            complete_trace_row(&root, "req_6", "a4d1585d310070d0f"),
-        ];
-        api[0].request_identity = Some(serde_json::from_value(json!({
-            "identity_hash_scheme":"provider-sha256:v1",
-            "account":{"origin":"resource_and_log_record","disposition":"complete","resource_hash":"a".repeat(64),"log_record_hash":"a".repeat(64)},
-            "organization":{"origin":"missing","disposition":"missing"},"disposition":"missing"
-        })).unwrap());
-        let rehash = |row: &mut crate::claude_local_otel::ClaudeLocalOtelEvidence| {
-            row.fingerprint.clear();
-            row.fingerprint = format!(
-                "sha256:{:x}",
-                Sha256::digest(serde_json::to_vec(row).unwrap())
+        // Own-request qualification inside a mixed-account root: the parent's
+        // requests and an auxiliary row carry other logins, yet only the
+        // child's own request decides its account. The legacy effort fold
+        // stamps nothing and binds no family witness.
+        {
+            let child = items[1].clone();
+            let make_api = |request: &str, seq: u64, account: &str| {
+                let mut row = complete_api_row(&root, request, seq, 10, 1, 0);
+                row.account_identifier_hash = Some(account.to_string());
+                row.fingerprint.clear();
+                row.fingerprint = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(&row).unwrap())
+                );
+                row
+            };
+            let a = "a".repeat(64);
+            let b = "b".repeat(64);
+            let c = "c".repeat(64);
+            let api = vec![
+                make_api("req_1", 1, &a),
+                make_api("req_2", 2, &a),
+                make_api("req_3", 3, &a),
+                make_api("req_4", 4, &a),
+                make_api("req_5", 5, &b),
+                make_api("aux", 6, &c),
+            ];
+            let trace = vec![complete_trace_row(&root, "req_5", "a4d1585d310070d0f")];
+            let evidence = BTreeMap::from([(root.clone(), api.clone())]);
+            let mut current = vec![child.clone()];
+            let mut index =
+                crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
+            apply_claude_effort_evidence_with_index(
+                &mut current,
+                &evidence,
+                &mut index,
+                false,
+                "2026-08-02T07:01:00Z",
             );
-        };
-        rehash(&mut api[0]);
-        assert!(
-            d1_subagent_account_specimen(&mut child.clone(), &api, &trace),
-            "missing request organization does not invent or veto an account"
-        );
-        let mut mixed = api.clone();
-        mixed[1].account_identifier_hash = Some("b".repeat(64));
-        rehash(&mut mixed[1]);
-        assert!(!d1_subagent_account_specimen(
-            &mut child.clone(),
-            &mixed,
-            &trace
-        ));
-        api[0]
-            .request_identity
-            .as_mut()
-            .unwrap()
-            .account
-            .resource_hash = Some("b".repeat(64));
-        rehash(&mut api[0]);
-        assert!(
-            !d1_subagent_account_specimen(&mut child.clone(), &api, &trace),
-            "contradictory typed observations cannot qualify"
-        );
-        let mut imported = items[1].clone();
-        let before = imported.clone();
-        let mut report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
-        report.health.unreadable_lines = 1;
-        assert_eq!(
-            claude_request_accounts::apply(
-                std::slice::from_mut(&mut imported),
-                &report,
-                &Default::default()
+            assert!(current[0]
+                .model_usage
+                .iter()
+                .all(|r| r.account_identifier_hash.is_none()));
+            assert!(index.claude_account_family_witnesses.is_empty());
+            let mut before = child.clone();
+            before.source_file_fingerprint = Some("c".repeat(64));
+            for row in before.model_usage.iter_mut().chain(
+                before
+                    .usage_buckets
+                    .iter_mut()
+                    .flat_map(|b| b.model_usage.iter_mut()),
+            ) {
+                row.cost_usd = Some("2.00".into());
+            }
+            before.cost = Some(SnapshotCost {
+                total_cost_usd: Some("2.00".into()),
+                input_cost_usd: None,
+                output_cost_usd: None,
+                cache_read_cost_usd: None,
+                cache_creation_cost_usd: None,
+                evidence_source: "synthetic_reported".into(),
+            });
+            before.session_account_evidence = Some(SessionAccountEvidence {
+                provider: "anthropic",
+                account_identifier_hash: None,
+                provider_workspace_hash: None,
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "claude_desktop_original:v1",
+                identity_disposition: Some("missing"),
+                source_created_at: None,
+            });
+            before.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &before);
+            let before_wire = serde_json::to_value(&before).unwrap();
+            let mut after = before.clone();
+
+            assert!(d1_subagent_account_specimen(&mut after, &api, &trace));
+            assert!(after
+                .model_usage
+                .iter()
+                .chain(
+                    after
+                        .usage_buckets
+                        .iter()
+                        .flat_map(|b| b.model_usage.iter())
+                )
+                .all(|r| r.account_identifier_hash.as_deref() == Some(b.as_str())));
+            let mut comparison = after.clone();
+            set_session_account_hash(&mut comparison, None);
+            comparison.snapshot_fingerprint = before.snapshot_fingerprint.clone();
+            comparison.provenance.collector = before.provenance.collector.clone();
+            assert_eq!(
+                serde_json::to_value(&comparison).unwrap(),
+                before_wire,
+                "identity-only specimen preserves every other field"
+            );
+            assert!(after.usage_accounting_contract.is_none());
+            assert_eq!(
+                after.session_account_evidence,
+                before.session_account_evidence
+            );
+            for name in [
+                "missing_api",
+                "unchecked",
+                "missing_hash",
+                "duplicate_api",
+                "conflicting_api",
+                "wrong_api_root",
+                "invalid_fingerprint",
+                "missing_trace",
+                "wrong_trace_owner",
+                "trace_client_mismatch",
+                "known_account_conflict",
+                "cloud_destination",
+                "request_count_mismatch",
+                "malformed_account",
+            ] {
+                let mut candidate = before.clone();
+                let mut rows = api.clone();
+                let mut witnesses = trace.clone();
+                match name {
+                    "missing_api" => {
+                        rows.retain(|r| r.request_id != "req_5");
+                    }
+                    "unchecked" => rows[4].account_identity_checked = false,
+                    "missing_hash" => rows[4].account_identifier_hash = None,
+                    "duplicate_api" => rows.push(rows[4].clone()),
+                    "conflicting_api" => rows.push(make_api("req_5", 5, &c)),
+                    "wrong_api_root" => rows[4].session_id = "foreign-root".into(),
+                    "invalid_fingerprint" => rows[4].fingerprint = "bad".into(),
+                    "missing_trace" => witnesses.clear(),
+                    "wrong_trace_owner" => {
+                        witnesses[0] = complete_trace_row(&root, "req_5", "different-child")
+                    }
+                    "trace_client_mismatch" => {
+                        witnesses[0].client_request_id = "other-client".into()
+                    }
+                    "known_account_conflict" => set_session_account_hash(&mut candidate, Some(&a)),
+                    "cloud_destination" => {
+                        candidate.usage_buckets[0].model_usage[0].gateway_provider =
+                            Some("vertex".into())
+                    }
+                    "request_count_mismatch" => candidate.request_count = 2,
+                    "malformed_account" => rows[4].account_identifier_hash = Some("ABC".into()),
+                    _ => unreachable!(),
+                }
+                if name != "invalid_fingerprint" {
+                    for row in &mut rows {
+                        row.fingerprint.clear();
+                        row.fingerprint = format!(
+                            "sha256:{:x}",
+                            Sha256::digest(serde_json::to_vec(&row).unwrap())
+                        );
+                    }
+                }
+                for witness in &mut witnesses {
+                    witness.fingerprint.clear();
+                    witness.fingerprint = format!(
+                        "sha256:{:x}",
+                        Sha256::digest(serde_json::to_vec(&witness).unwrap())
+                    );
+                }
+                let exact = serde_json::to_value(&candidate).unwrap();
+                assert!(
+                    !d1_subagent_account_specimen(&mut candidate, &rows, &witnesses),
+                    "{name}"
+                );
+                assert_eq!(
+                    candidate.provenance.collector,
+                    claude_request_accounts::UNKNOWN
+                );
+                candidate.provenance.collector = before.provenance.collector.clone();
+                candidate.snapshot_fingerprint = before.snapshot_fingerprint.clone();
+                assert_eq!(
+                    serde_json::to_value(&candidate).unwrap(),
+                    exact,
+                    "{name} must not erase facts"
+                );
+            }
+            let mut unknown = after;
+            assert!(!d1_subagent_account_specimen(&mut unknown, &[], &[]));
+        }
+
+        // Several own requests: typed request identity with a missing
+        // organization neither invents nor vetoes an account; mixed or
+        // contradictory typed observations refuse; unreadable evidence fails
+        // closed without touching the body.
+        {
+            let path = dir
+                .join(&root)
+                .join("subagents/agent-a4d1585d310070d0f.jsonl");
+            let first = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+            fs::write(&path, format!("{first}{}", first.replace("req_5", "req_6"))).unwrap();
+            let child = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+                &path,
+                "2026-08-02T07:01:00Z",
+                "d".repeat(64),
             )
-            .coverage,
-            [claude_request_accounts::Coverage::UnreadableEvidence]
-        );
-        assert_eq!(
-            imported.provenance.collector,
-            claude_request_accounts::UNKNOWN
-        );
-        imported.provenance.collector = before.provenance.collector.clone();
-        imported.snapshot_fingerprint = before.snapshot_fingerprint.clone();
-        assert_eq!(
-            serde_json::to_value(&imported).unwrap(),
-            serde_json::to_value(&before).unwrap()
-        );
+            .unwrap()
+            .remove(0);
+            assert_eq!(child.request_count, 2);
+            let mut api = vec![
+                complete_api_row(&root, "req_5", 5, 10, 1, 0),
+                complete_api_row(&root, "req_6", 6, 10, 1, 0),
+            ];
+            let trace = vec![
+                complete_trace_row(&root, "req_5", "a4d1585d310070d0f"),
+                complete_trace_row(&root, "req_6", "a4d1585d310070d0f"),
+            ];
+            api[0].request_identity = Some(serde_json::from_value(json!({
+                "identity_hash_scheme":"provider-sha256:v1",
+                "account":{"origin":"resource_and_log_record","disposition":"complete","resource_hash":"a".repeat(64),"log_record_hash":"a".repeat(64)},
+                "organization":{"origin":"missing","disposition":"missing"},"disposition":"missing"
+            })).unwrap());
+            let rehash = |row: &mut crate::claude_local_otel::ClaudeLocalOtelEvidence| {
+                row.fingerprint.clear();
+                row.fingerprint = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(row).unwrap())
+                );
+            };
+            rehash(&mut api[0]);
+            assert!(
+                d1_subagent_account_specimen(&mut child.clone(), &api, &trace),
+                "missing request organization does not invent or veto an account"
+            );
+            let mut mixed = api.clone();
+            mixed[1].account_identifier_hash = Some("b".repeat(64));
+            rehash(&mut mixed[1]);
+            assert!(!d1_subagent_account_specimen(
+                &mut child.clone(),
+                &mixed,
+                &trace
+            ));
+            api[0]
+                .request_identity
+                .as_mut()
+                .unwrap()
+                .account
+                .resource_hash = Some("b".repeat(64));
+            rehash(&mut api[0]);
+            assert!(
+                !d1_subagent_account_specimen(&mut child.clone(), &api, &trace),
+                "contradictory typed observations cannot qualify"
+            );
+            let mut imported = items[1].clone();
+            let before = imported.clone();
+            let mut report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+            report.health.unreadable_lines = 1;
+            assert_eq!(
+                claude_request_accounts::apply(
+                    std::slice::from_mut(&mut imported),
+                    &report,
+                    &Default::default()
+                )
+                .coverage,
+                [claude_request_accounts::Coverage::UnreadableEvidence]
+            );
+            assert_eq!(
+                imported.provenance.collector,
+                claude_request_accounts::UNKNOWN
+            );
+            imported.provenance.collector = before.provenance.collector.clone();
+            imported.snapshot_fingerprint = before.snapshot_fingerprint.clone();
+            assert_eq!(
+                serde_json::to_value(&imported).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -68496,66 +68428,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_parser_sums_message_usage_and_uses_summary_title() {
-        // Parse-stage native hours: gate on, e2::finish_page emits the hours.
-
-        let path = temp_file("claude");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-06T10:00:00Z\",\"sessionId\":\"claude-session-1\",\"summary\":\"Fix telemetry labels\"}\n",
-                "{\"timestamp\":\"2026-05-06T10:01:00Z\",\"sessionId\":\"claude-session-1\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":3}}}\n",
-                "{\"timestamp\":\"2026-05-06T10:02:00Z\",\"sessionId\":\"claude-session-1\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9,\"cache_creation_input_tokens\":2}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
-            &path,
-            "2026-05-06T10:04:00Z",
-            "file-fingerprint".to_string(),
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(item.source_session_id, "claude-session-1");
-        assert_eq!(
-            item.session_display_name.as_deref(),
-            Some("Fix telemetry labels")
-        );
-        assert_eq!(item.input_tokens, 17);
-        assert_eq!(item.cache_read_tokens, 3);
-        // Flat `cache_creation_input_tokens` with no nested split defaults to the 5m bucket
-        // (Anthropic's default TTL).
-        assert_eq!(item.cache_creation_5m_tokens, 2);
-        assert_eq!(item.cache_creation_1h_tokens, 0);
-        assert_eq!(item.output_tokens, 14);
-        assert_eq!(item.request_count, 2);
-        assert_eq!(item.usage_buckets.len(), 1);
-        let bucket = &item.usage_buckets[0];
-        assert_eq!(bucket.bucket_start, "2026-05-06T10:00:00Z");
-        assert_eq!(
-            bucket.first_activity_at.as_deref(),
-            Some("2026-05-06T10:01:00Z")
-        );
-        assert_eq!(
-            bucket.last_activity_at.as_deref(),
-            Some("2026-05-06T10:02:00Z")
-        );
-        let bucket_request_count: u64 = bucket.model_usage.iter().map(|r| r.request_count).sum();
-        assert_eq!(bucket_request_count, 2);
-        assert_eq!(item.model_usage[0].model, "claude-sonnet-4-6");
-        assert_eq!(
-            item.provenance.input_token_scope.as_deref(),
-            Some("uncached")
-        );
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
     fn claude_code_duplicate_content_block_records_count_usage_once() {
         // Claude Code writes one JSONL record per assistant content block. All
         // records of one API response share message.id + requestId and resolve
@@ -68756,40 +68628,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_true_chronological_usage_regression_quarantines_the_file() {
-        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
-
-        let root = temp_dir("claude-progressive-conflict");
-        let path = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-08-02T10:00:01Z\",\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"requestId\":\"req_conflict\",\"message\":{\"id\":\"msg_conflict\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":9}}}\n",
-                "{\"timestamp\":\"2026-08-02T10:00:02Z\",\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"requestId\":\"req_conflict\",\"message\":{\"id\":\"msg_conflict\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":11,\"output_tokens\":8}}}\n"
-            ),
-        )
-        .expect("write fixture");
-        let mut index =
-            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
-        let scan = scan_source_roots_with_test_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-08-09T10:01:00Z",
-            365,
-            10,
-            false,
-        )
-        .expect("scan");
-        assert!(scan.snapshots.is_empty());
-        assert!(scan.recognized_usage_drop_count > 0);
-        assert!(!index
-            .confirmed_empty_files
-            .contains(&local_index_key(&path)));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn claude_equal_provider_time_usage_conflict_quarantines_the_file() {
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
 
@@ -68818,6 +68656,37 @@ mod tests {
         assert!(scan.snapshots.is_empty());
         assert_eq!(scan.recognized_usage_drop_count, 2);
         assert_eq!(scan.dropped_usage_record_count, 2);
+        assert!(!index
+            .confirmed_empty_files
+            .contains(&local_index_key(&path)));
+        let _ = fs::remove_dir_all(root);
+
+        // Control: a true chronological regression (a later provider time
+        // whose output shrinks) is a usage conflict too and quarantines the file.
+        let root = temp_dir("claude-progressive-conflict");
+        let path = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-02T10:00:01Z\",\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"requestId\":\"req_conflict\",\"message\":{\"id\":\"msg_conflict\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":9}}}\n",
+                "{\"timestamp\":\"2026-08-02T10:00:02Z\",\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"requestId\":\"req_conflict\",\"message\":{\"id\":\"msg_conflict\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":11,\"output_tokens\":8}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
+        let scan = scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-09T10:01:00Z",
+            365,
+            10,
+            false,
+        )
+        .expect("scan");
+        assert!(scan.snapshots.is_empty());
+        assert!(scan.recognized_usage_drop_count > 0);
         assert!(!index
             .confirmed_empty_files
             .contains(&local_index_key(&path)));
@@ -75033,86 +74902,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_zero_token_usage_events_drop_from_buckets() {
-        // Parse-stage native hours: gate on, e2::finish_page emits the hours.
-
-        let path = temp_file("claude-zero-token-activity");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-06T10:01:00Z\",\"sessionId\":\"claude-session-zero\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
-                "{\"timestamp\":\"2026-05-06T10:02:00Z\",\"sessionId\":\"claude-session-zero\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
-            &path,
-            "2026-05-06T10:04:00Z",
-            "file-fingerprint".to_string(),
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        // v6 couples usage and activity into the same bucket-row aggregation;
-        // a token-less event with no usage has nothing to attribute to the
-        // hour, so the second event drops out entirely. v5 would have
-        // counted it in activity_buckets but never in model_usage.
-        assert_eq!(item.request_count, 1);
-        assert_eq!(item.usage_buckets.len(), 1);
-        assert_eq!(item.usage_buckets[0].bucket_start, "2026-05-06T10:00:00Z");
-        assert_eq!(
-            item.usage_buckets[0].first_activity_at.as_deref(),
-            Some("2026-05-06T10:01:00Z")
-        );
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn claude_code_parser_builds_distinct_hourly_usage_buckets() {
-        // Parse-stage native hours: gate on, e2::finish_page emits the hours.
-
-        let path = temp_file("claude-activity-buckets");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-06T10:59:59Z\",\"sessionId\":\"claude-session-buckets\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
-                "{\"timestamp\":\"2026-05-06T11:00:01Z\",\"sessionId\":\"claude-session-buckets\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
-            &path,
-            "2026-05-06T11:04:00Z",
-            "file-fingerprint".to_string(),
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(item.usage_buckets.len(), 2);
-        assert_eq!(item.usage_buckets[0].bucket_start, "2026-05-06T10:00:00Z");
-        assert_eq!(
-            item.usage_buckets[0].first_activity_at.as_deref(),
-            Some("2026-05-06T10:59:59Z")
-        );
-        assert_eq!(item.usage_buckets[0].model_usage[0].request_count, 1);
-        assert_eq!(item.usage_buckets[1].bucket_start, "2026-05-06T11:00:00Z");
-        assert_eq!(
-            item.usage_buckets[1].first_activity_at.as_deref(),
-            Some("2026-05-06T11:00:01Z")
-        );
-        assert_eq!(item.usage_buckets[1].model_usage[0].request_count, 1);
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
     fn claude_code_parser_preserves_speed_region_and_batch_selectors() {
         let path = temp_file("claude-selectors");
         fs::write(
@@ -76503,6 +76292,71 @@ mod tests {
         // sees long/short separated per hour, not merged into one row.
         assert_eq!(item.usage_buckets.len(), 1);
         assert_eq!(item.usage_buckets[0].model_usage.len(), 2);
+
+        // Message usage sums across responses, the summary names the session,
+        // a flat cache write without a nested split defaults to the 5m bucket
+        // (Anthropic's default TTL), and the hour spans both responses.
+        assert_eq!(item.source_session_id, "ctx-bucket-session");
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("1M context demo")
+        );
+        assert_eq!(item.cache_creation_1h_tokens, 0);
+        assert_eq!(item.request_count, 2);
+        let bucket = &item.usage_buckets[0];
+        assert_eq!(bucket.bucket_start, "2026-05-29T09:00:00Z");
+        assert_eq!(
+            bucket.first_activity_at.as_deref(),
+            Some("2026-05-29T09:01:00Z")
+        );
+        assert_eq!(
+            bucket.last_activity_at.as_deref(),
+            Some("2026-05-29T09:05:00Z")
+        );
+        let bucket_request_count: u64 = bucket.model_usage.iter().map(|r| r.request_count).sum();
+        assert_eq!(bucket_request_count, 2);
+        assert_eq!(
+            item.provenance.input_token_scope.as_deref(),
+            Some("uncached")
+        );
+
+        let _ = fs::remove_file(path);
+
+        // Responses on either side of an hour boundary land in distinct
+        // hourly buckets, each with its own first activity and one request.
+        let path = temp_file("claude-activity-buckets");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-06T10:59:59Z\",\"sessionId\":\"claude-session-buckets\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-05-06T11:00:01Z\",\"sessionId\":\"claude-session-buckets\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
+            &path,
+            "2026-05-06T11:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.usage_buckets.len(), 2);
+        assert_eq!(item.usage_buckets[0].bucket_start, "2026-05-06T10:00:00Z");
+        assert_eq!(
+            item.usage_buckets[0].first_activity_at.as_deref(),
+            Some("2026-05-06T10:59:59Z")
+        );
+        assert_eq!(item.usage_buckets[0].model_usage[0].request_count, 1);
+        assert_eq!(item.usage_buckets[1].bucket_start, "2026-05-06T11:00:00Z");
+        assert_eq!(
+            item.usage_buckets[1].first_activity_at.as_deref(),
+            Some("2026-05-06T11:00:01Z")
+        );
+        assert_eq!(item.usage_buckets[1].model_usage[0].request_count, 1);
 
         let _ = fs::remove_file(path);
     }
@@ -84413,66 +84267,6 @@ pub(crate) mod cache_adapter_tests {
             examined += 3;
         }
         assert_eq!(examined, 48);
-    }
-    #[test]
-    fn cache_claude_owned_fixture_is_independent_of_curve_sampling() {
-        // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
-
-        let session = "00000000-0000-7000-8000-000000000002";
-        let mut parser = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-        parser.context_curve_enabled = false;
-        apply_claude_code_line(
-            &json!({"type":"assistant","sessionId":session,"forkedFrom":{"sessionId":"parent","messageUuid":"copied"},"timestamp":"2026-09-30T09:59:00Z","requestId":"copied","message":{"id":"copied","model":"claude-opus-4-8","usage":{"input_tokens":100_000,"output_tokens":1}}}),
-            &mut parser,
-        );
-        for (index, read) in [90_000, 0, 90_000].into_iter().enumerate() {
-            for output in [1, 2] {
-                apply_claude_code_line(
-                    &json!({"type":"assistant","sessionId":session,"requestId":format!("req_cache_fixture_{index}"),"timestamp":format!("2026-09-30T10:00:0{index}Z"),"message":{"id":format!("msg_cache_fixture_{index}"),"model":"claude-opus-4-8","usage":{"input_tokens":100_000-read,"cache_read_input_tokens":read,"cache_creation_input_tokens":0,"output_tokens":output}}}),
-                    &mut parser,
-                );
-            }
-        }
-        parser.finalize_claude_responses();
-        let mut items = parser.into_items(
-            Path::new("cache-claude-fixture.jsonl"),
-            "2026-09-30T10:00:03Z",
-            "f".repeat(64),
-            None,
-        );
-        let mut index =
-            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
-        apply_claude_reported_usage_with_index(
-            &mut items,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
-            &mut index,
-            true,
-            "2026-09-30T10:00:03Z",
-        );
-        let item = &mut items[0];
-        // Freeze the released cache-only producer fixture. The actual new
-        // identity+cache HTTP bytes are independently covered by the original
-        // Claude source corpus, not silently substituted for installed wires.
-        item.session_account_evidence = None;
-        assert!(item.context_curve.is_none());
-        assert_eq!(
-            item.cache_observations.as_ref().unwrap().operations.len(),
-            1
-        );
-        prepare_cache_observations(item, None);
-        let fixture = json!({"snapshot":cache_fixture_snapshot_value(SnapshotSource::ClaudeCode,item),"cache_observations_state":item.cache_observations_state,"body_witness_version":snapshot_upload_body_witness_version(item),"body_witness_digest":snapshot_upload_body_witness(item)});
-        let golden: Value = serde_json::from_str(include_str!(
-            "../../../fixtures/snapshot-audit/cache_observation_claude_v1.json"
-        ))
-        .unwrap();
-        if let Ok(output) = std::env::var("OTTTO_CACHE_CLAUDE_FIXTURE_OUT") {
-            std::fs::write(output, serde_json::to_string_pretty(&fixture).unwrap()).unwrap();
-        }
-        assert_eq!(
-            fixture, golden,
-            "production claude cache fixture must remain exact"
-        );
     }
     #[test]
     fn cache_generated_wire_fixture_and_witness() {

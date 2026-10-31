@@ -1006,23 +1006,6 @@ fn fe_claude_source_prefix_d1_record_is_unverified_and_replaced_next_read() {
     );
 }
 
-/// Proof control (GREEN): in this fixture a quiescent read with exactly
-/// matching API and trace evidence mints v1 at a healthy terminal.
-#[test]
-fn fe_claude_census_control_exact_api_rows_mint_v1() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
-
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let (_fixture, mut index, result) = quiescent();
-    assert!(
-        mints_v1(&mut index, &result, 0..6),
-        "control: exact rows mint v1"
-    );
-    assert!(index.claude_usage_family_witnesses.contains_key(SESSION));
-}
-
 /// SOURCE, proof (RED): a prefix body never mints v1 or a family witness,
 /// even when the API evidence matches the prefix exactly.
 ///
@@ -1191,29 +1174,6 @@ fn fe_claude_prefix_without_d1_record_still_cannot_mint_v1() {
         .index
         .claude_usage_family_witnesses
         .contains_key(SESSION));
-}
-
-/// A saved family cannot reconstruct v1 from an actual FE prefix on an
-/// incomplete page, even with unchanged API/trace evidence.
-#[test]
-fn fe_claude_unverified_source_cannot_reconstruct_a_saved_family_witness() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
-
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let (_fixture, mut verified, result) = quiescent();
-    assert!(mints_v1(&mut verified, &result, 0..9));
-    let previous_witness = verified.claude_usage_family_witnesses[SESSION].clone();
-    let mut grown = grown_full();
-    grown.index.claude_usage_family_witnesses = verified.claude_usage_family_witnesses;
-    grown.result.census_complete = false;
-    assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
-    assert_eq!(
-        grown.index.claude_usage_family_witnesses.get(SESSION),
-        Some(&previous_witness),
-        "historical witness remains for hold accounting, never prefix authority"
-    );
 }
 
 /// Both explicit owned-start and file-birth posture admission stay closed
@@ -1405,10 +1365,30 @@ fn fe_claude_prefix_with_different_physical_key_cannot_reconstruct_v1() {
         return;
     }
     let (_verified_fixture, mut verified, verified_result) = quiescent();
+    // Proof control: a quiescent read with exactly matching API and trace
+    // evidence mints v1 and its family witness at a healthy terminal.
+    let mut exact = verified.clone();
+    assert!(
+        mints_v1(&mut exact, &verified_result, 0..6),
+        "control: exact rows mint v1"
+    );
+    assert!(exact.claude_usage_family_witnesses.contains_key(SESSION));
     assert!(mints_v1(&mut verified, &verified_result, 0..9));
+    let previous_witness = verified.claude_usage_family_witnesses[SESSION].clone();
     let mut grown = grown_full();
     assert_eq!(grown.seen.unreadable, 0);
     grown.index.claude_usage_family_witnesses = verified.claude_usage_family_witnesses;
+    // A saved family cannot reconstruct v1 from an actual FE prefix on an
+    // incomplete page, even with unchanged API/trace evidence and key.
+    let mut unmoved = grown.index.clone();
+    let mut incomplete = grown.result.clone();
+    incomplete.census_complete = false;
+    assert!(!mints_v1(&mut unmoved, &incomplete, 0..9));
+    assert_eq!(
+        unmoved.claude_usage_family_witnesses.get(SESSION),
+        Some(&previous_witness),
+        "historical witness remains for hold accounting, never prefix authority"
+    );
     let moved_key = local_index_key(&grown.base.path.with_file_name("physical-other.jsonl"));
     let entry = grown.index.files.remove(&grown.base.key).unwrap();
     assert!(entry.has_unverified_source());
@@ -1426,30 +1406,6 @@ fn fe_claude_prefix_with_different_physical_key_cannot_reconstruct_v1() {
         !mints_v1(&mut grown.index, &grown.result, 0..9),
         "SOURCE: physical-key drift cannot bypass prefix exclusion"
     );
-}
-
-/// Ordinary EOF-recomposed Tail retains positive behavior despite unverified D1.
-#[test]
-fn fe_claude_ordinary_tail_d1_debt_does_not_exclude_recomposed_body() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
-
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let base = baseline(CLAUDE, 4, 2);
-    let (mut index, result, seen) = plain(&base.fixture, CLAUDE, base.index, &base.cache);
-    assert_eq!(seen.modes, (0, 1, 0));
-    assert_eq!(seen.unreadable, 0);
-    assert!(index
-        .claude_request_census_for_test()
-        .get(&base.key)
-        .unwrap()
-        .unverified_or_twin());
-    assert!(
-        index.files[&base.key].has_unverified_source(),
-        "audit debt remains"
-    );
-    assert!(mints_v1(&mut index, &result, 0..9));
 }
 
 /// Old, unknown and malformed tags cannot assert a complete native reduction.
@@ -1546,6 +1502,7 @@ fn fe_claude_prefix_then_complete_tail_at_eof_is_positive_again() {
         .unwrap()
         .unverified_or_twin());
     assert!(mints_v1(&mut index, &result, 0..9));
+    assert!(index.claude_usage_family_witnesses.contains_key(SESSION));
 }
 
 /// A later grown Tail publication still owes the prefix exclusion, even if
@@ -1730,134 +1687,6 @@ fn fe_n1_identity_incomplete_record_cannot_bind_recomposed_body() {
     }
 }
 
-/// SOURCE N1, marker-preserving versions: an actual identity-incomplete Tail
-/// cannot reconstruct a saved witness until its persisted hourly Full audit.
-/// Neither a reload nor loss of the optional retained copy cancels the read.
-#[test]
-fn fe_n1_held_tail_save_reload_reaches_due_full_and_reproves() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
-
-    use crate::snapshots::claude_request_census::{
-        identity_incomplete_hold_totals, ClaudeRequestCensusShape as Shape,
-    };
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    struct Clock;
-    impl Drop for Clock {
-        fn drop(&mut self) {
-            sampled_scan::set_test_now(None);
-        }
-    }
-    let _clock = Clock;
-    // The scanner's candidate clock remains real. Put the initial verified
-    // read one interval back, then complete the Tail just before its due
-    // time; after reload both clocks agree the saved deadline has arrived.
-    let due = sampled_scan::now_seconds();
-    sampled_scan::set_test_now(Some(
-        due - crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
-    ));
-    let fixture = ScanFixture::new(CLAUDE);
-    append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..6));
-    let key = local_index_key(&fixture.file.0);
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (mut index, first, seen) = plain(
-        &fixture,
-        CLAUDE,
-        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default()),
-        &cache,
-    );
-    assert_eq!(seen.modes, (1, 0, 0));
-    assert_eq!(seen.unreadable, 0);
-    assert!(cache.retained_checkpoint(&key).is_some());
-    let mut proven = index.clone();
-    assert!(mints_v1(&mut proven, &first, 0..6));
-    index.claude_usage_family_witnesses = proven.claude_usage_family_witnesses;
-    let witness = index.claude_usage_family_witnesses[SESSION].clone();
-    let before = identity_incomplete_hold_totals();
-
-    // Keep the six keyed occurrences unchanged and add a real id-less
-    // response. Native finish marks the census IdentityIncomplete; only the
-    // saved witness, not a fresh identity-complete transcript proof, can bind.
-    let mut idless = row(CLAUDE, 6);
-    idless.as_object_mut().unwrap().remove("requestId");
-    fixture.file.append(&idless);
-    sampled_scan::set_test_now(Some(due - 1));
-    let (mut index, tail, seen) = plain(&fixture, CLAUDE, index, &cache);
-    assert_eq!(seen.modes, (0, 1, 0), "real continued Tail");
-    assert_eq!(seen.unreadable, 0);
-    let record = index.claude_request_census_for_test().get(&key).unwrap();
-    assert_eq!(record.shape_for_test(), Shape::IdentityIncomplete);
-    assert!(record.unverified_or_twin());
-    assert!(!record.can_bind_recomposed_body(), "Exact|Empty refusal");
-    assert_eq!(index.files[&key].unverified_deadline(), Some(due));
-    assert!(!index.files[&key].audit_requires_full(due - 1));
-    // Isolate the binding decision from the fold's separate retry/rearm
-    // bookkeeping; save the native scan's actual D1 and audit marker below.
-    assert!(!mints_v1(&mut index.clone(), &tail, 0..6));
-    let mut verified_control = index.clone();
-    let record = verified_control
-        .claude_request_census_for_test()
-        .get(&key)
-        .unwrap()
-        .clone()
-        .with_unverified_for_test(false);
-    verified_control
-        .claude_request_census_mut_for_test()
-        .insert_for_test(&key, record);
-    assert!(
-        mints_v1(&mut verified_control, &tail, 0..6),
-        "the identical body can reconstruct once N1 verification holds"
-    );
-    assert_eq!(identity_incomplete_hold_totals(), (before.0 + 1, before.1));
-
-    let path = fixture.dir.join("n1-index.json");
-    index.save(&path).unwrap();
-    drop(index);
-    cache.clear();
-    let loaded = ScanIndex::load(&path).unwrap();
-    assert!(cache.retained_checkpoint(&key).is_none());
-    assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
-    let record = loaded.claude_request_census_for_test().get(&key).unwrap();
-    assert_eq!(record.shape_for_test(), Shape::IdentityIncomplete);
-    assert!(record.unverified_or_twin());
-    assert!(!record.can_bind_recomposed_body());
-    assert!(!mints_v1(&mut loaded.clone(), &tail, 0..6));
-    assert_eq!(identity_incomplete_hold_totals(), (before.0 + 1, before.1));
-
-    sampled_scan::set_test_now(Some(due));
-    assert!(loaded.files[&key].audit_requires_full(due));
-    let (mut audited, result, seen, read) = page_injecting(
-        &fixture,
-        CLAUDE,
-        loaded,
-        &cache,
-        |mode| mode == ReadMode::Full(FullReason::StateMissing),
-        |_| {},
-    );
-    assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
-    assert_eq!(seen.modes, (1, 0, 0));
-    assert_eq!(seen.full_reasons[STATE_MISSING], 1);
-    assert_eq!(seen.unreadable, 0);
-    assert!(!audited.files[&key].has_unverified_source());
-    let record = audited.claude_request_census_for_test().get(&key).unwrap();
-    assert_eq!(record.shape_for_test(), Shape::IdentityIncomplete);
-    assert!(!record.unverified_or_twin(), "Full verifies the source");
-    assert!(
-        !record.can_bind_recomposed_body(),
-        "shape gate stays narrow"
-    );
-    assert_eq!(audited.claude_usage_family_witnesses[SESSION], witness);
-    assert!(
-        mints_v1(&mut audited, &result, 0..6),
-        "audit releases N1 hold"
-    );
-    assert_eq!(
-        identity_incomplete_hold_totals(),
-        (before.0 + 1, before.1 + 1)
-    );
-}
-
 /// Resets the thread-local sampled scan clock, panic-safe.
 struct TestClock;
 impl Drop for TestClock {
@@ -1866,11 +1695,13 @@ impl Drop for TestClock {
     }
 }
 
-/// A held N1 Tail built as `fe_n1_held_tail_save_reload_reaches_due_full_and_reproves`
-/// builds it (Full one interval before `due`, id-less Tail just before), then
-/// a marker-erasing downgrade: 0.1.189's parse-free migrate rewrites the
-/// entry to plain v2, the index is saved, the retained copy lost and the
-/// index reloaded.
+/// A held N1 Tail (SOURCE N1, marker-preserving versions): Full one
+/// interval before `due`, then an actual identity-incomplete id-less Tail
+/// just before it, which cannot reconstruct the saved witness until its
+/// hourly Full audit (the identical body can once N1 verification holds).
+/// Then a marker-erasing downgrade: 0.1.189's parse-free migrate rewrites
+/// the entry to plain v2, the index is saved, the retained copy lost and
+/// the index reloaded.
 struct ErasedHold {
     fixture: ScanFixture,
     key: String,
@@ -1892,10 +1723,15 @@ fn erased_hold(due: u64) -> ErasedHold {
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let (mut index, first, seen) = plain(&fixture, CLAUDE, ScanIndex::default(), &cache);
     assert_eq!(seen.modes, (1, 0, 0));
+    assert_eq!(seen.unreadable, 0);
+    assert!(cache.retained_checkpoint(&key).is_some());
     let mut proven = index.clone();
     assert!(mints_v1(&mut proven, &first, 0..6));
     index.claude_usage_family_witnesses = proven.claude_usage_family_witnesses;
     let witness = index.claude_usage_family_witnesses[SESSION].clone();
+    // Keep the six keyed occurrences unchanged and add a real id-less
+    // response. Native finish marks the census IdentityIncomplete; only the
+    // saved witness, not a fresh identity-complete transcript proof, can bind.
     let mut idless = row(CLAUDE, 6);
     idless.as_object_mut().unwrap().remove("requestId");
     fixture.file.append(&idless);
@@ -1904,9 +1740,30 @@ fn erased_hold(due: u64) -> ErasedHold {
     assert_eq!(seen.modes, (0, 1, 0), "real continued Tail");
     assert_eq!(seen.unreadable, 0);
     assert_eq!(index.files[&key].unverified_deadline(), Some(due));
+    assert!(!index.files[&key].audit_requires_full(due - 1));
     let record = index.claude_request_census_for_test().get(&key).unwrap();
     assert_eq!(record.shape_for_test(), Shape::IdentityIncomplete);
     assert!(record.identity_incomplete_hold());
+    assert!(record.unverified_or_twin());
+    assert!(!record.can_bind_recomposed_body(), "Exact|Empty refusal");
+    // Isolate the binding decision from the fold's separate retry/rearm
+    // bookkeeping: the held Tail cannot bind, the identical body can once
+    // N1 verification holds.
+    assert!(!mints_v1(&mut index.clone(), &tail, 0..6));
+    let mut verified_control = index.clone();
+    let record = verified_control
+        .claude_request_census_for_test()
+        .get(&key)
+        .unwrap()
+        .clone()
+        .with_unverified_for_test(false);
+    verified_control
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, record);
+    assert!(
+        mints_v1(&mut verified_control, &tail, 0..6),
+        "the identical body can reconstruct once N1 verification holds"
+    );
 
     let entry = index.files.get_mut(&key).unwrap();
     entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
@@ -1967,7 +1824,7 @@ fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
     let due = sampled_scan::now_seconds();
     let before = identity_incomplete_hold_totals();
     let restored_before = restored();
-    let hold = erased_hold(due);
+    let mut hold = erased_hold(due);
     let key = hold.key.clone();
     assert_eq!(identity_incomplete_hold_totals(), (before.0 + 1, before.1));
     assert_eq!(restored(), restored_before, "save/load restores nothing");
@@ -2005,6 +1862,13 @@ fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
     assert_eq!(restore_dated(&mut loaded, due), 0);
     assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
     assert_eq!(restored(), restored_before + 2, "a restored marker is kept");
+    // Neither a reload nor loss of the optional retained copy cancels the
+    // held record or its read.
+    assert!(hold.cache.retained_checkpoint(&key).is_none());
+    let record = loaded.claude_request_census_for_test().get(&key).unwrap();
+    assert_eq!(record.shape_for_test(), Shape::IdentityIncomplete);
+    assert!(record.unverified_or_twin());
+    assert!(!record.can_bind_recomposed_body());
     assert_eq!(identity_incomplete_hold_totals(), (before.0 + 1, before.1));
 
     sampled_scan::set_test_now(Some(due));
@@ -2045,7 +1909,9 @@ fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
 /// of the backfill window leaves discovery. While the audit-slot budget
 /// defers its restoration, reconciliation keeps the unobserved entry and its
 /// hold; a later scan restores it without reading, and the restored marker
-/// brings it back for its one due Full.
+/// brings it back for its one due Full, where the saved witness re-proves.
+/// Its age rejections (at candidate conversion or after stat but before
+/// open) settle as ordinary removals, never as vanished-file retirement.
 #[test]
 fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
@@ -2061,6 +1927,22 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     let restored_before = restored();
     let hold = erased_hold(due);
     let key = hold.key.clone();
+    let traversal = || ScanTraversalPath {
+        scan_root: hold.fixture.root.clone(),
+        path: hold.fixture.file.0.clone(),
+        census_member: true,
+        watcher_hint: false,
+    };
+    let mut at_open = ScanCensus::default();
+    let candidate = candidate_from_traversal_path(
+        CLAUDE,
+        traversal(),
+        &mut at_open,
+        Some(due),
+        BACKFILL_WINDOW_DAYS,
+        &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None),
+    )
+    .expect("retained while recent");
     OpenOptions::new()
         .write(true)
         .open(&hold.fixture.file.0)
@@ -2071,6 +1953,32 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
         !sampled_audit::path_requires_verification(&hold.index.files, &hold.fixture.file.0),
         "the erased marker lost the age-window rescue"
     );
+    // The member becomes old after its stat but before open, or at
+    // candidate conversion. Both age rejections settle as ordinary
+    // removals, never as explicit vanished-file retirement.
+    assert!(open_and_identify_scan_candidate(
+        CLAUDE,
+        candidate,
+        &mut at_open,
+        Some(due),
+        BACKFILL_WINDOW_DAYS,
+        discovery_retention!(hold.index),
+    )
+    .is_none());
+    let mut at_conversion = ScanCensus::default();
+    assert!(candidate_from_traversal_path(
+        CLAUDE,
+        traversal(),
+        &mut at_conversion,
+        Some(due),
+        BACKFILL_WINDOW_DAYS,
+        &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None),
+    )
+    .is_none());
+    for census in [&at_open, &at_conversion] {
+        assert!(census.removed_index_keys.contains(&key));
+        assert!(!census.claude_vanished_index_keys.contains(&key));
+    }
     let held = |index: &ScanIndex| {
         index
             .claude_request_census_for_test()
@@ -2099,6 +2007,9 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
         "the deferred aged entry is kept"
     );
     assert!(held(&crowded), "and so is its hold");
+    assert!(sampled_audit::awaits_hold_deadline_restoration(
+        &crowded, &key
+    ));
 
     // A freed slot: the next scan restores it, reading nothing.
     let mut freed = crowded;
@@ -2114,6 +2025,7 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
         &freed.files,
         &hold.fixture.file.0
     ));
+    assert!(freed.files[&key].has_prefix_provenance());
     assert!(held(&freed));
 
     // Dated one interval before `due` (the candidate clock stays real):
@@ -2127,7 +2039,7 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     let loaded = ScanIndex::load(&hold.index_path).unwrap();
 
     sampled_scan::set_test_now(Some(due));
-    let (audited, result, seen, read) = page_injecting(
+    let (mut audited, result, seen, read) = page_injecting(
         &hold.fixture,
         CLAUDE,
         loaded,
@@ -2137,6 +2049,7 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     );
     assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
     assert_eq!(seen.modes, (1, 0, 0));
+    assert_eq!(seen.full_reasons[STATE_MISSING], 1);
     assert_eq!(seen.unreadable, 0);
     assert!(
         !result.snapshots.is_empty(),
@@ -2144,262 +2057,14 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     );
     assert!(!audited.files[&key].has_unverified_source());
     assert!(!held(&audited));
+    assert!(!audited
+        .claude_request_census_for_test()
+        .get(&key)
+        .unwrap()
+        .unverified_or_twin());
+    assert_eq!(audited.claude_usage_family_witnesses[SESSION], hold.witness);
+    assert!(mints_v1(&mut audited, &result, 0..6));
     assert_eq!(restored(), restored_before + 2);
-}
-
-/// A retained member can become old at candidate conversion or after its
-/// stat but before open. Both age rejections settle as ordinary removals,
-/// never as explicit vanished-file retirement.
-#[test]
-fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reload() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
-
-    use std::time::{Duration, UNIX_EPOCH};
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let _clock = TestClock;
-    let due = sampled_scan::now_seconds();
-    for at_open in [false, true] {
-        let mut hold = erased_hold(due);
-        let key = hold.key.clone();
-        let pending = || ScanTraversalPath {
-            scan_root: hold.fixture.root.clone(),
-            path: hold.fixture.file.0.clone(),
-            census_member: true,
-            watcher_hint: false,
-        };
-        let mut census = ScanCensus::default();
-        let candidate = candidate_from_traversal_path(
-            CLAUDE,
-            pending(),
-            &mut census,
-            Some(due),
-            BACKFILL_WINDOW_DAYS,
-            &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None),
-        )
-        .expect("retained while recent");
-        File::open(&hold.fixture.file.0)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
-            .unwrap();
-        if at_open {
-            assert!(open_and_identify_scan_candidate(
-                CLAUDE,
-                candidate,
-                &mut census,
-                Some(due),
-                BACKFILL_WINDOW_DAYS,
-                discovery_retention!(hold.index),
-            )
-            .is_none());
-        } else {
-            assert!(candidate_from_traversal_path(
-                CLAUDE,
-                pending(),
-                &mut census,
-                Some(due),
-                BACKFILL_WINDOW_DAYS,
-                &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None),
-            )
-            .is_none());
-        }
-        assert!(census.removed_index_keys.contains(&key));
-        assert!(!census.claude_vanished_index_keys.contains(&key));
-        let mut index = hold.index;
-        // This earlier hold takes the one restoration, deferring the real
-        // retained member. No deletion or manual freeing of an audit slot.
-        index
-            .files
-            .insert("!earlier-held".into(), index.files[&key].clone());
-        let record = index
-            .claude_request_census_for_test()
-            .get(&key)
-            .unwrap()
-            .clone();
-        index
-            .claude_request_census_mut_for_test()
-            .insert_for_test("!earlier-held", record);
-        sampled_scan::set_test_now(None);
-        let removed = census.removed_index_keys.clone();
-        let (mut index, _, seen) = page(&hold.fixture, CLAUDE, index, &hold.cache, |scan| {
-            scan.census
-                .removed_index_keys
-                .extend(removed.iter().cloned());
-        });
-        assert_eq!(seen.modes, (0, 0, 0));
-        assert!(sampled_audit::awaits_hold_deadline_restoration(
-            &index, &key
-        ));
-        index.save(&hold.index_path).unwrap();
-        let index = ScanIndex::load(&hold.index_path).unwrap();
-        assert!(sampled_audit::awaits_hold_deadline_restoration(
-            &index, &key
-        ));
-        let (mut index, _, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
-        assert_eq!(seen.modes, (0, 0, 0));
-        assert!(index.files[&key].has_prefix_provenance());
-        // Date this already-restored deadline so the real candidate clock
-        // and deterministic acquisition clock agree, then persist it again.
-        index
-            .files
-            .get_mut(&key)
-            .unwrap()
-            .set_unverified_deadline(due);
-        index.save(&hold.index_path).unwrap();
-        let index = ScanIndex::load(&hold.index_path).unwrap();
-        sampled_scan::set_test_now(Some(due));
-        let (mut index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
-        assert_eq!(seen.modes, (1, 0, 0));
-        assert_eq!(seen.full_reasons[STATE_MISSING], 1);
-        assert_eq!(seen.unreadable, 0);
-        assert!(!index
-            .claude_request_census_for_test()
-            .get(&key)
-            .unwrap()
-            .unverified_or_twin());
-        assert_eq!(index.claude_usage_family_witnesses[SESSION], hold.witness);
-        assert!(mints_v1(&mut index, &result, 0..6));
-    }
-}
-
-/// Capture and attachment straddle D in both directions. A pre-due page
-/// cannot spend a virtual turn merely because attachment occurs after D.
-#[test]
-fn fe_n1_option_b_attachment_uses_captured_audit_time_across_due_edge() {
-    use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
-    use crate::transcript_cache::CACHE_ENTRIES;
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let _clock = TestClock;
-    let due = sampled_scan::now_seconds();
-    for saturated in [false, true] {
-        let hold = erased_hold(due);
-        let key = hold.key.clone();
-        File::open(&hold.fixture.file.0)
-            .unwrap()
-            .set_modified(std::time::UNIX_EPOCH)
-            .unwrap();
-        let mut index = hold.index;
-        assert!(sampled_audit::awaits_hold_deadline_restoration(
-            &index, &key
-        ));
-        if saturated {
-            for n in 0..CACHE_ENTRIES - 1 {
-                let mut pending = index.files[&key].clone();
-                pending.set_unverified_deadline(due);
-                index
-                    .files
-                    .insert(format!("/attachment-unavailable/{n}"), pending);
-            }
-            index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
-                key: key.clone(),
-                due,
-                attempted: false,
-            });
-        }
-        for captured in [due - 1, due] {
-            if !saturated && captured == due {
-                break; // The free-slot arm restores a new ordinary deadline.
-            }
-            sampled_scan::set_test_now(Some(captured));
-            let scan = OwnedSourceScan::new(
-                CLAUDE,
-                std::slice::from_ref(&hold.fixture.root),
-                index,
-                NOW,
-                BACKFILL_WINDOW_DAYS,
-                10,
-                false,
-                None,
-                &[],
-                false,
-                true,
-            );
-            assert_eq!(scan.audit_now, captured);
-            assert!(
-                !scan
-                    .identified_candidates
-                    .iter()
-                    .any(|candidate| local_index_key(&candidate.path) == key),
-                "the old unmarked file needs held-slot rescue"
-            );
-            // Unlike a before_step/setup hook, this is BEFORE attachment.
-            sampled_scan::set_test_now(Some(if captured < due { due + 1 } else { due - 1 }));
-            let scan = scan.with_sampled_acquisition(hold.cache.clone(), Scope(NAMESPACE.into()));
-            let scheduled = captured == due;
-            if saturated {
-                let slot = scan.index.held_audit_progress.as_ref().unwrap();
-                assert_eq!(slot.key, key);
-                assert_eq!(
-                    slot.due, due,
-                    "attachment never postpones the original turn"
-                );
-                if !scheduled {
-                    assert!(
-                        !slot.attempted,
-                        "no spent turn before the captured deadline"
-                    );
-                }
-                assert_eq!(
-                    sampled_audit::progress_debt(&scan.index, &key, scan.audit_now).is_some(),
-                    scheduled
-                );
-                assert_eq!(
-                    scan.identified_candidates
-                        .iter()
-                        .any(|candidate| local_index_key(&candidate.path) == key),
-                    scheduled
-                );
-                assert_eq!(scan.sampling.as_ref().unwrap().audit_slots, 1);
-                assert!(!scan.index.files[&key].has_unverified_source());
-            } else {
-                let restored_due = captured + INTERVAL;
-                assert_eq!(
-                    scan.index.files[&key].unverified_deadline(),
-                    Some(restored_due),
-                    "ordinary restoration is also dated by the captured clock"
-                );
-                assert!(!scan.index.files[&key].audit_requires_full(scan.audit_now));
-                assert!(scan.index.held_audit_progress.is_none());
-            }
-            let (next, raw, _, modes, _) = finish_production_scan_page(scan, CLAUDE);
-            index = next;
-            assert_eq!(modes, (usize::from(scheduled), 0, 0));
-            if scheduled {
-                assert!(
-                    !raw.snapshots.is_empty(),
-                    "the original due turn performs its native read"
-                );
-                assert!(!sampled_audit::awaits_hold_deadline_restoration(
-                    &index, &key
-                ));
-                assert_eq!(index.held_audit_progress.as_ref().unwrap().due, due);
-            } else {
-                assert!(index
-                    .claude_request_census_for_test()
-                    .get(&key)
-                    .unwrap()
-                    .identity_incomplete_hold());
-                if saturated {
-                    let slot = index.held_audit_progress.as_ref().unwrap();
-                    assert_eq!(slot.due, due);
-                    assert!(
-                        !slot.attempted,
-                        "rescue and completion did not spend a future turn"
-                    );
-                }
-            }
-            index.save(&hold.index_path).unwrap();
-            index = ScanIndex::load(&hold.index_path).unwrap();
-            if saturated && !scheduled {
-                let slot = index.held_audit_progress.as_ref().unwrap();
-                assert_eq!(slot.due, due, "D survives save/reload unchanged");
-                assert!(!slot.attempted);
-            }
-        }
-    }
 }
 
 /// Saturate the marker pool with debts that cannot drain, then cross the

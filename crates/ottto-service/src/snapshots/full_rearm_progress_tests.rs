@@ -1593,133 +1593,129 @@ fn a_contract_change_rearms_at_most_once_then_skips() {
     }
 }
 
-/// Lead A ruling (a), gate off (collector contract, revision below 3), where
-/// the latch's own re-arm clears every family file. A never-permitted index
-/// (recorded `""`, structural baseline built without evidence) observes the
-/// always-on contract: an opening fence leaves the cutover owed, and the
-/// first complete terminal behind a closed fence re-arms the family once,
-/// counted with its files and bytes as `contract_cutover_rearm`, and keeps
-/// the structural baseline (no whole-index re-arm). While an unsettled sweep
-/// holds the latch, later terminals, a restart, an incomplete census and an
-/// evidence-gap veto re-arm nothing more; the next settled terminal clears
-/// the latch.
-#[test]
-fn a_never_permitted_cutover_rearms_once_and_is_counted() {
-    claude_request_identity::with_cycle_contract_for_test(
-        claude_request_identity::COLLECTOR,
-        || {
-            let rearm = Rearm::new();
-            let support = temp_dir("full-rearm-cutover");
-            let path = support.join("index.json");
-            let mut index = rearm.index();
-            assert_eq!(index.claude_request_identity_contract.as_deref(), Some(""));
-            {
-                let _pre_cutover = claude_request_identity::PreCutoverEvidenceForTest::enter();
-                let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
-                assert!(first.counts.full_rearm, "{first:?} {state}");
-                let (skipped, _, state) = always_on_terminal(&rearm, &support, &mut index);
-                assert!(
-                    skipped.suppression.full_rearm_suppressed,
-                    "{skipped:?} {state}"
-                );
-            }
-            index.observe_claude_request_identity_contract(true);
-            assert!(index.claude_request_identity_contract_changed);
-            // An opening fence runs none of the latch's re-arm causes, so the
-            // cutover stays owed (Claude review, round 3).
-            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-            index.bounded_sweep_had_unsettled_upload = true;
-            index.claude_duplicate_request_witness_overflowed = false;
-            let (opening, _, state) = always_on_terminal(&rearm, &support, &mut index);
-            assert_eq!(
-                index.claude_full_rearm_progress.contract_cutover, CLAUDE_CONTRACT_CUTOVER_OWED,
-                "{opening:?} {state}"
-            );
-            assert_eq!(scope.finish().contract.contract_cutover_rearm.runs, 0);
-            index.claude_duplicate_request_witness_overflowed = true;
-            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-            index.bounded_sweep_had_unsettled_upload = true;
-            let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
-            assert!(
-                !first.counts.full_rearm,
-                "no whole-index re-arm: {first:?} {state}"
-            );
-            assert!(first.suppression.full_rearm_suppressed, "{first:?} {state}");
-            assert_eq!(
-                first.rearmed_files, 2,
-                "the latch re-arms the family once: {state}"
-            );
-            let cutover = scope.finish().contract.contract_cutover_rearm;
-            assert_eq!(
-                (cutover.runs, cutover.files, cutover.bytes),
-                (1, 2, first.rearmed_bytes),
-                "counted with its files and bytes"
-            );
-            assert!(first.rearmed_bytes > 0);
-            assert!(index.claude_request_identity_contract_changed, "held latch");
-
-            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-            for step in [
-                "later",
-                "later again",
-                "restart",
-                "incomplete census",
-                "complete again",
-                "evidence gap",
-            ] {
-                if step == "restart" {
-                    index.save(&path).unwrap();
-                    index = ScanIndex::load(&path).unwrap();
-                    assert!(index.claude_request_identity_contract_changed, "{step}");
-                }
-                index.bounded_sweep_had_unsettled_upload = true;
-                if step == "evidence gap" {
-                    index.note_claude_full_rearm_evidence_gap(WINDOW);
-                }
-                // The evidence gap vetoes the structural skip, so its terminal is
-                // not due: only the latch could re-arm there.
-                let due_at = if step == "evidence gap" {
-                    CENSUS_CLOCK + 3_600
-                } else {
-                    1
-                };
-                let (run, _, state) = always_on_terminal_at(
-                    &rearm,
-                    &support,
-                    &mut index,
-                    due_at,
-                    step != "incomplete census",
-                );
-                assert!(!run.counts.full_rearm, "{step}: {run:?} {state}");
-                assert_eq!(run.rearmed_files, 0, "{step}: never again: {state}");
-            }
-            assert!(index.claude_request_identity_contract_changed, "still held");
-            index.bounded_sweep_had_unsettled_upload = false;
-            let (settled, _, state) =
-                always_on_terminal_at(&rearm, &support, &mut index, CENSUS_CLOCK + 3_600, true);
-            assert_eq!(settled.rearmed_files, 0, "{state}");
-            assert!(
-                !index.claude_request_identity_contract_changed,
-                "a settled terminal clears the spent latch: {state}"
-            );
-            assert_eq!(
-                scope.finish().contract.contract_cutover_rearm.runs,
-                0,
-                "the cutover is spent for good"
-            );
-            let _ = fs::remove_dir_all(support);
-        },
-    );
-}
-
 /// A pre-cutover writer drops the spent field and records `""` again.
 /// Re-upgrading owes exactly one additional counted cutover, then keeps SPENT
 /// through another terminal and restart. An unknown contract is not this case.
+///
+/// First (folded in from the retired never-permitted cutover test, U51): a
+/// never-permitted index (recorded `""`, structural baseline built without
+/// evidence) observes the always-on contract. An opening fence leaves the
+/// cutover owed; the first complete terminal behind a closed fence re-arms the
+/// family once, counted with its files and bytes as `contract_cutover_rearm`,
+/// and keeps the structural baseline (no whole-index re-arm). While an
+/// unsettled sweep holds the latch, later terminals, a restart, an incomplete
+/// census and an evidence-gap veto re-arm nothing more; the next settled
+/// terminal clears the latch.
 #[test]
 fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
     claude_request_identity::with_cycle_contract_for_test(
         claude_request_identity::COLLECTOR,
         || {
+            // Closed-fence, once-only counted cutover with a held latch,
+            // restart and veto proof, on its own fixture.
+            {
+                let rearm = Rearm::new();
+                let support = temp_dir("full-rearm-cutover");
+                let path = support.join("index.json");
+                let mut index = rearm.index();
+                assert_eq!(index.claude_request_identity_contract.as_deref(), Some(""));
+                {
+                    let _pre_cutover = claude_request_identity::PreCutoverEvidenceForTest::enter();
+                    let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                    assert!(first.counts.full_rearm, "{first:?} {state}");
+                    let (skipped, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                    assert!(
+                        skipped.suppression.full_rearm_suppressed,
+                        "{skipped:?} {state}"
+                    );
+                }
+                index.observe_claude_request_identity_contract(true);
+                assert!(index.claude_request_identity_contract_changed);
+                // An opening fence runs none of the latch's re-arm causes, so the
+                // cutover stays owed (Claude review, round 3).
+                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                index.bounded_sweep_had_unsettled_upload = true;
+                index.claude_duplicate_request_witness_overflowed = false;
+                let (opening, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                assert_eq!(
+                    index.claude_full_rearm_progress.contract_cutover, CLAUDE_CONTRACT_CUTOVER_OWED,
+                    "{opening:?} {state}"
+                );
+                assert_eq!(scope.finish().contract.contract_cutover_rearm.runs, 0);
+                index.claude_duplicate_request_witness_overflowed = true;
+                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                index.bounded_sweep_had_unsettled_upload = true;
+                let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                assert!(
+                    !first.counts.full_rearm,
+                    "no whole-index re-arm: {first:?} {state}"
+                );
+                assert!(first.suppression.full_rearm_suppressed, "{first:?} {state}");
+                assert_eq!(
+                    first.rearmed_files, 2,
+                    "the latch re-arms the family once: {state}"
+                );
+                let cutover = scope.finish().contract.contract_cutover_rearm;
+                assert_eq!(
+                    (cutover.runs, cutover.files, cutover.bytes),
+                    (1, 2, first.rearmed_bytes),
+                    "counted with its files and bytes"
+                );
+                assert!(first.rearmed_bytes > 0);
+                assert!(index.claude_request_identity_contract_changed, "held latch");
+
+                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                for step in [
+                    "later",
+                    "later again",
+                    "restart",
+                    "incomplete census",
+                    "complete again",
+                    "evidence gap",
+                ] {
+                    if step == "restart" {
+                        index.save(&path).unwrap();
+                        index = ScanIndex::load(&path).unwrap();
+                        assert!(index.claude_request_identity_contract_changed, "{step}");
+                    }
+                    index.bounded_sweep_had_unsettled_upload = true;
+                    if step == "evidence gap" {
+                        index.note_claude_full_rearm_evidence_gap(WINDOW);
+                    }
+                    // The evidence gap vetoes the structural skip, so its terminal is
+                    // not due: only the latch could re-arm there.
+                    let due_at = if step == "evidence gap" {
+                        CENSUS_CLOCK + 3_600
+                    } else {
+                        1
+                    };
+                    let (run, _, state) = always_on_terminal_at(
+                        &rearm,
+                        &support,
+                        &mut index,
+                        due_at,
+                        step != "incomplete census",
+                    );
+                    assert!(!run.counts.full_rearm, "{step}: {run:?} {state}");
+                    assert_eq!(run.rearmed_files, 0, "{step}: never again: {state}");
+                }
+                assert!(index.claude_request_identity_contract_changed, "still held");
+                index.bounded_sweep_had_unsettled_upload = false;
+                let (settled, _, state) =
+                    always_on_terminal_at(&rearm, &support, &mut index, CENSUS_CLOCK + 3_600, true);
+                assert_eq!(settled.rearmed_files, 0, "{state}");
+                assert!(
+                    !index.claude_request_identity_contract_changed,
+                    "a settled terminal clears the spent latch: {state}"
+                );
+                assert_eq!(
+                    scope.finish().contract.contract_cutover_rearm.runs,
+                    0,
+                    "the cutover is spent for good"
+                );
+                let _ = fs::remove_dir_all(support);
+            }
+
             let rearm = Rearm::new();
             let support = temp_dir("full-rearm-cutover-reupgrade");
             let path = support.join("index.json");
@@ -2913,6 +2909,10 @@ fn bound_retry_pending_authority_survives_unrelated_suppression_and_offers_its_o
         held,
         &index.claude_usage_family_witnesses[OTHER_ROOT]
     ));
+    assert_eq!(
+        held.member_source_file_fingerprints, before.member_source_file_fingerprints,
+        "the unchanged held family keeps its binding"
+    );
     assert_ignored(&diagnostics(scope.finish()), "invalid_rows", 3);
     let mut candidate = test_candidate(rearm.root.join(format!("{OTHER_ROOT}.jsonl")));
     candidate.source_file_fingerprint = held.member_source_file_fingerprints[OTHER_ROOT].clone();
@@ -2929,6 +2929,16 @@ fn bound_retry_pending_authority_survives_unrelated_suppression_and_offers_its_o
             .claude_usage_authority_candidate_requires_family_reparse(&candidate)
             .as_deref(),
         Some(OTHER_ROOT)
+    );
+    // Only the held family's own due retry is offered: a settled file of an
+    // unrelated family at its committed revision is not re-read.
+    let mut settled = test_candidate(rearm.root.join(format!("{}.jsonl", rearm.parent)));
+    settled.source_file_fingerprint = "rev-parent".to_string();
+    assert!(
+        index
+            .claude_usage_authority_candidate_requires_family_reparse(&settled)
+            .is_none(),
+        "an unrelated settled file stays quiet at the held family's retry"
     );
     assert!(
         index

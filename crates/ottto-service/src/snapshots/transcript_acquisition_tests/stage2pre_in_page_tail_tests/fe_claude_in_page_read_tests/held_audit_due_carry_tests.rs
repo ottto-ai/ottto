@@ -40,79 +40,6 @@ fn hold_released(index: &ScanIndex, key: &str) -> bool {
         .unverified_or_twin()
 }
 
-/// Slots saturated while the slot was minted; at D capacity opens and the
-/// source preparation's restorer converts the key first. The marker carries
-/// D, so the same page runs the owed Full instead of waiting to D+interval.
-#[test]
-fn fe_n1_virtual_due_carries_into_marker_when_capacity_opens_at_due() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
-
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let _clock = TestClock;
-    let due = sampled_scan::now_seconds();
-    let hold = erased_hold(due);
-    let key = hold.key.clone();
-    let mut index = hold.index;
-    owe(&mut index, &key, due);
-    let restored_before = restored();
-
-    // Saturated: the reserved last slot stays free, nothing converts, and
-    // the virtual slot still owes D.
-    let mut saturated = index.clone();
-    saturate(&mut saturated, &key, due);
-    assert_eq!(
-        sampled_audit::restore_held_audit_deadlines(&mut saturated, due),
-        0
-    );
-    assert!(sampled_audit::awaits_hold_deadline_restoration(
-        &saturated, &key
-    ));
-    assert_eq!(
-        sampled_audit::debt_for_key(&saturated, &key, due).map(|debt| debt.due_unix_seconds),
-        Some(due)
-    );
-    assert_eq!(markers(&saturated), CACHE_ENTRIES - 1);
-    assert_eq!(restored(), restored_before);
-
-    // Converting before D carries D rather than a fresh, later interval.
-    let mut early = index.clone();
-    assert_eq!(
-        sampled_audit::restore_held_audit_deadlines(&mut early, due - 60),
-        1
-    );
-    assert_eq!(early.files[&key].unverified_deadline(), Some(due));
-    assert!(
-        early.files[&key].has_prefix_provenance(),
-        "fail closed to `p`"
-    );
-    // Control: a spent turn (its secure open passed) owes nothing to carry.
-    let mut spent = index.clone();
-    spent.held_audit_progress.as_mut().unwrap().attempted = true;
-    assert_eq!(
-        sampled_audit::restore_held_audit_deadlines(&mut spent, due - 60),
-        1
-    );
-    assert_eq!(
-        spent.files[&key].unverified_deadline(),
-        Some(due - 60 + INTERVAL)
-    );
-    assert_eq!(restored(), restored_before + 2);
-
-    // The real source preparation exactly at D, with capacity open.
-    sampled_scan::set_test_now(Some(due));
-    let (mut audited, result, seen, read) =
-        page_injecting(&hold.fixture, CLAUDE, index, &hold.cache, is_full, |_| {});
-    assert!(is_full(read.mode));
-    assert_eq!(seen.modes, (1, 0, 0), "the owed Full runs at D");
-    assert_eq!(seen.unreadable, 0);
-    assert_eq!(restored(), restored_before + 3, "one restoration");
-    assert!(!audited.files[&key].has_unverified_source());
-    assert!(hold_released(&audited, &key));
-    assert!(mints_v1(&mut audited, &result, 0..6));
-}
-
 /// GUARDRAILS rule 5 through the real open path: an unavailable held key
 /// backs off by pages (1, 2, 4), each wait capped at 6 h, and parks with
 /// one alarm after 8 failed opens, its due D still owed across save/reload.
@@ -229,6 +156,8 @@ fn fe_n1_failing_held_open_backs_off_parks_and_never_blocks_healthy_key() {
 
 /// #870/#903 composition: rescue and failed-open backoff share the page's
 /// captured clock, even when the live clock crosses D before secure open.
+/// Capture and attachment straddle D in both directions, and a virtual
+/// slot's D carries into a restored marker (#865).
 #[test]
 fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -240,13 +169,140 @@ fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
         sampled_audit::reset_open_backoff_for_test();
         let hold = erased_hold(due);
         let key = hold.key.clone();
+        let written = std::fs::metadata(&hold.fixture.file.0)
+            .unwrap()
+            .modified()
+            .unwrap();
         File::open(&hold.fixture.file.0)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH)
             .unwrap();
         let mut index = hold.index;
+        assert!(sampled_audit::awaits_hold_deadline_restoration(
+            &index, &key
+        ));
+        let unsaturated = index.clone();
         saturate(&mut index, &key, due);
         owe(&mut index, &key, due);
+        let identified = |scan: &OwnedSourceScan| {
+            scan.identified_candidates
+                .iter()
+                .any(|candidate| local_index_key(&candidate.path) == key)
+        };
+        if !denied {
+            // #865: a virtual slot's due D is owed debt. Saturated, nothing
+            // converts and D stays owed; converting before D carries D, not a
+            // fresh, later interval. Control: a spent turn owes nothing.
+            let restored_before = restored();
+            let mut saturated = index.clone();
+            assert_eq!(
+                sampled_audit::restore_held_audit_deadlines(&mut saturated, due),
+                0
+            );
+            assert!(sampled_audit::awaits_hold_deadline_restoration(
+                &saturated, &key
+            ));
+            assert_eq!(
+                sampled_audit::debt_for_key(&saturated, &key, due)
+                    .map(|debt| debt.due_unix_seconds),
+                Some(due)
+            );
+            assert_eq!(markers(&saturated), CACHE_ENTRIES - 1);
+            assert_eq!(restored(), restored_before);
+            let mut early = unsaturated.clone();
+            owe(&mut early, &key, due);
+            let mut spent = early.clone();
+            assert_eq!(
+                sampled_audit::restore_held_audit_deadlines(&mut early, due - 60),
+                1
+            );
+            assert_eq!(early.files[&key].unverified_deadline(), Some(due));
+            assert!(
+                early.files[&key].has_prefix_provenance(),
+                "fail closed to `p`"
+            );
+            spent.held_audit_progress.as_mut().unwrap().attempted = true;
+            assert_eq!(
+                sampled_audit::restore_held_audit_deadlines(&mut spent, due - 60),
+                1
+            );
+            assert_eq!(
+                spent.files[&key].unverified_deadline(),
+                Some(due - 60 + INTERVAL)
+            );
+            assert_eq!(restored(), restored_before + 2);
+
+            // Capture before D, attachment after D: a pre-due page cannot
+            // spend a virtual turn merely because attachment occurs after D.
+            // With a free slot the ordinary restoration is dated by the
+            // captured clock.
+            for (early, saturated) in [(unsaturated.clone(), false), (index.clone(), true)] {
+                let captured = due - 1;
+                sampled_scan::set_test_now(Some(captured));
+                let scan = OwnedSourceScan::new(
+                    CLAUDE,
+                    std::slice::from_ref(&hold.fixture.root),
+                    early,
+                    NOW,
+                    BACKFILL_WINDOW_DAYS,
+                    10,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                );
+                assert_eq!(scan.audit_now, captured);
+                assert!(
+                    !identified(&scan),
+                    "the old unmarked file needs held-slot rescue"
+                );
+                sampled_scan::set_test_now(Some(due + 1));
+                let scan =
+                    scan.with_sampled_acquisition(hold.cache.clone(), Scope(NAMESPACE.into()));
+                if saturated {
+                    let slot = scan.index.held_audit_progress.as_ref().unwrap();
+                    assert_eq!(slot.key, key);
+                    assert_eq!(
+                        slot.due, due,
+                        "attachment never postpones the original turn"
+                    );
+                    assert!(
+                        !slot.attempted,
+                        "no spent turn before the captured deadline"
+                    );
+                    assert!(
+                        sampled_audit::progress_debt(&scan.index, &key, scan.audit_now).is_none()
+                    );
+                    assert!(!identified(&scan));
+                    assert_eq!(scan.sampling.as_ref().unwrap().audit_slots, 1);
+                    assert!(!scan.index.files[&key].has_unverified_source());
+                } else {
+                    assert_eq!(
+                        scan.index.files[&key].unverified_deadline(),
+                        Some(captured + INTERVAL),
+                        "ordinary restoration is also dated by the captured clock"
+                    );
+                    assert!(!scan.index.files[&key].audit_requires_full(scan.audit_now));
+                    assert!(scan.index.held_audit_progress.is_none());
+                }
+                let (early, _, _, modes, _) = finish_production_scan_page(scan, CLAUDE);
+                assert_eq!(modes, (0, 0, 0));
+                assert!(early
+                    .claude_request_census_for_test()
+                    .get(&key)
+                    .unwrap()
+                    .identity_incomplete_hold());
+                if saturated {
+                    let slot = early.held_audit_progress.as_ref().unwrap();
+                    assert_eq!(slot.due, due);
+                    assert!(
+                        !slot.attempted,
+                        "rescue and completion did not spend a future turn"
+                    );
+                }
+            }
+        }
         sampled_scan::set_test_now(Some(due));
         let scan = OwnedSourceScan::new(
             CLAUDE,
@@ -260,8 +316,15 @@ fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
             &[],
             false,
             true,
-        )
-        .with_sampled_acquisition(hold.cache.clone(), Scope(NAMESPACE.into()));
+        );
+        assert_eq!(scan.audit_now, due);
+        assert!(
+            !identified(&scan),
+            "the old unmarked file needs held-slot rescue"
+        );
+        // Captured at D, attached after the live clock fell back before D.
+        sampled_scan::set_test_now(Some(due - 1));
+        let scan = scan.with_sampled_acquisition(hold.cache.clone(), Scope(NAMESPACE.into()));
         assert_eq!(scan.audit_now, due);
         let slot = scan.index.held_audit_progress.as_ref().unwrap();
         assert_eq!(
@@ -269,11 +332,10 @@ fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
             (key.as_str(), due, false),
             "queueing is not a successful open"
         );
-        assert!(scan
-            .identified_candidates
-            .iter()
-            .any(|candidate| local_index_key(&candidate.path) == key));
+        assert!(identified(&scan));
         assert!(sampled_audit::progress_debt(&scan.index, &key, scan.audit_now).is_some());
+        assert_eq!(scan.sampling.as_ref().unwrap().audit_slots, 1);
+        assert!(!scan.index.files[&key].has_unverified_source());
         // Success needs rescue although the live clock is now before D.
         // Failure must date backoff by D, not this much later live clock.
         sampled_scan::set_test_now(Some(if denied { due + 6 * INTERVAL } else { due - 1 }));
@@ -349,6 +411,42 @@ fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
             assert_eq!((slot.due, slot.attempted), (due, true));
             assert_eq!(sampled_audit::held_audit_open_failed(due + 1), (0, 0));
             assert_eq!(markers(&index), CACHE_ENTRIES - 1);
+        } else {
+            // #865 at D with capacity open: the source preparation's
+            // restorer converts the owed key first and the marker carries D,
+            // so the same page runs the owed Full instead of waiting to
+            // D+interval; the audit releases the hold and the saved witness
+            // re-proves. The file keeps its written stat (not aged out), as
+            // the erased hold left it.
+            File::open(&hold.fixture.file.0)
+                .unwrap()
+                .set_modified(written)
+                .unwrap();
+            let mut index = unsaturated;
+            owe(&mut index, &key, due);
+            let restored_before = restored();
+            sampled_scan::set_test_now(Some(due));
+            let scan = OwnedSourceScan::new(
+                CLAUDE,
+                std::slice::from_ref(&hold.fixture.root),
+                index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_sampled_acquisition(hold.cache.clone(), Scope(NAMESPACE.into()));
+            let (mut audited, raw, _, modes, _) = finish_production_scan_page(scan, CLAUDE);
+            assert_eq!(modes, (1, 0, 0), "the owed Full runs at D");
+            assert_eq!(raw.unreadable_path_count, 0);
+            assert_eq!(restored(), restored_before + 1, "one restoration");
+            assert!(!audited.files[&key].has_unverified_source());
+            assert!(hold_released(&audited, &key));
+            assert!(mints_v1(&mut audited, &raw, 0..6));
         }
     }
 }

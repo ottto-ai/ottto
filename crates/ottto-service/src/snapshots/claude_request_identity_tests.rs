@@ -1718,86 +1718,6 @@ fn contract5_lifecycle_matches_the_legacy_qualification_path() {
     let _ = fs::remove_dir_all(dir);
 }
 
-#[test]
-fn reported_path_tags_from_rebuild_groupings() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-
-    let (dir, root, mut items) = claude_account_family_fixture(true);
-    items.truncate(1);
-    let mut item = items.remove(0);
-    let mut api = Vec::new();
-    for request_id in item.claude_usage_occurrences.keys() {
-        let n: u64 = request_id.trim_start_matches("req_").parse().unwrap();
-        let mut row = complete_api_row(&root, request_id, n, 10, 10, 0);
-        if n % 2 == 0 {
-            row.account_identifier_hash = Some("b".repeat(64));
-        }
-        api.push(signed(row));
-    }
-    let trace = api
-        .iter()
-        .map(|row| complete_trace_row(&root, &row.request_id, ""))
-        .collect::<Vec<_>>();
-    item.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".to_string());
-    for row in item.model_usage.iter_mut().chain(
-        item.usage_buckets
-            .iter_mut()
-            .flat_map(|b| b.model_usage.iter_mut()),
-    ) {
-        row.cost_usd = Some(usd_picos_string(
-            100_000_000 * u128::from(row.request_count),
-        ));
-    }
-    let (api, trace) = reports(api, trace);
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
-    // What `rebuild_claude_reported_usage` feeds the sink, request by request.
-    let mut sink = identity::RequestSink::for_item(&evidence, &item, usize::MAX).unwrap();
-    for (request_id, occurrence) in &item.claude_usage_occurrences {
-        let (row_key, _, _) = build_row_identity(
-            occurrence.model.as_deref().unwrap(),
-            &occurrence.selector,
-            occurrence.reasoning_effort.as_deref(),
-        );
-        let mut usage = occurrence.usage.clone();
-        usage.request_count = 1;
-        usage.costs = UsageCosts {
-            observed: true,
-            reported: true,
-            total: Some(100_000_000),
-            ..Default::default()
-        };
-        sink.add(
-            &item,
-            identity::Request {
-                request_id,
-                occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
-                timestamp: occurrence.timestamp.as_deref().unwrap(),
-                bucket_start: "2026-08-02T07:00:00Z",
-                row_key: &row_key,
-                usage: &usage,
-            },
-        );
-    }
-    let groupings = BTreeMap::from([(item.source_session_id.clone(), sink.finish())]);
-    let mut items = vec![item];
-    let outcome = identity::apply_scan(&mut items, &evidence, groupings);
-    assert_eq!(outcome.sent, 1, "{outcome:?}");
-    let parts = items[0].usage_buckets[0].model_usage[0]
-        .identity_parts
-        .clone()
-        .unwrap();
-    assert_eq!(parts.len(), 2);
-    assert!(parts
-        .iter()
-        .all(|part| part.cost_usd == Some("0.0002".to_string())));
-    // A reported item without this pass's grouping stays on today's path.
-    let mut ungrouped = vec![items[0].clone()];
-    ungrouped[0].provenance.collector = "claude_code_jsonl".to_string();
-    let outcome = identity::apply_scan(&mut ungrouped, &evidence, BTreeMap::new());
-    assert_eq!(outcome.ineligible, 1, "{outcome:?}");
-    let _ = fs::remove_dir_all(dir);
-}
-
 const CHILD_AGENT: &str = "a4d1585d310070d0f";
 
 /// The fixture family's telemetry: one row per transcript request and, with
@@ -1960,6 +1880,21 @@ fn reported_rebuild_groups_requests_without_changing_its_output() {
         );
         assert!(plain_disposition.request_groupings.is_empty());
         let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        // Capture ON without any marker: the same rebuild and tagging must
+        // reach the canonical non-marker bytes.
+        let mut captured = items.clone();
+        for item in &mut captured {
+            item.claude_org_markers = Some(Box::default());
+        }
+        let mut captured_disposition = apply_claude_reported_usage_with_identity(
+            &mut captured,
+            &api,
+            &trace,
+            &mut index(),
+            true,
+            "2026-08-02T07:10:00Z",
+            Some(&evidence),
+        );
         let mut grouped = items;
         let mut disposition = apply_claude_reported_usage_with_identity(
             &mut grouped,
@@ -2009,6 +1944,19 @@ fn reported_rebuild_groups_requests_without_changing_its_output() {
             }
         }
         let before = grouped.clone();
+        // A reported item without this pass's grouping stays on today's path
+        // with today's bytes.
+        let mut ungrouped = grouped.clone();
+        let untouched = serde_json::to_vec(&ungrouped).unwrap();
+        assert_eq!(
+            identity::apply_scan(&mut ungrouped, &evidence, BTreeMap::new()),
+            identity::ScanOutcome {
+                ineligible: 2,
+                ..Default::default()
+            },
+            "with_aux={with_aux} aux_login={aux_login}"
+        );
+        assert_eq!(serde_json::to_vec(&ungrouped).unwrap(), untouched);
         let outcome = identity::apply_scan(&mut grouped, &evidence, groupings);
         assert_eq!(
             outcome,
@@ -2017,6 +1965,16 @@ fn reported_rebuild_groups_requests_without_changing_its_output() {
                 ..Default::default()
             },
             "with_aux={with_aux} aux_login={aux_login}"
+        );
+        let captured_groupings = std::mem::take(&mut captured_disposition.request_groupings);
+        assert_eq!(
+            identity::apply_scan(&mut captured, &evidence, captured_groupings),
+            outcome
+        );
+        assert_eq!(
+            serde_json::to_vec(&captured).unwrap(),
+            serde_json::to_vec(&grouped).unwrap(),
+            "capture-ON non-marker body"
         );
         for (tagged, before) in grouped.iter().zip(&before) {
             assert_eq!(tagged.provenance.collector, identity::COLLECTOR);
@@ -2044,6 +2002,69 @@ fn reported_rebuild_groups_requests_without_changing_its_output() {
         }
         let _ = fs::remove_dir_all(dir);
     }
+
+    // Two telemetry logins in one bucket row: tagging splits it into one
+    // identity part per login, each carrying exactly its own two requests'
+    // reported money (0.0001 per request).
+    let (dir, parent, items) = claude_account_family_fixture(true);
+    let (_, trace) = family_reports(&parent, false, true);
+    let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+        evidence: BTreeMap::from([(
+            parent.clone(),
+            (1..=5)
+                .map(|n| {
+                    let output = if n == 5 { 1 } else { 10 };
+                    let mut row = complete_api_row(&parent, &format!("req_{n}"), n, 10, output, 0);
+                    if n % 2 == 0 {
+                        row.account_identifier_hash = Some("b".repeat(64));
+                    }
+                    signed(row)
+                })
+                .collect(),
+        )]),
+        health: Default::default(),
+    };
+    let mut index =
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
+    for key in family_index_keys(&dir, &parent) {
+        index.files.insert(key, manifest_index_entry(None));
+    }
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let mut split = items;
+    let mut disposition = apply_claude_reported_usage_with_identity(
+        &mut split,
+        &api,
+        &trace,
+        &mut index,
+        true,
+        "2026-08-02T07:10:00Z",
+        Some(&evidence),
+    );
+    let groupings = std::mem::take(&mut disposition.request_groupings);
+    let before = split.clone();
+    assert_eq!(
+        identity::apply_scan(&mut split, &evidence, groupings),
+        identity::ScanOutcome {
+            sent: 2,
+            ..Default::default()
+        }
+    );
+    for (tagged, before) in split.iter().zip(&before) {
+        assert_usage_conserved(tagged, before);
+    }
+    let parts = split[0].usage_buckets[0].model_usage[0]
+        .identity_parts
+        .clone()
+        .unwrap();
+    assert_eq!(parts.len(), 2);
+    assert!(parts
+        .iter()
+        .all(|part| part.request_count == 2 && part.cost_usd == Some("0.0002".to_string())));
+    assert_eq!(
+        identity_shares(&split[0]).0,
+        BTreeMap::from([(OWNER_A.to_string(), (2, 0)), ("b".repeat(64), (2, 0))])
+    );
+    let _ = fs::remove_dir_all(dir);
 }
 
 /// F1 repair path. A complete census that proves a family re-arms each member
@@ -3022,6 +3043,118 @@ fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
         "parts changed"
     );
     let _ = fs::remove_dir_all(dir);
+
+    // Creator conflicts and clock loss stay separate under direct D1
+    // qualification (was `claude_h296_root_clocks_and_creator_conflicts_stay_separate`):
+    // the h296 root (requests 1-4 at login A, child-owned req_5) parsed as
+    // ordinary (listed) money; every case is refused with creator and usage kept.
+    let (dir, _, mut family) = claude_account_family_fixture(true);
+    let mut original = family.remove(0);
+    original.source_file_fingerprint = Some("e".repeat(64));
+    let (api, trace) = reports(
+        (1..=5)
+            .map(|n| {
+                let output_tokens = if n == 5 { 1 } else { 10 };
+                complete_api_row(ROOT, &format!("req_{n}"), n, 10, output_tokens, 0)
+            })
+            .collect(),
+        (1..=5)
+            .map(|n| {
+                let agent = if n == 5 { "a4d1585d310070d0f" } else { "" };
+                complete_trace_row(ROOT, &format!("req_{n}"), agent)
+            })
+            .collect(),
+    );
+    for case in [
+        "missing_clock",
+        "observer_fallback",
+        "hour_minimum",
+        "missing_hour",
+        "creator_conflict",
+        "creator_other_account",
+        "unsupported_route",
+        "multiple_logins",
+    ] {
+        let mut item = original.clone();
+        let mut api = api.clone();
+        match case {
+            "missing_clock" => {
+                item.claude_usage_occurrences
+                    .get_mut("req_1")
+                    .unwrap()
+                    .timestamp = None
+            }
+            "observer_fallback" => {
+                item.claude_usage_occurrences
+                    .get_mut("req_1")
+                    .unwrap()
+                    .event_clock_complete = false
+            }
+            "hour_minimum" => {
+                item.usage_buckets[0].first_activity_at = Some("2026-08-02T07:00:01Z".into())
+            }
+            "missing_hour" => item.usage_buckets.clear(),
+            "creator_conflict" | "creator_other_account" => {
+                item.session_account_evidence = Some(SessionAccountEvidence {
+                    provider: "anthropic",
+                    account_identifier_hash: Some(login_b.clone()),
+                    provider_workspace_hash: Some("c".repeat(64)),
+                    identity_hash_scheme: "provider-sha256:v1",
+                    evidence_source: "claude_desktop_original:v1",
+                    identity_disposition: Some(if case == "creator_conflict" {
+                        "conflict"
+                    } else {
+                        "complete"
+                    }),
+                    source_created_at: Some("2026-08-02T06:59:00Z".into()),
+                });
+            }
+            "unsupported_route" => item.model_usage[0].billing_channel = Some("api".into()),
+            "multiple_logins" => {
+                let row = &mut api.evidence.get_mut(ROOT).unwrap()[0];
+                row.account_identifier_hash = Some(login_b.clone());
+                *row = signed(row.clone());
+            }
+            _ => unreachable!(),
+        }
+        let creator = item.session_account_evidence.clone();
+        let usage = (
+            item.input_tokens,
+            item.output_tokens,
+            item.request_count,
+            item.cost.clone(),
+        );
+        let result = claude_request_accounts::apply(std::slice::from_mut(&mut item), &api, &trace);
+        assert_ne!(
+            result.coverage,
+            [claude_request_accounts::Coverage::Complete],
+            "{case}"
+        );
+        assert_eq!(
+            item.provenance.collector,
+            claude_request_accounts::UNKNOWN,
+            "{case}"
+        );
+        assert_eq!(item.session_account_evidence, creator, "{case}");
+        assert_eq!(
+            (
+                item.input_tokens,
+                item.output_tokens,
+                item.request_count,
+                item.cost.clone()
+            ),
+            usage,
+            "{case}"
+        );
+        if case == "observer_fallback" {
+            assert_eq!(
+                crate::snapshots::exact_session_account_hash(&item),
+                Some(OWNER_A.to_string()),
+                "clock loss does not erase independently proved account"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
 }
 
 // --- transcript_email over the status-coverage feed --------------------------
@@ -3335,98 +3468,6 @@ fn parse_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
 }
 
 #[test]
-fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conserved() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-
-    let dir = temp_dir("claude-request-identity-email");
-    let slot = dir.join("slot");
-    let home = crate::claude_status_coverage::home_key(&slot);
-    let email_home = |items: &[SnapshotItem]| {
-        let item = &items[0];
-        let sequence = item.claude_usage_occurrences["req_1"].sequence;
-        item.claude_org_markers
-            .as_deref()
-            .and_then(|markers| markers.email_home(sequence))
-            .copied()
-    };
-    let items = parse_session(&slot, &email_session(true, false));
-    assert_eq!(email_home(&items), Some(home));
-    let wire = serde_json::to_string(&items[0]).unwrap();
-    assert!(!wire.contains("example.invalid"), "no email on the item");
-    assert_eq!(
-        email_home(&parse_session(&slot, &email_session(false, false))),
-        None,
-        "email after the request"
-    );
-    assert_eq!(
-        email_home(&parse_session(&slot, &email_session(true, true))),
-        None,
-        "email switched before it"
-    );
-
-    // Slot samples LOGIN_A under the marker org over the whole window.
-    let request_at = rfc3339_unix_seconds("2026-08-02T07:00:01Z").unwrap();
-    let start_of = |items: &[SnapshotItem]| {
-        rfc3339_unix_seconds(items[0].source_started_at.as_deref().unwrap()).unwrap()
-    };
-    let (api, trace) = reports(Vec::new(), Vec::new());
-    let mut items = parse_session(&slot, &email_session(true, false));
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None).with_status_coverage(
-        Some(coverage(
-            home,
-            LOGIN_A,
-            &org_hash(ORG_1),
-            start_of(&items) - 600,
-            request_at + 300,
-        )),
-    );
-    let before = items[0].clone();
-    identity::apply_scan(&mut items, &evidence, BTreeMap::new());
-    let item = &items[0];
-    // Refused, not weakened: no login, no org-only evidence, a positive
-    // refusal (which also blocks Desktop-pair fill), usage and money intact.
-    assert!(item.request_identity_refusals >= 1);
-    let text = serde_json::to_string(item).unwrap();
-    assert!(!text.contains(LOGIN_A), "the slot login is never selected");
-    assert!(item
-        .request_evidence
-        .iter()
-        .all(|evidence| evidence.identity_basis != identity::TRANSCRIPT_ORG));
-    assert_eq!(item.input_tokens, before.input_tokens);
-    assert_eq!(item.output_tokens, before.output_tokens);
-    assert_eq!(item.request_count, before.request_count);
-    assert_eq!(item.cost, before.cost);
-    let rows = |item: &SnapshotItem| {
-        item.usage_buckets
-            .iter()
-            .flat_map(|bucket| &bucket.model_usage)
-            .map(|row| (row.request_count, row.input_tokens, row.cost_usd.clone()))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(rows(item), rows(&before));
-    let home_hex = home
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    for absent in ["example.invalid", home_hex.as_str(), slot.to_str().unwrap()] {
-        assert!(!text.contains(absent), "{absent}");
-    }
-
-    // Absent/disqualified email or an unregistered folder does not refuse,
-    // but its transcript-only org is still withdrawn.
-    for mut other in [
-        parse_session(&slot, &email_session(false, false)),
-        parse_session(&slot, &email_session(true, true)),
-        parse_session(&dir.join("loose"), &email_session(true, false)),
-    ] {
-        identity::apply_scan(&mut other, &evidence, BTreeMap::new());
-        assert!(other[0].request_evidence.is_empty());
-        assert_eq!(other[0].request_identity_refusals, 0);
-    }
-    let _ = fs::remove_dir_all(dir);
-}
-
-#[test]
 fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
 
@@ -3444,15 +3485,45 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
     )
     .unwrap();
     let from = start - crate::claude_status_coverage::SESSION_LEAD_SECONDS;
+    // The parser binds a recorded email to the slot folder only when it
+    // precedes the request unswitched, and never puts the email on the item.
+    let email_home = |items: &[SnapshotItem]| {
+        let item = &items[0];
+        let sequence = item.claude_usage_occurrences["req_1"].sequence;
+        item.claude_org_markers
+            .as_deref()
+            .and_then(|markers| markers.email_home(sequence))
+            .copied()
+    };
+    let parsed = parse_session(&slot, &email_session(true, false));
+    assert_eq!(email_home(&parsed), Some(home));
+    assert!(
+        !serde_json::to_string(&parsed[0])
+            .unwrap()
+            .contains("example.invalid"),
+        "no email on the item"
+    );
+    assert_eq!(
+        email_home(&parse_session(&slot, &email_session(false, false))),
+        None,
+        "email after the request"
+    );
+    assert_eq!(
+        email_home(&parse_session(&slot, &email_session(true, true))),
+        None,
+        "email switched before it"
+    );
     let (api, trace) = reports(Vec::new(), Vec::new());
-    let scan = |folder: &Path, ledger: &Ledger| {
-        let mut items = parse_session(folder, &email_session(true, false));
+    let scan_lines = |folder: &Path, lines: &[Value], ledger: &Ledger| {
+        let mut items = parse_session(folder, lines);
         let before = items[0].clone();
         let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
             .with_status_coverage(Some(ledger.clone()));
         identity::apply_scan(&mut items, &evidence, BTreeMap::new());
         (before, items.remove(0))
     };
+    let scan =
+        |folder: &Path, ledger: &Ledger| scan_lines(folder, &email_session(true, false), ledger);
     let rows = |item: &SnapshotItem| {
         item.usage_buckets
             .iter()
@@ -3507,8 +3578,28 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
         reason(&ledger, &home),
         RequestIdentity::Refused(Refusal::CoverageUnqualified)
     );
-    assert_refused("registered slot", scan(&slot, &ledger));
+    let registered = scan(&slot, &ledger);
+    // Neither the email, the slot's home key nor its folder reaches the body.
+    let text = serde_json::to_string(&registered.1).unwrap();
+    let home_hex = home
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    for absent in ["example.invalid", home_hex.as_str(), slot.to_str().unwrap()] {
+        assert!(!text.contains(absent), "{absent}");
+    }
+    assert_refused("registered slot", registered);
     assert_withdrawn("never-registered folder", scan(&loose, &ledger));
+    // An email after the request or switched before it does not refuse, but
+    // its transcript-only org is still withdrawn.
+    assert_withdrawn(
+        "email after the request",
+        scan_lines(&slot, &email_session(false, false), &ledger),
+    );
+    assert_withdrawn(
+        "email switched before it",
+        scan_lines(&slot, &email_session(true, true), &ledger),
+    );
 
     // The slot is removed: its history is cleared, but the SAME request stays
     // refused instead of becoming org-only.
@@ -3875,62 +3966,6 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// Non-marker capture-ON bodies retain main's pre-withdrawal wire bytes.
-/// The oracle reproduces tag_item at main 02cad8ab: build the RequestSink
-/// grouping and apply it directly, which a settled pass did on that head.
-#[test]
-fn capture_on_non_marker_body_matches_main_before_withdrawal() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-
-    let dir = temp_dir("claude-i1b-non-marker-parity");
-    let lines = vec![
-        json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
-            "attachment": {"type": "session_context", "context": {}}}),
-        owned_response("req_1", "2026-08-02T07:00:01Z", 10, 1),
-    ];
-    let (api, trace) = reports(
-        vec![signed(complete_api_row(ROOT, "req_1", 1, 10, 1, 0))],
-        vec![complete_trace_row(ROOT, "req_1", "")],
-    );
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
-    let mut items = parse_session(&dir, &lines);
-    assert!(items[0].claude_org_markers.is_some(), "capture ON");
-    let mut main = items[0].clone();
-    let occurrence = &main.claude_usage_occurrences["req_1"];
-    let (row_key, _, _) = build_row_identity(
-        occurrence.model.as_deref().unwrap(),
-        &occurrence.selector,
-        occurrence.reasoning_effort.as_deref(),
-    );
-    let mut usage = occurrence.usage.clone();
-    usage.request_count = 1;
-    let mut sink = identity::RequestSink::for_item(&evidence, &main, usize::MAX).unwrap();
-    sink.add(
-        &main,
-        identity::Request {
-            request_id: "req_1",
-            occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
-            timestamp: occurrence.timestamp.as_deref().unwrap(),
-            bucket_start: "2026-08-02T07:00:00Z",
-            row_key: &row_key,
-            usage: &usage,
-        },
-    );
-    assert!(matches!(
-        identity::apply_grouped(&mut main, sink.finish()),
-        Ok(Tagged::Sent { .. })
-    ));
-    assert_eq!(
-        identity::apply_scan(&mut items, &evidence, BTreeMap::new()).sent,
-        1
-    );
-    assert_eq!(
-        serde_json::to_vec(&items[0]).unwrap(),
-        serde_json::to_vec(&main).unwrap()
-    );
-    let _ = fs::remove_dir_all(dir);
-}
-
 // --- Zero-usage responses -----------------------------------------------------
 
 /// One owned response of `ROOT` with its own request id.
@@ -4027,6 +4062,23 @@ fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
     assert!(claude_snapshot_request_id_hashes(&raw_before).is_some());
     assert!(claude_snapshot_request_id_hashes(&raw_after).is_none());
     assert_usage_conserved(&raw_after, &raw_before);
+    // A token-less event with neither usage fields nor a request id has
+    // nothing to attribute to its hour: it adds no request and no bucket,
+    // and the hour keeps its first owned activity.
+    let mut token_less = base.clone();
+    token_less.push(json!({"timestamp": second(5), "type": "assistant", "sessionId": ROOT,
+        "message": {"model": "claude-haiku-4-5", "usage": {}}}));
+    let raw_token_less = parse_session(&dir, &token_less).remove(0);
+    assert_eq!(raw_token_less.request_count, 3);
+    assert_eq!(raw_token_less.usage_buckets.len(), 1);
+    assert_eq!(
+        raw_token_less.usage_buckets[0].bucket_start,
+        "2026-08-02T07:00:00Z"
+    );
+    assert_eq!(
+        raw_token_less.usage_buckets[0].first_activity_at.as_deref(),
+        Some(second(1).as_str())
+    );
 
     let (api, trace) = owned_session_reports();
     let (mut claimed_api, mut claimed_trace) = owned_session_reports();
@@ -4053,6 +4105,29 @@ fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
         identity_shares(&before),
         (BTreeMap::from([(OWNER_A.to_string(), (3, 0))]), (0, 0))
     );
+    // Zero-usage records the parser never counts as a request id keep the
+    // same contract-5 body: an error without a request id, and a response
+    // whose early progressive record is all zero before its final usage.
+    let mut without_id = base.clone();
+    without_id.push(api_error_response(None, &second(4)));
+    let mut progressive = base.clone();
+    progressive.insert(2, owned_response("req_3", "2026-08-02T07:00:02.500Z", 0, 0));
+    for (case, lines) in [("without id", without_id), ("progressive", progressive)] {
+        let raw = parse_session(&dir, &lines).remove(0);
+        assert_eq!(raw.request_count, 3, "{case}");
+        assert_eq!(raw.claude_usage_request_ids.len(), 3, "{case}");
+        assert!(
+            raw.claude_usage_occurrences
+                .values()
+                .all(|occurrence| !occurrence.usage.is_zero()),
+            "{case}"
+        );
+        assert!(claude_snapshot_request_id_hashes(&raw).is_some(), "{case}");
+        let (outcome, tagged) = tag_one(&raw, &api, &trace);
+        assert_eq!(outcome, sent, "{case}");
+        assert_usage_conserved(&tagged, &raw);
+        assert_eq!(tagged_body(&tagged), tagged_body(&before), "{case}");
+    }
     for (api, trace) in [(&api, &trace), (&claimed_api, &claimed_trace)] {
         let (outcome, after) = tag_one(&raw_after, api, trace);
         assert_eq!(outcome, sent);
@@ -4088,47 +4163,12 @@ fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// Zero-usage records the parser never counts as a request id keep today's
-/// contract 5 unchanged: an error without a request id, and a response whose
-/// early progressive record is all zero before its final usage.
-#[test]
-fn zero_usage_without_an_id_or_before_final_usage_keeps_todays_contract5() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-
-    let dir = temp_dir("claude-request-identity-zero-usage-unchanged");
-    let (api, trace) = owned_session_reports();
-    let base = owned_session();
-    let (outcome, expected) = tag_one(&parse_session(&dir, &base).remove(0), &api, &trace);
-    assert_eq!(outcome.sent, 1, "{outcome:?}");
-
-    let mut without_id = base.clone();
-    without_id.push(api_error_response(None, &second(4)));
-    let mut progressive = base.clone();
-    progressive.insert(2, owned_response("req_3", "2026-08-02T07:00:02.500Z", 0, 0));
-    for (case, lines) in [("without id", without_id), ("progressive", progressive)] {
-        let raw = parse_session(&dir, &lines).remove(0);
-        assert_eq!(raw.request_count, 3, "{case}");
-        assert_eq!(raw.claude_usage_request_ids.len(), 3, "{case}");
-        assert!(
-            raw.claude_usage_occurrences
-                .values()
-                .all(|occurrence| !occurrence.usage.is_zero()),
-            "{case}"
-        );
-        assert!(claude_snapshot_request_id_hashes(&raw).is_some(), "{case}");
-        let (outcome, tagged) = tag_one(&raw, &api, &trace);
-        assert_eq!(outcome.sent, 1, "{case}: {outcome:?}");
-        assert_usage_conserved(&tagged, &raw);
-        assert_eq!(tagged_body(&tagged), tagged_body(&expected), "{case}");
-    }
-    let _ = fs::remove_dir_all(dir);
-}
-
 /// A zero-usage record admits nothing else: with one present, nonzero usage
 /// without its own request id, a nonzero request id held by two responses, a
 /// multi-iteration response and a row the requests cannot reproduce each keep
 /// the item on today's path with its bytes unchanged. The first two make the
-/// plain request-id count coincide, which never admitted them either.
+/// plain request-id count coincide, which never admitted them either. Nor
+/// does it let a copied request owned under another root lend that login.
 #[test]
 fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
@@ -4178,16 +4218,9 @@ fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
         );
         assert_eq!(serde_json::to_vec(&item).unwrap(), untouched, "{case}");
     }
-    let _ = fs::remove_dir_all(dir);
-}
 
-/// A copied response whose telemetry sits under another root stays refused
-/// and never lends that root's login, with or without a zero-usage record.
-#[test]
-fn zero_usage_record_keeps_a_foreign_owned_request_refused() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-
-    let dir = temp_dir("claude-request-identity-zero-usage-foreign");
+    // A copied response whose telemetry sits under another root stays refused
+    // and never lends that root's login, with or without a zero-usage record.
     let foreign_login = "b".repeat(64);
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
@@ -4429,10 +4462,13 @@ fn desktop_recent_cli_to_desktop_and_missing_entrypoint_fail_closed() {
     );
 }
 
-/// Same order as the daemon: save native originals, apply request enrichment
-/// (including its billing veto), rebuild/place requests, then publish the fold.
+/// Desktop recent identity stays in the exact account/org scope. Positive,
+/// in the daemon's order (save native originals, apply request enrichment
+/// including its billing veto, rebuild/place requests, publish the fold): a
+/// same-account org switch records both orgs on both folds. Negative: a
+/// foreign-owned, conflicting or other-account request records nothing.
 #[test]
-fn desktop_recent_survives_same_account_org_switch_through_enrichment_and_both_folds() {
+fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without_duplicate_index() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
 
     let dir = temp_dir("desktop-recent-enrichment");
@@ -4572,12 +4608,9 @@ fn desktop_recent_survives_same_account_org_switch_through_enrichment_and_both_f
         .iter()
         .all(|o| o.desktop_recent_at.is_some()));
     fs::remove_dir_all(dir).unwrap();
-}
 
-#[test]
-fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without_duplicate_index() {
-    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-
+    // A foreign-owned, conflicting or other-account request never records
+    // recent activity for the session's account.
     let dir = temp_dir("desktop-recent-foreign");
     let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
     let at = now - time::Duration::seconds(30);

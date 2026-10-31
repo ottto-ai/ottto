@@ -463,36 +463,6 @@ fn c1b_invalid_pending_keeps_base_rearm() {
     assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
 }
 
-/// SI I3 and Condition X(a): after the red window the root's API rows gain
-/// account evidence, so the sidecar-inclusive selection fingerprint of every
-/// member changes (M1). The carry keeps the committed revisions, the walk
-/// re-reads every member exactly as BASE's re-arm does, and every window's
-/// liveness equals BASE.
-#[test]
-#[serial(source_manifests)]
-fn c1b_sidecar_changed_family_is_reread_like_base() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-
-    if !c1a_layout_supported("c1b_sidecar_changed") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fix = c1b_red_chain("c1b-sidecar-changed", "fix", c1a_late_account_row);
-    let base = c1b_base_red_chain("c1b-sidecar-changed-base", c1a_late_account_row);
-    let family = rearm_family_sessions().len();
-    assert_eq!(
-        fix.windows[2].family_reads, family,
-        "M1 re-selects every member"
-    );
-    assert_eq!(base.windows[2].family_reads, family);
-    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
-    for (window, base_window) in fix.windows.iter().zip(&base.windows).skip(3) {
-        assert_eq!(window.family_reads, base_window.family_reads);
-    }
-    assert_eq!(fix.heads_after, base.heads_after);
-    assert_eq!(fix.witness_after, base.witness_after);
-}
-
 /// SOURCE B9: after the red window one subagent's transcript gains a request
 /// without telemetry. The walk re-parses that member at the 08:20 retry
 /// (`SourceChanged` instead of BASE's `Rearmed`), which cancels the family's
@@ -1234,39 +1204,6 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
     assert_eq!(fix.witness_after, base.witness_after);
 }
 
-/// Control, SI I3: a late API row gives the root's requests account evidence
-/// before the clean follow-up, so the sidecar-inclusive selection of every
-/// member changes (M1) and the family is re-read exactly as BASE's re-arm
-/// does. Every window's liveness equals BASE.
-#[test]
-#[serial(source_manifests)]
-fn fix2_late_api_row_rereads_the_family_like_base() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-
-    if !c1a_layout_supported("fix2_late_api_row") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let between = |fixture: &RearmFixture| {
-        fix2_clean_followup(fixture);
-        c1a_late_account_row(fixture);
-    };
-    let fix = c1b_red_chain("fix2-late-api-row", "fix", between);
-    let base = c1b_base_red_chain("fix2-late-api-row-base", between);
-    let family = rearm_family_sessions().len();
-    assert_eq!(
-        fix.windows[2].family_reads, family,
-        "M1 re-selects every member"
-    );
-    assert_eq!(base.windows[2].family_reads, family);
-    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
-    for (window, base_window) in fix.windows.iter().zip(&base.windows).skip(3) {
-        assert_eq!(window.family_reads, base_window.family_reads);
-    }
-    assert_eq!(fix.heads_after, base.heads_after);
-    assert_eq!(fix.witness_after, base.witness_after);
-}
-
 /// Exercise Condition X through the widened carry, using actual sidecars,
 /// bounded scanner, proof fold, uploads, ACKs and save/reload between pages.
 #[test]
@@ -1348,7 +1285,8 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     fixture.native_file_limit = 64;
 
     let mut parsed = BTreeSet::new();
-    let mut tagged_root = false;
+    let mut tagged_root = None;
+    let mut late = Vec::new();
     for number in 0..C1B_MAX_PAGES {
         let page = fixture.page(
             &format!("2026-08-02T08:{:02}:00Z", 30 + number),
@@ -1368,19 +1306,57 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
                 evidence.identity_basis == crate::snapshots::claude_request_identity::TELEMETRY
                     && evidence.provider_workspace_hash.as_deref() == Some(org.as_str())
             }));
-            tagged_root = true;
+            tagged_root = Some(item.snapshot_fingerprint.clone());
         }
-        if c1b_traversal_ended(&page.index).0 {
+        let ended = c1b_traversal_ended(&page.index).0;
+        late.push(page);
+        if ended {
             break;
         }
     }
     assert_eq!(
         parsed.intersection(&rearm_family_sessions()).count(),
-        rearm_family_sessions().len()
+        rearm_family_sessions().len(),
+        "M1 re-selects every member"
+    );
+    let root = tagged_root
+        .expect("late identity evidence emits and ACKs the tagged root in this retry");
+    // Transferred from the deleted late-row controls (E2-054
+    // c1a_late_identity_row_reselects_and_tags_skipped_family, E2-055
+    // c1a_late_row_between_windows_equals_base, E2-065
+    // c1b_sidecar_changed_family_is_reread_like_base, E2-071
+    // fix2_late_api_row_rereads_the_family_like_base): the late evidence is
+    // taken at normal cadence behind a closed fence, nothing is left
+    // RetryPending, and the re-emitted root body is the durable accepted head
+    // of a retained family proof (the heads/witness BASE's re-arm reaches).
+    let last = late.last().expect("the late window has a page");
+    assert!(
+        !last.duplicate_census.full_rearm,
+        "normal cadence, not the daily re-read"
+    );
+    assert!(last.duplicate_census.fence_before && last.duplicate_census.fence_after);
+    assert!(
+        late.iter().all(|page| !page
+            .index
+            .claude_authority_record_for_test(REARM_ROOT)
+            .is_some_and(|record| !record.terminal)),
+        "the late evidence leaves no RetryPending hold"
     );
     assert!(
-        tagged_root,
-        "late identity evidence emits and ACKs the tagged root in this retry"
+        last.index.accepted_snapshot_fingerprint_recorded(&root),
+        "durable accepted body"
+    );
+    let heads = RearmFixture::family_heads(&last.index);
+    assert_eq!(
+        heads[REARM_ROOT].as_deref(),
+        Some(root.as_str()),
+        "the re-emitted root is the accepted head"
+    );
+    assert!(
+        last.index
+            .claude_usage_family_witness_digest_for_test(REARM_ROOT)
+            .is_some(),
+        "the family proof is retained"
     );
 }
 

@@ -22350,9 +22350,6 @@ mod tests {
             include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
             mod stale_family_carry_pipeline_tests {
                 include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
-                mod unhealthy_retry_reread_acceptance_tests {
-                    include!("snapshot_sync/unhealthy_retry_reread_acceptance_tests.rs");
-                }
                 mod oversized_discovery_pipeline_tests {
                     include!("snapshot_sync/oversized_discovery_pipeline_tests.rs");
                 }
