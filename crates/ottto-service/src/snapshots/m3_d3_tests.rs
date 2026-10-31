@@ -1086,7 +1086,7 @@ fn m3_d3_codex_strict_rebind_survives_save_and_load_and_refuses_a_with_one_full(
     assert!(!refused.disabled());
     let (counts, stats) = rig.counters();
     assert_eq!(
-        counts.ineligible.get("selection_cleared.stale_record"),
+        counts.ineligible.get("selection_cleared.stale_record_full"),
         Some(&1)
     );
     assert_eq!(counts.restored, 0);
