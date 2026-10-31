@@ -5636,7 +5636,7 @@ impl SharedCache {
         index: &ScanIndex,
     ) -> Option<store::BatchReceipt> {
         durable_source(snapshot_source)?;
-        self.erase_private_labels(writer, snapshot_source, None);
+        self.erase_private_labels(writer, snapshot_source, Ok(None));
         if !restart_restore::enabled() {
             // The committed save, not the working index, owns quiet-marker
             // settlement even without a record. Keep the ordinary second CAS.
@@ -5704,8 +5704,12 @@ impl SharedCache {
         &self,
         writer: &W,
         snapshot_source: SnapshotSource,
-        keep: Option<&BTreeSet<store::Digest32>>,
+        keep: std::io::Result<Option<&BTreeSet<store::Digest32>>>,
     ) {
+        let (keep, candidate_error) = match keep {
+            Ok(keep) => (keep, None),
+            Err(error) => (None, Some(error)),
+        };
         let owner = self.off_exception(snapshot_source);
         if owner == Ok(false) {
             return;
@@ -5715,6 +5719,7 @@ impl SharedCache {
             return;
         };
         let needed = owner_blocked
+            || candidate_error.is_some()
             || self.durable().is_some_and(|mut stores| {
                 stores.slot(source).as_ref().is_some_and(|slot| {
                     (keep.is_some()
@@ -5732,7 +5737,9 @@ impl SharedCache {
         };
         if let Some(mut stores) = self.durable() {
             if let Some(slot) = stores.slot(source).as_mut() {
-                let result = if owner_blocked {
+                let result = if let Some(error) = candidate_error {
+                    Err(error)
+                } else if owner_blocked {
                     Err(std::io::Error::other("prior OFF unlink barrier"))
                 } else {
                     match keep {
@@ -6198,7 +6205,7 @@ impl SharedCache {
             Ok(false) => return Ok(()),
             Err(()) => {
                 // Count refusal without touching the old slot under new context.
-                self.erase_private_labels(writer, snapshot_source, None);
+                self.erase_private_labels(writer, snapshot_source, Ok(None));
                 return Ok(());
             }
         }
@@ -6208,18 +6215,24 @@ impl SharedCache {
                 if !slot.store.private_label_purge_needed(None) {
                     return None;
                 }
-                slot.store.private_label_candidates().ok()
+                Some(slot.store.private_label_candidates())
             });
-            if let Some(possible) = possible {
-                // Retention intersects a bounded marker/inventory, never a
-                // second unbounded copy of the committed index.
-                let keep = index
-                    .files
-                    .keys()
-                    .map(|key| store::key_digest(ds, key))
-                    .filter(|key| possible.contains(key))
-                    .collect();
-                self.erase_private_labels(writer, snapshot_source, Some(&keep));
+            match possible {
+                Some(Ok(possible)) => {
+                    // Retention intersects a bounded marker/inventory, never a
+                    // second unbounded copy of the committed index.
+                    let keep = index
+                        .files
+                        .keys()
+                        .map(|key| store::key_digest(ds, key))
+                        .filter(|key| possible.contains(key))
+                        .collect();
+                    self.erase_private_labels(writer, snapshot_source, Ok(Some(&keep)));
+                }
+                Some(Err(error)) => {
+                    self.erase_private_labels(writer, snapshot_source, Err(error));
+                }
+                None => {}
             }
         }
         if !restart_restore::enabled() {
@@ -6362,7 +6375,7 @@ impl SharedCache {
         writer: &W,
         snapshot_source: SnapshotSource,
     ) -> std::io::Result<()> {
-        self.erase_private_labels(writer, snapshot_source, Some(&BTreeSet::new()));
+        self.erase_private_labels(writer, snapshot_source, Ok(Some(&BTreeSet::new())));
         // OFF fresh-index cleanup only erases private labels. It cannot
         // settle v1 failures, especially when an old unlink barrier deferred
         // that erasure; only verified absence/invalidation clears those ages.
