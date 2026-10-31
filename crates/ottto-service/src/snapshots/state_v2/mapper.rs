@@ -180,7 +180,7 @@ pub(super) fn read<T: DeserializeOwned + Serialize>(
         _ => "",
     };
     let projection = shared_json(tx, kind, &json, false)?;
-    codec::exact_json(&projection.json)
+    Ok(codec::exact_json(&projection.json)?.0)
 }
 pub(super) fn put<T: Serialize + ?Sized>(
     tx: &mut dyn Transaction,
