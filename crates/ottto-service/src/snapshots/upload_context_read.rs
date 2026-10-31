@@ -1,18 +1,21 @@
 //! Admit context-only body reads before constructing a parser. No durable queue.
 use super::*;
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalCounts {
     pub files: u64,
     pub local_bytes: u64,
-    pub wire_allowance: usize,
+    /// This page's admitted reads with their selection flags (RAM-only), so a
+    /// file whose context ACK set the pass allowance split can be re-queued.
+    read_paths: Vec<ScanTraversalPath>,
 }
 #[derive(Debug)]
 pub(super) struct Budget {
     native_limit: u64,
     native_read: u64,
     native_reserved: u64,
-    wire_reserved: usize,
+    /// (bodies measured, their wire bytes) for this page.
+    page_wire_counted: (usize, usize),
     admitted: BTreeSet<String>,
     read_files: BTreeSet<String>,
     cursor_ordinary_charged: bool,
@@ -30,7 +33,7 @@ impl Budget {
             native_limit,
             native_read: 0,
             native_reserved: 0,
-            wire_reserved: 0,
+            page_wire_counted: (0, 0),
             admitted: BTreeSet::new(),
             read_files: BTreeSet::new(),
             cursor_ordinary_charged: false,
@@ -60,43 +63,18 @@ impl Budget {
         if keys.iter().all(|key| self.admitted.contains(key)) {
             return true;
         }
-        // A joined owner has aliases at several paths. Reserve its unique
-        // entities atomically, not once per physical alias (which cannot fit).
-        let entities = keys
-            .iter()
-            .filter_map(|key| index.file_snapshot_fingerprints.get(key))
-            .flatten()
-            .collect::<BTreeSet<_>>()
-            .len()
-            .max(1);
-        // Three legal item bodies reserve both optional head-bootstrap stages
-        // and the final POST, including separators. No persisted size field.
-        let wire = entities
-            .saturating_mul(MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES.saturating_add(3))
-            .saturating_mul(3);
-        let ordinary_wire = ordinary
-            .iter()
-            .filter(|item| {
-                !item.source_file_fingerprint.as_ref().is_some_and(|fp| {
-                    self.admitted.iter().any(|key| {
-                        index
-                            .files
-                            .get(key)
-                            .is_some_and(|entry| &entry.source_file_fingerprint == fp)
-                    })
-                })
-            })
-            .fold(0usize, |sum, item| {
-                sum.saturating_add(
-                    crate::snapshot_sync::snapshot_packing_json_length(item)
-                        .unwrap_or(usize::MAX)
-                        .saturating_add(3)
-                        .saturating_mul(3),
-                )
-            });
-        let wire_left = crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES
-            .saturating_sub(ordinary_wire)
-            .saturating_sub(self.wire_reserved);
+        // Lead B Q1 (2026-10-31): a file's context ACKs may split across
+        // passes, so reserve real bytes only (this page's parsed bodies). A
+        // file's own bodies are unknown before its parse: admit it while one
+        // legal body still fits, so a single-body file does not split; a
+        // longer tail stays owed and is re-queued.
+        if self
+            .page_wire(ordinary)
+            .saturating_add(MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES.saturating_add(3))
+            > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES
+        {
+            return false;
+        }
         // Oversized Codex singletons keep their existing resumable cursor;
         // each page pays only its bounded chunk. Claude legal files fit 1GiB.
         let available = self
@@ -112,20 +90,38 @@ impl Budget {
         if read == 0 || read > available {
             return false;
         }
-        let alone = ordinary.is_empty() && self.admitted.is_empty();
-        if wire > wire_left && !(alone && wire > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES) {
-            return false;
-        }
-        self.wire_reserved = self.wire_reserved.saturating_add(wire);
         self.native_reserved = self.native_reserved.saturating_add(read);
-        if wire > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES {
-            // The explicitly allowed single oversized logical unit gets its
-            // own bounded transport allowance so its final ACK set is atomic
-            // within this pass. Individual request packing is unchanged.
-            index.context_read_counts.wire_allowance = wire;
-        }
+        index
+            .context_read_counts
+            .read_paths
+            .extend(candidates.iter().map(|candidate| ScanTraversalPath {
+                scan_root: candidate.scan_root.clone(),
+                path: candidate.path.clone(),
+                census_member: true,
+                watcher_hint: false,
+            }));
         self.admitted.extend(keys);
         true
+    }
+    /// Wire bytes of this page's parsed bodies, each with both optional
+    /// head-bootstrap stages and separators. A page only appends bodies, so
+    /// each is measured once.
+    fn page_wire(&mut self, ordinary: &[SnapshotItem]) -> usize {
+        let (counted, bytes) = if ordinary.len() >= self.page_wire_counted.0 {
+            self.page_wire_counted
+        } else {
+            (0, 0)
+        };
+        let bytes = ordinary[counted..].iter().fold(bytes, |sum, item| {
+            sum.saturating_add(
+                crate::snapshot_sync::snapshot_packing_json_length(item)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(3)
+                    .saturating_mul(3),
+            )
+        });
+        self.page_wire_counted = (ordinary.len(), bytes);
+        bytes
     }
     pub(super) fn is_admitted(&self, candidate: &CandidateFile) -> bool {
         self.admitted.contains(&local_index_key(&candidate.path))
@@ -137,6 +133,12 @@ impl Budget {
         // One pending-queue walk per page, not one walk per deferred file.
         sampled_scan::codex_cursor::requeue_members(index, flags, &self.deferred);
         self.deferred.clear();
+        for read in &mut index.context_read_counts.read_paths {
+            if let Some(&(census_member, watcher_hint)) = flags.get(&local_index_key(&read.path)) {
+                read.census_member = census_member;
+                read.watcher_hint = watcher_hint;
+            }
+        }
     }
     pub(super) fn record(&mut self, index: &mut ScanIndex, candidate: &CandidateFile, bytes: u64) {
         if bytes == 0 || !index.file_upload_context_enabled {
@@ -173,6 +175,30 @@ impl Budget {
     }
 }
 impl ScanIndex {
+    /// Lead B Q1: return a split file read on this page to its generation's
+    /// queue; its next read resends only the bodies still unACKed.
+    pub(super) fn requeue_split_context_read(&mut self, key: &str) -> bool {
+        let Some(read) = self
+            .context_read_counts
+            .read_paths
+            .iter()
+            .find(|read| local_index_key(&read.path) == key)
+        else {
+            return false;
+        };
+        let Some(traversal) = self.traversal.as_mut() else {
+            return false;
+        };
+        if traversal
+            .pending_candidates
+            .iter()
+            .any(|pending| pending.path == read.path)
+        {
+            return false;
+        }
+        traversal.pending_candidates.push_back(read.clone());
+        true
+    }
     pub(super) fn context_only_read(&self, candidate: &CandidateFile, audit_now: u64) -> bool {
         if !self.file_upload_context_enabled {
             return false;
@@ -218,8 +244,8 @@ pub(super) fn with_read_limit<T>(limit: u64, f: impl FnOnce() -> T) -> (T, Vec<P
     let order = TEST_READ_ORDER.with(|order| order.replace(None).unwrap());
     (result, order)
 }
-crate::heap_layout_bound::fields!(LocalCounts; files, local_bytes, wire_allowance);
-crate::heap_layout_bound::fields!(Budget; native_limit, native_read, native_reserved, wire_reserved, admitted, read_files, cursor_ordinary_charged, deferred);
+crate::heap_layout_bound::fields!(LocalCounts; files, local_bytes, read_paths);
+crate::heap_layout_bound::fields!(Budget; native_limit, native_read, native_reserved, page_wire_counted, admitted, read_files, cursor_ordinary_charged, deferred);
 
 #[cfg(test)]
 mod tests {
