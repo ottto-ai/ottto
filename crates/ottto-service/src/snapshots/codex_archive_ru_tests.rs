@@ -85,6 +85,47 @@ fn unfunded_archive_residue_has_no_ru_and_healthy_census_work_proceeds() {
     }
 }
 
+/// [money] Unreadable archive residue is disclosed and never credited: no output, no body or
+/// fingerprint incidence, no confirmed-empty coverage, and its session stays blocked.
+#[test]
+fn unreadable_archive_residue_is_never_credited_as_proven_unique() {
+    for (disposition, cause) in [
+        (
+            ArchiveDisposition::Held {
+                cause: CodexZstCause::OutputHeld,
+            },
+            CodexZstCause::OutputHeld,
+        ),
+        (
+            ArchiveDisposition::Refused {
+                cause: CodexZstCause::DecodeFailed,
+            },
+            CodexZstCause::DecodeFailed,
+        ),
+    ] {
+        let f = ArchiveFixture::new(b"unreadable-never-credited");
+        let key = local_index_key(&f.0);
+        let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+        evidence.disposition = disposition;
+        evidence.decode_attempts = 0;
+        let mut index = ScanIndex::default();
+        index.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
+        let (index, result, rows, _) =
+            archive_pass_with(&f, index, false, None, &[], archive_ru_healthy_sibling);
+        assert_eq!(decodes(&rows), 0, "no decoder for {cause:?}");
+        assert_archive_ru_residue(&result, &rows, cause);
+        let entry = &index.files[&key];
+        assert!(entry.last_snapshot_fingerprint.is_none(), "{cause:?}");
+        assert!(entry.last_upload_body_witness.is_none(), "{cause:?}");
+        assert!(!index.file_snapshot_fingerprints.contains_key(&key));
+        assert!(!index.confirmed_empty_files.contains(&key));
+        assert!(!matches!(
+            archive_evidence(&index, &f).disposition,
+            ArchiveDisposition::Acquired
+        ));
+    }
+}
+
 /// [behaviour] A quiet Pending attempt without a current body is disclosed as unreadable each pass,
 /// despite historical output.
 #[test]
