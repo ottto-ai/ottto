@@ -1,7 +1,7 @@
 //! Publication evidence is independent of the candidate database. Caller holds
 //! CheckpointLock throughout sniff, reconciliation, publication and adoption.
 use super::*;
-use anyhow::{bail, ensure};
+use anyhow::{bail, ensure, Context};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -227,7 +227,9 @@ pub(super) fn reconcile(
     }
     // Retry the durability barrier even when a previous attempt's rename
     // succeeded but its directory sync returned an error.
-    super::super::sync_checkpoint_parent(path).map_err(|_| Hold::DbUnavailable)?;
+    super::super::sync_checkpoint_parent(path)
+        .context("state_v2_fence_sync")
+        .map_err(Hold::storage)?;
     Ok(Some((identity, final_db)))
 }
 

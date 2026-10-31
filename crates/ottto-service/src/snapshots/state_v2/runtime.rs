@@ -1,7 +1,7 @@
 //! Locked runtime routing. Conversion stays paused until publication integration
 //! is complete. OFF remains v1 before publication; custody evidence always wins.
 use super::*;
-use anyhow::{bail, ensure};
+use anyhow::{bail, ensure, Context};
 use import::{ClaudeMapper, Mapper, Pace, Pause};
 use std::collections::BTreeMap;
 use std::fs;
@@ -359,13 +359,17 @@ fn load_with_custody<M: Mapper>(
                 .map_err(Hold::storage)?;
             db.path_extractor(M::private_paths);
             db.reference_extractor(M::references);
-            let stamp = db.stamp()?;
-            super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
-            let (mut index, cx) = mapper.hydrate_context(&mut db)?;
-            let stamp = db.stamp()?;
+            // Static stage labels: Hold::storage reports where a reopen failed.
+            let stamp = db.stamp().context("state_v2_open_stamp")?;
+            super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)
+                .context("state_v2_open_recover")?;
+            let (mut index, cx) = mapper
+                .hydrate_context(&mut db)
+                .context("state_v2_open_hydrate")?;
+            let stamp = db.stamp().context("state_v2_open_stamp")?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
-            normalize_hydrated(&mut index)?;
-            db.audit_headers()?;
+            normalize_hydrated(&mut index).context("state_v2_open_normalize")?;
+            db.audit_headers().context("state_v2_open_audit_headers")?;
             index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
                 active: true,
                 session: Mutex::new(Some(Session {
