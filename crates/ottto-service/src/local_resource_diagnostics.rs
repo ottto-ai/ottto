@@ -937,7 +937,8 @@ pub(crate) struct CensusRetireKeptOverlapCounts {
     pub(crate) overflow_admission: u64,
     /// New keys refused at the live census record bound.
     pub(crate) record_limit_refused: u64,
-    /// The terminal's shadow `missing_over_budget`; None on admission rows.
+    /// The terminal's shadow `missing_over_budget`; None where nothing
+    /// measured it (admission rows, ON's withheld-terminal retirement).
     pub(crate) missing_over_budget: Option<u64>,
 }
 

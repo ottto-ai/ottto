@@ -834,11 +834,27 @@ fn census_retirement_ages_on_the_service_clock_when_the_terminal_is_withheld() {
                 );
                 return;
             }
-            assert_eq!(
-                kept_overlap(&rows, "claude_census_retire_kept_overlap"),
-                Some((2, 4, 0)),
-                "{row}"
-            );
+            let stage = "claude_census_retire_kept_overlap";
+            let kept = if on {
+                // ON measures no census-full tombstones (the join is
+                // terminal-only): the count is absent, never 0.
+                let [kept] = rows.as_slice() else {
+                    panic!("{row}: one {stage} row: {rows:?}");
+                };
+                assert_eq!(kept["stage"], stage, "{row}");
+                let counts = &kept["counts"];
+                assert!(counts.get("census_missing_over_budget").is_none(), "{row}");
+                assert_eq!(counts["census_record_limit_refused"], 0, "{row}");
+                let count = |name: &str| counts[name].as_u64().unwrap();
+                Some((
+                    count("census_retire_kept_overlap_records"),
+                    count("census_retire_kept_overlap_hashes"),
+                    count("census_retire_kept_overflow"),
+                ))
+            } else {
+                kept_overlap(&rows, stage)
+            };
+            assert_eq!(kept, Some((2, 4, 0)), "{row}");
             let census = index.claude_request_census_for_test();
             let record = |key: &str| census.record_for_test(key).unwrap();
             assert_eq!(
