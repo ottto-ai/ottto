@@ -41546,13 +41546,14 @@ fn record_codex_identity_key(
 
 /// Bounded retries of a transient sidecar open: on Ron's M4 (2026-10-31)
 /// `~/.codex/state_5.sqlite` failed SQLITE_CANTOPEN at its first prepare on 11
-/// of 175 Codex pages while Codex itself kept it open.
+/// of 175 Codex pages while Codex itself kept it open. BUSY is not retried:
+/// rusqlite's connection busy timeout already waits for it.
 const CODEX_SIDECAR_OPEN_RETRIES: u32 = 3;
 const CODEX_SIDECAR_OPEN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Open a Codex sidecar database read-only and read its schema, which opens
 /// the WAL and its index for the connection's later statements. A transient
-/// CANTOPEN or BUSY is retried; `retries` counts the extra attempts.
+/// CANTOPEN is retried; `retries` counts the extra attempts.
 fn open_codex_sidecar_database(path: &Path, retries: &mut u32) -> Result<Connection> {
     retry_transient_sqlite(retries, || {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -41564,8 +41565,8 @@ fn open_codex_sidecar_database(path: &Path, retries: &mut u32) -> Result<Connect
     })
 }
 
-/// Run `attempt` until it succeeds, fails other than SQLITE_CANTOPEN or
-/// SQLITE_BUSY, or has been retried `CODEX_SIDECAR_OPEN_RETRIES` times.
+/// Run `attempt` until it succeeds, fails other than SQLITE_CANTOPEN, or has
+/// been retried `CODEX_SIDECAR_OPEN_RETRIES` times.
 fn retry_transient_sqlite<T>(
     retries: &mut u32,
     mut attempt: impl FnMut() -> Result<T>,
@@ -41578,11 +41579,7 @@ fn retry_transient_sqlite<T>(
                     && matches!(
                         error.downcast_ref::<rusqlite::Error>(),
                         Some(rusqlite::Error::SqliteFailure(failure, _))
-                            if matches!(
-                                failure.code,
-                                rusqlite::ErrorCode::CannotOpen
-                                    | rusqlite::ErrorCode::DatabaseBusy
-                            )
+                            if failure.code == rusqlite::ErrorCode::CannotOpen
                     ) =>
             {
                 retried += 1;
@@ -78217,10 +78214,11 @@ mod tests {
         .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
     }
 
-    /// [behaviour] E2 B3: a sidecar open that fails once with SQLITE_CANTOPEN
-    /// and then succeeds counts its root complete, with the retry counted.
+    /// [behaviour] E2 B3: an open that fails once with SQLITE_CANTOPEN and
+    /// then succeeds counts its root complete, with the retry counted; any
+    /// other failure is not retried.
     #[test]
-    fn codex_sidecar_open_retry_completes_root_after_transient_cantopen() {
+    fn codex_sidecar_open_retry_counts_root_complete_after_transient_cantopen() {
         let mut failures = 1;
         let mut retries = 0;
         let result = retry_transient_sqlite(&mut retries, || {
@@ -78235,31 +78233,6 @@ mod tests {
         assert_eq!((evidence.completed_roots, evidence.failed_roots), (1, 0));
         assert_eq!(evidence.transient_retries, 1);
         assert_eq!(evidence.completed_after_retry, 1);
-        assert_eq!(evidence.first_failure_stage, None);
-    }
-
-    /// [behaviour] E2 B3: a persistent SQLITE_CANTOPEN still fails the root
-    /// after the bounded retries, with main's stage and native code; any other
-    /// failure is not retried.
-    #[test]
-    fn codex_sidecar_open_retry_is_bounded_and_keeps_persistent_failure() {
-        let mut attempts = 0;
-        let mut retries = 0;
-        let result: Result<()> = retry_transient_sqlite(&mut retries, || {
-            attempts += 1;
-            Err(sqlite_cantopen())
-        });
-        assert_eq!(attempts, CODEX_SIDECAR_OPEN_RETRIES + 1);
-        let mut evidence = crate::codex_scan_diagnostics::LoaderEvidence::default();
-        evidence.observe_root(&result, retries, false, "codex root");
-        assert_eq!((evidence.completed_roots, evidence.failed_roots), (0, 1));
-        assert_eq!(
-            evidence.first_failure_stage,
-            Some(crate::codex_scan_diagnostics::LoaderStage::Prepare)
-        );
-        assert_eq!(evidence.sqlite_extended_code, Some(14));
-        assert_eq!(evidence.transient_retries, CODEX_SIDECAR_OPEN_RETRIES);
-        assert_eq!(evidence.completed_after_retry, 0);
 
         let mut attempts = 0;
         let mut retries = 0;
@@ -78272,6 +78245,48 @@ mod tests {
         });
         assert!(not_a_database.is_err());
         assert_eq!((attempts, retries), (1, 0));
+    }
+
+    /// [behaviour] E2 B3: a state database that keeps failing SQLITE_CANTOPEN
+    /// still fails each state loader's root after the bounded retries, with
+    /// main's stage, native code and created-thread ambiguity.
+    #[cfg(unix)]
+    #[test]
+    fn codex_state_loaders_keep_failing_root_after_bounded_cantopen_retries() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_dir("codex-state-persistent-cantopen");
+        let codex_dir = home.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create state fixture root");
+        let state_path = codex_dir.join("state_5.sqlite");
+        Connection::open(&state_path)
+            .expect("open state fixture")
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT, title TEXT, tokens_used INTEGER, \
+                 thread_source TEXT, first_user_message TEXT);",
+            )
+            .expect("create state fixture schema");
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let diagnostics = metadata.local_diagnostics;
+        for evidence in [
+            diagnostics.state_titles,
+            diagnostics.state_threads,
+            diagnostics.spawn_edges,
+        ] {
+            assert_eq!((evidence.completed_roots, evidence.failed_roots), (0, 1));
+            assert_eq!(evidence.transient_retries, CODEX_SIDECAR_OPEN_RETRIES);
+            assert_eq!(evidence.completed_after_retry, 0);
+            assert_eq!(
+                evidence.first_failure_stage,
+                Some(crate::codex_scan_diagnostics::LoaderStage::Open)
+            );
+            assert_eq!(evidence.sqlite_extended_code, Some(14));
+        }
+        assert!(metadata.state_census_incomplete);
+        assert!(metadata.created_thread_census_unscoped_incomplete);
     }
 
     #[test]
@@ -85577,6 +85592,19 @@ mod census_unreadable_tests {
             )
             .unwrap()["counts"],
             json!([1, 0, 1, 0, 0, 0, 0, 0])
+        );
+        // E2 B2: the OpenRead sample names the file's kind and key digest,
+        // never its path.
+        let sample = serde_json::to_value(census.unreadable_causes).unwrap()["samples"]
+            [UnreadableCause::OpenRead as usize][0]
+            .clone();
+        let key = crate::codex_scan_diagnostics::digest(&local_index_key(&path));
+        let key = u64::from_be_bytes(std::array::from_fn(|byte| key[byte]));
+        assert!(
+            sample
+                .as_str()
+                .is_some_and(|sample| sample.ends_with(&format!(":other_home:jsonl:{key:016x}"))),
+            "{sample}"
         );
         fs::set_permissions(&root, fs::Permissions::from_mode(0o100)).unwrap();
         let mut index = ScanIndex::default();

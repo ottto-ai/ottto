@@ -223,13 +223,21 @@ pub(crate) struct UnreadableBreakdown {
 crate::heap_layout_bound::fields!(UnreadableCauses; counts, samples);
 
 /// Per-cause sample size: the first distinct events of each cause win.
-pub(crate) const UNREADABLE_SAMPLES: usize = 4;
+const UNREADABLE_SAMPLES: usize = 4;
 
 /// The first `UNREADABLE_SAMPLES` distinct events per `UnreadableCause`
 /// ordinal. Fixed size and heap free, like `counts`.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 #[serde(transparent)]
 struct UnreadableSamples([[Option<UnreadableSample>; UNREADABLE_SAMPLES]; 8]);
+/// Diagnostic only: a sample this build cannot read (another build's shape)
+/// loads as empty and never fails the index load.
+impl<'de> Deserialize<'de> for UnreadableSamples {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(serde_json::from_value(value).map(Self).unwrap_or_default())
+    }
+}
 impl UnreadableSamples {
     fn insert(&mut self, cause: usize, sample: UnreadableSample) {
         let Some(slots) = self.0.get_mut(cause) else {
@@ -1149,6 +1157,10 @@ mod tests {
         let old: UnreadableCauses =
             serde_json::from_str(r#"{"counts":[0,0,2,0,1,0,0,0]}"#).unwrap();
         assert!(old.samples.is_empty());
+        let other_build: UnreadableCauses =
+            serde_json::from_str(r#"{"counts":[0,0,2,0,1,0,0,0],"samples":[["7:moon"]]}"#).unwrap();
+        assert!(other_build.samples.is_empty());
+        assert_eq!(other_build.counts, old.counts);
 
         let private = std::path::Path::new("/Users/private credential/.codex/sessions");
         let mut causes = UnreadableCauses::default();
@@ -1271,6 +1283,8 @@ mod tests {
             first_failure_root_digest: Some([255; 32]),
             first_failure_stage: Some(LoaderStage::Prepare),
             sqlite_extended_code: Some(i32::MAX),
+            transient_retries: u32::MAX,
+            completed_after_retry: u32::MAX,
             ..Default::default()
         };
         // PR-P: the two parent fields at their maxima.
