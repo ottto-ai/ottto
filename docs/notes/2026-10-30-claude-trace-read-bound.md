@@ -5,8 +5,9 @@ after its size check. A concurrent writer could therefore extend the read past
 the stat'd length, even past the 64 MiB per-file cap, and a file replaced while
 open could still yield complete ownership evidence.
 
-The reader now opens without blocking, re-checks the opened file (regular file
-below the cap), and reads at most the opened length plus one sentinel byte.
+The reader now opens without blocking, re-checks that the opened file is regular,
+and reads at most the opened length plus one sentinel byte. As of the October 31
+sidecar fix, 64 MiB is a size warning rather than a capture or read limit.
 It drops the decoded rows for that session when:
 
 - **cap**: the sentinel byte was read, so the file grew while it was read;
@@ -16,8 +17,9 @@ It drops the decoded rows for that session when:
 The generation-change guarantee is Unix-only (macOS/Linux daemons). On
 non-Unix the generation witness is absent; only the byte bound applies.
 
-A dropped read also counts as an oversized file, so the report is never
-complete. Downstream, an incomplete trace makes that root identity-unhealthy:
+A dropped read retains its existing `oversized_files` diagnostic count, but the
+`rows_discarded` witness independently makes the report incomplete. Size warnings
+alone do not make an otherwise complete read unhealthy. Downstream, an incomplete trace makes that root identity-unhealthy:
 its requests are refused as incomplete evidence. For cap/generation discards,
 E2 places every family share at None for this page: no own account, retained
 start/binding fallback, root-to-child inheritance, or markerless-account
