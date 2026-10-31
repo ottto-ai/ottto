@@ -2430,6 +2430,9 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
     let (mut base, mut proof) = sticky_session(400);
     sticky_price_fixture(&mut base, &mut proof);
     sticky_receiver_totals(&mut base);
+    base.session_display_name = Some("x".into());
+    base.workspace_display_label = Some("x".into());
+    base.repository_label = Some("x".into());
     base.context_curve = Some(max_fractional_context_curve_fixture());
     let (mut item, filler) = sticky_pad_to_bytes(&base, 1_600_000);
     proof.extend(filler);
@@ -2485,14 +2488,15 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
     // the existing upload hold instead of sending a smaller stripped revision.
     let mut held = item.clone();
     let before = sticky_money(&held);
-    let result = identity::apply_with_reserved_bytes_for_test(
-        &mut held,
-        &proof,
-        &ledger,
-        0,
-        Some(1_048_576),
-    )
-    .unwrap();
+    let (result, alarms) = crate::local_resource_diagnostics::capture(|| {
+        identity::apply_with_reserved_bytes_for_test(&mut held, &proof, &ledger, 0, Some(1_048_576))
+            .unwrap()
+    });
+    assert!(alarms.iter().any(
+        |record| record["counts"]["claude_request_identity_over_cap"]["identity_over_cap_held"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+    ));
     assert_eq!(result, Tagged::Held);
     assert_eq!(sticky_money(&held), before);
     assert!(held.usage_buckets[..400]
@@ -2512,6 +2516,9 @@ fn advertised_cap_retags_previously_stripped_accepted_body() {
     let (mut base, mut proof) = sticky_session(400);
     sticky_price_fixture(&mut base, &mut proof);
     sticky_receiver_totals(&mut base);
+    base.session_display_name = Some("x".into());
+    base.workspace_display_label = Some("x".into());
+    base.repository_label = Some("x".into());
     let (original, filler) = sticky_pad_to_bytes(&base, 620_000);
     proof.extend(filler);
     let mut ledger = identity::AcceptedBuckets::for_test();

@@ -10245,6 +10245,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if let Some((cache, committed)) = retained {
         cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
     }
+    let mut identity_custody = (wire_budget.max_item_bytes
+        > crate::snapshots::claude_request_identity::MAX_ITEM_BYTES)
+        .then(|| withheld.clone());
     disposition.hold_request_owned(withheld);
     {
         for item in &mut scan_result.snapshots {
@@ -10280,10 +10283,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             &ownership,
         );
         if !request_identity.held.is_empty() {
-            let held = disposition.hold_request_owned(request_identity.held);
-            if let Some((cache, committed)) = retained {
-                cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, held);
+            if let (Some((cache, committed)), Some(withheld)) =
+                (retained, identity_custody.as_mut())
+            {
+                withheld.extend(request_identity.held.iter().cloned());
+                cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, withheld);
             }
+            disposition.hold_request_owned(request_identity.held);
         }
         if let Some(activity) = request_owned_activity {
             crate::snapshots::claude_request_identity::publish_request_owned_activity(
