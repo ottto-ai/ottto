@@ -268,6 +268,11 @@ fn current() -> Option<u64> {
     None
 }
 
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn memory_harness_current() -> Option<u64> {
+    current()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

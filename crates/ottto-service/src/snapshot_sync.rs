@@ -23780,3 +23780,10 @@ crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reas
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn memory_harness_paths(support: &Path, source: SnapshotSource) -> (PathBuf, PathBuf) {
+    let index = snapshot_v3_index_path(&snapshot_index_path(support, source));
+    let progress = snapshot_upload_progress_path(&index);
+    (index, progress)
+}

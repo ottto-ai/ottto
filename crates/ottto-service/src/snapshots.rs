@@ -94,6 +94,8 @@ pub(crate) mod claude_request_accounts;
 pub(crate) mod claude_request_census;
 pub(crate) mod claude_request_identity;
 pub(crate) mod claude_request_money;
+#[cfg(all(test, target_os = "macos"))]
+mod memory_classes_harness;
 mod scan_index_integration;
 pub(crate) mod scan_index_persistence;
 use scan_index_integration::read_scan_index_representation;
