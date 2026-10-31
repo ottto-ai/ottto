@@ -5135,6 +5135,9 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// The account-deferred subset of `quarantined_source_session_ids`. Upload
     /// retention still uses the union; this only classifies settlement.
     account_deferred_source_session_ids: BTreeSet<String>,
+    /// Fixed-label E2 emission veto counts for this page. Diagnostic only;
+    /// never serialized, persisted, or used to decide upload eligibility.
+    pub(crate) request_owned_hold_reasons: BTreeMap<&'static str, u64>,
     pub(crate) mixed_uploads: claude_request_accounts::MixedUploads,
     /// Contract-5 only: each rebuilt item's requests, classified and folded
     /// into bounded row x authority-key groups during the rebuild.
@@ -7740,6 +7743,8 @@ pub struct SourceScanResult {
     pub census_residue_archived_rollout_count: usize,
     pub census_residue_blocked_session_count: usize,
     pub snapshots: Vec<SnapshotItem>,
+    /// Exact selection deferrals from this page, diagnostic only; never persisted.
+    pub(crate) claude_queued_family_deferred_paths: BTreeSet<claude_money_birth_store::LocationKey>,
     pending_finalization: Vec<PendingIndexFinalization>,
     /// RAM-only observations of this bounded page; never serialized or uploaded.
     discovery_growth: discovery_growth::Page,
@@ -26168,17 +26173,20 @@ fn finish_claude_retry_selection(
     pending_paths: &mut Vec<ScanTraversalPath>,
     retry_service_end: usize,
     service_at: &str,
-) {
-    if claude_request_money::e2::enabled() {
+) -> BTreeSet<claude_money_birth_store::LocationKey> {
+    let deferred = if claude_request_money::e2::enabled() {
         claude_request_money::e2::defer_roots_of_queued_families(
             pending_paths,
             index.traversal.as_mut().expect("traversal initialized"),
-        );
-    }
+        )
+    } else {
+        BTreeSet::new()
+    };
     let offered_end = retry_service_end.min(pending_paths.len());
     if offered_end > 0 {
         claude_retry_note_offered(index, &pending_paths[..offered_end], service_at);
     }
+    deferred
 }
 
 impl OwnedSourceScan {
@@ -26635,7 +26643,7 @@ impl OwnedSourceScan {
             scanned_file_count: 0,
             scanned_session_count: 0,
             semantic_noop_count: 0,
-            history_upgrade: HistoryPage::with_twin_groups(Default::default()),
+            history_upgrade: HistoryPage::with_twin_groups(Default::default(), BTreeSet::new()),
             context_read_budget: upload_context_read::Budget::new(SnapshotSource::Codex),
             codex_state_only_blocked_session_ids: Default::default(),
             codex_parent_resolution_retry_required: false,
@@ -27089,7 +27097,7 @@ impl OwnedSourceScan {
         }
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
         let causes = traversal.counts.causes.page(census_unix_seconds);
-        if source == SnapshotSource::ClaudeCode {
+        let claude_queued_family_deferred_paths = if source == SnapshotSource::ClaudeCode {
             finish_claude_retry_selection(
                 index,
                 &mut pending_paths,
@@ -27099,8 +27107,10 @@ impl OwnedSourceScan {
                 } else {
                     &census_window_end
                 },
-            );
-        }
+            )
+        } else {
+            BTreeSet::new()
+        };
         index.resume_census_window_end = Some(census_window_end.clone());
         let mut census = ScanCensus {
             causes,
@@ -27440,7 +27450,10 @@ impl OwnedSourceScan {
             scanned_file_count,
             scanned_session_count,
             semantic_noop_count,
-            history_upgrade: HistoryPage::with_twin_groups(claude_twin_groups),
+            history_upgrade: HistoryPage::with_twin_groups(
+                claude_twin_groups,
+                claude_queued_family_deferred_paths,
+            ),
             context_read_budget: upload_context_read::Budget::new(source),
             codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
@@ -32223,6 +32236,9 @@ impl OwnedSourceScan {
                     );
                 }
                 let scan = SourceScanResult {
+                    claude_queued_family_deferred_paths: std::mem::take(
+                        &mut history_upgrade.queued_family_deferred_paths,
+                    ),
                     discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                     strict_cohort_deferred_root_count: 0,
                     source,

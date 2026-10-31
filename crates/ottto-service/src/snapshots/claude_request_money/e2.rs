@@ -3726,9 +3726,9 @@ fn directory_names(queued: &VecDeque<ScanTraversalPath>) -> BTreeSet<String> {
 pub(in crate::snapshots) fn defer_roots_of_queued_families(
     selected: &mut Vec<ScanTraversalPath>,
     traversal: &mut ScanTraversalCheckpoint,
-) {
+) -> BTreeSet<LocationKey> {
     if traversal.pending_directories.is_empty() {
-        return;
+        return BTreeSet::new();
     }
     let queued = directory_names(&traversal.pending_directories);
     let (deferred, kept): (Vec<_>, Vec<_>) =
@@ -3739,9 +3739,14 @@ pub(in crate::snapshots) fn defer_roots_of_queued_families(
         });
     *selected = kept;
     diag("deferred_root_queued_family", deferred.len() as u64);
+    let locations = deferred
+        .iter()
+        .map(|candidate| location_key(&local_index_key(&candidate.path)))
+        .collect();
     for candidate in deferred.into_iter().rev() {
         traversal.pending_candidates.push_front(candidate);
     }
+    locations
 }
 
 /// The family members of `root` this traversal observed but has not indexed.
@@ -3804,9 +3809,14 @@ pub(crate) fn finish_page(
     items: &mut Vec<SnapshotItem>,
     index: &ScanIndex,
     telemetry: TelemetryRead,
+    hold_reasons: &mut BTreeMap<&'static str, u64>,
+    queued_family_deferred_paths: &BTreeSet<LocationKey>,
 ) -> BTreeSet<String> {
     if !index.persistence_available() {
-        let held = items.iter().map(|i| i.source_session_id.clone()).collect();
+        let held: BTreeSet<_> = items.iter().map(|i| i.source_session_id.clone()).collect();
+        if !held.is_empty() {
+            *hold_reasons.entry("index_unavailable").or_default() += held.len() as u64;
+        }
         items.clear();
         return held;
     }
@@ -3974,7 +3984,12 @@ pub(crate) fn finish_page(
         .iter()
         .map(|(session, state)| (*session, state.locations.as_slice()))
         .collect::<Vec<_>>();
-    let held = absent_twins(&locations, index);
+    let held = absent_twins(
+        &locations,
+        index,
+        queued_family_deferred_paths,
+        hold_reasons,
+    );
     diag("held_absent_twin", held.len() as u64);
     drop(locations);
     let mut decided = Vec::with_capacity(sessions.len());
@@ -4011,6 +4026,16 @@ pub(crate) fn finish_page(
             }
         }
         if !emitted {
+            let reason = if held.contains(item.source_session_id.as_str()) {
+                "absent_twin"
+            } else if entity.held {
+                "request_owned_held"
+            } else if !entity.certificate_ok {
+                "uncertified"
+            } else {
+                "emission_rejected"
+            };
+            *hold_reasons.entry(reason).or_default() += 1;
             withheld.insert(item.source_session_id.clone());
         }
         if let Some(fold) = item.claude_money.as_deref_mut() {
@@ -4100,7 +4125,12 @@ pub(crate) fn visit_identity_rows(
 /// not on this page: never publish one path over complete twin history. Only
 /// sessions whose birth table knows more paths than the page holds build the
 /// shared twin groups (after the scan, so not the page's own copy).
-fn absent_twins(sessions: &[(&str, &[LocationKey])], index: &ScanIndex) -> BTreeSet<String> {
+fn absent_twins(
+    sessions: &[(&str, &[LocationKey])],
+    index: &ScanIndex,
+    queued_family_deferred_paths: &BTreeSet<LocationKey>,
+    hold_reasons: &mut BTreeMap<&'static str, u64>,
+) -> BTreeSet<String> {
     let store = &index.claude_money_birth_store;
     let suspects = sessions
         .iter()
@@ -4123,6 +4153,57 @@ fn absent_twins(sessions: &[(&str, &[LocationKey])], index: &ScanIndex) -> BTree
         });
         if absent {
             held.insert((*session).to_owned());
+        }
+    }
+    if !held.is_empty() {
+        // Count the known twin groups of each held FAMILY once, including
+        // sibling members. Staged means a native fold on this page, not a
+        // metadata birth probe (which may also stage an absent twin).
+        let families = held
+            .iter()
+            .filter_map(|member| groups.get(member)?.first())
+            .filter_map(|(key, _)| claude_index_path_member_ref(Path::new(key)))
+            .map(|member| member.root)
+            .collect::<BTreeSet<_>>();
+        let mut known = 0;
+        let mut staged = 0;
+        let mut deferred_families = BTreeSet::new();
+        for (member, keys) in &groups {
+            let Some(twins) = path_twins(&groups, member) else {
+                continue;
+            };
+            let Some(family) = keys
+                .first()
+                .and_then(|(key, _)| claude_index_path_member_ref(Path::new(key)))
+            else {
+                continue;
+            };
+            if !families.contains(family.root) {
+                continue;
+            }
+            let here = sessions
+                .iter()
+                .find(|(session, _)| *session == member)
+                .map(|(_, here)| *here)
+                .unwrap_or_default();
+            for (key, _) in twins {
+                let location = location_key(key);
+                known += 1;
+                staged += u64::from(here.contains(&location));
+                if queued_family_deferred_paths.contains(&location) {
+                    deferred_families.insert(family.root);
+                }
+            }
+        }
+        for (label, count) in [
+            ("known_twin_paths", known),
+            ("staged_twin_paths", staged),
+            (
+                "queued_family_deferred_families",
+                deferred_families.len() as u64,
+            ),
+        ] {
+            *hold_reasons.entry(label).or_default() += count;
         }
     }
     held
