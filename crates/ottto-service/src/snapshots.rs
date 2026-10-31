@@ -19435,7 +19435,7 @@ impl SnapshotAccumulator {
                 && !skills.iter().any(|seen| seen.eq_ignore_ascii_case(&name))
             {
                 skills.insert(name);
-            } else if !skills.iter().any(|seen| seen.eq_ignore_ascii_case(&name)) {
+            } else if restart_restore::enabled() && !skills.iter().any(|seen| seen.eq_ignore_ascii_case(&name)) {
                 crate::local_resource_diagnostics::skill_label_native_dropped(
                     self.source.api_slug(),
                     "activity",
@@ -19443,7 +19443,7 @@ impl SnapshotAccumulator {
                 );
             }
         });
-        if !named_all {
+        if restart_restore::enabled() && !named_all {
             crate::local_resource_diagnostics::skill_label_native_dropped(
                 self.source.api_slug(),
                 "activity",
@@ -20050,7 +20050,7 @@ impl SnapshotAccumulator {
             && self.provider_skills.len() <= crate::session_attribution::MAX_SKILL_FACTS
         {
             self.provider_skills.insert(normalized);
-        } else if !self.provider_skills.contains(&normalized) {
+        } else if restart_restore::enabled() && !self.provider_skills.contains(&normalized) {
             crate::local_resource_diagnostics::skill_label_native_dropped(
                 self.source.api_slug(),
                 "provider",
