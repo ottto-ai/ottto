@@ -174,3 +174,22 @@ code. None adds a persisted field.
 - **R4 disclosure counter:** each ON page emits `history_upgrade_page`
   (`admitted_files`, `budget`, `extra_files`): history files actually admitted
   to a parser, including local work beyond the upgrade budget.
+- **R10 fix P (context pacing):** under ON, Claude never adopts the
+  source-wide context, so UploadContext stays a file's first selecting gate.
+  `context_only_read` now also requires that the decision without the
+  UploadContext gate is not Parse, so a real sidecar or retry read uses
+  ordinary read budgets while pure context catch-up keeps its one-file
+  pacing. ON preflight opens UploadContext candidates before sorting, so both
+  sides of that comparison use the full opened identity. OFF and Codex keep
+  main's classification.
+- **R10 money harness:** `terminal_off_on_money_receipts` includes the
+  unchanged money-equivalence harness under the scoped ON guard.
+  `scripts/money_equivalence.py` runs base-OFF, head-OFF and head-ON (the same
+  head binary, a separate process and output directory), each requiring all
+  ten native money receipts and three disk receipts, and compares both head
+  arms with base-OFF through the existing decoded-body comparison
+  (`MONEY_EQUIVALENCE_DIFF`, `MONEY_EQUIVALENCE_ON_DIFF`). No ON-specific
+  exclusion is allowed; the manifest records `terminal_off_on`. Linux reports
+  the native harness UNEXECUTED. The three arms share one test thread's
+  containment RAM memos, so a green result does not claim cold-process memo
+  fidelity.
