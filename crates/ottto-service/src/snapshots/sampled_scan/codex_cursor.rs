@@ -4987,7 +4987,13 @@ impl SharedCache {
                     None => Ok(None),
                 }
             })
-            .unwrap_or_else(|| anyhow::bail!("custody decision holder unavailable"))?;
+            .unwrap_or_else(|| {
+                // Poisoned: nothing new is escrowed; a held payload still refuses.
+                if self.replay_custody_decision() {
+                    anyhow::bail!("custody decision holder unavailable")
+                }
+                Ok(None)
+            })?;
         if first {
             crate::local_resource_diagnostics::custody_latch_deferred(1, 0, 0);
         }
@@ -4999,9 +5005,18 @@ impl SharedCache {
 
     /// Yield BEFORE inventory/acquisition until the COMPLETE pending payload
     /// has been funded and saved. No cause-only replay or allocation here.
+    /// A poisoned cursor admits nothing, but its escrow stays readable: only
+    /// an escrowed payload waits (none is dropped), so W9 pages still finish.
     pub(in crate::snapshots) fn replay_custody_decision(&self) -> bool {
-        self.with_cursor(|cursor| cursor.custody_unsaved.is_some())
-            .unwrap_or(true)
+        debug_assert!(
+            !cursor_held(),
+            "cursor lock taken while this thread holds it"
+        );
+        self.cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .custody_unsaved
+            .is_some()
     }
 
     /// The key of the paused or active job (tests; selection uses
