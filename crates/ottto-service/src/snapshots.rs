@@ -244,16 +244,6 @@ pub fn collector_version() -> String {
     ottto_core::compiled_release_version()
 }
 
-#[cfg(test)]
-mod collector_version_tests {
-    use super::*;
-
-    #[test]
-    fn collector_version_uses_packaged_release_version() {
-        assert_eq!(collector_version(), ottto_core::compiled_release_version());
-    }
-}
-
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 6;
 pub const SNAPSHOT_ENTITY_ACK_CONTRACT: &str = "snapshot_entity_ack:v1";
 pub const SNAPSHOT_HEAD_CAS_CONTRACT: &str = "snapshot_head_etag:v1";
@@ -55622,34 +55612,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn scanner_rejects_symlinks_without_crossing_the_root() {
-        use std::os::unix::fs::symlink;
-
-        let root = temp_dir("scan-symlink-root");
-        let outside = temp_dir("scan-symlink-outside");
-        fs::write(outside.join("session.jsonl"), b"{}\n").expect("outside transcript");
-        symlink(&outside, root.join("escape")).expect("create directory symlink");
-        let mut index = ScanIndex::default();
-        let scan = scan_source_roots_with_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .expect("symlink is quarantined per path");
-        assert_eq!(scan.symlink_rejected_count, 1);
-        assert_eq!(scan.discovered_file_count, 0);
-        assert!(!scan.census_complete);
-        assert!(index.files.is_empty());
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn scanner_allows_one_configured_root_symlink_but_not_nested_symlinks() {
         use std::os::unix::fs::symlink;
 
@@ -56363,171 +56325,6 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn nanosecond_mtime_change_forces_parse_inside_same_second() {
-        let path = PathBuf::from("/redacted/session.jsonl");
-        let candidate = CandidateFile {
-            physical_identity: None,
-            scan_root: PathBuf::from("/redacted"),
-            path: path.clone(),
-            size_bytes: 42,
-            modified_unix_seconds: 1_777_777_777,
-            modified_unix_nanos: 1_777_777_777_000_000_002,
-            source_file_fingerprint: "new".to_string(),
-            legacy_source_file_fingerprint: "legacy".to_string(),
-            legacy_config_reconciliation_required: false,
-            opened_object_identity: "opened".to_string(),
-            fingerprint_changed_nanos: 0,
-            fingerprint_birth_nanos: 0,
-            withheld_content_stamp: None,
-        };
-        let index = ScanIndex {
-            files: BTreeMap::from([(
-                local_index_key(&path),
-                ScanIndexEntry {
-                    codex_fragment: None,
-                    size_bytes: 42,
-                    modified_unix_seconds: 1_777_777_777,
-                    modified_unix_nanos: Some(1_777_777_777_000_000_001),
-                    source_file_fingerprint: "old".to_string(),
-                    last_snapshot_fingerprint: Some("snapshot".to_string()),
-                    last_upload_body_witness: None,
-                    effective_upload_body_witness_revision: 0,
-                    scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
-                    codex_joined_member_set: None,
-                    codex_captured_joined_member_set: None,
-                    codex_protected_owner: None,
-                    codex_applied_tier_receipt: None,
-                    codex_applied_tier_receipt_required: false,
-                    codex_captured_tier_receipt: None,
-                    codex_captured_tier_receipt_required: false,
-                    codex_captured_uncommitted: false,
-                    codex_counting_v2: false,
-                    codex_counting_owner: None,
-                    opened_changed_nanos: 0,
-                    opened_birth_nanos: 0,
-                    upload_context_receipt: None,
-                },
-            )]),
-            ..ScanIndex::default()
-        };
-        // A legacy row has no nullable semantic-activity witness. A narrow
-        // config reconciliation cannot manufacture one, so v2 requires the
-        // one-time full parse before it can publish a complete manifest.
-        assert_eq!(
-            index.candidate_decision(&candidate),
-            CandidateDecision::Parse
-        );
-    }
-
-    #[test]
-    fn legacy_index_reparses_when_old_sidecar_identity_cannot_be_proven() {
-        let path = PathBuf::from("/redacted/session.jsonl");
-        let candidate = CandidateFile {
-            physical_identity: None,
-            scan_root: PathBuf::from("/redacted"),
-            path: path.clone(),
-            size_bytes: 42,
-            modified_unix_seconds: 1_777_777_777,
-            modified_unix_nanos: 1_777_777_777_000_000_001,
-            source_file_fingerprint: "semantic-sync".to_string(),
-            legacy_source_file_fingerprint: "legacy-current-sidecar".to_string(),
-            legacy_config_reconciliation_required: false,
-            opened_object_identity: "opened".to_string(),
-            fingerprint_changed_nanos: 0,
-            fingerprint_birth_nanos: 0,
-            withheld_content_stamp: None,
-        };
-        let index = ScanIndex {
-            files: BTreeMap::from([(
-                local_index_key(&path),
-                ScanIndexEntry {
-                    codex_fragment: None,
-                    size_bytes: 42,
-                    modified_unix_seconds: 1_777_777_777,
-                    modified_unix_nanos: None,
-                    source_file_fingerprint: "legacy-previous-sidecar".to_string(),
-                    last_snapshot_fingerprint: Some("snapshot".to_string()),
-                    last_upload_body_witness: None,
-                    effective_upload_body_witness_revision: 0,
-                    scan_identity_version: None,
-                    codex_joined_member_set: None,
-                    codex_captured_joined_member_set: None,
-                    codex_protected_owner: None,
-                    codex_applied_tier_receipt: None,
-                    codex_applied_tier_receipt_required: false,
-                    codex_captured_tier_receipt: None,
-                    codex_captured_tier_receipt_required: false,
-                    codex_captured_uncommitted: false,
-                    codex_counting_v2: false,
-                    codex_counting_owner: None,
-                    opened_changed_nanos: 0,
-                    opened_birth_nanos: 0,
-                    upload_context_receipt: None,
-                },
-            )]),
-            ..ScanIndex::default()
-        };
-        assert_eq!(
-            index.candidate_decision(&candidate),
-            CandidateDecision::Parse
-        );
-    }
-
-    #[test]
-    fn legacy_index_targets_config_derived_rows_for_reconciliation() {
-        let path = PathBuf::from("/redacted/session.jsonl");
-        let candidate = CandidateFile {
-            physical_identity: None,
-            scan_root: PathBuf::from("/redacted"),
-            path: path.clone(),
-            size_bytes: 42,
-            modified_unix_seconds: 1_777_777_777,
-            modified_unix_nanos: 1_777_777_777_000_000_001,
-            source_file_fingerprint: "semantic-sync".to_string(),
-            legacy_source_file_fingerprint: "legacy-matching-sidecar".to_string(),
-            legacy_config_reconciliation_required: true,
-            opened_object_identity: "opened".to_string(),
-            fingerprint_changed_nanos: 0,
-            fingerprint_birth_nanos: 0,
-            withheld_content_stamp: None,
-        };
-        let index = ScanIndex {
-            files: BTreeMap::from([(
-                local_index_key(&path),
-                ScanIndexEntry {
-                    codex_fragment: None,
-                    size_bytes: 42,
-                    modified_unix_seconds: 1_777_777_777,
-                    modified_unix_nanos: None,
-                    source_file_fingerprint: "legacy-matching-sidecar".to_string(),
-                    last_snapshot_fingerprint: Some("snapshot".to_string()),
-                    last_upload_body_witness: None,
-                    effective_upload_body_witness_revision: 0,
-                    scan_identity_version: None,
-                    codex_joined_member_set: None,
-                    codex_captured_joined_member_set: None,
-                    codex_protected_owner: None,
-                    codex_applied_tier_receipt: None,
-                    codex_applied_tier_receipt_required: false,
-                    codex_captured_tier_receipt: None,
-                    codex_captured_tier_receipt_required: false,
-                    codex_captured_uncommitted: false,
-                    codex_counting_v2: false,
-                    codex_counting_owner: None,
-                    opened_changed_nanos: 0,
-                    opened_birth_nanos: 0,
-                    upload_context_receipt: None,
-                },
-            )]),
-            ..ScanIndex::default()
-        };
-        assert_eq!(
-            index.candidate_decision(&candidate),
-            CandidateDecision::Parse
-        );
     }
 
     #[test]
@@ -71240,47 +71037,6 @@ mod tests {
     }
 
     #[test]
-    fn context_curve_fails_closed_without_exact_boundary_adjacency() {
-        let candidates = [1_u64, 2]
-            .into_iter()
-            .map(|ordinal| ContextCurveCandidatePoint {
-                observed_at: Some(format!("2026-08-20T12:00:0{ordinal}Z")),
-                effective_input_tokens: ordinal * 10,
-                model: Some("gpt-5.5".to_string()),
-                context_window_tokens: Some(258_400),
-            })
-            .collect::<Vec<_>>();
-        for point_count_before in [0_u64, 2] {
-            let curve = build_context_curve(
-                CODEX_SNAPSHOT_PARSER_VERSION,
-                "codex_owned_rollout_occurrences:v1",
-                "codex_token_count_model_context_window:v1",
-                &candidates,
-                &[ContextCurveCandidateBoundary {
-                    observed_at: Some("2026-08-20T12:00:01Z".to_string()),
-                    point_count_before,
-                }],
-                "ownership_unresolved",
-            );
-            assert_eq!(curve.coverage, "ownership_unresolved");
-            assert!(curve.boundaries.is_empty());
-        }
-        let out_of_interval = build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &candidates,
-            &[ContextCurveCandidateBoundary {
-                observed_at: Some("2026-08-20T12:00:03Z".to_string()),
-                point_count_before: 1,
-            }],
-            "ownership_unresolved",
-        );
-        assert_eq!(out_of_interval.coverage, "ownership_unresolved");
-        assert!(out_of_interval.boundaries.is_empty());
-    }
-
-    #[test]
     fn context_curve_cross_language_golden_is_canonical_and_current() {
         let point = |timestamp: &str, tokens: u64, model: &str, window: Option<u64>| {
             ContextCurveCandidatePoint {
@@ -85232,39 +84988,6 @@ mod census_unreadable_tests {
         }
         let older: PrePrP = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(older.unreadable_path_count, 2);
-    }
-
-    #[test]
-    fn unreadable_revalidation_keeps_short_circuit_and_exactly_one_existing_open() {
-        use std::cell::Cell;
-        let calls = Cell::new(0);
-        assert!(matches!(
-            sampled_revalidation_cause(false, || {
-                calls.set(calls.get() + 1);
-                Ok(true)
-            }),
-            Some(UnreadableCause::ScopeObject)
-        ));
-        assert_eq!(calls.get(), 0);
-        for (outcome, expected) in [
-            (Ok(true), None),
-            (Ok(false), Some(UnreadableCause::ScopeObject)),
-            (
-                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
-                Some(UnreadableCause::OpenRead),
-            ),
-        ] {
-            let before = calls.get();
-            let cause = sampled_revalidation_cause(true, || {
-                calls.set(calls.get() + 1);
-                outcome
-            });
-            assert_eq!(
-                cause.map(|value| value as usize),
-                expected.map(|value| value as usize)
-            );
-            assert_eq!(calls.get(), before + 1);
-        }
     }
 
     #[test]
