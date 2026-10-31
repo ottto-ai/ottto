@@ -166,6 +166,22 @@ pub(crate) const MAX_PARTS_PER_ITEM: usize = 2_048;
 pub(crate) const MAX_ROWS: usize = 100;
 /// Receiver `MAX_SNAPSHOT_ITEM_BYTES`, measured on sorted compact JSON.
 pub(crate) const MAX_ITEM_BYTES: usize = 640 * 1024;
+pub(crate) const MAX_ADVERTISED_ITEM_BYTES: usize = 3 * 1024 * 1024;
+
+pub(crate) fn effective_item_cap(advertised: Option<u64>) -> usize {
+    advertised
+        .filter(|bytes| *bytes >= MAX_ITEM_BYTES as u64)
+        .map_or(MAX_ITEM_BYTES, |bytes| {
+            bytes.min(MAX_ADVERTISED_ITEM_BYTES as u64) as usize
+        })
+}
+
+/// This pass's receiver limit and the existing cache reconciliation reserve.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct WireBudget<'a> {
+    pub(crate) max_snapshot_item_bytes: Option<u64>,
+    pub(crate) reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
+}
 const MICRO_PICOS: u128 = USD_PICO_SCALE / 1_000_000;
 const MAX_MONEY_PICOS: u128 = 1_000_000_000 * USD_PICO_SCALE;
 
@@ -288,6 +304,7 @@ pub(crate) enum OverCap {
     PartsPerItem,
     Rows,
     Bytes,
+    NearCap,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -815,7 +832,7 @@ pub(crate) fn apply_with_accepted_for_test(
     contributions: &[Contribution],
     accepted: &AcceptedBuckets,
 ) -> Result<Tagged, Ineligible> {
-    apply_with_reserved_bytes_for_test(item, contributions, accepted, 0)
+    apply_with_reserved_bytes_for_test(item, contributions, accepted, 0, None)
 }
 
 #[cfg(test)]
@@ -824,6 +841,7 @@ pub(crate) fn apply_with_reserved_bytes_for_test(
     contributions: &[Contribution],
     accepted: &AcceptedBuckets,
     extra_wire_bytes: usize,
+    advertised_item_bytes: Option<u64>,
 ) -> Result<Tagged, Ineligible> {
     let mut grouping = Grouping::new(bucket_row_count(item));
     grouping.extra_wire_bytes = extra_wire_bytes;
@@ -838,7 +856,13 @@ pub(crate) fn apply_with_reserved_bytes_for_test(
     }
     let known = accepted.get(&item.source_session_id);
     grouping.accepted_miss = accepted.miss_cause();
-    apply_grouped_with_accepted(item, grouping, known, accepted.retained_enabled())
+    apply_grouped_with_accepted(
+        item,
+        grouping,
+        known,
+        accepted.retained_enabled(),
+        effective_item_cap(advertised_item_bytes),
+    )
 }
 
 /// `apply` with each request's own transcript time (`None`: auxiliary),
@@ -870,7 +894,7 @@ pub(crate) fn apply_grouped(
     item: &mut SnapshotItem,
     grouping: Grouping,
 ) -> Result<Tagged, Ineligible> {
-    apply_grouped_with_accepted(item, grouping, None, false)
+    apply_grouped_with_accepted(item, grouping, None, false, MAX_ITEM_BYTES)
 }
 
 /// `retained` is option (ii): the server retains proof per bucket row, so the
@@ -881,6 +905,7 @@ fn apply_grouped_with_accepted(
     mut grouping: Grouping,
     known: Option<&accepted::AcceptedSession>,
     retained: bool,
+    max_item_bytes: usize,
 ) -> Result<Tagged, Ineligible> {
     let retained = retained && super::claude_history_upgrade::is_request_owned_literal(item);
     let (accepted, proved) = if retained {
@@ -1061,17 +1086,19 @@ fn apply_grouped_with_accepted(
     // below must satisfy the same wire bounds and reconciliation rules.
     install(item, &evidence, top_identities, bucket_identities, refusals);
     let attempted_bytes = grouping.item_bytes(item);
-    let components = (attempted_bytes > MAX_ITEM_BYTES)
+    if max_item_bytes > MAX_ITEM_BYTES && attempted_bytes > max_item_bytes / 2 {
+        crate::local_resource_diagnostics::claude_identity_over_cap(
+            &BTreeSet::from([OverCap::NearCap]), attempted_bytes, None,
+        );
+    }
+    let components = (attempted_bytes > max_item_bytes)
         .then(|| shed_display_leaves(item, &grouping, attempted_bytes));
     if let Some(bytes) = &components {
-        if bytes.after_shed > MAX_ITEM_BYTES {
+        if bytes.after_shed > max_item_bytes {
             over_cap.insert(OverCap::Bytes);
         } else if over_cap.is_empty() {
-            // Shedding alone fit: record it, since no strip will.
             crate::local_resource_diagnostics::claude_identity_over_cap(
-                &over_cap,
-                attempted_bytes,
-                Some(bytes),
+                &over_cap, attempted_bytes, Some(bytes),
             );
         }
     }
@@ -1081,7 +1108,7 @@ fn apply_grouped_with_accepted(
         .flatten();
     if let Some(unpriced) = unpriced {
         // Stripping only removes tags; the wire bound is still re-checked.
-        if grouping.item_bytes(item) <= MAX_ITEM_BYTES {
+        if grouping.item_bytes(item) <= max_item_bytes {
             let mut counts = cap_counts(item, &grouping, accepted, None);
             unpriced.count(&mut counts);
             deferred.drop_stripped(item, &unpriced.keys);
@@ -1122,7 +1149,7 @@ fn apply_grouped_with_accepted(
         })
         .count() as u64;
     let selected = (!grouping.upstream_proof_lost)
-        .then(|| budget::select(item, &grouping, prior_refusals, accepted))
+        .then(|| budget::select(item, &grouping, prior_refusals, accepted, max_item_bytes))
         .flatten()
         .and_then(|(kept, mut measurement)| {
             let unpriced = untag_unpriced_parts(item, &grouping, accepted)?;
@@ -1131,7 +1158,7 @@ fn apply_grouped_with_accepted(
                 measurement.accepted_retained =
                     cap_counts(item, &grouping, accepted, None).retained_buckets;
             }
-            (grouping.item_bytes(item) <= MAX_ITEM_BYTES).then_some((kept, measurement, unpriced))
+            (grouping.item_bytes(item) <= max_item_bytes).then_some((kept, measurement, unpriced))
         });
     if let Some((kept, measurement, unpriced)) = selected {
         let mut counts = cap_counts(item, &grouping, accepted, Some(&measurement));
@@ -1197,7 +1224,7 @@ fn apply_grouped_with_accepted(
         let unmarked = grouping
             .item_bytes(item)
             .saturating_sub(deferred.marker_bytes());
-        deferred.keep_newest(MAX_ITEM_BYTES.saturating_sub(unmarked))
+        deferred.keep_newest(max_item_bytes.saturating_sub(unmarked))
     };
     let refusals = refusals.saturating_add(dropped);
     deferred.mark(item);
@@ -1564,6 +1591,7 @@ pub(crate) fn measure_identity_cap(
                 &grouping,
                 item.request_identity_refusals,
                 known,
+                MAX_ITEM_BYTES,
             )
         })
         .flatten();
@@ -3739,7 +3767,7 @@ pub(crate) struct ScanEvidence<'a> {
     /// unambiguous native account used by local Desktop activity.
     native_originals: Option<&'a BTreeMap<String, super::SessionAccountEvidence>>,
     accepted_buckets: Option<&'a AcceptedBuckets>,
-    wire_size_reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
+    wire_budget: WireBudget<'a>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -3823,11 +3851,8 @@ impl<'a> ScanEvidence<'a> {
         self
     }
 
-    pub(crate) fn with_wire_size_reservation(
-        mut self,
-        reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
-    ) -> Self {
-        self.wire_size_reservation = reservation;
+    pub(crate) fn with_wire_budget(mut self, budget: WireBudget<'a>) -> Self {
+        self.wire_budget = budget;
         self
     }
 
@@ -5072,10 +5097,17 @@ fn tag_item(
         );
         normalize_activity(item);
         grouping.extra_wire_bytes = evidence
-            .wire_size_reservation
+            .wire_budget
+            .reservation
             .map_or(0, |reserve| reserve(item));
         grouping.accepted_miss = miss;
-        let tagged = apply_grouped_with_accepted(item, grouping, accepted, retained);
+        let tagged = apply_grouped_with_accepted(
+            item,
+            grouping,
+            accepted,
+            retained,
+            effective_item_cap(evidence.wire_budget.max_snapshot_item_bytes),
+        );
         if tagged.is_err() {
             (
                 item.source_started_at,
@@ -5136,12 +5168,19 @@ fn tag_item(
     );
     normalize_activity(item);
     grouping.extra_wire_bytes = evidence
-        .wire_size_reservation
+        .wire_budget
+        .reservation
         .map_or(0, |reserve| reserve(item));
     let desktop_recent = std::mem::take(&mut grouping.desktop_recent);
     let owned = !grouping.unowned_request;
     grouping.accepted_miss = miss;
-    let tagged = apply_grouped_with_accepted(item, grouping, accepted, retained);
+    let tagged = apply_grouped_with_accepted(
+        item,
+        grouping,
+        accepted,
+        retained,
+        effective_item_cap(evidence.wire_budget.max_snapshot_item_bytes),
+    );
     if tagged.is_ok() && owned {
         crate::desktop_recent::publish(desktop_recent);
     }

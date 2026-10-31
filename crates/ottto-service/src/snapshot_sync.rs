@@ -25,16 +25,17 @@ use crate::snapshot_client::{
     SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
     CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT,
 };
+#[cfg(test)]
+use crate::snapshots::validate_snapshot_batch_request;
 use crate::snapshots::{
     apply_upload_policy, collector_version, context_curve_derivation_revision,
     finalize_scan_after_policy_with_body_witness, prepare_codex_recovery_diagnostics,
-    snapshot_quarantine_deadline_is_bounded, snapshot_upload_body_witness,
-    validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest, SnapshotItem,
-    SnapshotQuarantineDisposition, SnapshotQuarantineRecord, SnapshotQuarantineWitness,
-    SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy, SourceScanResult,
-    UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
-    MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
-    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    snapshot_quarantine_deadline_is_bounded, snapshot_upload_body_witness, ScanIndex,
+    SnapshotBatchRequest, SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
+    SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
+    SourceScanResult, UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION,
+    MAX_BACKFILL_FILES_PER_SOURCE, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+    SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -7666,7 +7667,10 @@ fn finish_sync_source(
             native_comparison_lease.as_ref(),
             Some((&daemon.transcript_cache, &committed_index)),
             Some(&upload_progress.accepted_identity_buckets),
-            Some(&reserve_cache_bytes),
+            crate::snapshots::claude_request_identity::WireBudget {
+                max_snapshot_item_bytes: activity_hint.max_snapshot_item_bytes,
+                reservation: Some(&reserve_cache_bytes),
+            },
         );
         let (disposition, census_withheld, stats) = match applied {
             Ok(applied) => applied,
@@ -8119,7 +8123,14 @@ fn finish_sync_source(
                     upload_policy,
                     client_report: crate::client_report::ClientReport::empty(),
                 };
-                if let Err(reason) = validate_snapshot_batch_request(&request) {
+                if let Err(reason) =
+                    crate::snapshots::validate_snapshot_batch_request_with_item_limit(
+                        &request,
+                        crate::snapshots::claude_request_identity::effective_item_cap(
+                            activity_hint.max_snapshot_item_bytes,
+                        ),
+                    )
+                {
                     return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
                         reason,
                     }));
@@ -8224,7 +8235,14 @@ fn finish_sync_source(
                         }),
                     "legacy reconciliation must stay isolated at a batch boundary"
                 );
-                if let Err(reason) = validate_snapshot_batch_request(&request) {
+                if let Err(reason) =
+                    crate::snapshots::validate_snapshot_batch_request_with_item_limit(
+                        &request,
+                        crate::snapshots::claude_request_identity::effective_item_cap(
+                            activity_hint.max_snapshot_item_bytes,
+                        ),
+                    )
+                {
                     return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
                         reason,
                     }));
@@ -9702,7 +9720,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
         None,
         None,
         accepted_identity_buckets,
-        None,
+        Default::default(),
     )
     .expect("evidence fixture has no resource refusal")
 }
@@ -9748,7 +9766,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         lease,
         None,
         None,
-        None,
+        Default::default(),
     )
     .expect("ordinary or logical comparison evidence fixture has no resource refusal")
 }
@@ -9771,7 +9789,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
     retained: Option<(&crate::snapshots::sampled_scan::SharedCache, &ScanIndex)>,
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
-    wire_size_reservation: Option<&dyn Fn(&SnapshotItem) -> usize>,
+    wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
 ) -> std::result::Result<
     (
         crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -10146,7 +10164,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .with_status_coverage(crate::claude_status_coverage::snapshot())
         .with_native_originals(&originals)
         .with_accepted_buckets(accepted_identity_buckets)
-        .with_wire_size_reservation(wire_size_reservation)
+        .with_wire_budget(wire_budget)
     });
     if !full_rearm_evidence_complete {
         index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);

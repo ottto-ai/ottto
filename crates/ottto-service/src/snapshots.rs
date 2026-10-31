@@ -15747,6 +15747,13 @@ impl UsageTotals {
 }
 
 pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result<(), String> {
+    validate_snapshot_batch_request_with_item_limit(request, MAX_SNAPSHOT_ITEM_WIRE_BYTES)
+}
+
+pub(crate) fn validate_snapshot_batch_request_with_item_limit(
+    request: &SnapshotBatchRequest,
+    item_limit: usize,
+) -> Result<(), String> {
     if request.schema_version != SNAPSHOT_SCHEMA_VERSION {
         return Err(format!(
             "schema_version {} does not match daemon SNAPSHOT_SCHEMA_VERSION {}",
@@ -15758,6 +15765,11 @@ pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result
     }
     let source = snapshot_source_from_api_slug(&request.source)
         .ok_or_else(|| "unsupported snapshot source".to_string())?;
+    let item_limit = if source == SnapshotSource::ClaudeCode {
+        item_limit
+    } else {
+        MAX_SNAPSHOT_ITEM_WIRE_BYTES
+    };
     for (index, item) in request.snapshots.iter().enumerate() {
         validate_snapshot_item(index, item)?;
         let component_hashes = snapshot_semantic_component_hashes(source, item);
@@ -15790,15 +15802,17 @@ pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result
         item_without_curve.context_curve = None;
         let item_without_curve_size =
             snapshot_item_wire_size(source, &item_without_curve, request.upload_policy);
-        if !snapshot_item_wire_size_is_allowed(
-            item_size,
-            item_without_curve_size,
-            item.context_curve
-                .as_ref()
-                .map(|curve| curve.coverage.as_str()),
-        ) {
+        if !(source == SnapshotSource::ClaudeCode && item_size <= item_limit)
+            && !snapshot_item_wire_size_is_allowed(
+                item_size,
+                item_without_curve_size,
+                item.context_curve
+                    .as_ref()
+                    .map(|curve| curve.coverage.as_str()),
+            )
+        {
             return Err(format!(
-                "snapshot[{index}] wire body is {item_size} bytes; maximum is {MAX_SNAPSHOT_ITEM_WIRE_BYTES} (or {MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES} only for an explicit payload_budget_exceeded clear whose ordinary item fits)"
+                "snapshot[{index}] wire body is {item_size} bytes; maximum is {item_limit} (or {MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES} only for an explicit payload_budget_exceeded clear whose ordinary item fits)"
             ));
         }
     }
