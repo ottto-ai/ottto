@@ -6,16 +6,17 @@
 //! - Q3: an invalid family with no stored evidence whose every member is the
 //!   exact revision its census record was parsed from in that family's window,
 //!   with an ACKed head, behind a closed fence, is kept beside the carry: not
-//!   re-read, credits nothing, stays invalid. A changed member or an open fence
-//!   ends the keep at the next start.
+//!   re-read, credits nothing, stays invalid. A changed member, an open fence,
+//!   or pending occurrence-cap room after the start's clears re-arms it.
 //! - Sticky admission: an unfinished retry admission no longer forces the
-//!   batch path; the whole carry is tried first and, when it fits, replaces
-//!   the admission (every uncarried stale family is re-armed as on main).
+//!   batch path; the whole carry is tried first and, when it fits, settles the
+//!   admission's root walk (every uncarried stale family is re-armed as on
+//!   main). Unoffered due service keeps the admission until it is served.
 //! - Q5: a complete census whose stored evidence is all from its own window,
 //!   or empty/invalid, under the recorded contract clears the latch before the
 //!   latch's full re-arm.
-//! - GUARD: that completion retires no invalid or evidence-free pending; it
-//!   stays owed until a valid proof.
+//! - GUARD: that completion retires only families with a completed family
+//!   proof; every other indexed family's pending stays owed.
 use super::*;
 
 pub(super) const NAME: &str = "claude_settled_contract_carry_enabled";
@@ -120,6 +121,53 @@ pub(super) fn kept_invalid_roots(
     (roots, files)
 }
 
+/// Lead B Q1: the pending occurrence cap (the accumulation's own count and
+/// bound) has room for another occurrence.
+pub(super) fn occurrence_cap_has_room(index: &ScanIndex) -> bool {
+    let retained = index
+        .claude_usage_family_pending
+        .values()
+        .flat_map(|pending| pending.member_occurrences.values())
+        .map(BTreeMap::len)
+        .fold(0_usize, usize::saturating_add);
+    claude_pending_occurrence_count_after_replace(
+        retained,
+        0,
+        1,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+    )
+    .is_some()
+}
+
+/// Rev F2: the admission still owes due paths its existing selector has not
+/// offered (the same predicate `claude_retry_queue_due_families` serves).
+pub(super) fn due_unoffered(
+    index: &ScanIndex,
+    state: &ClaudeRetryAdmission,
+    collected_at: &str,
+) -> bool {
+    let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
+    index
+        .files
+        .keys()
+        .any(|key| claude_retry_path_due(state, &index.claude_usage_authority_quarantine, key, now))
+}
+
+/// The whole carry covered every root: only the due cursor stays owed. It
+/// completes when that service finishes and the next start then drops it.
+pub(super) fn due_only(state: &ClaudeRetryAdmission) -> ClaudeRetryAdmission {
+    ClaudeRetryAdmission {
+        after_root: Some(state.upper_root.clone()),
+        roots_complete: true,
+        complete: false,
+        progressed: false,
+        oversized_root: None,
+        oversized_after_path: None,
+        storage_deferred: false,
+        ..state.clone()
+    }
+}
+
 /// Q5: every stored evidence set is from this census window, or there is none.
 pub(super) fn evidence_from_window(index: &ScanIndex, census_window_end: &str) -> bool {
     index.claude_usage_family_pending.values().all(|pending| {
@@ -127,14 +175,15 @@ pub(super) fn evidence_from_window(index: &ScanIndex, census_window_end: &str) -
     })
 }
 
-/// GUARD: an indexed family whose pending is invalid or evidence-free stays
-/// owed at a complete census; only families that may hold proof retire.
+/// GUARD: an indexed family this census did not prove stays owed; only a
+/// completed family proof retires pending.
 pub(super) fn owed_at_completion(
     root_session_id: &str,
     pending: &ClaudeUsageFamilyPending,
+    proven: bool,
     indexed_claude_family_ids: &BTreeSet<String>,
 ) -> bool {
-    (pending.invalid || evidence_free(pending))
+    !proven
         && (indexed_claude_family_ids.contains(root_session_id)
             || pending
                 .member_request_id_hashes

@@ -46,9 +46,10 @@ fn settled_contract_admission_vetoes_health(index: &ScanIndex) -> bool {
 }
 
 /// [regress] RF1 B1 deadlock: latch -> admission -> unhealthy -> no census.
-/// [off=main] OFF keeps the unfinished admission (health vetoed) and re-reads
-/// the invalid family; ON keeps that family unread and uncredited, carries the
-/// rest whole and leaves no admission, so the walk can retire healthy.
+/// Main keeps the unfinished admission (health vetoed) and re-reads the
+/// invalid family; ON keeps that family unread and uncredited, carries the
+/// rest whole and drops the admission (no unoffered due work), so the walk can
+/// retire healthy.
 #[test]
 fn settled_contract_carry_breaks_latched_admission_deadlock() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -88,18 +89,26 @@ fn settled_contract_carry_breaks_latched_admission_deadlock() {
         .is_empty());
 }
 
-/// [money] GUARD: a complete census retires no cap-invalid or evidence-free
-/// pending and proves nothing for it; a family with stored evidence retires as
-/// on main. [off=main] OFF retires all three.
+/// [money] GUARD: a complete census retires only a completed family proof.
+/// Cap-invalid, evidence-free, older-window and partially observed pending
+/// (one member changed mid-walk: valid, current-window, not every member)
+/// stays owed and credits nothing; main retires all of them.
 #[test]
 fn settled_contract_completion_keeps_invalid_and_evidence_free_pending_owed() {
     const INVALID: &str = "e5555555-5555-4555-8555-555555555555";
     const EMPTY: &str = "f6666666-6666-4666-8666-666666666666";
+    const PARTIAL: &str = "d4444444-4444-4444-8444-444444444444";
     for on in [false, true] {
         let _on = on.then(settled_contract_carry::SettledContractCarryForTest::enabled);
         let mut index = carry_index();
         carry_family(&mut index, INVALID, &[None], true);
         carry_family(&mut index, EMPTY, &[None], true);
+        carry_family(&mut index, PARTIAL, &[None, Some(CARRY_AGENT)], true);
+        let pending = index.claude_usage_family_pending.get_mut(PARTIAL).unwrap();
+        let changed = carry_member(PARTIAL, Some(CARRY_AGENT));
+        pending.census_window_end = CARRY_RETRY.to_string();
+        pending.member_request_id_hashes.remove(&changed);
+        pending.member_occurrences.remove(&changed);
         let pending = index.claude_usage_family_pending.get_mut(INVALID).unwrap();
         pending.member_request_id_hashes.clear();
         pending.member_occurrences.clear();
@@ -122,17 +131,20 @@ fn settled_contract_completion_keeps_invalid_and_evidence_free_pending_owed() {
             MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
             None,
         );
-        assert_eq!(index.claude_usage_family_pending.contains_key(INVALID), on);
-        assert_eq!(index.claude_usage_family_pending.contains_key(EMPTY), on);
-        assert!(
-            !index.claude_usage_family_pending.contains_key(CARRY_ROOT),
-            "stored evidence retires as on main"
-        );
+        for root in [INVALID, EMPTY, PARTIAL, CARRY_ROOT, CARRY_UNWITNESSED] {
+            assert_eq!(
+                index.claude_usage_family_pending.contains_key(root),
+                on,
+                "only a completed family proof retires"
+            );
+        }
         if on {
             let invalid = &index.claude_usage_family_pending[INVALID];
             assert!(invalid.invalid && invalid.census_window_end == CARRY_FAILED);
             assert_eq!(index.claude_usage_family_pending[EMPTY].census_window_end, CARRY_FAILED);
-            for root in [INVALID, EMPTY] {
+            let partial = &index.claude_usage_family_pending[PARTIAL];
+            assert!(!partial.invalid && partial.member_occurrences.len() == 1);
+            for root in [INVALID, EMPTY, PARTIAL] {
                 assert_eq!(
                     index.claude_usage_family_witnesses.get(root),
                     witnesses.get(root),
