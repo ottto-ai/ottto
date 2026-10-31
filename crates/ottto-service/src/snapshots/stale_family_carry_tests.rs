@@ -4857,3 +4857,71 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         &BTreeSet::new()
     ));
 }
+
+/// [regress] RF1 round 2 admission drop (B1 deadlock: off terminal-off any
+/// persisted admission vetoes traversal health). Main keeps the admission;
+/// evidence owed ON drops the unfinished one at the next start, creates no
+/// batch admission, counts the drop, and its stale members keep their
+/// fingerprints (owed, never credited by the dropped carry).
+#[test]
+fn owed_evidence_start_drops_an_unfinished_admission() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let start = |on: bool| {
+        let _owed = on.then(evidence_owed::EvidenceOwedForTest::on);
+        let mut fixture = contract_debt_fixture(3);
+        let invalid = fixture.roots[2].clone();
+        let pending = fixture
+            .index
+            .claude_usage_family_pending
+            .get_mut(&invalid)
+            .unwrap();
+        pending.member_request_id_hashes.clear();
+        pending.member_occurrences.clear();
+        pending.invalid = true;
+        let stale = fixture.roots.iter().cloned().collect();
+        let admission = claude_retry_admission_start(&fixture.index, &stale, CARRY_RETRY, None);
+        assert!(!admission.complete);
+        fixture.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+            context_fingerprint: fixture
+                .index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .context_fingerprint
+                .clone(),
+            process: claude_full_rearm_process(),
+            full_rearm_window: false,
+            admission: Some(admission),
+        });
+        let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        (row, fixture)
+    };
+    let admission = |fixture: &ScopedRetryFixture| {
+        fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.admission.clone())
+    };
+    let (off, off_fixture) = start(false);
+    assert!(admission(&off_fixture).is_some(), "main keeps an admission");
+    assert!(off.get("admissions_dropped").is_none());
+
+    let (on, on_fixture) = start(true);
+    assert!(admission(&on_fixture).is_none(), "ON leaves no admission");
+    assert_eq!(on["admissions_dropped"], 1);
+    assert!(on.get("due_retained").is_none());
+    let cleared = on_fixture
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            on_fixture.index.files[&local_index_key(&candidate.path)]
+                .source_file_fingerprint
+                .is_empty()
+        })
+        .count();
+    assert_eq!(cleared, 0, "re-armed members stay owed with their fingerprint");
+}

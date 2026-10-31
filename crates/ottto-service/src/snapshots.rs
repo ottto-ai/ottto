@@ -43040,7 +43040,11 @@ fn ensure_bounded_traversal(
                 Err(refusal) if owed_route => {
                     // No new batch admission: every stale root returns to the
                     // re-arm below and the resolver; carry credits nothing.
-                    stale_carry_rejection_counts.reject(refusal.into(), stale_pending_roots.len());
+                    let accounted = stale_carry_rejection_counts.rejected() as usize;
+                    stale_carry_rejection_counts.reject(
+                        refusal.into(),
+                        stale_pending_roots.len().saturating_sub(accounted),
+                    );
                     ClaudeStaleFamilyCarry::default()
                 }
                 Err(refusal) => {
