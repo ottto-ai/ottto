@@ -58,6 +58,8 @@ pub(super) fn temp_key(name: &str) -> Option<Digest32> {
     name_key(&format!("{record}.rec")).map(|(key, _)| key)
 }
 
+pub(super) type LabelNamePage = (BTreeMap<Digest32, Vec<String>>, BTreeSet<Digest32>);
+
 impl DurableTailStore {
     pub(super) fn immutable_path(&self, name: &str, key: &Digest32) -> io::Result<PathBuf> {
         if self.source != DurableSource::ClaudeCode
@@ -206,7 +208,7 @@ impl DurableTailStore {
     pub(super) fn immutable_label_names(
         &mut self,
         keys: &BTreeSet<Digest32>,
-    ) -> io::Result<(BTreeMap<Digest32, Vec<String>>, BTreeSet<Digest32>)> {
+    ) -> io::Result<LabelNamePage> {
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {

@@ -52999,6 +52999,7 @@ impl ScanIndex {
             v2: previous.v2.as_ref().map(|state| {
                 Box::new(state_v2::IndexState {
                     persistence_v2: state.persistence_v2.clone(),
+                    resume_checkpoints: state.resume_checkpoints.clone(),
                     growth_claim_context: state.growth_claim_context.clone(),
                     growth_retention: sampled_audit::growth_subset(self, previous, &safe_keys),
                     growth_checked: Default::default(),

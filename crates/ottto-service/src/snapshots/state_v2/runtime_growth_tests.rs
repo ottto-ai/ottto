@@ -581,7 +581,7 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
             claude_request_census::record_claude_request_census(
                 &mut index,
                 ClaudeRequestCensusParse {
-                    held_index_keys: &BTreeSet::new(),
+                    held_index_keys: &std::collections::BTreeSet::new(),
                     path: &f.source,
                     index_key: &f.key,
                     source_file_fingerprint: if case == "no_record" {

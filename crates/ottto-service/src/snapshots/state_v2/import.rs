@@ -209,7 +209,7 @@ impl ClaudeMapper {
             tx.commit(index.generation, generation) == DurableCommitOutcome::Committed(generation),
             Pause::Mismatch
         );
-        if let Some(hooks) = hooks.as_deref_mut() {
+        if let Some(hooks) = hooks {
             cx.post_commit(&DurableCommitOutcome::Committed(generation), hooks)?;
         }
         // A COMMIT advanced control.generation; the proof must compare the
@@ -848,6 +848,7 @@ fn verify_normalized(
 ) -> Result<KindCx> {
     verify_normalized_at(tx, index, original, binding, index.generation)
 }
+#[cfg(test)]
 fn verify_normalized_at(
     tx: &mut dyn Transaction,
     index: &ScanIndex,

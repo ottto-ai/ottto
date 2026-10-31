@@ -87,6 +87,8 @@ impl SharedCache {
                 let retained = cache.peek(key)?;
                 let chain = cache.custody(key)?.chain()?;
                 if retained.state.source() != source
+                    || chain.source() != source
+                    || chain.key() != key
                     || selected.get(key).map(String::as_str)
                         != Some(entry.source_file_fingerprint.as_str())
                     || entry.source_file_fingerprint.is_empty()
