@@ -18,28 +18,19 @@ pub(crate) use crate::durable_tail_store::{
 
 /// Borrowed PRE-finalization native state; never a copy of the graph.
 pub(in crate::snapshots) struct LiveFinishView<'a> {
-    pub(in crate::snapshots) accumulator: &'a SnapshotAccumulator,
-    pub(in crate::snapshots) report: &'a JsonlReadReport,
-    pub(in crate::snapshots) recognized_usage_drop_count: usize,
-    pub(in crate::snapshots) positive_recognized_usage_count: usize,
-    pub(in crate::snapshots) positive_usage_evidence: bool,
+    native: PreFinalization<'a>,
     pub(in crate::snapshots) checkpoint: &'a Checkpoint,
     pub(in crate::snapshots) chain: &'a AcquiredChain,
     pub(in crate::snapshots) line_cap: u64,
 }
 impl<'a> LiveFinishView<'a> {
-    #[allow(clippy::too_many_arguments)] // Exact G1 view constructor (skeleton).
     pub(in crate::snapshots) fn new(
-        accumulator: &'a SnapshotAccumulator,
-        report: &'a JsonlReadReport,
-        recognized_usage_drop_count: usize,
-        positive_recognized_usage_count: usize,
-        positive_usage_evidence: bool,
+        native: PreFinalization<'a>,
         checkpoint: &'a Checkpoint,
         chain: &'a AcquiredChain,
         line_cap: u64,
     ) -> Result<Self, NotPersisted> {
-        if accumulator.source != chain.source() || line_cap == 0 {
+        if native.accumulator.source != chain.source() || line_cap == 0 {
             return Err(NotPersisted::Layout);
         }
         if checkpoint.scope() != chain.file_scope() {
@@ -49,11 +40,7 @@ impl<'a> LiveFinishView<'a> {
             return Err(NotPersisted::Unsealed);
         }
         Ok(Self {
-            accumulator,
-            report,
-            recognized_usage_drop_count,
-            positive_recognized_usage_count,
-            positive_usage_evidence,
+            native,
             checkpoint,
             chain,
             line_cap,
@@ -647,12 +634,12 @@ impl SharedCache {
         // Count first, without allocating the stream buffer; the complete
         // header+trailer record bound is applied before any staging.
         let plan = match codec::BodyEncoding::new(
-            view.accumulator,
-            view.report,
+            view.native.accumulator,
+            view.native.report,
             (
-                view.recognized_usage_drop_count,
-                view.positive_recognized_usage_count,
-                view.positive_usage_evidence,
+                view.native.recognized_usage_drop_count,
+                view.native.positive_recognized_usage_count,
+                view.native.positive_usage_evidence,
             ),
             view.line_cap,
             self.skill_labels_enabled(chain.source()),
@@ -724,8 +711,8 @@ impl SharedCache {
                 Ok(false) => return PrepareOutcome::Degraded(Degraded::Paused),
                 Err(_) => return PrepareOutcome::Degraded(Degraded::Refused),
             }
-            if (!view.accumulator.activity_skills.is_empty()
-                || !view.accumulator.provider_skills.is_empty())
+            if (!view.native.accumulator.activity_skills.is_empty()
+                || !view.native.accumulator.provider_skills.is_empty())
                 && slot
                     .store
                     .mark_private_labels(writer, chain.binding().key)

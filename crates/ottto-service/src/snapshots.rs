@@ -36738,13 +36738,15 @@ impl OwnedJsonlParser {
         if let Some(pre) = pre {
             let traces = accumulator.codex_turn_traces.take();
             let parents = accumulator.codex_parent_ownership_ledgers.take();
-            pre(PreFinalization {
-                accumulator: &accumulator,
-                report: &report,
-                recognized_usage_drop_count: reduction_drop_count,
-                positive_recognized_usage_count,
-                positive_usage_evidence,
-            });
+            pre(PreFinalization::new(
+                &accumulator,
+                &report,
+                (
+                    reduction_drop_count,
+                    positive_recognized_usage_count,
+                    positive_usage_evidence,
+                ),
+            ));
             accumulator.codex_turn_traces = traces;
             accumulator.codex_parent_ownership_ledgers = parents;
         }
@@ -36997,6 +36999,22 @@ struct PreFinalization<'a> {
     positive_usage_evidence: bool,
 }
 
+impl<'a> PreFinalization<'a> {
+    fn new(
+        accumulator: &'a SnapshotAccumulator,
+        report: &'a JsonlReadReport,
+        scalars: (usize, usize, bool),
+    ) -> Self {
+        Self {
+            accumulator,
+            report,
+            recognized_usage_drop_count: scalars.0,
+            positive_recognized_usage_count: scalars.1,
+            positive_usage_evidence: scalars.2,
+        }
+    }
+}
+
 /// Stage one durable record from the acquisition's own chain and lease.
 /// `None`: no acquired chain, so this completion is not on the M3 route and
 /// keeps the legacy behavior. The retained reduction, when present, is the
@@ -37056,29 +37074,12 @@ where
     let Some(lease) = active.as_mut() else {
         return Some(PrepareOutcome::NotPersisted(NotPersisted::ActiveBound));
     };
-    let (accumulator, report, (drops, positives, evidence)) = match reduction {
-        Some(reduction) => reduction.finish_view(),
-        None => (
-            live.accumulator,
-            live.report,
-            (
-                live.recognized_usage_drop_count,
-                live.positive_recognized_usage_count,
-                live.positive_usage_evidence,
-            ),
-        ),
-    };
+    let live = reduction.map_or(live, |reduction| {
+        let (accumulator, report, scalars) = reduction.finish_view();
+        PreFinalization::new(accumulator, report, scalars)
+    });
     Some(
-        match LiveFinishView::new(
-            accumulator,
-            report,
-            drops,
-            positives,
-            evidence,
-            checkpoint,
-            chain,
-            jsonl_line_cap() as u64,
-        ) {
+        match LiveFinishView::new(live, checkpoint, chain, jsonl_line_cap() as u64) {
             Ok(view) => prepare(lease, view),
             Err(refusal) => PrepareOutcome::NotPersisted(refusal),
         },
