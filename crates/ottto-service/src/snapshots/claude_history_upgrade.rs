@@ -577,7 +577,9 @@ pub(crate) struct HistoryPage {
     birth_page_begun: bool,
 }
 
-crate::heap_layout_bound::fields!(HistoryPage; read_files, files, bytes, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index, birth_page_begun);
+// `read_files` is an inline ON counter that owns no heap; skipping it keeps
+// OFF's frame walk at main's visit count.
+crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index, birth_page_begun; shared read_files);
 
 impl HistoryPage {
     /// A page whose twin groups candidate selection already built.

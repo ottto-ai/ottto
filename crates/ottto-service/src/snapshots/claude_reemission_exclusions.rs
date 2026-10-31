@@ -144,7 +144,9 @@ pub(crate) struct ReemissionExclusions {
     walked_roots: BTreeMap<String, MemberDirStamp>,
 }
 
-crate::heap_layout_bound::fields!(ReemissionExclusions; digests, held_context_digest, state, missing_cause, walked_roots);
+// `held_context_digest` is inline and owns no heap: its bytes are paid by the
+// containing slot, so the walk skips it and OFF keeps main's 4096-visit count.
+crate::heap_layout_bound::fields!(ReemissionExclusions; digests, state, missing_cause, walked_roots; shared held_context_digest);
 
 impl ReemissionExclusions {
     pub(crate) fn path(support_dir: &Path) -> PathBuf {
