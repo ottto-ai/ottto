@@ -54,7 +54,7 @@ pub(crate) const E2_GROUPING: &str =
 /// otherwise (records written by permit-era builds without a permit).
 #[cfg(not(test))]
 pub(crate) const fn cycle_contract(captured: bool) -> &'static str {
-    compiled_cycle_contract(captured, super::claude_request_money::e2::GATE)
+    compiled_cycle_contract(captured, true)
 }
 
 // Durable grouping version shares the existing identity-contract rearm. The
@@ -3286,9 +3286,6 @@ pub(crate) fn unhealthy_cleared_account(item: &SnapshotItem) -> Option<&str> {
 /// Read retained creator bindings using the same machine/session key as the
 /// account owner. No transcript read, new index field, or current-login guess.
 pub(crate) fn retain_root_accounts(items: &mut [SnapshotItem], index: &ScanIndex, machine: &str) {
-    if !super::claude_request_money::e2::enabled() {
-        return;
-    }
     for item in items {
         if item
             .claude_money
@@ -4597,8 +4594,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 MarkerVerdict::Trusted(org) => org,
                 _ => return,
             },
-            None if super::claude_request_money::e2::enabled()
-                && keeps_markerless_account(item)
+            None if keeps_markerless_account(item)
                 && super::exact_session_account_hash(item).as_deref() == Some(account) =>
             {
                 let Some(org) = owner
@@ -4827,9 +4823,7 @@ pub(crate) struct RequestOwnedOriginals(
 
 pub(crate) fn capture_request_owned_originals(items: &[SnapshotItem]) -> RequestOwnedOriginals {
     let mut originals = RequestOwnedOriginals::default();
-    if !super::claude_request_money::e2::enabled() {
-        return originals;
-    }
+
     for item in items {
         if item.claude_money.is_none()
             || !item
@@ -4868,9 +4862,7 @@ pub(crate) fn stage_request_owned_activity(
     originals: &RequestOwnedOriginals,
 ) -> RequestOwnedActivity {
     let mut page = RequestOwnedActivity::default();
-    if !super::claude_request_money::e2::enabled() {
-        return page;
-    }
+
     for item in items {
         if item.claude_money.is_none()
             || !item
@@ -5054,9 +5046,7 @@ fn tag_item(
     let retained = evidence
         .accepted_buckets
         .is_some_and(AcceptedBuckets::retained_enabled);
-    if super::claude_request_money::e2::enabled()
-        && super::claude_history_upgrade::is_request_owned_literal(item)
-    {
+    if super::claude_history_upgrade::is_request_owned_literal(item) {
         if item
             .model_usage
             .iter()

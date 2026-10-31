@@ -125,6 +125,9 @@ struct C1bWindow {
     retry_pending: bool,
     proven: bool,
     start: Option<C1bStart>,
+    /// Sessions whose body this window emitted as a request-owned (E2)
+    /// literal; a listed family's bodies stay on ordinary money.
+    request_owned: BTreeSet<String>,
 }
 
 /// RetryPending, red, census complete, census invalid, fence before and
@@ -219,6 +222,15 @@ fn c1b_generation(fixture: &RearmFixture, arm: &str, (hour, minute): (u32, usize
                     .claude_usage_family_witness_digest_for_test(REARM_ROOT)
                     .is_some(),
                 start,
+                request_owned: pages
+                    .iter()
+                    .flat_map(|page| &page.scan.snapshots)
+                    .filter(|item| {
+                        item.usage_accounting_contract.as_deref()
+                            == Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT)
+                    })
+                    .map(|item| item.source_session_id.clone())
+                    .collect(),
             };
             writeln!(
                 std::io::stderr().lock(),
@@ -463,36 +475,6 @@ fn c1b_invalid_pending_keeps_base_rearm() {
     assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
 }
 
-/// SI I3 and Condition X(a): after the red window the root's API rows gain
-/// account evidence, so the sidecar-inclusive selection fingerprint of every
-/// member changes (M1). The carry keeps the committed revisions, the walk
-/// re-reads every member exactly as BASE's re-arm does, and every window's
-/// liveness equals BASE.
-#[test]
-#[serial(source_manifests)]
-fn c1b_sidecar_changed_family_is_reread_like_base() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    if !c1a_layout_supported("c1b_sidecar_changed") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fix = c1b_red_chain("c1b-sidecar-changed", "fix", c1a_late_account_row);
-    let base = c1b_base_red_chain("c1b-sidecar-changed-base", c1a_late_account_row);
-    let family = rearm_family_sessions().len();
-    assert_eq!(
-        fix.windows[2].family_reads, family,
-        "M1 re-selects every member"
-    );
-    assert_eq!(base.windows[2].family_reads, family);
-    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
-    for (window, base_window) in fix.windows.iter().zip(&base.windows).skip(3) {
-        assert_eq!(window.family_reads, base_window.family_reads);
-    }
-    assert_eq!(fix.heads_after, base.heads_after);
-    assert_eq!(fix.witness_after, base.witness_after);
-}
-
 /// SOURCE B9: after the red window one subagent's transcript gains a request
 /// without telemetry. The walk re-parses that member at the 08:20 retry
 /// (`SourceChanged` instead of BASE's `Rearmed`), which cancels the family's
@@ -598,17 +580,26 @@ fn c1b_repair_and_gain_recorded_request(fixture: &RearmFixture) {
 
 /// The recoverable member change in a fix arm and a BASE arm on pages of
 /// `page_files` files, as (fix, BASE, cancellations, terminal holds) with the
-/// fix arm's counter deltas.
-fn c1b_recoverable_change_arms(
+/// fix arm's counter deltas. With `listed`, both arms list the family (a real
+/// list the retry's pages load) after the unlisted closing and red windows, so
+/// the member change is read on ordinary money.
+fn c1b_recoverable_change_arms_listed(
     case: &'static str,
     page_files: usize,
+    listed: bool,
 ) -> (C1bRun, C1bRun, usize, usize) {
+    let between = |fixture: &RearmFixture| {
+        c1b_repair_and_gain_recorded_request(fixture);
+        if listed {
+            fixture.list_held(&[REARM_ROOT]);
+        }
+    };
     let cancellations = crate::snapshots::claude_stale_family_carry_cancellations_for_test();
     let holds = crate::snapshots::claude_stale_family_carry_terminal_holds_for_test();
     let fix = c1b_red_chain_with(
         c1b_recorded_request_fixture(case, page_files),
         "fix",
-        c1b_repair_and_gain_recorded_request,
+        between,
     );
     let cancelled =
         crate::snapshots::claude_stale_family_carry_cancellations_for_test() - cancellations;
@@ -618,7 +609,7 @@ fn c1b_recoverable_change_arms(
         c1b_red_chain_with(
             c1b_recorded_request_fixture(case, page_files),
             "base",
-            c1b_repair_and_gain_recorded_request,
+            between,
         )
     };
     (fix, base, cancelled, held)
@@ -634,18 +625,34 @@ fn c1b_recoverable_change_arms(
 #[test]
 #[serial(source_manifests)]
 fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // Terminal-authority hold/rearm policy: E2 literal bodies bypass legacy
+    // demotion (E2 rule 5), so the family is listed (ordinary money) after
+    // the unlisted closing and red windows.
     if !c1a_layout_supported("c1b_terminal_page_member_change") {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
     let (fix, base, cancelled, held) =
-        c1b_recoverable_change_arms("c1b-terminal-page-member-change", 64);
+        c1b_recoverable_change_arms_listed("c1b-terminal-page-member-change", 64, true);
     assert_eq!((cancelled, held), (0, 1), "one hold, no cancel");
     let family = rearm_family_sessions().len();
     let retry = &fix.windows[2];
     let base_retry = &base.windows[2];
+    // The listed retry reads the family on ordinary money; the unlisted
+    // closing window (positive control) emitted request-owned bodies.
+    for (arm, run) in [("fix", &fix), ("base", &base)] {
+        assert!(
+            rearm_family_sessions().is_subset(&run.windows[0].request_owned),
+            "{arm}: unlisted family bodies are request-owned"
+        );
+        assert!(run.windows[2].family_reads > 0, "{arm}");
+        assert!(
+            run.windows[2]
+                .request_owned
+                .is_disjoint(&rearm_family_sessions()),
+            "{arm}: no listed family body is request-owned"
+        );
+    }
     // BASE: the healthy terminal page re-reads and re-proves the family.
     assert!(base_retry.census_complete && !base_retry.red);
     assert_eq!(base_retry.family_reads, family);
@@ -737,6 +744,11 @@ struct C1bHeldRun {
 /// The red chain with the unrelated terminal session made a RetryPending
 /// authority family before the red window: its new revision is read there and
 /// held. `before_retry` runs between the red window and its retry.
+///
+/// A request-owned (E2) body settles authority whatever the proof's health
+/// (E2 rule 5), so the held family is listed after the unlisted closing
+/// window: its later revisions are read on ordinary money and the legacy
+/// authority hold applies, as for a protected family in production.
 fn c1b_held_retry_chain(
     case: &'static str,
     arm: &str,
@@ -746,6 +758,11 @@ fn c1b_held_retry_chain(
     let closing = c1b_generation(&fixture, arm, (8, 0));
     assert!(closing.census_complete, "{arm}: the first census completes");
     assert!(closing.fence_after && closing.proven, "{arm}");
+    assert!(
+        closing.request_owned.contains(REARM_TERMINAL),
+        "{arm}: positive control, the unlisted body is request-owned"
+    );
+    fixture.list_held(&[REARM_TERMINAL]);
     let mut index = ScanIndex::load(&fixture.index_path).unwrap();
     let head_before = c1b_terminal_head(&index);
     index.insert_retry_pending_claude_authority_for_test(REARM_TERMINAL);
@@ -757,6 +774,14 @@ fn c1b_held_retry_chain(
     );
     let red = c1b_generation(&fixture, arm, (8, 10));
     assert!(red.red && !red.census_complete, "{arm}: the window is red");
+    assert!(
+        red.parsed.contains(REARM_TERMINAL),
+        "{arm}: the held family's new revision is read"
+    );
+    assert!(
+        !red.request_owned.contains(REARM_TERMINAL),
+        "{arm}: the listed family is read on ordinary money"
+    );
     let saved = ScanIndex::load(&fixture.index_path).unwrap();
     let marked_after_red = saved.bounded_sweep_had_unsettled_upload();
     let record_after_red = saved.claude_authority_record_for_test(REARM_TERMINAL);
@@ -785,7 +810,7 @@ fn c1b_held_retry_chain(
 #[serial(source_manifests)]
 fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_one() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("c1b_retry_pending_beside_witnessed") {
         return;
     }
@@ -849,7 +874,7 @@ fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_o
 #[serial(source_manifests)]
 fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("c1b_retry_pending_existing_mark") {
         return;
     }
@@ -915,7 +940,7 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
 #[serial(source_manifests)]
 fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("c1b_held_mark_full_rearm_window") {
         return;
     }
@@ -1023,8 +1048,9 @@ fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry(
 #[test]
 #[serial(source_manifests)]
 fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // Terminal-authority hold/rearm policy: E2 literal bodies bypass legacy
+    // demotion (E2 rule 5), so the held family is listed (ordinary money)
+    // after the unlisted closing window.
     if !c1a_layout_supported("c1a_latch_retry_pending_debt") {
         return;
     }
@@ -1038,6 +1064,7 @@ fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
         saved.remove("claude_request_identity_contract");
         saved.remove("claude_request_identity_contract_changed");
     });
+    fixture.list_held(&[REARM_TERMINAL]);
     let mut index = ScanIndex::load(&fixture.index_path).unwrap();
     index.insert_retry_pending_claude_authority_for_test(REARM_TERMINAL);
     index.save(&fixture.index_path).unwrap();
@@ -1162,46 +1189,14 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
     assert_eq!(fix.witness_after, base.witness_after);
 }
 
-/// Control, SI I3: a late API row gives the root's requests account evidence
-/// before the clean follow-up, so the sidecar-inclusive selection of every
-/// member changes (M1) and the family is re-read exactly as BASE's re-arm
-/// does. Every window's liveness equals BASE.
-#[test]
-#[serial(source_manifests)]
-fn fix2_late_api_row_rereads_the_family_like_base() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    if !c1a_layout_supported("fix2_late_api_row") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let between = |fixture: &RearmFixture| {
-        fix2_clean_followup(fixture);
-        c1a_late_account_row(fixture);
-    };
-    let fix = c1b_red_chain("fix2-late-api-row", "fix", between);
-    let base = c1b_base_red_chain("fix2-late-api-row-base", between);
-    let family = rearm_family_sessions().len();
-    assert_eq!(
-        fix.windows[2].family_reads, family,
-        "M1 re-selects every member"
-    );
-    assert_eq!(base.windows[2].family_reads, family);
-    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
-    for (window, base_window) in fix.windows.iter().zip(&base.windows).skip(3) {
-        assert_eq!(window.family_reads, base_window.family_reads);
-    }
-    assert_eq!(fix.heads_after, base.heads_after);
-    assert_eq!(fix.witness_after, base.witness_after);
-}
-
 /// Exercise Condition X through the widened carry, using actual sidecars,
 /// bounded scanner, proof fold, uploads, ACKs and save/reload between pages.
 #[test]
 #[serial(source_manifests)]
 fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
-    // Contract-5 tagging oracle; markerless single-account E2 bodies keep the D1 wire shape.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // Contract-5 tagging oracle on ordinary money: a markerless single-account
+    // request-owned (E2) body keeps the D1 wire shape without row tags, so the
+    // family is listed before the late identity rows arrive.
     use sha2::{Digest, Sha256};
     if !c1a_layout_supported("scoped_retry_late_identity") {
         return;
@@ -1210,6 +1205,10 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     let mut fixture = c1a_fixture("scoped-retry-late-identity");
     let closing = c1b_generation(&fixture, "scoped", (8, 0));
     assert!(closing.census_complete && closing.proven && closing.full_rearm);
+    assert!(
+        closing.request_owned.contains(REARM_ROOT),
+        "positive control: the unlisted root body is request-owned"
+    );
     RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
     RearmFixture::append(
         &c1b_terminal_path(&fixture),
@@ -1236,6 +1235,9 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     );
     assert!(retry.red && retry.census_invalid && retry.fence_after);
     unsettled();
+    // The family is listed after the unlisted baseline, so the late rows'
+    // re-selected bodies are built on ordinary money.
+    fixture.list_held(&[REARM_ROOT]);
 
     let login = "a".repeat(64);
     let org = "d".repeat(64);
@@ -1275,7 +1277,8 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     fixture.native_file_limit = 64;
 
     let mut parsed = BTreeSet::new();
-    let mut tagged_root = false;
+    let mut tagged_root = None;
+    let mut late = Vec::new();
     for number in 0..C1B_MAX_PAGES {
         let page = fixture.page(
             &format!("2026-08-02T08:{:02}:00Z", 30 + number),
@@ -1290,24 +1293,67 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
         {
             assert!(page.offered.contains(&item.snapshot_fingerprint));
             assert!(page.uploaded.contains(&item.snapshot_fingerprint));
+            assert_ne!(
+                item.usage_accounting_contract.as_deref(),
+                Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
+                "the listed root is on ordinary money"
+            );
             assert!(!item.request_evidence.is_empty());
             assert!(item.request_evidence.iter().all(|evidence| {
                 evidence.identity_basis == crate::snapshots::claude_request_identity::TELEMETRY
                     && evidence.provider_workspace_hash.as_deref() == Some(org.as_str())
             }));
-            tagged_root = true;
+            tagged_root = Some(item.snapshot_fingerprint.clone());
         }
-        if c1b_traversal_ended(&page.index).0 {
+        let ended = c1b_traversal_ended(&page.index).0;
+        late.push(page);
+        if ended {
             break;
         }
     }
     assert_eq!(
         parsed.intersection(&rearm_family_sessions()).count(),
-        rearm_family_sessions().len()
+        rearm_family_sessions().len(),
+        "M1 re-selects every member"
+    );
+    let root =
+        tagged_root.expect("late identity evidence emits and ACKs the tagged root in this retry");
+    // Transferred from the deleted late-row controls (E2-054
+    // c1a_late_identity_row_reselects_and_tags_skipped_family, E2-055
+    // c1a_late_row_between_windows_equals_base, E2-065
+    // c1b_sidecar_changed_family_is_reread_like_base, E2-071
+    // fix2_late_api_row_rereads_the_family_like_base): the late evidence is
+    // taken at normal cadence behind a closed fence, nothing is left
+    // RetryPending, and the re-emitted root body is the durable accepted head
+    // of a retained family proof (the heads/witness BASE's re-arm reaches).
+    let last = late.last().expect("the late window has a page");
+    assert!(
+        !last.duplicate_census.full_rearm,
+        "normal cadence, not the daily re-read"
+    );
+    assert!(last.duplicate_census.fence_before && last.duplicate_census.fence_after);
+    assert!(
+        late.iter().all(|page| !page
+            .index
+            .claude_authority_record_for_test(REARM_ROOT)
+            .is_some_and(|record| !record.terminal)),
+        "the late evidence leaves no RetryPending hold"
     );
     assert!(
-        tagged_root,
-        "late identity evidence emits and ACKs the tagged root in this retry"
+        last.index.accepted_snapshot_fingerprint_recorded(&root),
+        "durable accepted body"
+    );
+    let heads = RearmFixture::family_heads(&last.index);
+    assert_eq!(
+        heads[REARM_ROOT].as_deref(),
+        Some(root.as_str()),
+        "the re-emitted root is the accepted head"
+    );
+    assert!(
+        last.index
+            .claude_usage_family_witness_digest_for_test(REARM_ROOT)
+            .is_some(),
+        "the family proof is retained"
     );
 }
 
@@ -1318,7 +1364,7 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
 #[serial(source_manifests)]
 fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_family() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !c1a_layout_supported("scoped_retry_mark_and_authority") {
         return;
     }
@@ -1367,9 +1413,9 @@ fn source_latch_generation(
         index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(
             SnapshotSource::ClaudeCode,
         ));
-        index.adopt_effective_upload_body_witness_revision_monotonically();
-        index.load_claude_reemission_exclusions(&fixture.support);
-        crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
+        // The page adopts, loads the real exclusion list and applies the
+        // money rules (`RearmFixture::load_exclusion_list`), in
+        // `finish_sync_source`'s order, on this index.
         index.observe_claude_request_identity_contract(fixture.request_identity);
         let (mut page, rows) = crate::local_resource_diagnostics::capture(|| {
             let fold_diagnostics =
@@ -1408,13 +1454,11 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
         return;
     }
     let _manifests = SourceManifestTestGuard::new();
-    for e2 in [false, true] {
-        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(e2);
-        let contract = if e2 {
-            crate::snapshots::claude_request_identity::E2_GROUPING
-        } else {
-            crate::snapshots::claude_request_identity::COLLECTOR
-        };
+    // Production's only cycle contract: the COLLECTOR (gate-off) arm is
+    // unreachable with the gate retired (`compiled_cycle_contract` always
+    // yields E2_GROUPING), and listing a session is not gate-off.
+    {
+        let contract = crate::snapshots::claude_request_identity::E2_GROUPING;
         crate::snapshots::claude_request_identity::with_cycle_contract_for_test(contract, || {
             for case in ["accepted", "held", "listed"] {
                 for base in [false, true] {
@@ -1451,7 +1495,7 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
                     });
                     latch_contract_generation(&fixture, 10);
                     let accepted = fixture.body_trace.borrow().finalizer_bodies[session].clone();
-                    assert_eq!(accepted["input_tokens"], 10, "{case}/{base}/{e2}");
+                    assert_eq!(accepted["input_tokens"], 10, "{case}/{base}/e2");
                     assert_eq!(accepted["output_tokens"], 10);
                     assert_eq!(accepted["request_count"], 1);
                     c1a_edit_index(&fixture, |saved| {
@@ -1463,7 +1507,7 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
                     let retry = latch_contract_generation(&fixture, 20);
                     let reads = rearm_parsed(&retry).contains(session);
                     if case == "accepted" {
-                        assert_eq!(reads, base, "exact-ACK unchanged {base}/{e2}");
+                        assert_eq!(reads, base, "exact-ACK unchanged {base}/e2");
                         if !base {
                             assert_eq!(
                                 fixture.body_trace.borrow().finalizer_bodies[session],
@@ -1471,7 +1515,7 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
                             );
                         }
                     } else if case == "held" {
-                        assert!(reads, "held keeps today's path {base}/{e2}");
+                        assert!(reads, "held keeps today's path {base}/e2");
                         assert!(retry.iter().all(|page| !page
                             .uploaded
                             .contains(accepted["snapshot_fingerprint"].as_str().unwrap())));
@@ -1507,7 +1551,7 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
                         assert_eq!(body["request_count"], 2);
                         assert_eq!(
                             body, expected,
-                            "grown accepted body equals cold Full {base}/{e2}"
+                            "grown accepted body equals cold Full {base}/e2"
                         );
                     }
                 }
@@ -1527,7 +1571,6 @@ fn source_latch_clear_count(rows: &[serde_json::Value]) -> u64 {
 #[test]
 #[serial(source_manifests)]
 fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("source-t1-started-a-b") {
         return;
     }
@@ -1598,24 +1641,38 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
         fixture.native_file_limit = 2;
         c1a_add_family_request_identity(&fixture);
         {
-            let _a = crate::snapshots::claude_request_money::e2::GateForTest::off();
             crate::snapshots::claude_request_identity::with_cycle_contract_for_test(
                 crate::snapshots::claude_request_identity::COLLECTOR,
                 || {
+                    // Unlisted baseline: every file reaches revision 3 and
+                    // the closing census re-arms them. Then F's and G's
+                    // families are listed, so the re-read builds their
+                    // contract-A bodies on ordinary money (the older daemon's
+                    // state that A -> B migrates from).
                     latch_contract_generation(&fixture, 0);
+                    fixture.list_held(&[REARM_ROOT, REARM_SIBLING]);
                     latch_contract_generation(&fixture, 10);
                 },
             );
         }
         let old_f = fixture.body_trace.borrow().finalizer_bodies[REARM_ROOT].clone();
+        for session in [REARM_ROOT, REARM_SIBLING] {
+            assert_ne!(
+                fixture.body_trace.borrow().finalizer_bodies[session]["usage_accounting_contract"],
+                crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT,
+                "{session}: the listed contract-A body is ordinary"
+            );
+        }
         // Keep the migration traversal red so G's accepted pending remains
         // available for the next start; only this unrelated file is repaired.
         RearmFixture::append(&c1b_terminal_path(&fixture), "not-json\n");
-        let _b = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+
         crate::snapshots::claude_request_identity::with_cycle_contract_for_test(
             crate::snapshots::claude_request_identity::E2_GROUPING,
             || {
                 fixture.local_holds.insert(REARM_ROOT.to_owned());
+                // B runs unlisted: an installed, empty list.
+                fixture.list_held(&[]);
                 // #825 (card G (b)): A -> B itself re-owes nothing now. Owe
                 // every file as its removed adoption loop did; another re-owe
                 // path (path B, a money rule) leaves the same owed state.
@@ -1639,6 +1696,11 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 );
                 let invariant_g =
                     fixture.body_trace.borrow().finalizer_bodies[REARM_SIBLING].clone();
+                assert_eq!(
+                    invariant_g["usage_accounting_contract"],
+                    crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT,
+                    "positive control: unlisted under B, G's body is request-owned"
+                );
                 let g_fp = invariant_g["snapshot_fingerprint"].as_str().unwrap();
                 assert!(saved["claude_request_census"].get(&g_key).is_some());
                 assert!(migrated.iter().any(|page| page.uploaded.contains(g_fp)));

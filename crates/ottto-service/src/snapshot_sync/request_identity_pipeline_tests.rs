@@ -200,9 +200,13 @@ fn identity_pipeline_cycle(
 #[serial(source_cadences, source_manifests)]
 fn native_comparison_real_source_preparation_stays_base_without_paired_evidence() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let fixture = IdentityPipelineHome::new();
     let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
+    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(
+        &fixture.base.join("support-native-preparation"),
+        &[IDENTITY_PIPELINE_ROOT],
+    );
     let cycle = identity_pipeline_cycle(&fixture, "native-preparation", "").unwrap();
     if crate::heap_layout_bound::layout_supported() {
         assert!(cycle.prepared_before_body);
@@ -237,7 +241,7 @@ fn native_comparison_real_source_preparation_stays_base_without_paired_evidence(
 #[serial(source_cadences, source_manifests)]
 fn always_on_emits_contract5_whatever_the_hint_token() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     use crate::snapshots::claude_request_identity as identity;
     let fixture = IdentityPipelineHome::new();
     let session = |cycle: &IdentityPipelineCycle| {
@@ -269,6 +273,10 @@ fn always_on_emits_contract5_whatever_the_hint_token() {
             r#","session_request_identity_contract":"claude_code_jsonl:own_request_identity_rows:v1""#,
         ),
     ] {
+        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(
+            &fixture.base.join(format!("support-{name}")),
+            &[IDENTITY_PIPELINE_ROOT],
+        );
         let cycle = identity_pipeline_cycle(&fixture, name, extra).expect("cycle");
         let item = session(&cycle);
         assert_eq!(item.provenance.collector, identity::COLLECTOR, "{name}");
@@ -301,7 +309,11 @@ fn always_on_emits_contract5_whatever_the_hint_token() {
             .expect("serialize identity projection"),
         );
     }
-    assert_eq!(bodies.len(), 1, "the hint token changes no identity or usage");
+    assert_eq!(
+        bodies.len(),
+        1,
+        "the hint token changes no identity or usage"
+    );
 
     // A hint that cannot be read aborts the cycle: no scan, no fallback body.
     let support = fixture.base.join("support-unreadable");
@@ -317,6 +329,111 @@ fn always_on_emits_contract5_whatever_the_hint_token() {
             .next()
             .is_none(),
         "an aborted cycle writes no scan state"
+    );
+
+    // Telemetry-owned tags need no org marker and no cohort token, and are
+    // the same every run (was `claude_contract5_bodies_need_no_cohort_token`).
+    let transcript = fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+    let unmarked = std::fs::read_to_string(&transcript)
+        .expect("read synthetic transcript")
+        .lines()
+        .filter(|line| !line.contains("credential_org"))
+        .map(|line| line.to_owned() + "\n")
+        .collect::<String>();
+    std::fs::write(&transcript, unmarked).expect("drop the org marker");
+    let mut telemetry_bodies = BTreeSet::new();
+    for name in ["telemetry-first", "telemetry-again"] {
+        let telemetry_support = fixture.base.join(format!("support-{name}"));
+        write_native_bootstrap_sidecars(&fixture, &telemetry_support);
+        // Bootstrap rows prove usage, but intentionally contain no login.
+        // This identity guard needs the same paired rows with real typed
+        // login/org evidence, as the deleted unit specimen supplied.
+        let api_path = telemetry_support
+            .join("local-otel/claude-code-effort")
+            .join(format!(
+                "{:x}.jsonl",
+                Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())
+            ));
+        let rows = std::fs::read_to_string(&api_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
+                    serde_json::from_str(line).unwrap();
+                row.account_identifier_hash = Some("a".repeat(64));
+                use crate::claude_local_otel::{
+                    ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin,
+                    ClaudeIdentityDisposition, ClaudeRequestIdentityEvidence,
+                };
+                row.account_identity_checked = true;
+                row.request_identity = Some(ClaudeRequestIdentityEvidence {
+                    identity_hash_scheme: "provider-sha256:v1".into(),
+                    disposition: ClaudeIdentityDisposition::Complete,
+                    account: ClaudeIdentityAttributeEvidence {
+                        disposition: ClaudeIdentityDisposition::Complete,
+                        origin: ClaudeIdentityAttributeOrigin::LogRecord,
+                        log_record_hash: row.account_identifier_hash.clone(),
+                        resource_hash: None,
+                    },
+                    organization: ClaudeIdentityAttributeEvidence {
+                        disposition: ClaudeIdentityDisposition::Complete,
+                        origin: ClaudeIdentityAttributeOrigin::LogRecord,
+                        log_record_hash: ottto_core::billing_identity_hash(
+                            "anthropic",
+                            "organization",
+                            IDENTITY_PIPELINE_ORG,
+                        ),
+                        resource_hash: None,
+                    },
+                });
+                row.fingerprint.clear();
+                row.fingerprint = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(&row).unwrap())
+                );
+                serde_json::to_string(&row).unwrap() + "\n"
+            })
+            .collect::<String>();
+        std::fs::write(api_path, rows).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(
+            &fixture.base.join(format!("support-{name}")),
+            &[IDENTITY_PIPELINE_ROOT],
+        );
+        let cycle = identity_pipeline_cycle(&fixture, name, "").expect("cycle");
+        let item = session(&cycle);
+        assert_eq!(item.provenance.collector, identity::COLLECTOR, "{name}");
+        assert!(
+            item.claude_org_markers.is_none(),
+            "{name}: fresh tags need no org marker"
+        );
+        assert!(
+            !item.request_evidence.is_empty(),
+            "{name}: fresh contract-5 bodies get identity tags"
+        );
+        assert_eq!(item.request_identity_refusals, 0, "{name}");
+        assert_eq!(
+            (item.request_count, item.input_tokens, item.output_tokens),
+            (2, 30, 3),
+            "{name}"
+        );
+        telemetry_bodies.insert(
+            serde_json::to_vec(&(
+                &item.provenance.collector,
+                &item.request_evidence,
+                item.request_identity_refusals,
+                &item.model_usage,
+                &item.usage_buckets,
+            ))
+            .expect("serialize identity projection"),
+        );
+    }
+    assert_eq!(
+        telemetry_bodies.len(),
+        1,
+        "telemetry-owned tags are the same every run"
     );
 }
 
@@ -496,7 +613,7 @@ fn write_native_bootstrap_sidecars(fixture: &IdentityPipelineHome, support: &Pat
 #[serial(client_report)]
 fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save() {
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_real_bootstrap: supported_positive=UNEXECUTED layout_supported=false; actual unsupported BASE preparation covered separately").unwrap();
         return;
@@ -705,7 +822,11 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
     );
     assert!(bodies
         .iter()
-        .any(|body| body["usage_accounting_contract"] == "session_exclusive_reported_usage:v1"));
+        .any(|body| body["usage_accounting_contract"]
+            == crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT));
+    assert!(bodies
+        .iter()
+        .all(|body| body["usage_accounting_contract"] != "session_exclusive_reported_usage:v1"));
     drop(bodies);
     let abandoned = crate::agent_status_refresh::with_test_collection(collection(), || {
         prepare_sync_source(

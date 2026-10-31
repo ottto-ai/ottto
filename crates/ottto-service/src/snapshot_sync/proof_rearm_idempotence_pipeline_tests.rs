@@ -109,7 +109,9 @@ fn c1a_invalid_path(fixture: &RearmFixture) -> PathBuf {
 }
 
 /// The re-arm fixture plus the request-id-less transcript, under a contract-5
-/// identity permit unless the test changes it.
+/// identity permit unless the test changes it. No exclusion list is installed
+/// (production's always-on path); a test that needs a family on ordinary
+/// money lists only that family with `list_held` after an unlisted baseline.
 fn c1a_fixture(case: &'static str) -> RearmFixture {
     let mut fixture = RearmFixture::new(case);
     fixture.request_identity = true;
@@ -301,8 +303,9 @@ fn c1a_closed_fence_unchanged_proof_rearms_nothing_after_its_reproof() {
 #[test]
 #[serial(source_manifests)]
 fn c1a_refused_budget_fallback_equals_base() {
-    // BASE re-offers the unchanged family at 08:10; gate on it is a semantic no-op (no re-upload).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // BASE (recorded gate-off) re-offered the unchanged family at 08:10. On
+    // the always-on path the re-read family is a semantic no-op: no re-upload,
+    // so the accepted heads stay those of 08:00.
     if !c1a_layout_supported("c1a_refused_budget_fallback") {
         return;
     }
@@ -323,15 +326,28 @@ fn c1a_refused_budget_fallback_equals_base() {
     };
     let base = [
         window(6, 3, 0, false, true),
-        window(6, 3, 3, true, false),
+        window(6, 0, 6, true, false),
         window(3, 0, 3, true, false),
     ];
     let refused = c1a_fixture("c1a-fallback-refused");
     let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
     let fallbacks = crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test();
-    let windows = [(8, 0), (8, 10), (8, 20)]
-        .map(|clock| c1a_window(&c1a_generation(&refused, "refused", clock)));
+    let mut heads = Vec::new();
+    let windows = [(8, 0), (8, 10), (8, 20)].map(|clock| {
+        let pages = c1a_generation(&refused, "refused", clock);
+        heads.push(RearmFixture::family_heads(
+            &pages.last().expect("terminal page").index,
+        ));
+        c1a_window(&pages)
+    });
     assert_eq!(windows, base, "the refused fallback is BASE");
+    assert_eq!(heads[0].len(), rearm_family_sessions().len());
+    assert!(
+        heads[0].values().all(Option::is_some),
+        "08:00 accepts every member's body"
+    );
+    assert_eq!(heads[1], heads[0], "08:10 re-uploads nothing");
+    assert_eq!(heads[2], heads[0], "08:20 re-uploads nothing");
     assert!(
         crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test() > fallbacks,
         "the fallback is counted"
@@ -402,111 +418,6 @@ fn c1a_changed_witness_rearms_like_base() {
     assert_eq!(after.family_reads, base_after.family_reads);
     assert_eq!(after.retry_pending, base_after.retry_pending);
     assert_eq!(after.proven, base_after.proven);
-}
-
-/// X(a), M1: with the skip active, a changed `claude_api_request:v2` root row
-/// that adds request identity re-selects every family member at the next
-/// visit (the sidecar-inclusive selection fingerprint), and the re-emitted
-/// root body carries TELEMETRY tags with the organization in the same window
-/// as under BASE, with no full re-arm.
-#[test]
-#[serial(source_manifests)]
-fn c1a_late_identity_row_reselects_and_tags_skipped_family() {
-    // Contract-5 tagging oracle; markerless single-account E2 bodies keep the D1 wire shape.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    use sha2::{Digest, Sha256};
-    if !c1a_layout_supported("c1a_late_identity_row") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
-    let login = "a".repeat(64);
-    let org = "d".repeat(64);
-    let upgrade = |fixture: &RearmFixture| {
-        let path = fixture.sidecar_path("claude-code-effort");
-        let rows = std::fs::read_to_string(&path)
-            .expect("read the root API sidecar")
-            .lines()
-            .map(|line| {
-                let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
-                    serde_json::from_str(line).expect("synthetic API row");
-                row.account_identity_checked = true;
-                row.account_identifier_hash = Some(login.clone());
-                row.request_identity = Some(
-                    serde_json::from_value(serde_json::json!({
-                        "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
-                        "account":{"disposition":"complete", "origin":"log_record", "log_record_hash":login},
-                        "organization":{"disposition":"complete", "origin":"log_record", "log_record_hash":org},
-                    }))
-                    .unwrap(),
-                );
-                row.fingerprint.clear();
-                row.fingerprint = format!(
-                    "sha256:{:x}",
-                    Sha256::digest(serde_json::to_vec(&row).unwrap())
-                );
-                serde_json::to_string(&row).unwrap() + "\n"
-            })
-            .collect::<String>();
-        std::fs::write(&path, rows).expect("rewrite the root API sidecar");
-    };
-    let run = |fixture: &mut RearmFixture, arm: &str| {
-        c1a_close_and_reprove(fixture, arm);
-        let quiet = c1a_window(&c1a_generation(fixture, arm, (8, 20)));
-        upgrade(fixture);
-        // One page, so the changed evidence is re-proved on the terminal page.
-        fixture.native_file_limit = 64;
-        let pages = c1a_generation(fixture, arm, (8, 30));
-        let late = c1a_window(&pages);
-        let root = pages
-            .iter()
-            .find_map(|page| {
-                page.scan
-                    .snapshots
-                    .iter()
-                    .find(|item| item.source_session_id == REARM_ROOT)
-                    .map(|item| (page, item.clone()))
-            })
-            .map(|(page, item)| {
-                assert!(page.offered.contains(&item.snapshot_fingerprint), "{arm}");
-                assert!(page.uploaded.contains(&item.snapshot_fingerprint), "{arm}");
-                item
-            })
-            .expect("the root body is re-emitted");
-        (quiet, late, root)
-    };
-    let mut fixture = c1a_fixture("c1a-late-identity-row");
-    let (quiet, late, root) = run(&mut fixture, "fix");
-    let mut base = c1a_fixture("c1a-late-identity-row-base");
-    let (base_quiet, base_late, base_root) = {
-        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
-        run(&mut base, "base")
-    };
-    // Precondition: the skip was active, so nothing re-armed the family.
-    assert_eq!(quiet.family_reads, 0);
-    assert_eq!(quiet.debt, 0);
-    assert_eq!(base_quiet.family_reads, family);
-    for (arm, window, item) in [("fix", &late, &root), ("base", &base_late, &base_root)] {
-        assert_eq!(
-            window.family_reads, family,
-            "{arm}: M1 re-selects every member"
-        );
-        assert!(
-            !window.full_rearm,
-            "{arm}: normal cadence, not the daily re-read"
-        );
-        assert!(window.fence_before && window.fence_after, "{arm}");
-        assert!(!window.retry_pending, "{arm}");
-        assert!(
-            !item.request_evidence.is_empty()
-                && item.request_evidence.iter().all(|evidence| {
-                    evidence.identity_basis == crate::snapshots::claude_request_identity::TELEMETRY
-                        && evidence.provider_workspace_hash.as_deref() == Some(org.as_str())
-                }),
-            "{arm}: the re-emitted root body is tagged"
-        );
-    }
-    assert_eq!(late, base_late, "the late window equals BASE");
 }
 
 /// X(b), contract change after the skip is active: the changed contract
@@ -703,69 +614,6 @@ fn c1a_late_copied_import_stays_suppressed_while_skip_active() {
     assert_eq!(postures, base_postures);
 }
 
-/// Rewrite the root API sidecar so that every row gains account evidence.
-/// The reduced evidence fingerprint changes, so a retained witness no longer
-/// reconstructs, and the sidecar stats change, so M1 re-selects the family.
-fn c1a_late_account_row(fixture: &RearmFixture) {
-    use sha2::{Digest, Sha256};
-    let path = fixture.sidecar_path("claude-code-effort");
-    let rows = std::fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .map(|line| {
-            let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
-                serde_json::from_str(line).unwrap();
-            row.account_identity_checked = true;
-            row.account_identifier_hash = Some("a".repeat(64));
-            row.fingerprint.clear();
-            row.fingerprint = format!(
-                "sha256:{:x}",
-                Sha256::digest(serde_json::to_vec(&row).unwrap())
-            );
-            serde_json::to_string(&row).unwrap() + "\n"
-        })
-        .collect::<String>();
-    std::fs::write(&path, rows).unwrap();
-}
-
-/// Liveness control, between windows: with the skip active, the root API
-/// rows change after one terminal and before the next window. Both arms
-/// re-select the family through M1 and reconstruct it against the witness the
-/// earlier terminal proved, so both hold it identically. Only the re-arm debt
-/// differs: BASE re-armed the family at that terminal and the fix skipped it.
-#[test]
-#[serial(source_manifests)]
-fn c1a_late_row_between_windows_equals_base() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    if !c1a_layout_supported("c1a_late_row_between_windows") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let run = |fixture: &RearmFixture, arm: &str| {
-        c1a_close_and_reprove(fixture, arm);
-        c1a_late_account_row(fixture);
-        [(8, 20), (8, 30), (8, 40)].map(|clock| c1a_window(&c1a_generation(fixture, arm, clock)))
-    };
-    let fixture = c1a_fixture("c1a-late-row-between");
-    let windows = run(&fixture, "fix");
-    let base = c1a_fixture("c1a-late-row-between-base");
-    let base_windows = {
-        let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
-        run(&base, "base")
-    };
-    for (window, base_window) in windows.iter().zip(&base_windows) {
-        assert_eq!(
-            C1aWindow {
-                debt: base_window.debt,
-                ..window.clone()
-            },
-            *base_window
-        );
-    }
-    assert_eq!(windows[0].family_reads, rearm_family_sessions().len());
-}
-
 fn c1a_family_bodies(
     pages: &[RearmPage],
 ) -> BTreeMap<String, (&RearmPage, crate::snapshots::SnapshotItem)> {
@@ -881,83 +729,6 @@ fn c1a_assert_family_emitted_and_tagged(
     );
 }
 
-/// X(b) off→on, re-emission (SI condition 4): the bodies built while no
-/// contract was permitted carry the legacy collector. After the contract
-/// turns on, the latch re-arms the skipped family at the next terminal, and
-/// the window after that re-emits every family body under contract 5: each
-/// is offered and acknowledged, carries the contract-5 collector token, and
-/// differs from its contract-off body. Every usage row links to its own
-/// telemetry identity, present before the permit changes.
-#[test]
-#[serial(source_manifests)]
-fn c1a_contract_off_to_on_reemits_family_bodies_under_new_contract() {
-    // Contract-5 tagging oracle; markerless single-account E2 bodies keep the D1 wire shape.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    if !c1a_layout_supported("c1a_contract_off_to_on_reemits") {
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions();
-    let collector = crate::snapshots::claude_request_identity::COLLECTOR;
-    let mut fixture = c1a_fixture("c1a-contract-off-to-on-reemits");
-    c1a_add_family_request_identity(&fixture);
-    fixture.request_identity = false;
-    fixture.owned_base_preparation = true;
-    let closing = c1a_generation(&fixture, "fix", (8, 0));
-    let off_bodies = c1a_family_bodies(&closing)
-        .into_iter()
-        .map(|(session, (_, item))| (session, item))
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(off_bodies.len(), family.len(), "every member is read");
-    for (session, item) in &off_bodies {
-        assert_ne!(
-            item.provenance.collector, collector,
-            "{session}: no contract-5 body without a permit"
-        );
-        assert!(item.request_evidence.is_empty(), "{session}");
-    }
-    let reproved = c1a_window(&c1a_generation(&fixture, "fix", (8, 10)));
-    assert_eq!(reproved.debt, 0, "the skip is active");
-    assert_eq!(c1a_latch(&fixture), (Some(String::new()), false));
-    let quiet = c1a_window(&c1a_generation(&fixture, "fix", (8, 20)));
-    assert_eq!(quiet.family_reads, 0);
-    fixture.request_identity = true;
-    let changed = c1a_window(&c1a_generation(&fixture, "fix", (8, 30)));
-    assert_eq!(changed.family_reads, 0, "nothing re-selected the family");
-    assert_eq!(
-        changed.debt,
-        family.len(),
-        "the latch re-arms the skipped family"
-    );
-    assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
-    let reread = c1a_generation(&fixture, "fix", (8, 40));
-    let on_bodies = c1a_family_bodies(&reread);
-    assert_eq!(
-        on_bodies.keys().collect::<Vec<_>>(),
-        off_bodies.keys().collect::<Vec<_>>(),
-        "every member is re-read under the new contract"
-    );
-    for (session, (page, item)) in &on_bodies {
-        assert_eq!(
-            item.provenance.collector, collector,
-            "{session}: the re-read body is built under contract 5"
-        );
-        assert_ne!(
-            item.snapshot_fingerprint, off_bodies[session].snapshot_fingerprint,
-            "{session}: the contract-5 body is a new body"
-        );
-        assert!(
-            page.offered.contains(&item.snapshot_fingerprint),
-            "{session}: re-emitted"
-        );
-        assert!(
-            page.uploaded.contains(&item.snapshot_fingerprint),
-            "{session}: acknowledged"
-        );
-    }
-    c1a_assert_family_emitted_and_tagged(&reread, collector, &off_bodies);
-}
-
 /// X(b) v1→v2: only the collector token changes. A v2→v1→v2 flip inside
 /// the first traversal keeps the latch even though its terminal sees v2.
 /// Only the next complete traversal, wholly under v2, clears it after
@@ -966,8 +737,10 @@ fn c1a_contract_off_to_on_reemits_family_bodies_under_new_contract() {
 #[test]
 #[serial(source_manifests)]
 fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
-    // Contract-5 tagging oracle; markerless single-account E2 bodies keep the D1 wire shape.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    // Contract-5 tagging oracle on ordinary money: a markerless single-account
+    // request-owned (E2) body need not carry the cycle collector. The family
+    // is listed after an unlisted baseline, as a protected family is in
+    // production; listed bodies take the cycle contract and its row tags.
     use crate::snapshots::claude_request_identity::with_cycle_contract_for_test;
     if !c1a_layout_supported("c1a_contract_v1_to_v2_reemits") {
         return;
@@ -978,12 +751,43 @@ fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
     let fixture = c1a_fixture("c1a-contract-v1-to-v2-reemits");
     c1a_add_family_request_identity(&fixture);
     let family = rearm_family_sessions();
+    // Unlisted baseline: the first complete census closes the fence with a
+    // full re-arm, so the next window re-reads every member.
+    let baseline = with_cycle_contract_for_test(V1, || c1a_generation(&fixture, "v1", (7, 55)));
+    let baseline_window = c1a_window(&baseline);
+    assert!(baseline_window.census_complete && baseline_window.full_rearm);
+    assert_eq!(
+        baseline_window.debt,
+        family.len(),
+        "the first proof re-arms"
+    );
+    // Positive control for the listed collector below: unlisted, the same
+    // family bodies carry nonzero request-owned usage, regardless of collector.
+    let unlisted_bodies = c1a_family_bodies(&baseline);
+    assert_eq!(unlisted_bodies.len(), family.len());
+    for (session, (_, item)) in &unlisted_bodies {
+        assert_eq!(
+            item.usage_accounting_contract.as_deref(),
+            Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
+            "{session}: unlisted body is request-owned"
+        );
+        assert!(
+            item.request_count > 0,
+            "{session}: the unlisted control contains actual request-owned usage"
+        );
+    }
+    fixture.list_held(&[REARM_ROOT]);
     let closing = with_cycle_contract_for_test(V1, || c1a_generation(&fixture, "v1", (8, 0)));
     let v1_bodies = c1a_family_bodies(&closing)
         .into_iter()
         .map(|(session, (_, item))| {
             assert_eq!(item.provenance.collector, V1);
             assert!(!item.request_evidence.is_empty());
+            assert_ne!(
+                item.usage_accounting_contract.as_deref(),
+                Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
+                "{session}: the listed family is on ordinary money"
+            );
             (session, item)
         })
         .collect::<BTreeMap<_, _>>();
