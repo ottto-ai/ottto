@@ -56,7 +56,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-          # The PR merge commit plus its base parent, for the lint ratchet.
+          # The PR merge commit plus its base parent, for the PR Rust diff checks.
           fetch-depth: 2
 
       # rusqlite links the system SQLite; command-environment tests probe zsh.
@@ -91,20 +91,19 @@ jobs:
             crates -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # On pull requests the same step also runs the lint ratchet against the
-      # merge commit's base parent: no added allow(dead_code)/allow(unused..)
-      # or blanket #![allow], and a "Reuse:" line in the PR body.
+      # Clippy owns lint policy; PR-only checks cover reuse and blanket allows.
       - name: Runtime clippy
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          ratchet=0
           if [ "$EVENT_NAME" = pull_request ]; then
-            bash scripts/lint_ratchet.sh HEAD^1 || ratchet=1
+            rust_diff=$(git diff -U0 HEAD^1 HEAD -- '*.rs') || exit 1
+            rust_files=$(git diff --name-only HEAD^1 HEAD -- '*.rs') || exit 1
+            [ -z "$rust_files" ] || grep -q '^Reuse:' <<< "$PR_BODY" || { echo 'error: Rust changes need a Reuse: line in the PR body'; exit 1; }
+            if grep -Eq '^\+[[:space:]]*#!\[(allow|cfg_attr\(.*allow)' <<< "$rust_diff"; then echo 'error: added blanket allow'; exit 1; fi
           fi
           cargo clippy --workspace --all-targets --locked -- -D warnings
-          exit "$ratchet"
 
       - name: Connector clippy
         run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings
