@@ -154,7 +154,7 @@ fn store_records(disk: &Disk) -> Records {
 
 /// One synthetic Pi session on the real store. Mirrors M1's routes: Ram and
 /// EvictRetry reuse the live owner, DiskRestore/Restart begin a new owner.
-struct PiDriver {
+pub(super) struct PiDriver {
     c: Corpus,
     disk: Disk,
     path: PathBuf,
@@ -170,7 +170,7 @@ struct PiDriver {
     restarts: usize,
 }
 impl PiDriver {
-    fn warm(name: &str, initial: &str) -> Self {
+    pub(super) fn warm(name: &str, initial: &str) -> Self {
         let c = corpus(name);
         let disk = Disk::new(&c);
         Self::warm_in(c, disk, initial)
@@ -363,6 +363,37 @@ impl TransitionDriver for PiDriver {
     }
 }
 
+/// Pi's line shape in the shared rows. A message before the first restart is
+/// paired by its message_end after it, so a lost usage-key ledger double
+/// counts; the pages carry a compaction and a branch summary with their own
+/// usage.
+impl super::durable_transition_tests::SharedSource for PiDriver {
+    const HEAD_REDERIVE_CONSUMED: bool = false;
+    fn entity(&self) -> &str {
+        &self.entity
+    }
+    fn append(&mut self, n: u64) -> u64 {
+        let message = pi_turn(
+            "message",
+            Some("pair-across-restart"),
+            20,
+            "2026-10-27T06:01:00Z",
+        );
+        let mut end = message.clone();
+        end["type"] = json!("message_end");
+        self.grow(&match n {
+            0 => vec![message, summary_line("compaction", "b0000001")],
+            1 => vec![end, summary_line("branch_summary", "b0000002")],
+            _ => vec![pi_turn(
+                "message",
+                Some("after-restarts"),
+                30,
+                "2026-10-27T06:03:00Z",
+            )],
+        })
+    }
+}
+
 /// The only record file and its bytes.
 fn only_record(disk: &Disk) -> (PathBuf, Vec<u8>) {
     let records = store_records(disk);
@@ -438,118 +469,6 @@ fn pi_quiet_restart_twice_reads_nothing_and_posts_nothing() {
         assert_eq!(stored_bodies(&f.prior), bodies, "{restart}: index body");
     }
     assert_eq!(f.restarts, 2);
-}
-
-// P-A x2: append, then restart, twice. Every warm route reads only the Tail
-// and equals cold Full. A message before restart one is paired by its
-// message_end after it, so a lost usage-key ledger double counts. The pages
-// carry a compaction and a branch summary with their own usage.
-/// [format] Pi native accounting and restore contract.
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "Pi restore requires qualified native heap layout"
-)]
-fn pi_append_then_restart_twice_reads_only_tail_and_keeps_the_ledger() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_transition_append") {
-        return;
-    }
-    let mut f = PiDriver::warm("transition-pi-append", &pi_seed());
-    let message = pi_turn(
-        "message",
-        Some("pair-across-restart"),
-        20,
-        "2026-10-27T06:01:00Z",
-    );
-    let mut end = message.clone();
-    end["type"] = json!("message_end");
-    let pages = [
-        (vec![message, summary_line("compaction", "b0000001")], 3),
-        (vec![end, summary_line("branch_summary", "b0000002")], 4),
-        (
-            vec![pi_turn(
-                "message",
-                Some("after-restarts"),
-                30,
-                "2026-10-27T06:03:00Z",
-            )],
-            5,
-        ),
-    ];
-    for (page, (lines, requests)) in pages.into_iter().enumerate() {
-        let tail = f.grow(&lines);
-        assert!(tail > 0);
-        let cold = f.emit_bodies(Mode::ColdFull);
-        assert_eq!(cold.modes, (1, 0, 0));
-        assert_eq!(
-            cold.snapshots[&f.entity]["request_count"],
-            json!(requests),
-            "page {page}: the pair is one request"
-        );
-        for mode in [Mode::Ram, Mode::DiskRestore, Mode::Restart] {
-            let route = f.emit_bodies(mode);
-            assert_eq!(route.modes, (0, 1, 0), "page {page} {mode:?}");
-            if mode != Mode::Ram || page > 0 {
-                assert_eq!(route.restored, 1, "page {page} {mode:?}");
-            }
-            assert_eq!(
-                route.io.consumed,
-                tail,
-                "page {page} {mode:?}: reader bytes = Tail; bounded head pread is counted separately"
-            );
-            money_oracle::assert_equivalent(&cold, &route);
-            whole_body(&cold, &route);
-        }
-        f.save_gc(Mode::Restart);
-        if page < 2 {
-            f.restart();
-        }
-    }
-    assert_eq!(f.restarts, 2);
-}
-
-// P-E: evict RAM, retry from the record, save, restart: zero Full throughout.
-/// [format] Pi native accounting and restore contract.
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "Pi restore requires qualified native heap layout"
-)]
-fn pi_evict_retry_save_restart_reads_no_full() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_transition_evict") {
-        return;
-    }
-    let mut f = PiDriver::warm("transition-pi-evict", &pi_seed());
-    let tail = f.grow(&[
-        pi_turn("message", Some("evict-one"), 20, "2026-10-27T06:01:00Z"),
-        summary_line("compaction", "b0000001"),
-    ]);
-    let cold = f.emit_bodies(Mode::ColdFull);
-    let ram = f.emit_bodies(Mode::Ram);
-    assert_eq!((ram.modes, ram.restored), ((0, 1, 0), 0));
-    money_oracle::assert_equivalent(&cold, &ram);
-    whole_body(&cold, &ram);
-    let retry = f.emit_bodies(Mode::EvictRetry);
-    assert_eq!((retry.modes, retry.restored), ((0, 1, 0), 1));
-    assert_eq!(retry.io.consumed, tail);
-    money_oracle::assert_equivalent(&cold, &retry);
-    whole_body(&cold, &retry);
-    f.save_gc(Mode::EvictRetry);
-    f.restart();
-    let tail = f.grow(&[pi_turn(
-        "message",
-        Some("evict-two"),
-        30,
-        "2026-10-27T06:02:00Z",
-    )]);
-    let cold = f.emit_bodies(Mode::ColdFull);
-    let restart = f.emit_bodies(Mode::Restart);
-    assert_eq!((restart.modes, restart.restored), ((0, 1, 0), 1));
-    assert_eq!(restart.io.consumed, tail);
-    money_oracle::assert_equivalent(&cold, &restart);
-    whole_body(&cold, &restart);
 }
 
 // P-S (restore path: restart or RAM miss; Lead B 2026-10-30: no Pi floor): an

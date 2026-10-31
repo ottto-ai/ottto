@@ -308,7 +308,70 @@ impl Drop for Hooks {
     }
 }
 
-/// [money] shared old writer tail receipt gc and two restarts.
+/// What a shared row body needs from a source's driver beyond its routes.
+pub(super) trait SharedSource: TransitionDriver {
+    /// Whether bounded head rederive reads through the native reader, so its
+    /// bytes are part of `io.consumed` (Claude), or by pread (Pi).
+    const HEAD_REDERIVE_CONSUMED: bool;
+    /// The session entity the row follows.
+    fn entity(&self) -> &str;
+    /// Appends billed growth number `n`; returns the bytes past the committed
+    /// extent.
+    fn append(&mut self, n: u64) -> u64;
+}
+impl SharedSource for M1 {
+    const HEAD_REDERIVE_CONSUMED: bool = true;
+    fn entity(&self) -> &str {
+        ROOT
+    }
+    fn append(&mut self, n: u64) -> u64 {
+        let old_size = self.prior.files[&fixture::local_key(&self.path)].size_bytes;
+        self.grow(&format!("r{}", 4 + n), 40 + n);
+        std::fs::metadata(&self.path).unwrap().len() - old_size
+    }
+}
+
+/// Three appended pages: every warm route reads only the Tail and equals cold
+/// Full; the restarted route's save is the next predecessor, across two
+/// restarts.
+pub(super) fn tail_routes_across_two_restarts<D: SharedSource>(f: &mut D) {
+    for page in 0..3 {
+        let tail_bytes = f.append(page);
+        assert!(tail_bytes > 0);
+        let cold = f.emit_bodies(Mode::ColdFull);
+        assert_eq!(cold.modes, (1, 0, 0));
+        assert!(!cold.batches.is_empty());
+        for mode in [Mode::Ram, Mode::DiskRestore, Mode::EvictRetry] {
+            let route = f.emit_bodies(mode);
+            assert_eq!(route.modes, (0, 1, 0), "page {page} {mode:?}");
+            if mode != Mode::Ram || page > 0 {
+                assert_eq!(route.restored, 1);
+            }
+            let head = if D::HEAD_REDERIVE_CONSUMED {
+                route.io.rederive_head
+            } else {
+                0
+            };
+            assert_eq!(
+                route.io.consumed,
+                tail_bytes + head,
+                "actual reader bytes = Tail + head rederive read through the reader"
+            );
+            money_oracle::assert_equivalent(&cold, &route);
+        }
+        let restart = f.emit_bodies(Mode::Restart);
+        assert_eq!(restart.restored, 1);
+        money_oracle::assert_no_smaller_reemit(f.entity(), &cold, &restart, &cold, false);
+        // Native completion writes before ACK; save reconciles it.
+        f.save_gc(Mode::Restart);
+        if page < 2 {
+            f.restart();
+        }
+    }
+}
+
+/// [money] shared old writer tail receipt gc and two restarts, for every
+/// Claude writer and for Pi (no old writer: its warm native receipt).
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -322,39 +385,12 @@ fn shared_old_writer_tail_receipt_gc_and_two_restarts() {
     with_e2(|| {
         for pin in WRITERS {
             let mut f = M1::old_writer(&format!("transition-{pin}"), pin);
-            for (page, request) in ["r4", "r5", "r6"].iter().enumerate() {
-                let old_size = f.prior.files[&fixture::local_key(&f.path)].size_bytes;
-                f.grow(request, 40 + page as u64);
-                let tail_bytes = std::fs::metadata(&f.path).unwrap().len() - old_size;
-                assert!(tail_bytes > 0);
-                let cold = f.emit_bodies(Mode::ColdFull);
-                assert_eq!(cold.modes, (1, 0, 0));
-                assert!(!cold.batches.is_empty());
-                for mode in [Mode::Ram, Mode::DiskRestore, Mode::EvictRetry] {
-                    let route = f.emit_bodies(mode);
-                    assert_eq!(route.modes, (0, 1, 0), "{pin} {mode:?}");
-                    if mode != Mode::Ram || page > 0 {
-                        assert_eq!(route.restored, 1);
-                    }
-                    assert_eq!(
-                        route.io.consumed,
-                        tail_bytes + route.io.rederive_head,
-                        "actual reader bytes = Tail + separately counted M1 head rederive"
-                    );
-                    money_oracle::assert_equivalent(&cold, &route);
-                }
-                let restart = f.emit_bodies(Mode::Restart);
-                assert_eq!(restart.restored, 1);
-                money_oracle::assert_no_smaller_reemit(ROOT, &cold, &restart, &cold, false);
-                // Native completion writes before ACK; save reconciles it.
-                f.save_gc(Mode::Restart);
-                if page < 2 {
-                    f.restart();
-                }
-            }
+            tail_routes_across_two_restarts(&mut f);
             assert_eq!(f.restarts, 2);
         }
     });
+    let mut pi = super::durable_transition_pi_tests::PiDriver::warm("transition-pi", &pi_seed());
+    tail_routes_across_two_restarts(&mut pi);
 }
 
 /// [money] shared unknown record holds last accepted body and survives gc.
