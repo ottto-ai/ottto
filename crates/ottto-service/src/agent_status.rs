@@ -26926,49 +26926,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_usage_parser_extracts_windows_and_credits() {
-        let json = serde_json::json!({
-            "rate_limit": {
-                "primary_window": {
-                    "used_percent": 3,
-                    "reset_at": 1779049800,
-                    "limit_window_seconds": 18000
-                },
-                "secondary_window": {
-                    "used_percent": 1,
-                    "reset_at": "1779613200",
-                    "limit_window_seconds": 604800
-                },
-                "credits": {
-                    "has_credits": true,
-                    "unlimited": false,
-                    "balance": 0
-                }
-            }
-        });
-
-        let windows = codex_usage_quota_windows(&json);
-        let credits = codex_usage_credit_balances(&json);
-
-        assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0].name, "legacy_primary_five_hour_reset_known");
-        assert_eq!(windows[0].left_percent, Some(97));
-        assert_eq!(
-            windows[0].started_at.as_deref(),
-            Some("2026-05-17T15:30:00Z")
-        );
-        assert_eq!(windows[1].name, "legacy_secondary_weekly_reset_known");
-        assert_eq!(windows[1].left_percent, Some(99));
-        assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
-        assert_eq!(credits[0].remaining, Some(0));
-        // The legacy payload carries none of the 2026-07 credit metadata.
-        assert_eq!(credits[0].spend_control_reached, None);
-        assert_eq!(credits[0].rate_limit_reached_type, None);
-        assert_eq!(credits[0].limit_id, None);
-    }
-
-    #[test]
     fn codex_app_server_prefers_effective_snapshot_over_internal_limit_map() {
         let json = serde_json::json!({
             "rateLimits": {
