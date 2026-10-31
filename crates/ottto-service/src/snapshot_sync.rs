@@ -1083,9 +1083,8 @@ fn settle_upload_corrections_after_selection(
 ) -> bool {
     // D1 is deliberately unavailable to partial/deferred/shed/error outcomes.
     // Both existing durable refusal carriers must bind the exact current body.
-    // D1, D2 and M2 settle against the selected entries, but a later
-    // account-audit release can still clear one; their drains join the finish
-    // restore.
+    // It settles against the selected entries, but a later account-audit
+    // release can still clear one; its drains join the finish restore.
     if transport_fully_settled {
         let drains = index.settle_claude_proof_corrections_with_permanent(
             committed_index,
@@ -1108,8 +1107,8 @@ fn settle_upload_corrections_after_selection(
         );
         body_drains.append(drains);
     }
-    body_drains.append(index.settle_cutoff_claude_proof_corrections(cutoff_candidates));
-    body_drains.append(index.settle_empty_claude_proof_corrections(scan));
+    index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
+    index.settle_empty_claude_proof_corrections(scan);
     // Correction members the history gate holds wait for it; they are counted,
     // not blocking (StateMissing M2).
     let (blocking, deferred) = index.claude_authority_proof_correction_blocking();
@@ -1169,8 +1168,8 @@ fn finish_selected_settlement(
         );
     }
     // After every selected-entry restore and the account-audit release, which
-    // can clear a drained entry's revision: a drain (pre-selection, D1, D2 or
-    // M2) whose entry this save does not keep stays owed.
+    // can clear a drained entry's revision: a drain (pre-selection or D1)
+    // whose entry this save does not keep stays owed.
     if index.restore_unselected_claude_proof_body_drains(body_drains) {
         fully_settled = false;
     }
@@ -3262,7 +3261,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     fallback: Option<NativeSelectedRestore<'_>>,
     cause: Option<UnsettledUploadCause>,
     audit_release: Option<AccountAuditRelease<'_>>,
-    mut body_drains: crate::snapshots::ClaudeProofBodyDrains,
+    body_drains: crate::snapshots::ClaudeProofBodyDrains,
 ) -> Result<ScanIndex> {
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
@@ -3347,7 +3346,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     if let Some(scan) = correction_scan {
         // A2: settle no-body grants only against the file/empty/map facts
         // actually selected for this save, after any old-entry restoration.
-        body_drains.append(committable.settle_empty_claude_proof_corrections(scan));
+        committable.settle_empty_claude_proof_corrections(scan);
     }
     #[cfg(test)]
     crate::snapshots::envelope_selection_experiment::after_selected_restore(
