@@ -1060,36 +1060,37 @@ fn e2_pipeline_bound_a_own_b_generation_discard_has_no_fallback_then_recovers() 
     e2_bound_trace_case("generation", false, "subscription", false, false);
 }
 
-/// [regress] SOURCE 2026-10-30: uniform B used to keep B through the D1
-/// shortcut on a malformed trace; it is Unknown until a clean read.
+/// [money] Uniform B on a malformed trace is Unknown until a clean read,
+/// never B through the D1 shortcut.
+/// guard: unseen on M4 (0 of 3,614 evidence pages); code-derived from #932 review P2-1
 #[test]
 fn e2_pipeline_bound_a_uniform_b_malformed_trace_is_unknown_not_a() {
     e2_bound_trace_case("malformed", false, "subscription", false, false);
 }
 
-/// [regress] #932 P2-1: split B/C on a malformed trace used to emit retained
-/// A. Never accepted, so no refusal.
+/// [money] Split B/C on a malformed trace is Unknown, never retained A.
+/// Never accepted, so no refusal.
+/// guard: unseen on M4 (0 of 3,614 evidence pages); code-derived from #932 review P2-1
 #[test]
 fn e2_pipeline_bound_a_split_logins_malformed_trace_is_unknown_not_a() {
     e2_bound_trace_case("malformed", true, "subscription", false, false);
 }
 
-/// [behaviour] Unreadable trace: counted as `unreadable`.
+/// [money] SOURCE reason counts: split B/C on every other unhealthy read is
+/// Unknown, never retained A, and counted under its own reason.
+/// guard: unseen on M4 (0 of 3,614 evidence pages)
 #[test]
-fn e2_pipeline_bound_a_split_logins_unreadable_trace_is_unknown_not_a() {
-    e2_bound_trace_case("unreadable", true, "subscription", false, false);
-}
-
-/// [behaviour] Trace oversized at open: counted as `oversized`.
-#[test]
-fn e2_pipeline_bound_a_split_logins_oversized_trace_is_unknown_not_a() {
-    e2_bound_trace_case("oversized", true, "subscription", false, false);
-}
-
-/// [behaviour] Missing trace pair member: counted as `incomplete`.
-#[test]
-fn e2_pipeline_bound_a_split_logins_missing_trace_member_is_unknown_not_a() {
-    e2_bound_trace_case("incomplete", true, "subscription", false, false);
+fn e2_pipeline_bound_a_split_logins_unhealthy_trace_reasons_are_unknown_not_a() {
+    for (case, mode) in [
+        ("unreadable: the trace path is a directory", "unreadable"),
+        ("oversized: refused at open from metadata", "oversized"),
+        ("incomplete: the trace pair member is missing", "incomplete"),
+    ] {
+        let row = std::panic::catch_unwind(|| {
+            e2_bound_trace_case(mode, true, "subscription", false, false)
+        });
+        assert!(row.is_ok(), "{case}");
+    }
 }
 
 /// [money] #932: the discard withholds the split family too.
