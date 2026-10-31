@@ -23311,6 +23311,24 @@ for line in sys.stdin:
         assert_never_logged("synthetic-own-secret");
     }
 
+    #[test]
+    #[serial]
+    fn history_choice_receipt_transport_failure_keeps_proof_and_marker() {
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let stores = history_choice_test_stores();
+        history_choice_stage_test_release(&stores, &base, 100);
+        history_choice_store_test_receipt(&stores, 100);
+        let before = stores.receipt.load().unwrap();
+        assert!(history_choice_create(&base, &stores, 101).is_err());
+        assert_eq!(stores.receipt.load().unwrap(), before);
+        assert!(stores.marker.load().is_ok());
+        assert!(stores.proof.load().is_ok());
+    }
+
     struct HistoryChoiceFaultStore {
         inner: ottto_core::token_store::MemoryTokenStore,
         fail_load: std::sync::atomic::AtomicBool,
@@ -23431,6 +23449,135 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
+    fn history_choice_release_recovery_preserves_identity_reservation_witness() {
+        let _lock = lock_backend_test_env();
+        let (root, _guards, daemon, _) =
+            connected_binding_fixture("history-reservation", DEFAULT_API_BASE_URL.into());
+        let account = FileAccountStore::default().load().unwrap();
+        let reservation = reserve_identity_mutation(false).unwrap();
+        let stores = history_stores();
+        history_choice_stage_test_release(&stores, DEFAULT_API_BASE_URL, history_now());
+        {
+            let _identity_lock = lock_setup_run_binding();
+            assert_eq!(reservation.validate_locked(), Ok(()));
+        }
+        let pending = PendingAuthClaim {
+            claim_code: "claim".into(),
+            claim_token: "token".into(),
+            nonce: "nonce".into(),
+            claim_url: "https://ottto.net/setup/claim?code=claim".into(),
+            expires_at: "2030-01-01T00:00:00Z".into(),
+        };
+        assert!(matches!(
+            begin_durable_browser_claim(&daemon, pending),
+            Err(LocalApiError::IdentityMutationInProgress)
+        ));
+        clear_local_release(&stores).unwrap();
+        assert_eq!(FileAccountStore::default().load().unwrap(), account);
+        {
+            let _identity_lock = lock_setup_run_binding();
+            assert_eq!(reservation.validate_locked(), Ok(()));
+            let mut changed = account;
+            changed.message = Some(StableMessage {
+                code: "unrelated-authority-change".into(),
+                text: "synthetic".into(),
+            });
+            FileAccountStore::default().save(&changed).unwrap();
+            assert_eq!(
+                reservation.validate_locked(),
+                Err(LocalApiError::IdentityMutationInProgress)
+            );
+        }
+        drop(reservation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_interrupted_closed_cleanup_needs_no_deleted_proof() {
+        use ottto_core::token_store::MemoryTokenStore;
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        let (base, server) = scripted_json_backend(vec![(200, RECEIPT_CLAIM_SUCCESS)]);
+        let mut stores = history_choice_test_stores();
+        history_choice_stage_test_release(&stores, &base, 100);
+        history_choice_store_test_receipt(&stores, 100);
+        let marker = MemoryTokenStore::new();
+        marker.save(&stores.marker.load().unwrap()).unwrap();
+        stores.marker = Box::new(HistoryChoiceFaultStore {
+            inner: marker,
+            fail_load: false.into(),
+            fail_delete: true.into(),
+        });
+        assert!(clear_local_release(&stores).is_err());
+        assert!(matches!(stores.proof.load(), Err(TokenStoreError::Missing)));
+        assert!(
+            history_load::<LocalReleaseMarker>(stores.marker.as_ref())
+                .unwrap()
+                .unwrap()
+                .ceremony_closed
+        );
+        assert!(history_choice_create(&base, &stores, 101).is_ok());
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /api/v1/setup-claims "));
+        assert!(matches!(
+            stores.marker.load(),
+            Err(TokenStoreError::Missing)
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_receipt_missing_read_or_parse_failure_reissues_before_claim() {
+        use ottto_core::token_store::MemoryTokenStore;
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        for fault in ["missing", "read", "parse"] {
+            let (base, server) = scripted_json_backend(vec![
+                (
+                    200,
+                    r#"{"outcome":"receipt_issued","revocation_receipt":"otrr_reissued"}"#,
+                ),
+                (200, RECEIPT_CLAIM_SUCCESS),
+            ]);
+            let inner = MemoryTokenStore::new();
+            if fault == "parse" {
+                inner.save("{").unwrap();
+            }
+            let mut stores = history_choice_test_stores();
+            history_choice_stage_test_release(&stores, &base, 100);
+            stores.browser.save("{").unwrap();
+            assert!(
+                resume_history_browser_claim_with_stores(&test_machine(), &base, &stores)
+                    .unwrap()
+                    .is_none()
+            );
+            stores.receipt = Box::new(HistoryChoiceFaultStore {
+                inner,
+                fail_load: (fault == "read").into(),
+                fail_delete: false.into(),
+            });
+            assert_eq!(
+                history_choice_create(&base, &stores, 101)
+                    .unwrap()
+                    .claim_code,
+                "claim"
+            );
+            let requests = server.join().unwrap();
+            assert!(requests[0]
+                .starts_with("POST /api/v1/telemetry/devices/released-device/revocation-receipt "));
+            assert!(requests[0].contains("X-Ottto-Device-Secret: synthetic-own-secret"));
+            assert!(requests[1].starts_with("POST /api/v1/setup-claims "));
+            assert_eq!(
+                history_choice_request_body(&requests[1])["revocation_receipt"],
+                "otrr_reissued"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
     fn history_choice_receipt_failed_delete_recovers_same_claim_and_original_nonce() {
         use ottto_core::token_store::MemoryTokenStore;
         let _lock = lock_backend_test_env();
@@ -23514,6 +23661,29 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
+    fn history_choice_receipt_definitive_reissue_refusal_allows_unconfirmed_claim() {
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        for (status, body) in [
+            (401, r#"{"detail":{"code":"device_secret_invalid"}}"#),
+            (409, r#"{"detail":{"code":"ceremony_closed"}}"#),
+            (404, r#"{"detail":"Not Found"}"#),
+        ] {
+            let (base, server) =
+                scripted_json_backend(vec![(status, body), (200, RECEIPT_CLAIM_SUCCESS)]);
+            let stores = history_choice_test_stores();
+            history_choice_stage_test_release(&stores, &base, 100);
+            assert!(history_choice_create(&base, &stores, 101).is_ok());
+            let requests = server.join().unwrap();
+            assert!(requests[0].contains("/revocation-receipt "));
+            assert!(history_choice_request_body(&requests[1])
+                .get("revocation_receipt")
+                .is_none());
+        }
+    }
+
+    #[test]
+    #[serial]
     fn history_choice_receipt_marker_survives_reload_and_expires_at_24h() {
         let _lock = lock_backend_test_env();
         let _env = history_choice_test_env();
@@ -23539,6 +23709,116 @@ for line in sys.stdin:
         for store in [&reloaded.receipt, &reloaded.marker, &reloaded.proof] {
             assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_receipt_definitive_4xx_closes_local_marker() {
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        for status in [400, 401, 404, 422] {
+            let (base, server) = scripted_json_backend(vec![(status, "{}")]);
+            let stores = history_choice_test_stores();
+            history_choice_stage_test_release(&stores, &base, 100);
+            history_choice_store_test_receipt(&stores, 100);
+            assert!(history_choice_create(&base, &stores, 101).is_err());
+            assert_eq!(server.join().unwrap().len(), 1);
+            for store in [&stores.receipt, &stores.marker, &stores.proof] {
+                assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_registration_prepare_400_preserves_old_binding() {
+        let _lock = lock_backend_test_env();
+        let (base, server) = scripted_json_backend(vec![(
+            400,
+            r#"{"code":"history_choice_required","detail":"Setup claim session is pending: answer in the browser"}"#,
+        )]);
+        let (root, _guards, _, old_device) =
+            connected_binding_fixture("history-prepare-refusal", base.clone());
+        let session = InstallSessionApiResponse {
+            install_session_id: "install-existing".into(),
+            install_session_token: "synthetic-install-token".into(),
+        };
+        let error = prepare_telemetry_device_registration(&base, &session, &test_machine())
+            .err()
+            .expect("history refusal");
+        assert!(registration_history_choice_required(&error));
+        assert!(registration_history_choice_account(
+            &FileAccountStore::default().load().unwrap()
+        ));
+        assert_eq!(FileDeviceStore::default().load().unwrap(), Some(old_device));
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .unwrap()
+            .is_none());
+        assert_eq!(server.join().unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_registration_action_reoffers_browser_without_failed_completion() {
+        let _lock = lock_backend_test_env();
+        let (base, server) = scripted_json_backend(vec![
+            (200, "{}"), // heartbeat before polling the next setup action
+            (
+                200,
+                r#"{"action":{"id":"action-history","action_type":"install_source","source":"codex"}}"#,
+            ),
+            (200, "{}"),
+            (
+                200,
+                r#"{"install_session_id":"install-history","install_session_token":"synthetic-install"}"#,
+            ),
+            (200, "{}"),
+            (
+                400,
+                r#"{"code":"history_choice_required","detail":"Setup claim session is pending: answer in the browser"}"#,
+            ),
+            (200, RECEIPT_CLAIM_SUCCESS),
+        ]);
+        let (root, _guards, daemon, old_device) =
+            connected_binding_fixture("history-action", base.clone());
+        let connection = FileConnectionStore::default().load().unwrap().unwrap();
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let mut pending = test_pending_device_credential("old-running-candidate", true);
+        pending.api_base_url = base.clone();
+        pending.expires_at = "2099-01-01T00:00:00Z".into();
+        stage_pending_device_credential(&pending, &candidate).unwrap();
+        let mut credentials = SetupRunCredentials {
+            setup_run_token: "synthetic-setup-token".into(),
+            connection: connection.clone(),
+        };
+        let results =
+            process_setup_actions(&daemon, &base, &mut credentials, &test_machine()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "running");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert!(requests.iter().all(|r| !r.contains("/complete ")));
+        assert_eq!(
+            daemon
+                .pending_auth_claim_snapshot()
+                .unwrap()
+                .unwrap()
+                .0
+                .claim_code,
+            "claim"
+        );
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default().load().unwrap(),
+            Some(pending)
+        );
+        assert_eq!(FileDeviceStore::default().load().unwrap(), Some(old_device));
+        assert_eq!(
+            FileConnectionStore::default().load().unwrap(),
+            Some(connection)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
