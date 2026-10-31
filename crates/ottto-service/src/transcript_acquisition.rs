@@ -1595,6 +1595,7 @@ impl DurableCertificate {
     /// input), `scope`, the sample windows just re-read and verified from the
     /// held FD, and the certified audit clock and debt. `select_mode` then
     /// decides Unchanged, Tail or Full exactly as for a RAM checkpoint.
+    #[cfg(test)]
     pub(crate) fn restore(
         &self,
         file: &mut File,
@@ -1604,7 +1605,7 @@ impl DurableCertificate {
     }
 
     /// M3's grown path permits concurrent appends outside the certified prefix.
-    /// The M1/OFF entry above keeps its exact metadata guard.
+    /// The legacy certificate fixture above keeps its exact metadata guard.
     pub(crate) fn restore_grown(
         &self,
         file: &mut File,

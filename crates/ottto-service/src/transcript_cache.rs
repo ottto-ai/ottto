@@ -167,6 +167,10 @@ pub(crate) fn entry_overhead<S>() -> usize {
 /// payloads; it never estimates memory from the source file's size.
 pub(crate) struct TranscriptCache<S> {
     entries: BTreeMap<String, Entry<S>>,
+    #[expect(
+        clippy::box_collection,
+        reason = "OFF allocates no custody map and retains the predecessor cache root size"
+    )]
     custody: Option<Box<BTreeMap<String, Box<crate::snapshots::DurableCustody>>>>,
     clock: u64,
     byte_limit: usize,
@@ -534,7 +538,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             {
                 return None;
             }
-            let heap = heap_layout_bound::bound(retained, (self.entry_limit as usize))?
+            let heap = heap_layout_bound::bound(retained, self.entry_limit as usize)?
                 .checked_sub(std::mem::size_of_val(retained))?;
             let entry = std::mem::size_of::<Entry<S>>()
                 .checked_add(heap)?
@@ -623,16 +627,15 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         if (self.count_limit as usize) == 0 || !heap_layout_bound::layout_supported() {
             return refuse(Event::InsertDisabledOrLayoutRefused, incoming);
         }
-        let Some(heap_bytes) =
-            heap_layout_bound::bound(&taken.retained, (self.entry_limit as usize))
-                .and_then(|bytes| bytes.checked_sub(std::mem::size_of_val(&taken.retained)))
+        let Some(heap_bytes) = heap_layout_bound::bound(&taken.retained, self.entry_limit as usize)
+            .and_then(|bytes| bytes.checked_sub(std::mem::size_of_val(&taken.retained)))
         else {
             return refuse(Event::InsertEntryBoundRefused, incoming);
         };
         if !taken.retained.state.supports_frozen_charge() {
             return refuse(Event::InsertFrozenChargeRefused, incoming);
         }
-        let custody_bytes = taken.durable.retained_bytes((self.entry_limit as usize));
+        let custody_bytes = taken.durable.retained_bytes(self.entry_limit as usize);
         let state_bytes = custody_bytes.and_then(|bytes| {
             std::mem::size_of::<Entry<S>>()
                 .checked_add(heap_bytes)?
@@ -641,7 +644,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         let Some(state_bytes) = state_bytes.filter(|n| *n <= (self.entry_limit as usize)) else {
             return refuse(Event::InsertEntryBoundRefused, incoming);
         };
-        if heap_layout_bound::bound(&key, (self.entry_limit as usize) - state_bytes).is_none() {
+        if heap_layout_bound::bound(&key, self.entry_limit as usize - state_bytes).is_none() {
             return refuse(Event::InsertKeyBoundRefused, incoming);
         }
         let extra = entry_slot_bytes::<S>(key.len())
