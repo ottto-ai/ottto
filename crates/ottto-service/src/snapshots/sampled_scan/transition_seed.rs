@@ -86,7 +86,7 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "snapshots/sampled_scan/durable_tail.rs",
         text: include_str!("durable_tail.rs"),
-        sha256: "cfe897560385b43fed8a1e6d60429dce92e365b991d6b058955039295da5c705",
+        sha256: "ff38e11164fad3ee58e34fdef0690886575dcaf931fbac57a65bf5f888bfbb17",
     },
     SourcePin {
         path: "durable_tail_store.rs",
@@ -171,7 +171,7 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "snapshots.rs",
         text: include_str!("../../snapshots.rs"),
-        sha256: "df4fa458a11f4e45199884e69baeebeeb83c9a67f410ba9eac50334d384815b8",
+        sha256: "e564c7d9c396c64f2cf74be3068d278cbe53f95fd2eb12786b909bd8983383c5",
     },
     SourcePin {
         path: "owned_heap.rs",
@@ -309,11 +309,11 @@ fn pinned_v1_refuses_enum_tag_drift() {
 }
 
 #[test]
-fn pinned_v1_refuses_handwritten_codec_order_drift() {
+fn pinned_v1_refuses_selector_codec_order_drift() {
     assert_source_drift_refused(
         "snapshots.rs",
-        "        context.put(e)?;\n        sources.put(e)",
-        "        sources.put(e)?;\n        context.put(e)",
+        "    U context: BTreeMap<String, String>,\n    U sources: BTreeMap<String, String>,",
+        "    U sources: BTreeMap<String, String>,\n    U context: BTreeMap<String, String>,",
     );
 }
 
