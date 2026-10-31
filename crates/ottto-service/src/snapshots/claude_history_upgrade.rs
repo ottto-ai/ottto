@@ -548,9 +548,6 @@ fn holds_until_history_cutoff(inputs: &PolicyInputs<'_>) -> bool {
 /// One page's history budget and its count-only, local diagnostics.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HistoryPage {
-    // ON-only count of history files actually admitted to a parser, including
-    // local work that bypasses the upgrade-only budget. No proof authority.
-    read_files: usize,
     files: usize,
     bytes: u64,
     reserved: BTreeSet<String>,
@@ -577,7 +574,7 @@ pub(crate) struct HistoryPage {
     birth_page_begun: bool,
 }
 
-crate::heap_layout_bound::fields!(HistoryPage; read_files, files, bytes, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index, birth_page_begun);
+crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index, birth_page_begun);
 
 impl HistoryPage {
     /// A page whose twin groups candidate selection already built.
@@ -700,9 +697,15 @@ impl HistoryPage {
             self.family_closure_root_absent_excluded.saturating_add(1);
     }
 
-    pub(super) fn note_history_read(&mut self) {
+    // ON-only count of history files actually admitted to a parser, including
+    // local work that bypasses the upgrade-only budget. No proof authority;
+    // kept in the static diagnostics array so OFF's layout equals main.
+    pub(super) fn note_history_read(&self) {
         if super::claude_terminal_off() {
-            self.read_files = self.read_files.saturating_add(1);
+            crate::local_resource_diagnostics::terminal_off_count(
+                crate::local_resource_diagnostics::TerminalOffCount::HistoryRead,
+                1,
+            );
         }
     }
 
@@ -710,16 +713,19 @@ impl HistoryPage {
         if !super::claude_terminal_off() {
             return;
         }
-        let budget = super::body_witness_adoption_page_budget();
+        let budget = super::body_witness_adoption_page_budget() as u64;
+        let read_files = crate::local_resource_diagnostics::take_terminal_off_count(
+            crate::local_resource_diagnostics::TerminalOffCount::HistoryRead,
+        );
         crate::local_resource_diagnostics::traversal_point(
             "history_upgrade_page",
             "claude_code",
             &std::collections::BTreeMap::from([(
                 "history_upgrade_page",
                 std::collections::BTreeMap::from([
-                    ("admitted_files", self.read_files),
+                    ("admitted_files", read_files),
                     ("budget", budget),
-                    ("extra_files", self.read_files.saturating_sub(budget)),
+                    ("extra_files", read_files.saturating_sub(budget)),
                 ]),
             )]),
         );
