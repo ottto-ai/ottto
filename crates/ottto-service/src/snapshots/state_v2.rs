@@ -21,6 +21,7 @@ pub(super) use runtime::{
     idle, load_locked, published, recovery_save_guard, save_locked, save_oversize_active,
     save_read_admitted, save_read_completed,
 };
+mod catalogue;
 mod codec;
 #[cfg(test)]
 mod field_coverage;
