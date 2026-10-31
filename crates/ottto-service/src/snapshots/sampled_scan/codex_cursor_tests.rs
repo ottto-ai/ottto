@@ -12135,6 +12135,7 @@ fn continuation_prepares_no_group_attempt() {
     });
 }
 
+/// [behaviour]
 #[test]
 fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails() {
     use crate::snapshots::sampled_scan::durable_tail::{Interpretation, RestoreOutcome};
@@ -14657,6 +14658,7 @@ fn decoder_fixed_floor_admits_a_warm_cache_without_evicting_it() {
     });
 }
 
+/// [behaviour]
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
 fn decoder_production_budget_admits_seven_mib_without_eviction_or_yields() {
@@ -14712,7 +14714,7 @@ fn decoder_production_budget_admits_seven_mib_without_eviction_or_yields() {
         fs::write(&archive, bytes).unwrap();
         let candidate = crate::snapshots::codex_zst_refusal_tests::candidate(&archive);
         let archive_key = local_index_key(&archive);
-        let streak = |yielded| codex_compressed_input::admission_streak(&archive_key, yielded);
+        let streak = |yielded| cache.archive_streak(&archive_key, yielded);
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
             // Twelve passes through the real admission point. Each starts one
             // yield short of the alarm, so any yield would raise it.
@@ -15035,6 +15037,7 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
     assert_eq!(durable.restored, 0);
 }
 
+/// [behaviour]
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
 fn inventory_decoder_releases_without_waiting_for_stores_bounded_join() {
@@ -15205,6 +15208,7 @@ pub(in crate::snapshots) fn seed_join_provenance(cache: &SharedCache, owner: &st
         .expect("synthetic cursor lock");
 }
 
+/// [format]
 #[test]
 fn deferred_custody_saves_decision_before_frozen_continuation_and_restart() {
     use crate::local_resource_diagnostics::CodexZstCause;
@@ -15489,6 +15493,7 @@ fn deferred_group_fixture_with_loss(
     (fixture, index, cache, held, prior_body)
 }
 
+/// [money]
 #[test]
 fn deferred_group_preserves_accepted_extent_and_releases_through_existing_ends() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -15609,6 +15614,7 @@ fn deferred_group_preserves_accepted_extent_and_releases_through_existing_ends()
     }
 }
 
+/// [format]
 #[test]
 fn failed_custody_save_survives_preparation_loss_and_job_eviction() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -15684,6 +15690,7 @@ fn failed_custody_save_survives_preparation_loss_and_job_eviction() {
     }
 }
 
+/// [format]
 #[test]
 fn custody_negative_payload_survives_save_failure_funding_refusal_and_restart() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -15810,6 +15817,7 @@ fn custody_negative_payload_survives_save_failure_funding_refusal_and_restart() 
     });
 }
 
+/// [behaviour]
 #[test]
 fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails() {
     use crate::snapshots::sampled_scan::durable_tail::{Interpretation, RestoreOutcome};
@@ -16051,6 +16059,7 @@ fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails
     }
 }
 
+/// [money]
 #[test]
 fn complete_negative_transaction_fences_custom_named_owner_before_publication_after_restart() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -16177,6 +16186,7 @@ fn complete_negative_transaction_fences_custom_named_owner_before_publication_af
     });
 }
 
+/// [off=main]
 #[test]
 fn plain_cursor_resumes_unchanged_when_its_archive_sibling_is_family_held() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -16278,6 +16288,7 @@ fn plain_cursor_resumes_unchanged_when_its_archive_sibling_is_family_held() {
     });
 }
 
+/// [behaviour]
 #[test]
 fn deferred_custody_tail_priority_eof_never_reopens_as_full() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -16437,6 +16448,7 @@ fn deferred_custody_tail_priority_eof_never_reopens_as_full() {
 }
 
 /// Lead B R21: ordinary native unit checks own publication; minting is negative only.
+/// [money]
 #[cfg(unix)]
 #[test]
 fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
@@ -16839,6 +16851,7 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
     }
 }
 
+/// [behaviour]
 #[test]
 fn custody_hold_counts_survive_worker_save_failure_once_across_threads() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -16937,6 +16950,7 @@ fn custody_hold_counts_survive_worker_save_failure_once_across_threads() {
     );
 }
 
+/// [money]
 #[test]
 fn omitted_raw_archive_fences_paused_singleton_and_group_across_reload() {
     if !crate::heap_layout_bound::layout_supported() {

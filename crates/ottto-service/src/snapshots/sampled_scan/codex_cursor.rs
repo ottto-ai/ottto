@@ -70,6 +70,14 @@ const WAITER_FORGET_PAGES: u64 = 64;
 const ROTATION_KEYS: usize = 64;
 /// Owners with B's blocked-owner provenance (§d.1.3, L-1).
 const JOIN_OWNERS: usize = 64;
+/// Consecutive funding yields that alarm and make an archive's residue
+/// `AdmissionStarved`.
+const ARCHIVE_STARVED_YIELDS: u8 = 12;
+/// Tracked archive streak keys; the lowest digest is forgotten past it.
+const ARCHIVE_STREAK_KEYS: usize = 256;
+/// Thread CPU an archive pass may spend across its ordinary and
+/// continuation pages.
+const ARCHIVE_PASS_CPU_MICROS: u64 = 30_000_000;
 /// Bumped when a join or singleton proof rule changes; it is part of every
 /// memo key, so a bump wakes every memoized hold without a timed retry.
 /// U1a-2a (D6(a)): also part of `codex_parent_proof_scope`.
@@ -265,6 +273,58 @@ pub(in crate::snapshots) enum StartRefusal {
     InputsUnavailable,
     /// The held file's stamp could not be read: a retryable read failure.
     Unstartable,
+}
+
+/// Archive catch-up pacing for one ordinary page and its continuation
+/// pages: RAM-only on `ScanIndex`, carried by the continuation inputs, never
+/// durable authority. A refusal never resets it; unknown CPU denies.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ArchivePass {
+    pub(crate) started: bool,
+    pub(crate) cpu: u64,
+    pub(crate) work: u64,
+    pub(crate) power: bool,
+    pub(crate) prep_after: Option<String>,
+}
+crate::heap_layout_bound::fields!(ArchivePass; started, cpu, work, power, prep_after);
+
+impl ArchivePass {
+    /// A new ordinary pass: fresh counters and the prepare-time power gate;
+    /// the cached-archive walk position carries over.
+    pub(crate) fn prepare(&mut self) {
+        *self = Self {
+            prep_after: self.prep_after.take(),
+            power: crate::snapshot_sync::archive_power_ready(),
+            ..Self::default()
+        };
+    }
+
+    /// Archive work may start now: prepare-time and live power, the pass's
+    /// CPU and work (continuation's contention threshold), and `remaining`
+    /// page bytes.
+    pub(crate) fn ready(&self, remaining: u64) -> bool {
+        self.power
+            && crate::snapshot_sync::archive_acquisition_power_ready(self.power)
+            && self.cpu < ARCHIVE_PASS_CPU_MICROS
+            && remaining > 0
+            && crate::snapshot_sync::archive_work_ready(self.work)
+    }
+
+    /// One step's thread CPU (`None`: unknown) and wall time. CPU counts
+    /// once archive work started; unknown CPU then exhausts the pass.
+    pub(crate) fn observe(&mut self, cpu: Option<u64>, wall: u64) {
+        if self.started || cpu.is_none() {
+            self.cpu = cpu.map_or(u64::MAX, |cpu| self.cpu.saturating_add(cpu));
+        }
+        self.work = self.work.saturating_add(wall);
+    }
+}
+
+impl PageBudget {
+    /// `ArchivePass::ready` with this page's singleton bytes.
+    pub(in crate::snapshots) fn archive_ready(&self, pass: &ArchivePass) -> bool {
+        pass.ready(self.singleton_remaining(Limits::current()))
+    }
 }
 
 impl PageBudget {
@@ -2090,6 +2150,53 @@ impl CursorState {
     }
 }
 
+impl SharedCache {
+    /// Archive `key`'s funding streak: a yield extends it (returned, capped
+    /// past the threshold); funding or retirement (`!yielded`) forgets it.
+    /// A restart starts every streak again.
+    pub(in crate::snapshots) fn archive_streak(&self, key: &str, yielded: bool) -> u8 {
+        let digest = ticket_digest(b"archive_streak", &[key.as_bytes()]);
+        self.with_cursor(|cursor| {
+            let streaks = &mut cursor.archive_streaks;
+            let previous = streaks.remove(&digest).unwrap_or(0);
+            if !yielded {
+                return 0;
+            }
+            if streaks.len() == ARCHIVE_STREAK_KEYS {
+                streaks.pop_first();
+            }
+            let count = previous.saturating_add(1).min(ARCHIVE_STARVED_YIELDS + 1);
+            streaks.insert(digest, count);
+            count
+        })
+        .unwrap_or(0)
+    }
+
+    /// Starved archive keys, optionally only `key`.
+    pub(in crate::snapshots) fn archive_starved_count(&self, key: Option<&str>) -> usize {
+        let digest = key.map(|key| ticket_digest(b"archive_streak", &[key.as_bytes()]));
+        self.with_cursor(|cursor| {
+            cursor
+                .archive_streaks
+                .iter()
+                .filter(|(k, n)| **n >= ARCHIVE_STARVED_YIELDS && digest.map_or(true, |d| d == **k))
+                .count()
+        })
+        .unwrap_or(0)
+    }
+
+    /// The yield that reaches the threshold alarms once.
+    pub(in crate::snapshots) fn archive_yield(&self, key: &str) {
+        if self.archive_streak(key, true) == ARCHIVE_STARVED_YIELDS {
+            crate::local_resource_diagnostics::traversal_point(
+                "codex_zst_admission_alarm",
+                "codex",
+                &serde_json::json!({"consecutive_yields": ARCHIVE_STARVED_YIELDS, "admission_starved_count": self.archive_starved_count(None)}),
+            );
+        }
+    }
+}
+
 /// One owner's L-1 provenance: (LRU tick, member keys joined by '\0').
 type JoinProvenance = (u64, String);
 
@@ -2408,6 +2515,8 @@ pub(in crate::snapshots) struct CursorState {
     proof_due: Option<(String, bool)>,
     /// Stage 1 guard (§6): huge keys' last attempts (inline, never walked).
     pace: PaceTable,
+    /// Archive keys' consecutive funding yields (`archive_streak`), charged.
+    archive_streaks: BTreeMap<[u8; 32], u8>,
 }
 
 impl Default for CursorState {
@@ -2438,6 +2547,7 @@ impl Default for CursorState {
             proof_rotation: Rotation::default(),
             proof_due: None,
             pace: PaceTable::default(),
+            archive_streaks: BTreeMap::new(),
         }
     }
 }
@@ -2473,6 +2583,7 @@ impl HeapLayoutBound for CursorState {
             // Stage 1 guard: inline slots and deadline, no heap; charged once
             // through this state's `size_of_val` (`bound`).
             pace: _,
+            archive_streaks,
         } = self;
         // The paused job was walked once when it paused; its charge stays
         // fixed while it sits here because nothing mutates a paused parser.
@@ -2507,7 +2618,8 @@ impl HeapLayoutBound for CursorState {
         // U1a-2a: a suspended proof is charged its walked bound.
         proof.heap_bound(c)?;
         proof_rotation.heap_bound(c)?;
-        proof_due.heap_bound(c)
+        proof_due.heap_bound(c)?;
+        archive_streaks.heap_bound(c)
     }
 }
 

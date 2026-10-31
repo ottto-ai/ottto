@@ -218,13 +218,16 @@ fn parser_admission_ru_ends_at_own_twelfth_yield() {
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let f = correction_archive();
-    let key = local_index_key(&f.0);
-    admission_streak(&key, false);
+    // One process cache whose single decoder is taken (where funding exists).
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let busy = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+        .ok()
+        .flatten();
     for attempt in 1..=12 {
-        let (_, result, rows, _) = archive_pass_with(
+        let (_, result, rows, _) = archive_pass_in(
             &f,
             ScanIndex::default(),
-            false,
+            Some(cache.clone()),
             None,
             &[],
             archive_ru_healthy_sibling,
@@ -243,18 +246,20 @@ fn parser_admission_ru_ends_at_own_twelfth_yield() {
                 .any(|r| r["stage"] == "codex_zst_admission_alarm"));
         }
     }
-    admission_streak(&key, false);
+    if let Some(busy) = busy {
+        busy.close();
+    }
 }
 
 #[test]
 fn parser_errors_without_admission_yield_or_bodyless_pending_have_no_generic_ru() {
     let f = ArchiveFixture::new(b"classification-only");
     let key = local_index_key(&f.0);
-    admission_streak(&key, false);
     let mut index = ScanIndex::default();
     let mut census = ScanCensus::default();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
         census.archive_parser_failure(
+            None,
             SnapshotSource::Codex,
             &index,
             &f.0,
@@ -270,6 +275,7 @@ fn parser_errors_without_admission_yield_or_bodyless_pending_have_no_generic_ru(
     index.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence.clone()));
     let mut pending = ScanCensus::default();
     pending.archive_parser_failure(
+        None,
         SnapshotSource::Codex,
         &index,
         &f.0,
@@ -283,6 +289,7 @@ fn parser_errors_without_admission_yield_or_bodyless_pending_have_no_generic_ru(
     index.files.get_mut(&key).unwrap().archive = Some(Box::new(evidence));
     let mut body_retained = ScanCensus::default();
     body_retained.archive_parser_failure(
+        None,
         SnapshotSource::Codex,
         &index,
         &f.0,
@@ -335,6 +342,7 @@ fn scoped_header_and_constructor_failures_survive_witness_without_terminal_archi
                     .archive_residue(&f.0, archive_evidence(&scan.index, &f).into(), cause);
             } else {
                 scan.census.archive_parser_failure(
+                    None,
                     SnapshotSource::Codex,
                     &scan.index,
                     &f.0,

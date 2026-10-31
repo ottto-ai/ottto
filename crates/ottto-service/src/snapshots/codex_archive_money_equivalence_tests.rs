@@ -33,7 +33,7 @@ fn discovered_scan(f: &ArchiveFixture, mut index: ScanIndex, limit: usize) -> Ow
 
 #[test]
 fn fake_thread_cpu_and_clock_enforce_archive_boundary_pacing() {
-    use crate::snapshots::codex_archive_catchup::Pass;
+    use crate::snapshots::sampled_scan::ArchivePass as Pass;
     let mut pass = Pass::default();
     assert!(!pass.ready(1));
     pass.power = true;

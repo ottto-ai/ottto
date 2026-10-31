@@ -6796,7 +6796,7 @@ fn prepare_sync_source_inner(
 struct ContinuationInputs {
     codex_preludes: std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
     codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
-    archive_pass: crate::snapshots::codex_archive_catchup::Pass,
+    archive_pass: crate::snapshots::sampled_scan::ArchivePass,
     account_witness: [u8; 32],
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,

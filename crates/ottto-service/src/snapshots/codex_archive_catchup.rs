@@ -1,36 +1,3 @@
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Pass {
-    pub started: bool,
-    pub cpu: u64,
-    pub work: u64,
-    pub power: bool,
-    pub prep_after: Option<String>,
-}
-crate::heap_layout_bound::fields!(Pass; started, cpu, work, power, prep_after);
-impl Pass {
-    pub fn prepare(&mut self) {
-        let prep_after = self.prep_after.take();
-        *self = Self {
-            prep_after,
-            ..Self::default()
-        };
-        self.power = crate::snapshot_sync::archive_power_ready();
-    }
-    pub fn ready(&self, remaining: u64) -> bool {
-        self.power
-            && crate::snapshot_sync::archive_acquisition_power_ready(self.power)
-            && self.cpu < 30_000_000
-            && remaining > 0
-            && crate::snapshot_sync::archive_work_ready(self.work)
-    }
-    pub fn observe(&mut self, cpu: Option<u64>, wall: u64) {
-        if self.started || cpu.is_none() {
-            self.cpu = cpu.map_or(u64::MAX, |cpu| self.cpu.saturating_add(cpu));
-        }
-        self.work = self.work.saturating_add(wall);
-    }
-}
-
 use super::*;
 use codex_compressed_input::{HeaderRead, HeaderWork};
 
@@ -116,10 +83,7 @@ impl ScanIndex {
         if inventory.is_some_and(|inventory| !inventory.complete) {
             return Ok(Admission::Deferred);
         }
-        if !self
-            .archive_pass
-            .ready(budget.singleton_remaining(sampled_scan::codex_cursor::Limits::current()))
-        {
+        if !budget.archive_ready(&self.archive_pass) {
             return Ok(Admission::Deferred);
         }
         // An unchanged pending object already has a validated header. The
@@ -161,10 +125,7 @@ impl ScanIndex {
         {
             return Ok(Admission::Deferred);
         }
-        if !self
-            .archive_pass
-            .ready(budget.singleton_remaining(sampled_scan::codex_cursor::Limits::current()))
-        {
+        if !budget.archive_ready(&self.archive_pass) {
             return Ok(Admission::Deferred);
         }
         crate::context_composition::set_utility_qos();

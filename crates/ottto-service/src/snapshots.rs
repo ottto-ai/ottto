@@ -3483,7 +3483,7 @@ pub struct ScanIndex {
     claude_account_window_retention: account_pending_retention::Counts,
     /// RAM-only pacing spans ordinary + continuation pages, never durable authority.
     #[serde(skip)]
-    pub(crate) archive_pass: codex_archive_catchup::Pass,
+    pub(crate) archive_pass: sampled_scan::ArchivePass,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
     #[serde(default)]
@@ -27961,7 +27961,7 @@ impl OwnedSourceScan {
                     let remaining = codex_page
                         .singleton_remaining(sampled_scan::codex_cursor::Limits::current());
                     inventory.archive_work.allowed = allowed
-                        && index.archive_pass.ready(remaining)
+                        && codex_page.archive_ready(&index.archive_pass)
                         && remaining >= 2 * codex_file_join::MAX_HEADER_BYTES as u64;
                     if inventory.archive_work.allowed {
                         crate::context_composition::set_utility_qos();
@@ -29242,7 +29242,7 @@ impl OwnedSourceScan {
                     .reader
                     .reader
                     .is_compressed()
-                    .then(codex_compressed_input::thread_cpu_micros);
+                    .then(crate::context_composition::thread_cpu_micros);
                 index.archive_pass.started |= archive_started.is_some();
                 let mut group_end = None;
                 let stepped = if active.group.is_some() {
@@ -29300,9 +29300,12 @@ impl OwnedSourceScan {
                 if let (Some(started), Some(inventory)) =
                     (archive_started, codex_join_inventory.as_mut())
                 {
+                    // Unknown CPU exhausts the header work: unknown is denied.
                     inventory.archive_work.cpu_micros =
                         inventory.archive_work.cpu_micros.saturating_add(
-                            codex_compressed_input::thread_cpu_micros().saturating_sub(started),
+                            started
+                                .zip(crate::context_composition::thread_cpu_micros())
+                                .map_or(u64::MAX, |(started, ended)| ended.saturating_sub(started)),
                         );
                 }
                 if let Some(header) = active.parser.reader.header_validated.take() {
@@ -29488,6 +29491,7 @@ impl OwnedSourceScan {
                         index.archive_decode_error(&active.candidate.path, &error);
                         active.parser.reader.reader.close();
                         census.archive_failure(
+                            sampling.as_ref().map(|context| &*context.cache),
                             index,
                             &active.candidate.path,
                             UnreadableCause::OpenRead,
@@ -32230,6 +32234,9 @@ impl OwnedSourceScan {
                         }
                         if !index.files.contains_key(index_key) {
                             index.drop_codex_proof_items(index_key, codex_side_drop);
+                            if let Some((cache, _)) = codex_side_drop {
+                                cache.archive_streak(index_key, false);
+                            }
                         }
                     }
                 }
@@ -32556,7 +32563,11 @@ impl OwnedSourceScan {
                     .saturating_add(usize::from(needs_clean_followup))
                     .saturating_add(usize::from(parent_resolution_restart));
                 if raw_census_complete {
-                    index.record_scan_residue_witness(source, &traversal_snapshot);
+                    index.record_scan_residue_witness(
+                        source,
+                        &traversal_snapshot,
+                        sampling.as_ref().map(|context| &*context.cache),
+                    );
                     index.retain_observed_claude_account_deferred_holds(
                         &traversal_snapshot.observed_index_keys,
                     );
@@ -33809,9 +33820,7 @@ impl OwnedSourceScan {
                 .get(&local_index_key(&candidate.path))
                 .and_then(|e| e.archive.as_ref())
                 .is_some_and(|a| a.user_change && a.matches(&opened_file))
-                && !index.archive_pass.ready(
-                    codex_page.singleton_remaining(sampled_scan::codex_cursor::Limits::current()),
-                )
+                && !codex_page.archive_ready(&index.archive_pass)
             {
                 let archive = index
                     .files
@@ -33885,9 +33894,7 @@ impl OwnedSourceScan {
             // retain the candidate and all paid/header/CPU/work evidence.
             if source == SnapshotSource::Codex
                 && codex_archive_path(&candidate.path)
-                && !index.archive_pass.ready(
-                    codex_page.singleton_remaining(sampled_scan::codex_cursor::Limits::current()),
-                )
+                && !codex_page.archive_ready(&index.archive_pass)
             {
                 sampled_scan::codex_cursor::requeue(index, &codex_selected_flags, &candidate);
                 residue_index_keys.insert(local_index_key(&candidate.path));
@@ -33922,7 +33929,13 @@ impl OwnedSourceScan {
                             &candidate.path,
                         );
                     }
-                    census.archive_parser_failure(source, index, &candidate.path, &error);
+                    census.archive_parser_failure(
+                        sampling.as_ref().map(|context| &*context.cache),
+                        source,
+                        index,
+                        &candidate.path,
+                        &error,
+                    );
                     pending!();
                 }
             };
@@ -44989,7 +45002,9 @@ fn reconcile_missing_index_entries_with_side(
         {
             index.record_confirmed_absent_claude_account_member(key);
             index.files.remove(key);
-            codex_compressed_input::admission_streak(key, false);
+            if let Some((cache, _)) = codex_side_drop {
+                cache.archive_streak(key, false);
+            }
             index.confirmed_empty_files.remove(key);
             index.file_snapshot_fingerprints.remove(key);
             index.claude_account_deferred_holds.remove(key);
@@ -48055,6 +48070,7 @@ impl ScanIndex {
         &mut self,
         source: SnapshotSource,
         traversal: &ScanTraversalCheckpoint,
+        cache: Option<&sampled_scan::SharedCache>,
     ) {
         let archive_residue = source == SnapshotSource::Codex
             && traversal.residue.index_keys.iter().any(|key| {
@@ -48062,7 +48078,7 @@ impl ScanIndex {
                     .get(key)
                     .and_then(|e| e.archive.as_ref())
                     .is_some_and(|a| a.terminal_cause().is_some())
-                    || codex_compressed_input::admission_starved_count(Some(key)) > 0
+                    || cache.is_some_and(|cache| cache.archive_starved_count(Some(key)) > 0)
                     || is_compressed_codex_rollout(Some(Path::new(key)), None)
             });
         let next = traversal
@@ -51732,7 +51748,6 @@ impl ScanIndex {
         }
         self.record_confirmed_absent_claude_account_member(key);
         self.files.remove(key);
-        codex_compressed_input::admission_streak(key, false);
         self.terminal_jsonl_dispositions.remove(key);
         self.confirmed_empty_files.remove(key);
         self.file_snapshot_fingerprints.remove(key);

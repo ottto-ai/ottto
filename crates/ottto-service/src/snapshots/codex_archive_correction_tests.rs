@@ -379,10 +379,6 @@ fn rotating_admission_starvation_is_per_archive_and_alarm_reports_source_count()
     let _lock = ARCHIVE_TEST_LOCK
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    STREAKS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clear();
     let a = correction_archive();
     let b = correction_archive();
     let c = correction_archive();
@@ -405,35 +401,56 @@ fn rotating_admission_starvation_is_per_archive_and_alarm_reports_source_count()
     };
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
         for pass in 1..=12 {
-            assert!(admit(&a, None).is_err());
-            assert!(admit(&b, None).is_err());
+            let busy = OpenedInput::funded(File::open(&c.0).unwrap(), &cache)
+                .unwrap()
+                .unwrap();
+            assert!(admit(&a, Some(&cache)).is_err());
+            assert!(admit(&b, Some(&cache)).is_err());
+            busy.close();
             admit(&c, Some(&cache)).unwrap().reader.reader.close();
-            assert_eq!(admission_starved_count(None), if pass < 12 { 0 } else { 2 });
+            assert_eq!(
+                cache.archive_starved_count(None),
+                if pass < 12 { 0 } else { 2 }
+            );
         }
     });
     assert!(
-        (admission_starved_count(Some(&keys[0])) > 0)
-            && (admission_starved_count(Some(&keys[1])) > 0)
+        (cache.archive_starved_count(Some(&keys[0])) > 0)
+            && (cache.archive_starved_count(Some(&keys[1])) > 0)
     );
     assert!(rows
         .iter()
         .any(|r| r["stage"] == "codex_zst_admission_alarm"
             && r["counts"]["admission_starved_count"] == 2));
     let mut census = ScanCensus::default();
-    census.archive_failure(&ScanIndex::default(), &a.0, UnreadableCause::Reduction);
-    census.archive_failure(&ScanIndex::default(), &b.0, UnreadableCause::Reduction);
+    census.archive_failure(
+        Some(&cache),
+        &ScanIndex::default(),
+        &a.0,
+        UnreadableCause::Reduction,
+    );
+    census.archive_failure(
+        Some(&cache),
+        &ScanIndex::default(),
+        &b.0,
+        UnreadableCause::Reduction,
+    );
     assert_eq!(census.unreadable_path_count, 0);
     admit(&a, Some(&cache)).unwrap().reader.reader.close();
-    assert_eq!(admission_starved_count(Some(&keys[0])), 0);
-    assert_eq!(admission_starved_count(Some(&keys[1])), 1);
-    assert_eq!(admission_starved_count(None), 1);
+    assert_eq!(cache.archive_starved_count(Some(&keys[0])), 0);
+    assert_eq!(cache.archive_starved_count(Some(&keys[1])), 1);
+    assert_eq!(cache.archive_starved_count(None), 1);
     let mut after = ScanCensus::default();
-    after.archive_failure(&ScanIndex::default(), &a.0, UnreadableCause::Reduction);
+    after.archive_failure(
+        Some(&cache),
+        &ScanIndex::default(),
+        &a.0,
+        UnreadableCause::Reduction,
+    );
     assert_eq!(
         after.unreadable_path_count, 1,
         "A left the admission residue"
     );
-    admission_streak(&keys[1], false);
 }
 
 #[test]
