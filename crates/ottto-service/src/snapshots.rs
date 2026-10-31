@@ -44444,6 +44444,12 @@ fn is_recent_enough_at(
     modified_unix_seconds >= now_unix_seconds.saturating_sub(window_seconds)
 }
 
+/// Per-caller derived view, bounded by the held inventory; never move proof.
+struct AccountMoveObservations {
+    paths: BTreeMap<String, Vec<String>>,
+    through: Option<String>,
+}
+
 /// Owed-key discovery retention, the one shared exemption from the discovery
 /// window (`docs/diagnostics.md`, "Owed-key discovery retention"). Contract: a
 /// key owed by any registered source stays discoverable and observed whatever
@@ -49913,7 +49919,7 @@ impl ScanIndex {
 
     /// At most two observed paths per held member suffice to answer "another
     /// path?" for every key. This is transient derived scratch, never move proof.
-    fn observed_account_members(&self) -> BTreeMap<String, Vec<String>> {
+    fn observed_account_members(&self) -> AccountMoveObservations {
         let held = self.held_move_sources();
         let mut members: BTreeMap<String, Vec<String>> = BTreeMap::new();
         if !held.is_empty() {
@@ -49933,7 +49939,17 @@ impl ScanIndex {
                 }
             }
         }
-        members
+        AccountMoveObservations {
+            paths: members,
+            through: (self.claude_account_deferred_holds.len() > MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
+                .then(|| {
+                    self.claude_account_deferred_holds
+                        .keys()
+                        .nth(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS - 1)
+                        .cloned()
+                })
+                .flatten(),
+        }
     }
 
     /// Correctness custody follows a proven physical generation before the age gate.
@@ -51156,12 +51172,18 @@ impl ScanIndex {
 
     /// Retire only obligations made unfulfillable by positively proven absence.
     /// Codex protection retains the entry and its own lineage/receipt state.
-    fn retire_absent_account_hold(
-        &mut self,
-        key: &str,
-        members: &BTreeMap<String, Vec<String>>,
-    ) -> bool {
+    fn retire_absent_account_hold(&mut self, key: &str, members: &AccountMoveObservations) -> bool {
         if !self.claude_account_deferred_holds.contains_key(key) {
+            return false;
+        }
+        // Reconciliation/hints may name an imported tail outside the view's
+        // bounded prefix. Missing lookup coverage is uncertainty, never absence.
+        if members
+            .through
+            .as_ref()
+            .is_some_and(|last| key > last.as_str())
+        {
+            self.withheld_memo.reset_absence(key);
             return false;
         }
         if self.traversal.as_ref().is_some_and(|walk| {
@@ -51169,6 +51191,7 @@ impl ScanIndex {
                 || walk.counts.directory_entry_cap_exceeded_count != 0
                 || claude_index_path_family_member(Path::new(key)).is_some_and(|(_, member)| {
                     members
+                        .paths
                         .get(&member)
                         .is_some_and(|paths| paths.iter().any(|other| other != key))
                 })

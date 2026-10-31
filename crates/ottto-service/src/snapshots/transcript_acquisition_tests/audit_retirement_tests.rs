@@ -2206,6 +2206,14 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
         index.claude_account_deferred_holds.contains_key(&eligible),
         "over-bound imported tail was not probed or dropped"
     );
+    // Indexed/hint callers can name an imported tail too; the central gate
+    // must keep it even with memo capacity and two spaced secure absences.
+    let members = index.observed_account_members();
+    for now in [1_000, 1_600] {
+        sampled_scan::set_test_now(Some(now));
+        assert!(!index.retire_absent_account_hold(&eligible, &members));
+        assert!(index.claude_account_deferred_holds.contains_key(&eligible));
+    }
     index
         .claude_account_deferred_holds
         .retain(|key, _| key == &eligible);

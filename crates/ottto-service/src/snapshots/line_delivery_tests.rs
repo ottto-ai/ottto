@@ -2170,7 +2170,12 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
                 new_key.clone(),
                 resolved.file_snapshot_fingerprints[&new_key].clone(),
             );
-            raced.accepted_snapshot_fingerprints = resolved.accepted_snapshot_fingerprints.clone();
+            raced
+                .accepted_snapshot_fingerprints
+                .extend(resolved.accepted_snapshot_fingerprints.clone());
+            raced
+                .snapshot_activity_at
+                .extend(resolved.snapshot_activity_at.clone());
             let opened = claude_context_file_birth::ClaudeOpenedBirth::from_metadata(
                 &fs::metadata(&moved).unwrap(),
             );
