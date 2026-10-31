@@ -1596,6 +1596,8 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
             let store::ReadOutcome::Found(record) = disk.read(&store::key_digest(ds, &key)) else {
                 panic!("the native predecessor is verified");
             };
+            let original_due = index.files[&key].unverified_deadline().unwrap();
+            assert_eq!(record.envelope_audit_debt, Some(original_due));
             // Binding OFF ruling: OFF never writes records. Reproduce the
             // historical V1 writer with the existing checked byte fixture.
             let record = if fault == "legacy_index_clear" {
@@ -1618,11 +1620,8 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
                 },
                 "the legacy fault requires a real V1 predecessor"
             );
-            assert_eq!(
-                record.envelope_audit_debt.is_some(),
-                fault != "legacy_index_clear",
-                "V3 carries envelope debt; V1 keeps the deadline in the index"
-            );
+            assert_eq!(record.envelope_audit_debt, Some(original_due));
+            assert_eq!(index.files[&key].unverified_deadline(), Some(original_due));
             assert!(index.files[&key].has_unverified_source());
             let full_time = cache
                 .retained_checkpoint(&key)
@@ -1647,6 +1646,8 @@ fn durable_quiet_retirement_faults(faults: &[&str]) {
             if fault == "legacy_index_clear" {
                 // Reproduce the old broken index-saved/old-record window, and
                 // force its next actual visit without granting a new revision.
+                assert_eq!(record.envelope_audit_debt, Some(original_due));
+                assert_eq!(index.files[&key].unverified_deadline(), Some(original_due));
                 let fp = index.files[&key].source_file_fingerprint.clone();
                 assert!(index.retire_quiet_audit(&key, &fp));
                 index.files.get_mut(&key).unwrap().last_snapshot_fingerprint = None;

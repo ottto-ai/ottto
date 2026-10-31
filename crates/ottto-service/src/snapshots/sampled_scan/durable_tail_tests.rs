@@ -4655,6 +4655,12 @@ pub(crate) fn seed_pinned_v1(
         other => panic!("{other:?}"),
     };
     let mut pending = record.record;
+    // Decoding drops certificate debt. Reconstruct the historical writer's
+    // envelope obligation from the current index, as the live writer does.
+    pending.certificate.audit_debt_unix_seconds =
+        certificate_at(key, &checkpoint, index, super::super::now_seconds())
+            .unwrap()
+            .audit_debt_unix_seconds;
     pending.binding.scope = scope_for(
         ds,
         source,
@@ -13207,10 +13213,12 @@ fn off_no_record_growth_uses_ordinary_full_without_store_io() {
         assert_eq!(modes.1, 0);
         a1a_wire(&root, &mut prior, &mut grown);
         assert_eq!(grown.snapshots[0].input_tokens, 300);
-        assert!(owner
+        let (_, disk) = owner
             .cache
             .durable_counters(SnapshotSource::ClaudeCode)
-            .is_none());
+            .expect("begin_durable configures an inert OFF slot");
+        // Includes reads, writes, GC, guards, repairs and resource probes.
+        assert_eq!(disk, store::StoreCounters::default());
         assert!(!store::store_dir_for_index(&index_path).exists());
     });
 }
