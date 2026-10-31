@@ -1094,9 +1094,9 @@ fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let header = tx.get(&key).unwrap().unwrap();
     assert_eq!(value(&mut tx, &header), b"old");
 }
-/// [format] sqlite full at commit or chunk write rolls back the complete save.
+/// [format] sqlite full at a row or chunk write rolls back the complete save.
 #[test]
-fn sqlite_full_at_commit_or_chunk_write_rolls_back_the_complete_save() {
+fn sqlite_full_at_row_or_chunk_write_rolls_back_the_complete_save() {
     struct JsonChunk;
     impl Value for JsonChunk {
         fn write(&self, out: &mut dyn Write) -> Result<()> {
@@ -1110,22 +1110,33 @@ fn sqlite_full_at_commit_or_chunk_write_rolls_back_the_complete_save() {
         let tmp = Scratch::new();
         let mut db = tmp.live_store();
         let key = traversal("uncommitted".into());
+        // SQLite's own page cap stands in for a full disk.
+        sqlite::cap_pages(&db);
         let mut tx = db.begin(TxnMode::Write).unwrap();
         put(&mut tx, &key, b"evidence");
-        if chunk_write {
-            sqlite::fail_part_full_for_test();
-            let error = tx
-                .put(RowInput {
-                    value_version: 1,
-                    key: &traversal("chunked".into()),
-                    fixed: &Fixed::None,
-                    value: &JsonChunk,
-                })
-                .unwrap_err();
-            assert!(sqlite::disk_full(&error));
+        let error = if chunk_write {
+            tx.put(RowInput {
+                value_version: 1,
+                key: &traversal("chunked".into()),
+                fixed: &Fixed::None,
+                value: &JsonChunk,
+            })
+            .unwrap_err()
         } else {
-            sqlite::fail_commit_full_for_test();
-        }
+            // Inline rows fill the free page space, then need a new page.
+            (0..)
+                .find_map(|n| {
+                    tx.put(RowInput {
+                        value_version: 1,
+                        key: &traversal(format!("row-{n}")),
+                        fixed: &Fixed::None,
+                        value: &Bytes(vec![b'x'; 512]),
+                    })
+                    .err()
+                })
+                .unwrap()
+        };
+        assert!(sqlite::disk_full(&error));
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::NotPublished);
         assert_eq!(db.save_failure(), Some(Hold::SaveFull));
         assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(0));

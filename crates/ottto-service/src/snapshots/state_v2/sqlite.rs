@@ -861,13 +861,6 @@ impl Store for Sqlite {
         } else {
             self.conn()?.execute_batch("BEGIN")?;
         }
-        let dirty_bytes = 0;
-        #[cfg(test)]
-        let dirty_bytes = if mode == TxnMode::Write {
-            fixtures::next_save_bytes()
-        } else {
-            dirty_bytes
-        };
         Ok(Txn {
             store: self,
             write: mode == TxnMode::Write,
@@ -878,7 +871,7 @@ impl Store for Sqlite {
             shared_erasure: false,
             failed: false,
             changed: BTreeMap::new(),
-            dirty_bytes,
+            dirty_bytes: 0,
             estimated_pages: 0,
             dirty_rows: 0,
         })
@@ -1212,7 +1205,7 @@ impl Txn<'_> {
         }
         // Targets size the NEXT collection page; the complete dirty delta may
         // exceed them. Only the hard charged-work ceiling refuses publication.
-        if self.dirty_bytes > SAVE_CEILING_BYTES {
+        if self.dirty_bytes > self.store.purge_policy.save_ceiling {
             self.store.save_failure = Some(Hold::SaveCeiling);
             telemetry::event("save_ceiling_alarm", &self.dirty_bytes);
             anyhow::bail!(Hold::SaveCeiling);
@@ -1350,13 +1343,6 @@ impl PartWriter<'_> {
     fn part(&mut self) -> io::Result<()> {
         if self.bytes.is_empty() {
             return Ok(());
-        }
-        #[cfg(test)]
-        if fixtures::part_full() {
-            return Err(io::Error::other(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
-                None,
-            )));
         }
         self.conn
             .execute(
@@ -1706,14 +1692,6 @@ impl Txn<'_> {
         }
         let started = Instant::now();
         let result = (|| -> Result<()> {
-            #[cfg(test)]
-            if fixtures::commit_full() {
-                return Err(rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
-                    None,
-                )
-                .into());
-            }
             self.store.conn()?.execute_batch("COMMIT")?;
             Ok(())
         })();

@@ -31,6 +31,24 @@ fn save_with_mode(
 /// Generation of a freshly imported native fixture store.
 const G: u64 = 1;
 
+/// Apply a per-store seam to the live session store behind `index`; the
+/// failed save's reload reopens the store without it.
+pub(super) fn with_session_db(index: &ScanIndex, f: impl FnOnce(&mut sqlite::Sqlite)) {
+    let runtime = index.v2().persistence_v2.as_ref().unwrap();
+    let mut guard = runtime.session.lock().unwrap();
+    f(&mut guard.as_mut().unwrap().db);
+}
+/// Cap the session at its current pages and add enough new rows that the
+/// next save must grow the file: SQLite's own SQLITE_FULL, no fault knob.
+fn fill_session(index: &mut ScanIndex) {
+    with_session_db(index, |db| sqlite::cap_pages(db));
+    for n in 0..2048 {
+        index
+            .accepted_snapshot_fingerprints
+            .insert(format!("{n:064x}"));
+    }
+}
+
 struct Fixture {
     support: PathBuf,
     path: PathBuf,
@@ -1043,7 +1061,7 @@ fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
     f.published();
     let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
     assert_eq!(collection_page_limit(&index, 250), 250);
-    sqlite::seed_next_save_bytes_for_test(256 * 1024 * 1024);
+    with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
     let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
     assert_eq!(collection_page_limit(&index, 250), 125);
@@ -1088,7 +1106,7 @@ fn page_one_oversize_holds_and_fences_upload_ack_and_publication() {
     f.published();
     let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
     assert_eq!(collection_page_limit(&index, 1), 1);
-    sqlite::seed_next_save_bytes_for_test(256 * 1024 * 1024);
+    with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
     let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveOversize));
     let current = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
@@ -1112,7 +1130,7 @@ fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
-    sqlite::fail_commit_full_for_test();
+    fill_session(&mut index);
     let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveFull));
     let mut retry = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
@@ -1188,7 +1206,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let committed_generation = current.generation;
     let committed_context = current.upload_context_fingerprint.clone();
     current.upload_context_fingerprint = Some("uncommitted-context".into());
-    sqlite::fail_commit_full_for_test();
+    fill_session(&mut current);
     assert!(save_locked(
         &f.path,
         &mut current,

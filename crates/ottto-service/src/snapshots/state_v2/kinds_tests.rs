@@ -436,7 +436,13 @@ fn whole_delta_stages_before_begin_and_calls_gc_only_after_commit() {
     hooks.0.clear();
     let mut retry = current.clone();
     retry.upload_context_fingerprint = Some("never-committed".into());
-    sqlite::fail_commit_full_for_test();
+    // Enough new rows that the save must grow the file past SQLite's page cap.
+    for n in 0..2048 {
+        retry
+            .accepted_snapshot_fingerprints
+            .insert(format!("{n:064x}"));
+    }
+    sqlite::cap_pages(&db);
     assert!(save_graph(&mut db, &identity, &current, &mut retry, &mut cx, &mut hooks).is_err());
     assert_eq!(hooks.0, ["plan", "preflight", "stage"]);
     assert!(!cx.valid && cx.ambiguous);
