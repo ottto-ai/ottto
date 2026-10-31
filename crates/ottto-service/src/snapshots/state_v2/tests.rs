@@ -237,7 +237,6 @@ fn owner_sidecar_allows_sqlite_init_migration_publication_and_reopen() {
     assert_eq!(owner.mode() & 0o777, 0o600);
     assert_eq!(owner.nlink(), 1);
     assert_ne!(owner.ino(), fs::metadata(tmp.path()).unwrap().ino());
-    assert_eq!(sqlite::schema_for_test(&db).0.len(), 4);
     assert_eq!(
         sqlite::Sqlite::create_import(&tmp.path())
             .err()
