@@ -21575,7 +21575,7 @@ mod tests {
         assert_eq!(status["manifest"]["window_start"], manifest.window_start);
         assert_eq!(status["manifest"]["window_end"], manifest.window_end);
         assert_eq!(status["manifest"]["rolling_hash"], manifest.rolling_hash);
-        assert_eq!(scan_request_window_days(183, false), u64::MAX);
+        assert_eq!(scan_request_window_days(183, true), u64::MAX);
     }
 
     #[test]
