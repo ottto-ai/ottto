@@ -146,7 +146,7 @@ impl Fixture {
         }
         drop(guard);
         with_state(&self.path, |state| {
-            state.cached = Some(index.clone());
+            state.save_baseline = None;
             Ok(())
         })
         .unwrap();

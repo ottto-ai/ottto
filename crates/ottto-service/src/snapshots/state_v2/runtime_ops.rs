@@ -16,14 +16,6 @@ pub(in super::super::super) fn before_collection(index: &ScanIndex) -> Result<()
         ensure!(!state.custody_held(), Hold::AckCustody);
         Ok(())
     }))?;
-    if telemetry::sample_cached_graph() {
-        with_state(&path, |state| {
-            if let Some(cached) = &state.cached {
-                telemetry::retained(cached, "cached_graph");
-            }
-            Ok(())
-        })?;
-    }
     if !due {
         return Ok(());
     }
