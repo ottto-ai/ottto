@@ -98,7 +98,7 @@ impl WorkspaceReport {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "test helper, 9 case inputs")]
     pub(super) fn record(
         &mut self,
         session_id: &str,

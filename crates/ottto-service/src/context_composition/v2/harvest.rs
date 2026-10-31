@@ -1960,7 +1960,7 @@ fn opening_verdict_pending(
 /// Failed reads in a row that quarantine a file.
 const QUARANTINE_AFTER: u8 = 2;
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn process_scope(
     run: &mut Run,
     source: Source,
@@ -2309,7 +2309,7 @@ fn created_at(born: Option<i64>, first_seen: i64) -> i64 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
 fn read_file(
     run: &mut Run,
     source: Source,

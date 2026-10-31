@@ -413,7 +413,10 @@ fn tree_open_files(host: &impl ProcessHost, job: RunningJob) -> TreeOpenFiles {
 /// process gone) as 0 rather than -1 and sets `errno`, so 0 counts as no
 /// descriptors only while `errno` stayed clear. A partial entry is a short
 /// write, and a full buffer may have been cut short.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "only macOS builds call it")
+)]
 fn listed_descriptor_count(
     written: i32,
     errno: i32,
@@ -508,7 +511,10 @@ impl ProvenOwners {
     }
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "only macOS builds call it")
+)]
 pub(super) fn proven_owners() -> &'static Mutex<ProvenOwners> {
     static PROVEN: OnceLock<Mutex<ProvenOwners>> = OnceLock::new();
     PROVEN.get_or_init(|| Mutex::new(ProvenOwners::default()))
@@ -532,7 +538,6 @@ mod native {
     const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
 
     /// `struct proc_fileinfo` from `<sys/proc_info.h>`. Only its size matters.
-    #[allow(dead_code)]
     #[repr(C)]
     struct ProcFileInfo {
         fi_openflags: u32,
@@ -543,7 +548,6 @@ mod native {
     }
 
     /// `struct vnode_fdinfowithpath` from `<sys/proc_info.h>`.
-    #[allow(dead_code)]
     #[repr(C)]
     struct VnodeFdInfoWithPath {
         pfi: ProcFileInfo,

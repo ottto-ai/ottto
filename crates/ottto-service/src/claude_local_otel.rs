@@ -2090,7 +2090,7 @@ mod otlp_proto {
         // Variant names mirror the canonical OTLP protobuf schema. Renaming
         // them would make this deliberately minimal wire model harder to audit
         // against opentelemetry-proto.
-        #[allow(clippy::enum_variant_names)]
+        #[expect(clippy::enum_variant_names, reason = "names mirror the OTLP schema")]
         #[derive(Clone, PartialEq, ::prost::Oneof)]
         pub enum Value {
             #[prost(string, tag = "1")]

@@ -118,7 +118,6 @@ fn acquire(
 }
 /// `acquire` under explicit Codex sidecar metadata and reduction scope;
 /// `complete` is the expected `ParsedJsonlFile::complete()`.
-#[allow(clippy::too_many_arguments)]
 fn acquire_with(
     fixture: &Fixture,
     source: SnapshotSource,
@@ -139,7 +138,6 @@ fn acquire_with(
 }
 /// `acquire_with`, returning the items themselves so local-only (`serde(skip)`)
 /// fields can be compared too.
-#[allow(clippy::too_many_arguments)]
 fn acquire_items_with(
     fixture: &Fixture,
     source: SnapshotSource,
@@ -1099,7 +1097,6 @@ fn production_scan_at(
         |_| {},
     )
 }
-#[allow(clippy::too_many_arguments)] // Preserve the fixture's production scanner options.
 fn production_scan_at_with_setup(
     fixture: &ScanFixture,
     source: SnapshotSource,

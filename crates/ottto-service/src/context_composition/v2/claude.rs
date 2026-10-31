@@ -291,7 +291,6 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn attachment(
     out: &mut LineSink,
     state: &mut ParseState,

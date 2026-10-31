@@ -37,7 +37,10 @@ const MAX_CRONTAB_BYTES: usize = 256 * 1_024;
 const MAX_LIVE_CANDIDATES: usize = 4;
 #[cfg(target_os = "macos")]
 const LOCAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "only macOS builds read it")
+)]
 const LIVE_OWNER_WRITE_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Default)]
@@ -331,7 +334,10 @@ impl ExternalSchedulerInventory {
         })
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only macOS builds call it")
+    )]
     fn candidate_launchd_labels(&self, session: &ExternalSchedulerSession<'_>) -> Vec<&str> {
         self.definitions
             .iter()
@@ -576,7 +582,7 @@ fn refresh_crontab_inventory(
     {
         let _ = key;
         // Return from this cfg branch before the macOS-only block.
-        #[allow(clippy::needless_return)]
+        #[allow(clippy::needless_return, reason = "exits before the macOS-only block")]
         return (previous_digest, previous_definitions);
     }
     #[cfg(target_os = "macos")]
@@ -818,7 +824,10 @@ fn live_launchd_labels(
 impl ExternalSchedulerInventory {
     /// Labels of launchd jobs proven to run this session: remembered from an
     /// earlier scan, or found now in a running candidate job's process tree.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only macOS builds and tests call it")
+    )]
     #[cfg(any(target_os = "macos", test))]
     fn live_owner_labels(
         &self,
@@ -883,7 +892,10 @@ impl ExternalSchedulerInventory {
 /// Only a session written in the last few minutes can still be running, so
 /// untouched history never costs a process check. A session proven earlier
 /// keeps its owner without this gate.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "only macOS builds call it")
+)]
 fn transcript_may_have_live_owner(modified: Option<SystemTime>, now: SystemTime) -> bool {
     match modified {
         Some(modified) => now

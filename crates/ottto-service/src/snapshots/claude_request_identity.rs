@@ -1503,7 +1503,7 @@ fn cap_counts(
 
 /// Pure measurement over a request-owned item's currently held native proof.
 /// It never reads accounts/transcripts, emits diagnostics or uploads a body.
-#[allow(dead_code)] // Side-run/debug hook; deliberately not a runtime decision input.
+#[allow(dead_code, reason = "side-run/debug hook; not a runtime input")]
 pub(crate) fn measure_identity_cap(
     item: &SnapshotItem,
     accepted: &AcceptedBuckets,
@@ -3364,7 +3364,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
 // copy proportional to response count; id-less native usage remains counted.
 // The next request is the minimum over every member's peeked head; a
 // `while let` would hold that mutable walk across the body.
-#[allow(clippy::while_let_loop)]
+#[expect(clippy::while_let_loop, reason = "a while-let holds the walk borrow")]
 fn inherited_requests(members: &[&SnapshotItem]) -> u64 {
     let mut identified = 0u64;
     let mut total = 0u64;
