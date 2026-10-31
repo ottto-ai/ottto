@@ -45,7 +45,7 @@ pub(super) fn assert_refused<T>(cause: CodexZstCause, run: impl FnOnce() -> T) -
                 .expect("named cause counter")
         })
         .collect::<Vec<_>>();
-    assert!(!totals.is_empty());
+    assert!(!totals.is_empty(), "no codex_zst_refused row for {key}");
     assert!(totals[0] > 0);
     for pair in totals.windows(2) {
         assert!(pair[1] > pair[0]);

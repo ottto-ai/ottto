@@ -28,9 +28,10 @@ fn assert_archive_ru_residue(result: &SourceScanResult, rows: &[Value], cause: C
     );
 }
 
-/// [behaviour] Unfunded quiet held/refused sites and a settlement-exhausted
-/// parser error each report one archive residue under their cause, construct
-/// no decoder, and leave the healthy sibling's census work to proceed.
+/// [behaviour] Unfunded quiet held/refused sites and an unscoped exhausted
+/// Pending archive each report one archive residue under their cause, construct
+/// no decoder, keep their disposition, and leave the healthy sibling's census
+/// work to proceed.
 #[test]
 fn unfunded_archive_residue_has_no_ru_and_healthy_census_work_proceeds() {
     for (disposition, decode_attempts, cause) in [
@@ -48,18 +49,22 @@ fn unfunded_archive_residue_has_no_ru_and_healthy_census_work_proceeds() {
             0,
             CodexZstCause::DecodeFailed,
         ),
-        // stop_exhausted runs before decoder funding and holds the archive.
+        // Without a provable retained scope the constructor defers before
+        // stop_exhausted: a retained resend spends no decode budget, so an
+        // unscoped pass must not hold it. The scoped DecodeBudget hold is
+        // archive_interrupted_decode_budget_sticks_and_content_change_resets_attempts.
         (
             ArchiveDisposition::Pending {
                 attempts: 6,
                 retry_after: 0,
             },
             6,
-            CodexZstCause::DecodeBudget,
+            CodexZstCause::OutputHeld,
         ),
     ] {
         let f = ArchiveFixture::new(b"unfunded-stamp-only");
         let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+        let kept = serde_json::to_value(&disposition).unwrap();
         evidence.disposition = disposition;
         evidence.decode_attempts = decode_attempts;
         let mut index = ScanIndex::default();
@@ -71,13 +76,11 @@ fn unfunded_archive_residue_has_no_ru_and_healthy_census_work_proceeds() {
         let (index, result, rows, _) =
             archive_pass_with(&f, index, false, None, &[], archive_ru_healthy_sibling);
         assert_eq!(decodes(&rows), 0, "no decoder for {cause:?}");
-        match &archive_evidence(&index, &f).disposition {
-            ArchiveDisposition::Held { cause: kept }
-            | ArchiveDisposition::Refused { cause: kept } => {
-                assert_eq!(*kept, cause)
-            }
-            other => panic!("{cause:?} site must stay held or refused: {other:?}"),
-        }
+        assert_eq!(
+            serde_json::to_value(&archive_evidence(&index, &f).disposition).unwrap(),
+            kept,
+            "{cause:?} site keeps its disposition"
+        );
         assert_archive_ru_residue(&result, &rows, cause);
     }
 }
@@ -205,19 +208,24 @@ fn native_finish_output_held_has_no_ru_and_healthy_census_work_proceeds() {
     assert_archive_ru_residue(&result, &rows, CodexZstCause::OutputHeld);
 }
 
-/// [behaviour] Parser admission starvation becomes residue at the archive's own twelfth yield.
+/// [behaviour] Admission starvation of a new archive yields in C's header
+/// path, before any parser exists: every pass stays deferred debt (no
+/// unreadable count, no residue), and the archive's own twelfth yield alarms
+/// once and marks it starved.
 #[test]
 fn parser_admission_ru_ends_at_own_twelfth_yield() {
     let _lock = ARCHIVE_TEST_LOCK
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let f = correction_archive();
+    let key = local_index_key(&f.0);
     // One process cache whose single decoder is taken (where funding exists).
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let busy = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
         .ok()
         .flatten();
-    for attempt in 1..=12 {
+    let mut alarms = 0;
+    for _ in 1..=12 {
         let (_, result, rows, _) = archive_pass_in(
             &f,
             ScanIndex::default(),
@@ -227,19 +235,18 @@ fn parser_admission_ru_ends_at_own_twelfth_yield() {
             archive_ru_healthy_sibling,
         );
         assert_eq!(decodes(&rows), 0);
-        if attempt < 12 {
-            assert_eq!(result.unreadable_path_count, 1);
-            assert!(!result.census_complete);
-            assert!(!rows
-                .iter()
-                .any(|r| r["stage"] == "archive_terminal_residue"));
-        } else {
-            assert_archive_ru_residue(&result, &rows, CodexZstCause::AdmissionStarved);
-            assert!(rows
-                .iter()
-                .any(|r| r["stage"] == "codex_zst_admission_alarm"));
-        }
+        assert_eq!(result.unreadable_path_count, 0);
+        assert!(!result.census_complete);
+        assert!(!rows
+            .iter()
+            .any(|r| r["stage"] == "archive_terminal_residue"));
+        alarms += rows
+            .iter()
+            .filter(|r| r["stage"] == "codex_zst_admission_alarm")
+            .count();
     }
+    assert_eq!(alarms, 1);
+    assert_eq!(cache.archive_starved_count(Some(&key)), 1);
     if let Some(busy) = busy {
         busy.close();
     }

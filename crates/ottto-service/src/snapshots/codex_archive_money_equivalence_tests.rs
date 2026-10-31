@@ -307,19 +307,16 @@ fn watcher_retained_refresh_and_bounded_walk_admit_exact_codex_archives() {
             .pending_candidates
             .iter()
             .all(|p| p.path == plain || (source == SnapshotSource::Codex && p.path == f.0)));
-        refresh_retained_codex_roster(
+        advance_bounded_directory_traversal(
             source,
             traversal,
             BACKFILL_WINDOW_DAYS,
             DiscoveryRetention::unverified(&index.files),
         );
-        assert_eq!(
-            traversal
-                .codex_rollout_paths
-                .contains(&local_index_key(&f.0)),
-            source == SnapshotSource::Codex
-        );
-        advance_bounded_directory_traversal(
+        assert!(traversal.pending_directories.is_empty());
+        // The retained refresh runs only on a walked generation; it keeps the
+        // walk's exact archive roster.
+        refresh_retained_codex_roster(
             source,
             traversal,
             BACKFILL_WINDOW_DAYS,
@@ -335,7 +332,6 @@ fn watcher_retained_refresh_and_bounded_walk_admit_exact_codex_archives() {
                 .contains(&local_index_key(&f.0)),
             source == SnapshotSource::Codex
         );
-        assert!(traversal.pending_directories.is_empty());
     }
 }
 

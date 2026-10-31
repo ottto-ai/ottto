@@ -2146,7 +2146,7 @@ pub(in crate::snapshots) mod tests {
                 if let OpenedInput::Compressed(reader, _) = &input {
                     assert_eq!(
                         reader.get_ref().remaining,
-                        max_jsonl_file_bytes(SnapshotSource::Codex)
+                        FIRST_READ_DECODED_LIMIT.min(max_jsonl_file_bytes(SnapshotSource::Codex))
                     );
                 }
                 assert_eq!(
@@ -2580,7 +2580,8 @@ pub(in crate::snapshots) mod tests {
         assert!(reconcile_missing_index_entries_with_side(
             &mut scan.index,
             100,
-            Some((&cache, 0))
+            Some((&cache, 0)),
+            SnapshotSource::Codex,
         ));
         assert!(!scan.index.files.contains_key(&key));
         assert_eq!(cache.archive_starved_count(Some(&key)), 0, "retirement");

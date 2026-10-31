@@ -1482,7 +1482,7 @@ pub(super) fn evaluate_page<'p>(
     now: u64,
 ) -> Option<PageCounts> {
     let traversal = index.traversal.as_ref()?;
-    let started = super::codex_compressed_input::thread_cpu_micros();
+    let started = crate::context_composition::thread_cpu_micros().unwrap_or(0);
     runtime.align_scope(scope);
     let scope_since = *runtime.scope_since.get_or_insert(now);
     let generation = generation_tag(traversal);
@@ -1565,7 +1565,8 @@ pub(super) fn evaluate_page<'p>(
     let parsed_count = parsed_keys.len();
     runtime.followup = Touched::from_keys(parsed_keys, MAX_FOLLOWUP_FAMILIES).families;
     let cost = Cost {
-        predicate_cpu_us: super::codex_compressed_input::thread_cpu_micros()
+        predicate_cpu_us: crate::context_composition::thread_cpu_micros()
+            .unwrap_or(0)
             .saturating_sub(started),
         families_evaluated: families.evaluated,
         root_index_keys_processed: (root_keys + parsed_count) as u64,
@@ -1696,7 +1697,7 @@ pub(super) fn attest_equality_skip(
             return;
         }
         runtime.meter.attempts += 1;
-        let started = super::codex_compressed_input::thread_cpu_micros();
+        let started = crate::context_composition::thread_cpu_micros().unwrap_or(0);
         if equality_skip(index, candidate, now, &mut runtime.meter.decision_calls) {
             runtime.attest(
                 generation_tag(traversal),
@@ -1705,7 +1706,9 @@ pub(super) fn attest_equality_skip(
             );
         }
         runtime.meter.micros = runtime.meter.micros.saturating_add(
-            super::codex_compressed_input::thread_cpu_micros().saturating_sub(started),
+            crate::context_composition::thread_cpu_micros()
+                .unwrap_or(0)
+                .saturating_sub(started),
         );
     });
 }

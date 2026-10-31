@@ -523,6 +523,9 @@ fn custody_preserves_parser_identity_and_never_selects_migration_or_parse() {
             loaded.candidate_decision(&candidate),
             CandidateDecision::Skip
         );
+        // Each row saves a fresh index; the save CAS (#894) refuses to
+        // overwrite another index's file.
+        fs::remove_file(saved).unwrap();
     }
     fs::remove_dir_all(root).unwrap();
 }
