@@ -298,6 +298,8 @@ fn misc_row_digests_cover_scalar_map_ack_and_raw_hold_changes() {
         )
         .unwrap();
     let (_, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    // Commit to `next` itself, not to the stored rows decoded by hydrate.
+    cx.digests.clear();
     let after = baseline(&next, &mut cx).unwrap();
     let changed: BTreeSet<_> = after
         .rows
@@ -315,6 +317,35 @@ fn misc_row_digests_cover_scalar_map_ack_and_raw_hold_changes() {
             mapper::key("raw_hold.files", "/synthetic/held", 0).unwrap(),
         ])
     );
+}
+
+/// [format] digests recorded while decoding equal those the seed computes,
+/// for every logical row except untyped census records and opaque holds.
+#[test]
+fn decoded_row_digests_equal_seed_computed_digests() {
+    let (_scratch, mut db) = Scratch::store();
+    commit_populate(&mut db, &fixture());
+    let (index, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let decoded = cx.digests.clone();
+    let seeded = baseline(&index, &mut cx).unwrap();
+    assert!(cx.digests.is_empty());
+    let (_, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    cx.digests.clear();
+    let computed = baseline(&index, &mut cx).unwrap();
+    assert_eq!(seeded.rows, computed.rows);
+    let uncached: BTreeSet<_> = computed
+        .rows
+        .keys()
+        .filter(|key| !decoded.contains_key(*key))
+        .filter_map(|key| match key {
+            RowKey::Record { kind, .. } => Some(kind.name()),
+            _ => None,
+        })
+        .collect();
+    assert!(uncached.contains("file.census"));
+    assert!(uncached
+        .iter()
+        .all(|kind| *kind == "file.census" || kind.starts_with("raw_hold.")));
 }
 
 /// [money] streamed cas merges retry and growth maxima without resurrecting removed quarantine.
@@ -566,7 +597,7 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
         delta(baseline, &next, &mut tx, &mut cx).unwrap();
         let key = mapper::key("account.current", "synthetic-family", 1).unwrap();
         let h = tx.get(&key).unwrap().unwrap();
-        let (id, high, _): (Option<u64>, u64, Vec<u64>) = mapper::read(&mut tx, &h).unwrap();
+        let (id, high, _): (Option<u64>, u64, Vec<u64>) = mapper::read(&mut tx, &h, None).unwrap();
         if let Some(id) = id {
             assert!(id > prior_id);
             assert!(high > id);

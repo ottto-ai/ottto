@@ -10,8 +10,9 @@ pub(super) struct KindCx {
     pub(super) ambiguous: bool,
     /// Original field presence, obtained before any v1 normalization.
     pub(super) presence: BTreeMap<String, bool>,
-    // Hydration scratch, consumed when the normalized baseline is seeded.
+    // Hydration scratch, consumed when the baseline is seeded.
     pub(super) account_ids: BTreeMap<String, Vec<u64>>,
+    pub(super) digests: mapper::Digests,
     pub(super) account_controls: usize,
     valid: bool,
 }
@@ -36,7 +37,10 @@ fn enumerate(
     Ok(windows)
 }
 pub(super) fn baseline(index: &ScanIndex, cx: &mut KindCx) -> Result<Baseline> {
-    let mut rows = mapper::Rows::default();
+    let mut rows = mapper::Rows {
+        seed: std::mem::take(&mut cx.digests),
+        ..Default::default()
+    };
     let windows = enumerate(index, &mut rows, &BTreeMap::new(), cx)?;
     Ok(Baseline {
         generation: index.generation,
@@ -139,7 +143,7 @@ pub(super) fn hydrate_txn(
         ..Default::default()
     };
     kinds_misc::hydrate_txn(tx, &mut index, &mut cx)?;
-    kinds_files::hydrate_txn(tx, &mut index)?;
+    kinds_files::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_accounts::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_census::hydrate_txn(tx, &mut index, &mut cx)?;
     cx.valid = true;

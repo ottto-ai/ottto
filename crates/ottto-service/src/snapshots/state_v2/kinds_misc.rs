@@ -29,8 +29,9 @@ fn write_field<T: Serialize + ?Sized>(
 fn read_field<T: serde::de::DeserializeOwned + Serialize>(
     kind: &str,
     tx: &mut dyn Transaction,
+    seed: Option<&mut mapper::Digests>,
 ) -> Result<T> {
-    mapper::field_read(tx, kind, field_mode(kind))
+    mapper::field_read(tx, kind, field_mode(kind), seed)
 }
 #[derive(Serialize, Deserialize, Default)]
 struct HoldMetadata {
@@ -71,8 +72,12 @@ fn write_holds(index: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
         mapper::Members::Field,
     )
 }
-fn read_holds(index: &mut ScanIndex, txn: &mut dyn Transaction) -> Result<()> {
-    let metadata: HoldMetadata = read_field("v1_field.repair_provenance", txn)?;
+fn read_holds(
+    index: &mut ScanIndex,
+    txn: &mut dyn Transaction,
+    seed: Option<&mut mapper::Digests>,
+) -> Result<()> {
+    let metadata: HoldMetadata = read_field("v1_field.repair_provenance", txn, seed)?;
     let mut holds = super::super::lenient_decode::Holds::default();
     let mut expected = 0;
     for (field, slots) in metadata.entries {
@@ -158,11 +163,14 @@ pub(super) fn merge_cas_at(
         "state_v2_concurrent_change"
     );
     let mut custody = ScanIndex::default();
-    read_holds(&mut custody, tx)?;
+    read_holds(&mut custody, tx, None)?;
     custody.schema_version = schema;
     custody.generation = generation;
-    custody.accepted_snapshot_fingerprint_ledger_version =
-        read_field("v1_field.accepted_snapshot_fingerprint_ledger_version", tx)?;
+    custody.accepted_snapshot_fingerprint_ledger_version = read_field(
+        "v1_field.accepted_snapshot_fingerprint_ledger_version",
+        tx,
+        None,
+    )?;
     kinds_census::hydrate_cas_controls(tx, &mut custody)?;
     let raw_quarantines: BTreeSet<_> = custody
         .decode_holds
@@ -350,12 +358,12 @@ pub(super) fn hydrate_txn(
     );
     macro_rules! load {
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = read_field($kind, tx)?;
+            index.$f = read_field($kind, tx, Some(&mut cx.digests))?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
-    read_holds(index, tx)
+    read_holds(index, tx, Some(&mut cx.digests))
 }
 pub(super) fn references(
     _: &Header,

@@ -39,9 +39,11 @@ pub(super) fn rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> 
 pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,
     index: &mut ScanIndex,
-    _: &mut KindCx,
+    cx: &mut KindCx,
 ) -> Result<()> {
-    let raw: BTreeMap<String, serde_json::Value> = mapper::read_map(tx, "file.census", None)?;
+    // Census rows decode as untyped JSON, whose serialization is not the
+    // typed record's: the seed computes their digests itself.
+    let raw: BTreeMap<String, serde_json::Value> = mapper::read_map(tx, "file.census", None, None)?;
     for (name, value) in raw {
         let singleton = serde_json::json!({name.clone():value});
         let census: super::super::claude_request_census::ClaudeRequestCensus =
@@ -59,25 +61,30 @@ pub(super) fn hydrate_txn(
     }
     macro_rules! load_map {
         ($f:ident, Census, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = mapper::read_map(tx, $kind, None)?;
+            index.$f = mapper::read_map(tx, $kind, None, Some(&mut cx.digests))?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load_map);
-    index.claude_retired_family_tombstones.entries =
-        mapper::read_map(tx, "tombstone.claude_retired_family_tombstones", None)?;
+    index.claude_retired_family_tombstones.entries = mapper::read_map(
+        tx,
+        "tombstone.claude_retired_family_tombstones",
+        None,
+        Some(&mut cx.digests),
+    )?;
     index.claude_retired_family_tombstones.decoded = true;
     macro_rules! load {
         ($f:ident, Census, (scalar $($c:ident)*), [$kind:literal], $h:ident) => {
             let h = tx
                 .get(&mapper::key($kind, "", 0)?)?
                 .context("state_v2_census_missing")?;
-            index.$f = mapper::read(tx, &h)?;
+            index.$f = mapper::read(tx, &h, Some(&mut cx.digests))?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
-    let members: BTreeMap<String, usize> = mapper::read_map(tx, "family.requests", None)?;
+    let members: BTreeMap<String, usize> =
+        mapper::read_map(tx, "family.requests", None, Some(&mut cx.digests))?;
     ensure!(
         members.len() == index.claude_usage_family_pending.len(),
         "state_v2_census_membership"
@@ -99,6 +106,7 @@ pub(super) fn hydrate_cas_controls(tx: &mut dyn Transaction, index: &mut ScanInd
         tx,
         "tombstone.claude_retired_family_tombstones",
         Some(&BTreeSet::new()),
+        None,
     )?;
     index.claude_retired_family_tombstones.decoded = true;
     let h = tx
@@ -108,7 +116,7 @@ pub(super) fn hydrate_cas_controls(tx: &mut dyn Transaction, index: &mut ScanInd
             0,
         )?)?
         .context("state_v2_census_missing")?;
-    index.claude_retired_family_tombstones_initialized = mapper::read(tx, &h)?;
+    index.claude_retired_family_tombstones_initialized = mapper::read(tx, &h, None)?;
     Ok(())
 }
 pub(super) fn hydrate_cas_families(
@@ -116,7 +124,8 @@ pub(super) fn hydrate_cas_families(
     index: &mut ScanIndex,
     roots: &BTreeSet<String>,
 ) -> Result<()> {
-    let members: BTreeMap<String, usize> = mapper::read_map(tx, "family.requests", Some(roots))?;
+    let members: BTreeMap<String, usize> =
+        mapper::read_map(tx, "family.requests", Some(roots), None)?;
     for (root, count) in members {
         ensure!(
             index

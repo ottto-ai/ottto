@@ -1799,7 +1799,7 @@ impl Sqlite {
             };
             if *position == 0 {
                 ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
-                expected = Some(super::mapper::read::<usize>(tx, &header)?);
+                expected = Some(super::mapper::read::<usize>(tx, &header, None)?);
             } else {
                 ensure!(*position == 1, "state_v2_member_position");
                 let path = super::mapper::family(key_bytes)?;

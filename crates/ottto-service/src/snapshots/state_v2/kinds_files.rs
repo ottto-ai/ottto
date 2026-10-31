@@ -21,22 +21,28 @@ pub(super) fn rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> 
     }
     Ok(())
 }
-pub(super) fn hydrate_txn(tx: &mut dyn Transaction, index: &mut ScanIndex) -> Result<()> {
+pub(super) fn hydrate_txn(
+    tx: &mut dyn Transaction,
+    index: &mut ScanIndex,
+    cx: &mut KindCx,
+) -> Result<()> {
     macro_rules! load {
         ($f:ident, Files, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = mapper::read_map(tx, $kind, None)?;
+            index.$f = mapper::read_map(tx, $kind, None, Some(&mut cx.digests))?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
-    index.v2_mut().growth_retention = mapper::read_map(tx, "file.growth_retention", None)?;
-    let empty: BTreeMap<String, bool> = mapper::read_map(tx, "file.confirmed_empty", None)?;
+    index.v2_mut().growth_retention =
+        mapper::read_map(tx, "file.growth_retention", None, Some(&mut cx.digests))?;
+    let empty: BTreeMap<String, bool> =
+        mapper::read_map(tx, "file.confirmed_empty", None, Some(&mut cx.digests))?;
     ensure!(empty.values().all(|v| *v), "state_v2_empty_members");
     index.confirmed_empty_files = empty.into_keys().collect();
     Ok(())
 }
 pub(super) fn merge_growth_cas(tx: &mut dyn Transaction, working: &mut ScanIndex) -> Result<()> {
-    let claims = mapper::read_map(tx, "file.growth_retention", None)?;
+    let claims = mapper::read_map(tx, "file.growth_retention", None, None)?;
     super::super::sampled_audit::merge_growth_claims(
         &mut working.v2_mut().growth_retention,
         &claims,

@@ -40,14 +40,21 @@ pub(super) fn rows(
             .into_iter()
             .flat_map(|p| p.previous_windows.iter().chain(std::iter::once(&p.current)))
             .collect();
+        let seeded = rows
+            .tx
+            .is_none()
+            .then(|| cx.account_ids.remove(family).unwrap_or_default());
         let digests = values
             .iter()
-            .map(|w| mapper::digest(*w))
+            .enumerate()
+            .map(|(n, w)| match seeded.as_ref().and_then(|ids| ids.get(n)) {
+                Some(id) => rows.digest(&mapper::key("account_window", family, *id)?, *w),
+                None => mapper::digest(*w),
+            })
             .collect::<Result<Vec<_>>>()?;
         let current_end = wanted.map(|p| p.census_window_end.clone());
         let control = mapper::key("account.current", family, 1)?;
-        let ids = if rows.tx.is_none() {
-            let ids = cx.account_ids.remove(family).unwrap_or_default();
+        let ids = if let Some(ids) = seeded {
             ensure!(ids.len() == values.len(), "accounts_window_inventory");
             ids
         } else if let Some(previous) =
@@ -61,7 +68,7 @@ pub(super) fn rows(
             controls += usize::from(header.is_none());
             let created = header.is_none();
             let (current, mut high, ids): Positions = match header {
-                Some(h) => mapper::read(tx, &h)?,
+                Some(h) => mapper::read(tx, &h, None)?,
                 None => (None, 1, Vec::new()),
             };
             let old_ids = previous.map(|p| p.ids.as_slice()).unwrap_or_default();
@@ -155,9 +162,11 @@ pub(super) fn hydrate_filtered(
     filter: Option<(&BTreeSet<String>, bool)>,
 ) -> Result<()> {
     let roots = filter.map(|(roots, _)| roots);
+    // Only a complete hydrate seeds a baseline; CAS views stay unhashed.
+    let mut seed = filter.is_none().then_some(&mut cx.digests);
     macro_rules! load {
         ($f:ident, Accounts, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = mapper::read_map(tx, $kind, roots)?;
+            index.$f = mapper::read_map(tx, $kind, roots, seed.as_deref_mut())?;
         };
         ($($t:tt)*) => {};
     }
@@ -165,7 +174,7 @@ pub(super) fn hydrate_filtered(
     let h = tx
         .get(&mapper::key("account.current", "", 0)?)?
         .context("accounts_missing_manifest")?;
-    let expected: (usize, usize) = mapper::read(tx, &h)?;
+    let expected: (usize, usize) = mapper::read(tx, &h, seed.as_deref_mut())?;
     let mut count = 0;
     let mut controls = 0;
     let mut seen = BTreeSet::new();
@@ -185,7 +194,7 @@ pub(super) fn hydrate_filtered(
         ensure!(*position == 1, "accounts_position");
         controls += 1;
         let family = dependency_family(key_bytes)?;
-        let (current, high, ids): Positions = mapper::read(tx, &h)?;
+        let (current, high, ids): Positions = mapper::read(tx, &h, None)?;
         ensure!(
             ids.windows(2).all(|w| w[0] < w[1])
                 && ids.iter().all(|id| *id > 0 && *id < high)
@@ -204,13 +213,17 @@ pub(super) fn hydrate_filtered(
         for id in &ids {
             let key = mapper::key("account_window", &family, *id)?;
             let h = tx.get(&key)?.context("accounts_missing_window")?;
-            windows.push(mapper::read::<ClaudeAccountFamilyPendingWindow>(tx, &h)?);
+            windows.push(mapper::read::<ClaudeAccountFamilyPendingWindow>(
+                tx,
+                &h,
+                seed.as_deref_mut(),
+            )?);
             seen.insert(key);
         }
         let h = tx
             .get(&mapper::key("account.absent_members", &family, 1)?)?
             .context("accounts_missing_absent")?;
-        let absent = mapper::read(tx, &h)?;
+        let absent = mapper::read(tx, &h, seed.as_deref_mut())?;
         let current = windows.pop().context("accounts_current")?;
         cx.account_ids.insert(family.clone(), ids);
         index.claude_account_family_pending.insert(
