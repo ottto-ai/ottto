@@ -817,6 +817,58 @@ pub(in super::super) fn guard_external(
     guard_current(path, runtime, graph_generation, true)
 }
 
+/// Privacy may postpone erasure indefinitely to preserve committed restart
+/// custody. Keep the checkpoint lock through the caller's unlink decisions;
+/// unresolved/cold/ambiguous ownership protects every immutable generation.
+pub(in crate::snapshots) fn with_resume_privacy_guard<T>(
+    path: &Path,
+    action: impl FnOnce(&dyn Fn(&str) -> bool) -> T,
+) -> T {
+    if binding(path).is_none() {
+        return action(&|_| false);
+    }
+    let owner = super::super::CheckpointLock::acquire(path);
+    let refs = (|| -> Result<_> {
+        owner.as_ref().map_err(|_| Hold::ReloadRequired)?;
+        if !published(path)? {
+            return Ok(None);
+        }
+        with_state(path, |state| {
+            let runtime = state.current.as_ref().ok_or(Hold::ReloadRequired)?;
+            let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+            let session = guard.as_mut().ok_or(Hold::ReloadRequired)?;
+            ensure!(
+                !session.reload && !session.cx.ambiguous && !session.db.reload_required(),
+                Hold::ReloadRequired
+            );
+            let (identity, _) = fence::reconcile(path, &session.identity.binding, state.latched)?
+                .ok_or(Hold::FenceLost)?;
+            ensure!(
+                identity == session.identity && session.stamp == session.db.stamp()?,
+                Hold::ReloadRequired
+            );
+            let cached = state.cached.as_ref().ok_or(Hold::ReloadRequired)?;
+            ensure!(cached.generation == session.stamp.0, Hold::ReloadRequired);
+            let refs = cached.v2().resume_checkpoints.clone();
+            ensure!(
+                refs.as_deref()
+                    .map_or(session.cx.committed.is_empty(), |refs| refs
+                        == &session.cx.committed),
+                Hold::ReferenceDrift
+            );
+            Ok(refs)
+        })
+    })();
+    action(&|name| {
+        refs.as_ref().map_or(true, |refs| {
+            refs.as_ref().is_some_and(|refs| {
+                refs.values()
+                    .any(|checkpoint| checkpoint.record_name == name)
+            })
+        })
+    })
+}
+
 /// Only the local checkpoint-retry path may ignore a save-pressure hold.
 /// Generation, owner, reload and capability fencing still apply.
 pub(in super::super) fn recovery_save_guard(

@@ -13,7 +13,7 @@ mod fence;
 mod import;
 pub(super) mod resume_adapter;
 mod runtime;
-pub(super) use runtime::register_resume_owner;
+pub(super) use runtime::{register_resume_owner, with_resume_privacy_guard};
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;

@@ -13271,6 +13271,9 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
         .0
         .is_none());
     state_v2::after_v1_locked(&index_path, &mut imported).unwrap();
+    // Match the production attributed-load entry point: Full admission
+    // authenticates this graph through its ordinary growth-claim lineage.
+    imported = ScanIndex::load(&index_path).unwrap();
     assert!(state_v2::state_v2_growth_retention_active(&imported));
     assert!(imported
         .v2()
@@ -13346,6 +13349,42 @@ fn v2_resume_adapter_native_plan_stage_and_exact_reopen() {
         .as_ref()
         .clone();
     let checkpoint = committed[&key].clone();
+    owner
+        .cache
+        .durable_skill_label_permission(SnapshotSource::ClaudeCode, false);
+    // Expected privacy holds preserve the actual SQL reference and count under
+    // the existing family without consuming the consecutive-failure budget.
+    // Exercise the unknown inventory used once the existing marker overflows.
+    std::fs::write(
+        store::store_dir_for_index(&index_path).with_extension("private-labels"),
+        b"PL??",
+    )
+    .unwrap();
+    for _ in 0..5 {
+        owner
+            .cache
+            .durable_write_after_save(writer, SnapshotSource::ClaudeCode, &next);
+        owner
+            .cache
+            .durable_gc(writer, SnapshotSource::ClaudeCode, &next)
+            .unwrap();
+    }
+    let privacy = owner
+        .cache
+        .durable_counters(SnapshotSource::ClaudeCode)
+        .unwrap()
+        .0;
+    assert_eq!(
+        privacy.not_persisted.get("skill_label_purge_failed"),
+        Some(&0)
+    );
+    assert!(privacy
+        .not_persisted
+        .get("skill_label_purge_held_by_committed_ref")
+        .is_some_and(|n| *n >= 5));
+    assert!(store::store_dir_for_index(&index_path)
+        .join(&checkpoint.record_name)
+        .exists());
     // A later, durable, uncommitted candidate must never become the restore target.
     owner
         .cache

@@ -5405,40 +5405,63 @@ impl SharedCache {
         else {
             return;
         };
-        if let Some(mut stores) = self.durable() {
-            if let Some(slot) = stores.slot(source).as_mut() {
-                let result = match keep {
-                    Some(keep) => slot.store.purge_private_labels_kept(writer, keep, |body| {
-                        codec::body_has_skill_labels(body).unwrap_or(true)
-                    }),
-                    None => slot.store.purge_private_labels(writer, |body| {
-                        codec::body_has_skill_labels(body).unwrap_or(true)
-                    }),
-                };
-                let (scanned, erased, failed) =
-                    result.map_or((0, 0, 1), |r| (r.scanned, r.erased, r.refused));
-                slot.skill_label_purge_complete =
-                    failed == 0 && !slot.store.private_label_purge_needed(None);
-                slot.skill_label_purge_failures = if failed == 0 {
-                    0
-                } else {
-                    slot.skill_label_purge_failures.saturating_add(1)
-                };
-                let alarm = slot.skill_label_purge_failures > 3;
-                for (class, count) in [
-                    ("skill_label_scanned", scanned),
-                    ("skill_label_purged", erased),
-                    ("skill_label_purge_failed", failed),
-                ] {
-                    *stores.counters.not_persisted.entry(class).or_default() += count;
+        let path = self.durable().and_then(|mut stores| {
+            stores
+                .slot(source)
+                .as_ref()
+                .map(|slot| slot.index_path.clone())
+        });
+        if let Some(path) = path {
+            state_v2::with_resume_privacy_guard(&path, |protected| {
+                if let Some(mut stores) = self.durable() {
+                    if let Some(slot) = stores.slot(source).as_mut() {
+                        // Revoked consent also applies during the GC sweep;
+                        // only the exact committed-generation guard may hold it.
+                        let result = match keep.filter(|_| slot.skill_labels_enabled) {
+                            Some(keep) => slot.store.purge_private_labels_kept(
+                                writer,
+                                keep,
+                                protected,
+                                |body| codec::body_has_skill_labels(body).unwrap_or(true),
+                            ),
+                            None => slot.store.purge_private_labels(writer, protected, |body| {
+                                codec::body_has_skill_labels(body).unwrap_or(true)
+                            }),
+                        };
+                        let (scanned, erased, failed, held) = result.map_or((0, 0, 1, 0), |r| {
+                            (r.scanned, r.erased, r.refused, r.held_committed)
+                        });
+                        slot.skill_label_purge_complete =
+                            failed == 0 && !slot.store.private_label_purge_needed(None);
+                        slot.skill_label_purge_failures = if failed == 0 {
+                            0
+                        } else {
+                            slot.skill_label_purge_failures.saturating_add(1)
+                        };
+                        let alarm = slot.skill_label_purge_failures > 3;
+                        for (class, count) in [
+                            ("skill_label_scanned", scanned),
+                            ("skill_label_purged", erased),
+                            ("skill_label_purge_failed", failed),
+                        ] {
+                            *stores.counters.not_persisted.entry(class).or_default() += count;
+                        }
+                        if held > 0 {
+                            *stores
+                                .counters
+                                .not_persisted
+                                .entry("skill_label_purge_held_by_committed_ref")
+                                .or_default() += held;
+                        }
+                        if alarm {
+                            crate::local_resource_diagnostics::durable_tail_alarm(
+                                snapshot_source.api_slug(),
+                                &serde_json::json!({"skill_label_purge_failed_consecutive":4}),
+                            );
+                        }
+                    }
                 }
-                if alarm {
-                    crate::local_resource_diagnostics::durable_tail_alarm(
-                        snapshot_source.api_slug(),
-                        &serde_json::json!({"skill_label_purge_failed_consecutive":4}),
-                    );
-                }
-            }
+            });
         }
         lease.release();
     }

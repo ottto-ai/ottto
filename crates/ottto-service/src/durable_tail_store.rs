@@ -739,7 +739,9 @@ pub(crate) struct DurableTailStore {
     startup_synced: bool,
     gc_after: Option<Digest32>,
     private_purge_after: Option<Digest32>,
-    private_purge_dirty: bool,
+    /// Unknown-inventory sweep debt: (refused/live key, expected ref hold).
+    /// An earlier page's expected hold keeps eligibility without an alarm.
+    private_purge_dirty: (bool, bool),
     pending: BTreeMap<Digest32, PendingWrite>,
     resource_pause: Option<stream::ResourcePause>,
     stream_dirty: Arc<AtomicU64>,
@@ -779,6 +781,7 @@ pub(crate) struct PrivateLabelPurge {
     pub(crate) scanned: u64,
     pub(crate) erased: u64,
     pub(crate) refused: u64,
+    pub(crate) held_committed: u64,
 }
 
 impl DurableTailStore {
@@ -798,7 +801,7 @@ impl DurableTailStore {
             startup_synced: false,
             gc_after: None,
             private_purge_after: None,
-            private_purge_dirty: false,
+            private_purge_dirty: (false, false),
             pending: BTreeMap::new(),
             resource_pause: None,
             stream_dirty: Arc::default(),
@@ -2373,7 +2376,7 @@ impl DurableTailStore {
         // A newly staged literal invalidates a prior partial no-label sweep,
         // including a new canonical key ordered before its old cursor.
         self.private_purge_after = None;
-        self.private_purge_dirty = false;
+        self.private_purge_dirty = (false, false);
         let mut keys = self.private_label_keys().unwrap_or(None);
         if let Some(keys) = keys.as_mut() {
             keys.insert(key);
@@ -2387,6 +2390,7 @@ impl DurableTailStore {
         &mut self,
         writer: &W,
         keep: &BTreeSet<Digest32>,
+        protected: impl Fn(&str) -> bool,
         mut contains: impl FnMut(&[u8]) -> bool,
     ) -> io::Result<PrivateLabelPurge> {
         self.check_writer(writer)?;
@@ -2397,6 +2401,7 @@ impl DurableTailStore {
             scanned: 0,
             erased: 0,
             refused: 0,
+            held_committed: 0,
         };
         let (mut generations, overflow) = self.immutable_label_names(&keys)?;
         let mut erased = 0;
@@ -2411,6 +2416,11 @@ impl DurableTailStore {
             }
             let names = generations.remove(key).unwrap_or_default();
             for name in std::iter::once(None).chain(names.into_iter().map(Some)) {
+                if name.as_deref().is_some_and(&protected) {
+                    report.held_committed += 1;
+                    remaining.insert(*key);
+                    continue;
+                }
                 report.scanned += 1;
                 if let Some(name) = &name {
                     self.immutable_target = Some((*key, self.dir.join(name)));
@@ -2438,7 +2448,9 @@ impl DurableTailStore {
         }
         report.erased = erased;
         if known.is_none() {
-            self.private_purge_dirty |= report.refused > 0 || !remaining.is_empty();
+            self.private_purge_dirty.0 |=
+                report.refused > 0 || remaining.iter().any(|key| keep.contains(key));
+            self.private_purge_dirty.1 |= report.held_committed > 0;
             if keys.len() >= GC_RECORDS_PER_PASS {
                 // Advance over retained/non-label records too; the marker stays
                 // unknown until an entire bounded traversal proves erasure.
@@ -2446,10 +2458,16 @@ impl DurableTailStore {
                 return Ok(report);
             }
             self.private_purge_after = None;
-            if std::mem::take(&mut self.private_purge_dirty) {
+            let (failed, held) = std::mem::take(&mut self.private_purge_dirty);
+            if failed {
                 // Earlier pages may owe retry, but a failure on this page is
                 // already counted. Never count the same refusal twice.
                 report.refused = report.refused.max(1);
+                return Ok(report);
+            }
+            if held {
+                // An earlier page may still contain a protected ref. Keep the
+                // unknown marker eligible without inventing a purge failure.
                 return Ok(report);
             }
         }
@@ -2500,9 +2518,10 @@ impl DurableTailStore {
     pub(crate) fn purge_private_labels<W: SingleWriter>(
         &mut self,
         writer: &W,
+        protected: impl Fn(&str) -> bool,
         contains: impl FnMut(&[u8]) -> bool,
     ) -> io::Result<PrivateLabelPurge> {
-        self.purge_private_labels_kept(writer, &BTreeSet::new(), contains)
+        self.purge_private_labels_kept(writer, &BTreeSet::new(), protected, contains)
     }
 
     /// Retire exactly the verified predecessor. `sync_due` belongs to writer

@@ -479,8 +479,24 @@ mod tests {
         let mut reopened = scratch.store();
         // The existing caller owns the label predicate; the store still
         // verifies each envelope and retains unknown/corrupt generations.
-        let report = reopened.purge_private_labels(writer, |_| true).unwrap();
-        assert_eq!(report.erased, 2);
+        // Expected holds remain eligible across repeated passes and never
+        // count as erasure failures, even with unknown inventory after reopen.
+        fs::write(reopened.dir.with_extension("private-labels"), b"PL??").unwrap();
+        for pass in 0..5 {
+            let report = reopened
+                .purge_private_labels(writer, |name| name == first.name, |_| true)
+                .unwrap();
+            assert_eq!(report.erased, u64::from(pass == 0));
+            assert_eq!(report.held_committed, 1);
+            assert_eq!(report.refused, 0);
+            assert!(reopened.dir.join(&first.name).exists());
+            assert!(reopened.private_label_purge_needed(None));
+        }
+        assert!(!reopened.dir.join(&second.name).exists());
+        let report = reopened
+            .purge_private_labels(writer, |_| false, |_| true)
+            .unwrap();
+        assert_eq!(report.erased, 1);
         assert_eq!(report.refused, 0);
         assert!(!orphan.exists());
         assert!(!reopened.dir.join(first.name).exists());

@@ -4628,10 +4628,14 @@ fn private_label_purge_erases_known_labelled_records_without_receipt_or_money_cr
     let before = store.counters();
     // The source-specific caller supplies the no-allocation record predicate.
     let purged = store
-        .purge_private_labels(&lock, |body| {
-            body.windows("syntheticpurgelabel".len())
-                .any(|s| s == b"syntheticpurgelabel")
-        })
+        .purge_private_labels(
+            &lock,
+            |_| false,
+            |body| {
+                body.windows("syntheticpurgelabel".len())
+                    .any(|s| s == b"syntheticpurgelabel")
+            },
+        )
         .unwrap();
     assert_eq!(purged.erased, 1);
     assert_eq!(purged.refused, 0);
@@ -4657,7 +4661,10 @@ fn private_label_purge_erases_known_labelled_records_without_receipt_or_money_cr
         )
         .unwrap();
     assert_eq!(
-        store.purge_private_labels(&lock, |_| false).unwrap().erased,
+        store
+            .purge_private_labels(&lock, |_| false, |_| false)
+            .unwrap()
+            .erased,
         0
     );
     assert!(matches!(store.read(&empty.key), ReadOutcome::Found(_)));
@@ -4689,7 +4696,9 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
     let mut corrupt = fs::read(&file).unwrap();
     *corrupt.last_mut().unwrap() ^= 1;
     put_record(&file, &corrupt);
-    let report = store.purge_private_labels(&lock, |_| true).unwrap();
+    let report = store
+        .purge_private_labels(&lock, |_| false, |_| true)
+        .unwrap();
     assert_eq!(report.erased, 1);
     assert_eq!(report.refused, 1);
     assert!(!record_file(&store, &good.key).exists());
@@ -4726,7 +4735,10 @@ fn private_label_purge_revokes_retained_completion_but_keeps_candidate_owed() {
     let before = store.counters().receipt_reconciled;
     assert!(store.pending[&b.key].completed.is_some());
     assert_eq!(
-        store.purge_private_labels(&lock, |_| true).unwrap().erased,
+        store
+            .purge_private_labels(&lock, |_| false, |_| true)
+            .unwrap()
+            .erased,
         1
     );
     assert!(
