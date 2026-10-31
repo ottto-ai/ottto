@@ -375,8 +375,7 @@ pub(crate) fn codex_slot(
 
 // Closed owned-field inventory for optional scan overlap admission.
 crate::heap_layout_bound::fields!(CacheObservations; schema_version, operations, coverage, omitted_observation_count);
-crate::heap_layout_bound::fields!(OwnedRequest; slot, ordering, compaction_before, configuration_changed, configuration_witness, idle_seconds);
-crate::durable_tail_codec::durable_struct!(OwnedRequest {
+crate::durable_tail_codec::durable_struct!(heap OwnedRequest {
     D slot: RequestSlot,
     N ordering: String,
     N compaction_before: bool,
@@ -384,8 +383,7 @@ crate::durable_tail_codec::durable_struct!(OwnedRequest {
     H configuration_witness: Option<String>,
     N idle_seconds: Option<u64>,
 });
-crate::heap_layout_bound::fields!(RequestSlot; request_ref, occurred_at, model, effort, prompt_tokens, cache_read_tokens, cache_creation_tokens, uncached_tokens, output_tokens);
-crate::durable_tail_codec::durable_struct!(RequestSlot {
+crate::durable_tail_codec::durable_struct!(heap RequestSlot {
     L request_ref: String,
     N occurred_at: String,
     U model: Option<String>,

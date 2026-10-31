@@ -1283,6 +1283,15 @@ macro_rules! durable_struct {
             }
         }
     };
+    // `heap [key] T { .. }` also emits `heap_layout_bound::fields!(T; ..)`.
+    (heap $($rest:tt)+) => {
+        $crate::durable_tail_codec::durable_struct!($($rest)+);
+        $crate::durable_tail_codec::durable_struct!(@heap $($rest)+);
+    };
+    (@heap key $($rest:tt)+) => { $crate::durable_tail_codec::durable_struct!(@heap $($rest)+); };
+    (@heap $t:ident { $($c:ident $f:ident : $ty:ty),* $(,)? }) => {
+        $crate::heap_layout_bound::fields!($t; $($f),*);
+    };
 }
 pub(crate) use durable_struct;
 

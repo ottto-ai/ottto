@@ -685,13 +685,11 @@ pub(super) fn validate_context_curve(
 mod tests;
 
 // Closed owned-field inventory for optional scan overlap admission.
-crate::heap_layout_bound::fields!(ContextCurveCandidateBoundary; observed_at, point_count_before);
-crate::durable_tail_codec::durable_struct!(ContextCurveCandidateBoundary {
+crate::durable_tail_codec::durable_struct!(heap ContextCurveCandidateBoundary {
     N observed_at: Option<String>,
     N point_count_before: u64,
 });
-crate::heap_layout_bound::fields!(ContextCurveCandidatePoint; observed_at, effective_input_tokens, model, context_window_tokens);
-crate::durable_tail_codec::durable_struct!(ContextCurveCandidatePoint {
+crate::durable_tail_codec::durable_struct!(heap ContextCurveCandidatePoint {
     N observed_at: Option<String>,
     N effective_input_tokens: u64,
     U model: Option<String>,

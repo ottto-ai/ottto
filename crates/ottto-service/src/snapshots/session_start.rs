@@ -522,8 +522,7 @@ pub(super) struct SessionStartState {
     content_end: Option<u64>,
 }
 
-crate::heap_layout_bound::fields!(OpeningRequest; context_tokens, uncached_input_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, parts_reconcile, output_tokens);
-crate::durable_tail_codec::durable_struct!(OpeningRequest {
+crate::durable_tail_codec::durable_struct!(heap OpeningRequest {
     N context_tokens: u64,
     N uncached_input_tokens: u64,
     N cache_read_tokens: u64,
@@ -532,27 +531,23 @@ crate::durable_tail_codec::durable_struct!(OpeningRequest {
     N parts_reconcile: bool,
     N output_tokens: u64,
 });
-crate::heap_layout_bound::fields!(ClaudeBlob; parts, unmeasurable, config_digest);
-crate::durable_tail_codec::durable_struct!(ClaudeBlob {
+crate::durable_tail_codec::durable_struct!(heap ClaudeBlob {
     N parts: [u64; PARTS],
     N unmeasurable: bool,
     // A reversible rolling digest of instruction text (F1): content, never
     // stored; re-derived with the opening content and hash-verified.
     X config_digest: Option<ConfigDigest>,
 });
-crate::heap_layout_bound::fields!(ConfigDigest; a, b, len);
 // Not a cryptographic digest: its state reverses to short instruction text,
 // so it is content (X) everywhere and cannot be classed H (no `HDigest`).
-crate::durable_tail_codec::durable_struct!(ConfigDigest {
+crate::durable_tail_codec::durable_struct!(heap ConfigDigest {
     X a: u64,
     X b: u64,
     X len: u64,
 });
 crate::durable_tail_codec::durable_struct!(key ClaudeRequestKey(H digest: [u8; 32]));
-crate::heap_layout_bound::fields!(OpeningCallId; id);
-crate::durable_tail_codec::durable_struct!(key OpeningCallId { L id: String });
-crate::heap_layout_bound::fields!(OpeningCall; response, tool, candidates, files, answered, truncated);
-crate::durable_tail_codec::durable_struct!(OpeningCall {
+crate::durable_tail_codec::durable_struct!(heap key OpeningCallId { L id: String });
+crate::durable_tail_codec::durable_struct!(heap OpeningCall {
     N response: u8,
     U tool: String,
     N candidates: u64,
@@ -560,8 +555,7 @@ crate::durable_tail_codec::durable_struct!(OpeningCall {
     N answered: bool,
     N truncated: bool,
 });
-crate::heap_layout_bound::fields!(OpeningFileState; ordinal, tool, repo_path, instruction_segments, reads, chars, client_loaded, truncated);
-crate::durable_tail_codec::durable_struct!(OpeningFileState {
+crate::durable_tail_codec::durable_struct!(heap OpeningFileState {
     N ordinal: u64,
     U tool: String,
     X repo_path: Option<String>,
@@ -571,8 +565,7 @@ crate::durable_tail_codec::durable_struct!(OpeningFileState {
     N client_loaded: [bool; 2],
     N truncated: [bool; 2],
 });
-crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests, content_end);
-crate::durable_tail_codec::durable_struct!(SessionStartState {
+crate::durable_tail_codec::durable_struct!(heap SessionStartState {
     U client_version: Option<String>,
     N user_turns: u8,
     N inherited_prefix: bool,

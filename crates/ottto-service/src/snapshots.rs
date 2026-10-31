@@ -93306,8 +93306,7 @@ crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; current, previous_
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPendingWindow; version, census_window_end, account_identifier_hash, evidence_request_count, census_complete, members, member_requests, invalid);
 crate::heap_layout_bound::fields!(ClaudeAccountRequestSet; prefixes, fingerprint, identity_revision);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyWitness; account_identifier_hash, evidence_request_count, members, member_request_id_fingerprints);
-crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before, pair_key, has_parent_link, trigger, id_less_before, id_less_after);
-crate::durable_tail_codec::durable_struct!(ClaudeCompactionObservation {
+crate::durable_tail_codec::durable_struct!(heap ClaudeCompactionObservation {
     N kind: ClaudeCompactionKind,
     N timestamp: Option<String>,
     N pre_tokens: Option<u64>,
@@ -93405,10 +93404,8 @@ crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);
 crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_session_ids, codex_inventory_hold);
 crate::heap_layout_bound::fields!(CodexInventoryHold; owed, refused_headers, outside_roster, awaiting_directories);
-crate::heap_layout_bound::fields!(ActivityCallId; id);
-crate::durable_tail_codec::durable_struct!(key ActivityCallId { L id: String });
-crate::heap_layout_bound::fields!(ActivityCallTool; name);
-crate::durable_tail_codec::durable_struct!(ActivityCallTool { U name: String });
+crate::durable_tail_codec::durable_struct!(heap key ActivityCallId { L id: String });
+crate::durable_tail_codec::durable_struct!(heap ActivityCallTool { U name: String });
 crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 // P2-1 (SOURCE): Claude attribution capture (`OTTTO_CLAUDE_ATTRIBUTION_CAPTURE`)
 // puts raw skill, plugin, MCP and subagent names into `context`. A context
@@ -93751,8 +93748,7 @@ inline_scan_enum!(SnapshotSource; Self::Pi,Self::Codex,Self::ClaudeCode);
 inline_scan_enum!(CodexOwnershipBoundary; Self::Undetermined,Self::AllLocal,Self::AwaitingLegacyTrigger,
     Self::AwaitingParentPrefix,Self::Ordinal { start: _ },Self::NativeCreatedThread,Self::AmbiguousFork);
 
-crate::heap_layout_bound::fields!(JsonlReadReport; physical_line_count, parsed_json_line_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count);
-crate::durable_tail_codec::durable_struct!(JsonlReadReport {
+crate::durable_tail_codec::durable_struct!(heap JsonlReadReport {
     N physical_line_count: usize,
     N parsed_json_line_count: usize,
     N malformed_json_line_count: usize,
