@@ -2987,19 +2987,28 @@ fn hold_copies(item: &mut SnapshotItem, reason: &'static str) {
 /// This page discarded the family's strict trace read (cap or generation
 /// race), so no account can be decided for it: every member is withheld like
 /// an undecided copy. No new revision replaces the accepted one; the next
-/// clean page decides it. Returns the items withheld.
-pub(crate) fn hold_trace_discarded(items: &mut [SnapshotItem], roots: &BTreeSet<String>) -> u64 {
+/// clean page decides it. Members without a fold (a family kept on ordinary
+/// money by the re-emission list) are returned for the same page withhold.
+/// Returns the items withheld and those unfolded sessions.
+pub(crate) fn hold_trace_discarded(
+    items: &mut [SnapshotItem],
+    roots: &BTreeSet<String>,
+) -> (u64, BTreeSet<String>) {
     let mut held = 0;
+    let mut unfolded = BTreeSet::new();
     for item in items {
         if !roots.contains(claude_snapshot_family_root_ref(item)) {
             continue;
         }
-        if let Some(fold) = item.claude_money.as_deref_mut() {
-            fold.entity.held = true;
-            held += 1;
+        match item.claude_money.as_deref_mut() {
+            Some(fold) => fold.entity.held = true,
+            None => {
+                unfolded.insert(item.source_session_id.clone());
+            }
         }
+        held += 1;
     }
-    held
+    (held, unfolded)
 }
 
 /// Decided: `uncovered` (and every id-less copy) counts, disclosed.
