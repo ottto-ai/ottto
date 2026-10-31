@@ -26572,21 +26572,7 @@ impl OwnedSourceScan {
             source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(index);
         if growth_active {
             sampled_audit::prune_growth_retention(index, sampled_scan::now_seconds());
-            if state_v2::retain_resume_exclusions(index, roots).is_err() {
-                let mut blocked = Self::new_continuation(
-                    &[],
-                    owned_index,
-                    collected_at,
-                    requested_backfill_window_days,
-                    0,
-                    artifacts_enabled,
-                    context_curve_enabled,
-                    None,
-                    None,
-                );
-                blocked.source = source;
-                return blocked;
-            }
+            state_v2::retain_resume_exclusions(index, roots);
         }
         let next_generation_hints;
         {

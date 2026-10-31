@@ -61,36 +61,44 @@ pub(in super::super::super) fn before_collection(index: &ScanIndex) -> Result<()
 
 /// Retain source debt and requeue the failed path through the existing bounded
 /// traversal. Backoff suppresses parsing, never discovery or age retention.
-pub(in super::super::super) fn retain_resume_exclusions(
-    index: &mut ScanIndex,
-    roots: &[PathBuf],
-) -> Result<()> {
-    let Some(path) = runtime_path(index)? else {
-        return Ok(());
-    };
-    let keys = with_state(&path, |state| {
-        let now = Instant::now();
-        for excluded in state.resume_excluded.values_mut() {
-            excluded.passes = excluded.passes.saturating_add(1);
-            if excluded.passes >= 3
-                || now.saturating_duration_since(excluded.first_seen)
-                    > Duration::from_secs(6 * 3600)
-            {
-                telemetry::event("v2_resume_stage_excluded_alarm", &1);
+/// A failure is a hold: the session is dropped, so the collection guard
+/// (before_collection) and every save/side-effect guard refuse this scan.
+pub(in super::super::super) fn retain_resume_exclusions(index: &mut ScanIndex, roots: &[PathBuf]) {
+    let keys = held(runtime_path(index).and_then(|path| {
+        let Some(path) = path else {
+            return Ok(Vec::new());
+        };
+        with_state(&path, |state| {
+            let now = Instant::now();
+            for excluded in state.resume_excluded.values_mut() {
+                excluded.passes = excluded.passes.saturating_add(1);
+                if excluded.passes >= 3
+                    || now.saturating_duration_since(excluded.first_seen)
+                        > Duration::from_secs(6 * 3600)
+                {
+                    telemetry::event("v2_resume_stage_excluded_alarm", &1);
+                }
+            }
+            if !state.resume_excluded.is_empty() {
+                telemetry::event(
+                    "v2_resume_stage_excluded",
+                    &(state.resume_excluded.len() as u64),
+                );
+            }
+            Ok(state.resume_excluded.keys().cloned().collect::<Vec<_>>())
+        })
+    }));
+    let Ok(keys) = keys else {
+        if let Some(runtime) = &index.v2().persistence_v2 {
+            if let Ok(mut session) = runtime.session.lock() {
+                session.take();
             }
         }
-        if !state.resume_excluded.is_empty() {
-            telemetry::event(
-                "v2_resume_stage_excluded",
-                &(state.resume_excluded.len() as u64),
-            );
-        }
-        Ok(state.resume_excluded.keys().cloned().collect::<Vec<_>>())
-    })?;
+        return;
+    };
     for key in keys {
         super::super::super::sampled_audit::retain_resume_excluded(index, &key, roots);
     }
-    Ok(())
 }
 
 pub(in super::super::super) fn resume_key_retained(index: &ScanIndex, key: &str) -> bool {

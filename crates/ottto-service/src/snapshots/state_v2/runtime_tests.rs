@@ -1310,6 +1310,32 @@ fn resume_exclusion_survives_reload_and_skips_transcript_before_parse() {
     }
 }
 
+/// [regress] N3: a failure while retaining R1 exclusions holds the route for
+/// the collection guard, never selecting through an empty continuation.
+#[test]
+fn resume_exclusion_failure_is_a_collection_hold() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    super::before_collection(&index).unwrap();
+    // A holder panicked: this route's state is poisoned.
+    let _ = std::panic::catch_unwind(|| {
+        with_state(&f.path, |_| -> Result<()> {
+            panic!("synthetic route-state panic")
+        })
+    });
+    retain_resume_exclusions(&mut index, &[]);
+    // A fresh route slot isolates the hold to the retained-exclusion failure.
+    states().lock().unwrap().remove(&f.path);
+    assert_eq!(
+        super::before_collection(&index)
+            .unwrap_err()
+            .downcast_ref::<Hold>(),
+        Some(&Hold::DbUnavailable)
+    );
+    assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &index)().is_err());
+}
+
 /// [regress] R1 backoff keeps aged keys and owed debt discoverable, counts growth,
 /// alarms on repeated/long exclusions, and permits the next normal read.
 #[test]
