@@ -633,6 +633,9 @@ impl SnapshotAccumulator {
         selector: &SelectorCapture,
     ) {
         self.observe_codex_turn_lifecycle(value, true);
+        if !self.codex_counting_v2() {
+            return;
+        }
         if string_eq_at(value, &["type"], "token_usage_record") {
             self.admit_codex_native(value, timestamp, selector);
         }
@@ -700,6 +703,9 @@ impl SnapshotAccumulator {
 
     pub(super) fn observe_codex_content_counting(&mut self, value: &Value) {
         self.observe_codex_turn_lifecycle(value, false);
+        if !self.codex_counting_v2() {
+            return;
+        }
         if string_eq_at(value, &["type"], "token_usage_record") {
             let _ = self.note_codex_native_authority(value);
         }
