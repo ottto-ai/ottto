@@ -18,6 +18,8 @@
 //! discovered and reported as `reachable = false` with empty tools (cost zero)
 //! until a network MCP client lands — see `TODO(mcp-http-transport)` below.
 
+mod plugins;
+
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::codex_version::{CodexVersionFeed, Sample};
 use crate::snapshots::SnapshotSource;
@@ -87,6 +89,8 @@ const DEFAULT_CONTEXT_WINDOW_TOKENS: i64 = 200_000;
 /// How a configured MCP server is reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Transport {
+    /// A plugin declaration contributes names/state only; never launch it.
+    Plugin,
     Stdio {
         command: String,
         args: Vec<String>,
@@ -101,11 +105,12 @@ enum Transport {
 
 impl Transport {
     /// The wire label persisted on the inventory (`transport` field).
-    fn label(&self) -> &'static str {
+    fn label(&self) -> Option<&'static str> {
         match self {
-            Transport::Stdio { .. } => "stdio",
-            Transport::Http { .. } => "http",
-            Transport::Sse { .. } => "sse",
+            Transport::Plugin => None,
+            Transport::Stdio { .. } => Some("stdio"),
+            Transport::Http { .. } => Some("http"),
+            Transport::Sse { .. } => Some("sse"),
         }
     }
 }
@@ -763,6 +768,10 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
         }
     }
 
+    for server in plugins::discover_claude(home) {
+        servers.entry(server.name.clone()).or_insert(server);
+    }
+
     // Carry the disabled state rather than dropping the server: a server the
     // user can re-enable is information worth reporting. The backend excludes
     // disabled servers from server_count / tool_count / grand_total_tokens.
@@ -785,11 +794,17 @@ fn discover_codex(home: &Path) -> Vec<ConfiguredServer> {
     let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
         return Vec::new();
     };
-    let Some(table) = document.get("mcp_servers").and_then(|item| item.as_table()) else {
-        return Vec::new();
-    };
-    let mut servers: BTreeMap<String, ConfiguredServer> = BTreeMap::new();
-    for (name, item) in table.iter() {
+    let mut servers: BTreeMap<String, ConfiguredServer> =
+        plugins::discover_codex(&codex_dir, &document)
+            .into_iter()
+            .map(|server| (server.name.clone(), server))
+            .collect();
+    for (name, item) in document
+        .get("mcp_servers")
+        .and_then(|item| item.as_table())
+        .into_iter()
+        .flat_map(|table| table.iter())
+    {
         // Re-serialize the per-server sub-table to JSON via toml->json so the
         // normalizer can share Claude Code's value-shape logic.
         let Some(value) = toml_item_to_json(item) else {
@@ -1435,7 +1450,7 @@ fn harvest_server(server: &ConfiguredServer, env: &SpawnEnv) -> (McpServerInput,
         // TODO(mcp-http-transport): implement Streamable HTTP + SSE handshakes.
         // Until then network servers are reported unreachable (cost zero) rather
         // than fabricating a footprint.
-        Transport::Http { .. } | Transport::Sse { .. } => None,
+        Transport::Plugin | Transport::Http { .. } | Transport::Sse { .. } => None,
     };
     let input = match tools {
         Some(probe) => McpServerInput {
@@ -1547,7 +1562,7 @@ fn harvest_servers(
 fn unreachable_server(server: &ConfiguredServer) -> McpServerInput {
     McpServerInput {
         server: server.name.clone(),
-        transport: Some(server.transport.label().to_string()),
+        transport: server.transport.label().map(str::to_string),
         reachable: false,
         loading_mode: "unknown".to_string(),
         loading_mode_basis: String::new(),
