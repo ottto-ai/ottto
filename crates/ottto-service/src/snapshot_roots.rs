@@ -135,6 +135,10 @@ fn watcher_roots_with(
     Ok(roots)
 }
 
+/// Fixed message `safe_error` prints when a scan's Claude roots moved under it.
+pub(crate) const CLAUDE_ROOTS_CHANGED_DURING_SCAN: &str =
+    "registered Claude transcript roots changed during scan";
+
 pub(crate) fn validate_claude_roots(home: &Path, expected: &[PathBuf]) -> Result<()> {
     validate_claude_roots_at(
         home,
@@ -154,10 +158,7 @@ fn validate_claude_roots_at(
         &[],
         &store.registered_config_dirs()?,
     );
-    anyhow::ensure!(
-        current == expected,
-        "registered Claude transcript roots changed during scan"
-    );
+    anyhow::ensure!(current == expected, CLAUDE_ROOTS_CHANGED_DURING_SCAN);
     Ok(())
 }
 
