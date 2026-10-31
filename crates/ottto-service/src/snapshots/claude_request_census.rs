@@ -2935,7 +2935,7 @@ pub(crate) fn record_claude_request_census(
         // An unchanged re-parse of a retired record (a backfill, a resume
         // miss) stays retired while its file is still past the cutoff: its
         // hashes, and the index bytes, do not bounce back.
-        let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
+        let cutoff = retirement_window(window).saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
         if old.retired.is_some()
             && window > 0
             && old.derivation == record.derivation
@@ -2989,7 +2989,7 @@ fn insert_transcript_record(
         note_record_limit_refused();
         return ClaudeRequestCensusInsert::Refused;
     }
-    let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
+    let cutoff = retirement_window(window).saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
     let files = &index.files;
     let mut released = 0;
     let outcome =
@@ -3096,6 +3096,18 @@ pub(crate) fn settle_claude_request_census_terminal(
 
 /// A transcript is retired 35 days after its last modification.
 pub(crate) const CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS: u64 = 35 * 24 * 60 * 60;
+
+/// The window #920's retirement ages against. OFF: the traversal's census
+/// window (main). ON: no new generation starts, so that window is frozen;
+/// age against the service clock instead, floored to a day so the
+/// admission release memo (keyed by cutoff) keeps holding within a day.
+fn retirement_window(window: u64) -> u64 {
+    if !super::claude_terminal_off() {
+        return window;
+    }
+    let now = super::sampled_scan::now_seconds();
+    window.max(now - now % 86_400)
+}
 
 /// Process counters of transcript retirements (aged, vanished) for the P1
 /// shadow line; D1's counts are unchanged.
