@@ -4077,8 +4077,9 @@ fn identity_count(counts: &serde_json::Value, key: &str) -> u64 {
     counts["identity_cap"][key].as_u64().unwrap_or(0)
 }
 
-/// [money] SOURCE 2026-10-31 (#944 xPR F5) fixtures 1-3 and 5, in #909 and
-/// option (ii) modes. Switch OFF froze an own turn's org a copied prefix
+/// [money] SOURCE 2026-10-31 (#944 xPR F5) fixtures 1-5, in #909 and
+/// option (ii) modes. Fixture 4 composes #947: the tombstoned row on an
+/// unhealthy root stays definite (no refusal, marker or second tombstone). Switch OFF froze an own turn's org a copied prefix
 /// marker lent (X). Switch ON tombstones that row once, counted, and sends it
 /// untagged with no refusal or marker (today's attribution), while a later
 /// row its own marker proves (B) keeps its accepted identity. A later own
@@ -4156,6 +4157,30 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                 assert!(got[1].4 || got[1].5, "the row B proves keeps its accepted identity");
                 assert_eq!(org_shares(&copy).get(&x), None);
             }
+            // Fixture 4: one sidecar of the pair makes the root unhealthy
+            // (#947: all-Unknown). Only the row B proves keeps protection.
+            let effort = c.support.join("local-otel/claude-code-effort")
+                .join(format!("{:x}.jsonl", Sha256::digest(COPY.as_bytes())));
+            std::fs::create_dir_all(effort.parent().unwrap()).unwrap();
+            std::fs::write(&effort, "").unwrap();
+            let saved = serde_json::to_vec(&ledger).unwrap();
+            let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
+            take_identity_counts();
+            page.enrich_with(&c, Some(&mut ledger));
+            let counts = serde_json::to_value(take_identity_counts()).unwrap();
+            assert!(page.unhealthy.incomplete > 0, "#947's unhealthy-root branch ran");
+            assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 0);
+            assert_eq!(identity_count(&counts, "copy_derived_skipped_evidence_unavailable"), 0);
+            assert_eq!(serde_json::to_vec(&ledger).unwrap(), saved, "no second tombstone");
+            let copy = body(&page, COPY).unwrap();
+            assert!(crate::snapshots::claude_request_money::is_request_owned_literal(copy));
+            let got = rows(copy);
+            assert_eq!((&got[0].0, got[0].1, got[0].2, &got[0].3, got[0].4, got[0].5),
+                (&today[0].0, today[0].1, today[0].2, &today[0].3, false, false),
+                "the tombstoned row: same money, untagged, no marker");
+            assert_eq!(copy.request_identity_refusals, u64::from(!retained), "only B's row refuses");
+            assert_eq!(identity_count(&counts, "accepted_share_changed"), 1, "B's bucket only");
+            std::fs::remove_file(&effort).unwrap();
             // The invalidated row reads as never accepted: own evidence tags it fresh.
             let (copy, _) = pass(&c, &mut ledger);
             ack(&mut ledger, &copy);
