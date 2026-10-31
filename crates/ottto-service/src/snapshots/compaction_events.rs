@@ -100,13 +100,7 @@ impl ClaudeCompactionTrigger {
     }
 }
 
-impl crate::heap_layout_bound::HeapLayoutBound for ClaudeCompactionTrigger {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ClaudeCompactionTrigger);
 
 /// Sizes and trigger for exactly the events `claude_compaction_summary`
 /// lists for the same `owned_observations`: every boundary plus every legacy

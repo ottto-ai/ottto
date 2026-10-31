@@ -1038,13 +1038,7 @@ impl JoinRefusal {
         )
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for JoinRefusal {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; JoinRefusal);
 
 /// First eight bytes of SHA-256: the exact compact set element. A collision
 /// errs toward `Overlap`, never toward admission.
@@ -1741,12 +1735,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ContentDigest {
         c.add(0)
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for Tokens {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; Tokens);
 
 #[cfg(test)]
 pub(super) mod tests {
