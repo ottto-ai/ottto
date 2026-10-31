@@ -47,6 +47,7 @@ pub(crate) struct Properties {
             &mut crate::durable_tail_store::ActiveLease,
         ) -> Result<durable::Decoded, crate::durable_tail_codec::DecodeFailure>,
     pub(super) verify: fn(&[u8]) -> Result<(), Corrupt>,
+    #[cfg(test)]
     pub(super) apply_line: fn(&Value, &mut SnapshotAccumulator),
 }
 
@@ -70,6 +71,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
         verify: durable::verify,
+        #[cfg(test)]
         apply_line: apply_claude_code_line,
     },
     Properties {
@@ -88,6 +90,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
         verify: durable::verify,
+        #[cfg(test)]
         apply_line: apply_codex_line,
     },
 ];
