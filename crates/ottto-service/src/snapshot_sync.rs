@@ -6763,6 +6763,7 @@ fn prepare_sync_source_inner(
             context_curve_enabled,
             request_identity_capture,
             &copy_prefix_scope,
+            Some(&daemon.transcript_cache),
         )
         .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
         .with_codex_side_pass(codex_side_pass)
@@ -9625,12 +9626,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 &evidence,
             );
             let census_window_end = scan_result.census_window_end.clone();
-            crate::snapshots::apply_claude_effort_evidence_with_index(
+            crate::snapshots::apply_claude_effort_evidence_with_shared_cache(
                 &mut scan_result.snapshots,
                 &evidence.evidence,
                 index,
                 census_complete,
                 &census_window_end,
+                retained.map(|(cache, _)| cache),
             );
             api_read = evidence;
         }

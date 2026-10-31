@@ -152,6 +152,8 @@ impl CapPace {
 pub(crate) struct SharedCache {
     pub(crate) withheld_memo: withheld_account::Memo,
     inner: Mutex<RetainedCache>,
+    /// Q-D3 process memo. Leaf lock; never held across sidecar reads.
+    pub(in crate::snapshots) child_evidence: Mutex<Option<Box<child_evidence_digest::Memo>>>,
     cap_pace: Mutex<CapPace>,
     /// The resumable Codex job slot and held-singleton memo. Charged once,
     /// here; copy budgets and insert admission see it through this cache.
@@ -171,6 +173,7 @@ impl Default for SharedCache {
         Self {
             withheld_memo: Default::default(),
             inner: Mutex::new(TranscriptCache::with_byte_limit(STATE_BYTES)),
+            child_evidence: Mutex::new(None),
             cap_pace: Mutex::new(CapPace::default()),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
             side: Mutex::new(side_ledger::SideLedger::default()),
@@ -189,6 +192,7 @@ impl HeapLayoutBound for SharedCache {
         // The shared cache owns the memo allocation header even when empty.
         // Its optional entries are priced separately by the rotation owner.
         self.withheld_memo.heap_bound(c)?;
+        self.child_evidence.heap_bound(c)?;
         if BLOCKING_RESIDENT_MEASURE.with(std::cell::Cell::get) {
             // P1-RETAIN R0's completion measure: wait for each lock, one at a
             // time and in lock order (`retained` checks this thread holds

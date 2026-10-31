@@ -1173,8 +1173,9 @@ fn decode_api_sidecar(
     let (rows, mut bytes) = decode_api_rows(&mut reader, session_id, &mut health);
     if terminal_off {
         bytes = limit - reader.get_ref().limit();
-        strict_budget::consumed(bytes);
     }
+    // OFF also feeds the loader byte receipt; it installs no allowance.
+    strict_budget::consumed(bytes);
     #[cfg(test)]
     API_AFTER_READ.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
