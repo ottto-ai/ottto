@@ -234,14 +234,19 @@ pub(crate) struct LineDeliveryCounts {
 pub(crate) enum UnselectedReason {
     Age,
     Size,
+    /// ON strict API/trace pair deferred for the shared byte allowance.
+    StrictBudgetDeferred = 4,
+    /// ON page pair or first rotating off-page pair gets a protected read.
+    StrictBudgetProtected,
 }
-/// Claude, Codex, Pi x (age, size, serial fallback causes), drained by that
-/// source's page line. Diagnostics only; never carried in a scan/frame graph.
+/// Claude, Codex, Pi x (age, size, serial fallback causes, ON strict budget).
+/// Page and strict-cohort lines drain their own slots. Diagnostics only; never
+/// carried in a scan/frame graph.
 #[cfg(not(test))]
-static SOURCE_COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static SOURCE_COUNTS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
 #[cfg(test)]
 thread_local! {
-    static SOURCE_COUNTS: [AtomicU64; 12] = const { [const { AtomicU64::new(0) }; 12] };
+    static SOURCE_COUNTS: [AtomicU64; 18] = const { [const { AtomicU64::new(0) }; 18] };
 }
 fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
     let sources = ["claude_code", "codex", "pi"];
@@ -250,16 +255,25 @@ fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) 
     };
     #[cfg(test)]
     {
-        SOURCE_COUNTS.with(|slots| f(&slots[4 * slot + reason]))
+        SOURCE_COUNTS.with(|slots| f(&slots[6 * slot + reason]))
     }
     #[cfg(not(test))]
     {
-        f(&SOURCE_COUNTS[4 * slot + reason])
+        f(&SOURCE_COUNTS[6 * slot + reason])
     }
 }
 /// One skip decision, recorded after the gate decided; never a gate input.
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
     source_count(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+}
+/// Drain only the ON budget slots on the existing strict-cohort line. No
+/// diagnostic payload or heap-measured report gains a field.
+pub(crate) fn take_strict_budget_counts() -> (u64, u64) {
+    let take = |reason| source_count("claude_code", reason, |slot| slot.swap(0, Relaxed));
+    (
+        take(UnselectedReason::StrictBudgetDeferred as usize),
+        take(UnselectedReason::StrictBudgetProtected as usize),
+    )
 }
 /// One failed parking decision; no logging, resource probes or scan ownership.
 pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bool) {

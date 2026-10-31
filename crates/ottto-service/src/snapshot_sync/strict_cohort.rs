@@ -6,7 +6,7 @@ pub(super) struct Plan {
     pub roots: Vec<String>,
     pub deferred: BTreeSet<String>,
     pub deferred_bytes: u64,
-    /// Pass read allowance: the plan's reservation, never below BYTES_PER_PASS.
+    /// Planned reservation (diagnostic); each read pair protects its own allowance.
     pub allowance: u64,
 }
 // A normal source cycle reloads ScanIndex. Keep scheduling in bounded
@@ -49,6 +49,35 @@ pub(super) fn plan(
     cursors.push_back((key, cursor));
     result
 }
+/// If growth exhausted a non-first off-page read, resume immediately after
+/// its predecessor. Extend the existing scoped cursor owner: no retry store.
+pub(super) fn retry_after(support: &Path, scope: &str, predecessor: &str) {
+    let key = format!(
+        "{:x}",
+        Sha256::digest(format!("{}:{scope}", support.display()).as_bytes())
+    );
+    let mut cursors = CURSORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, cursor)) = cursors.iter_mut().find(|(saved, _)| saved == &key) {
+        *cursor = Some(predecessor.to_owned());
+    }
+}
+/// Page pairs and the first off-page pair cannot lose to stale metadata:
+/// reserve both per-file caps before their reads, charging only actual bytes.
+/// Other off-page reads share the unused part of 16 MiB. Thus their total is
+/// at most max(16 MiB, the first pair), even if that pair grew after planning.
+pub(super) fn read_allowance(protected: bool, offpage_consumed: u64) -> u64 {
+    if protected {
+        crate::local_resource_diagnostics::line_delivery_unselected(
+            "claude_code",
+            crate::local_resource_diagnostics::UnselectedReason::StrictBudgetProtected,
+        );
+        2 * crate::claude_local_otel::MAX_EVIDENCE_FILE_BYTES
+    } else {
+        BYTES_PER_PASS.saturating_sub(offpage_consumed)
+    }
+}
 fn select(
     support: &Path,
     roots: Vec<String>,
@@ -78,6 +107,7 @@ fn select(
     };
     let mut reserved = 0u64;
     let mut next = None;
+    let mut offpage_deferred = false;
     for root in ordered {
         let bytes = crate::claude_local_otel::strict_cohort_bytes(support, root);
         // The first off-page root after the cursor is planned even over the
@@ -90,7 +120,9 @@ fn select(
         // read it cannot cover through the #932 hold, never as unhealthy.
         if page.contains(root)
             || first_offpage
-            || plan.roots.len() < ROOTS_PER_PASS && reserved.saturating_add(bytes) <= BYTES_PER_PASS
+            || !offpage_deferred
+                && plan.roots.len() < ROOTS_PER_PASS
+                && reserved.saturating_add(bytes) <= BYTES_PER_PASS
         {
             reserved = reserved.saturating_add(bytes);
             plan.roots.push(root.clone());
@@ -98,6 +130,9 @@ fn select(
                 next = Some(root.clone());
             }
         } else {
+            // Keep a contiguous off-page prefix. Skipping a large middle pair
+            // for a small tail could park the cursor past it every rotation.
+            offpage_deferred = true;
             plan.deferred.insert(root.clone());
             plan.deferred_bytes = plan.deferred_bytes.saturating_add(bytes);
         }
@@ -211,29 +246,43 @@ mod tests {
 
     /// [behaviour] X1: a page root whose pair exceeds the pass allowance is
     /// planned, and a strict read the allowance cannot cover is deferred to
-    /// the #932 hold (a trace cap discard, or the pass's deferred API read),
-    /// never only an oversized file. OFF rows are main: only oversized.
+    /// the #932 hold and a distinct budget counter. Protected rows grow after
+    /// planning and still read immediately. OFF rows are main: only oversized.
     #[test]
     fn strict_allowance_shortfall_defers_page_root_through_discard() {
-        // (terminal_off, the API sidecar is over the allowance, else the trace)
-        for (terminal_off, api_over) in [(true, false), (false, false), (true, true), (false, true)]
-        {
+        // (terminal_off, API sidecar grows, protected page/first pair).
+        for (terminal_off, api_over, protected) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (false, true, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
             let _terminal_off =
                 terminal_off.then(crate::snapshots::ClaudeTerminalOffForTest::enabled);
             let scratch = crate::test_scratch::ScratchDir::new("strict-allowance-shortfall");
             let over = BYTES_PER_PASS + 1;
             let (api_len, trace_len) = if api_over { (over, 0) } else { (0, over) };
             write_pair(&scratch, "page-small", 0, 0);
-            write_pair(&scratch, "page-over", api_len, trace_len);
+            write_pair(&scratch, "page-over", 0, 0);
             let roots = vec!["page-over".to_string(), "page-small".to_string()];
             let page = roots.iter().cloned().collect::<BTreeSet<_>>();
             let planned = plan(&scratch, roots.clone(), &page, "shortfall");
             assert_eq!(planned.roots, roots, "terminal_off={terminal_off}");
             assert!(planned.deferred.is_empty(), "terminal_off={terminal_off}");
 
-            let row = format!("terminal_off={terminal_off} api_over={api_over}");
-            let allowance =
-                crate::claude_local_otel::strict_budget::StrictReadBudget::new(BYTES_PER_PASS);
+            // Real M4 precondition: the pair grows between plan and read.
+            write_pair(&scratch, "page-over", api_len, trace_len);
+            let _ = crate::local_resource_diagnostics::take_strict_budget_counts();
+            let row =
+                format!("terminal_off={terminal_off} api_over={api_over} protected={protected}");
+            let bytes = if protected {
+                read_allowance(true, 0)
+            } else {
+                BYTES_PER_PASS
+            };
+            let allowance = crate::claude_local_otel::strict_budget::StrictReadBudget::new(bytes);
             let api = crate::claude_local_otel::load_claude_api_request_evidence_report(
                 &scratch,
                 ["page-over".to_string()],
@@ -247,24 +296,37 @@ mod tests {
             // OFF (main) bounds the API read by the per-file cap only.
             assert_eq!(
                 api.health.oversized_files,
-                u64::from(terminal_off && api_over),
+                u64::from(terminal_off && api_over && !protected),
                 "{row}"
             );
             assert_eq!(trace.is_complete(), api_over, "{row}");
-            assert_eq!(trace.oversized_files, u64::from(!api_over), "{row}");
+            assert_eq!(
+                trace.oversized_files,
+                u64::from(!api_over && !protected),
+                "{row}"
+            );
             assert_eq!(
                 trace.rows_discarded,
-                crate::claude_local_otel::ClaudeTraceRowsDiscarded {
-                    cap: u64::from(terminal_off && !api_over),
-                    ..Default::default()
-                },
+                crate::claude_local_otel::ClaudeTraceRowsDiscarded::default(),
                 "{row}"
             );
             assert_eq!(
                 allowance.deferred("page-over"),
-                terminal_off && api_over,
+                terminal_off && !protected,
                 "{row}"
             );
+            assert_eq!(
+                crate::local_resource_diagnostics::take_strict_budget_counts(),
+                (u64::from(terminal_off && !protected), u64::from(protected)),
+                "one root counter for either sidecar; no cap/growth discard: {row}",
+            );
+            if protected {
+                assert_eq!(
+                    allowance.consumed(),
+                    over,
+                    "grown pair read in this pass: {row}"
+                );
+            }
         }
     }
 
@@ -281,36 +343,58 @@ mod tests {
             &'static [&'static str],
             &'static [&'static str],
             u64,
+            u8,
         );
         let big = (18 << 20) + 2;
-        let rows: [Row; 4] = [
+        let rows: [Row; 6] = [
             (
                 true,
                 &["big", "page"],
                 &["big", "page", "tail"],
                 &[],
                 big + 4,
+                0,
             ),
-            (true, &["page"], &["page", "big"], &["tail"], big + 2),
-            (true, &["tail"], &["tail", "big"], &["page"], big + 2),
+            (true, &["page"], &["page", "big"], &["tail"], big + 2, 0),
+            (true, &["tail"], &["tail", "big"], &["page"], big + 2, 0),
             (
                 false,
                 &["page"],
                 &["big", "page", "tail"],
                 &[],
                 BYTES_PER_PASS,
+                0,
             ),
+            (
+                true,
+                &["page"],
+                &["page", "big", "tail"],
+                &[],
+                BYTES_PER_PASS,
+                1,
+            ),
+            (true, &[], &["big"], &["page", "tail"], BYTES_PER_PASS, 2),
         ];
-        for (terminal_off, page, planned, deferred, allowance) in rows {
+        for (terminal_off, page, planned, deferred, allowance, liveness) in rows {
             let _terminal_off =
                 terminal_off.then(crate::snapshots::ClaudeTerminalOffForTest::enabled);
             let scratch = crate::test_scratch::ScratchDir::new("strict-cohort-big-root");
-            write_pair(&scratch, "big", 10 << 20, 8 << 20);
-            write_pair(&scratch, "page", 0, 0);
+            write_pair(
+                &scratch,
+                "big",
+                if liveness != 0 { 0 } else { 10 << 20 },
+                if liveness != 0 { 0 } else { 8 << 20 },
+            );
+            write_pair(
+                &scratch,
+                "page",
+                0,
+                if liveness == 2 { 18 << 20 } else { 0 },
+            );
             write_pair(&scratch, "tail", 0, 0);
             let roots = ["big", "page", "tail"].map(String::from).to_vec();
             let page = page.iter().map(|r| r.to_string()).collect::<BTreeSet<_>>();
-            let result = plan(&scratch, roots, &page, "big-root");
+            let result = plan(&scratch, roots.clone(), &page, "big-root");
             assert_eq!(
                 result.roots, planned,
                 "terminal_off={terminal_off} page={page:?}"
@@ -324,6 +408,68 @@ mod tests {
                 result.allowance, allowance,
                 "the reader allowance covers the reservation"
             );
+            if liveness == 2 {
+                // A small tail must not advance the cursor past a plan-deferred
+                // large middle pair forever. It is first on the next pass.
+                let next = plan(&scratch, roots.clone(), &page, "big-root");
+                assert_eq!(next.roots, ["page"]);
+                let budget = crate::claude_local_otel::strict_budget::StrictReadBudget::new(
+                    read_allowance(true, 0),
+                );
+                let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+                    &scratch,
+                    ["page".to_string()],
+                );
+                assert_eq!(budget.consumed(), 18 << 20);
+                assert_eq!(trace.oversized_files, 0);
+                assert!(!budget.deferred("page"));
+            }
+            if liveness == 1 {
+                let _ = crate::local_resource_diagnostics::take_strict_budget_counts();
+                // Pass N: tail was planned empty, then grew beyond the unused
+                // ordinary allowance. Big is the protected first off-page pair.
+                let mut spent = 0;
+                for (root, protected) in [("big", true), ("tail", false)] {
+                    write_pair(&scratch, "tail", 0, BYTES_PER_PASS + 1);
+                    let budget = crate::claude_local_otel::strict_budget::StrictReadBudget::new(
+                        read_allowance(protected, spent),
+                    );
+                    let _ = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+                        &scratch,
+                        [root.to_string()],
+                    );
+                    spent += budget.consumed();
+                    assert_eq!(budget.deferred(root), root == "tail");
+                    if budget.deferred(root) {
+                        retry_after(&scratch, "big-root", "big");
+                    }
+                }
+                // Ordinary index reloads do not own or erase the cursor.
+                // Pass N+1: tail is first even though it grows AGAIN after plan.
+                let next = plan(&scratch, roots, &page, "big-root");
+                assert_eq!(next.roots, ["page", "tail"]);
+                let grown = BYTES_PER_PASS + 1024;
+                write_pair(&scratch, "tail", 0, grown);
+                let budget = crate::claude_local_otel::strict_budget::StrictReadBudget::new(
+                    read_allowance(true, 0),
+                );
+                let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+                    &scratch,
+                    ["tail".to_string()],
+                );
+                assert_eq!(
+                    budget.consumed(),
+                    grown,
+                    "deferred N is read N+1 despite continued growth"
+                );
+                assert!(!budget.deferred("tail"));
+                assert_eq!(trace.oversized_files, 0);
+                assert!(trace.rows_discarded.is_empty());
+                assert_eq!(
+                    crate::local_resource_diagnostics::take_strict_budget_counts(),
+                    (1, 2)
+                );
+            }
         }
     }
 }

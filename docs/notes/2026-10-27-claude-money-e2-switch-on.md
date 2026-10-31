@@ -4,6 +4,34 @@ PR C enables the E2 fold and advances the Claude upload body-witness revision
 from 2 to 3, with maximum gated revision 3. The existing history-upgrade path
 paces the one owed reread; completed revision-3 files owe no repeat pass.
 
+## Strict paired-sidecar service under the terminal-off switch
+
+Lead B (2) ACCEPTED: page pairs as OFF + max(16 MiB, first off-page pair);
+the off-page part is at most 2×64 MiB. The planner's
+`allowance_bytes` is max(16 MiB, its metadata reservation). At read time,
+each page pair and the first rotating off-page pair reserve both 64 MiB
+per-file caps. Only actual bytes are charged. Later off-page pairs share the
+unused part of 16 MiB, so growth in the first pair cannot enlarge that bound.
+The per-file cap and existing generation/growth discard checks still apply.
+
+Page pairs therefore cannot be budget-deferred, even after growth between
+planning and reading. If an ordinary off-page pair is budget-deferred, the
+existing scoped strict-cohort cursor stops at its predecessor. The first such
+root is read with the protected reservation on pass N+1. With M roots remaining
+in that stable cohort, every later budget-deferred root gets its protected read
+within at most M passes: each pass advances through at least its first off-page
+root without skipping the first budget deferral. Becoming a page root serves it
+immediately. This is a budget-service bound; malformed, replaced, continuously
+changing-during-read or per-file oversized evidence still keeps its existing
+hold. Restart or eviction of the existing 64-scope cursor restarts rotation.
+
+The existing `strict_cohort_deferred` line reports `budget_deferred_roots`
+(one per root with API or trace allowance shortfall) separately from #932 growth
+discards, and `budget_protected_pairs` (protected page/first-pair reservations).
+Both drain slots in the existing local-resource diagnostics atomic array; no
+heap-measured report, serialized diagnostics record or OFF layout gains fields.
+The switch remains default OFF; no marker is created by this change.
+
 ## Legacy test pins
 
 T8 records **51 gate-off pins**: 29 from its first round and 22 from its second.
