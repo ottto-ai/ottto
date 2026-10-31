@@ -769,7 +769,7 @@ mod tests {
             .claude_account_deferred_holds
             .contains_key(&member_key));
         assert!(index.files[&member_key].has_unverified_source());
-        for (at, now) in [(NOW, 1_600), (RETRY, 2_200)] {
+        for (at, now) in [(LATER, 1_600), (RETRY, 2_200)] {
             super::super::sampled_scan::set_test_now(Some(now));
             let (result, rows) = crate::local_resource_diagnostics::capture(|| {
                 observe_vanished(|| {
@@ -779,7 +779,7 @@ mod tests {
                 })
             });
             let (((pages, events), sites), vanished) = result;
-            let retired = u64::from(at == NOW);
+            let retired = u64::from(at == LATER);
             // Pin the shared #799 keys and meanings independently of the
             // temporary stage/carrier, including zero on the next generation.
             // Count across ALL records so a second emitter cannot hide behind
