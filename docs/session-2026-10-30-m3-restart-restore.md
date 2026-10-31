@@ -9,8 +9,8 @@ protected. Parser versions and upload wire contracts are unchanged. The retained
 private-label schema uses new allowlist pins; retired pre-label pins are not read.
 
 The `restart_restore_enabled` sentinel requests the feature. The discovery
-readiness gate must also be open; otherwise `restart_restore_on_refused` reports
-the refusal. OFF fully disables ordinary store reads, writes, repair and GC;
+readiness gate must also be open; otherwise the store remains OFF.
+OFF fully disables ordinary store reads, writes, repair and GC;
 files use main's no-record acquisition path. Consent/source erasure remains
 bounded, counted and fail-closed. Owned sibling recognition and counted deletion
 of outgrown v1 records also remain active while OFF. A failed deletion retries at
