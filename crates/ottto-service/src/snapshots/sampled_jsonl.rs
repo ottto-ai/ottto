@@ -48,13 +48,15 @@ impl CachedJsonlReduction {
     pub(super) fn usage_witness(&self) -> u64 {
         self.accumulator.usage_witness()
     }
-    pub(super) fn covers_archive(
+    /// Compare only complete native identity sets and monotone usage. `Less`
+    /// means the archive adds nothing; `None` supplies no equivalence proof.
+    pub(super) fn compare_archive(
         &self,
         owner: &str,
         signatures: &[String],
         usage: &UsageTotals,
         budget: usize,
-    ) -> bool {
+    ) -> Option<std::cmp::Ordering> {
         if self.accumulator.source != SnapshotSource::Codex
             || self.accumulator.source_session_id.as_deref() != Some(owner)
             || self.accumulator.codex_creator_header_id.as_deref() != Some(owner)
@@ -66,20 +68,32 @@ impl CachedJsonlReduction {
                 self.recognized_usage_drop_count,
                 self.accumulator.dropped_usage_record_count,
             )
-            || !usage.is_monotonic_after(&self.accumulator.accepted_usage_totals)
             || signatures
                 .len()
-                .checked_mul(std::mem::size_of::<&String>())
+                .checked_add(self.accumulator.codex_physical_signatures.len())
+                .and_then(|n| n.checked_mul(std::mem::size_of::<&String>()))
                 .map_or(true, |b| b > budget)
         {
-            return false;
+            return None;
         }
         let mut sorted: Vec<_> = signatures.iter().collect();
         sorted.sort_unstable();
-        self.accumulator
-            .codex_physical_signatures
-            .iter()
-            .all(|s| sorted.binary_search(&s).is_ok())
+        let mut prior: Vec<_> = self.accumulator.codex_physical_signatures.iter().collect();
+        prior.sort_unstable();
+        let covers = usage.is_monotonic_after(&self.accumulator.accepted_usage_totals)
+            && prior.iter().all(|s| sorted.binary_search(s).is_ok());
+        let dominated = self
+            .accumulator
+            .accepted_usage_totals
+            .is_monotonic_after(usage)
+            && sorted.iter().all(|s| prior.binary_search(s).is_ok());
+        use std::cmp::Ordering::*;
+        match (covers, dominated) {
+            (true, true) => Some(Equal),
+            (true, false) => Some(Greater),
+            (false, true) => Some(Less),
+            (false, false) => None,
+        }
     }
 
     pub(super) fn into_archive_baseline(

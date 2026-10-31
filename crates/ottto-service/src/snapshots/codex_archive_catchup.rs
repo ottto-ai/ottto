@@ -9,6 +9,11 @@ pub(super) enum Admission {
     Deferred(CodexZstCause),
 }
 
+pub(super) enum ArchiveReplacement {
+    Replace(Vec<codex_file_join::LegacyBaseline>),
+    Dominated,
+}
+
 /// Borrowed scan inputs; the existing acquisition still owns the opened file
 /// and the saved reservation. This operation builds neither a parser nor an ACK.
 pub(super) struct Preparation<'a> {
@@ -114,11 +119,12 @@ impl ScanIndex {
             &CodexTitleMetadata,
         ),
         mut budget: usize,
-    ) -> Option<Vec<codex_file_join::LegacyBaseline>> {
+    ) -> Option<ArchiveReplacement> {
         let (inventory, cache, metadata) = inputs;
         let key = local_index_key(path);
         if !inventory.old_carrier(&key) {
-            return (!inventory.archive_class(&key).sibling).then(Vec::new);
+            return (!inventory.archive_class(&key).sibling)
+                .then(|| ArchiveReplacement::Replace(Vec::new()));
         }
         let (owner, ledger) = parsed
             .codex_parent_ownership_ledger
@@ -148,6 +154,8 @@ impl ScanIndex {
             carriers.checked_mul(std::mem::size_of::<codex_file_join::LegacyBaseline>())?,
         )?;
         let mut baselines = Vec::with_capacity(carriers);
+        let mut replacement = true;
+        let mut dominated = true;
         for carrier in inventory.carrier_paths(owner).filter(|p| *p != key) {
             if codex_archive_path(Path::new(carrier)) {
                 return None;
@@ -169,12 +177,11 @@ impl ScanIndex {
             }
             let retained = cache.retained().ok()?;
             let prior = retained.peek(carrier)?;
-            if !prior
+            let relation = prior
                 .state
-                .covers_archive(owner, &ledger.signatures, usage, budget)
-            {
-                return None;
-            }
+                .compare_archive(owner, &ledger.signatures, usage, budget)?;
+            replacement &= relation != std::cmp::Ordering::Less;
+            dominated &= relation != std::cmp::Ordering::Greater;
             // Keep the accepted plain proof available for an unACKed archive's
             // next retry. Fund both the copy and its existing output charge
             // before cloning; no baseline file read is introduced.
@@ -189,7 +196,28 @@ impl ScanIndex {
             drop(retained);
             baselines.push(state.into_archive_baseline(carrier, entry, owner, metadata));
         }
-        (!baselines.is_empty()).then_some(baselines)
+        if baselines.is_empty() {
+            return None;
+        }
+        if replacement {
+            return Some(ArchiveReplacement::Replace(baselines));
+        }
+        // A subset may settle without uploading only when this exact native
+        // baseline already reproduces accepted output. A projection mismatch
+        // remains unknown; it must never authorize discarding new usage.
+        if dominated
+            && baselines.iter().all(|baseline| {
+                snapshot_file_entity_set_hex(
+                    baseline
+                        .snapshots
+                        .iter()
+                        .map(|s| s.snapshot_fingerprint.clone()),
+                ) == baseline.expected
+            })
+        {
+            return Some(ArchiveReplacement::Dominated);
+        }
+        None
     }
 
     /// Custody is negative scope only; acquisition and ACK remain independent.

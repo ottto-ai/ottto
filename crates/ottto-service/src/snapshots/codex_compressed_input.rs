@@ -322,6 +322,12 @@ impl ArchiveEvidence {
         parsed: &super::ParsedJsonlFile,
     ) -> bool {
         use ArchiveDisposition::*;
+        // Use the native plain-file terminal parent verdict. It is disclosed
+        // loss, never exclusive usage, an ACK, or an archive-specific raw body.
+        let parent_residue = parsed.non_progressing_residue()
+            && parsed
+                .codex_parent_unresolvable
+                .is_some_and(|cause| !cause.deferred());
         let header = self.header_for(path);
         self.owner = owner.filter(|o| header.is_some_and(|h| h.owner == *o));
         if let Some(owner) = &self.owner {
@@ -333,6 +339,7 @@ impl ArchiveEvidence {
                 cause: CodexZstCause::OwnerUnproven,
             };
         } else if !parsed.complete()
+            && !parent_residue
             && !parsed.codex_parent_resolution_pending
             && !parsed
                 .codex_parent_unresolvable
@@ -345,7 +352,10 @@ impl ArchiveEvidence {
         } else if parsed.complete() && parsed.snapshots.is_empty() {
             self.disposition = Empty;
         }
-        self.owner.is_some() && parsed.complete()
+        if self.owner.is_some() && parent_residue {
+            self.defer_custody(CodexZstCause::ParentLedgerUnbound);
+        }
+        self.owner.is_some() && (parsed.complete() || parent_residue)
     }
     pub(super) fn quiet(&self, file: &File) -> bool {
         self.matches(file)

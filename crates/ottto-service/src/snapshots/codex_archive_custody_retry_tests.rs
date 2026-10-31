@@ -101,14 +101,14 @@ fn archive_replacement_requires_equal_session_and_accepted_identity_superset() {
             )
             .unwrap();
         let (owner, ledger) = parsed.codex_parent_ownership_ledger.as_ref().unwrap();
-        let covers = retained.covers_archive(owner, &ledger.signatures, &usage, usize::MAX);
+        let covers = matches!(
+            retained.compare_archive(owner, &ledger.signatures, &usage, usize::MAX),
+            Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+        );
         assert_eq!(covers, superset);
-        assert!(!retained.covers_archive(
-            "another-session",
-            &ledger.signatures,
-            &usage,
-            usize::MAX
-        ));
+        assert!(retained
+            .compare_archive("another-session", &ledger.signatures, &usage, usize::MAX)
+            .is_none());
         let mut heads = BTreeMap::from([(ack.source_session_id.clone(), ack.clone())]);
         if covers {
             assert_eq!(parsed.snapshots.len(), 1);
@@ -217,4 +217,195 @@ fn catchup_size_custody_pages_to_complete_usage_and_counts_decoded_size() {
     assert!(rows
         .iter()
         .any(|row| row["counts"]["codex_zst_decoded_size"]["lt_16_mib"] == 1));
+}
+
+/// [money] An accepted plain superset ends archive custody without emitting a
+/// second head; the terminal cause and the original ACK survive a cold restart.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn accepted_plain_superset_settles_archive_dominated_without_upload() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let bytes = synthetic_rollout();
+    let subset = String::from_utf8(bytes.clone())
+        .unwrap()
+        .lines()
+        .take(3)
+        .map(|line| line.to_owned() + "\n")
+        .collect::<String>();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(subset.as_bytes(), 1).unwrap());
+    let plain = f.0.with_extension("");
+    fs::write(&plain, bytes).unwrap();
+    let mut member = super::super::codex_zst_refusal_tests::candidate(&plain);
+    member.size_bytes = fs::metadata(&plain).unwrap().len();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut scan = selector_scan(
+        &f,
+        ScanIndex::default(),
+        cache.clone(),
+        VecDeque::from([member.clone()]),
+        true,
+    );
+    scan.state_census_complete = true;
+    scan.sidecar_census_complete = true;
+    let (mut index, accepted) = finish_selector(scan);
+    assert_eq!(accepted.snapshots.len(), 1);
+    assert_eq!(accepted.snapshots[0].input_tokens, 750);
+    let ack = accepted.snapshots[0].snapshot_fingerprint.clone();
+    index.accepted_snapshot_fingerprints.insert(ack.clone());
+    let plain_key = local_index_key(&plain);
+    let prior_body = index.files[&plain_key].last_upload_body_witness.clone();
+    let prior_head = index.files[&plain_key].last_snapshot_fingerprint.clone();
+    let key = local_index_key(&f.0);
+    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+    evidence.header_validated =
+        ValidatedHeader::from_bytes(subset.lines().next().unwrap().as_bytes());
+    evidence.owner = Some("compressed-fixture".into());
+    index.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
+    index.hold_compressed(
+        &f.0,
+        BTreeSet::from(["compressed-fixture".into()]),
+        CodexZstCause::ArchiveEquivalenceUnproven,
+    );
+    retry_due(&mut index, &key);
+    let ((index, result), rows) = crate::local_resource_diagnostics::capture(|| {
+        let mut scan = selector_scan(
+            &f,
+            index,
+            cache,
+            VecDeque::from([member, f.candidate()]),
+            true,
+        );
+        scan.state_census_complete = true;
+        scan.sidecar_census_complete = true;
+        finish_selector(scan)
+    });
+    assert!(
+        result.snapshots.is_empty(),
+        "subset cannot replace or add usage"
+    );
+    let archive = index.files[&key].archive.as_ref().unwrap();
+    assert!(matches!(
+        archive.disposition,
+        ArchiveDisposition::Refused {
+            cause: CodexZstCause::ArchiveDominated
+        }
+    ));
+    assert!(archive.body_witness.is_none());
+    assert_eq!(index.files[&plain_key].last_upload_body_witness, prior_body);
+    assert_eq!(
+        index.files[&plain_key].last_snapshot_fingerprint,
+        prior_head
+    );
+    assert!(index.accepted_snapshot_fingerprints.contains(&ack));
+    assert!(rows
+        .iter()
+        .any(|r| r["counts"]["archive_terminal_residue"]["archive_dominated"] == 1));
+    let ((saved, quiet), rows) = crate::local_resource_diagnostics::capture(|| {
+        finish_selector(retained_archive_scan(
+            &f,
+            checkpoint(&index),
+            Arc::new(sampled_scan::SharedCache::default()),
+        ))
+    });
+    assert!(quiet.snapshots.is_empty());
+    assert_eq!(decoded_archive_bytes(&rows), 0);
+    assert!(saved.accepted_snapshot_fingerprints.contains(&ack));
+    assert!(matches!(
+        saved.files[&key].archive.as_ref().unwrap().disposition,
+        ArchiveDisposition::Refused {
+            cause: CodexZstCause::ArchiveDominated
+        }
+    ));
+}
+
+/// [money] A permanently absent parent uses the same native disclosed loss for
+/// plain and compressed children. No raw/exclusive body or ACK is invented.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn unresolved_archive_parent_uses_plain_native_loss_and_counted_retry() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let parent = "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb";
+    let mut rows: Vec<Value> = String::from_utf8(synthetic_rollout())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    rows[0]["payload"]["forked_from_id"] = json!(parent);
+    let bytes = rows
+        .iter()
+        .map(|row| row.to_string() + "\n")
+        .collect::<String>();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap());
+    let plain = f.0.with_extension("");
+    fs::write(&plain, &bytes).unwrap();
+    let witness = CodexParentOwnershipLedger {
+        unresolvable: Some(CodexParentUnresolvable::Absent),
+        ..Default::default()
+    };
+    let ledgers = Arc::new(Mutex::new(BTreeMap::from([(parent.to_owned(), witness)])));
+    let mut parser = codex_parser(OpenedInput::plain(File::open(&plain).unwrap()), &plain);
+    parser.accumulator.codex_parent_ownership_ledgers = Some(ledgers.clone());
+    let expected =
+        opened_object_identity(SnapshotSource::Codex, parser.reader.reader.get_mut()).unwrap();
+    while !parser.step().unwrap() {}
+    let native = parser
+        .finish(
+            &expected,
+            &plain,
+            NOW,
+            "plain-parent-loss".into(),
+            Some(&CodexTitleMetadata::default()),
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(native.non_progressing_residue());
+    assert_eq!(
+        native.codex_parent_unresolvable,
+        Some(CodexParentUnresolvable::Absent)
+    );
+    assert!(native.snapshots.is_empty());
+    fs::remove_file(&plain).unwrap();
+    let (mut index, result, _, ends) =
+        archive_pass_with(&f, ScanIndex::default(), true, None, &[], |scan| {
+            scan.codex_parent_ownership_ledgers = Some(ledgers);
+        });
+    assert!(result.snapshots.is_empty());
+    assert!(result.ownership_incomplete_file_count > 0);
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+    let key = local_index_key(&f.0);
+    assert!(
+        index.files[&key].codex_compressed_hold.is_none(),
+        "native parent loss reaches shared settlement"
+    );
+    assert_pending(&index, &f.0, 1);
+    assert!(index.files[&key]
+        .archive
+        .as_ref()
+        .unwrap()
+        .body_witness
+        .is_none());
+    assert_eq!(
+        result
+            .local_codex_diagnostics
+            .as_ref()
+            .unwrap()
+            .parent_unresolvable
+            .counts()[CodexParentUnresolvable::Absent.index()],
+        1
+    );
+    assert!(!ends
+        .0
+        .lock()
+        .unwrap()
+        .contains(&super::super::line_delivery::DeliveryEnd::Complete));
+    let (_, quiet, diagnostics, _) = archive_pass(&f, checkpoint(&index), true, None);
+    assert!(quiet.snapshots.is_empty());
+    assert_eq!(decoded_archive_bytes(&diagnostics), 0);
+    retry_due(&mut index, &key);
+    assert!(index.files[&key].custody_retry_due(&f.0));
 }

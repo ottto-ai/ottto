@@ -30633,9 +30633,37 @@ impl OwnedSourceScan {
                                 finish_copy_budget.unwrap_or(archive_proof_budget),
                             )
                         });
-                    if let Some(baselines) = replacement {
+                    if let Some(codex_archive_catchup::ArchiveReplacement::Replace(baselines)) =
+                        replacement
+                    {
                         codex_legacy_join_baselines.extend(baselines);
                         index.release_compressed_hold(&key);
+                    } else if matches!(
+                        replacement,
+                        Some(codex_archive_catchup::ArchiveReplacement::Dominated)
+                    ) {
+                        index.release_compressed_hold(&key);
+                        let archive = index
+                            .files
+                            .get_mut(&key)
+                            .and_then(|e| e.archive.as_mut())
+                            .expect("validated archive replacement");
+                        archive.finish(archive_owner, &candidate.path, &parsed_file);
+                        archive.body_witness = None;
+                        archive.disposition = ArchiveDisposition::Refused {
+                            cause: CodexZstCause::ArchiveDominated,
+                        };
+                        census.archive_residue(
+                            &candidate.path,
+                            Some(archive),
+                            CodexZstCause::ArchiveDominated,
+                        );
+                        codex_archive_catchup::retain_residue(
+                            &mut residue_index_keys,
+                            &candidate.path,
+                            CodexZstCause::ArchiveDominated,
+                        );
+                        pending!();
                     } else {
                         index.hold_compressed(
                             &candidate.path,
@@ -30653,6 +30681,11 @@ impl OwnedSourceScan {
                             &mut residue_index_keys,
                             &candidate.path,
                             CodexZstCause::ArchiveEquivalenceUnproven,
+                        );
+                        crate::local_resource_diagnostics::traversal_point(
+                            "codex_zst_admission_alarm",
+                            "codex",
+                            &BTreeMap::from([("archive_equivalence_unproven", 1_u64)]),
                         );
                         pending!();
                     }
@@ -30683,6 +30716,18 @@ impl OwnedSourceScan {
                             pending!();
                         }
                         census.record_unreadable(UnreadableCause::Reduction, 1);
+                    } else if !parsed_file.complete() {
+                        // A native unresolvable-parent residue follows the same
+                        // shared disclosed-loss path as a plain child below.
+                        if index
+                            .files
+                            .get(&local_index_key(&candidate.path))
+                            .is_some_and(|e| {
+                                e.codex_compressed_hold == Some(CodexZstCause::ParentLedgerUnbound)
+                            })
+                        {
+                            index.release_compressed_hold(&local_index_key(&candidate.path));
+                        }
                     } else if let Some(delivery) = line_delivery.as_mut() {
                         delivery.archive_complete();
                     }
