@@ -671,6 +671,15 @@ impl ScanIndex {
                 progressed.push(candidate.key.as_str());
             }
         }
+        // The terminal census can retire its traversal and tentatively adopt
+        // the source context before upload. A deferred tail must revoke that
+        // adoption too, so the existing next-generation context scan still
+        // selects the owed file after a restart, even with no queue left.
+        if counts.context_split_files > 0
+            && self.upload_context_fingerprint == self.active_upload_context_fingerprint
+        {
+            self.upload_context_fingerprint = None;
+        }
         self.requeue_split_context_reads(progressed.into_iter());
         counts
     }

@@ -65,12 +65,13 @@ impl Fixture {
         &self.index.files[&self.key()]
     }
     fn walk(&mut self, finalize: bool) -> (SourceScanResult, u64) {
-        self.walk_with_file_limit(finalize, 10)
+        self.walk_with_file_limit(finalize, 10, false)
     }
     fn walk_with_file_limit(
         &mut self,
         finalize: bool,
         file_limit: usize,
+        allow_census_complete: bool,
     ) -> (SourceScanResult, u64) {
         let mut scan = OwnedSourceScan::new(
             self.source,
@@ -100,9 +101,11 @@ impl Fixture {
                     index, mut scan, ..
                 } => {
                     self.index = index;
-                    // Model a source whose census cannot complete; no page can
-                    // advance source-wide context even when its file settles.
-                    scan.census_complete = false;
+                    // Most fixtures model an incomplete census. Terminal-page
+                    // regressions retain the scanner's actual completion result.
+                    if !allow_census_complete {
+                        scan.census_complete = false;
+                    }
                     apply_upload_policy(
                         self.source,
                         &mut scan.snapshots,
@@ -1394,6 +1397,58 @@ fn split_context_ack_set_receipts_after_every_body_and_keeps_money_totals() {
     }
 }
 
+/// [regress] Strict review P1: a terminal Codex census adopted its source
+/// context before a budget-deferred body, hiding that body's debt after restart.
+#[test]
+fn terminal_census_context_deferral_stays_owed_after_restart() {
+    let source = SnapshotSource::Codex;
+    let mut f = Fixture::new(source);
+    f.adopt();
+    let context = "e".repeat(64);
+    f.index
+        .activate_file_upload_context(source, context.clone());
+    let previous = f.index.clone();
+    let (mut scan, _) = f.walk_with_file_limit(false, 10, true);
+    assert!(scan.census_complete, "the actual scanner closes its census");
+    assert!(f.index.traversal.is_none(), "the terminal queue is retired");
+    finalize_scan_after_policy(source, &mut scan, &mut f.index);
+    assert_eq!(f.index.upload_context_fingerprint.as_ref(), Some(&context));
+    f.uploader.activate(source, context.clone(), &mut f.index);
+    f.uploader.set_byte_allowance(0);
+    let first = f.uploader.posts.len();
+    assert_eq!(
+        f.uploader
+            .send(source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        0
+    );
+    assert_eq!(f.uploader.posts.len(), first);
+    assert_ne!(f.index.upload_context_fingerprint.as_ref(), Some(&context));
+
+    // Restart with only persisted index/ACK evidence and no retained traversal.
+    f.index = serde_json::from_slice(&serde_json::to_vec(&f.index).unwrap()).unwrap();
+    f.uploader.restart(source, &context);
+    f.index
+        .activate_file_upload_context(source, context.clone());
+    f.cache = Arc::default();
+    let previous = f.index.clone();
+    let (scan, _) = f.walk_with_file_limit(true, 10, true);
+    assert_eq!(scan.scanned_file_count, 1, "the owed body is rediscovered");
+    assert_eq!(scan.snapshots.len(), 1);
+    f.uploader.activate(source, context, &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        1,
+        "only the final exact ACK earns the receipt"
+    );
+    assert_eq!(f.uploader.posts.len(), first + 1);
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+}
+
 /// [behaviour] B1 (M4, 2026-10-31): a census page read one context file,
 /// because each file reserved three worst-case item bodies (about 1.88 MiB of
 /// the 2 MiB pass). Real-size reservation reads 40 small context files in one
@@ -1433,7 +1488,7 @@ fn real_scan_reads_forty_small_context_files_in_one_page() {
     };
     for _ in 0..40 {
         let previous = f.index.clone();
-        let (scan, _) = f.walk_with_file_limit(true, 64);
+        let (scan, _) = f.walk_with_file_limit(true, 64, false);
         f.uploader.activate(source, "d".repeat(64), &mut f.index);
         f.uploader
             .send(source, &mut f.index, &previous, &scan.snapshots)
@@ -1447,7 +1502,7 @@ fn real_scan_reads_forty_small_context_files_in_one_page() {
     f.cache = Arc::default(); // force cold Full reads
     let previous = f.index.clone();
     let ((scan, _), per_file) =
-        terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 64));
+        terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 64, false));
     assert_eq!(
         per_file.len(),
         40,
@@ -1864,7 +1919,7 @@ fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
     f.cache = Arc::default();
     let previous = f.index.clone();
     let ((scan, _), order) =
-        upload_context_read::with_read_limit(limit, || f.walk_with_file_limit(true, 3));
+        upload_context_read::with_read_limit(limit, || f.walk_with_file_limit(true, 3, false));
     assert!(
         order
             .first()
@@ -1999,7 +2054,9 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
         let previous = f.index.clone();
         let (((scan, native), reads), group_native) =
             terminal_contract_retry::group_body_bytes(|| {
-                terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 2))
+                terminal_contract_retry::source_acquisitions(|| {
+                    f.walk_with_file_limit(true, 2, false)
+                })
             });
         assert!(native + group_native <= sampled_scan::codex_cursor::Limits::current().singleton());
         assert_eq!(
@@ -2037,7 +2094,9 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
         let previous = f.index.clone();
         let (((scan, native), reads), group_native) =
             terminal_contract_retry::group_body_bytes(|| {
-                terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 2))
+                terminal_contract_retry::source_acquisitions(|| {
+                    f.walk_with_file_limit(true, 2, false)
+                })
             });
         assert!(native + group_native <= sampled_scan::codex_cursor::Limits::current().singleton());
         assert_eq!(
@@ -2197,7 +2256,9 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
         let previous = f.index.clone();
         let (((scan, native), reads), physical_group_bytes) =
             terminal_contract_retry::group_body_bytes(|| {
-                terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 3))
+                terminal_contract_retry::source_acquisitions(|| {
+                    f.walk_with_file_limit(true, 3, false)
+                })
             });
         assert!(scan.scanned_file_count <= 3);
         assert!(

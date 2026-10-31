@@ -300,5 +300,8 @@ reservation and the alone-pass oversized exception above:
   `upload_context_rearm.context_split_files`. If this pass ACKed part of it, it
   returns to its generation queue and its next read resends only unACKed
   bodies; if nothing was ACKed it waits for the next generation, as before.
+  A terminal census may already have retired that queue and tentatively adopted
+  the source context. An owed split revokes that adoption, preserving the existing
+  context scan's obligation after restart without adding a durable queue.
 - An oversized file splits, at most the 2 MiB pass allowance per read, instead
   of taking one alone pass. Each split pass re-reads the native file.
