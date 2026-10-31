@@ -1558,13 +1558,29 @@ fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
 fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let mut rig = Rig::new(SnapshotSource::Codex, "m3-singleton-group");
-    rig.create(CODEX_SESSION, 2);
+    let first = codex_file_join::tests::member(CODEX_SESSION, "rotation-a", 200, 200);
+    fs::write(
+        rig.path(CODEX_SESSION),
+        first
+            .iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
     assert_eq!(rig.pass().published(CODEX_SESSION), 1);
     rig.assert_native_record(CODEX_SESSION);
     let stale = fs::read(rig.record(CODEX_SESSION)).unwrap();
     let alias = rig.sessions.join("joined.jsonl");
-    fs::copy(rig.path(CODEX_SESSION), &alias).unwrap();
-    rig.append(CODEX_SESSION, 1);
+    // A copied cumulative-only file has no independent ownership chain.
+    // Use the production join fixture's contiguous native response proof.
+    let next = codex_file_join::tests::member(CODEX_SESSION, "rotation-b", 100, 300);
+    fs::write(
+        &alias,
+        next.iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
     rig.cache = Arc::new(SharedCache::default());
     let grouped = rig.pass();
     assert_eq!(
