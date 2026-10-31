@@ -10902,8 +10902,7 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
                 length > max_jsonl_file_bytes(SnapshotSource::Codex),
                 over_cap
             );
-            // Loaded later-build custody conservatively drains at the foundation;
-            // no native producer exists until the bounded owner-admission cut.
+            // An unrelated plain session beside the held file.
             let other = fs::read(fixture.file(SESSION)).unwrap();
             let other = String::from_utf8(other)
                 .unwrap()
@@ -10963,11 +10962,16 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
                     .iter()
                     .all(|s| s.source_session_id != SESSION));
             }
-            assert!(index
-                .files
-                .get(&local_index_key(&fixture.file(SESSION_B)))
-                .and_then(|entry| entry.last_snapshot_fingerprint.as_ref())
-                .is_none());
+            // GR3: unknown custody never fences plain work; the unrelated
+            // plain file publishes, as in the shared-refused sibling.
+            assert!(
+                index
+                    .files
+                    .get(&local_index_key(&fixture.file(SESSION_B)))
+                    .and_then(|entry| entry.last_snapshot_fingerprint.as_ref())
+                    .is_some(),
+                "unrelated plain progresses"
+            );
             // Synthetic 11c handoff: the fixture owns the obligation while
             // admitting its aged/over-cap FD directly to the existing Tail
             // engine. Production release/admission remains unimplemented.
@@ -11047,7 +11051,8 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
                 None,
                 None,
                 false,
-                false,
+                // Curve generation on, matching the restored checkpoint's accumulator.
+                true,
             )
             .unwrap();
             while !full.step().unwrap() {}
@@ -14071,7 +14076,8 @@ fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails
                 None,
                 None,
                 false,
-                false,
+                // Curve generation on, matching the restored checkpoint's accumulator.
+                true,
             )
             .unwrap();
             while !full.step().unwrap() {}
