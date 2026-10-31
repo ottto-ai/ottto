@@ -85,6 +85,7 @@ struct Counters {
     counts: [AtomicU64; 4],
     not_found_sites: [AtomicU64; SITES * OUTCOMES],
     vanished: [AtomicU64; VANISHED],
+    parent_missing_removals: AtomicU64,
     overflowed: AtomicBool,
 }
 impl Counters {
@@ -93,6 +94,7 @@ impl Counters {
             counts: [const { AtomicU64::new(0) }; 4],
             not_found_sites: [const { AtomicU64::new(0) }; SITES * OUTCOMES],
             vanished: [const { AtomicU64::new(0) }; VANISHED],
+            parent_missing_removals: AtomicU64::new(0),
             overflowed: AtomicBool::new(false),
         }
     }
@@ -124,6 +126,7 @@ impl Counters {
                 .load(Ordering::Relaxed),
             vanished_request_census_removed: self.vanished[Vanished::RequestCensusRemoved.index()]
                 .load(Ordering::Relaxed),
+            parent_missing_removals: self.parent_missing_removals.load(Ordering::Relaxed),
             overflowed: self.overflowed.load(Ordering::Relaxed),
         }
     }
@@ -136,6 +139,8 @@ static TOTALS: [Counters; 3] = [const { Counters::new() }; 3];
 /// `Site` order, each `[loss, removal]`; NotFound in `counts` includes both,
 /// and root NotFounds have no site. The `vanished_*` counts are what the
 /// page merge dropped with a vanished Claude member's retired entry.
+/// `parent_missing_removals` (Q-B2, omitted at zero) counts the NotFound
+/// removals settled below a missing parent; they are also in the site split.
 /// The sticky flag invalidates exact intervals; false is not a coherence proof.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(super) struct Totals {
@@ -145,6 +150,8 @@ pub(super) struct Totals {
     not_found_sites: [[u64; OUTCOMES]; SITES],
     vanished_audit_debt_dropped: u64,
     vanished_request_census_removed: u64,
+    #[serde(skip_serializing_if = "super::is_zero_u64")]
+    parent_missing_removals: u64,
     overflowed: bool,
 }
 
@@ -199,6 +206,12 @@ pub(super) fn vanished(source: SnapshotSource, vanished: Vanished) {
             events.set(Some(counts));
         }
     });
+}
+
+/// Q-B2: a census member below a missing parent settled as a removal.
+pub(super) fn parent_missing_removal(source: SnapshotSource) {
+    let counters = &TOTALS[source_index(source)];
+    counters.bump(&counters.parent_missing_removals);
 }
 
 pub(super) fn snapshot(source: SnapshotSource) -> Totals {
@@ -274,6 +287,7 @@ impl Totals {
             not_found_sites: [[u64::MAX; OUTCOMES]; SITES],
             vanished_audit_debt_dropped: u64::MAX,
             vanished_request_census_removed: u64::MAX,
+            parent_missing_removals: u64::MAX,
             overflowed: true,
         }
     }
@@ -877,6 +891,98 @@ mod tests {
             .files
             .get(&member_key)
             .is_some_and(|entry| entry.has_unverified_source()));
+    }
+
+    /// Two generations over the forced member after its whole session
+    /// directory was deleted (parent missing, scan root live), the RF1 B2 shape.
+    #[cfg(unix)]
+    fn deleted_session_directory_walks(
+        prefix: &str,
+        on: bool,
+        prepare: impl FnOnce(&mut ScanIndex, &str),
+    ) -> (ScanIndex, String, [SiteEvents; 2], Vec<SourceScanResult>) {
+        let fixture = ForcedFamilyFixture::new(prefix);
+        let member_key = local_index_key(&fixture.member_path);
+        fs::remove_dir_all(fixture.dir.join(FORCED_ROOT)).unwrap();
+        let mut index = fixture.index();
+        prepare(&mut index, &member_key);
+        let _switch = super::super::terminal_off_policy::VanishedDirectoryRemovalForTest::set(on);
+        let mut sites = [[[[0; OUTCOMES]; SITES]; 3]; 2];
+        let mut pages = Vec::new();
+        for (walk, (at, now)) in [(NOW, 1_000), (LATER, 1_600)].into_iter().enumerate() {
+            super::super::sampled_scan::set_test_now(Some(now));
+            (pages, sites[walk]) =
+                observe_sites(|| claude_generation(&mut index, &fixture.dir, at, 10, &[]));
+        }
+        super::super::sampled_scan::set_test_now(None);
+        (index, member_key, sites, pages)
+    }
+
+    /// [off=main] With the switch OFF a member below a deleted directory stays
+    /// loss in every generation and keeps its entry, as on main.
+    #[cfg(unix)]
+    #[test]
+    fn claude_member_of_deleted_directory_stays_loss_when_switch_off() {
+        let (index, member_key, sites, pages) =
+            deleted_session_directory_walks("absence-deleted-dir-off", false, |_, _| {});
+        let mut loss = [[[0; OUTCOMES]; SITES]; 3];
+        loss[1][Site::CandidateForcedIndex.index()] = [1, 0];
+        assert_eq!(sites, [loss, loss]);
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page.disappeared_file_count)
+                .sum::<usize>(),
+            1
+        );
+        assert!(index.files.contains_key(&member_key));
+    }
+
+    /// [regress] RF1 B2: on the M4 every Claude walk ended red with 47-71
+    /// CandidateForcedIndex losses per process, all members of deleted
+    /// directories. ON: the first NotFound stays loss; the later completed
+    /// walk settles it as a removal and retires the entry.
+    #[cfg(unix)]
+    #[test]
+    fn claude_member_of_deleted_directory_is_removal_after_a_later_walk() {
+        let (index, member_key, sites, pages) =
+            deleted_session_directory_walks("absence-deleted-dir-on", true, |_, _| {});
+        let mut loss = [[[0; OUTCOMES]; SITES]; 3];
+        loss[1][Site::CandidateForcedIndex.index()] = [1, 0];
+        let mut removal = [[[0; OUTCOMES]; SITES]; 3];
+        removal[1][Site::CandidateForcedIndex.index()] = [0, 1];
+        assert_eq!(sites, [loss, removal]);
+        assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
+        assert!(!index.files.contains_key(&member_key));
+        assert!(snapshot(SnapshotSource::ClaudeCode).parent_missing_removals >= 1);
+    }
+
+    /// [money] Lead B Q-B2: settling the deleted member drops only its entry.
+    /// The usage the server ACKed stays accepted, and no zero or removal body
+    /// is built for its family.
+    #[cfg(unix)]
+    #[test]
+    fn claude_member_of_deleted_directory_keeps_acked_usage_accepted() {
+        let acked = "acked-member-body".to_string();
+        let (index, member_key, _, pages) =
+            deleted_session_directory_walks("absence-deleted-dir-money", true, |index, key| {
+                index.files.get_mut(key).unwrap().last_snapshot_fingerprint = Some(acked.clone());
+                index
+                    .file_snapshot_fingerprints
+                    .insert(key.to_string(), [acked.clone()].into());
+                index.accepted_snapshot_fingerprints.insert(acked.clone());
+            });
+        assert!(!index.files.contains_key(&member_key));
+        assert!(index.accepted_snapshot_fingerprints.contains(&acked));
+        assert_eq!(
+            index.file_snapshot_fingerprints.get(&member_key),
+            Some(&[acked].into())
+        );
+        for snapshot in pages.iter().flat_map(|page| &page.snapshots) {
+            assert!(snapshot.removed_usage.is_none());
+            assert!(snapshot.removed_request_count.is_none());
+            assert!(snapshot.input_tokens + snapshot.output_tokens > 0);
+        }
     }
 
     /// Control: the quarantined family losing one member through N leaves the
@@ -1483,8 +1589,8 @@ mod tests {
 
     #[test]
     fn fixed_storage_bounds_are_target_layout_checks_not_rss_or_capacity_claims() {
-        assert!(std::mem::size_of_val(&TOTALS) <= 408);
-        assert!(std::mem::size_of::<Totals>() <= 152);
+        assert!(std::mem::size_of_val(&TOTALS) <= 432);
+        assert!(std::mem::size_of::<Totals>() <= 160);
     }
 
     #[test]

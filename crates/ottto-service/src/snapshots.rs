@@ -43904,6 +43904,37 @@ fn claude_absence_is_removal(source: SnapshotSource, path: &Path) -> Parent {
     }
 }
 
+/// Q-B2 (default OFF): a member below a deleted directory settles as a removal
+/// once a later completed walk proves the same absence beneath the same pinned
+/// ancestor of a live configured root, on its device, with no symlink. Every
+/// other case, including the first NotFound, stays loss as on main.
+fn claude_missing_parent_is_removal(index: &ScanIndex, parent: Parent, path: &Path) -> bool {
+    if !matches!(parent, Parent::Missing) || !terminal_off_policy::vanished_directory_removal() {
+        return false;
+    }
+    // Keep the first NotFound across an unfinished walk, as F4 does.
+    let Some(walk) = index
+        .traversal
+        .as_ref()
+        .filter(|walk| walk.pending_directories.is_empty())
+    else {
+        return false;
+    };
+    let Some(walk_window) = rfc3339_unix_seconds(&walk.census_window_end) else {
+        return false;
+    };
+    let ancestor = sampled_audit::absence_parent_on_root_device(path, &walk.scan_roots);
+    let removal = index.withheld_memo.vanished_absence_eligible(
+        &local_index_key(path),
+        ancestor,
+        walk_window,
+    );
+    if removal {
+        disappearance_diagnostics::parent_missing_removal(SnapshotSource::ClaudeCode);
+    }
+    removal
+}
+
 /// Mutable candidate-boundary owner plus the same bounded member view used by
 /// discovery. Built once per selection batch; no filesystem work or move authority.
 struct CandidateDiscovery<'a> {
@@ -43962,7 +43993,10 @@ fn candidate_from_traversal_path_at(
                     .removed_index_keys
                     .insert(local_index_key(&pending.path));
             } else if pending.census_member {
-                if claude_absence_is_removal(source, &pending.path).is_removal(&pending.path) {
+                let parent = claude_absence_is_removal(source, &pending.path);
+                if parent.is_removal(&pending.path)
+                    || claude_missing_parent_is_removal(discovery.index, parent, &pending.path)
+                {
                     // The same exact retirement as a remove hint, whichever
                     // order the hint and the queued member arrived in.
                     disappearance_diagnostics::not_found_removal(source, site);

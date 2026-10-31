@@ -106,8 +106,7 @@ pub(super) fn enabled() -> bool {
     ENABLED.with(std::cell::Cell::get)
 }
 fn enabled_at(support: &std::path::Path) -> bool {
-    !std::fs::symlink_metadata(support.join("money_freshness_disabled"))
-        .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+    !super::terminal_off_policy::marker_at(support, "money_freshness_disabled")
 }
 #[cfg(test)]
 thread_local! {
