@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use zeroize::Zeroize;
 
-mod continuation;
+pub(crate) mod continuation;
 #[cfg(test)]
 mod identity_bucket_progress_tests;
 mod reason_reoffer;
@@ -23742,60 +23742,36 @@ fn archive_residue_receipt_discloses_terminal_loss_without_retryable_error() {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    static ARCHIVE_POWER_TEST: std::cell::RefCell<Option<std::collections::VecDeque<Option<bool>>>> = const { std::cell::RefCell::new(None) };
-}
-#[cfg(test)]
-pub(crate) fn with_archive_power<T>(states: &[Option<bool>], run: impl FnOnce() -> T) -> T {
-    struct Reset(Option<std::collections::VecDeque<Option<bool>>>);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            ARCHIVE_POWER_TEST.with(|slot| *slot.borrow_mut() = self.0.take());
-        }
+/// Continuation's platform gates for archive work: the native signals unless
+/// a caller injects its own. A pass and its continuation pages share them.
+#[derive(Clone)]
+pub(crate) struct ArchiveGates(std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>);
+impl Default for ArchiveGates {
+    fn default() -> Self {
+        Self::new(continuation::MacPlatformSignals::default())
     }
-    assert!(!states.is_empty());
-    let _reset =
-        Reset(ARCHIVE_POWER_TEST.with(|slot| slot.replace(Some(states.iter().copied().collect()))));
-    run()
 }
-#[cfg(test)]
-fn archive_test_power() -> Option<bool> {
-    ARCHIVE_POWER_TEST.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let states = slot.as_mut()?;
-        let state = if states.len() > 1 {
-            states.pop_front()?
-        } else {
-            *states.front()?
-        };
-        Some(state.unwrap_or(false))
-    })
-}
-/// Re-query native power at acquisition boundaries. Existing unit fixtures may
-/// supply a fixed pass permission; transition fixtures override the producer.
-pub(crate) fn archive_acquisition_power_ready(_fixture_permission: bool) -> bool {
-    #[cfg(test)]
-    {
-        archive_test_power().unwrap_or(_fixture_permission)
+impl std::fmt::Debug for ArchiveGates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ArchiveGates")
     }
-    #[cfg(not(test))]
-    archive_power_ready()
 }
-/// Use the same native power policy as continuation pages; unknown denies work.
-pub(crate) fn archive_power_ready() -> bool {
-    #[cfg(test)]
-    if let Some(allowed) = archive_test_power() {
-        return allowed;
+impl ArchiveGates {
+    pub(crate) fn new(gates: impl continuation::PlatformGates + Send + 'static) -> Self {
+        Self(std::sync::Arc::new(Mutex::new(gates)))
     }
-    archive_power_ready_with(&mut continuation::MacPlatformSignals::default())
+    /// Continuation's power policy: only `Allowed` permits archive work;
+    /// `Refused` and `Unknown` deny.
+    pub(crate) fn power_ready(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .power()
+            == continuation::PlatformState::Allowed
+    }
 }
 
 /// Share continuation's work threshold with archive admission.
 pub(crate) fn archive_work_ready(micros: u64) -> bool {
     std::time::Duration::from_micros(micros) <= continuation::CONTENTION_WORK
-}
-
-fn archive_power_ready_with(signals: &mut impl continuation::PlatformGates) -> bool {
-    signals.power() == continuation::PlatformState::Allowed
 }

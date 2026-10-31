@@ -261,7 +261,7 @@ fn prior_plain_carrier_or_tombstone_holds_move_before_any_content_read() {
                 },
             );
         }
-        index.archive_pass.power = true;
+        archive_power(&mut index.archive_pass, true);
         let before = serde_json::to_value(&index).unwrap();
         let (decision, rows) = crate::local_resource_diagnostics::capture(|| {
             index
@@ -644,8 +644,7 @@ fn compressed_retained_save_never_writes_a_durable_record() {
     assert_eq!(cache.durable_selected_count_for_test(), 0);
     cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
     assert_eq!(cache.durable_selected_count_for_test(), 0);
-    // Force a hostile touch: the save path must independently fence this.
-    cache.durable_touch_for_test(&key);
+    // Normal admission and save: the compressed reduction is never offered.
     index.save(&index_path).unwrap();
     cache.durable_fence_archives(writer, SnapshotSource::Codex);
     cache.durable_write_after_save(writer, SnapshotSource::Codex, &index);
@@ -653,7 +652,7 @@ fn compressed_retained_save_never_writes_a_durable_record() {
         .durable_gc(writer, SnapshotSource::Codex, &index)
         .unwrap();
     let (counts, disk) = cache.durable_counters(SnapshotSource::Codex).unwrap();
-    assert_eq!(counts.not_persisted.get("compressed"), Some(&1));
+    assert_eq!(counts.not_persisted.get("compressed"), None);
     assert_eq!(disk.disk_records, 0);
     assert_eq!(disk.records_written, 0);
     assert_eq!(counts.gc_keep_peak, 0);

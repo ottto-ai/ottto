@@ -78,26 +78,10 @@ const ARCHIVE_STREAK_KEYS: usize = 256;
 /// Thread CPU an archive pass may spend across its ordinary and
 /// continuation pages.
 const ARCHIVE_PASS_CPU_MICROS: u64 = 30_000_000;
-/// Consecutive passes with unknown thread CPU after which archive work
-/// proceeds under the remaining page, power and work gates, alarmed per pass.
-const ARCHIVE_UNKNOWN_CPU_PASSES: u32 = 12;
-#[cfg(not(test))]
-static UNKNOWN_CPU_PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-#[cfg(test)]
-thread_local! {
-    static UNKNOWN_CPU_PASSES: std::sync::atomic::AtomicU32 =
-        const { std::sync::atomic::AtomicU32::new(0) };
-}
-/// Process-wide RAM streak (the index reloads every pass); a test thread
-/// keeps its own.
-fn unknown_cpu_passes<T>(f: impl FnOnce(&std::sync::atomic::AtomicU32) -> T) -> T {
-    #[cfg(test)]
-    {
-        UNKNOWN_CPU_PASSES.with(f)
-    }
-    #[cfg(not(test))]
-    f(&UNKNOWN_CPU_PASSES)
-}
+/// Process age past which an unknown-CPU denial raises the archive admission
+/// alarm. Thread CPU is a platform property, so denial has then lasted about
+/// this long; the process start is the existing clock, no streak is kept.
+const ARCHIVE_UNKNOWN_CPU_ALARM_SECONDS: u64 = 24 * 3600;
 /// Bumped when a join or singleton proof rule changes; it is part of every
 /// memo key, so a bump wakes every memoized hold without a timed retry.
 /// U1a-2a (D6(a)): also part of `codex_parent_proof_scope`.
@@ -297,29 +281,34 @@ pub(in crate::snapshots) enum StartRefusal {
 
 /// Archive catch-up pacing for one ordinary page and its continuation
 /// pages: RAM-only on `ScanIndex`, carried by the continuation inputs, never
-/// durable authority. A refusal never resets it; unknown CPU denies until
-/// `ARCHIVE_UNKNOWN_CPU_PASSES` consecutive passes.
+/// durable authority. A refusal never resets it; unknown CPU denies, as
+/// continuation treats any non-`Allowed` platform answer.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ArchivePass {
     pub(crate) started: bool,
     pub(crate) cpu: u64,
     pub(crate) work: u64,
     pub(crate) power: bool,
-    /// A step of this pass had unknown thread CPU.
-    pub(crate) cpu_unknown: bool,
     pub(crate) prep_after: Option<String>,
+    /// Continuation's platform gates; a pass and its pages share them.
+    pub(crate) gates: crate::snapshot_sync::ArchiveGates,
 }
-crate::heap_layout_bound::fields!(ArchivePass; started, cpu, work, power, cpu_unknown, prep_after);
+crate::heap_layout_bound::fields!(ArchivePass; started, cpu, work, power, prep_after; shared gates);
 
 impl ArchivePass {
     /// A new ordinary pass: fresh counters and the prepare-time power gate;
-    /// the cached-archive walk position carries over.
+    /// the cached-archive walk position and the gates carry over.
     pub(crate) fn prepare(&mut self) {
-        *self = Self {
-            prep_after: self.prep_after.take(),
-            power: crate::snapshot_sync::archive_power_ready(),
-            ..Self::default()
-        };
+        let Self {
+            started,
+            cpu,
+            work,
+            power,
+            prep_after: _,
+            gates,
+        } = self;
+        (*started, *cpu, *work) = (false, 0, 0);
+        *power = gates.power_ready();
     }
 
     /// Archive work may start now: prepare-time and live power, the pass's
@@ -327,44 +316,43 @@ impl ArchivePass {
     /// page bytes.
     pub(crate) fn ready(&self, remaining: u64) -> bool {
         self.power
-            && crate::snapshot_sync::archive_acquisition_power_ready(self.power)
+            && self.gates.power_ready()
             && self.cpu < ARCHIVE_PASS_CPU_MICROS
-            && (!self.cpu_unknown
-                || unknown_cpu_passes(|passes| passes.load(std::sync::atomic::Ordering::Relaxed))
-                    >= ARCHIVE_UNKNOWN_CPU_PASSES)
             && remaining > 0
             && crate::snapshot_sync::archive_work_ready(self.work)
     }
 
     /// One step's thread CPU (`None`: unknown) and wall time. CPU counts
-    /// once archive work started. Unknown CPU denies the pass; each such pass
-    /// counts once, a known step resets the streak, and passes at or past
-    /// the bound alarm and proceed under the remaining gates.
+    /// once archive work started; unknown CPU then exhausts the pass, counted
+    /// once per pass and alarmed once the process is a day old.
     pub(crate) fn observe(&mut self, cpu: Option<u64>, wall: u64) {
         match cpu {
-            Some(cpu) => {
-                unknown_cpu_passes(|passes| passes.store(0, std::sync::atomic::Ordering::Relaxed));
-                if self.started {
-                    self.cpu = self.cpu.saturating_add(cpu);
-                }
-            }
-            None if !self.cpu_unknown => {
-                self.cpu_unknown = true;
-                let passes = unknown_cpu_passes(|passes| {
-                    passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                })
-                .saturating_add(1);
-                if passes >= ARCHIVE_UNKNOWN_CPU_PASSES {
-                    crate::local_resource_diagnostics::traversal_point(
-                        "codex_zst_unknown_cpu_fallback",
-                        "codex",
-                        &serde_json::json!({"consecutive_unknown_cpu_passes": passes}),
-                    );
-                }
+            Some(cpu) if self.started => self.cpu = self.cpu.saturating_add(cpu),
+            Some(_) => {}
+            None if self.cpu != u64::MAX => {
+                self.cpu = u64::MAX;
+                unknown_cpu_denied(crate::codex_scan_diagnostics::process_age_seconds());
             }
             None => {}
         }
         self.work = self.work.saturating_add(wall);
+    }
+}
+
+/// Counts an unknown-CPU archive denial; past `ARCHIVE_UNKNOWN_CPU_ALARM_SECONDS`
+/// of process age it also raises the archive admission alarm.
+pub(in crate::snapshots) fn unknown_cpu_denied(process_age_seconds: Option<u64>) {
+    crate::local_resource_diagnostics::traversal_point(
+        "codex_zst_unknown_cpu_denied",
+        "codex",
+        &serde_json::json!({"codex_zst_unknown_cpu_denied": 1}),
+    );
+    if let Some(age) = process_age_seconds.filter(|age| *age >= ARCHIVE_UNKNOWN_CPU_ALARM_SECONDS) {
+        crate::local_resource_diagnostics::traversal_point(
+            "codex_zst_admission_alarm",
+            "codex",
+            &serde_json::json!({"unknown_cpu_denied": 1, "process_age_hours": age / 3600}),
+        );
     }
 }
 

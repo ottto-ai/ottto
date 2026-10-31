@@ -1109,6 +1109,73 @@ pub(in crate::snapshots) mod tests {
     const NOW: &str = "2026-10-07T12:00:00Z";
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
+    /// Continuation's power answers for archive work in query order; the
+    /// last one repeats.
+    struct ScriptedPower(VecDeque<crate::snapshot_sync::continuation::PlatformState>);
+    impl crate::snapshot_sync::continuation::PlatformGates for ScriptedPower {
+        fn power(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
+            if self.0.len() > 1 {
+                self.0.pop_front().unwrap()
+            } else {
+                self.0[0]
+            }
+        }
+        fn enter_background_qos(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
+            crate::snapshot_sync::continuation::PlatformState::Allowed
+        }
+        fn restore_qos(&mut self) {}
+    }
+    fn scripted_power(
+        states: &[crate::snapshot_sync::continuation::PlatformState],
+    ) -> crate::snapshot_sync::ArchiveGates {
+        crate::snapshot_sync::ArchiveGates::new(ScriptedPower(states.iter().copied().collect()))
+    }
+    /// A pass whose prepare-time and live power answers are `allowed`,
+    /// independently of the host's actual power.
+    fn archive_power(pass: &mut sampled_scan::ArchivePass, allowed: bool) {
+        use crate::snapshot_sync::continuation::PlatformState;
+        pass.power = allowed;
+        pass.gates = scripted_power(&[if allowed {
+            PlatformState::Allowed
+        } else {
+            PlatformState::Refused
+        }]);
+    }
+
+    /// [behaviour] Unknown thread CPU denies the archive pass, as continuation
+    /// denies any non-Allowed platform answer; each denied pass is counted,
+    /// and past a day of process age it also raises the admission alarm.
+    #[test]
+    fn unknown_thread_cpu_denies_archive_pass_counted_and_alarmed_after_a_day() {
+        let count = |rows: &[serde_json::Value], stage: &str| {
+            rows.iter().filter(|r| r["stage"] == stage).count()
+        };
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            for _ in 0..13 {
+                let mut pass = sampled_scan::ArchivePass::default();
+                archive_power(&mut pass, true);
+                assert!(pass.ready(1));
+                pass.observe(None, 1);
+                pass.observe(None, 1); // One count per pass, not per step.
+                pass.observe(Some(0), 1);
+                assert!(!pass.ready(1), "no fallback: the pass stays denied");
+            }
+        });
+        assert_eq!(count(&rows, "codex_zst_unknown_cpu_denied"), 13);
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            sampled_scan::codex_cursor::unknown_cpu_denied(None);
+            sampled_scan::codex_cursor::unknown_cpu_denied(Some(0));
+            sampled_scan::codex_cursor::unknown_cpu_denied(Some(2 * 24 * 3600));
+        });
+        assert_eq!(count(&rows, "codex_zst_unknown_cpu_denied"), 3);
+        let alarms: Vec<_> = rows
+            .iter()
+            .filter(|r| r["stage"] == "codex_zst_admission_alarm")
+            .collect();
+        assert_eq!(alarms.len(), 1, "only the day-old denial alarms");
+        assert_eq!(alarms[0]["counts"]["unknown_cpu_denied"], 1);
+    }
+
     fn decode(data: &[u8], limit: u64) -> io::Result<Vec<u8>> {
         let mut reader = BoundedDecoder::new(data, limit)?;
         let mut decoded = Vec::new();
@@ -1607,12 +1674,13 @@ pub(in crate::snapshots) mod tests {
             }
             // Deterministic A1 permission; corrections need the explicit A3
             // permission fixture, independently of the host's actual power.
-            scan.index.archive_pass.power = !scan
+            let allowed = !scan
                 .index
                 .files
                 .get(&local_index_key(&f.0))
                 .and_then(|e| e.archive.as_ref())
                 .is_some_and(|a| a.user_change && a.matches(&File::open(&f.0).unwrap()));
+            archive_power(&mut scan.index.archive_pass, allowed);
             scan.identified_candidates = VecDeque::from([f.candidate()]);
             scan.census
                 .observed_index_keys
@@ -2634,7 +2702,7 @@ pub(in crate::snapshots) mod tests {
             true,
         )
         .with_sampled_acquisition(cache, Scope("archive-test".into()));
-        scan.index.archive_pass.power = true; // synthetic pacing permission
+        archive_power(&mut scan.index.archive_pass, true); // synthetic pacing permission
         scan.identified_candidates = VecDeque::from([f.candidate()]);
         scan.census
             .observed_index_keys

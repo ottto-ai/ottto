@@ -2398,13 +2398,6 @@ pub(super) mod tests {
         let reads = HEADER_READ_PROBE.with(|probe| probe.borrow_mut().take().unwrap());
         (result, reads)
     }
-    pub(in crate::snapshots) fn count_header_reads<T>(
-        path: &Path,
-        run: impl FnOnce() -> T,
-    ) -> (T, usize) {
-        let (result, reads) = header_reads(run);
-        (result, reads.get(path).copied().unwrap_or_default())
-    }
 
     pub(crate) fn usage(input: u64) -> Value {
         json!({"input_tokens":input,"cached_input_tokens":0,"cache_write_input_tokens":0,

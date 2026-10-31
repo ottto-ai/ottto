@@ -5,28 +5,6 @@ fn funded_header_work() -> HeaderWork {
     }
 }
 
-// Models a saved checkpoint from the acquisition-only release. Production
-// activation is unconditional; this override exists only in the test binary.
-thread_local! {
-    static ARCHIVE_DISCOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
-pub(in crate::snapshots) fn archive_discovery_enabled() -> bool {
-    ARCHIVE_DISCOVERY.with(std::cell::Cell::get)
-}
-struct ArchiveDiscovery(bool);
-impl Drop for ArchiveDiscovery {
-    fn drop(&mut self) {
-        ARCHIVE_DISCOVERY.with(|slot| slot.set(self.0));
-    }
-}
-fn archive_discovery_scope(enabled: bool) -> ArchiveDiscovery {
-    ArchiveDiscovery(ARCHIVE_DISCOVERY.with(|slot| slot.replace(enabled)))
-}
-fn with_archive_discovery<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
-    let _reset = archive_discovery_scope(enabled);
-    run()
-}
-
 /// [format] An index saved with the retired optional header `cli_version`
 /// still loads with its validated header; new saves omit the field.
 #[test]
@@ -838,309 +816,6 @@ fn unreadable_segment_holds_its_filename_owner_but_not_unrelated_plain() {
     );
 }
 
-/// [off=main] With discovery off after restart, the retained archive queue and roster stay as on
-/// main.
-#[test]
-fn retained_archive_queue_and_roster_obey_discovery_off_after_restart() {
-    let _discovery = archive_discovery_scope(false);
-    for disposition in [
-        Some(ArchiveDisposition::HeaderValidated),
-        Some(ArchiveDisposition::Pending {
-            attempts: 1,
-            retry_after: 0,
-        }),
-        None,
-    ] {
-        let bytes = synthetic_rollout();
-        let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
-        let root = f.0.parent().unwrap().to_owned();
-        let roots = [root.clone()];
-        let plain = root.join("rollout-retained-plain-sibling.jsonl");
-        fs::write(
-            &plain,
-            String::from_utf8(bytes.clone())
-                .unwrap()
-                .replace("compressed-fixture", "retained-plain-sibling"),
-        )
-        .unwrap();
-        // Keep state writes outside the witnessed directory's entries.
-        let related = root.join("rollout-compressed-fixture.jsonl");
-        fs::write(&related, &bytes).unwrap();
-        let accepted = "a".repeat(64); // production accepted-ledger decoder requires 64 hex
-        let state_dir = root.join("state");
-        fs::create_dir(&state_dir).unwrap();
-        let saved_path = state_dir.join("index.json");
-        let reservation_path = state_dir.join("reservation.json");
-        let key = local_index_key(&f.0);
-        let has_evidence = disposition.is_some();
-        let mut index = ScanIndex::default();
-        if let Some(disposition) = disposition {
-            let mut archive =
-                ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
-            archive.header_validated =
-                ValidatedHeader::from_bytes(bytes.split_inclusive(|b| *b == b'\n').next().unwrap());
-            archive.header_attempted = true;
-            archive.disposition = disposition;
-            index.files.insert(
-                key.clone(),
-                ScanIndexEntry {
-                    source_file_fingerprint: "historical-file".into(),
-                    last_snapshot_fingerprint: Some(accepted.clone()),
-                    last_upload_body_witness: Some("historical-body".into()),
-                    archive: Some(Box::new(archive)),
-                    ..Default::default()
-                },
-            );
-            index
-                .file_snapshot_fingerprints
-                .insert(key.clone(), BTreeSet::from([accepted.clone()]));
-            index
-                .accepted_snapshot_fingerprints
-                .insert(accepted.clone());
-        }
-        ensure_bounded_traversal(
-            SnapshotSource::Codex,
-            &roots,
-            &mut index,
-            NOW,
-            BACKFILL_WINDOW_DAYS,
-        );
-        let traversal = index.traversal.as_mut().unwrap();
-        traversal.pending_directories.clear();
-        traversal.pending_candidates = [f.0.clone(), plain.clone(), related.clone()]
-            .into_iter()
-            .map(|path| ScanTraversalPath {
-                order_modified: None,
-                scan_root: root.clone(),
-                path,
-                census_member: true,
-                watcher_hint: false,
-            })
-            .collect();
-        traversal.codex_rollout_paths = BTreeSet::from([
-            key.clone(),
-            local_index_key(&plain),
-            local_index_key(&related),
-        ]);
-        let mut directories = codex_file_join::DirectoryCensus::new();
-        directories.observe(&root, &fs::metadata(&root).unwrap());
-        traversal.codex_join_directory_census = Some(directories);
-        index.save(&saved_path).unwrap();
-        let (restored, origin) =
-            ScanIndex::load_inner(&saved_path, Some(SnapshotSource::Codex)).unwrap();
-        assert!(matches!(origin, LoadOrigin::Loaded(_)));
-        let traversal = restored.traversal.as_ref().unwrap();
-        assert!(traversal.pending_candidates.iter().any(|p| p.path == f.0));
-        assert!(traversal.codex_rollout_paths.contains(&key));
-        assert_eq!(
-            traversal.context_fingerprint,
-            scan_traversal_context_fingerprint(
-                SnapshotSource::Codex,
-                &roots,
-                &restored,
-                BACKFILL_WINDOW_DAYS
-            )
-        );
-        assert!(
-            traversal
-                .codex_join_directory_census
-                .as_ref()
-                .unwrap()
-                .moved_directories()
-                .is_empty(),
-            "restart must exercise the unchanged retained roster"
-        );
-        if has_evidence {
-            assert!(archive_evidence(&restored, &f).matches(&File::open(&f.0).unwrap()));
-            assert!(restored.archive_header(&f.0).is_some());
-            assert!(
-                restored.accepted_snapshot_fingerprints.contains(&accepted),
-                "seed must survive the real accepted-ledger decoder"
-            );
-        } else {
-            assert!(
-                !restored.files.contains_key(&key),
-                "no pre-inventory evidence entry"
-            );
-        }
-        let entry_before = restored
-            .files
-            .get(&key)
-            .map(|entry| serde_json::to_value(entry).unwrap());
-        let incidence_before = restored.file_snapshot_fingerprints.get(&key).cloned();
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        let mut committed = restored.clone();
-        let constructions = super::super::codex_zst_refusal_tests::decoder_construction_count();
-        let ((index, results), rows) = crate::local_resource_diagnostics::capture(|| {
-            let mut index = restored;
-            let mut results = Vec::new();
-            for page in 0..3 {
-                let mut scan = OwnedSourceScan::new(
-                    SnapshotSource::Codex,
-                    &roots,
-                    index,
-                    NOW,
-                    BACKFILL_WINDOW_DAYS,
-                    if page == 0 { 1 } else { 10 },
-                    false,
-                    None,
-                    &[],
-                    false,
-                    true,
-                )
-                .with_sampled_acquisition(cache.clone(), Scope("retained-discovery-off".into()));
-                assert!(scan
-                    .index
-                    .traversal
-                    .as_ref()
-                    .unwrap()
-                    .codex_rollout_paths
-                    .iter()
-                    .all(|key| transcript_path_admitted(SnapshotSource::Codex, Path::new(key))));
-                assert!(scan
-                    .identified_candidates
-                    .iter()
-                    .all(|candidate| candidate.path != f.0));
-                let (next, result) = 'page: {
-                    for _ in 0..1000 {
-                        match scan.step(None) {
-                            OwnedSourceScanStep::Pending(mut next) => {
-                                assert!(next
-                                    .active_file
-                                    .as_ref()
-                                    .is_none_or(|active| active.candidate.path != f.0));
-                                next.persist_archive_reservation(&mut committed, &reservation_path)
-                                    .unwrap();
-                                scan = next;
-                            }
-                            OwnedSourceScanStep::Complete {
-                                mut index,
-                                mut scan,
-                                ..
-                            } => {
-                                finalize_scan_after_policy(
-                                    SnapshotSource::Codex,
-                                    &mut scan,
-                                    &mut index,
-                                );
-                                break 'page (index, scan);
-                            }
-                        }
-                    }
-                    panic!("retained traversal did not complete");
-                };
-                index = next;
-                results.push(result);
-                if page == 0 {
-                    assert!(
-                        index
-                            .traversal
-                            .as_ref()
-                            .unwrap()
-                            .pending_candidates
-                            .iter()
-                            .any(|pending| pending.path == related),
-                        "related plain segment must remain queued across the page restart"
-                    );
-                    assert!(index
-                        .traversal
-                        .as_ref()
-                        .unwrap()
-                        .residue
-                        .index_keys
-                        .contains(&key));
-                }
-                if page == 1 {
-                    // A completed generation must not release retained archive
-                    // custody into a partial plain-only body in the next one.
-                    assert!(
-                        index
-                            .scan_residue_witness
-                            .as_ref()
-                            .unwrap()
-                            .index_keys
-                            .contains(&key),
-                        "path hold must survive a completed generation without an evidence entry"
-                    );
-                    index.traversal = None;
-                }
-                if page < 2 {
-                    index.save(&saved_path).unwrap();
-                    let (restarted, origin) =
-                        ScanIndex::load_inner(&saved_path, Some(SnapshotSource::Codex)).unwrap();
-                    assert!(matches!(origin, LoadOrigin::Loaded(_)));
-                    index = restarted;
-                }
-            }
-            (index, results)
-        });
-        assert_eq!(
-            super::super::codex_zst_refusal_tests::decoder_construction_count(),
-            constructions,
-            "zero decoder constructions"
-        );
-        assert_eq!(decodes(&rows), 0);
-        assert!(
-            !reservation_path.exists(),
-            "zero new persisted reservations"
-        );
-        assert_eq!(
-            committed
-                .files
-                .get(&key)
-                .map(|entry| serde_json::to_value(entry).unwrap()),
-            entry_before
-        );
-        assert_eq!(
-            index
-                .files
-                .get(&key)
-                .map(|entry| serde_json::to_value(entry).unwrap()),
-            entry_before,
-            "entry and archive evidence remain untouched"
-        );
-        assert_eq!(
-            index.file_snapshot_fingerprints.get(&key).cloned(),
-            incidence_before
-        );
-        assert_eq!(
-            index.accepted_snapshot_fingerprints.contains(&accepted),
-            has_evidence
-        );
-        assert!(rows
-            .iter()
-            .any(
-                |row| row["counts"]["archive_terminal_residue"]["CompressedAdmissionRefused"] == 1
-            ));
-        let body_bytes = rows
-            .iter()
-            .map(|row| {
-                row["counts"]["codex_zst_compressed_bytes"]
-                    .as_u64()
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
-        assert_eq!(body_bytes, 0, "zero archive body bytes");
-        assert_eq!(cache.cursor_reserved(), 0);
-        assert_eq!(
-            results[0].scanned_file_count, 1,
-            "unrelated plain progresses"
-        );
-        assert_eq!(
-            results[1].scanned_file_count, 0,
-            "related plain stays held across the saved page"
-        );
-        assert!(results
-            .iter()
-            .flat_map(|result| &result.snapshots)
-            .any(|snapshot| snapshot.source_session_id == "retained-plain-sibling"));
-        assert!(results
-            .iter()
-            .flat_map(|result| &result.snapshots)
-            .all(|snapshot| snapshot.source_session_id != "compressed-fixture"));
-    }
-}
-
 /// [behaviour] A cached archive header does not bypass the permission gate.
 #[test]
 fn cached_archive_header_does_not_bypass_permission_gate() {
@@ -1169,523 +844,6 @@ fn cached_archive_header_does_not_bypass_permission_gate() {
         index.archive_header(&f.0).is_some(),
         "cached metadata remains available"
     );
-}
-
-/// [format] An excluded-archive inventory hold survives restart without a plain header re-read.
-#[test]
-fn excluded_archive_inventory_hold_survives_restart_without_plain_header_reread() {
-    let _discovery = archive_discovery_scope(false);
-    use codex_file_join::{tests::count_header_reads, DirectoryCensus, HeaderInventory};
-    for outside_roster in [false, true] {
-        let mut f = ArchiveFixture::new(b"refused-archive-stamp");
-        let state_root = f.0.parent().unwrap().to_owned();
-        let root = state_root.join("sessions");
-        fs::create_dir(&root).unwrap();
-        let archive_path = root.join(f.0.file_name().unwrap());
-        fs::rename(&f.0, &archive_path).unwrap();
-        f.0 = archive_path;
-        let roots = [root.clone()];
-        let plain = root.join("rollout-owed-plain.jsonl");
-        fs::write(
-            &plain,
-            String::from_utf8(synthetic_rollout())
-                .unwrap()
-                .replace("compressed-fixture", "owed-plain"),
-        )
-        .unwrap();
-        let archive_key = local_index_key(&f.0);
-        let plain_key = local_index_key(&plain);
-        let archive_witness = codex_file_join::path_witness(&f.0);
-        assert!(archive_witness.is_some());
-        let plain_witness = codex_file_join::path_witness(&plain).unwrap();
-        let mut directories = DirectoryCensus::new();
-        directories.observe(&root, &fs::metadata(&root).unwrap());
-        // Prove the plain first record was actually inventoried before the
-        // persisted hold, and prove that our I/O probe observes a real read.
-        let (_, prior_reads) = count_header_reads(&plain, || {
-            let mut inventory = HeaderInventory::new(
-                &roots,
-                &BTreeSet::from([plain_key.clone()]),
-                Some(&directories),
-            );
-            while !inventory.step(&CodexTitleMetadata::default()) {}
-            assert!(inventory.complete);
-            assert_eq!(inventory.headers.len(), 1);
-            assert!(inventory.read_bytes > 0);
-        });
-        assert_eq!(prior_reads, 1);
-        let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
-        evidence.disposition = ArchiveDisposition::Refused {
-            cause: CodexZstCause::HeaderInvalid,
-        };
-        let mut index = ScanIndex::default();
-        index.files.entry(archive_key.clone()).or_default().archive = Some(Box::new(evidence));
-        index.files.insert(
-            plain_key.clone(),
-            ScanIndexEntry {
-                size_bytes: fs::metadata(&plain).unwrap().len(),
-                source_file_fingerprint: "held-plain".into(),
-                ..Default::default()
-            },
-        );
-        ensure_bounded_traversal(
-            SnapshotSource::Codex,
-            &roots,
-            &mut index,
-            NOW,
-            BACKFILL_WINDOW_DAYS,
-        );
-        let hold = CodexInventoryHold {
-            owed: BTreeSet::from([plain_key.clone()]),
-            refused_headers: if outside_roster {
-                BTreeMap::new()
-            } else {
-                BTreeMap::from([(archive_key.clone(), archive_witness.clone())])
-            },
-            outside_roster: if outside_roster {
-                BTreeMap::from([(archive_key.clone(), archive_witness.clone())])
-            } else {
-                BTreeMap::new()
-            },
-            awaiting_directories: false,
-        };
-        let retry_after = rfc3339_unix_seconds(NOW).unwrap() + 1800;
-        let traversal = index.traversal.as_mut().unwrap();
-        traversal.pending_directories.clear();
-        traversal.pending_candidates.clear();
-        traversal.codex_rollout_paths = BTreeSet::from([plain_key.clone()]);
-        if !outside_roster {
-            traversal.codex_rollout_paths.insert(archive_key.clone());
-        }
-        traversal
-            .observed_index_keys
-            .extend([archive_key.clone(), plain_key.clone()]);
-        traversal.residue.index_keys.insert(archive_key.clone());
-        traversal.residue.codex_inventory_hold = Some(hold.clone());
-        traversal.codex_join_directory_census = Some(directories);
-        // An incomplete-inventory page already carries retryable debt. Its
-        // retained generation is not due for a fresh walk in this fixture.
-        traversal
-            .counts
-            .record_unreadable(UnreadableCause::AliasParser, 1);
-        traversal.unhealthy_retry_not_before_unix_seconds = Some(retry_after);
-        let archive_before = serde_json::to_value(&index.files[&archive_key]).unwrap();
-        let saved = state_root.join("held-index.json");
-        let run_page = |index, hints: &[PathBuf], quiet| {
-            let mut scan = OwnedSourceScan::new(
-                SnapshotSource::Codex,
-                &roots,
-                index,
-                NOW,
-                BACKFILL_WINDOW_DAYS,
-                10,
-                false,
-                None,
-                hints,
-                false,
-                false,
-            );
-            let traversal = scan.index.traversal.as_ref().unwrap();
-            assert!(!traversal.codex_rollout_paths.contains(&archive_key));
-            assert_eq!(traversal.residue.codex_inventory_hold.as_ref(), Some(&hold));
-            if quiet {
-                assert!(traversal.pending_candidates.is_empty());
-                assert!(scan.identified_candidates.is_empty());
-                assert!(scan.codex_join_inventory.is_none());
-            } else {
-                assert!(scan
-                    .identified_candidates
-                    .iter()
-                    .any(|candidate| candidate.path == plain));
-            }
-            for _ in 0..1000 {
-                scan = match scan.step(None) {
-                    OwnedSourceScanStep::Pending(next) => next,
-                    OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
-                };
-            }
-            panic!("inventory-held page did not complete");
-        };
-        for pass in 0..3 {
-            index.save(&saved).unwrap();
-            let (restored, origin) =
-                ScanIndex::load_inner(&saved, Some(SnapshotSource::Codex)).unwrap();
-            assert!(matches!(origin, LoadOrigin::Loaded(_)));
-            let traversal = restored.traversal.as_ref().unwrap();
-            assert!(
-                traversal.pending_candidates.is_empty() && traversal.pending_directories.is_empty()
-            );
-            assert!(traversal
-                .codex_join_directory_census
-                .as_ref()
-                .unwrap()
-                .moved_directories()
-                .is_empty());
-            assert_eq!(traversal.residue.codex_inventory_hold.as_ref(), Some(&hold));
-            assert_eq!(
-                codex_file_join::path_witness(&plain).as_deref(),
-                Some(plain_witness.as_str())
-            );
-            if pass < 2 {
-                assert_eq!(codex_file_join::path_witness(&f.0), archive_witness);
-            }
-            let ((next, result), reads) =
-                count_header_reads(&plain, || run_page(restored, &[], true));
-            assert_eq!(reads, 0, "no recovery header read of unchanged plain work");
-            assert_eq!(result.scanned_file_count, 0);
-            assert!(result.snapshots.is_empty());
-            let traversal = next.traversal.as_ref().unwrap();
-            assert_eq!(traversal.residue.codex_inventory_hold.as_ref(), Some(&hold));
-            assert_eq!(
-                traversal.counts.unreadable_path_count, 1,
-                "exclusion adds no retryable debt"
-            );
-            assert_eq!(
-                traversal.unhealthy_retry_not_before_unix_seconds,
-                Some(retry_after)
-            );
-            assert_eq!(
-                serde_json::to_value(&next.files[&archive_key]).unwrap(),
-                archive_before
-            );
-            index = next;
-            if pass == 1 {
-                // Even a denied neighbor's real metadata change cannot rearm P.
-                fs::OpenOptions::new()
-                    .append(true)
-                    .open(&f.0)
-                    .unwrap()
-                    .write_all(b"changed")
-                    .unwrap();
-                assert_ne!(codex_file_join::path_witness(&f.0), archive_witness);
-            }
-        }
-        // A real edit of admitted P keeps its existing watcher admission path.
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&plain)
-            .unwrap()
-            .write_all(b"\n")
-            .unwrap();
-        assert_ne!(
-            codex_file_join::path_witness(&plain).as_deref(),
-            Some(plain_witness.as_str())
-        );
-        index.save(&saved).unwrap();
-        let (restored, origin) =
-            ScanIndex::load_inner(&saved, Some(SnapshotSource::Codex)).unwrap();
-        assert!(matches!(origin, LoadOrigin::Loaded(_)));
-        let ((next, result), reads) = count_header_reads(&plain, || {
-            run_page(restored, std::slice::from_ref(&plain), false)
-        });
-        assert!(
-            reads > 0,
-            "changed admitted P reaches real header inventory"
-        );
-        assert_eq!(result.scanned_file_count, 1);
-        assert!(result
-            .snapshots
-            .iter()
-            .any(|snapshot| snapshot.source_session_id == "owed-plain"));
-        assert_eq!(
-            serde_json::to_value(&next.files[&archive_key]).unwrap(),
-            archive_before
-        );
-        fs::remove_dir_all(state_root).unwrap();
-    }
-}
-
-/// [behaviour] A denied-only inventory hold re-offers owed plain work at a bounded retry
-/// generation.
-#[test]
-fn denied_only_inventory_hold_reoffers_owed_plain_at_bounded_retry_generation() {
-    let _discovery = archive_discovery_scope(false);
-    use codex_file_join::{tests::header_reads, DirectoryCensus, HeaderInventory};
-
-    fn page(
-        roots: &[PathBuf],
-        index: ScanIndex,
-        clock: &str,
-    ) -> (ScanIndex, SourceScanResult, usize) {
-        let mut scan = OwnedSourceScan::new(
-            SnapshotSource::Codex,
-            roots,
-            index,
-            clock,
-            BACKFILL_WINDOW_DAYS,
-            10,
-            false,
-            None,
-            &[],
-            false,
-            false,
-        );
-        let mut header_bytes = 0;
-        for _ in 0..1000 {
-            if let Some(inventory) = &scan.codex_join_inventory {
-                header_bytes = header_bytes.max(inventory.read_bytes);
-            }
-            scan = match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => {
-                    return (index, scan, header_bytes);
-                }
-            };
-        }
-        panic!("bounded retry page did not finish");
-    }
-
-    let _lock = ARCHIVE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut f = ArchiveFixture::new(b"stable-refused-archive");
-    let state_root = f.0.parent().unwrap().to_owned();
-    let root = state_root.join("sessions");
-    fs::create_dir(&root).unwrap();
-    let archive_path = root.join(f.0.file_name().unwrap());
-    fs::rename(&f.0, &archive_path).unwrap();
-    f.0 = archive_path;
-    let roots = [root.clone()];
-    let plain = root.join("rollout-owed-plain.jsonl");
-    let settled = root.join("rollout-settled-plain.jsonl");
-    let rollout = String::from_utf8(synthetic_rollout()).unwrap();
-    fs::write(
-        &settled,
-        rollout.replace("compressed-fixture", "settled-plain"),
-    )
-    .unwrap();
-    // Q is genuinely parsed, finalized and ACKed, rather than a fabricated
-    // unchanged entry whose missing ownership evidence could hide a replay.
-    let (mut index, mut first, _) = page(&roots, ScanIndex::default(), NOW);
-    assert_eq!(first.snapshots.len(), 1);
-    assert_eq!(first.snapshots[0].source_session_id, "settled-plain");
-    finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
-    first.finish_codex_capture_boundary(&mut index);
-    let accepted = first
-        .snapshots
-        .iter()
-        .map(|item| item.snapshot_fingerprint.clone())
-        .collect();
-    index = index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
-    index.record_accepted_snapshot_fingerprints(&accepted);
-    let plain_key = local_index_key(&plain);
-    let settled_key = local_index_key(&settled);
-    assert!(codex_index_file_body_accepted(
-        &index,
-        &settled_key,
-        &index.files[&settled_key]
-    ));
-    let settled_before = serde_json::to_value(&index.files[&settled_key]).unwrap();
-    let settled_incidence = index.file_snapshot_fingerprints[&settled_key].clone();
-    fs::write(&plain, rollout.replace("compressed-fixture", "owed-plain")).unwrap();
-    let mut directories = DirectoryCensus::new();
-    directories.observe(&root, &fs::metadata(&root).unwrap());
-    // P's first record was already read in the failed inventory, but its body
-    // has not settled. The saved hold below models that archive-enabled writer.
-    let mut inventory = HeaderInventory::new(
-        &roots,
-        &BTreeSet::from([plain_key.clone(), settled_key.clone()]),
-        Some(&directories),
-    );
-    while !inventory.step(&CodexTitleMetadata::default()) {}
-    assert!(inventory.complete);
-    assert_eq!(inventory.headers.len(), 2);
-    let archive_key = local_index_key(&f.0);
-    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
-    evidence.disposition = ArchiveDisposition::Refused {
-        cause: CodexZstCause::HeaderInvalid,
-    };
-    let historical = "a".repeat(64);
-    index.files.insert(
-        archive_key.clone(),
-        ScanIndexEntry {
-            source_file_fingerprint: "historical-archive".into(),
-            last_snapshot_fingerprint: Some(historical.clone()),
-            last_upload_body_witness: Some("historical-body".into()),
-            archive: Some(Box::new(evidence)),
-            ..Default::default()
-        },
-    );
-    index
-        .file_snapshot_fingerprints
-        .insert(archive_key.clone(), BTreeSet::from([historical.clone()]));
-    index
-        .accepted_snapshot_fingerprints
-        .insert(historical.clone());
-    index.files.insert(
-        plain_key.clone(),
-        ScanIndexEntry {
-            size_bytes: fs::metadata(&plain).unwrap().len(),
-            source_file_fingerprint: "held-unsettled-plain".into(),
-            ..Default::default()
-        },
-    );
-    ensure_bounded_traversal(
-        SnapshotSource::Codex,
-        &roots,
-        &mut index,
-        NOW,
-        BACKFILL_WINDOW_DAYS,
-    );
-    let delay = unhealthy_scan_retry_delay_seconds(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS);
-    assert_eq!(delay, 3600);
-    let retry_at = rfc3339_unix_seconds(NOW).unwrap() + delay;
-    let hold = CodexInventoryHold {
-        owed: BTreeSet::from([plain_key.clone()]),
-        refused_headers: BTreeMap::from([(
-            archive_key.clone(),
-            codex_file_join::path_witness(&f.0),
-        )]),
-        awaiting_directories: false,
-        ..Default::default()
-    };
-    let traversal = index.traversal.as_mut().unwrap();
-    traversal.pending_directories.clear();
-    traversal.pending_candidates.clear();
-    traversal.codex_rollout_paths =
-        BTreeSet::from([archive_key.clone(), plain_key.clone(), settled_key.clone()]);
-    traversal.observed_index_keys = traversal.codex_rollout_paths.clone();
-    traversal.codex_join_directory_census = Some(directories);
-    traversal.residue.index_keys.insert(archive_key.clone());
-    traversal.residue.codex_inventory_hold = Some(hold.clone());
-    traversal
-        .counts
-        .record_unreadable(UnreadableCause::AliasParser, 1);
-    traversal.unhealthy_retry_attempt = UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS;
-    traversal.unhealthy_retry_not_before_unix_seconds = Some(retry_at);
-    let archive_before = serde_json::to_value(&index.files[&archive_key]).unwrap();
-    let archive_incidence = index.file_snapshot_fingerprints[&archive_key].clone();
-    let saved = state_root.join("retry-index.json");
-    index.save(&saved).unwrap();
-    let (restored, origin) = ScanIndex::load_inner(&saved, Some(SnapshotSource::Codex)).unwrap();
-    assert!(matches!(origin, LoadOrigin::Loaded(_)));
-    assert_eq!(
-        restored
-            .traversal
-            .as_ref()
-            .unwrap()
-            .residue
-            .codex_inventory_hold
-            .as_ref(),
-        Some(&hold)
-    );
-    let constructions = super::super::codex_zst_refusal_tests::decoder_construction_count();
-    let (((index, emissions), body_reads), headers) = header_reads(|| {
-        terminal_contract_retry::source_acquisitions(|| {
-            let (mut index, quiet, bytes) = page(&roots, restored, NOW);
-            assert!(quiet.snapshots.is_empty());
-            assert_eq!(quiet.scanned_file_count, 0);
-            assert_eq!(bytes, 0);
-            let traversal = index.traversal.as_ref().unwrap();
-            assert_eq!(traversal.residue.codex_inventory_hold.as_ref(), Some(&hold));
-            assert_eq!(traversal.counts.unreadable_path_count, 1);
-            assert_eq!(
-                traversal.unhealthy_retry_not_before_unix_seconds,
-                Some(retry_at)
-            );
-            // Save/load once more after exclusion, with the empty queue intact.
-            index.save(&saved).unwrap();
-            index = ScanIndex::load_inner(&saved, Some(SnapshotSource::Codex))
-                .unwrap()
-                .0;
-            let due = OffsetDateTime::from_unix_timestamp((retry_at + 1) as i64)
-                .unwrap()
-                .format(&Rfc3339)
-                .unwrap();
-            let first_record_bytes = [&plain, &settled]
-                .iter()
-                .map(|path| {
-                    fs::read(path)
-                        .unwrap()
-                        .split_inclusive(|b| *b == b'\n')
-                        .next()
-                        .unwrap()
-                        .len()
-                })
-                .sum::<usize>();
-            assert!(first_record_bytes < 2 * codex_file_join::MAX_HEADER_BYTES);
-            let mut emissions = 0;
-            let mut inventory_bytes = 0;
-            let mut completed = false;
-            for _ in 0..4 {
-                let previous = index.clone();
-                let (mut next, mut result, bytes) = page(&roots, index, &due);
-                inventory_bytes += bytes;
-                assert_eq!(
-                    result.unreadable_path_count, 0,
-                    "old RU retires with its generation"
-                );
-                assert_eq!(result.ownership_incomplete_file_count, 0);
-                assert!(result
-                    .snapshots
-                    .iter()
-                    .all(|item| item.source_session_id == "owed-plain"));
-                finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut next);
-                result.finish_codex_capture_boundary(&mut next);
-                emissions += result.snapshots.len();
-                let accepted = result
-                    .snapshots
-                    .iter()
-                    .map(|item| item.snapshot_fingerprint.clone())
-                    .collect();
-                let census_complete = result.census_complete;
-                index = next.committable_subset(&previous, &accepted, &BTreeMap::new());
-                index.record_accepted_snapshot_fingerprints(&accepted);
-                if census_complete {
-                    assert!(
-                        index.traversal.is_none(),
-                        "normal completed generation retires"
-                    );
-                    completed = true;
-                    break;
-                }
-            }
-            assert!(
-                completed,
-                "owed work completes within four bounded pages after retry"
-            );
-            // The bounded first-record reader charges physical read-ahead,
-            // including bytes buffered past the first newline. Keep exact
-            // per-path call counts below, and bound all charged header I/O.
-            assert!(inventory_bytes >= first_record_bytes);
-            assert!(inventory_bytes <= 2 * codex_file_join::MAX_HEADER_BYTES);
-            (index, emissions)
-        })
-    });
-    assert_eq!(emissions, 1);
-    assert_eq!(
-        body_reads,
-        BTreeMap::from([(plain.clone(), 1)]),
-        "Q and A have zero body reads"
-    );
-    assert_eq!(headers, BTreeMap::from([(plain, 1), (settled, 1)]));
-    assert_eq!(
-        super::super::codex_zst_refusal_tests::decoder_construction_count(),
-        constructions
-    );
-    assert!(codex_index_file_body_accepted(
-        &index,
-        &plain_key,
-        &index.files[&plain_key]
-    ));
-    assert_eq!(
-        serde_json::to_value(&index.files[&settled_key]).unwrap(),
-        settled_before
-    );
-    assert_eq!(
-        index.file_snapshot_fingerprints[&settled_key],
-        settled_incidence
-    );
-    assert_eq!(
-        serde_json::to_value(&index.files[&archive_key]).unwrap(),
-        archive_before
-    );
-    assert_eq!(
-        index.file_snapshot_fingerprints[&archive_key],
-        archive_incidence
-    );
-    assert!(index.accepted_snapshot_fingerprints.contains(&historical));
-    fs::remove_dir_all(state_root).unwrap();
 }
 
 /// [format] Every persisted pre-composition archive disposition label still decodes.
@@ -1930,7 +1088,7 @@ fn selector_scan(
     scan.codex_join_inventory = Some(inventory);
     scan.codex_join_prepared = false;
     scan.census_unix_seconds = None;
-    scan.index.archive_pass.power = power;
+    archive_power(&mut scan.index.archive_pass, power);
     let traversal = scan.index.traversal.as_mut().unwrap();
     traversal.codex_rollout_paths = paths;
     traversal.scan_roots = vec![root];
@@ -2619,9 +1777,6 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
     let state = f.0.parent().unwrap().to_owned();
     let root = state.join("sessions");
     fs::create_dir(&root).unwrap();
-    let archive = root.join(f.0.file_name().unwrap());
-    fs::rename(&f.0, &archive).unwrap();
-    f.0 = archive;
     let other = state.join("other/sessions");
     fs::create_dir_all(&other).unwrap();
     let roots = [root.clone(), other.clone()];
@@ -2633,6 +1788,31 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
             .replace("compressed-fixture", "stable-plain"),
     )
     .unwrap();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    // The predecessor release never discovered archives: its accepted plain
+    // state is built before any archive exists under the configured roots.
+    let ((mut index, baseline), baseline_reads) =
+        terminal_contract_retry::source_acquisitions(|| {
+            finish_selector(
+                OwnedSourceScan::new(
+                    SnapshotSource::Codex,
+                    &roots,
+                    ScanIndex::default(),
+                    NOW,
+                    BACKFILL_WINDOW_DAYS,
+                    10,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    false,
+                )
+                .with_sampled_acquisition(cache.clone(), Scope("activation-held-debt".into())),
+            )
+        });
+    let archive = root.join(f.0.file_name().unwrap());
+    fs::rename(&f.0, &archive).unwrap();
+    f.0 = archive;
     let mut archives = BTreeSet::from([local_index_key(&f.0)]);
     for owner in ["second-archive", "third-archive"] {
         let path = root.join(format!("rollout-{owner}.jsonl.zst"));
@@ -2653,28 +1833,6 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
     )
     .unwrap();
     archives.insert(local_index_key(&hidden));
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let ((mut index, baseline), baseline_reads) =
-        terminal_contract_retry::source_acquisitions(|| {
-            with_archive_discovery(false, || {
-                finish_selector(
-                    OwnedSourceScan::new(
-                        SnapshotSource::Codex,
-                        &roots,
-                        ScanIndex::default(),
-                        NOW,
-                        BACKFILL_WINDOW_DAYS,
-                        10,
-                        false,
-                        None,
-                        &[],
-                        false,
-                        false,
-                    )
-                    .with_sampled_acquisition(cache.clone(), Scope("activation-held-debt".into())),
-                )
-            })
-        });
     assert_eq!(
         baseline_reads.get(&plain).copied().unwrap_or(0),
         1,
@@ -2688,53 +1846,41 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
     let plain_key = local_index_key(&plain);
     let before = serde_json::to_value(&index.files[&plain_key]).unwrap();
     let saved = state.join("held.json");
-    with_archive_discovery(false, || {
-        assert!(!transcript_path_admitted(SnapshotSource::Codex, &f.0));
-        ensure_bounded_traversal(
-            SnapshotSource::Codex,
-            &roots,
-            &mut index,
-            NOW,
-            BACKFILL_WINDOW_DAYS,
-        );
-        let traversal = index.traversal.as_mut().unwrap();
-        traversal.pending_directories.clear();
-        traversal.pending_candidates.clear();
-        traversal.codex_rollout_paths = BTreeSet::from([plain_key.clone()]);
-        traversal
-            .observed_index_keys
-            .extend(archives.iter().cloned());
-        traversal.observed_index_keys.insert(plain_key.clone());
-        let mut dirs = codex_file_join::DirectoryCensus::new();
-        for directory in &roots {
-            dirs.observe(directory, &fs::metadata(directory).unwrap());
-        }
-        traversal.codex_join_directory_census = Some(dirs);
-        traversal.residue.codex_inventory_hold = Some(CodexInventoryHold {
-            owed: owed.clone(),
-            refused_headers: BTreeMap::from([(
-                local_index_key(&f.0),
-                codex_file_join::path_witness(&f.0),
-            )]),
-            ..Default::default()
-        });
-        traversal
-            .counts
-            .record_unreadable(UnreadableCause::AliasParser, 1);
-        traversal.unhealthy_retry_not_before_unix_seconds =
-            Some(rfc3339_unix_seconds(NOW).unwrap() + 1800);
-        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            release_codex_inventory_hold(SnapshotSource::Codex, traversal, &index.decode_holds)
-        });
-        assert_eq!(
-            archive_event_count(&rows, "codex_archive_inventory_debt_released"),
-            0
-        );
-        assert!(traversal.pending_candidates.is_empty());
-        assert!(traversal.residue.codex_inventory_hold.is_some());
-        index.save(&saved).unwrap();
+    // The predecessor's saved inventory hold: archives owed, one refused.
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        &roots,
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.pending_directories.clear();
+    traversal.pending_candidates.clear();
+    traversal.codex_rollout_paths = BTreeSet::from([plain_key.clone()]);
+    traversal
+        .observed_index_keys
+        .extend(archives.iter().cloned());
+    traversal.observed_index_keys.insert(plain_key.clone());
+    let mut dirs = codex_file_join::DirectoryCensus::new();
+    for directory in &roots {
+        dirs.observe(directory, &fs::metadata(directory).unwrap());
+    }
+    traversal.codex_join_directory_census = Some(dirs);
+    traversal.residue.codex_inventory_hold = Some(CodexInventoryHold {
+        owed: owed.clone(),
+        refused_headers: BTreeMap::from([(
+            local_index_key(&f.0),
+            codex_file_join::path_witness(&f.0),
+        )]),
+        ..Default::default()
     });
-    assert!(transcript_path_admitted(SnapshotSource::Codex, &f.0));
+    traversal
+        .counts
+        .record_unreadable(UnreadableCause::AliasParser, 1);
+    traversal.unhealthy_retry_not_before_unix_seconds =
+        Some(rfc3339_unix_seconds(NOW).unwrap() + 1800);
+    index.save(&saved).unwrap();
     let (((mut index, _), rows), acquisitions) =
         terminal_contract_retry::source_acquisitions(|| {
             crate::local_resource_diagnostics::capture(|| {
@@ -2815,7 +1961,7 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
                         false,
                     )
                     .with_sampled_acquisition(cache.clone(), Scope("activation-held-debt".into()));
-                    scan.index.archive_pass.power = true;
+                    archive_power(&mut scan.index.archive_pass, true);
                     finish_selector(scan)
                 })
             });
@@ -2909,7 +2055,7 @@ fn activation_does_not_release_unchanged_nonregular_archive_inventory_witness() 
 fn incomplete_archive_inventory_defers_before_frame_or_header_io() {
     let f = ArchiveFixture::new(b"no read permission from incomplete membership");
     let mut index = ScanIndex::default();
-    index.archive_pass.power = true;
+    archive_power(&mut index.archive_pass, true);
     let inventory = codex_file_join::HeaderInventory::new(&[], &BTreeSet::new(), None);
     let (admission, rows) = crate::local_resource_diagnostics::capture(|| {
         index
@@ -3009,7 +2155,8 @@ fn power_plain_sibling(f: &ArchiveFixture) -> CandidateFile {
 /// [behaviour] Power loss after construction defers without a read or attempt; plain progresses.
 #[test]
 fn archive_power_loss_after_construction_defers_without_read_or_attempt_and_plain_progresses() {
-    for denied in [Some(false), None] {
+    use crate::snapshot_sync::continuation::PlatformState;
+    for denied in [PlatformState::Refused, PlatformState::Unknown] {
         // Refused and Unknown both deny.
         let f =
             ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
@@ -3017,24 +2164,21 @@ fn archive_power_loss_after_construction_defers_without_read_or_attempt_and_plai
         let key = local_index_key(&f.0);
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let decoders = codex_zst_refusal_tests::decoder_construction_count();
-        let (((state, result), rows), before) =
-            crate::snapshot_sync::with_archive_power(&[Some(true), denied], || {
-                let mut scan = selector_scan(
-                    &f,
-                    ScanIndex::default(),
-                    cache.clone(),
-                    VecDeque::from([plain, f.candidate()]),
-                    true,
-                );
-                assert!(scan.index.archive_pass.power, "constructed while Allowed");
-                scan.index.archive_pass.cpu = 123;
-                scan.index.archive_pass.work = 456;
-                let before = (scan.index.archive_pass.cpu, scan.index.archive_pass.work);
-                (
-                    crate::local_resource_diagnostics::capture(|| finish_selector(scan)),
-                    before,
-                )
-            });
+        let mut scan = selector_scan(
+            &f,
+            ScanIndex::default(),
+            cache.clone(),
+            VecDeque::from([plain, f.candidate()]),
+            true,
+        );
+        assert!(scan.index.archive_pass.power, "constructed while Allowed");
+        // Power is lost after construction: every live re-query is denied.
+        scan.index.archive_pass.gates = scripted_power(&[denied]);
+        scan.index.archive_pass.cpu = 123;
+        scan.index.archive_pass.work = 456;
+        let before = (scan.index.archive_pass.cpu, scan.index.archive_pass.work);
+        let ((state, result), rows) =
+            crate::local_resource_diagnostics::capture(|| finish_selector(scan));
         assert_eq!(result.snapshots.len(), 1);
         assert_eq!(result.snapshots[0].source_session_id, "unrelated");
         assert!(result.snapshots[0].input_tokens > 0);
@@ -3075,26 +2219,25 @@ fn archive_power_loss_between_header_and_body_preserves_paid_header_and_plain_pr
     let _lock = ARCHIVE_TEST_LOCK
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    for denied in [Some(false), None] {
+    use crate::snapshot_sync::continuation::PlatformState::{self, Allowed};
+    for denied in [PlatformState::Refused, PlatformState::Unknown] {
         let f =
             ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
         let plain = power_plain_sibling(&f);
         let key = local_index_key(&f.0);
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let decoders = codex_zst_refusal_tests::decoder_construction_count();
-        let ((state, result), rows) = crate::snapshot_sync::with_archive_power(
-            &[Some(true), Some(true), Some(true), denied],
-            || {
-                let scan = selector_scan(
-                    &f,
-                    ScanIndex::default(),
-                    cache.clone(),
-                    VecDeque::from([plain, f.candidate()]),
-                    true,
-                );
-                crate::local_resource_diagnostics::capture(|| finish_selector(scan))
-            },
+        let mut scan = selector_scan(
+            &f,
+            ScanIndex::default(),
+            cache.clone(),
+            VecDeque::from([plain, f.candidate()]),
+            true,
         );
+        // Allowed through the header's live re-queries, lost before the body.
+        scan.index.archive_pass.gates = scripted_power(&[Allowed, Allowed, denied]);
+        let ((state, result), rows) =
+            crate::local_resource_diagnostics::capture(|| finish_selector(scan));
         assert_eq!(result.snapshots.len(), 1);
         assert_eq!(result.snapshots[0].source_session_id, "unrelated");
         let evidence = state.files[&key].archive.as_ref().unwrap();

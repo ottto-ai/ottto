@@ -43997,16 +43997,7 @@ fn codex_fresh_data_pending(
 // archive decoding still requires live power, CPU/byte budget and a funded reader.
 fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
     path.extension().and_then(|value| value.to_str()) == Some("jsonl")
-        || (source == SnapshotSource::Codex && codex_archive_path(path) && {
-            #[cfg(test)]
-            {
-                codex_compressed_input::tests::archive_discovery_enabled()
-            }
-            #[cfg(not(test))]
-            {
-                true
-            }
-        })
+        || (source == SnapshotSource::Codex && codex_archive_path(path))
 }
 
 /// Returns how many Codex hints re-entered as next-generation evidence.

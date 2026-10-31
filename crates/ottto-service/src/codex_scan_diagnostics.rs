@@ -77,6 +77,15 @@ fn process_start() -> Option<ProcessStart> {
     *START.get_or_init(acquire_process_start)
 }
 
+/// Seconds since this process started (`None`: start unavailable).
+pub(crate) fn process_age_seconds() -> Option<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    now.checked_sub(process_start()?.sec)
+}
+
 #[cfg(not(test))]
 static CENSUS_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]

@@ -31,7 +31,7 @@ fn fake_thread_cpu_and_clock_enforce_archive_boundary_pacing() {
     use crate::snapshots::sampled_scan::ArchivePass as Pass;
     let mut pass = Pass::default();
     assert!(!pass.ready(1));
-    pass.power = true;
+    archive_power(&mut pass, true);
     assert!(pass.ready(1));
     assert!(!pass.ready(0));
     pass.observe(Some(0), 19_999_999);
@@ -54,7 +54,7 @@ fn fake_thread_cpu_and_clock_enforce_archive_boundary_pacing() {
 fn cpu_budget_survives_scan_completion_partial_commit_and_continuation_pages() {
     let f = ArchiveFixture::new(b"no decoder permission");
     let mut scan = discovered_scan(&f, ScanIndex::default(), 1);
-    scan.index.archive_pass.power = true;
+    archive_power(&mut scan.index.archive_pass, true);
     scan.index.archive_pass.started = true;
     scan.index.archive_pass.observe(Some(30_000_001), 1);
     let mut completed = None;
@@ -129,7 +129,7 @@ fn no_inventory_storm_and_live_work_precedes_paced_backlog() {
             18,
             "all synthetic archives supplied"
         );
-        scan.index.archive_pass.power = power;
+        archive_power(&mut scan.index.archive_pass, power);
         scan.index.archive_pass.cpu = cpu;
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
             for _ in 0..1000 {
@@ -437,7 +437,7 @@ fn compressed_only_root_read_once_and_acked_then_quiet_restart() {
         Arc::new(sampled_scan::SharedCache::default()),
         Scope("discovery-recovery".into()),
     );
-    scan.index.archive_pass.power = true;
+    archive_power(&mut scan.index.archive_pass, true);
     let ((mut index, result), rows) =
         crate::local_resource_diagnostics::capture(|| finish_selector(scan));
     assert_eq!(result.snapshots.len(), 1);
@@ -467,7 +467,7 @@ fn compressed_only_root_read_once_and_acked_then_quiet_restart() {
             Arc::new(sampled_scan::SharedCache::default()),
             Scope("discovery-recovery".into()),
         );
-        scan.index.archive_pass.power = true;
+        archive_power(&mut scan.index.archive_pass, true);
         let ((next, result), rows) =
             crate::local_resource_diagnostics::capture(|| finish_selector(scan));
         assert_eq!(decodes(&rows), 0, "restart is not a Full cause");
@@ -484,7 +484,7 @@ fn declared_over_1gib_held_without_decoder_and_restart_is_quiet() {
     frame.extend_from_slice(&(FIRST_READ_DECODED_LIMIT + 1).to_le_bytes());
     let f = ArchiveFixture::new(&frame);
     let mut scan = discovered_scan(&f, ScanIndex::default(), 10);
-    scan.index.archive_pass.power = true;
+    archive_power(&mut scan.index.archive_pass, true);
     let ((index, result), rows) =
         crate::local_resource_diagnostics::capture(|| finish_selector(scan));
     assert_eq!(decodes(&rows), 0);
@@ -494,7 +494,7 @@ fn declared_over_1gib_held_without_decoder_and_restart_is_quiet() {
         Some(CodexZstCause::CatchupTooLarge)
     );
     let mut scan = discovered_scan(&f, checkpoint(&index), 10);
-    scan.index.archive_pass.power = true;
+    archive_power(&mut scan.index.archive_pass, true);
     let ((_, result), rows) = crate::local_resource_diagnostics::capture(|| finish_selector(scan));
     assert!(result.snapshots.is_empty());
     assert_eq!(decodes(&rows), 0);
