@@ -109,6 +109,10 @@ impl SnapshotWatcher {
     pub(crate) fn matches_roots(&self, roots: &[(SnapshotSource, PathBuf)]) -> bool {
         self.roots == roots && self.watch_paths == watch_paths(roots)
     }
+
+    pub(crate) fn roots(&self) -> &[(SnapshotSource, PathBuf)] {
+        &self.roots
+    }
 }
 
 fn watch_paths(roots: &[(SnapshotSource, PathBuf)]) -> BTreeMap<PathBuf, RecursiveMode> {
