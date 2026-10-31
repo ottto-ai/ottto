@@ -2102,6 +2102,50 @@ fn present_family_archive_keeps_legacy_tombstone_across_two_censuses() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [regress] The #878 same-stamp early return for a persisted Held archive
+/// dropped its owner from `held_owners` (fixed in a6c394ffa), so custody lost
+/// the tombstone's absence scope before classification rebuilt it.
+#[test]
+fn regress_held_archive_early_return_keeps_owner_in_custody_scope() {
+    use codex_counting_version::{AckEvidence, CountingTombstone};
+    let root = crate::test_scratch::private_dir("regress-held-owner-scope");
+    let plain = member(&root, "sessions", PARENT, false);
+    let owner = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    let held = member(&root, "sessions", owner, true);
+    let mut index = ScanIndex::default();
+    index.codex_counting_tombstones.insert(
+        codex_protected_owner(owner),
+        CountingTombstone {
+            evidence: AckEvidence::LegacyAcked,
+            retired_in: "prior-generation".into(),
+            created_unix_ms: None,
+        },
+    );
+    let mut evidence = ArchiveEvidence::begin(&File::open(&held).unwrap(), &held, None).unwrap();
+    evidence.disposition = ArchiveDisposition::Held {
+        cause: CodexZstCause::HeaderInvalid,
+    };
+    index
+        .files
+        .entry(local_index_key(&held))
+        .or_default()
+        .archive = Some(Box::new(evidence));
+    let paths = [plain, held.clone()];
+    let mut inv = no_open(&held, || inventory(&root, &paths, &mut index));
+    assert!(
+        inv.held_owners.contains(owner),
+        "held_owners={}",
+        inv.held_owners.len()
+    );
+    while !inv.prepare_custody(&index) {}
+    assert!(
+        inv.absence_held.contains(&codex_protected_owner(owner)),
+        "absence_held={}",
+        inv.absence_held.len()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// [money] Excluded-archive priority receipts cannot be bypassed by a plain replacement.
 #[test]
 fn excluded_archive_priority_receipts_cannot_be_bypassed_by_plain_replacement() {

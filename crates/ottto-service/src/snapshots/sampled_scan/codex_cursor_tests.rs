@@ -10469,6 +10469,32 @@ fn a_release_without_a_measure_drops_no_proof() {
     refuses(overflow, "poisoned cursor");
 }
 
+/// [regress] A poisoned cursor read as "custody escrow pending", so every Codex
+/// step yielded forever (W9 spun 48 min on Linux; fixed in b7a625cda). With no
+/// escrow the poisoned cursor no longer waits; an escrowed payload still does.
+#[test]
+fn regress_poisoned_cursor_without_escrow_does_not_spin_custody_replay() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let empty = SharedCache::default();
+    let escrowed = SharedCache::default();
+    escrowed.with_cursor(|cursor| cursor.custody_unsaved = Some(CustodyWrite { pending: None }));
+    for cache in [&empty, &escrowed] {
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            cache.with_cursor(|_| panic!("poison the cursor"));
+        }));
+        assert!(unwound.is_err());
+        assert!(!cursor_held());
+    }
+    assert!(
+        !empty.replay_custody_decision(),
+        "no escrow: poison is not a pending payload"
+    );
+    assert!(
+        escrowed.replay_custody_decision(),
+        "escrow survives poison and still waits"
+    );
+}
+
 // Continuation fixtures drive the enabled resume-only scan frame directly.
 
 /// Steps `scan` to completion with the collector's post-policy finalization
