@@ -687,7 +687,7 @@ impl HeaderInventory {
         facts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let mut table: Vec<(String, Family<'_>)> = Vec::with_capacity(facts.len());
         for (owner, kind, name) in facts {
-            if table.last().is_none_or(|(id, _)| *id != owner) {
+            if table.last().map_or(true, |(id, _)| *id != owner) {
                 table.push((owner, Family::default()));
             }
             let family = &mut table.last_mut().expect("owner group").1;
@@ -1061,6 +1061,9 @@ impl HeaderInventory {
             // custody record excludes all archives from acquisition. This is
             // metadata-only classification, before every fact-cache operation.
             if codex_archive_path(Path::new(path)) && index.decode_holds_file(path) {
+                // It still names a negative family member. The former selected
+                // admission roster walk included raw-held paths as well.
+                self.held_archives.insert(path.clone());
                 self.pending.push_back(PathBuf::from(path));
                 continue;
             }
