@@ -674,6 +674,7 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
     );
 }
 
+/// [money] Cumulative acquisition modes and an independent cold read preserve all money fields.
 #[test]
 fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
     with_e2(|| {
@@ -711,6 +712,58 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
             canonical(&tail.scan.snapshots),
             canonical(&full.scan.snapshots)
         );
+        // Independent physical input and support, with neither a prior index
+        // nor a retained reduction. Reuse the corpus fixture and frozen bytes.
+        let mut cold = Corpus::new("e2-pipeline-modes-independent-cold");
+        let cold_path = cold.root(ROOT, &std::fs::read_to_string(&path).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(
+                std::fs::metadata(&path).unwrap().ino(),
+                std::fs::metadata(&cold_path).unwrap().ino()
+            );
+        }
+        let independent = ready(
+            &cold,
+            &E2ScanFixture::default(),
+            ScanIndex::default(),
+            100,
+            true,
+        );
+        assert_mode(independent.modes, (1, 0, 0));
+        assert_eq!(independent.scan.snapshots.len(), 1);
+        let before = serde_json::to_value(&tail.scan.snapshots[0]).unwrap();
+        let independent = serde_json::to_value(&independent.scan.snapshots[0]).unwrap();
+        assert_eq!(
+            before["source_session_id"],
+            independent["source_session_id"]
+        );
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_5m_tokens",
+            "cache_creation_1h_tokens",
+            "reasoning_output_tokens",
+            "unattributed_total_tokens",
+            "request_count",
+            "cost",
+            "usage_buckets",
+            "model_usage",
+            "removed_usage",
+            "removed_request_count",
+            "usage_accounting_contract",
+            "telemetry_owned_complete",
+        ] {
+            // Option<&Value> compares presence as well as the full value:
+            // an absent field must not equal an explicitly serialized null.
+            assert_eq!(
+                before.get(field),
+                independent.get(field),
+                "COLD mismatch: {field}"
+            );
+        }
         tail.finish();
         let prior = c.reload(&mut tail.index);
         // Unaccepted exact body remains due; a fresh sidecar is read even if
