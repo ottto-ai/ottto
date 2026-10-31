@@ -86,6 +86,8 @@ struct Counters {
     not_found_sites: [AtomicU64; SITES * OUTCOMES],
     vanished: [AtomicU64; VANISHED],
     parent_missing_removals: AtomicU64,
+    vanished_pin_refusals: AtomicU64,
+    vanished_retire_blocked_possible_move: AtomicU64,
     overflowed: AtomicBool,
 }
 impl Counters {
@@ -95,6 +97,8 @@ impl Counters {
             not_found_sites: [const { AtomicU64::new(0) }; SITES * OUTCOMES],
             vanished: [const { AtomicU64::new(0) }; VANISHED],
             parent_missing_removals: AtomicU64::new(0),
+            vanished_pin_refusals: AtomicU64::new(0),
+            vanished_retire_blocked_possible_move: AtomicU64::new(0),
             overflowed: AtomicBool::new(false),
         }
     }
@@ -127,6 +131,10 @@ impl Counters {
             vanished_request_census_removed: self.vanished[Vanished::RequestCensusRemoved.index()]
                 .load(Ordering::Relaxed),
             parent_missing_removals: self.parent_missing_removals.load(Ordering::Relaxed),
+            vanished_pin_refusals: self.vanished_pin_refusals.load(Ordering::Relaxed),
+            vanished_retire_blocked_possible_move: self
+                .vanished_retire_blocked_possible_move
+                .load(Ordering::Relaxed),
             overflowed: self.overflowed.load(Ordering::Relaxed),
         }
     }
@@ -141,6 +149,9 @@ static TOTALS: [Counters; 3] = [const { Counters::new() }; 3];
 /// page merge dropped with a vanished Claude member's retired entry.
 /// `parent_missing_removals` (Q-B2, omitted at zero) counts the NotFound
 /// removals settled below a missing parent; they are also in the site split.
+/// `vanished_pin_refusals` counts Q-B2 witnesses refused by the shared pin
+/// budget, and `vanished_retire_blocked_possible_move` confirmed absences held
+/// because another path carries the session (or the lookup was incomplete).
 /// The sticky flag invalidates exact intervals; false is not a coherence proof.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(super) struct Totals {
@@ -152,6 +163,10 @@ pub(super) struct Totals {
     vanished_request_census_removed: u64,
     #[serde(skip_serializing_if = "super::is_zero_u64")]
     parent_missing_removals: u64,
+    #[serde(skip_serializing_if = "super::is_zero_u64")]
+    vanished_pin_refusals: u64,
+    #[serde(skip_serializing_if = "super::is_zero_u64")]
+    vanished_retire_blocked_possible_move: u64,
     overflowed: bool,
 }
 
@@ -212,6 +227,18 @@ pub(super) fn vanished(source: SnapshotSource, vanished: Vanished) {
 pub(super) fn parent_missing_removal(source: SnapshotSource) {
     let counters = &TOTALS[source_index(source)];
     counters.bump(&counters.parent_missing_removals);
+}
+
+/// Q-B2: the shared pin budget refused a new absence witness.
+pub(super) fn vanished_pin_refused(source: SnapshotSource) {
+    let counters = &TOTALS[source_index(source)];
+    counters.bump(&counters.vanished_pin_refusals);
+}
+
+/// Q-B2 rename guard: a confirmed absence held as a possible move.
+pub(super) fn vanished_retire_blocked_possible_move(source: SnapshotSource) {
+    let counters = &TOTALS[source_index(source)];
+    counters.bump(&counters.vanished_retire_blocked_possible_move);
 }
 
 pub(super) fn snapshot(source: SnapshotSource) -> Totals {
@@ -288,6 +315,8 @@ impl Totals {
             vanished_audit_debt_dropped: u64::MAX,
             vanished_request_census_removed: u64::MAX,
             parent_missing_removals: u64::MAX,
+            vanished_pin_refusals: u64::MAX,
+            vanished_retire_blocked_possible_move: u64::MAX,
             overflowed: true,
         }
     }
@@ -893,90 +922,274 @@ mod tests {
             .is_some_and(|entry| entry.has_unverified_source()));
     }
 
-    /// Two generations over the forced member after its whole session
-    /// directory was deleted (parent missing, scan root live), the RF1 B2 shape.
+    /// One bounded walk per `(at, now)` over a deleted session directory, as on
+    /// the M4: a fresh census window whose discovery is still pending
+    /// (`pending_directories` > 0), the indexed member enumerated at the forced
+    /// index site, then the queued `directory` (if any) read. Returns, per
+    /// walk, the member's (disappeared, removed) and the directory's disappeared.
     #[cfg(unix)]
-    fn deleted_session_directory_walks(
-        prefix: &str,
-        on: bool,
-        prepare: impl FnOnce(&mut ScanIndex, &str),
-    ) -> (ScanIndex, String, [SiteEvents; 2], Vec<SourceScanResult>) {
-        let fixture = ForcedFamilyFixture::new(prefix);
-        let member_key = local_index_key(&fixture.member_path);
-        fs::remove_dir_all(fixture.dir.join(FORCED_ROOT)).unwrap();
-        let mut index = fixture.index();
-        prepare(&mut index, &member_key);
-        let _switch = super::super::terminal_off_policy::VanishedDirectoryRemovalForTest::set(on);
-        let mut sites = [[[[0; OUTCOMES]; SITES]; 3]; 2];
-        let mut pages = Vec::new();
-        for (walk, (at, now)) in [(NOW, 1_000), (LATER, 1_600)].into_iter().enumerate() {
-            super::super::sampled_scan::set_test_now(Some(now));
-            (pages, sites[walk]) =
-                observe_sites(|| claude_generation(&mut index, &fixture.dir, at, 10, &[]));
+    fn deleted_directory_walk(
+        index: &mut ScanIndex,
+        root: &Path,
+        (at, now): (&str, u64),
+        member: &Path,
+        directory: Option<&Path>,
+    ) -> (usize, bool, usize) {
+        super::super::sampled_scan::set_test_now(Some(now));
+        super::super::withheld_account::support::clock(&index.withheld_memo);
+        index.traversal = None;
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[root.to_path_buf()],
+            index,
+            at,
+            BACKFILL_WINDOW_DAYS,
+        );
+        let traversal = index.traversal.as_mut().unwrap();
+        assert!(
+            !traversal.pending_directories.is_empty(),
+            "discovery pending"
+        );
+        if let Some(directory) = directory {
+            traversal.pending_directories.push_front(ScanTraversalPath {
+                scan_root: root.to_path_buf(),
+                path: directory.to_path_buf(),
+                census_member: true,
+                watcher_hint: false,
+            });
         }
-        super::super::sampled_scan::set_test_now(None);
-        (index, member_key, sites, pages)
+        let mut census = ScanCensus::default();
+        assert!(super::super::candidate_from_traversal_path_at(
+            SnapshotSource::ClaudeCode,
+            Site::CandidateForcedIndex,
+            ScanTraversalPath {
+                scan_root: root.to_path_buf(),
+                path: member.to_path_buf(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            None,
+            BACKFILL_WINDOW_DAYS,
+            &mut crate::snapshots::CandidateDiscovery::new(index, None),
+        )
+        .is_none());
+        let removed = census.removed_index_keys.contains(&local_index_key(member));
+        let before = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .counts
+            .disappeared_file_count;
+        if directory.is_some() {
+            advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, index, 7, None);
+        }
+        let directory_lost = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .counts
+            .disappeared_file_count
+            - before;
+        (census.disappeared_file_count, removed, directory_lost)
     }
 
-    /// [off=main] With the switch OFF a member below a deleted directory stays
-    /// loss in every generation and keeps its entry, as on main.
+    /// A live real root with one indexed subagent member whose whole session
+    /// directory was deleted (the 107-entry M4 shape), plus a gone directory
+    /// that was still queued under the live root.
+    #[cfg(unix)]
+    fn deleted_directory_index(root: &Path) -> (ScanIndex, PathBuf, PathBuf) {
+        let member = root
+            .join("c4444444-4444-4444-8444-444444444444")
+            .join("subagents")
+            .join("agent-a4d1585d310070d0f.jsonl");
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&member),
+            super::super::tests::manifest_index_entry(Some("acked-member-body")),
+        );
+        (index, member, root.join("gone-tool-results"))
+    }
+
+    const WALKS: [(&str, u64); 3] = [(NOW, 1_000), (LATER, 1_600), (RETRY, 2_200)];
+
+    /// [off=main] With the switch OFF a member below a deleted directory and a
+    /// vanished queued directory stay loss in every walk, as on main.
     #[cfg(unix)]
     #[test]
     fn claude_member_of_deleted_directory_stays_loss_when_switch_off() {
-        let (index, member_key, sites, pages) =
-            deleted_session_directory_walks("absence-deleted-dir-off", false, |_, _| {});
-        let mut loss = [[[0; OUTCOMES]; SITES]; 3];
-        loss[1][Site::CandidateForcedIndex.index()] = [1, 0];
-        assert_eq!(sites, [loss, loss]);
-        assert_eq!(
-            pages
-                .iter()
-                .map(|page| page.disappeared_file_count)
-                .sum::<usize>(),
-            1
-        );
-        assert!(index.files.contains_key(&member_key));
+        let dir = crate::test_scratch::ScratchDir::new("absence-deleted-dir-off");
+        let root = fs::canonicalize(&dir).unwrap();
+        let (mut index, member, directory) = deleted_directory_index(&root);
+        for walk in WALKS {
+            assert_eq!(
+                deleted_directory_walk(&mut index, &root, walk, &member, Some(&directory)),
+                (1, false, 1)
+            );
+        }
+        super::super::sampled_scan::set_test_now(None);
     }
 
     /// [regress] RF1 B2: on the M4 every Claude walk ended red with 47-71
     /// CandidateForcedIndex losses per process, all members of deleted
-    /// directories. ON: the first NotFound stays loss; the later completed
-    /// walk settles it as a removal and retires the entry.
+    /// directories, observed while discovery was still pending. ON: the first
+    /// NotFound stays loss and a strictly later walk settles it (Q-B2a); a
+    /// member seen again needs two fresh observations; a vanished queued
+    /// directory below its live parent settles the same way (Q-B2b).
     #[cfg(unix)]
     #[test]
     fn claude_member_of_deleted_directory_is_removal_after_a_later_walk() {
-        let (index, member_key, sites, pages) =
-            deleted_session_directory_walks("absence-deleted-dir-on", true, |_, _| {});
-        let mut loss = [[[0; OUTCOMES]; SITES]; 3];
-        loss[1][Site::CandidateForcedIndex.index()] = [1, 0];
-        let mut removal = [[[0; OUTCOMES]; SITES]; 3];
-        removal[1][Site::CandidateForcedIndex.index()] = [0, 1];
-        assert_eq!(sites, [loss, removal]);
-        assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
-        assert!(!index.files.contains_key(&member_key));
+        let dir = crate::test_scratch::ScratchDir::new("absence-deleted-dir-on");
+        let root = fs::canonicalize(&dir).unwrap();
+        let (mut index, member, directory) = deleted_directory_index(&root);
+        let _on = super::super::terminal_off_policy::VanishedDirectoryRemovalForTest::set(true);
+        let [first, second, third] = WALKS;
+        assert_eq!(
+            deleted_directory_walk(&mut index, &root, first, &member, Some(&directory)),
+            (1, false, 1)
+        );
+        // Seen again: the earlier absence must not be reused.
+        fs::create_dir_all(member.parent().unwrap()).unwrap();
+        fs::write(
+            &member,
+            claude_line("c4444444-4444-4444-8444-444444444444", "r"),
+        )
+        .unwrap();
+        super::super::candidate_from_traversal_path(
+            SnapshotSource::ClaudeCode,
+            ScanTraversalPath {
+                scan_root: root.clone(),
+                path: member.clone(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut ScanCensus::default(),
+            None,
+            BACKFILL_WINDOW_DAYS,
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
+        );
+        fs::remove_dir_all(member.parent().unwrap().parent().unwrap()).unwrap();
+        assert_eq!(
+            deleted_directory_walk(&mut index, &root, second, &member, Some(&directory)),
+            (1, false, 0),
+            "the member's absence restarts; the directory settles"
+        );
+        assert_eq!(
+            deleted_directory_walk(&mut index, &root, third, &member, None),
+            (0, true, 0)
+        );
         assert!(snapshot(SnapshotSource::ClaudeCode).parent_missing_removals >= 1);
+        super::super::sampled_scan::set_test_now(None);
     }
 
-    /// [money] Lead B Q-B2: settling the deleted member drops only its entry.
-    /// The usage the server ACKed stays accepted, and no zero or removal body
-    /// is built for its family.
+    /// [money] Lead B rename guard: a confirmed absence whose session is also
+    /// indexed under another live path may be a move, so retiring it could
+    /// double count the copy. It stays loss and is counted, never retired.
+    #[cfg(unix)]
+    #[test]
+    fn claude_member_of_deleted_directory_with_its_session_elsewhere_stays_loss() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-deleted-dir-moved");
+        let root = fs::canonicalize(&dir).unwrap();
+        let (mut index, member, _) = deleted_directory_index(&root);
+        let moved = root
+            .join("-renamed-project")
+            .join(member.strip_prefix(&root).unwrap());
+        index.files.insert(
+            local_index_key(&moved),
+            super::super::tests::manifest_index_entry(Some("acked-member-body")),
+        );
+        let _on = super::super::terminal_off_policy::VanishedDirectoryRemovalForTest::set(true);
+        for walk in WALKS {
+            assert_eq!(
+                deleted_directory_walk(&mut index, &root, walk, &member, None),
+                (1, false, 0)
+            );
+        }
+        assert!(snapshot(SnapshotSource::ClaudeCode).vanished_retire_blocked_possible_move >= 1);
+        super::super::sampled_scan::set_test_now(None);
+    }
+
+    /// [money] Root-prefix symlink: a configured root reached through a
+    /// symlinked component may now point at another tree, so its NotFounds
+    /// are not proof of removal. The member stays loss in every walk.
+    #[cfg(unix)]
+    #[test]
+    fn claude_member_below_symlinked_root_prefix_stays_loss() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-deleted-dir-link");
+        let real = fs::canonicalize(&dir).unwrap().join("real");
+        fs::create_dir_all(real.join("projects")).unwrap();
+        std::os::unix::fs::symlink(&real, dir.join("link")).unwrap();
+        let root = fs::canonicalize(&dir)
+            .unwrap()
+            .join("link")
+            .join("projects");
+        let (mut index, member, _) = deleted_directory_index(&root);
+        let _on = super::super::terminal_off_policy::VanishedDirectoryRemovalForTest::set(true);
+        for walk in WALKS {
+            assert_eq!(
+                deleted_directory_walk(&mut index, &root, walk, &member, None),
+                (1, false, 0)
+            );
+        }
+        super::super::sampled_scan::set_test_now(None);
+    }
+
+    /// [money] Lead B Q-B2: settling the deleted member through the page
+    /// merge drops only its entry. The accepted ledger and the member's ACKed
+    /// snapshot incidence stay byte-for-byte, and no zero or removal body is
+    /// built for its family.
     #[cfg(unix)]
     #[test]
     fn claude_member_of_deleted_directory_keeps_acked_usage_accepted() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-deleted-dir-money");
+        let root = fs::canonicalize(&dir).unwrap();
+        fs::write(
+            root.join(format!("{FORCED_ROOT}.jsonl")),
+            claude_line(FORCED_ROOT, "request-root"),
+        )
+        .unwrap();
+        // A rejected symlink keeps family membership non-authoritative, so
+        // the forced enumeration reaches the indexed member in this tiny tree.
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("zz-link")).unwrap();
+        let member = root
+            .join(FORCED_ROOT)
+            .join("subagents")
+            .join("agent-a4d1585d310070d0f.jsonl");
+        let key = local_index_key(&member);
         let acked = "acked-member-body".to_string();
-        let (index, member_key, _, pages) =
-            deleted_session_directory_walks("absence-deleted-dir-money", true, |index, key| {
-                index.files.get_mut(key).unwrap().last_snapshot_fingerprint = Some(acked.clone());
-                index
-                    .file_snapshot_fingerprints
-                    .insert(key.to_string(), [acked.clone()].into());
-                index.accepted_snapshot_fingerprints.insert(acked.clone());
-            });
-        assert!(!index.files.contains_key(&member_key));
-        assert!(index.accepted_snapshot_fingerprints.contains(&acked));
+        let mut index = ScanIndex::default();
+        index.insert_retry_pending_claude_authority_for_test(FORCED_ROOT);
+        index.files.insert(
+            key.clone(),
+            super::super::tests::manifest_index_entry(Some(&acked)),
+        );
+        index
+            .file_snapshot_fingerprints
+            .insert(key.clone(), [acked.clone()].into());
+        index.accepted_snapshot_fingerprints.insert(acked.clone());
+        let ledger = |index: &ScanIndex| {
+            serde_json::to_vec(&(
+                &index.accepted_snapshot_fingerprints,
+                index.file_snapshot_fingerprints.get(&key),
+            ))
+            .unwrap()
+        };
+        let before = ledger(&index);
+        let _on = super::super::terminal_off_policy::VanishedDirectoryRemovalForTest::set(true);
+        let mut pages = Vec::new();
+        for (at, now) in WALKS {
+            super::super::sampled_scan::set_test_now(Some(now));
+            pages = claude_generation(&mut index, &root, at, 10, &[]);
+            if !index.files.contains_key(&key) {
+                break;
+            }
+        }
+        super::super::sampled_scan::set_test_now(None);
+        assert!(!index.files.contains_key(&key), "the member was retired");
         assert_eq!(
-            index.file_snapshot_fingerprints.get(&member_key),
-            Some(&[acked].into())
+            ledger(&index),
+            before,
+            "ACKed ledger and incidence unchanged"
         );
         for snapshot in pages.iter().flat_map(|page| &page.snapshots) {
             assert!(snapshot.removed_usage.is_none());
@@ -1589,8 +1802,8 @@ mod tests {
 
     #[test]
     fn fixed_storage_bounds_are_target_layout_checks_not_rss_or_capacity_claims() {
-        assert!(std::mem::size_of_val(&TOTALS) <= 432);
-        assert!(std::mem::size_of::<Totals>() <= 160);
+        assert!(std::mem::size_of_val(&TOTALS) <= 480);
+        assert!(std::mem::size_of::<Totals>() <= 176);
     }
 
     #[test]
@@ -1641,17 +1854,20 @@ mod tests {
             assert!(call.contains(counter));
             assert!(call.contains(site));
         }
-        // Process-only removals: Claude candidate and open sites, each in the
-        // parent-present branch, never an operational count.
+        // Process-only removals: the Q-B2b directory, candidate and open
+        // sites, each in a parent-present branch, never an operational count.
         let removals = calls("not_found_removal");
-        assert_eq!(removals.len(), 2);
-        for (call, site) in removals.into_iter().zip(["site", "Site::Open"]) {
+        assert_eq!(removals.len(), 3);
+        for (call, site) in removals
+            .into_iter()
+            .zip(["Site::WalkDirectory", "site", "Site::Open"])
+        {
             assert!(call.contains(site));
             assert!(!call.contains("disappeared_file_count"));
         }
         assert_eq!(
             source.matches("claude_absence_is_removal(source, ").count(),
-            2
+            3
         );
         // Only those two parent-present branches mark a key vanished. Audit
         // retirement also serves the bounded account-hold absence path; it

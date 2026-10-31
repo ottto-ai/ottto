@@ -43643,14 +43643,39 @@ fn advance_bounded_directory_traversal_with_budget(
         let Some(directory) = traversal.pending_directories.pop_front() else {
             break;
         };
+        let vanished_directories = source == SnapshotSource::ClaudeCode
+            && terminal_off_policy::vanished_directory_removal();
         let metadata = match fs::symlink_metadata(&directory.path) {
-            Ok(metadata) => metadata,
+            Ok(metadata) => {
+                if vanished_directories {
+                    index
+                        .withheld_memo
+                        .reset_vanished(&local_index_key(&directory.path));
+                }
+                metadata
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                disappearance_diagnostics::not_found(
-                    &mut traversal.counts.disappeared_file_count,
-                    source,
-                    disappearance_diagnostics::Site::WalkDirectory,
-                );
+                // Q-B2b: a queued directory gone below its live parent, in a
+                // strictly later walk too, is a removal; its files go through
+                // Q-B2a individually.
+                if vanished_directories
+                    && matches!(
+                        claude_absence_is_removal(source, &directory.path),
+                        Parent::Live
+                    )
+                    && claude_vanished_confirmed(&index.withheld_memo, &traversal, &directory.path)
+                {
+                    disappearance_diagnostics::not_found_removal(
+                        source,
+                        disappearance_diagnostics::Site::WalkDirectory,
+                    );
+                } else {
+                    disappearance_diagnostics::not_found(
+                        &mut traversal.counts.disappeared_file_count,
+                        source,
+                        disappearance_diagnostics::Site::WalkDirectory,
+                    );
+                }
                 continue;
             }
             Err(_) => {
@@ -43885,34 +43910,77 @@ fn claude_absence_is_removal(source: SnapshotSource, path: &Path) -> Parent {
 }
 
 /// Q-B2 (default OFF): a member below a deleted directory settles as a removal
-/// once a later completed walk proves the same absence beneath the same pinned
-/// ancestor of a live configured root, on its device, with no symlink. Every
-/// other case, including the first NotFound, stays loss as on main.
+/// once a strictly later walk proves the same absence beneath the same pinned
+/// ancestor of a live configured root with no symlink, on its device, >=600 s
+/// on (Q-B2a: discovery may still be pending, as on the M4). The rename guard
+/// then holds it if the session may have moved. Every other case, including
+/// the first NotFound, stays loss as on main.
 fn claude_missing_parent_is_removal(index: &ScanIndex, parent: Parent, path: &Path) -> bool {
-    if !matches!(parent, Parent::Missing) || !terminal_off_policy::vanished_directory_removal() {
+    if matches!(parent, Parent::OtherSource) || !terminal_off_policy::vanished_directory_removal() {
         return false;
     }
-    // Keep the first NotFound across an unfinished walk, as F4 does.
-    let Some(walk) = index
-        .traversal
-        .as_ref()
-        .filter(|walk| walk.pending_directories.is_empty())
-    else {
+    if !matches!(parent, Parent::Missing) {
+        // An observed or uncertain parent ends an earlier absence sequence.
+        index.withheld_memo.reset_vanished(&local_index_key(path));
+        return false;
+    }
+    let Some(walk) = index.traversal.as_ref() else {
         return false;
     };
+    if !claude_vanished_confirmed(&index.withheld_memo, walk, path) {
+        return false;
+    }
+    if claude_vanished_member_elsewhere(index, walk, path) {
+        disappearance_diagnostics::vanished_retire_blocked_possible_move(
+            SnapshotSource::ClaudeCode,
+        );
+        return false;
+    }
+    disappearance_diagnostics::parent_missing_removal(SnapshotSource::ClaudeCode);
+    true
+}
+
+/// Q-B2 later-walk confirmation for a vanished member or queued directory.
+fn claude_vanished_confirmed(
+    memo: &withheld_account::Memo,
+    walk: &ScanTraversalCheckpoint,
+    path: &Path,
+) -> bool {
     let Some(walk_window) = rfc3339_unix_seconds(&walk.census_window_end) else {
         return false;
     };
     let ancestor = sampled_audit::absence_parent_on_root_device(path, &walk.scan_roots);
-    let removal = index.withheld_memo.vanished_absence_eligible(
-        &local_index_key(path),
-        ancestor,
-        walk_window,
-    );
-    if removal {
-        disappearance_diagnostics::parent_missing_removal(SnapshotSource::ClaudeCode);
+    memo.vanished_absence_eligible(&local_index_key(path), ancestor, walk_window)
+}
+
+/// Lead B rename guard, with the #876 move owner's member identity: another
+/// indexed, observed or pending path carrying this session, or a walk whose
+/// coverage is incomplete (F4's entry-cap/unreadable refusal), is a possible
+/// move. It is held as loss, never retired.
+fn claude_vanished_member_elsewhere(
+    index: &ScanIndex,
+    walk: &ScanTraversalCheckpoint,
+    path: &Path,
+) -> bool {
+    if walk.counts.directory_entry_cap_exceeded_count != 0 || walk.counts.unreadable_path_count != 0
+    {
+        return true;
     }
-    removal
+    let Some(member) = claude_index_path_member_ref(path) else {
+        return true;
+    };
+    let elsewhere = |other: &Path| {
+        other != path && claude_index_path_member_ref(other).is_some_and(|other| other == member)
+    };
+    index.files.keys().any(|key| elsewhere(Path::new(key)))
+        || walk
+            .observed_index_keys
+            .iter()
+            .any(|key| elsewhere(Path::new(key)))
+        || walk
+            .pending_candidates
+            .iter()
+            .any(|pending| elsewhere(&pending.path))
 }
 
 /// Mutable candidate-boundary owner plus the same bounded member view used by
@@ -43972,6 +44040,14 @@ fn candidate_from_traversal_path_at(
                 census
                     .removed_index_keys
                     .insert(local_index_key(&pending.path));
+                if source == SnapshotSource::ClaudeCode
+                    && terminal_off_policy::vanished_directory_removal()
+                {
+                    discovery
+                        .index
+                        .withheld_memo
+                        .reset_vanished(&local_index_key(&pending.path));
+                }
             } else if pending.census_member {
                 let parent = claude_absence_is_removal(source, &pending.path);
                 if parent.is_removal(&pending.path)
@@ -44404,7 +44480,9 @@ impl<'a> DiscoveryRetention<'a> {
         stamp: Option<codex_fragment::Stamp>,
     ) {
         let key = local_index_key(path);
-        if self.account_holds.contains_key(&key) {
+        if self.account_holds.contains_key(&key)
+            || terminal_off_policy::vanished_directory_removal()
+        {
             // This gate already has physical presence; invalidate an earlier
             // absence even if the file disappears again before page completion.
             if let Some(memo) = self.memo {

@@ -127,6 +127,8 @@ impl Memo {
     /// Moving custody grants no release counter or acceptance credit.
     pub(super) fn rekey(&self, from: &str, to: &str) {
         self.with_state(|state| {
+            state.vanished.remove(&memo_key(from));
+            state.vanished.remove(&memo_key(to));
             if let Some(mut entry) = state.entries.remove(&memo_key(from)) {
                 entry.absence = None;
                 if let Some(current) = state.entries.get_mut(&memo_key(to)) {
@@ -142,6 +144,7 @@ impl Memo {
     }
     pub(super) fn reset_absence(&self, key: &str) {
         self.with_state(|state| {
+            state.vanished.remove(&memo_key(key));
             if let Some(entry) = state.entries.get_mut(&memo_key(key)) {
                 entry.absence = None;
             }
@@ -395,12 +398,24 @@ impl Memo {
                 return false;
             };
             let (eligible, after) = state.absence_step(before, parent, walk_window);
-            if let Some(after) = after.filter(|_| !eligible) {
-                state.vanished.insert(key, after);
+            match after {
+                Some(after) if !eligible => {
+                    state.vanished.insert(key, after);
+                }
+                None if !eligible => {
+                    disappearance_diagnostics::vanished_pin_refused(SnapshotSource::ClaudeCode)
+                }
+                _ => {}
             }
             eligible
         })
         .unwrap_or(false)
+    }
+
+    /// Q-B2: an observed member or directory, or an uncertain parent, ends
+    /// its absence sequence; a later absence starts with a fresh witness.
+    pub(super) fn reset_vanished(&self, key: &str) {
+        self.with_state(|state| state.vanished.remove(&memo_key(key)));
     }
 }
 impl State {
@@ -457,6 +472,7 @@ impl Memo {
                 Ok(state) => (state, false),
                 Err(poisoned) => (poisoned.into_inner(), true),
             };
+            state.vanished.remove(&memo_key(key));
             let entry = state.entries.remove(&memo_key(key));
             state.held_count = state.held_count.saturating_sub(1);
             state.unavailable |= poisoned;

@@ -13,6 +13,12 @@ pub(in crate::snapshots) fn marker_at(support: &Path, name: &str) -> bool {
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
 }
 
+/// A process-pinned support-dir switch behind the caller's own lock-free
+/// cell. The owner changes the marker and restarts the daemon to apply it.
+pub(in crate::snapshots) fn pinned_marker(cell: &std::sync::OnceLock<bool>, name: &str) -> bool {
+    *cell.get_or_init(|| marker_at(&ottto_core::default_support_dir(), name))
+}
+
 pub(super) fn enabled() -> bool {
     #[cfg(test)]
     {
@@ -29,18 +35,18 @@ pub(super) fn enabled() -> bool {
 }
 
 /// Q-B2 opt-in: settle Claude members of deleted directories as removals.
-/// Default OFF, pinned per process like `enabled`; the owner restarts to apply.
+/// Tests inject the policy on their own thread; no options seam reaches the
+/// candidate and walk sites.
 pub(in crate::snapshots) fn vanished_directory_removal() -> bool {
+    const NAME: &str = "claude_vanished_directory_removal_enabled";
     #[cfg(test)]
-    {
-        VANISHED_DIRECTORY.with(std::cell::Cell::get)
-    }
+    let cell = &std::sync::OnceLock::from(VANISHED_DIRECTORY.with(std::cell::Cell::get));
     #[cfg(not(test))]
-    {
-        const NAME: &str = "claude_vanished_directory_removal_enabled";
+    let cell = {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| marker_at(&ottto_core::default_support_dir(), NAME))
-    }
+        &ENABLED
+    };
+    pinned_marker(cell, NAME)
 }
 
 #[cfg(test)]

@@ -1655,8 +1655,9 @@ impl AbsenceParent {
     }
 }
 /// Q-B2: the pinned parent of the first configured root it is proven under,
-/// only when that parent is on the root's device. A mounted-over or replaced
-/// volume is unmount-like and stays loss.
+/// only when the root has no symlink in any component (its real path is
+/// itself) and that parent is on the root's device. A redirected prefix or a
+/// mounted-over or replaced volume is unmount-like and stays loss.
 pub(super) fn absence_parent_on_root_device(
     path: &Path,
     roots: &[PathBuf],
@@ -1664,6 +1665,10 @@ pub(super) fn absence_parent_on_root_device(
     #[cfg(unix)]
     {
         roots.iter().find_map(|root| {
+            let configured: PathBuf = root.components().collect();
+            if fs::canonicalize(root).ok()? != configured {
+                return None;
+            }
             let parent = absence_parent(path, std::slice::from_ref(root))?;
             let device = fs::symlink_metadata(root).ok()?.dev();
             (parent.directory.metadata().ok()?.dev() == device).then_some(parent)
