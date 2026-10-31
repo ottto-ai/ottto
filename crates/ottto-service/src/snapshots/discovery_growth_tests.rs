@@ -330,6 +330,9 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         &ClaudeTitleMetadata::default(),
         None,
     );
+    // Reopening starts at the prepared-sidecar boundary. The opened result's
+    // fingerprint already includes transcript identity and is not a sidecar.
+    let prepared_candidate = candidate.clone();
     let (candidate, mut file) = open_and_identify_scan_candidate(
         source,
         candidate,
@@ -389,20 +392,39 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     fs::set_permissions(&f.path, fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
     let (metadata_only, _) = open_and_identify_scan_candidate(
         source,
-        candidate.clone(),
+        prepared_candidate,
         &mut ScanCensus::default(),
         None,
         7,
         discovery_retention!(index),
     )
     .unwrap();
-    assert_eq!(
-        metadata_only.source_file_fingerprint,
-        candidate.source_file_fingerprint
+    let entry = &index.files[&key];
+    assert_ne!(
+        entry.size_bytes, metadata_only.size_bytes,
+        "certified prefix"
+    );
+    assert_ne!(
+        metadata_only.opened_object_identity, candidate.opened_object_identity,
+        "chmod changes the live ctime identity, which remains the TOCTOU witness"
     );
     assert_eq!(
-        index.candidate_decision(&metadata_only),
-        CandidateDecision::Skip
+        metadata_only.fingerprint_changed_nanos, entry.opened_changed_nanos,
+        "the certified-prefix extent must allow stored-ctime adoption"
+    );
+    assert!(entry.codex_fragment.as_ref().unwrap().matches(
+        entry.size_bytes,
+        metadata_only.size_bytes,
+        codex_fragment::Stamp::candidate(&metadata_only),
+    ));
+    assert_eq!(
+        metadata_only.source_file_fingerprint, candidate.source_file_fingerprint,
+        "the adopted trigger keeps known_fragment bound to the sampled fingerprint"
+    );
+    assert_eq!(
+        index.candidate_decision_with_reason(&metadata_only),
+        (CandidateDecision::Skip, None),
+        "metadata alone cannot select TranscriptChanged or another acquisition"
     );
     let metadata = fs::metadata(&f.path).unwrap();
     for _ in 0..2 {
