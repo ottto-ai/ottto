@@ -43474,30 +43474,58 @@ fn refresh_retained_codex_roster(
     }
 }
 
-/// F5: once per process, queue again the Codex files a retained generation
-/// observed but never indexed. A page dequeues and observes a file when it
-/// reads it, before the upload settles. A partial checkpoint keeps that
-/// traversal but drops the unacknowledged entry, so a restart before the final
-/// save left the file in no queue until the next generation (K7). Each one
-/// re-enters as a census member and passes the ordinary candidate gate: one
-/// counted first read. Files another record owns (queued, residue, inventory
-/// hold, state-only block, terminal disposition, decode hold), gone, or
-/// oversized are left alone.
-fn requeue_unindexed_codex_observed(index: &mut ScanIndex) {
-    let Some(traversal) = index.traversal.as_ref() else {
-        return;
-    };
+/// F5: queue `keys` again as census members of the generation that observed
+/// them. Each passes the ordinary candidate gate on a later page: one counted
+/// read. Keys not observed, already queued or outside every root are skipped.
+fn requeue_observed_codex_keys(
+    traversal: &mut ScanTraversalCheckpoint,
+    keys: Vec<String>,
+    cause: &'static str,
+) {
     let queued = traversal
         .pending_candidates
         .iter()
         .map(|candidate| local_index_key(&candidate.path))
         .collect::<BTreeSet<_>>();
+    let owed = keys
+        .into_iter()
+        .filter(|key| traversal.observed_index_keys.contains(key) && !queued.contains(key))
+        .filter_map(|key| {
+            let path = PathBuf::from(key);
+            Some(ScanTraversalPath {
+                scan_root: traversal.owning_scan_root(&path)?.clone(),
+                path,
+                census_member: true,
+                watcher_hint: false,
+            })
+        })
+        .collect::<Vec<_>>();
+    if owed.is_empty() {
+        return;
+    }
+    crate::local_resource_diagnostics::traversal_point(
+        "codex_requeue",
+        "codex",
+        &json!({"cause": cause, "requeued": owed.len()}),
+    );
+    traversal.pending_candidates.extend(owed);
+}
+
+/// F5, checkpoints an older binary wrote: once per process, queue again the
+/// Codex files a retained generation observed but never indexed. Its partial
+/// checkpoint kept the page's traversal (file dequeued and observed) without
+/// the unacknowledged entry, so the file waited for the next generation (K7).
+/// Files another record owns (residue, inventory hold, state-only block,
+/// terminal disposition, decode hold), gone, or oversized are left alone.
+fn requeue_unindexed_codex_observed(index: &mut ScanIndex) {
+    let Some(traversal) = index.traversal.as_ref() else {
+        return;
+    };
     let orphans = traversal
         .observed_index_keys
         .iter()
         .filter(|key| {
             !index.files.contains_key(*key)
-                && !queued.contains(*key)
                 && !traversal.residue.index_keys.contains(*key)
                 && !traversal
                     .residue
@@ -43507,38 +43535,17 @@ fn requeue_unindexed_codex_observed(index: &mut ScanIndex) {
                 && !index.codex_state_only_blocked_by_file.contains_key(*key)
                 && !index.terminal_jsonl_dispositions.contains_key(*key)
                 && !index.decode_holds_file(key)
-        })
-        .filter_map(|key| {
-            let path = PathBuf::from(key);
-            let scan_root = traversal.owning_scan_root(&path)?.clone();
-            fs::symlink_metadata(&path).ok().filter(|metadata| {
-                metadata.is_file()
-                    && !metadata.file_type().is_symlink()
-                    && metadata.len() <= max_jsonl_file_bytes(SnapshotSource::Codex)
-            })?;
-            Some(ScanTraversalPath {
-                scan_root,
-                path,
-                census_member: true,
-                watcher_hint: false,
-            })
+                && fs::symlink_metadata(key).is_ok_and(|metadata| {
+                    metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.len() <= max_jsonl_file_bytes(SnapshotSource::Codex)
+                })
         })
         .take(MAX_BACKFILL_FILES_PER_SOURCE)
+        .cloned()
         .collect::<Vec<_>>();
-    if orphans.is_empty() {
-        return;
-    }
-    crate::local_resource_diagnostics::traversal_point(
-        "codex_unindexed_requeue",
-        "codex",
-        &json!({"requeued": orphans.len()}),
-    );
-    index
-        .traversal
-        .as_mut()
-        .expect("traversal checked above")
-        .pending_candidates
-        .extend(orphans);
+    let traversal = index.traversal.as_mut().expect("traversal checked above");
+    requeue_observed_codex_keys(traversal, orphans, "load");
 }
 
 /// Remember the candidates an incomplete Codex header inventory held on this
@@ -50614,6 +50621,45 @@ impl ScanIndex {
         self.snapshot_activity_at
             .retain(|fingerprint, _| current.contains(fingerprint));
         self
+    }
+
+    /// F5 root: a partial checkpoint keeps this pass's traversal, in which
+    /// the page already dequeued and observed every file it read. A new Codex
+    /// file whose upload is not acknowledged gets no entry in the checkpoint,
+    /// so it stays queued instead and a later page reads it once, with or
+    /// without a restart. Locally held and decode-held files and entities keep
+    /// their holds.
+    pub(crate) fn keep_unacknowledged_codex_files_owed(
+        &mut self,
+        working: &ScanIndex,
+        locally_held: &BTreeSet<String>,
+    ) {
+        let unacknowledged = working
+            .files
+            .iter()
+            .filter(|(key, entry)| {
+                !self.files.contains_key(*key)
+                    && !working.decode_holds_file(key)
+                    && !entry
+                        .last_snapshot_fingerprint
+                        .iter()
+                        .chain(
+                            working
+                                .file_snapshot_fingerprints
+                                .get(*key)
+                                .into_iter()
+                                .flatten(),
+                        )
+                        .any(|fingerprint| {
+                            locally_held.contains(fingerprint)
+                                || working.decode_holds_entity(fingerprint)
+                        })
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if let Some(traversal) = self.traversal.as_mut() {
+            requeue_observed_codex_keys(traversal, unacknowledged, "unacknowledged");
+        }
     }
 
     pub fn committable_subset(
