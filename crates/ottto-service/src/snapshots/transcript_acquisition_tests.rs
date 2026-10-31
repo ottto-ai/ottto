@@ -5759,7 +5759,7 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
             &mut ScanCensus::default(),
             None,
             183,
-            &index.files,
+            discovery_retention!(index),
         )
         .unwrap();
         let retry_dependencies = sampled_scan::reduction_dependencies(

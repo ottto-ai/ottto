@@ -1941,7 +1941,7 @@ fn terminal_off_new_round_observes_targeted_pending_and_floor_blocked_presence()
         SnapshotSource::ClaudeCode,
         index.traversal.as_mut().unwrap(),
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     );
     for key in [&pending_key, &held_key] {
         assert!(index
