@@ -226,6 +226,13 @@ pub(crate) fn verify_durable_body(
         && (source.properties().verify)(body).is_ok()
 }
 #[cfg(all(test, unix))]
+pub(crate) fn durable_body_has_skill_labels_for_test(
+    source: SnapshotSource,
+    body: &[u8],
+) -> Result<bool, crate::durable_tail_codec::Corrupt> {
+    sampled_jsonl::durable::body_has_skill_labels(source, body)
+}
+#[cfg(all(test, unix))]
 pub(crate) fn durable_store_fixture_body_with_skill() -> Vec<u8> {
     sampled_jsonl::durable::store_skill_fixture_body()
 }

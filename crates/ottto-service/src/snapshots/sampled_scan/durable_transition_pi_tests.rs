@@ -2045,3 +2045,134 @@ fn pi_fork_pre_header_copies_reduce_double_counted_money() {
         whole_body(&cold, &route);
     }
 }
+
+// Keep head-only coverage outside the transplanted helper file; the dispatch
+// comparison owns a fixed cross-build receipt catalog (money_equivalence.py).
+/// [money] Recorded Pi 1.4.0 growth, copied fork and skill shapes survive durable restarts.
+#[test]
+#[cfg(unix)]
+fn pi_real_1_4_0_sessions_across_restarts() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("pi_real_1_4_0_sessions_across_restarts") {
+        return;
+    }
+    const VERSIONS: [&str; 4] = [
+        include_str!("../../../../../fixtures/pi-real/pi-real-1.v1.jsonl"),
+        include_str!("../../../../../fixtures/pi-real/pi-real-1.v2.jsonl"),
+        include_str!("../../../../../fixtures/pi-real/pi-real-1.v3.jsonl"),
+        include_str!("../../../../../fixtures/pi-real/pi-real-1.v4.jsonl"),
+    ];
+    const FORK: &str = include_str!("../../../../../fixtures/pi-real/pi-real-2.jsonl");
+    const SKILL: &str = include_str!("../../../../../fixtures/pi-real/pi-real-3.jsonl");
+    let totals = |items: &[SnapshotItem]| {
+        (
+            items.iter().map(|s| s.request_count).sum::<u64>(),
+            items.iter().map(|s| s.input_tokens).sum::<u64>(),
+            items.iter().map(|s| s.output_tokens).sum::<u64>(),
+        )
+    };
+    let cost = |item: &SnapshotItem| item.cost.as_ref().unwrap().total_cost_usd.clone().unwrap();
+    let source = SnapshotSource::Pi;
+    let (c, mut disk, path, scanner, prior, mut proof) =
+        pi_disk_corpus("pi_real_growth", VERSIONS[0]);
+    assert!(proof.durable, "the real shape must persist a Pi record");
+    assert_eq!(totals(&proof.bodies[0].items), (1, 488, 1));
+    assert_eq!(cost(&proof.bodies[0].items[0]), "0.0001235");
+    let mut priors = [prior.clone(), prior.clone(), prior];
+    let mut parent = Vec::new();
+    for (i, (requests, input, output, dollars)) in [
+        (2, 985, 2, "0.00024925"),
+        (4, 2351, 27, "0.00062825"),
+        (5, 2906, 29, "0.00077"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(VERSIONS[i + 1].starts_with(VERSIONS[i]));
+        std::fs::write(&path, VERSIONS[i + 1]).unwrap();
+        input_clock(&path);
+        let restart = disk.owner(source);
+        let before = durable_restores(&restart.cache, source).1;
+        assert_eq!(before, 0, "fresh process cache");
+        let ([tail, full, mut restored], scan) = pi_pages_checked(
+            &mut proof,
+            &c,
+            &scanner,
+            &restart,
+            priors,
+            (0, 1, 0),
+            (0, 1, 0),
+            before + 1,
+            None,
+        );
+        assert_eq!(durable_restores(&restart.cache, source).1, before + 1);
+        assert_eq!(totals(&scan.snapshots), (requests, input, output));
+        assert_eq!(cost(&scan.snapshots[0]), dollars);
+        priors = [
+            tail,
+            full,
+            disk.commit(&restart.cache, source, &mut restored),
+        ];
+        parent = scan.snapshots;
+    }
+
+    // Header + 12 copied entries, ending at line 13 (including both tool responses).
+    let copied = FORK.split_inclusive('\n').take(13).collect::<String>();
+    assert_eq!(copied.lines().count(), 13);
+    assert_eq!(
+        copied.lines().skip(1).collect::<Vec<_>>(),
+        VERSIONS[2].lines().skip(1).collect::<Vec<_>>()
+    );
+    let (c, mut disk, path, scanner, prior, mut proof) = pi_disk_corpus("pi_real_fork", &copied);
+    assert!(proof.durable);
+    assert_eq!(totals(&proof.bodies[0].items), (0, 0, 0));
+    assert!(proof.bodies[0].items.iter().all(|s| s.cost.is_none()));
+    std::fs::write(&path, FORK).unwrap();
+    input_clock(&path);
+    let restart = disk.owner(source);
+    let ([_, _, mut restored], scan) = pi_pages_checked(
+        &mut proof,
+        &c,
+        &scanner,
+        &restart,
+        [prior.clone(), prior.clone(), prior],
+        (0, 1, 0),
+        (0, 1, 0),
+        1,
+        None,
+    );
+    // New fork response: input=556, output=2; cost=0.000139 + 0.000003 = 0.000142.
+    assert_eq!(totals(&scan.snapshots), (1, 556, 2));
+    assert_eq!(cost(&scan.snapshots[0]), "0.000142");
+    disk.commit(&restart.cache, source, &mut restored);
+    // Distinct responses: 488+497+665+701+555+556 input; 1+1+24+1+2+2 output.
+    let aggregate_cost = [cost(&parent[0]), cost(&scan.snapshots[0])]
+        .iter()
+        .map(|s| s.parse::<f64>().unwrap())
+        .sum::<f64>();
+    parent.extend(scan.snapshots);
+    assert_eq!(totals(&parent), (6, 3462, 31));
+    assert!((aggregate_cost - 0.000912).abs() < 1e-15);
+
+    let (c, mut disk, _, _, prior, proof) = pi_disk_corpus("pi_real_skill", SKILL);
+    assert!(proof.durable);
+    use crate::durable_tail_store::{self as store, DurableSource, DurableTailStore, ReadOutcome};
+    let key = store::key_digest(DurableSource::Pi, prior.files.keys().next().unwrap());
+    let mut store =
+        DurableTailStore::new(store::store_dir_for_index(&disk.index), DurableSource::Pi);
+    let ReadOutcome::Found(record) = store.read(&key) else {
+        panic!("skill session must have a readable durable record");
+    };
+    assert_eq!(
+        crate::snapshots::durable_body_has_skill_labels_for_test(source, &record.record.body),
+        Ok(false)
+    );
+    let restart = disk.owner(source);
+    let ((_, _, mode), consumed) =
+        crate::snapshots::sampled_scan::transition_fixture::observe_consumed(|| {
+            other_page(&c, &restart, source, prior)
+        });
+    assert_eq!(mode, (0, 0, 1), "restored skill session is Unchanged");
+    assert_eq!(consumed, 0, "Unchanged consumes no transcript bytes");
+    assert_eq!(durable_restores(&restart.cache, source).1, 1);
+}
