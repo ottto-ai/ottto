@@ -2114,7 +2114,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
 }
 
 /// [regress] P1: an overdue restored checkpoint must finish through the real cursor
-/// seal, publish, replace its disk binding, then restore without rereading.
+/// seal, publish, replace its disk record, then restore without rereading.
 /// At 57ffaa32 Codex increments jobs_audit_restarted, never jobs_certified.
 /// Claude is the already-working ordinary-Tail negative regression control.
 #[cfg(unix)]
@@ -2188,6 +2188,10 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
                 }
             };
             let old_record = read_record();
+            assert_eq!(old_record.format, store::FORMAT_V3);
+            assert!(old_record.record.acquisition.is_some());
+            assert_eq!(old_record.record.certificate.sealed_offset, before);
+            assert!(old_record.wire.is_some());
             drop(first);
             for id in 1..=12 {
                 fixture
@@ -2291,9 +2295,11 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             // Codex's paged cursor still offers its record after index save.
             // Verify that boundary as well as the exact replacement below.
             if source == SnapshotSource::ClaudeCode {
+                let settled = read_record();
+                assert_eq!(settled.format, store::FORMAT_V3);
+                assert_eq!(settled.record.certificate.sealed_offset, length);
                 assert_ne!(
-                    read_record().record.binding.entry,
-                    old_record.record.binding.entry,
+                    settled.wire, old_record.wire,
                     "native Tail committed before index save",
                 );
             }
@@ -2306,10 +2312,13 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
                 usize::from(source == SnapshotSource::Codex),
             );
             let new_record = read_record();
-            assert_ne!(
-                new_record.record.binding.entry, old_record.record.binding.entry,
-                "disk binding replaced"
-            );
+            // V3 keeps binding.entry zero across acquisitions. The verified
+            // wire identity and advanced seal prove replacement on disk.
+            assert_eq!(new_record.format, store::FORMAT_V3);
+            assert!(new_record.record.acquisition.is_some());
+            assert_eq!(new_record.record.certificate.sealed_offset, length);
+            assert!(new_record.wire.is_some());
+            assert_ne!(new_record.wire, old_record.wire, "disk record replaced");
             drop(second);
             let third = Arc::new(sampled_scan::SharedCache::default());
             third.durable_begin_pass(source, &index_path, &namespace, true);

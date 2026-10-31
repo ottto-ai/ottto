@@ -185,9 +185,9 @@ fn m3_p4a_scope_formula_uses_canonical_counting_and_distinct_domain() {
     );
 }
 
-/// [format] ON drains every admitted v1 reduction into the paced rebuild path.
+/// [format] ON refuses current-pin v1 forgeries without write or restore authority.
 #[test]
-fn on_current_pin_v1_is_missing_and_cannot_be_written_or_restored() {
+fn on_current_pin_v1_is_refused_and_cannot_be_written_or_restored() {
     let _on = crate::snapshots::RestartRestoreForTest::enabled();
     let root = crate::test_scratch::ScratchDir::new("v3-only-retired");
     let lock = test_locks::hold(&root);
@@ -211,8 +211,10 @@ fn on_current_pin_v1_is_missing_and_cannot_be_written_or_restored() {
         let record_path = path(&dir, &key);
         std::fs::write(&record_path, &bytes).unwrap();
         std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(disk.missing_cause(&key), Some("repin"));
-        assert!(matches!(disk.read(&key), ReadOutcome::Missing));
+        assert_eq!(disk.missing_cause(&key), None);
+        assert_eq!(disk.read(&key), ReadOutcome::Refused(Refusal::Unknown));
+        let mut cold = store::DurableTailStore::new(dir.clone(), row.source);
+        assert_eq!(cold.read(&key), ReadOutcome::Refused(Refusal::Unknown));
         assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
     }
 }
