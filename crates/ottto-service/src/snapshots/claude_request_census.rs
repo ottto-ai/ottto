@@ -1808,6 +1808,9 @@ impl<R: std::io::Read> CensusRead<R> {
                     "reread_guard" => {
                         self.shadow_key = true;
                         self.upgrade_guard = true;
+                        if !super::restart_restore::enabled() {
+                            return Ok(b"\"_ignored_retired_reread_guard\"".to_vec());
+                        }
                         let duplicate = self.seen_upgrade;
                         self.seen_upgrade = true;
                         self.duplicate_upgrade |= duplicate;
@@ -1849,7 +1852,10 @@ impl<R: std::io::Read> CensusRead<R> {
         // Original admitted evidence was grammar-checked by the lexical
         // boundary. The syntax-only pass substitutes null without buffering
         // or interpreting census records, even before header controls run.
-        let mut overflow = self.syntax_only;
+        // OFF preserves the retired slot's constant-space drain, including
+        // positional and duplicate values, before any typed normalization.
+        let mut overflow =
+            self.syntax_only || (self.upgrade_guard && !super::restart_restore::enabled());
         while let Some(byte) = self.byte()? {
             if !quoted && depth == 0 && matches!(byte, b',' | b'}' | b']') {
                 self.replay = Some(byte);
@@ -1892,7 +1898,7 @@ impl<R: std::io::Read> CensusRead<R> {
         // Parsing is isolated from the enclosing index, including numeric
         // conversion and wrong-token errors. Only canonical, finite tokens
         // leave this reader. JSON syntax outside the optional field is intact.
-        Ok(if self.upgrade_guard {
+        Ok(if self.upgrade_guard && super::restart_restore::enabled() {
             let state = serde_json::from_slice::<super::upgrade_replay::State>(&bytes)
                 .unwrap_or_else(|_| super::upgrade_replay::State::refused());
             drop(bytes);
