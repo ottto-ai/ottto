@@ -1305,26 +1305,17 @@ fn receipted_locked(stores: &mut Stores, source: DurableSource, key: &str, recei
     let digest = store::key_digest(source, key);
     stores.release_hold(digest, HoldRelease::Write);
     stores.release_restore_pending(&digest, receipt.identity().certificate().length);
-    if source != DurableSource::ClaudeCode {
-        return;
-    }
-    let Some(slot) = stores.slots[source.slot()].as_mut() else {
-        return;
-    };
-    if let Some(custody) = stores.retail_spent.get_mut(&digest) {
-        if custody
-            .original
-            .as_ref()
-            .is_some_and(|original| slot.store.replacement_receipted(original, receipt))
-        {
-            stores.counters.migration[3] += u64::from(
-                custody
-                    .original
-                    .as_ref()
-                    .is_some_and(|original| original.is_migration()),
-            );
-            custody.original = None;
-        }
+    let replaced = stores
+        .retail_spent
+        .get(&digest)
+        .and_then(|c| c.original.as_ref())
+        .is_some_and(|original| {
+            stores.slots[source.slot()]
+                .as_ref()
+                .is_some_and(|slot| slot.store.replacement_receipted(original, receipt))
+        });
+    if replaced {
+        stores.complete_predecessor_replacement(&digest, false);
     }
     stores.release_idle_custody(&digest);
 }

@@ -765,6 +765,25 @@ impl Default for Stores {
 }
 
 impl Stores {
+    /// Called only after an exact successor receipt or verified retirement.
+    /// Native receipts precede the pass directory barrier: retain the witness
+    /// while an earlier unlink still owes that barrier.
+    fn complete_predecessor_replacement(&mut self, key: &store::Digest32, synced: bool) {
+        if let Some(debt) = self.key_debt.get_mut(key) {
+            if debt.retire_sync && !synced {
+                return;
+            }
+            debt.retire_source = None;
+            debt.retire_sync = false;
+        }
+        if let Some(custody) = self.retail_spent.get_mut(key) {
+            self.counters.migration[3] +=
+                u64::from(custody.original.as_ref().is_some_and(|p| p.is_migration()));
+            custody.original = None;
+        }
+        self.release_idle_custody(key);
+    }
+
     fn retry_offered(&mut self, offered: BTreeMap<store::Digest32, String>, index: &ScanIndex) {
         for key in offered.into_values() {
             if let Some(entry) = index.files.get(&key) {
@@ -3792,11 +3811,14 @@ impl SharedCache {
         let mut stores = self
             .durable()
             .ok_or(Failure::Resource("stores_unavailable"))?;
-        if stores
+        if let Some(debt) = stores
             .key_debt
             .get(&digest)
-            .is_some_and(|debt| debt.retire_source == Some(ds))
+            .filter(|d| d.retire_source == Some(ds))
         {
+            if debt.retire_sync {
+                return Err(Failure::Resource("rederive_retire_sync"));
+            }
             return Err(Failure::Certificate(CertificateRefusal::Changed(
                 FullReason::HeadChanged,
             )));
@@ -5636,22 +5658,19 @@ impl SharedCache {
         {
             let stores = &mut *stores;
             for digest in offered.keys() {
-                if let Some(c) = stores.retail_spent.get_mut(digest) {
-                    if c.original.as_ref().is_some_and(|p| {
+                let replaced = stores
+                    .retail_spent
+                    .get(digest)
+                    .and_then(|c| c.original.as_ref())
+                    .is_some_and(|p| {
                         stores.slots[source.slot()]
                             .as_ref()
                             .expect("slot")
                             .store
                             .replacement_committed(p, &receipt)
-                    }) {
-                        stores.counters.migration[3] +=
-                            u64::from(c.original.as_ref().is_some_and(|p| p.is_migration()));
-                        c.original = None;
-                        if let Some(debt) = stores.key_debt.get_mut(digest) {
-                            debt.retire_source = None;
-                            debt.retire_sync = false;
-                        }
-                    }
+                    });
+                if replaced {
+                    stores.complete_predecessor_replacement(digest, true);
                 }
                 stores.release_idle_custody(digest);
             }

@@ -534,3 +534,61 @@ fn claude_both_restore_floor_edges_hold_then_catch_up_without_moving_accepted_fa
         assert_eq!(modes.0, 0);
     }
 }
+
+/// [regress] Exact native replacement must not retire its good successor after RAM eviction.
+#[test]
+fn native_replacement_finishes_retirement_before_eviction_and_growth() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for failed_barrier in [false, true] {
+        let rig = ColdReplay::new(None, false, false);
+        let original = std::fs::read(&rig.path).unwrap();
+        let offset = original
+            .windows(b"PRIVATE-LABEL-M3".len())
+            .position(|s| s == b"PRIVATE-LABEL-M3")
+            .unwrap();
+        let mut file = File::options().write(true).open(&rig.path).unwrap();
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        file.write_all(b"X").unwrap();
+        rig.append();
+        let cache = Arc::new(rig.cache());
+        assert!(matches!(rig.restore(&cache), RestoreOutcome::Miss(_)));
+        let digest = full_pace_key(SnapshotSource::Codex, &rig.key());
+        assert_eq!(
+            cache.durable().unwrap().key_debt[&digest].retire_source,
+            Some(DurableSource::Codex)
+        );
+        if failed_barrier {
+            store::test_hooks::set_before_dir_sync(Some(Box::new(|_| {
+                Err(std::io::Error::other("retirement barrier"))
+            })));
+            cache.durable_write_after_save(
+                test_locks::hold(&rig.root),
+                SnapshotSource::Codex,
+                &rig.index,
+            );
+            store::test_hooks::set_before_dir_sync(None);
+            assert!(cache.durable().unwrap().key_debt[&digest].retire_sync);
+        }
+        let (next, _, fulls) = rig.scan(cache.clone(), rig.index.clone());
+        assert_eq!(fulls, 1);
+        cache.durable_write_after_save(test_locks::hold(&rig.root), SnapshotSource::Codex, &next);
+        {
+            let stores = cache.durable().unwrap();
+            assert!(stores
+                .key_debt
+                .get(&digest)
+                .is_none_or(|d| d.retire_source.is_none() && !d.retire_sync));
+            assert!(stores
+                .retail_spent
+                .get(&digest)
+                .is_none_or(|c| c.original.is_none()));
+        }
+        cache.retained().unwrap().clear();
+        rig.append();
+        let (_, _, fulls) = rig.scan(cache.clone(), next);
+        assert_eq!(fulls, 0, "good successor must restore then Tail");
+    }
+}
