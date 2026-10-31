@@ -2154,7 +2154,8 @@ fn pi_real_1_4_0_sessions_across_restarts() {
     assert_eq!(totals(&parent), (6, 3462, 31));
     assert!((aggregate_cost - 0.000912).abs() < 1e-15);
 
-    let (_, disk, _, _, prior, proof) = pi_disk_corpus("pi_real_skill", SKILL);
+    // The corpus owns the scratch store; keep it alive through the read.
+    let (_corpus, disk, _, _, prior, proof) = pi_disk_corpus("pi_real_skill", SKILL);
     assert!(proof.durable);
     use crate::durable_tail_store::{self as store, DurableSource, DurableTailStore, ReadOutcome};
     let key = store::key_digest(DurableSource::Pi, prior.files.keys().next().unwrap());
