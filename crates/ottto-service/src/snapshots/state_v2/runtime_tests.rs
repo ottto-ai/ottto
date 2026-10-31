@@ -1254,7 +1254,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
             key: &mapper::key("file.progress", path, 1).unwrap(),
             fixed: &Fixed::None,
             value_version: 1,
-            value: &codec::Bytes(&encoded),
+            value: &encoded,
         })
         .unwrap();
         assert_eq!(

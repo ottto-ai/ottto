@@ -151,7 +151,7 @@ pub(super) fn checkpoint(
         key: &row,
         fixed: &Fixed::None,
         value_version: 1,
-        value: &ControlJson(entry),
+        value: &control_json(entry).unwrap(),
     })
     .unwrap()
     .digest;

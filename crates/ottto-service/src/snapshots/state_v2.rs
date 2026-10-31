@@ -116,7 +116,6 @@ impl RecordKind {
         let known = matches!(
             name,
             "file.progress"
-                | "file.receipt"
                 | "file.terminal"
                 | "file.confirmed_empty"
                 | "file.entities"
@@ -125,7 +124,6 @@ impl RecordKind {
                 // V2-only custody has no corresponding v1 positional slot.
                 | "raw_hold.growth_retention"
                 | "account_window"
-                | "account.window_retention"
                 | "account.current"
                 | "account.absent_members"
                 | "usage.pending"
@@ -206,15 +204,17 @@ pub(super) struct Header {
     parts: u16,
 }
 
-/// Replayable streaming value: preflight and write must emit identical bytes.
+/// Stored row bytes handed to path/reference extractors; a stored row is read
+/// only if the extractor needs its value.
 pub(super) trait Value {
     fn write(&self, out: &mut dyn Write) -> Result<()>;
 }
+/// One immutable encoded row: `value` is the exact stored (codec) bytes.
 pub(super) struct RowInput<'a> {
     key: &'a RowKey,
     fixed: &'a Fixed,
     value_version: u32,
-    value: &'a dyn Value,
+    value: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -403,9 +403,9 @@ fn preflight(row: &RowInput<'_>) -> Result<Header> {
         value_version_supported(row.key, row.value_version),
         "scan_index_representation_refused"
     );
-    let stored = codec::capture(row.value, value_cap(row.key))?;
-    let len = stored.len() as u64;
-    let logical_digest = codec::stored_digest(row.key, row.value_version, &stored)?;
+    let len = row.value.len() as u64;
+    anyhow::ensure!(len <= value_cap(row.key), "state_v2_value_admission");
+    let logical_digest = codec::stored_digest(row.key, row.value_version, row.value)?;
     let parts = if matches!(row.key, RowKey::Meta(_)) || len <= INLINE_BYTES as u64 {
         0
     } else {
@@ -421,15 +421,7 @@ fn preflight(row: &RowInput<'_>) -> Result<Header> {
         parts,
     };
     header.row_checksum = if let RowKey::Meta(name) = row.key {
-        let bytes = codec::capture(row.value, CONTROL_BYTES)?;
-        let mut hash = value_digest_start(row.value_version);
-        use sha2::Digest;
-        hash.update(&bytes);
-        anyhow::ensure!(
-            bytes.len() as u64 == header.len && integrity(hash) == header.digest,
-            "state_v2_value_changed_after_preflight"
-        );
-        control_checksum(name, row.value_version, &bytes)
+        control_checksum(name, row.value_version, row.value)
     } else {
         row_checksum(&header)?
     };
@@ -497,12 +489,9 @@ fn row_checksum(h: &Header) -> Result<[u8; 16]> {
 #[cfg(test)]
 mod tests;
 
-struct ControlJson<'a, T: Serialize + ?Sized>(&'a T);
-impl<T: Serialize + ?Sized> Value for ControlJson<'_, T> {
-    fn write(&self, out: &mut dyn Write) -> Result<()> {
-        serde_json::to_writer(out, self.0)?;
-        Ok(())
-    }
+/// Controls are stored as plain serde JSON, bounded before allocation grows.
+fn control_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    codec::json(value, CONTROL_BYTES)
 }
 fn control_checksum(name: &str, version: u32, value: &[u8]) -> [u8; 16] {
     use sha2::Digest;

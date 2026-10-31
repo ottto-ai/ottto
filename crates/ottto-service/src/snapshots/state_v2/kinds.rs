@@ -189,7 +189,7 @@ pub(super) fn save_graph(
                     key: &key,
                     fixed: &Fixed::None,
                     value_version: 1,
-                    value: &ControlJson(&generation),
+                    value: &control_json(&generation)?,
                 })?;
                 pending.misc_rows.insert(key, (header, true));
                 pending.post_commit(&DurableCommitOutcome::Committed(generation), hooks)?;
