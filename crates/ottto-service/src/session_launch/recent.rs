@@ -1,4 +1,5 @@
 //! Bounded, local-only folder history. These paths never enter status uploads.
+use crate::snapshots::codex_sqlite_read::CodexSqliteRead;
 use hmac::{Hmac, Mac};
 use ottto_core::{
     generate_control_token, session_launch::launch_user, FileClaudeConfigSlotSettingsStore,
@@ -9,7 +10,7 @@ use ottto_protocol::{
     SessionLaunchRecencyPrecisionV1 as Precision, SessionLaunchRecentFolderV1 as Item,
     SessionLaunchRecentFoldersV1 as Response,
 };
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::OpenFlags;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -375,7 +376,7 @@ fn codex_folders(
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let connection = Connection::open_with_flags(
+    let connection = CodexSqliteRead::open(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
@@ -423,13 +424,17 @@ fn codex_folders(
     let rows = statement
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|_| "codex_database")?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "codex_database")
+    let rows = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "codex_database")?;
+    connection.verify().map_err(|_| "codex_database")?;
+    Ok(rows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     #[test]
     fn timed_out_folder_scan_still_answers_cli_launchable() {
         let support = std::env::temp_dir().join(format!(

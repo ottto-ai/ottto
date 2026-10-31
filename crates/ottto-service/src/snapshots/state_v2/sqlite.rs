@@ -419,12 +419,12 @@ pub(super) fn private_parent(path: &Path) -> Result<()> {
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
-fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+pub(in crate::snapshots) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
     PathBuf::from(name)
 }
-fn sqlite_uri(path: &Path) -> Result<String> {
+pub(in crate::snapshots) fn sqlite_uri(path: &Path) -> Result<String> {
     use std::os::unix::ffi::OsStrExt;
     ensure!(path.is_absolute(), "state_v2_absolute_path_required");
     let mut uri = String::from("file:");
