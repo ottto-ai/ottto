@@ -18,9 +18,9 @@ struct ClaudeProofBodyDrain {
     previous: Option<String>,
 }
 
-/// Exact-ACK and proven no-op drains settled on the working index before save
-/// selection, with each drained family's pre-drain record and pending proof.
-/// Not persisted.
+/// Exact-ACK and proven no-op drains (no-body D2/M2 drains with an empty
+/// entity set), with each drained family's pre-drain record and pending
+/// proof. Not persisted.
 #[derive(Debug, Default)]
 pub(crate) struct ClaudeProofBodyDrains {
     drains: Vec<ClaudeProofBodyDrain>,
@@ -466,7 +466,12 @@ impl ScanIndex {
             self.files
                 .get(&drain.key)
                 .is_some_and(|entry| entry.source_file_fingerprint == drain.revision)
-                && self.file_snapshot_fingerprints.get(&drain.key) == Some(&drain.fingerprints)
+                && self
+                    .file_snapshot_fingerprints
+                    .get(&drain.key)
+                    .map_or(drain.fingerprints.is_empty(), |fingerprints| {
+                        *fingerprints == drain.fingerprints
+                    })
         });
         for drain in &reverted {
             if self
@@ -601,9 +606,13 @@ impl ScanIndex {
 
     // M2 drains only local authority correction bookkeeping, never old entity
     // or manifest debt. Partial checkpoint keeps its existing prior-entity rule.
-    pub(crate) fn settle_empty_claude_proof_corrections(&mut self, result: &SourceScanResult) {
+    pub(crate) fn settle_empty_claude_proof_corrections(
+        &mut self,
+        result: &SourceScanResult,
+    ) -> ClaudeProofBodyDrains {
+        let mut drains = ClaudeProofBodyDrains::default();
         if !result.census_complete || !self.claude_authority_proof_correction_pending() {
-            return;
+            return drains;
         }
         let mut empty = Vec::new();
         for key in &self.confirmed_empty_files {
@@ -613,13 +622,14 @@ impl ScanIndex {
             let Some(record) = self.claude_usage_authority_quarantine.get(&root) else {
                 continue;
             };
-            if !record
+            let Some(proof) = record
                 .proof_correction
                 .as_ref()
-                .is_some_and(|correction| correction.owed_member_ids.contains(&member))
-            {
+                .filter(|correction| correction.owed_member_ids.contains(&member))
+                .map(|correction| correction.proof_witness_fingerprint.clone())
+            else {
                 continue;
-            }
+            };
             let Some(entry) = self.files.get(key) else {
                 continue;
             };
@@ -641,23 +651,20 @@ impl ScanIndex {
             {
                 continue;
             }
-            empty.push((root, member, entry.source_file_fingerprint.clone()));
+            empty.push(ClaudeProofBodyDrain {
+                root,
+                member,
+                key: key.clone(),
+                proof,
+                revision: entry.source_file_fingerprint.clone(),
+                fingerprints: BTreeSet::new(),
+                previous: None,
+            });
         }
-        for (root, member, revision) in empty {
-            let record = self
-                .claude_usage_authority_quarantine
-                .get_mut(&root)
-                .unwrap();
-            record
-                .member_source_file_fingerprints
-                .insert(member.clone(), revision);
-            let correction = record.proof_correction.as_mut().unwrap();
-            correction.owed_member_ids.remove(&member);
-            if correction.owed_member_ids.is_empty() {
-                self.claude_usage_authority_quarantine.remove(&root);
-                self.claude_usage_family_pending.remove(&root);
-            }
+        for drain in empty {
+            self.drain_claude_proof_member(&mut drains, drain);
         }
+        drains
     }
 
     pub(crate) fn log_claude_proof_correction_debt(&self) {
@@ -826,7 +833,8 @@ impl ScanIndex {
     pub(crate) fn settle_cutoff_claude_proof_corrections(
         &mut self,
         candidates: &[ClaudeCutoffCorrectionCandidate],
-    ) {
+    ) -> ClaudeProofBodyDrains {
+        let mut drains = ClaudeProofBodyDrains::default();
         for candidate in candidates {
             let Some(record) = self.claude_usage_authority_quarantine.get(&candidate.root) else {
                 continue;
@@ -850,22 +858,54 @@ impl ScanIndex {
             {
                 continue;
             }
-            let record = self
-                .claude_usage_authority_quarantine
-                .get_mut(&candidate.root)
-                .unwrap();
-            record
-                .member_source_file_fingerprints
-                .insert(candidate.member.clone(), candidate.revision.clone());
-            let correction = record.proof_correction.as_mut().unwrap();
-            correction.owed_member_ids.remove(&candidate.member);
-            if correction.owed_member_ids.is_empty() {
-                self.claude_usage_authority_quarantine
-                    .remove(&candidate.root);
-                self.claude_usage_family_pending.remove(&candidate.root);
-            }
+            self.drain_claude_proof_member(
+                &mut drains,
+                ClaudeProofBodyDrain {
+                    root: candidate.root.clone(),
+                    member: candidate.member.clone(),
+                    key: candidate.index_key.clone(),
+                    proof: candidate.proof.clone(),
+                    revision: candidate.revision.clone(),
+                    fingerprints: BTreeSet::new(),
+                    previous: None,
+                },
+            );
             eprintln!("local snapshot sync: claude proof correction reason=backfill_cutoff drained_members=1");
         }
+        drains
+    }
+
+    /// Drains one owed member at `drain.revision` and records the drain, with
+    /// its family's pre-drain record and pending proof, for the finish
+    /// restore. The caller checked that the current proof owes the member.
+    fn drain_claude_proof_member(
+        &mut self,
+        drains: &mut ClaudeProofBodyDrains,
+        mut drain: ClaudeProofBodyDrain,
+    ) {
+        let record = self
+            .claude_usage_authority_quarantine
+            .get_mut(&drain.root)
+            .unwrap();
+        drains
+            .families
+            .entry(drain.root.clone())
+            .or_insert_with(|| {
+                (
+                    record.clone(),
+                    self.claude_usage_family_pending.get(&drain.root).cloned(),
+                )
+            });
+        drain.previous = record
+            .member_source_file_fingerprints
+            .insert(drain.member.clone(), drain.revision.clone());
+        let correction = record.proof_correction.as_mut().unwrap();
+        correction.owed_member_ids.remove(&drain.member);
+        if correction.owed_member_ids.is_empty() {
+            self.claude_usage_authority_quarantine.remove(&drain.root);
+            self.claude_usage_family_pending.remove(&drain.root);
+        }
+        drains.drains.push(drain);
     }
 
     /// Called only at an index settlement boundary. A following save either
@@ -989,40 +1029,18 @@ impl ScanIndex {
             for item in group.iter().filter(|item| rejected(item)) {
                 eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={}", item.body_witness);
             }
-            drains
-                .families
-                .entry(candidate.root.clone())
-                .or_insert_with(|| {
-                    (
-                        record.clone(),
-                        self.claude_usage_family_pending
-                            .get(&candidate.root)
-                            .cloned(),
-                    )
-                });
-            let record = self
-                .claude_usage_authority_quarantine
-                .get_mut(&candidate.root)
-                .unwrap();
-            let previous = record
-                .member_source_file_fingerprints
-                .insert(candidate.member.clone(), candidate.revision.clone());
-            let correction = record.proof_correction.as_mut().unwrap();
-            correction.owed_member_ids.remove(&candidate.member);
-            if correction.owed_member_ids.is_empty() {
-                self.claude_usage_authority_quarantine
-                    .remove(&candidate.root);
-                self.claude_usage_family_pending.remove(&candidate.root);
-            }
-            drains.drains.push(ClaudeProofBodyDrain {
-                root: candidate.root.clone(),
-                member: candidate.member.clone(),
-                key: key.to_string(),
-                proof: candidate.proof.clone(),
-                revision: candidate.revision.clone(),
-                fingerprints,
-                previous,
-            });
+            self.drain_claude_proof_member(
+                &mut drains,
+                ClaudeProofBodyDrain {
+                    root: candidate.root.clone(),
+                    member: candidate.member.clone(),
+                    key: key.to_string(),
+                    proof: candidate.proof.clone(),
+                    revision: candidate.revision.clone(),
+                    fingerprints,
+                    previous: None,
+                },
+            );
         }
         drains
     }

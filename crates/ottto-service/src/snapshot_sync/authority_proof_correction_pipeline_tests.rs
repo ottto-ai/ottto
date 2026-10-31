@@ -4050,14 +4050,16 @@ fn r2_sidecar_only_revision_move_then_a_held_page_keeps_no_op_members_owed() {
 /// accepting generation, so every other owed member drains and each held
 /// member's account hold is committed; then turns on the production
 /// account-audit release (no retained custody), restores the owner proof of
-/// `released` and runs one generation with `upload`. Returns that
-/// generation's pages and the first one that parsed every released member.
+/// `released`, sets the backfill `cutoff` and runs one generation with
+/// `upload`. Returns that generation's pages and the first one that parsed
+/// every released member.
 fn apc_f1_hold_then_release(
     fixture: &ApcFixture,
     grant: &ApcGrant,
     held: &BTreeSet<String>,
     released: &BTreeSet<String>,
     upload: ApcUpload,
+    cutoff: Option<&'static str>,
 ) -> (Vec<ApcPage>, usize) {
     assert!(held.is_subset(&grant.owed), "{held:?} {:?}", grant.owed);
     assert!(released.is_subset(held));
@@ -4082,6 +4084,7 @@ fn apc_f1_hold_then_release(
         "each held member's account hold is committed"
     );
     fixture.audit_release.set(true);
+    fixture.cutoff.set(cutoff);
     fixture
         .withheld_owners
         .borrow_mut()
@@ -4229,7 +4232,7 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
     // needs an exact ACK.
     let held = BTreeSet::from([apc_member_session(Some(APC_AGENTS[0]))]);
     let (pages, release) =
-        apc_f1_hold_then_release(&fixture, &grant, &held, &held, ApcUpload::Accept);
+        apc_f1_hold_then_release(&fixture, &grant, &held, &held, ApcUpload::Accept, None);
     let page = &pages[release];
     let transition = ApcFixture::check(page, "release page");
     assert!(transition.granted.is_none() && !transition.failed);
@@ -4288,7 +4291,7 @@ fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_
         .chain([still_held.clone()])
         .collect::<BTreeSet<_>>();
     let (pages, release) =
-        apc_f1_hold_then_release(&fixture, &grant, &held, &released, ApcUpload::Accept);
+        apc_f1_hold_then_release(&fixture, &grant, &held, &released, ApcUpload::Accept, None);
     let page = &pages[release];
     let transition = ApcFixture::check(page, "release page");
     assert!(transition.granted.is_none() && !transition.failed);
@@ -4363,6 +4366,7 @@ fn f1_released_account_hold_audit_clear_keeps_a_permanent_refusal_drain_owed() {
         &held,
         &held,
         ApcUpload::PermanentRejection,
+        None,
     );
     let page = &pages[release];
     for member in &held {
@@ -4406,4 +4410,54 @@ fn f1_released_account_hold_audit_clear_keeps_a_permanent_refusal_drain_owed() {
             "{member}'s saved entry has its drained revision again"
         );
     }
+}
+
+/// [regress] P3-5 (review-942 delta shard), D2: the released root's requests
+/// all predate the backfill cutoff, so on its release page the post-selection
+/// D2 settle drains it with no body at its parsed revision. The account-audit
+/// release then clears that saved revision. The D2 drain joins the finish
+/// restore: the root stays owed under the same proof with its pre-drain pair
+/// beside the still held agent b, never a drained pair beside the cleared
+/// entry. At the production E2 gate (ON), on an owed pre-flip correction
+/// (`ApcFixture::pre_flip_grant`). Fails without the D2/M2 ledger capture: the
+/// restore never sees the drain, so `apc_f1_released_members_stay_owed`
+/// panics "stays owed".
+#[test]
+#[serial(source_manifests)]
+fn f1_released_account_hold_audit_clear_keeps_a_cutoff_drain_owed() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("claude-authority-proof-correction-f1-cutoff", true);
+    let grant = fixture.pre_flip_grant();
+    // The root's requests (seconds 0 and 1) predate the cutoff; agent b's
+    // (second 3) does not.
+    let released = BTreeSet::from([apc_member_session(None)]);
+    let still_held = apc_member_session(Some(APC_AGENTS[1]));
+    let held = released
+        .iter()
+        .cloned()
+        .chain([still_held.clone()])
+        .collect::<BTreeSet<_>>();
+    let (pages, release) = apc_f1_hold_then_release(
+        &fixture,
+        &grant,
+        &held,
+        &released,
+        ApcUpload::Accept,
+        Some("2026-08-02T07:00:02Z"),
+    );
+    let page = &pages[release];
+    for member in &released {
+        assert!(
+            !page.offered_bodies.contains_key(member),
+            "{member}'s rows are all cut off: no body"
+        );
+    }
+    apc_f1_released_members_stay_owed(page, &grant, &released, "cutoff beside a held member");
+    let (_, owed) = page
+        .record()
+        .and_then(|record| record.correction)
+        .expect("owed");
+    assert!(owed.contains(&still_held), "the held member stays owed");
 }
