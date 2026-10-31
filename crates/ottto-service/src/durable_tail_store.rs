@@ -734,6 +734,8 @@ pub(crate) struct DurableTailStore {
     rebuilt: BTreeMap<Digest32, Rebuild>,
     startup_synced: bool,
     gc_after: Option<Digest32>,
+    private_purge_after: Option<Digest32>,
+    private_purge_dirty: bool,
     pending: BTreeMap<Digest32, PendingWrite>,
     resource_pause: Option<stream::ResourcePause>,
     stream_dirty: Arc<AtomicU64>,
@@ -789,6 +791,8 @@ impl DurableTailStore {
             rebuilt: BTreeMap::new(),
             startup_synced: false,
             gc_after: None,
+            private_purge_after: None,
+            private_purge_dirty: false,
             pending: BTreeMap::new(),
             resource_pause: None,
             stream_dirty: Arc::default(),
@@ -2296,6 +2300,15 @@ impl DurableTailStore {
         Ok(Some(keys))
     }
 
+    /// The same page for retention planning and erase; its cursor is separate
+    /// from ordinary GC so neither owner can skip another owner's keys.
+    pub(crate) fn private_label_candidates(&self) -> io::Result<BTreeSet<Digest32>> {
+        match self.private_label_keys().unwrap_or(None) {
+            Some(keys) => Ok(keys),
+            None => self.inventory_after(self.private_purge_after),
+        }
+    }
+
     pub(crate) fn private_label_purge_needed(&self, keep: Option<&BTreeSet<Digest32>>) -> bool {
         !matches!(self.private_label_keys(), Ok(Some(keys)) if keys.iter().all(|key| keep.is_some_and(|keep| keep.contains(key))))
     }
@@ -2332,6 +2345,10 @@ impl DurableTailStore {
         writer: &W,
         key: Digest32,
     ) -> io::Result<()> {
+        // A newly staged literal invalidates a prior partial no-label sweep,
+        // including a new canonical key ordered before its old cursor.
+        self.private_purge_after = None;
+        self.private_purge_dirty = false;
         let mut keys = self.private_label_keys().unwrap_or(None);
         if let Some(keys) = keys.as_mut() {
             keys.insert(key);
@@ -2349,10 +2366,7 @@ impl DurableTailStore {
     ) -> io::Result<PrivateLabelPurge> {
         self.check_writer(writer)?;
         let known = self.private_label_keys().unwrap_or(None);
-        let keys = match known.as_ref() {
-            Some(keys) => keys.clone(),
-            None => self.inventory_after(None)?,
-        };
+        let keys = self.private_label_candidates()?;
         let mut remaining = BTreeSet::new();
         let mut report = PrivateLabelPurge {
             scanned: 0,
@@ -2406,12 +2420,23 @@ impl DurableTailStore {
             return Ok(report); // Previous inventory still says PL may exist.
         }
         report.erased = erased;
-        // The normal store is bounded to MAX_RECORDS. Unexpected oversized
-        // legacy directories stay unknown and counted, never falsely clean.
-        if (known.is_none() && keys.len() >= GC_RECORDS_PER_PASS)
-            || self
-                .write_private_label_keys(writer, Some(&remaining))
-                .is_err()
+        if known.is_none() {
+            self.private_purge_dirty |= report.refused > 0 || !remaining.is_empty();
+            if keys.len() >= GC_RECORDS_PER_PASS {
+                // Advance over retained/non-label records too; the marker stays
+                // unknown until an entire bounded traversal proves erasure.
+                self.private_purge_after = keys.last().copied();
+                return Ok(report);
+            }
+            self.private_purge_after = None;
+            if std::mem::take(&mut self.private_purge_dirty) {
+                report.refused += 1;
+                return Ok(report);
+            }
+        }
+        if self
+            .write_private_label_keys(writer, Some(&remaining))
+            .is_err()
         {
             report.refused += 1;
         }

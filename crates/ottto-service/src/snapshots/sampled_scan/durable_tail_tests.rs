@@ -12230,7 +12230,11 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
         let mut index = ScanIndex::default();
         index.save(&index_path).unwrap();
         let before_index = std::fs::read(&index_path).unwrap();
-        let key = store::key_digest(ds, "synthetic");
+        let key = if case == "unreadable" {
+            [255; 32]
+        } else {
+            store::key_digest(ds, "synthetic")
+        };
         let dir = store::store_dir_for_index(&index_path);
         let marker = dir.with_extension("private-labels");
         if case != "no-marker" {
@@ -12265,6 +12269,35 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
         if case == "unreadable" {
             std::fs::remove_file(&marker).unwrap();
             std::fs::create_dir(&marker).unwrap();
+            // The unknown-inventory fallback must advance past a full page
+            // of retained, content-free records to reach the labelled tail.
+            let empty = PendingRecord {
+                acquisition: None,
+                binding: Binding {
+                    source: ds,
+                    key: [0; 32],
+                    context: [1; 32],
+                    scope: [2; 32],
+                    entry: [3; 32],
+                },
+                certificate: certificate(&path, &scope),
+                body: codec::store_fixture_body(source, 0, 0),
+                allowlist: codec::allowlist_digest(source),
+            };
+            for n in 0..store::INVENTORY_BOUND {
+                let mut record = empty.clone();
+                record.binding.key[24..].copy_from_slice(&(n as u64).to_be_bytes());
+                let name: String = record
+                    .binding
+                    .key
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                let path = dir.join(format!("{name}.rec"));
+                std::fs::write(&path, store::tests::pinned_v1_bytes(&record, 1)).unwrap();
+                std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                    .unwrap();
+            }
         }
         if case == "failure" {
             store::test_hooks::set_before_unlink(Some(Box::new(|_| {
@@ -12274,12 +12307,22 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
         cache.durable_skill_label_permission(source, false);
         cache.durable_write_after_save(lock, source, &index);
         store::test_hooks::set_before_unlink(None);
+        if case == "unreadable" {
+            cache.durable_write_after_save(lock, source, &index);
+        }
         let counts = cache.durable_counters(source).unwrap().0;
         if case == "no-marker" {
             assert_eq!(counts.not_persisted.get("skill_label_scanned"), None);
             assert!(!dir.exists());
         } else {
-            assert_eq!(counts.not_persisted.get("skill_label_scanned"), Some(&1));
+            assert_eq!(
+                counts.not_persisted.get("skill_label_scanned"),
+                Some(&if case == "unreadable" {
+                    store::INVENTORY_BOUND as u64 + 1
+                } else {
+                    1
+                })
+            );
             if case == "failure" {
                 assert_eq!(counts.not_persisted.get("skill_label_purged"), Some(&0));
                 assert_eq!(
@@ -12298,11 +12341,15 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
                     Some(&1)
                 );
             }
-            assert!(std::fs::read_dir(&dir).unwrap().all(|entry| entry
-                .unwrap()
-                .path()
-                .extension()
-                .is_none_or(|ext| ext != "rec")));
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|ext| ext == "rec") {
+                    let bytes = std::fs::read(path).unwrap();
+                    assert!(!bytes
+                        .windows(b"syntheticpurgelabel".len())
+                        .any(|s| s == b"syntheticpurgelabel"));
+                }
+            }
             assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
         }
     }

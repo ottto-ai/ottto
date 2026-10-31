@@ -5800,11 +5800,7 @@ impl SharedCache {
                 if !slot.store.private_label_purge_needed(None) {
                     return None;
                 }
-                slot.store
-                    .private_label_keys()
-                    .ok()
-                    .flatten()
-                    .or_else(|| slot.store.inventory().ok())
+                slot.store.private_label_candidates().ok()
             });
             if let Some(possible) = possible {
                 // Retention intersects a bounded marker/inventory, never a
