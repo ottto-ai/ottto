@@ -403,7 +403,7 @@ pub(super) fn absence_coverage_complete(
     inventory.complete
         && index.legacy_unresolved_root_file_witnesses.is_empty()
         && index.traversal.as_ref().is_some_and(|traversal| {
-            !traversal.counts.has_errors()
+            !traversal.counts.has_errors(SnapshotSource::Codex)
                 && !traversal.watcher_hint_seen
                 && traversal.pending_directories.is_empty()
                 && !traversal.scan_roots.is_empty()

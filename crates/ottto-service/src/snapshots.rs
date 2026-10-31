@@ -98,7 +98,7 @@ mod scan_index_integration;
 pub(crate) mod scan_index_persistence;
 use scan_index_integration::read_scan_index_representation;
 mod idless_retry_marker;
-mod oversized_discovery;
+pub(crate) mod oversized_discovery;
 pub(crate) mod scan_index_health;
 #[cfg(test)]
 pub(crate) use tests::claude_request_account_mixed_fixture;
@@ -1364,7 +1364,7 @@ pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// or a test's scaled cap on its own thread. Memory charges keep the constant.
 fn jsonl_line_cap() -> usize {
     #[cfg(test)]
-    if let Some(cap) = TEST_LINE_CAP.with(std::cell::Cell::get) {
+    if let Some(cap) = TEST_JSONL_LIMITS.with(|limits| limits.get().map(|(line, _)| line)) {
         return cap;
     }
     MAX_JSONL_LINE_BYTES
@@ -1372,20 +1372,25 @@ fn jsonl_line_cap() -> usize {
 
 #[cfg(test)]
 thread_local! {
-    static TEST_LINE_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static TEST_JSONL_LIMITS: std::cell::Cell<Option<(usize, Option<u64>)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Scaled line cap for tests only; the production constant is never changed.
 #[cfg(test)]
 fn with_test_line_cap<T>(cap: usize, run: impl FnOnce() -> T) -> T {
-    struct Reset;
+    with_test_jsonl_limits(cap, None, run)
+}
+
+/// Scaled limits share the reader's existing thread-local fixture seam.
+#[cfg(test)]
+fn with_test_jsonl_limits<T>(line: usize, file: Option<u64>, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<(usize, Option<u64>)>);
     impl Drop for Reset {
         fn drop(&mut self) {
-            TEST_LINE_CAP.with(|line_cap| line_cap.set(None));
+            TEST_JSONL_LIMITS.with(|limits| limits.set(self.0));
         }
     }
-    TEST_LINE_CAP.with(|line_cap| line_cap.set(Some(cap)));
-    let _reset = Reset;
+    let _reset = Reset(TEST_JSONL_LIMITS.with(|limits| limits.replace(Some((line, file)))));
     run()
 }
 
@@ -2587,6 +2592,11 @@ struct ScanTraversalCounts {
     retired_reread_budget_refused: serde::de::IgnoredAny,
     #[serde(skip_serializing_if = "ownership::Counts::is_empty")]
     causes: ownership::Counts,
+    /// These size sightings came from a walk that admitted oversized files.
+    /// Old checkpoints default false, retaining their skipped-file debt until
+    /// that walk ends. OFF omits the field and preserves its legacy bytes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    oversized_pressure_only: bool,
 }
 
 /// Residue a generation disclosed as terminal after settling. Counts exclude
@@ -2611,11 +2621,12 @@ impl ScanTraversalCounts {
     /// could not enter or finish, an object it could not open or read, a root
     /// that vanished, or a line the parser rejected. These keep their retry
     /// semantics: the census stays red and the bounded retry latch re-walks.
-    fn has_retryable_problems(&self) -> bool {
+    fn has_retryable_problems(&self, source: SnapshotSource) -> bool {
         self.symlink_rejected_count > 0
             || self.directory_entry_cap_exceeded_count > 0
             || self.unreadable_path_count > 0
-            || self.oversized_file_count > 0
+            || (self.oversized_file_count > 0
+                && (!self.oversized_pressure_only || !oversized_discovery::pressure_only(source)))
             || self.disappeared_file_count > 0
             || self.malformed_json_line_count > 0
             || self.invalid_utf8_line_count > 0
@@ -2632,8 +2643,8 @@ impl ScanTraversalCounts {
             || self.dropped_usage_record_count > self.terminal_dropped_usage_record_count
     }
 
-    fn has_errors(&self) -> bool {
-        self.has_retryable_problems() || self.has_unsettled_residue()
+    fn has_errors(&self, source: SnapshotSource) -> bool {
+        self.has_retryable_problems(source) || self.has_unsettled_residue()
     }
 
     /// Promote the non-progressing residue to terminal for this generation.
@@ -2645,8 +2656,8 @@ impl ScanTraversalCounts {
     /// assignment, not an accumulation, so a retained traversal that parses
     /// further pages settles again from the counts it actually re-derived.
     /// Returns true when something was newly settled.
-    fn settle_non_progressing_residue(&mut self) -> bool {
-        if self.has_retryable_problems() || !self.has_unsettled_residue() {
+    fn settle_non_progressing_residue(&mut self, source: SnapshotSource) -> bool {
+        if self.has_retryable_problems(source) || !self.has_unsettled_residue() {
             return false;
         }
         self.terminal_ownership_incomplete_file_count = self.ownership_incomplete_file_count;
@@ -26338,7 +26349,7 @@ impl OwnedSourceScan {
             && local.directory_entry_cap_exceeded_count == 0
             && local.symlink_rejected_count == 0
             && local.unreadable_path_count == 0
-            && local.oversized_file_count == 0
+            && (local.oversized_file_count == 0 || oversized_discovery::pressure_only(self.source))
             && local.disappeared_file_count == 0
             && local.malformed_json_line_count == 0
             && local.invalid_utf8_line_count == 0
@@ -26351,7 +26362,7 @@ impl OwnedSourceScan {
                 .index
                 .traversal
                 .as_ref()
-                .is_some_and(|traversal| !traversal.counts.has_errors())
+                .is_some_and(|traversal| !traversal.counts.has_errors(self.source))
     }
 
     pub(crate) fn take_native_comparison_acquisition(
@@ -31767,7 +31778,7 @@ impl OwnedSourceScan {
                     // sweep, the terminal manifest) held behind it. Retryable problems
                     // veto the settlement inside the helper.
                     if let Some(traversal) = index.traversal.as_mut() {
-                        traversal.counts.settle_non_progressing_residue();
+                        traversal.counts.settle_non_progressing_residue(source);
                     }
                     // L-1 (§d.1.3): on a clean completed walk, release every
                     // owner B blocked for a group whose members all left the
@@ -31776,7 +31787,7 @@ impl OwnedSourceScan {
                     let clean = index
                         .traversal
                         .as_ref()
-                        .is_some_and(|traversal| !traversal.counts.has_retryable_problems());
+                        .is_some_and(|traversal| !traversal.counts.has_retryable_problems(source));
                     let inventory = codex_join_inventory
                         .as_ref()
                         .filter(|inventory| inventory.complete);
@@ -31801,7 +31812,7 @@ impl OwnedSourceScan {
                     .as_ref()
                     .cloned()
                     .expect("traversal remains active");
-                let traversal_healthy = !traversal_snapshot.counts.has_errors()
+                let traversal_healthy = !traversal_snapshot.counts.has_errors(source)
                     && (source != SnapshotSource::ClaudeCode
                         || index
                             .claude_stale_family_carry
@@ -32157,7 +32168,7 @@ impl OwnedSourceScan {
                         &pending_finalization,
                         census_complete
                             && pending_work_count == 0
-                            && !counts.has_errors()
+                            && !counts.has_errors(source)
                             && !index.bounded_sweep_had_unsettled_upload,
                     );
                 }
@@ -42537,6 +42548,16 @@ fn ensure_bounded_traversal(
     if source == SnapshotSource::ClaudeCode {
         rearm_cause::retain(index);
     }
+    if let Some(traversal) = index.traversal.as_mut() {
+        // Do not relabel OFF-era skipped files as warnings. A walk with no
+        // such loss can continue under ON without changing its context or
+        // re-arming any family. OFF restores the legacy count interpretation.
+        if !oversized_discovery::pressure_only(source) {
+            traversal.counts.oversized_pressure_only = false;
+        } else if traversal.counts.oversized_file_count == 0 {
+            traversal.counts.oversized_pressure_only = true;
+        }
+    }
     let context_fingerprint =
         scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
     let context_observation = (source == SnapshotSource::ClaudeCode).then(|| {
@@ -42606,7 +42627,7 @@ fn ensure_bounded_traversal(
             traversal.context_fingerprint == context_fingerprint
                 && traversal.pending_directories.is_empty()
                 && traversal.pending_candidates.is_empty()
-                && (traversal.counts.has_errors() || prior_admission.is_some())
+                && (traversal.counts.has_errors(source) || prior_admission.is_some())
         });
     if source == SnapshotSource::ClaudeCode
         && (window_origin_invalid || (!carry.is_empty() && !carry_origin_valid))
@@ -42701,7 +42722,7 @@ fn ensure_bounded_traversal(
                 .any(|candidate| candidate.census_member)
             && index.claude_stale_family_carry.replay.is_empty()
             && (oversized_discovery::clock_retry_required(source, traversal)
-                || (traversal.counts.has_errors()
+                || (traversal.counts.has_errors(source)
                     && (family_retry_due || unsettled_retry_required || floor_retry_due))
                 || (prior_admission.is_some()
                     && !(source == SnapshotSource::ClaudeCode && claude_terminal_off())));
@@ -43316,6 +43337,7 @@ fn ensure_bounded_traversal(
         );
     }
     let counts = ScanTraversalCounts {
+        oversized_pressure_only: oversized_discovery::pressure_only(source),
         directory_entry_cap_exceeded_count: census.directory_entry_cap_exceeded_count,
         symlink_rejected_count: census.symlink_rejected_count,
         unreadable_path_count: census.unreadable_path_count,
@@ -44046,15 +44068,17 @@ fn advance_bounded_directory_traversal_with_budget(
             traversal.observed_index_keys.insert(local_index_key(&path));
             if metadata.len() > max_jsonl_file_bytes(source) {
                 traversal.counts.oversized_file_count += 1;
-                oversized_discovery::record(
-                    source,
-                    &directory.scan_root,
-                    &path,
-                    &mut traversal.oversized_discovery,
-                );
-                line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
-                retention.note_withheld_oversized(source, &path);
-                continue;
+                if !oversized_discovery::pressure_only(source) {
+                    oversized_discovery::record(
+                        source,
+                        &directory.scan_root,
+                        &path,
+                        &mut traversal.oversized_discovery,
+                    );
+                    line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
+                    retention.note_withheld_oversized(source, &path);
+                    continue;
+                }
             }
             if walk_path == terminal_off_discovery::WalkPath::ObserveOnly
                 && !pending.contains_key(&path)
@@ -44226,15 +44250,19 @@ fn candidate_from_traversal_path_at(
             census
                 .observed_index_keys
                 .insert(local_index_key(&pending.path));
-            oversized_discovery::record(
-                source,
-                &pending.scan_root,
-                &pending.path,
-                &mut census.oversized_discovery,
-            );
-            retention.note_withheld_oversized(source, &pending.path);
+            if !oversized_discovery::pressure_only(source) {
+                oversized_discovery::record(
+                    source,
+                    &pending.scan_root,
+                    &pending.path,
+                    &mut census.oversized_discovery,
+                );
+                retention.note_withheld_oversized(source, &pending.path);
+            }
         }
-        return None;
+        if !oversized_discovery::pressure_only(source) {
+            return None;
+        }
     }
     let modified_unix_seconds = metadata
         .modified()
@@ -44511,8 +44539,15 @@ fn collect_recent_jsonl_files(
         // opened, keeping the scan's memory bounded without aborting it.
         if metadata.len() > max_jsonl_file_bytes(source) {
             census.oversized_file_count += 1;
-            oversized_discovery::record(source, scan_root, &path, &mut census.oversized_discovery);
-            continue;
+            if !oversized_discovery::pressure_only(source) {
+                oversized_discovery::record(
+                    source,
+                    scan_root,
+                    &path,
+                    &mut census.oversized_discovery,
+                );
+                continue;
+            }
         }
         selection.insert(CandidateFile {
             physical_identity: None,
@@ -44719,6 +44754,10 @@ fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
 }
 
 fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
+    #[cfg(test)]
+    if let Some(cap) = TEST_JSONL_LIMITS.with(|limits| limits.get().and_then(|(_, file)| file)) {
+        return cap;
+    }
     match source {
         SnapshotSource::Codex => MAX_CODEX_JSONL_FILE_BYTES,
         SnapshotSource::ClaudeCode => MAX_CLAUDE_JSONL_FILE_BYTES,
@@ -45266,7 +45305,8 @@ fn opened_object_identity_and_stat_retained(
             "snapshot candidate is not a regular file",
         ));
     }
-    if metadata.len() > max_jsonl_file_bytes(source) {
+    if metadata.len() > max_jsonl_file_bytes(source) && !oversized_discovery::pressure_only(source)
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "snapshot candidate exceeds source file cap",
@@ -47652,7 +47692,7 @@ impl ScanIndex {
         if self.claude_history_unverified_in_process {
             return Some(ClaudeAbsenceRetirementRefusal::UnverifiedHistory);
         }
-        if traversal.counts.has_errors()
+        if traversal.counts.has_errors(SnapshotSource::ClaudeCode)
             || !traversal.pending_directories.is_empty()
             || !traversal.pending_candidates.is_empty()
         {
@@ -48514,7 +48554,7 @@ impl ScanIndex {
                 self.traversal.as_ref().is_some_and(|t| {
                     t.pending_directories.is_empty()
                         && t.pending_candidates.is_empty()
-                        && t.counts.has_errors()
+                        && t.counts.has_errors(source)
                 }) && self.claude_stale_family_carry.replay.is_empty();
             if traversal_is_terminal_unhealthy {
                 self.traversal = None;
@@ -48662,7 +48702,11 @@ impl ScanIndex {
     /// Reuse the existing quarantine retry page after a reviewed admission
     /// increase. Legacy records have no rejection reason: re-offer current
     /// refusals, preserving accepted marks and absent/superseded disclosures.
-    pub(crate) fn prepare_snapshot_admission_reoffer(&mut self, limit: usize) -> bool {
+    pub(crate) fn prepare_snapshot_admission_reoffer(
+        &mut self,
+        source: SnapshotSource,
+        limit: usize,
+    ) -> bool {
         let current = self
             .eligible_snapshot_fingerprint_refs()
             .map(str::to_owned)
@@ -48695,7 +48739,7 @@ impl ScanIndex {
             if self.traversal.as_ref().is_some_and(|t| {
                 t.pending_directories.is_empty()
                     && t.pending_candidates.is_empty()
-                    && t.counts.has_errors()
+                    && t.counts.has_errors(source)
             }) && self.claude_stale_family_carry.replay.is_empty()
             {
                 self.traversal = None;
@@ -55312,7 +55356,7 @@ mod tests {
             suppressed.snapshots.is_empty(),
             "unchanged terminal and accepted bodies were settled"
         );
-        assert!(index.prepare_snapshot_admission_reoffer(50));
+        assert!(index.prepare_snapshot_admission_reoffer(SnapshotSource::Codex, 50));
         let path = root.join("index.json");
         index.save(&path).unwrap();
         index = ScanIndex::load(&path).unwrap();
@@ -55417,7 +55461,7 @@ mod tests {
                 .remove("item_wire_byte_limit");
         }
         index = serde_json::from_value(old).unwrap();
-        assert!(index.prepare_snapshot_admission_reoffer(50));
+        assert!(index.prepare_snapshot_admission_reoffer(SnapshotSource::Codex, 50));
         assert_eq!(
             index
                 .quarantined_snapshot_fingerprints
@@ -55429,9 +55473,9 @@ mod tests {
         assert!(index.snapshot_admission_reoffer_pending());
         let mut resumed: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
-        assert!(resumed.prepare_snapshot_admission_reoffer(50));
+        assert!(resumed.prepare_snapshot_admission_reoffer(SnapshotSource::Codex, 50));
         assert!(
-            !resumed.prepare_snapshot_admission_reoffer(50),
+            !resumed.prepare_snapshot_admission_reoffer(SnapshotSource::Codex, 50),
             "no second policy rearm"
         );
         assert_eq!(
@@ -55449,7 +55493,7 @@ mod tests {
             .quarantined_snapshot_fingerprints
             .insert(rearmed.clone(), absent_record);
         assert!(
-            !resumed.prepare_snapshot_admission_reoffer(50),
+            !resumed.prepare_snapshot_admission_reoffer(SnapshotSource::Codex, 50),
             "four failures under new admission stay terminal"
         );
     }
@@ -56891,7 +56935,7 @@ mod tests {
 
         assert_eq!(traversal.counts.directory_entry_cap_exceeded_count, 1);
         assert!(traversal.pending_candidates.is_empty());
-        assert!(traversal.counts.has_errors());
+        assert!(traversal.counts.has_errors(SnapshotSource::Codex));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -57958,8 +58002,8 @@ mod tests {
             dropped_usage_record_count: 1_105,
             ..ScanTraversalCounts::default()
         };
-        assert!(residue.has_errors());
-        assert!(!residue.has_retryable_problems());
+        assert!(residue.has_errors(SnapshotSource::Codex));
+        assert!(!residue.has_retryable_problems(SnapshotSource::Codex));
         assert!(residue.has_unsettled_residue());
 
         // Every retryable class vetoes settlement: a walk that could not
@@ -57978,16 +58022,16 @@ mod tests {
         for veto in vetoes {
             let mut red = residue.clone();
             veto(&mut red);
-            assert!(!red.settle_non_progressing_residue());
-            assert!(red.has_errors());
+            assert!(!red.settle_non_progressing_residue(SnapshotSource::Codex));
+            assert!(red.has_errors(SnapshotSource::Codex));
             assert!(red.has_unsettled_residue());
             assert_eq!(red.terminal_ownership_incomplete_file_count, 0);
             assert!(red.settled_residue().is_none());
         }
 
         let mut settled = residue.clone();
-        assert!(settled.settle_non_progressing_residue());
-        assert!(!settled.has_errors());
+        assert!(settled.settle_non_progressing_residue(SnapshotSource::Codex));
+        assert!(!settled.has_errors(SnapshotSource::Codex));
         assert_eq!(
             settled.settled_residue(),
             Some(SettledScanResidue {
@@ -57997,7 +58041,7 @@ mod tests {
             })
         );
         assert!(
-            !settled.settle_non_progressing_residue(),
+            !settled.settle_non_progressing_residue(SnapshotSource::Codex),
             "settling is idempotent within a generation"
         );
 
@@ -58014,8 +58058,8 @@ mod tests {
             zero_snapshot_usage_evidence_count: 1,
             ..ScanTraversalCounts::default()
         };
-        assert!(with_cap_loss.settle_non_progressing_residue());
-        assert!(!with_cap_loss.has_errors());
+        assert!(with_cap_loss.settle_non_progressing_residue(SnapshotSource::Codex));
+        assert!(!with_cap_loss.has_errors(SnapshotSource::Codex));
         assert_eq!(
             with_cap_loss.settled_residue(),
             Some(SettledScanResidue {
@@ -58026,7 +58070,7 @@ mod tests {
         );
 
         let clean = ScanTraversalCounts::default();
-        assert!(!clean.has_errors());
+        assert!(!clean.has_errors(SnapshotSource::Codex));
         assert!(clean.settled_residue().is_none());
     }
 
@@ -58399,7 +58443,9 @@ mod tests {
         {
             let traversal = index.traversal.as_ref().expect("red witness stays durable");
             assert_eq!(traversal.counts.terminal_ownership_incomplete_file_count, 0);
-            assert!(traversal.counts.has_retryable_problems());
+            assert!(traversal
+                .counts
+                .has_retryable_problems(SnapshotSource::Codex));
             assert_eq!(traversal.unhealthy_retry_attempt, 1);
             assert_eq!(
                 traversal.unhealthy_retry_not_before_unix_seconds,
@@ -85088,7 +85134,7 @@ crate::heap_layout_bound::fields!(ScanIndex; withheld_memo, persistence_legacy_r
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; oversized_pressure_only, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
@@ -85486,9 +85532,9 @@ mod census_unreadable_tests {
             traversal.unreadable_path_count += page.unreadable_path_count;
             traversal.unreadable_causes.merge(page.unreadable_causes);
             // Exactly the original predicate; metadata may not settle residue.
-            assert!(traversal.has_retryable_problems());
-            assert!(traversal.has_errors());
-            assert!(!traversal.settle_non_progressing_residue());
+            assert!(traversal.has_retryable_problems(SnapshotSource::Codex));
+            assert!(traversal.has_errors(SnapshotSource::Codex));
+            assert!(!traversal.settle_non_progressing_residue(SnapshotSource::Codex));
         }
         assert_eq!(traversal.unreadable_path_count, 36);
         let projected = projection(&traversal);

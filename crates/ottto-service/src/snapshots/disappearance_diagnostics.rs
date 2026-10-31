@@ -348,7 +348,7 @@ mod tests {
             let done = index.traversal.as_ref().map_or(true, |traversal| {
                 traversal.pending_directories.is_empty()
                     && traversal.pending_candidates.is_empty()
-                    && traversal.counts.has_errors()
+                    && traversal.counts.has_errors(SnapshotSource::ClaudeCode)
             });
             if done {
                 return pages;
@@ -871,7 +871,7 @@ mod tests {
             1
         );
         let traversal = index.traversal.as_ref().expect("the loss keeps it red");
-        assert!(traversal.counts.has_errors());
+        assert!(traversal.counts.has_errors(SnapshotSource::ClaudeCode));
         assert_eq!(traversal.counts.disappeared_file_count, 1);
         assert!(index
             .files

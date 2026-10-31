@@ -1,7 +1,62 @@
-//! Oversized Claude files are honest sweep-wide loss, with content-driven,
-//! cadence-bounded discovery retries and a six-hour recovery re-walk. This
-//! state never enters an upload body.
+//! Default policy retains oversized Claude discovery loss and its retries.
+//! The local admission opt-in instead keeps the count as pressure and lets
+//! the existing native reader continuations consume the file. No upload state.
 use super::*;
+
+mod policy {
+    super::super::terminal_off_policy::local_switch!(
+        "claude_pi_oversized_admission_enabled",
+        marker_enables = true,
+        test_default = false
+    );
+
+    #[cfg(test)]
+    pub(crate) fn set(enabled: bool) -> super::super::terminal_off_policy::ThreadSwitchForTest {
+        super::super::terminal_off_policy::ThreadSwitchForTest::set(&ENABLED, enabled)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// [off=main] Absent local opt-in preserves admission and retryable loss.
+        #[test]
+        fn oversized_admission_defaults_off_and_requires_a_regular_marker() {
+            use super::super::super::{ScanTraversalCounts, SnapshotSource};
+            let scratch = crate::test_scratch::ScratchDir::new("oversized-admission-policy");
+            assert!(!enabled_at(&scratch));
+            std::fs::create_dir(scratch.join("claude_pi_oversized_admission_enabled")).unwrap();
+            assert!(!enabled_at(&scratch));
+            std::fs::remove_dir(scratch.join("claude_pi_oversized_admission_enabled")).unwrap();
+            std::fs::write(scratch.join("claude_pi_oversized_admission_enabled"), b"").unwrap();
+            assert!(enabled_at(&scratch));
+            assert!(!enabled(), "test default never reads the host marker");
+            let counts = ScanTraversalCounts {
+                oversized_file_count: 1,
+                ..Default::default()
+            };
+            assert!(serde_json::to_value(&counts)
+                .unwrap()
+                .get("oversized_pressure_only")
+                .is_none());
+            for source in [
+                SnapshotSource::ClaudeCode,
+                SnapshotSource::Pi,
+                SnapshotSource::Codex,
+            ] {
+                assert!(counts.has_errors(source));
+            }
+        }
+    }
+}
+
+/// The admission ceiling remains visible as pressure; only Codex retains its veto.
+pub(crate) fn pressure_only(source: SnapshotSource) -> bool {
+    source != SnapshotSource::Codex && policy::enabled()
+}
+
+#[cfg(test)]
+pub(super) use policy::set;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct Debt {
@@ -70,7 +125,7 @@ pub(super) fn record(
     path: &Path,
     debts: &mut BTreeMap<String, Debt>,
 ) {
-    if source != SnapshotSource::ClaudeCode {
+    if source != SnapshotSource::ClaudeCode || pressure_only(source) {
         return;
     }
     // A failed witness stays untracked retryable loss; never suppress its
@@ -100,8 +155,8 @@ pub(super) fn clock_retry_required(
     source: SnapshotSource,
     traversal: &ScanTraversalCheckpoint,
 ) -> bool {
-    if source != SnapshotSource::ClaudeCode {
-        return traversal.counts.has_errors();
+    if source != SnapshotSource::ClaudeCode || pressure_only(source) {
+        return traversal.counts.has_errors(source);
     }
     let mut counts = traversal.counts.clone();
     for debt in traversal.oversized_discovery.values() {
@@ -109,7 +164,7 @@ pub(super) fn clock_retry_required(
             .oversized_file_count
             .saturating_sub(debt.observations);
     }
-    counts.has_errors()
+    counts.has_errors(source)
 }
 
 /// Full discovery is still needed for missed watcher events and blocking holds.
@@ -122,6 +177,7 @@ pub(super) fn floor_retry_due(
 ) -> bool {
     const FLOOR_SECONDS: u64 = 6 * 60 * 60;
     source == SnapshotSource::ClaudeCode
+        && !pressure_only(source)
         && !traversal.oversized_discovery.is_empty()
         && rfc3339_unix_seconds(collected_at).map_or(true, |now| {
             rfc3339_unix_seconds(&traversal.census_window_end)
@@ -130,7 +186,8 @@ pub(super) fn floor_retry_due(
 }
 
 pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_at: &str) {
-    if !traversal.pending_directories.is_empty()
+    if pressure_only(SnapshotSource::ClaudeCode)
+        || !traversal.pending_directories.is_empty()
         || !traversal.pending_candidates.is_empty()
         || traversal.oversized_discovery.is_empty()
         || clock_retry_required(SnapshotSource::ClaudeCode, traversal)

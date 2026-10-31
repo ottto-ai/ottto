@@ -195,6 +195,119 @@ fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
     assert_eq!(MAX_JSONL_LINE_BYTES, 16 * 1024 * 1024);
 }
 
+/// [regress] Oversized sightings previously skipped every byte and vetoed census health.
+/// Reuse the native big-file fixture at a scaled cap; every reader continuation
+/// stays bounded, and the final upload body includes usage past the ceiling.
+#[test]
+fn oversized_claude_and_pi_reach_native_body_without_a_health_veto() {
+    with_test_jsonl_limits(MAX_JSONL_LINE_BYTES, Some(1024), || {
+        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+            let fixture = Fixture::new();
+            let mut file = File::create(fixture.path()).unwrap();
+            if source == SnapshotSource::Pi {
+                write_row(
+                    &mut file,
+                    &json!({"type":"session","id":SESSION,"timestamp":AT}),
+                );
+            }
+            for n in 0..8 {
+                let row = if source == SnapshotSource::ClaudeCode {
+                    usage(n)
+                } else {
+                    json!({"type":"message","id":format!("message-{n}"),
+                        "message":{"role":"assistant","model":"claude-sonnet-4-6",
+                            "timestamp":AT,"usage":{"input":100,"output":10,"cacheRead":20}}})
+                };
+                write_row(&mut file, &row);
+            }
+            drop(file);
+            let length = fs::metadata(fixture.path()).unwrap().len();
+            assert!(length > max_jsonl_file_bytes(source));
+            let mut index = ScanIndex::default();
+            let skipped = fixture.scan(source, &mut index, 8);
+            assert!(skipped.snapshots.is_empty());
+            assert!(!skipped.census_complete);
+            assert!(skipped.oversized_file_count > 0);
+            let context = index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .context_fingerprint
+                .clone();
+            let _switch = oversized_discovery::set(true);
+            let retained = fixture.scan(source, &mut index, 8);
+            assert!(
+                !retained.census_complete,
+                "OFF-era skipped files remain loss for this walk"
+            );
+            assert!(retained.snapshots.is_empty());
+            assert_eq!(
+                index.traversal.as_ref().unwrap().context_fingerprint,
+                context,
+                "enabling admission never changes the traversal context"
+            );
+            let mut scan = OwnedSourceScan::new(
+                source,
+                std::slice::from_ref(&fixture.0),
+                index,
+                "2026-10-27T09:00:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            );
+            let mut partial_read = false;
+            let (mut index, mut result) = loop {
+                if let Some(active) = scan.active_file.as_ref() {
+                    let consumed = active.parser.reader.consumed_bytes();
+                    if consumed > 0 && consumed < length {
+                        partial_read = true;
+                        assert!(
+                            scan.snapshots.is_empty(),
+                            "no body before the read completes"
+                        );
+                    }
+                }
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete { index, scan, .. } => break (index, scan),
+                }
+            };
+            assert!(
+                partial_read,
+                "existing native continuation yields within the file"
+            );
+            assert!(result.oversized_file_count > 0, "pressure remains visible");
+            assert!(result.census_complete, "pressure alone cannot veto health");
+            assert_eq!(result.unreadable_path_count, 0);
+            assert_eq!(result.dropped_usage_record_count, 0);
+            apply_upload_policy(
+                source,
+                &mut result.snapshots,
+                SnapshotUploadPolicy::default(),
+            );
+            finalize_scan_after_policy(source, &mut result, &mut index);
+            let body = serde_json::to_value(&result.snapshots).unwrap();
+            assert_eq!(body.as_array().unwrap().len(), 1);
+            assert_eq!(body[0]["request_count"], 8);
+            assert_eq!(body[0]["input_tokens"], 800);
+            assert_eq!(body[0]["output_tokens"], 80);
+            assert_eq!(body[0]["cache_read_tokens"], 160);
+        }
+        // The same switch never changes Codex admission or traversal health.
+        let _switch = oversized_discovery::set(true);
+        assert!(!oversized_discovery::pressure_only(SnapshotSource::Codex));
+        assert!(ScanTraversalCounts {
+            oversized_file_count: 1,
+            ..Default::default()
+        }
+        .has_errors(SnapshotSource::Codex));
+    });
+}
+
 #[test]
 fn three_hundred_mib_admission_is_claude_only() {
     let fixture = Fixture::new();
