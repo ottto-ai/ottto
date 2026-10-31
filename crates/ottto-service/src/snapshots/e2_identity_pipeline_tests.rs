@@ -1068,6 +1068,7 @@ fn e2_pipeline_bound_a_split_logins_cap_discard_blocks_retained_a() {
     e2_bound_trace_case("cap", true, "subscription", false, false);
 }
 
+/// [money] #932: the same for a replaced trace.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_bound_a_split_logins_generation_discard_blocks_retained_a() {
@@ -1080,6 +1081,7 @@ fn e2_pipeline_external_billing_cap_discard_clears_wire_account_then_recovers() 
     e2_bound_trace_case("cap", false, "external", false, false);
 }
 
+/// [money] #932: the same for a replaced trace.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_external_billing_generation_discard_clears_wire_account_then_recovers() {
@@ -1108,6 +1110,7 @@ fn e2_pipeline_accepted_b_cap_discard_defers_upload_then_recovers() {
     e2_bound_trace_case("cap", true, "subscription", true, false);
 }
 
+/// [money] #932 x #909: the same for a replaced trace.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_accepted_b_generation_discard_defers_upload_then_recovers() {
