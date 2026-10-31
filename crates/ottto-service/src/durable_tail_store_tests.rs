@@ -4737,7 +4737,7 @@ fn exact_retirement_stat_io_error_is_retry_and_never_proven_absence() {
     assert_eq!(store.counters.records_invalidated, 1);
 }
 
-/// [format] retiring label-capable v1 never skips consent erasure, ON or OFF.
+/// [format] current-pin v1 consent erasure verifies structure, ON or OFF.
 #[test]
 fn retired_label_capable_v1_is_erased_with_failed_unlink_retry() {
     let _reset = ResetFaults;
@@ -4757,9 +4757,25 @@ fn retired_label_capable_v1_is_erased_with_failed_unlink_retry() {
         ensure_private_dir(disk.dir()).unwrap();
         let wire = pinned_v1_bytes(&old, 1);
         let target = record_file(&disk, &b.key);
+        old.body[0] = u8::MAX;
+        let malformed = pinned_v1_bytes(&old, 1);
+        put_record(&target, &malformed);
+        disk.mark_private_labels(&lock, b.key).unwrap();
+        let stamp = stamp_at(&target).unwrap();
+        let preserved = disk
+            .purge_private_labels(&lock, |_| panic!("unverified body reached label predicate"))
+            .unwrap();
+        assert_eq!(preserved.verified, 0);
+        assert_eq!(preserved.erased, 0);
+        assert_eq!(preserved.refused, 1);
+        assert_eq!(fs::read(&target).unwrap(), malformed);
+        assert_eq!(stamp_at(&target).unwrap(), stamp);
         put_record(&target, &wire);
         disk.mark_private_labels(&lock, b.key).unwrap();
-        assert!(matches!(disk.read(&b.key), ReadOutcome::Missing));
+        assert!(matches!(
+            disk.read(&b.key),
+            ReadOutcome::Refused(Refusal::Unknown)
+        ));
         test_hooks::set_before_unlink(Some(Box::new(|_| Err(io::Error::other("unlink refused")))));
         let refused = disk.purge_private_labels(&lock, |_| true).unwrap();
         test_hooks::set_before_unlink(None);

@@ -3106,7 +3106,7 @@ fn verify(bytes: &[u8], source: DurableSource) -> Result<(), Refusal> {
     if end.checked_sub(start) != Some(h.body_len) {
         return Err(bad);
     }
-    if h.format == FORMAT_V1 {
+    if retired_pin(source, h.format, &h.record.allowlist) {
         // The retired body is opaque. Its checksum proves exact replacement
         // custody only; no current decoder or restore receives these bytes.
         return Ok(());
