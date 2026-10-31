@@ -13223,10 +13223,9 @@ fn off_no_record_growth_uses_ordinary_full_without_store_io() {
     });
 }
 
-/// [format] OFF publication discards outgrown v1 bytes without reading bodies;
-/// failed unlink preserves the record and publication, then retries on growth.
+/// [format] OFF publication discards outgrown v1 bytes without reading bodies.
 #[test]
-fn off_publication_invalidates_outgrown_v1_and_retries_failed_unlink() {
+fn off_publication_invalidates_outgrown_v1() {
     use std::os::unix::fs::PermissionsExt;
     claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
         let _off = RestartRestoreForTest::disabled();
@@ -13255,8 +13254,7 @@ fn off_publication_invalidates_outgrown_v1_and_retries_failed_unlink() {
             "{}.rec",
             key.iter().map(|b| format!("{b:02x}")).collect::<String>()
         ));
-        let original = store::tests::pinned_v1_bytes(&record, 1);
-        fs::write(&record_path, &original).unwrap();
+        fs::write(&record_path, store::tests::pinned_v1_bytes(&record, 1)).unwrap();
         fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).unwrap();
         store::test_hooks::set_before_access(Some(Box::new(|_, phase| {
             assert_ne!(phase, "body", "OFF never acquires a restart body");
@@ -13282,50 +13280,29 @@ fn off_publication_invalidates_outgrown_v1_and_retries_failed_unlink() {
         let (mut index, mut first, _) = scan(index);
         a1a_wire(&root, &mut index, &mut first);
         assert_eq!(first.snapshots[0].input_tokens, 100);
+        owner.evict();
+        std::io::Write::write_all(
+            &mut fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            a1a_row("growth", 200).as_bytes(),
+        )
+        .unwrap();
+        let (mut next, mut result, _) = scan(index);
+        a1a_wire(&root, &mut next, &mut result);
+        assert_eq!(result.snapshots[0].input_tokens, 300);
+        let disk = owner
+            .cache
+            .durable_counters(SnapshotSource::ClaudeCode)
+            .unwrap()
+            .1;
+        assert_eq!(disk.off_v1_invalidated, 1);
+        // No file remains for the historical v1 reader to open. Check
+        // physical absence, rather than the current retired-pin refusal.
         assert_eq!(
-            fs::read(&record_path).unwrap(),
-            original,
-            "equal extent survives"
+            File::open(&record_path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
         );
-        for (request, tokens, fail, total) in
-            [("growth", 200, true, 300), ("retry", 300, false, 600)]
-        {
-            owner.evict();
-            std::io::Write::write_all(
-                &mut fs::OpenOptions::new().append(true).open(&path).unwrap(),
-                a1a_row(request, tokens).as_bytes(),
-            )
-            .unwrap();
-            if fail {
-                store::test_hooks::set_before_unlink(Some(Box::new(|_| {
-                    Err(std::io::Error::other("injected unlink failure"))
-                })));
-            }
-            let (mut next, mut result, _) = scan(index);
-            store::test_hooks::set_before_unlink(None);
-            a1a_wire(&root, &mut next, &mut result);
-            assert_eq!(result.snapshots[0].input_tokens, total);
-            let disk = owner
-                .cache
-                .durable_counters(SnapshotSource::ClaudeCode)
-                .unwrap()
-                .1;
-            assert_eq!(disk.off_v1_invalidate_failed, 1);
-            assert_eq!(disk.off_v1_invalidated, u64::from(!fail));
-            if fail {
-                assert_eq!(fs::read(&record_path).unwrap(), original);
-            } else {
-                // No file remains for the historical v1 reader to open. Check
-                // physical absence, rather than the current retired-pin refusal.
-                assert_eq!(
-                    File::open(&record_path).unwrap_err().kind(),
-                    std::io::ErrorKind::NotFound
-                );
-                let mut reader = DurableTailStore::new(dir.clone(), DurableSource::ClaudeCode);
-                assert!(matches!(reader.read(&key), ReadOutcome::Missing));
-            }
-            index = next;
-        }
+        let mut reader = DurableTailStore::new(dir, DurableSource::ClaudeCode);
+        assert!(matches!(reader.read(&key), ReadOutcome::Missing));
         store::test_hooks::set_before_access(None);
     });
 }

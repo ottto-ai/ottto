@@ -530,6 +530,8 @@ struct Slot {
     /// A completed OFF purge stays valid until this slot permits labels again.
     skill_label_purge_complete: bool,
     skill_label_purge_failures: u8,
+    /// Conservative diagnostic when the existing bounded key map was full.
+    off_v1_failed_age_untracked: bool,
     /// Keys held (U) by this source, and the totals the last alarm reported:
     /// [held, t14_rebuild, mode_repaired, disabled, rebuild_full,
     /// upgrade_state_missing, old_binding_no_match, retail_exhausted[3], stale_full[3]].
@@ -2305,6 +2307,18 @@ impl SharedCache {
                 }
             }
         }
+        if stores
+            .slot(source)
+            .as_ref()
+            .is_some_and(|slot| slot.dir != dir)
+        {
+            for debt in stores.key_debt.values_mut() {
+                if debt.off_v1_failed_since.is_some_and(|(s, _)| s == source) {
+                    debt.off_v1_failed_since = None;
+                }
+            }
+            stores.key_debt.retain(|_, debt| !debt.is_empty());
+        }
         let slot = stores.slot(source);
         if let Some(current) = slot.as_mut().filter(|current| current.dir == dir) {
             current.decided.clear();
@@ -2330,6 +2344,7 @@ impl SharedCache {
                 skill_labels_enabled: false,
                 skill_label_purge_complete: false,
                 skill_label_purge_failures: 0,
+                off_v1_failed_age_untracked: false,
                 held: 0,
                 old_binding_no_match: 0,
                 reported: [0; 22],
@@ -2366,19 +2381,36 @@ impl SharedCache {
         let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) else {
             return;
         };
-        let Some(slot) = stores
-            .slot(source)
-            .as_mut()
-            .filter(|slot| slot.dir.exists())
-        else {
-            return; // Preserve the no-store OFF path without acquiring a record.
+        let digest = store::key_digest(source, key);
+        let Some(slot) = stores.slot(source).as_mut() else {
+            return;
         };
-        if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
-            slot.store.invalidate_outgrown_v1(
-                writer,
-                &store::key_digest(source, key),
-                published_end,
-            );
+        let outcome = if !slot.dir.try_exists().unwrap_or(true) {
+            Ok(true) // The record's whole directory was removed.
+        } else if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
+            slot.store
+                .invalidate_outgrown_v1(writer, &digest, published_end)
+        } else {
+            return;
+        };
+        match outcome {
+            Err(_) => {
+                // The diagnostic shares the prepaid, bounded key owner; it
+                // never grants discovery/receipt custody or blocks a publish.
+                if let Some(debt) = stores.fund_debt(digest) {
+                    debt.off_v1_failed_since
+                        .get_or_insert((source, std::time::Instant::now()));
+                } else if let Some(slot) = stores.slot(source).as_mut() {
+                    slot.off_v1_failed_age_untracked = true;
+                }
+            }
+            Ok(true) => {
+                if let Some(debt) = stores.key_debt.get_mut(&digest) {
+                    debt.off_v1_failed_since = None;
+                }
+                stores.release_idle_debt(&digest);
+            }
+            Ok(false) => {} // Inconclusive or unchanged: keep the first failure.
         }
     }
 
@@ -6003,6 +6035,18 @@ impl SharedCache {
         snapshot_source: SnapshotSource,
     ) -> std::io::Result<()> {
         self.erase_private_labels(writer, snapshot_source, Some(&BTreeSet::new()));
+        if let (Some(source), Some(mut stores)) = (durable_source(snapshot_source), self.durable())
+        {
+            for debt in stores.key_debt.values_mut() {
+                if debt.off_v1_failed_since.is_some_and(|(s, _)| s == source) {
+                    debt.off_v1_failed_since = None;
+                }
+            }
+            stores.key_debt.retain(|_, debt| !debt.is_empty());
+            if let Some(slot) = stores.slot(source).as_mut() {
+                slot.off_v1_failed_age_untracked = false;
+            }
+        }
         if !restart_restore::enabled() {
             return Ok(());
         }
@@ -6073,6 +6117,10 @@ impl SharedCache {
             store: store::StoreCounters,
             #[serde(skip_serializing_if = "Option::is_none")]
             store_bytes_alarm: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            off_v1_invalidate_failed_age: Option<HoldAlarm>,
+            off_v1_invalidate_failed_alarm: bool,
+            off_v1_failed_age_untracked: bool,
             owed_overflow_discovery_only: bool,
             platform: &'static str,
             native_stage_skipped: StageSkipped,
@@ -6164,9 +6212,32 @@ impl SharedCache {
             .get("restore_unavailable.layout")
             .copied()
             .unwrap_or(0);
-        let Some(slot) = stores.slot(source).as_mut() else {
+        // Walk only already-funded diagnostic keys. No directory inventory or
+        // body acquisition; confirmed record removal clears its age marker.
+        let Stores {
+            slots, key_debt, ..
+        } = &mut *stores;
+        let Some(slot) = slots[source.slot()].as_mut() else {
             return;
         };
+        let mut failed_keys = 0;
+        let mut oldest_failure = std::time::Duration::ZERO;
+        key_debt.retain(|key, debt| {
+            let mut removed = false;
+            if let Some((_, since)) = debt.off_v1_failed_since.filter(|(s, _)| *s == source) {
+                if slot.store.record_missing(key) {
+                    debt.off_v1_failed_since = None;
+                    removed = true;
+                } else {
+                    failed_keys += 1;
+                    oldest_failure = oldest_failure.max(at.saturating_duration_since(since));
+                }
+            }
+            !removed || !debt.is_empty()
+        });
+        let off_v1_failed_age_untracked = slot.off_v1_failed_age_untracked;
+        let off_v1_invalidate_failed_alarm =
+            oldest_failure > RESTART_FULL_ALARM_WINDOW || off_v1_failed_age_untracked;
         let hold_changed = std::mem::replace(&mut slot.d3_reported, hold_keys) != hold_keys;
         let (store, disabled) = (slot.store.counters(), slot.store.disabled());
         let now = [
@@ -6208,6 +6279,12 @@ impl SharedCache {
                     store_bytes_alarm: restart_restore::enabled()
                         .then_some(store.disk_bytes > 512 * 1024 * 1024),
                     store,
+                    off_v1_invalidate_failed_age: (failed_keys > 0).then_some(HoldAlarm {
+                        keys: failed_keys,
+                        oldest_age: oldest_failure.as_secs(),
+                    }),
+                    off_v1_invalidate_failed_alarm,
+                    off_v1_failed_age_untracked,
                     owed_overflow_discovery_only,
                     platform: std::env::consts::OS,
                     native_stage_skipped: StageSkipped {

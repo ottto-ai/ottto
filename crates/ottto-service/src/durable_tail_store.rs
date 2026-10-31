@@ -2485,21 +2485,22 @@ impl DurableTailStore {
         writer: &W,
         key: &Digest32,
         published_end: u64,
-    ) {
-        let result = (|| -> io::Result<()> {
+    ) -> io::Result<bool> {
+        let result = (|| -> io::Result<bool> {
             self.check_writer(writer)?;
             if self.pending.contains_key(key) {
-                return Ok(());
+                return Ok(false);
             }
-            let Ok(Some(header)) = self.classify(key, "off_invalidate", Some(writer)) else {
-                return Ok(()); // Absent, unknown, newer or unidentifiable: untouched.
+            let header = match self.classify(key, "off_invalidate", Some(writer)) {
+                Ok(Some(header)) => header,
+                _ => return Ok(self.record_missing(key)), // Never infer removal from a refusal.
             };
             if published_end <= header.record.certificate.length {
-                return Ok(());
+                return Ok(false);
             }
             let path = self.record_path(key);
             if stamp_at(&path)? != header.stamp {
-                return Ok(()); // Never unlink a replacement of the identified header.
+                return Ok(false); // Never unlink a replacement of the identified header.
             }
             remove_if_present(&path)?;
             self.durable.remove(key);
@@ -2509,11 +2510,17 @@ impl DurableTailStore {
             self.sync_store()?;
             self.startup_synced = true;
             self.counters.off_v1_invalidated += 1;
-            Ok(())
+            Ok(true)
         })();
         if result.is_err() {
             self.counters.off_v1_invalidate_failed += 1;
         }
+        result
+    }
+
+    /// Physical absence only: a retired reduction still has a record on disk.
+    pub(crate) fn record_missing(&self, key: &Digest32) -> bool {
+        matches!(stamp_at(&self.record_path(key)), Ok(None))
     }
 
     /// Retire exactly the verified predecessor. `sync_due` belongs to writer
