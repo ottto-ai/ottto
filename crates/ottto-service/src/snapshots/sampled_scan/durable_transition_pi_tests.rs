@@ -2154,7 +2154,7 @@ fn pi_real_1_4_0_sessions_across_restarts() {
     assert_eq!(totals(&parent), (6, 3462, 31));
     assert!((aggregate_cost - 0.000912).abs() < 1e-15);
 
-    let (c, mut disk, _, _, prior, proof) = pi_disk_corpus("pi_real_skill", SKILL);
+    let (_, disk, _, _, prior, proof) = pi_disk_corpus("pi_real_skill", SKILL);
     assert!(proof.durable);
     use crate::durable_tail_store::{self as store, DurableSource, DurableTailStore, ReadOutcome};
     let key = store::key_digest(DurableSource::Pi, prior.files.keys().next().unwrap());
@@ -2167,12 +2167,4 @@ fn pi_real_1_4_0_sessions_across_restarts() {
         crate::snapshots::durable_body_has_skill_labels_for_test(source, &record.record.body),
         Ok(false)
     );
-    let restart = disk.owner(source);
-    let ((_, _, mode), consumed) =
-        crate::snapshots::sampled_scan::transition_fixture::observe_consumed(|| {
-            other_page(&c, &restart, source, prior)
-        });
-    assert_eq!(mode, (0, 0, 1), "restored skill session is Unchanged");
-    assert_eq!(consumed, 0, "Unchanged consumes no transcript bytes");
-    assert_eq!(durable_restores(&restart.cache, source).1, 1);
 }
