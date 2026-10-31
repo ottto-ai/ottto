@@ -346,7 +346,7 @@ impl OriginalProgress {
 
 impl ProgressRecovery {
     /// Runtime load already holds CheckpointLock and has authenticated the DB.
-    /// Replay before returning either a hydrated or cached graph, without
+    /// Replay before returning a hydrated graph, without
     /// recursively acquiring the checkpoint/route/session locks.
     pub(super) fn recover_route(identity: &Identity, generation: u64, path: &Path) -> Result<()> {
         let recovery = Self {

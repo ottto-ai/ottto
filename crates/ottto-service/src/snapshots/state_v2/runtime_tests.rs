@@ -527,13 +527,13 @@ fn another_graph_save_cannot_advance_a_stale_external_guard() {
     crate::snapshots::state_v2_side_effect_guard(&f.path, &first)().unwrap();
 }
 
-/// [format] route replays receipt before fresh or cached graph and missing receipt holds.
+/// [format] route replays receipt before fresh or reused connection and missing receipt holds.
 #[test]
-fn route_replays_receipt_before_fresh_or_cached_graph_and_missing_receipt_holds() {
-    for cached in [false, true] {
+fn route_replays_receipt_before_fresh_or_reused_connection_and_missing_receipt_holds() {
+    for reused in [false, true] {
         let f = Fixture::new();
         f.published();
-        if cached {
+        if reused {
             load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
         }
         let recovery =
@@ -575,6 +575,21 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         published(&f.path).unwrap()
     )
     .unwrap());
+    // The committed graph is the next page's baseline; idle releases it.
+    with_state(&f.path, |state| {
+        assert_eq!(
+            state.save_baseline.as_ref().map(|b| b.generation),
+            Some(G + 1)
+        );
+        Ok(())
+    })
+    .unwrap();
+    let _ = idle(&f.path, &index, true);
+    with_state(&f.path, |state| {
+        assert!(state.save_baseline.is_none());
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(index.generation, G + 1);
     assert_eq!(
         index.active_upload_context_fingerprint.as_deref(),
@@ -786,13 +801,7 @@ mod hydrate_parity {
         }
 
         assert_graph(&expected, &actual);
-        assert_graph(&expected, &load()); // cached graph still runs outer load steps
-        with_state(&f.path, |state| {
-            state.cached = None;
-            Ok(())
-        })
-        .unwrap();
-        assert_graph(&expected, &load()); // hydrate again on the resident connection
+        assert_graph(&expected, &load()); // hydrate again on the same connection
         assert_eq!(fs::read(&v1).unwrap(), bytes);
         assert_eq!(fs::read(&f.path).unwrap(), fence_bytes);
         assert!(!fence::sibling(&f.path, ".v1-readonly").exists());

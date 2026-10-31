@@ -61,9 +61,7 @@ fn stats() -> &'static Mutex<Stats> {
 pub(super) fn event(name: &'static str, value: &impl Serialize) {
     if name == "route" {
         if let Ok(value) = serde_json::to_value(value) {
-            PASS.with(|pass| {
-                pass.borrow_mut().active = matches!(value.as_str(), Some("v2" | "v2_cached"))
-            });
+            PASS.with(|pass| pass.borrow_mut().active = matches!(value.as_str(), Some("v2")));
         }
     }
     if let Ok(mut stats) = stats().lock() {
@@ -244,7 +242,6 @@ struct Pass {
     written_start: Option<u64>,
     decoded: Decoded,
     acquire_sampled: bool,
-    cached_sampled: bool,
     initialized: bool,
 }
 thread_local! {
@@ -264,9 +261,6 @@ pub(in super::super) fn pass_start() {
 /// Failed v2 hydration cannot carry a baseline into a later preparation.
 pub(super) fn abort_pass() {
     PASS.with(|pass| *pass.borrow_mut() = Pass::default());
-}
-pub(super) fn sample_cached_graph() -> bool {
-    PASS.with(|pass| !std::mem::replace(&mut pass.borrow_mut().cached_sampled, true))
 }
 pub(in super::super) fn phase(name: &'static str) {
     if !PASS.with(|pass| pass.borrow().active) {
