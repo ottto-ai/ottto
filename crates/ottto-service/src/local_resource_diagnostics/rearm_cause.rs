@@ -1,6 +1,6 @@
 //! Process-local clear provenance. Never serialized with an index or upload.
 //! Sync reloads indexes between pages, so skipped entry fields are insufficient.
-use crate::snapshots::{ScanIndex, ScanIndexEntry};
+use crate::snapshots::{CandidateParseReason, ScanIndex, ScanIndexEntry};
 use crate::transcript_acquisition::ReadMode;
 use serde::{ser::SerializeMap, Serialize};
 use std::collections::BTreeMap;
@@ -71,9 +71,9 @@ pub(crate) fn reproven(key: &str) {
     });
 }
 #[derive(Clone, Copy, Debug, Default, Serialize)]
-struct Total {
-    count: u64,
-    completed_native_bytes: u64,
+pub(super) struct Total {
+    pub(super) count: u64,
+    pub(super) completed_native_bytes: u64,
 }
 /// Fixed page aggregates; the underlying acquisition full_reasons stay intact.
 #[derive(Clone, Copy, Debug, Default)]
@@ -85,11 +85,16 @@ impl Counts {
             .all(|n| n.count == 0 && n.completed_native_bytes == 0)
     }
 }
-// Counts stay outside Probe/OwnedSourceScan, preserving their exact layout and
-// the heap bounds consumed by acquisition/copy admission. One fixed aggregate
-// per live page that sees a tag; Probe::drop removes it, including early exits.
-fn with_pages<T>(f: impl FnOnce(&mut BTreeMap<Instant, Counts>) -> T) -> T {
-    static PAGES: std::sync::Mutex<BTreeMap<Instant, Counts>> =
+// Both fixed aggregates share the existing page registry. Keep them outside
+// Probe/OwnedSourceScan so diagnostic growth does not alter admission layout.
+#[derive(Default)]
+struct Page {
+    causes: Counts,
+    parse_reasons: super::claude_reread::FullByParseReason,
+}
+// Probe::drop releases the page, including early exits.
+fn with_pages<T>(f: impl FnOnce(&mut BTreeMap<Instant, Page>) -> T) -> T {
+    static PAGES: std::sync::Mutex<BTreeMap<Instant, Page>> =
         std::sync::Mutex::new(BTreeMap::new());
     f(&mut PAGES.lock().unwrap_or_else(|error| error.into_inner()))
 }
@@ -97,7 +102,7 @@ pub(crate) fn selected(page: Instant, key: &str, mode: ReadMode) {
     if matches!(mode, ReadMode::Full(_)) {
         if let Some(cause) = with_tags(|tags| tags.0.get(key).copied()) {
             with_pages(|pages| {
-                let n = &mut pages.entry(page).or_default().0[cause as usize];
+                let n = &mut pages.entry(page).or_default().causes.0[cause as usize];
                 n.count = n.count.saturating_add(1);
             });
         }
@@ -107,13 +112,35 @@ pub(crate) fn completed(page: Instant, key: &str, mode: ReadMode, native_bytes: 
     let cause = with_tags(|tags| tags.0.remove(key));
     if let Some(cause) = cause.filter(|_| matches!(mode, ReadMode::Full(_))) {
         with_pages(|pages| {
-            let n = &mut pages.entry(page).or_default().0[cause as usize];
+            let n = &mut pages.entry(page).or_default().causes.0[cause as usize];
             n.completed_native_bytes = n.completed_native_bytes.saturating_add(native_bytes);
         });
     }
 }
+pub(crate) fn record_parse_reason(
+    page: Instant,
+    reason: CandidateParseReason,
+    count: u64,
+    native_bytes: u64,
+) {
+    with_pages(|pages| {
+        pages
+            .entry(page)
+            .or_default()
+            .parse_reasons
+            .record(reason, count, native_bytes)
+    });
+}
 pub(crate) fn page(page: Instant) -> Counts {
-    with_pages(|pages| pages.get(&page).copied().unwrap_or_default())
+    with_pages(|pages| pages.get(&page).map(|page| page.causes).unwrap_or_default())
+}
+pub(crate) fn full_by_parse_reason(page: Instant) -> super::claude_reread::FullByParseReason {
+    with_pages(|pages| {
+        pages
+            .get(&page)
+            .map(|page| page.parse_reasons)
+            .unwrap_or_default()
+    })
 }
 pub(crate) fn finish_page(page: Instant) {
     with_pages(|pages| {

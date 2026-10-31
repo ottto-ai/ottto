@@ -11,7 +11,7 @@ Usage:
   mac_batch.py plan     [options] <pr> <pr> [<pr>...]
   mac_batch.py dispatch [options] [--dry-run] --gate <script> <pr> <pr> [...]
   mac_batch.py report   [options] --run <run-id> [--pr <n>] [--log-file <f>]
-                        [--members <n>[=<sha>],...] [--delete-branch]
+                        [--delete-branch]
   mac_batch.py detect   [options] (<pr>... | --range <base>..<head>)
 
   plan      Fetch the PR heads, refuse PRs that are closed, from forks, not on
@@ -29,7 +29,6 @@ Usage:
             run counts as its Mac evidence (CLEARED), it must fix and re-run
             (SUSPECT, exit 4), or the run proved nothing for this head
             (NO-EVIDENCE or STALE, exit 5); exit 0 = every member CLEARED.
-            --members replays attribution on any finished run (evaluation).
   detect    Pre-queue check from the diff alone: does the PR add or change
             tests or code that only macOS exercises (cfg(target_os = "macos"),
             cfg_attr(not(target_os = "macos"), ignore), early returns on
@@ -38,7 +37,7 @@ Usage:
 
 Options: --repo <owner/name> (default ottto-ai/ottto), --remote <name>
 (default origin), --base <branch> (default main), --max-members <n>
-(default 4), --skip-linux-check, --allow-overlap.
+(default 4).
 
 Combined-run evidence: a CLEARED PR may cite the run as its branch Mac evidence
 only while its head is exactly the head recorded in the integration commit
@@ -59,6 +58,8 @@ import sys
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+import libtest_log
 
 WORKFLOW = "ci.yml"
 MAC_JOB = "Rust contracts"
@@ -418,8 +419,8 @@ def detect_change(r: Runner, ch: Change, macos_paths: Optional[Set[str]] = None)
         macos_paths = macos_only_paths(r, ch.head)
     for path in sorted(ch.files):
         name = os.path.basename(path)
-        if path == ".github/workflows/ci.yml":
-            det.findings.append(Finding("NEEDED", path, 0, "changes the workflow that runs the macOS job"))
+        if path == ".github/workflows/ci.yml" or path.startswith(".github/actions/"):
+            det.findings.append(Finding("NEEDED", path, 0, "changes the workflow (or an action it uses) that runs the macOS job"))
         elif name in ("rust-toolchain", "rust-toolchain.toml") or name in LAYOUT_CORE_FILES:
             det.findings.append(Finding("NEEDED", path, 0, "changes the heap-layout core or toolchain the macOS layout gates pin"))
         elif name == "Cargo.lock":
@@ -482,7 +483,7 @@ def gh_json(r: Runner, *args: str):
     return json.loads(r.gh(*args).stdout or "null")
 
 
-def pr_member(r: Runner, repo: str, number: int, base: str, linux_check: bool) -> Member:
+def pr_member(r: Runner, repo: str, number: int, base: str) -> Member:
     pr = gh_json(r, "pr", "view", str(number), "-R", repo, "--json",
                  "number,state,headRefOid,headRefName,baseRefName,isCrossRepository,statusCheckRollup")
     if pr["state"] != "OPEN":
@@ -497,10 +498,9 @@ def pr_member(r: Runner, repo: str, number: int, base: str, linux_check: bool) -
         name = c.get("name")
         if name in LINUX_CHECKS and linux.get(name) != "SUCCESS":
             linux[name] = (c.get("conclusion") or c.get("status") or "").upper()
-    if linux_check:
-        bad = [f"{n}={linux.get(n, 'MISSING')}" for n in LINUX_CHECKS if linux.get(n) != "SUCCESS"]
-        if bad:
-            raise Refused(f"#{number} head {head[:10]} lacks green Linux checks ({', '.join(bad)}); Linux first")
+    bad = [f"{n}={linux.get(n, 'MISSING')}" for n in LINUX_CHECKS if linux.get(n) != "SUCCESS"]
+    if bad:
+        raise Refused(f"#{number} head {head[:10]} lacks green Linux checks ({', '.join(bad)}); Linux first")
     return Member(number, head, pr["headRefName"], linux)
 
 
@@ -620,7 +620,7 @@ def build_plan(r: Runner, a: argparse.Namespace) -> Tuple[Plan, List[str]]:
     refused: List[str] = []
     for n in prs:
         try:
-            members.append(pr_member(r, a.repo, n, a.base, not a.skip_linux_check))
+            members.append(pr_member(r, a.repo, n, a.base))
         except Refused as e:
             refused.append(str(e))
     base = remote_base(r, a.remote, a.base)
@@ -628,12 +628,11 @@ def build_plan(r: Runner, a: argparse.Namespace) -> Tuple[Plan, List[str]]:
     for m in members:
         if r.git("cat-file", "-e", f"{m.head}^{{commit}}", check=False).returncode != 0:
             refused.append(f"#{m.number} head {m.head[:10]} is not fetchable (moved?); retry")
-    if not a.allow_overlap:
-        for branch, mem in live_batches(r, a.remote).items():
-            clash = sorted({n for n, _ in mem} & {m.number for m in members})
-            if clash:
-                refused.append(f"{' '.join('#%d' % n for n in clash)} already in live batch {branch}; "
-                               "report/delete it first or pass --allow-overlap")
+    for branch, mem in live_batches(r, a.remote).items():
+        clash = sorted({n for n, _ in mem} & {m.number for m in members})
+        if clash:
+            refused.append(f"{' '.join('#%d' % n for n in clash)} already in live batch {branch}; "
+                           "report/delete it first")
     if refused:
         raise Refused("refused:\n  " + "\n  ".join(refused))
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -712,10 +711,7 @@ def cmd_dispatch(r: Runner, a: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- log parsing
 
 PREFIX_RE = re.compile(r"^[^\t]*\t[^\t]*\t\d{4}-\d\d-\d\dT[\d:.]+Z ?")
-RESULT_RE = re.compile(r"\btest (\S+) \.\.\. (ok|FAILED|ignored)\b")
-PANIC_RE = re.compile(r"thread '([^']+)'(?: \(\d+\))? panicked at ([^\s:]+\.rs):(\d+)")
 RERUN_RE = re.compile(r"error: test failed, to rerun pass `([^`]+)`")
-RUNNING_RE = re.compile(r"^\s*Running (?:unittests )?(\S+) \(target/[^/]+/deps/([A-Za-z0-9_]+)-[0-9a-f]+\)")
 LOCATION_RE = re.compile(r"^\s*--> ((?:crates|src|tests)/\S+?\.rs):(\d+)")
 
 
@@ -723,7 +719,6 @@ LOCATION_RE = re.compile(r"^\s*--> ((?:crates|src|tests)/\S+?\.rs):(\d+)")
 class TestLog:
     results: Dict[str, str] = field(default_factory=dict)
     panics: Dict[str, Set[str]] = field(default_factory=dict)
-    binary_of: Dict[str, str] = field(default_factory=dict)
     failed_binaries: List[str] = field(default_factory=list)
     error_locations: Set[str] = field(default_factory=set)
 
@@ -733,21 +728,9 @@ class TestLog:
 
 
 def parse_log(text: str) -> TestLog:
-    log = TestLog()
-    binary = ""
-    for raw in text.splitlines():
-        line = PREFIX_RE.sub("", raw)
-        m = RUNNING_RE.match(line)
-        if m:
-            binary = f"{m.group(2)}:{m.group(1)}"
-        for m in RESULT_RE.finditer(line):
-            name, status = m.group(1), m.group(2)
-            if log.results.get(name) != "FAILED":
-                log.results[name] = status
-            log.binary_of.setdefault(name, binary)
-        m = PANIC_RE.search(line)
-        if m:
-            log.panics.setdefault(m.group(1), set()).add(m.group(2))
+    lines = [PREFIX_RE.sub("", raw) for raw in text.splitlines()]
+    log = TestLog(libtest_log.results(lines), libtest_log.panics(lines))
+    for line in lines:
         m = RERUN_RE.search(line)
         if m:
             log.failed_binaries.append(m.group(1))
@@ -857,20 +840,8 @@ def cmd_report(r: Runner, a: argparse.Namespace) -> int:
         return EXIT_WAIT
     fetch(r, a.remote, [run["headSha"]])
     base, trailer_members = parse_trailers(r.git("log", "-1", "--format=%B", run["headSha"]).stdout)
-    if a.members:
-        trailer_members = []
-        for item in a.members.split(","):
-            num, _, sha = item.partition("=")
-            if not sha:
-                sha = gh_json(r, "pr", "view", num, "-R", a.repo, "--json", "headRefOid")["headRefOid"]
-            trailer_members.append((int(num), sha))
-        if base is None:
-            # Replay: diff each member against the current base tip so only
-            # its own changes count (an older base would add later base commits).
-            base = remote_base(r, a.remote, a.base)
-            fetch(r, a.remote, [base])
     if base is None or not trailer_members:
-        raise Refused(f"run {a.run} ({run['headBranch']}) is not a mac-batch run; pass --members to replay")
+        raise Refused(f"run {a.run} ({run['headBranch']}) is not a mac-batch run")
     fetch(r, a.remote, [sha for _, sha in trailer_members])
     job = next((j for j in run["jobs"] if j["name"] == MAC_JOB), None)
     if job is None:
@@ -1021,8 +992,6 @@ def main(argv: Optional[Sequence[str]] = None, runner: Optional[Runner] = None) 
         common(sp)
         sp.add_argument("prs", nargs="+", type=int)
         sp.add_argument("--max-members", type=int, default=4)
-        sp.add_argument("--skip-linux-check", action="store_true")
-        sp.add_argument("--allow-overlap", action="store_true")
         if name == "dispatch":
             sp.add_argument("--dry-run", action="store_true")
             sp.add_argument("--gate")
@@ -1031,7 +1000,6 @@ def main(argv: Optional[Sequence[str]] = None, runner: Optional[Runner] = None) 
     sp.add_argument("--run", required=True, type=int)
     sp.add_argument("--pr", type=int)
     sp.add_argument("--log-file")
-    sp.add_argument("--members")
     sp.add_argument("--delete-branch", action="store_true")
     sp = sub.add_parser("detect")
     common(sp)

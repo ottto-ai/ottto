@@ -95,38 +95,21 @@ fn claim_first_observation(observed: &std::sync::atomic::AtomicBool) -> bool {
 #[path = "money_freshness_tests.rs"]
 mod tests;
 
-/// Default ON, sampled once per process like restart_restore/#899 policy.
-pub(super) fn enabled() -> bool {
-    #[cfg(not(test))]
-    {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
-    }
-    #[cfg(test)]
-    ENABLED.with(std::cell::Cell::get)
-}
-fn enabled_at(support: &std::path::Path) -> bool {
-    !std::fs::symlink_metadata(support.join("money_freshness_disabled"))
-        .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
-}
+// Default ON, sampled once per process like restart_restore/#899 policy.
+super::terminal_off_policy::local_switch!(
+    "money_freshness_disabled",
+    marker_enables = false,
+    test_default = true
+);
 #[cfg(test)]
-thread_local! {
-    static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+pub(super) struct DisabledForTest {
+    _switch: super::terminal_off_policy::ThreadSwitchForTest,
 }
-#[cfg(test)]
-pub(super) struct DisabledForTest(bool, std::marker::PhantomData<std::rc::Rc<()>>);
 #[cfg(test)]
 impl DisabledForTest {
     pub(super) fn new() -> Self {
-        Self(
-            ENABLED.with(|slot| slot.replace(false)),
-            std::marker::PhantomData,
-        )
-    }
-}
-#[cfg(test)]
-impl Drop for DisabledForTest {
-    fn drop(&mut self) {
-        ENABLED.with(|slot| slot.set(self.0));
+        Self {
+            _switch: super::terminal_off_policy::ThreadSwitchForTest::set(&ENABLED, false),
+        }
     }
 }
