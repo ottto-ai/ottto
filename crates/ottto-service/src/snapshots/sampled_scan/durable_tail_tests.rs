@@ -7647,6 +7647,154 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
     }
 }
 
+/// [regress] unknown PL inventory converges above the memo bound on every durable source.
+#[test]
+fn live_private_label_inventory_above_256_converges_without_purge_failure() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    for row in crate::snapshots::durable_sources::SOURCES {
+        let source = row.snapshot;
+        for labelled in [false, true] {
+            for unknown_marker in [false, true] {
+                let owner = fixture::NativeColdStore::with_scope(
+                    source,
+                    "pl-inventory-above-memo",
+                    Scope("pl-inventory".into()),
+                );
+                let index_path = owner.root.join("index.json");
+                let path = owner.path("synthetic");
+                native_fixture(&path);
+                let mut index = ScanIndex::default();
+                let body = if labelled {
+                    codec::store_skill_fixture_body_for_source(source)
+                } else {
+                    codec::store_fixture_body(source, 0, 0)
+                };
+                assert_eq!(codec::body_has_skill_labels(&body).unwrap(), labelled);
+                let mut pending = Vec::new();
+                let mut live = BTreeSet::new();
+                for n in 0..257 {
+                    let key = format!("live-{n}");
+                    let digest = store::key_digest(row.source, &key);
+                    live.insert(digest);
+                    index.files.insert(
+                        key,
+                        serde_json::from_value(serde_json::json!({
+                            "size_bytes":1,"modified_unix_seconds":1,
+                            "source_file_fingerprint":"fp"
+                        }))
+                        .unwrap(),
+                    );
+                    pending.push(fixture::pending(
+                        source,
+                        Binding {
+                            source: row.source,
+                            key: digest,
+                            context: store::context_digest(&owner.namespace.0, None),
+                            scope: [2; 32],
+                            entry: [3; 32],
+                        },
+                        certificate(&path, &owner.namespace),
+                        body.clone(),
+                    ));
+                }
+                index.save(&index_path).unwrap();
+                let mut disk = fixture::store(&index_path, row.source);
+                for batch in pending.chunks(store::MAX_BATCH) {
+                    assert_eq!(
+                        disk.write_after_save(owner.writer, index.generation, 0, batch.to_vec())
+                            .unwrap()
+                            .written,
+                        batch.len()
+                    );
+                }
+                // Reproduce a pre-inventory store, rather than marking literals
+                // through the current writer before arranging the missing file.
+                let marker =
+                    store::store_dir_for_index(&index_path).with_extension("private-labels");
+                assert!(!marker.exists());
+                if unknown_marker {
+                    std::fs::write(&marker, b"PL??").unwrap();
+                    std::fs::set_permissions(
+                        &marker,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                    )
+                    .unwrap();
+                }
+                let cache = fixture::cache(source, &index_path, &owner.namespace, false);
+                cache.durable_skill_label_permission(source, true);
+                cache.durable_gc(owner.writer, source, &index).unwrap();
+                let (first, _) = cache.durable_counters(source).unwrap();
+                assert_eq!(
+                    first.not_persisted.get("skill_label_purge_failed"),
+                    Some(&0)
+                );
+                assert_eq!(
+                    first.not_persisted.get("skill_label_entries_visited"),
+                    Some(&257)
+                );
+                assert!(std::fs::read(&marker).unwrap().starts_with(b"PL01"));
+                assert_eq!(
+                    disk.private_label_keys().unwrap(),
+                    Some(if labelled {
+                        live.clone()
+                    } else {
+                        BTreeSet::new()
+                    })
+                );
+                cache.durable_gc(owner.writer, source, &index).unwrap();
+                let (second, _) = cache.durable_counters(source).unwrap();
+                assert_eq!(
+                    second.not_persisted, first.not_persisted,
+                    "no second PL walk or failure"
+                );
+                assert!(live
+                    .iter()
+                    .all(|key| fixture::record_path(disk.dir(), key).exists()));
+                {
+                    let mut stores = cache.durable().unwrap();
+                    assert_eq!(
+                        stores
+                            .slot(row.source)
+                            .as_ref()
+                            .unwrap()
+                            .skill_label_purge_failures,
+                        0
+                    );
+                }
+                if labelled && !unknown_marker {
+                    // A known inventory also stays bounded after expanding
+                    // beyond one erase page. Missing keys are conservative
+                    // positives; they consume scan work but no erase credit.
+                    for n in 0..256 {
+                        disk.mark_private_labels(
+                            owner.writer,
+                            store::key_digest(row.source, &format!("missing-{n}")),
+                        )
+                        .unwrap();
+                    }
+                    let first = disk
+                        .purge_private_labels(owner.writer, |body| {
+                            codec::body_has_skill_labels(body).unwrap_or(true)
+                        })
+                        .unwrap();
+                    assert_eq!(first.scanned, store::INVENTORY_BOUND as u64);
+                    assert_eq!(first.refused, 0);
+                    assert_eq!(disk.private_label_keys().unwrap().unwrap().len(), 1);
+                    let second = disk
+                        .purge_private_labels(owner.writer, |body| {
+                            codec::body_has_skill_labels(body).unwrap_or(true)
+                        })
+                        .unwrap();
+                    assert_eq!(second.scanned, 1);
+                    assert_eq!(second.refused, 0);
+                    assert_eq!(first.erased + second.erased, 257);
+                    assert_eq!(disk.private_label_keys().unwrap(), Some(BTreeSet::new()));
+                }
+            }
+        }
+    }
+}
+
 /// [format] quiet restore has no sample or content input before decode on all sources.
 #[test]
 fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
