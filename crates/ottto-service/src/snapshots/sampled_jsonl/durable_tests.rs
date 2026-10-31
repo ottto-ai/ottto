@@ -1400,6 +1400,60 @@ fn h_fields_are_audited() {
     assert_eq!(paths, audited);
 }
 
+/// Full-fallback classes on a synthetic corpus, by the refusing field: a
+/// skill reference (E) and a first prompt past the 1 MiB head bound (not
+/// re-derivable) each read Full; plain sessions persist.
+#[test]
+fn fallback_classes_over_the_synthetic_corpus() {
+    let mut skill = claude_lines(1, 1);
+    skill.push(
+        json!({"type":"assistant","sessionId":CLAUDE_SESSION,"uuid":"u-9","parentUuid":"u-3",
+            "timestamp":"2026-10-20T10:00:09Z","requestId":"req_skill",
+            "message":{"id":"msg_skill","type":"message","role":"assistant",
+                "model":"claude-opus-4-1","stop_reason":"tool_use",
+                "content":[{"type":"tool_use","id":"toolu_skill","name":"Bash",
+                    "input":{"command":"cat ~/.claude/skills/pdf/SKILL.md"}}],
+                "usage":{"input_tokens":1,"cache_creation_input_tokens":0,
+                    "cache_read_input_tokens":0,"output_tokens":1}}})
+        .to_string(),
+    );
+    let mut deep = claude_filler(0, 1100, 1024);
+    deep.extend(claude_lines(0, 0));
+    let corpus = [
+        (SnapshotSource::ClaudeCode, claude_lines(1, 1)),
+        (SnapshotSource::Codex, codex_lines()),
+        (SnapshotSource::ClaudeCode, skill),
+        (SnapshotSource::ClaudeCode, deep),
+    ];
+    let mut tally = BTreeMap::<&'static str, usize>::new();
+    for (source, lines) in corpus {
+        let scratch = Scratch::new("corpus");
+        let path = scratch.write("t.jsonl", &lines);
+        let (reduction, _) = full_read(&path, source);
+        let class = match encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        ) {
+            Ok(_) => "persisted",
+            Err(
+                Refuse::NonEmpty(field) | Refuse::NotRederivable(field) | Refuse::NotDigest(field),
+            ) => field,
+            Err(Refuse::TooLarge) => "record_bytes",
+            Err(Refuse::UnknownLabel) => "static_label",
+        };
+        *tally.entry(class).or_default() += 1;
+    }
+    assert_eq!(
+        tally,
+        BTreeMap::from([
+            ("persisted", 2),
+            ("SnapshotAccumulator.activity_skills", 1),
+            ("SnapshotAccumulator.first_prompt_material", 1),
+        ])
+    );
+}
+
 /// Budget receipt (static): the bounds every restore and write is held to.
 #[test]
 fn budget_bounds_hold() {
@@ -1597,6 +1651,23 @@ fn structural_verifier_nonempty_selector_capture() {
             .and_then(|()| d.finish())
             .is_err());
     }
+}
+
+#[test]
+fn structural_verifier_large_body_still_allocates_nothing() {
+    let scratch = Scratch::new("large-structural-verifier");
+    let path = scratch.write("large.jsonl", &codex_lines());
+    let (mut reduction, _) = full_read(&path, SnapshotSource::Codex);
+    // Uploaded model/tool strings are stored U fields, so make the body large
+    // without increasing transcript acquisition or test-probe bookkeeping.
+    reduction.accumulator.latest_model = Some("m".repeat(256 * 1024));
+    let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
+    assert!(body.len() > 256 * 1024);
+    assert_eq!(verified_without_allocation(&body), Ok(()));
+    assert_eq!(
+        verified_without_allocation(&body[..body.len() - 1]),
+        Err(Corrupt)
+    );
 }
 
 #[test]

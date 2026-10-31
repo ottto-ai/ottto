@@ -956,6 +956,126 @@ fn candidates(index: &ScanIndex) -> Vec<PathBuf> {
     paths
 }
 
+/// Gate 1 (the bounded walk): age and size skips are counted after the
+/// existing decisions; the rescued old file and the young file are selected
+/// exactly as before, and counter state is no gate input.
+#[test]
+fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
+    let root = Root::new("ld-walk-gate");
+    let project = root.projects().join("p");
+    fs::create_dir_all(&project).unwrap();
+    let file = |name: &str| project.join(format!("{name}.jsonl"));
+    for name in ["young", "old", "rescued"] {
+        append(&file(name), b"{}\n");
+    }
+    set_old(&file("old"));
+    set_old(&file("rescued"));
+    fs::File::create(file("big"))
+        .unwrap()
+        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
+        .unwrap();
+    let mut prepared = ScanIndex::default();
+    rescue(&mut prepared.files, &file("rescued"));
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[root.projects()],
+        &mut prepared,
+        NOW,
+        30,
+    );
+    let walk = || {
+        let mut index = prepared.clone();
+        while !index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_directories
+            .is_empty()
+        {
+            advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, &mut index, 30, None);
+        }
+        let counts = &index.traversal.as_ref().unwrap().counts;
+        let decided = (
+            candidates(&index),
+            counts.discovered_file_count,
+            counts.oversized_file_count,
+        );
+        (decided, unselected_page("claude_code"))
+    };
+    let (first, counted) = walk();
+    let (second, recounted) = walk();
+    assert_eq!(first, second, "counter state is no gate input");
+    let mut selected = vec![file("rescued"), file("young")];
+    selected.sort();
+    assert_eq!(first, (selected, 3, 1));
+    assert_eq!(counted, json!({"age": 1, "size": 1}));
+    assert_eq!(recounted, counted);
+}
+
+/// Gate 2 (Codex retained-roster refresh): the same conditions for files
+/// appearing in an already-walked directory.
+#[test]
+fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
+    let root = Root::new("ld-roster-gate");
+    let day = root.projects().join("2026/10/01");
+    fs::create_dir_all(&day).unwrap();
+    let file = |name: &str| day.join(format!("rollout-{name}.jsonl"));
+    append(&file("first"), b"{}\n");
+    let mut index = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        &[root.projects()],
+        &mut index,
+        NOW,
+        30,
+    );
+    while !index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty()
+    {
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 30, None);
+    }
+    unselected_page("codex");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    for name in ["young", "old", "rescued"] {
+        append(&file(name), b"{}\n");
+    }
+    set_old(&file("old"));
+    set_old(&file("rescued"));
+    fs::File::create(file("big"))
+        .unwrap()
+        .set_len(MAX_CODEX_JSONL_FILE_BYTES + 1)
+        .unwrap();
+    rescue(&mut index.files, &file("rescued"));
+    let refresh = || {
+        let mut index = index.clone();
+        refresh_retained_codex_roster(
+            SnapshotSource::Codex,
+            index.traversal.as_mut().unwrap(),
+            30,
+            discovery_retention!(index),
+        );
+        let counts = &index.traversal.as_ref().unwrap().counts;
+        let decided = (
+            candidates(&index),
+            counts.discovered_file_count,
+            counts.oversized_file_count,
+        );
+        (decided, unselected_page("codex"))
+    };
+    let (first, counted) = refresh();
+    let (second, recounted) = refresh();
+    assert_eq!(first, second, "counter state is no gate input");
+    let mut selected = vec![file("first"), file("rescued"), file("young")];
+    selected.sort();
+    assert_eq!(first, (selected, 4, 1));
+    assert_eq!(counted, json!({"age": 1, "size": 1}));
+    assert_eq!(recounted, counted);
+}
+
 // ---- E3: withheld-account holds stay discoverable until they resolve ----
 
 /// The key holds a parsed revision withheld for an unresolved account.

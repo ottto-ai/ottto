@@ -1407,6 +1407,146 @@ fn unchanged_group_releases_persisted_blocked_owner() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn group_with_legacy_tee_is_byte_charged() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (root, inventory) = fixture();
+    let previous = legacy_index(&inventory, None);
+    let mut boot = GroupBoot::new(inventory.groups().into_values().next().unwrap(), &previous);
+    loop {
+        match boot.step(None, &previous) {
+            Boot::Pending => {}
+            Boot::Ready => break,
+            _ => panic!("the legacy group boots"),
+        }
+    }
+    let metadata = CodexTitleMetadata::default();
+    let mut job = boot
+        .into_job(JobInputs {
+            metadata: &metadata,
+            traces: None,
+            ledgers: None,
+            artifacts: false,
+            context_curve: false,
+            index: &previous,
+        })
+        .unwrap();
+    assert!(job.group.as_ref().unwrap().tee.is_some());
+    let no_scope = |_: &CandidateFile| None;
+    let inputs = StepInputs {
+        metadata: &metadata,
+        attribution: None,
+        artifacts: false,
+        context_curve: false,
+        live_scope: &no_scope,
+    };
+    assert!(matches!(
+        step_group(&mut job, &inputs),
+        GroupStep::Read(Ok(false))
+    ));
+    let cache = Arc::new(SharedCache::default());
+    let mut owned = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        &[root.join("sessions")],
+        previous,
+        "2026-10-06T23:00:00Z",
+        7,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        false,
+    )
+    .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
+    *owned.active_file = Some(job);
+    // R2-M2: the group read without the cursor is charged by bytes
+    // (`completed_bound`, tee inputs taken out), never refused by the
+    // per-line visit walk, so retained singleton copies survive.
+    assert!(owned.sampled_copy_budget() > 0);
+    let walked = owned
+        .active_file
+        .as_ref()
+        .and_then(|active| active.group.as_ref())
+        .and_then(|group| group.walked);
+    assert!(
+        walked.is_some_and(|(charge, _, _)| charge != usize::MAX),
+        "{walked:?}"
+    );
+    assert!(owned.sampled_copy_budget() > 0, "the E3 estimate");
+    // L-A1: a group active owns a proof and tee, so even a measured copy
+    // refusal keeps the conservative release.
+    let (_, measured) = owned.sampled_copy_parts();
+    assert!(measured.is_some(), "precondition: residents measured");
+    let (_, lifecycle) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+        sampled_scan::release_cache_for_copy_refusal(
+            owned.sampling.as_ref(),
+            owned.active_file.as_deref(),
+            measured,
+        )
+    });
+    assert_eq!(lifecycle.clear_other_active, 1);
+    assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
+    // P1-RETAIN R0 (T-R0d): given a Tail acquisition and with every other
+    // borrowed-state conjunct cleared, the group conjunct alone keeps the job
+    // off shape F, so its refusal keeps ClearOtherActive and its completion
+    // never reaches R0's release.
+    let active = owned.active_file.as_deref_mut().unwrap();
+    let mut file = fs::File::open(&active.candidate.path).unwrap();
+    let plan = crate::transcript_acquisition::ReadPlan::prepare(
+        &mut file,
+        None,
+        &Scope("group-fixture".into()),
+        None,
+        100,
+    )
+    .unwrap();
+    let sampling = active.sampling.replace(sampled_scan::Active {
+        key: String::new(),
+        scope: Scope("group-fixture".into()),
+        mode: crate::transcript_acquisition::ReadMode::Tail,
+        audit_due: None,
+        retained_hint: Some((0, 0)),
+        retained_finalization_charge: 0,
+        retained_usage: None,
+        reinsertion: Default::default(),
+    });
+    let acquisition = active.parser.reader.acquisition.replace(plan);
+    let replay = active.parser.accumulator.codex_tier_replay.take();
+    let aliases = std::mem::take(&mut active.aliases);
+    let receipts = std::mem::take(&mut active.applied_receipts);
+    let comparison_target = std::mem::replace(&mut active.comparison_target, false);
+    let cursor = active.cursor.take();
+    assert!(active.group.is_some());
+    assert!(!sampled_scan::borrows_only_retained_reduction(active));
+    let group = active.group.take();
+    assert!(
+        sampled_scan::borrows_only_retained_reduction(active),
+        "precondition: only the group conjunct differs from shape F"
+    );
+    active.group = group;
+    let (_, lifecycle) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+        sampled_scan::release_cache_for_copy_refusal(
+            owned.sampling.as_ref(),
+            owned.active_file.as_deref(),
+            measured,
+        )
+    });
+    assert_eq!(lifecycle.clear_other_active, 1, "a Tail group job");
+    assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
+    let active = owned.active_file.as_deref_mut().unwrap();
+    active.sampling = sampling;
+    active.parser.reader.acquisition = acquisition;
+    active.parser.accumulator.codex_tier_replay = replay;
+    active.aliases = aliases;
+    active.applied_receipts = receipts;
+    active.comparison_target = comparison_target;
+    active.cursor = cursor;
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// M1 review F2: a byte-charged group job whose real charge overflows the
 /// state budget beside full residents is walked to the whole state budget,
 /// so its refusal evicts to fit on that charge: one entry for an overflow

@@ -1563,4 +1563,102 @@ mod absence_parent_counts_tests {
             }
         }
     }
+
+    #[test]
+    fn open_subagent_counts_survive_steps_and_emit_on_existing_page() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-open-subagent");
+        let parent = dir.join("subagents");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("member.jsonl");
+        fs::write(&path, b"{}\n").unwrap();
+        let mut census = ScanCensus::default();
+        let candidate = candidate_from_traversal_path(
+            SnapshotSource::ClaudeCode,
+            ScanTraversalPath {
+                scan_root: dir.to_path_buf(),
+                path: path.clone(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            None,
+            BACKFILL_WINDOW_DAYS,
+            &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
+        )
+        .unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&parent).unwrap();
+        let scope = Scope::begin(true);
+        let (_, events) = observe_sites(|| {
+            open_and_identify_scan_candidate(
+                SnapshotSource::ClaudeCode,
+                candidate,
+                &mut census,
+                None,
+                BACKFILL_WINDOW_DAYS,
+                crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
+            )
+        });
+        assert_eq!(events[1][Site::Open.index()], [1, 0]);
+        assert_eq!(census.disappeared_file_count, 1);
+        assert!(census.removed_index_keys.is_empty());
+        let mut probe = lr::Probe::start();
+        probe.page_events.merge(scope.finish());
+        let empty_step = Scope::begin(true);
+        probe.page_events.merge(empty_step.finish());
+        let (_, records) = lr::capture(|| {
+            probe.collection(
+                "claude_code",
+                lr::CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            )
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["stage"], "native_collection_page");
+        assert_eq!(records[0]["schema_version"], 2);
+        let c = &records[0]["counts"];
+        assert_eq!(c["claude_absence_parent_missing"], 1);
+        assert_eq!(c["claude_absence_parent_subagent_missing"], 1);
+        assert_eq!(
+            c.as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| k.starts_with("claude_absence_parent"))
+                .count(),
+            2
+        );
+        assert_eq!(counts(Scope::begin(true)), serde_json::json!({}));
+    }
+
+    #[test]
+    fn other_sources_hints_and_nonmembers_add_no_parent_counts() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-excluded");
+        for (source, census_member, watcher_hint) in [
+            (SnapshotSource::Codex, true, false),
+            (SnapshotSource::Pi, true, false),
+            (SnapshotSource::ClaudeCode, false, false),
+            (SnapshotSource::ClaudeCode, true, true),
+        ] {
+            let scope = Scope::begin(true);
+            let mut census = ScanCensus::default();
+            candidate_from_traversal_path(
+                source,
+                ScanTraversalPath {
+                    scan_root: dir.to_path_buf(),
+                    path: dir.join("missing/member.jsonl"),
+                    census_member,
+                    watcher_hint,
+                },
+                &mut census,
+                None,
+                BACKFILL_WINDOW_DAYS,
+                &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
+            );
+            assert_eq!(counts(scope), serde_json::json!({}));
+        }
+    }
 }
