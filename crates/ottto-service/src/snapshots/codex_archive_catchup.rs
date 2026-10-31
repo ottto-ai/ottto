@@ -5,8 +5,97 @@ use codex_compressed_input::{HeaderRead, HeaderWork};
 /// another carrier. `Deferred` keeps selection debt in the existing queue.
 pub(super) enum Admission {
     Read,
-    Held,
-    Deferred,
+    Held(CodexZstCause),
+    Deferred(CodexZstCause),
+}
+
+/// Borrowed scan inputs; the existing acquisition still owns the opened file
+/// and the saved reservation. This operation builds neither a parser nor an ACK.
+pub(super) struct Preparation<'a> {
+    pub(super) source: SnapshotSource,
+    pub(super) inventory: Option<&'a codex_file_join::HeaderInventory>,
+    pub(super) sampling: Option<&'a sampled_scan::Context>,
+    pub(super) codex_metadata: &'a CodexTitleMetadata,
+    pub(super) claude_metadata: &'a ClaudeTitleMetadata,
+    pub(super) effort_dir: Option<&'a Path>,
+    pub(super) census_complete: bool,
+    pub(super) curve: bool,
+}
+
+impl ScanIndex {
+    #[inline(never)] // Keep archive preparation scratch out of the native scan frame.
+    pub(super) fn prepare_archive(
+        &mut self,
+        candidate: &CandidateFile,
+        file: &File,
+        budget: &mut sampled_scan::codex_cursor::PageBudget,
+        options: Preparation<'_>,
+    ) -> Result<(Admission, Option<crate::transcript_acquisition::Scope>)> {
+        if options.source != SnapshotSource::Codex || !codex_archive_path(&candidate.path) {
+            return Ok((Admission::Read, None));
+        }
+        if self
+            .files
+            .get(&local_index_key(&candidate.path))
+            .and_then(|e| e.archive.as_ref())
+            .is_some_and(|a| a.user_change && a.matches(file))
+            && !budget.archive_ready(&self.archive_pass)
+        {
+            return Ok((Admission::Held(CodexZstCause::CorrectionUnapplied), None));
+        }
+        let admission = self.classify_archive(
+            candidate,
+            file,
+            options.inventory,
+            options.sampling.map(|c| &c.cache),
+            budget,
+        )?;
+        if !matches!(admission, Admission::Read) {
+            return Ok((admission, None));
+        }
+        crate::context_composition::set_utility_qos();
+        self.archive_pass.started = true;
+        let scope = options
+            .sampling
+            .filter(|_| options.census_complete)
+            .and_then(|context| {
+                sampled_scan::reduction_dependencies(
+                    options.source,
+                    candidate,
+                    options.codex_metadata,
+                    options.claude_metadata,
+                    options.effort_dir,
+                    self.archive_header(&candidate.path),
+                )
+                .map(|dependency| {
+                    context.file_scope(
+                        options.source,
+                        candidate,
+                        &dependency,
+                        true,
+                        options.curve,
+                        self,
+                    )
+                })
+            });
+        // Header work cannot carry AC permission into a later body claim.
+        if !budget.archive_ready(&self.archive_pass) {
+            return Ok((Admission::Deferred(CodexZstCause::AdmissionRefused), None));
+        }
+        Ok((Admission::Read, scope))
+    }
+}
+
+/// One cause per newly retained residue key. This is disclosure only: deferred
+/// work remains queued and gains no terminal, ownership or acceptance credit.
+pub(super) fn retain_residue(keys: &mut BTreeSet<String>, path: &Path, cause: CodexZstCause) {
+    if keys.insert(local_index_key(path)) {
+        crate::local_resource_diagnostics::traversal_point(
+            "codex_archive_residue",
+            "codex",
+            &BTreeMap::from([("codex_archive_residue", BTreeMap::from([(cause, 1_u64)]))]),
+        );
+    }
 }
 
 impl ScanIndex {
@@ -21,12 +110,12 @@ impl ScanIndex {
     ) -> Result<Admission> {
         let key = local_index_key(&candidate.path);
         let ids = codex_session_id_candidates_from_path(&candidate.path);
-        if self
+        if let Some(cause) = self
             .files
             .get(&key)
-            .is_some_and(|entry| entry.codex_compressed_hold.is_some())
+            .and_then(|entry| entry.codex_compressed_hold)
         {
-            return Ok(Admission::Held);
+            return Ok(Admission::Held(cause));
         }
         let prior = self
             .files
@@ -34,56 +123,36 @@ impl ScanIndex {
             .and_then(|e| e.archive.as_deref())
             .filter(|a| a.matches(file));
         if prior.is_some_and(|a| a.quiet(file)) {
-            return Ok(Admission::Held);
+            return Ok(Admission::Held(
+                prior
+                    .and_then(|a| a.terminal_cause())
+                    .unwrap_or(CodexZstCause::OutputHeld),
+            ));
         }
         let retry =
             prior.is_some_and(|a| matches!(a.disposition, ArchiveDisposition::Pending { .. }));
-        // The table counts this archive, so `sibling` means a second member.
-        // Decode-, feed- and persisted-held archives are not in it: keep the roster.
-        let family = inventory.is_some_and(|i| i.family_table().archive_class(&key).sibling)
-            || self.traversal.as_ref().is_some_and(|t| {
-                t.codex_rollout_paths.iter().any(|p| {
-                    p != &key
-                        && codex_archive_path(Path::new(p))
-                        && !inventory
-                            .and_then(|i| i.owner_for_path(Path::new(p)))
-                            .is_some_and(|owner| !ids.iter().any(|id| id == owner))
-                        && codex_session_id_candidates_from_path(Path::new(p))
-                            .iter()
-                            .any(|id| ids.contains(id))
-                })
-            });
-        let old_carrier = ids.iter().any(|id| {
-            let owner = codex_protected_owner(id);
-            self.codex_counting_tombstones.contains_key(&owner)
-                || self.codex_counting_moved_evidence.contains_key(&owner)
-                || self.files.iter().any(|(path, e)| {
-                    path != &key
-                        && (e.codex_protected_owner.as_ref() == Some(&owner)
-                            || (!codex_archive_path(Path::new(path))
-                                && codex_session_id_candidates_from_path(Path::new(path))
-                                    .contains(id)))
-                })
-        });
+        // One funded inventory result; no candidate-level roster/index walks.
+        let Some(inventory) = inventory.filter(|i| i.classified_archive(&key)) else {
+            return Ok(Admission::Deferred(CodexZstCause::AdmissionRefused));
+        };
+        let family = inventory.archive_class(&key).sibling;
+        let old_carrier = inventory.old_carrier(&key);
         if family || (!retry && old_carrier) {
-            self.hold_compressed(
-                &candidate.path,
-                ids.iter().cloned().collect(),
-                if family {
-                    CodexZstCause::FamilyUnproven
-                } else {
-                    CodexZstCause::ArchiveEquivalenceUnproven
-                },
-            );
-            return Ok(Admission::Held);
+            let cause = if family {
+                CodexZstCause::FamilyUnproven
+            } else {
+                CodexZstCause::ArchiveEquivalenceUnproven
+            };
+            self.hold_compressed(&candidate.path, ids.iter().cloned().collect(), cause);
+            return Ok(Admission::Held(cause));
         }
         // A partial/old intake census is negative scope only. New archive
         // acquisition waits until every configured root has been inventoried.
-        if inventory.is_some_and(|inventory| !inventory.complete) {
-            return Ok(Admission::Deferred);
+        if !inventory.complete {
+            return Ok(Admission::Deferred(CodexZstCause::AdmissionRefused));
         }
         if !budget.archive_ready(&self.archive_pass) {
-            return Ok(Admission::Deferred);
+            return Ok(Admission::Deferred(CodexZstCause::AdmissionRefused));
         }
         // An unchanged pending object already has a validated header. The
         // retained hit (or bounded lost-copy retry) is resolved by the parser.
@@ -115,17 +184,17 @@ impl ScanIndex {
                         "codex",
                         &BTreeMap::from([("codex_zst_held_declared_bytes", length)]),
                     );
-                    return Ok(Admission::Held);
+                    return Ok(Admission::Held(CodexZstCause::CatchupTooLarge));
                 }
             }
         }
         if budget.singleton_remaining(sampled_scan::codex_cursor::Limits::current())
             < 2 * codex_file_join::MAX_HEADER_BYTES as u64
         {
-            return Ok(Admission::Deferred);
+            return Ok(Admission::Deferred(CodexZstCause::AdmissionRefused));
         }
         if !budget.archive_ready(&self.archive_pass) {
-            return Ok(Admission::Deferred);
+            return Ok(Admission::Deferred(CodexZstCause::AdmissionRefused));
         }
         crate::context_composition::set_utility_qos();
         let mut work = HeaderWork {
@@ -136,7 +205,7 @@ impl ScanIndex {
         self.archive_pass.started |= work.decoded_bytes > 0;
         budget.charge(false, work.decoded_bytes);
         match header? {
-            HeaderRead::Deferred => Ok(Admission::Deferred),
+            HeaderRead::Deferred => Ok(Admission::Deferred(CodexZstCause::HeaderUnfunded)),
             HeaderRead::Validated(_) | HeaderRead::BoundReached => Ok(Admission::Read),
         }
     }

@@ -2129,23 +2129,25 @@ fn lineage_retainable(accumulator: &SnapshotAccumulator) -> bool {
     today || in_file_fork
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(super) struct ParserOptions<'a> {
+    pub(super) source: SnapshotSource,
+    pub(super) metadata: &'a CodexTitleMetadata,
+    pub(super) traces: Option<Arc<CodexTurnTraceMap>>,
+    pub(super) parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    pub(super) artifacts: bool,
+    pub(super) curve: bool,
+    pub(super) identity_capture: bool,
+    pub(super) cache: Option<&'a Arc<SharedCache>>,
+    pub(super) archive_scope: Option<&'a Scope>,
+}
+
 pub(super) fn new_source_parser(
     file: File,
     candidate: &CandidateFile,
-    source: SnapshotSource,
-    metadata: &CodexTitleMetadata,
-    traces: Option<Arc<CodexTurnTraceMap>>,
-    parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    artifacts: bool,
-    curve: bool,
-    identity_capture: bool,
     index: &mut ScanIndex,
-    cache: Option<&Arc<SharedCache>>,
+    options: ParserOptions<'_>,
 ) -> Result<OwnedJsonlParser> {
-    new_source_parser_with_archive_scope(
-        file,
-        candidate,
+    let ParserOptions {
         source,
         metadata,
         traces,
@@ -2153,27 +2155,9 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
         identity_capture,
-        index,
         cache,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn new_source_parser_with_archive_scope(
-    file: File,
-    candidate: &CandidateFile,
-    source: SnapshotSource,
-    metadata: &CodexTitleMetadata,
-    traces: Option<Arc<CodexTurnTraceMap>>,
-    parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    artifacts: bool,
-    curve: bool,
-    identity_capture: bool,
-    index: &mut ScanIndex,
-    cache: Option<&Arc<SharedCache>>,
-    archive_scope: Option<&Scope>,
-) -> Result<OwnedJsonlParser> {
+        archive_scope,
+    } = options;
     // Dedicated custody precedes every cache take, including retained resends.
     if source == SnapshotSource::Codex {
         if let Some(cause) = index

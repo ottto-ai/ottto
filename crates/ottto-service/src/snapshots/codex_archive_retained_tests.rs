@@ -263,18 +263,24 @@ fn prior_plain_carrier_or_tombstone_holds_move_before_any_content_read() {
         }
         archive_power(&mut index.archive_pass, true);
         let before = serde_json::to_value(&index).unwrap();
+        let mut inventory = codex_file_join::HeaderInventory::new(&[], &BTreeSet::new(), None);
+        inventory.first_read_archives.insert(local_index_key(&f.0));
+        inventory.prepare_archive_classification(&index);
         let (decision, rows) = crate::local_resource_diagnostics::capture(|| {
             index
                 .classify_archive(
                     &f.candidate(),
                     &File::open(&f.0).unwrap(),
-                    None,
+                    Some(&inventory),
                     None,
                     &mut sampled_scan::codex_cursor::PageBudget::default(),
                 )
                 .unwrap()
         });
-        assert!(matches!(decision, codex_archive_catchup::Admission::Held));
+        assert!(matches!(
+            decision,
+            codex_archive_catchup::Admission::Held(_)
+        ));
         assert_eq!(decoded_archive_bytes(&rows), 0);
         assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_frame_header"));
         let after = serde_json::to_value(&index).unwrap();

@@ -396,15 +396,18 @@ fn rotating_admission_starvation_is_per_archive_and_alarm_reports_source_count()
         sampled_scan::new_source_parser(
             File::open(&f.0).unwrap(),
             &f.candidate(),
-            SnapshotSource::Codex,
-            &CodexTitleMetadata::default(),
-            None,
-            None,
-            false,
-            false,
-            false,
             &mut ScanIndex::default(),
-            cache,
+            sampled_scan::ParserOptions {
+                source: SnapshotSource::Codex,
+                metadata: &CodexTitleMetadata::default(),
+                traces: None,
+                parents: None,
+                artifacts: false,
+                curve: false,
+                identity_capture: false,
+                cache,
+                archive_scope: None,
+            },
         )
     };
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {

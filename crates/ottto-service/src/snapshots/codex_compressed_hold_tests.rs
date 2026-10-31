@@ -2687,3 +2687,102 @@ fn declined_ordinary_archive_ack_replacement_keeps_custody_and_accepted_body() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+/// [money] Resolved negative scope releases only unread archive stubs, counted,
+/// without changing accepted bodies, attempt permission, or ACK membership.
+#[test]
+fn resolved_archive_stub_custody_has_a_counted_exit_without_ack() {
+    let root = crate::test_scratch::private_dir("custody-release");
+    let path = member(&root, "sessions", OWNER, true);
+    let key = local_index_key(&path);
+    for cause in [
+        CodexZstCause::FamilyUnproven,
+        CodexZstCause::ArchiveEquivalenceUnproven,
+        CodexZstCause::OwnerUnproven,
+    ] {
+        for accepted in [false, true] {
+            let mut index = ScanIndex::default();
+            index.hold_compressed(&path, BTreeSet::from([OWNER.into()]), cause);
+            if accepted {
+                index.files.get_mut(&key).unwrap().last_upload_body_witness =
+                    Some("accepted-body".into());
+            }
+            let prior = serde_json::to_value(&index).unwrap();
+            let mut inventory = codex_file_join::HeaderInventory::new(&[], &BTreeSet::new(), None);
+            inventory.complete = true;
+            inventory.held_archives.insert(key.clone());
+            inventory.prepare_archive_classification(&index);
+            let (released, rows) = capture(|| inventory.release_resolved_archive_holds(&mut index));
+            assert_eq!(released, !accepted);
+            assert_eq!(index.files[&key].codex_compressed_hold.is_none(), !accepted);
+            assert!(index.accepted_snapshot_fingerprints.is_empty());
+            assert!(
+                index.files[&key].archive.is_none(),
+                "no reservation or read grant minted"
+            );
+            let counts = rows
+                .iter()
+                .filter(|r| r["stage"] == "codex_archive_hold_released")
+                .count();
+            assert_eq!(counts, usize::from(!accepted));
+            if accepted {
+                assert_eq!(serde_json::to_value(&index).unwrap(), prior);
+            } else {
+                assert!(!index.codex_state_only_blocked_session_ids.contains(OWNER));
+                assert!(
+                    !inventory.release_resolved_archive_holds(&mut index),
+                    "one exit per revision"
+                );
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// [money] Held and deferred residue retain every physical key with one cause
+/// per key, even when more than one admission boundary observes the debt.
+#[test]
+fn archive_residue_keys_each_have_one_cause_without_retirement() {
+    let root = crate::test_scratch::private_dir("custody-residue-causes");
+    let held = member(&root, "held/sessions", OWNER, true);
+    let deferred = member(&root, "deferred/sessions", PARENT, true);
+    let mut keys = BTreeSet::new();
+    let (_, rows) = capture(|| {
+        for _ in 0..5 {
+            codex_archive_catchup::retain_residue(&mut keys, &held, CodexZstCause::FamilyUnproven);
+            codex_archive_catchup::retain_residue(
+                &mut keys,
+                &deferred,
+                CodexZstCause::HeaderUnfunded,
+            );
+        }
+    });
+    assert_eq!(
+        keys,
+        BTreeSet::from([local_index_key(&held), local_index_key(&deferred)])
+    );
+    let counts = rows
+        .iter()
+        .filter_map(|r| r["counts"]["codex_archive_residue"].as_object())
+        .flat_map(|m| m.values())
+        .map(|v| v.as_u64().unwrap())
+        .sum::<u64>();
+    assert_eq!(counts, keys.len() as u64);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["counts"]["codex_archive_residue"]["CompressedFamilyUnproven"] == 1)
+            .count(),
+        1
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["counts"]["codex_archive_residue"]["CompressedHeaderUnfunded"] == 1)
+            .count(),
+        1
+    );
+    assert!(
+        held.exists() && deferred.exists(),
+        "pacing retains the owed inputs"
+    );
+    fs::remove_dir_all(root).unwrap();
+}

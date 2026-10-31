@@ -428,6 +428,9 @@ pub(super) struct HeaderInventory {
     pub(super) deferred_archives: BTreeSet<String>,
     /// Bound archives held by name with a resolved family sibling (value: twin).
     pub(super) family_held: BTreeMap<String, bool>,
+    /// One compact, funded classification per completed inventory revision.
+    archive_classes: Vec<(String, FamilyClass)>,
+    family_peak: usize,
     pub(super) reuse_hits: usize,
     pub(super) reuse_misses: usize,
     pub(super) bytes_avoided: usize,
@@ -492,8 +495,10 @@ pub(super) struct FamilyClass {
     pub(super) sibling: bool,
     /// An unresolved archive shares a filename owner.
     pub(super) deferred: bool,
+    old_carrier: bool,
 }
-pub(super) struct FamilyTable<'a>(BTreeMap<String, Family<'a>>);
+crate::heap_layout_bound::fields!(FamilyClass; twin, validated_sibling, sibling, deferred, old_carrier);
+struct FamilyTable<'a>(Vec<(String, Family<'a>)>);
 impl FamilyTable<'_> {
     fn class<'o>(
         &self,
@@ -501,7 +506,12 @@ impl FamilyTable<'_> {
         name: Option<&str>,
     ) -> FamilyClass {
         let mut class = FamilyClass::default();
-        for family in owners.into_iter().filter_map(|owner| self.0.get(owner)) {
+        for family in owners.into_iter().filter_map(|owner| {
+            self.0
+                .binary_search_by(|(id, _)| id.as_str().cmp(owner))
+                .ok()
+                .map(|at| &self.0[at].1)
+        }) {
             let members =
                 family.plain.len() + family.archives.iter().filter(|n| !family.twin(**n)).count();
             class.twin |= family.twin(name);
@@ -637,31 +647,55 @@ impl HeaderInventory {
         self.custody_after = None;
         self.custody_next = 0;
         self.custody_done = false;
+        self.archive_classes = Vec::new();
+        self.family_peak = 0;
         // read_bytes is NOT reset: repeated real edits reach the existing bound.
         crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::OwnerUnproven);
     }
     /// D5: the one family facts table. Validated headers (plain or archive,
     /// keyed by header owner) and archives known only by name (bound, unknown
     /// or held; keyed by filename owners) stay separate evidence classes.
-    pub(super) fn family_table(&self) -> FamilyTable<'_> {
-        let mut table = BTreeMap::<String, Family>::new();
+    fn family_table(&self) -> FamilyTable<'_> {
+        // Flat facts sort once; no owner tree rebuilt for each candidate.
+        // The admitted upper capacity includes two filename owners per key.
+        let capacity = self.headers.len()
+            + 2 * (self.first_read_archives.len()
+                + self.held_archives.len()
+                + self.deferred_archives.len());
+        let mut facts = Vec::with_capacity(capacity);
         for header in &self.headers {
-            let family = table.entry(header.owner.clone()).or_default();
-            let name = logical_name(&header.candidate.path);
-            if codex_archive_path(&header.candidate.path) {
-                family.archives.push(name);
-            } else {
-                family.plain.push(name);
-            }
+            facts.push((
+                header.owner.clone(),
+                if codex_archive_path(&header.candidate.path) {
+                    1_u8
+                } else {
+                    0
+                },
+                logical_name(&header.candidate.path),
+            ));
         }
         for key in self.first_read_archives.union(&self.held_archives) {
             for owner in archive_owners(key) {
-                table.entry(owner).or_default().named += 1;
+                facts.push((owner, 2, None));
             }
         }
         for key in &self.deferred_archives {
             for owner in archive_owners(key) {
-                table.entry(owner).or_default().deferred = true;
+                facts.push((owner, 3, None));
+            }
+        }
+        facts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut table: Vec<(String, Family<'_>)> = Vec::with_capacity(facts.len());
+        for (owner, kind, name) in facts {
+            if table.last().is_none_or(|(id, _)| *id != owner) {
+                table.push((owner, Family::default()));
+            }
+            let family = &mut table.last_mut().expect("owner group").1;
+            match kind {
+                0 => family.plain.push(name),
+                1 => family.archives.push(name),
+                2 => family.named += 1,
+                _ => family.deferred = true,
             }
         }
         FamilyTable(table)
@@ -670,33 +704,204 @@ impl HeaderInventory {
     /// skipped without decoding; any other validated second member holds
     /// every archive of that owner (FamilyUnproven). Plain members never hold.
     pub(super) fn mark_validated_families(&mut self) {
-        let table = self.family_table();
-        let classes = self
-            .headers
-            .iter()
-            .map(|h| codex_archive_path(&h.candidate.path).then(|| table.validated_class(h)))
-            .collect::<Vec<_>>();
-        let owners = self
-            .headers
-            .iter()
-            .zip(&classes)
-            .filter(|(_, class)| class.is_some_and(|c| c.validated_sibling))
-            .map(|(h, _)| h.owner.clone())
-            .collect::<BTreeSet<_>>();
-        for (header, class) in self.headers.iter_mut().zip(classes) {
-            header.plain_twin = class.is_some_and(|c| c.twin);
-        }
-        for owner in owners {
-            self.mark_custody_owner(&owner, CodexZstCause::FamilyUnproven);
+        // Headers are sorted by owner by prepare_custody. No class/owner
+        // vectors: consume the admitted compact results in contiguous ranges.
+        let mut first = 0;
+        while first < self.headers.len() {
+            let last = first
+                + self.headers[first..].partition_point(|h| h.owner == self.headers[first].owner);
+            let held = self.headers[first..last].iter().any(|h| {
+                self.archive_class(&local_index_key(&h.candidate.path))
+                    .validated_sibling
+            });
+            for header in &mut self.headers[first..last] {
+                header.plain_twin = self
+                    .archive_classes
+                    .binary_search_by(|(key, _)| key.cmp(&local_index_key(&header.candidate.path)))
+                    .is_ok_and(|at| self.archive_classes[at].1.twin);
+            }
+            if held {
+                self.mark_custody_range(first, last, CodexZstCause::FamilyUnproven);
+            }
+            first = last;
         }
     }
+
+    pub(super) fn archive_class(&self, key: &str) -> FamilyClass {
+        self.archive_classes
+            .binary_search_by(|(path, _)| path.as_str().cmp(key))
+            .ok()
+            .map(|at| self.archive_classes[at].1)
+            .unwrap_or_default()
+    }
+    pub(super) fn old_carrier(&self, key: &str) -> bool {
+        self.archive_class(key).old_carrier
+    }
+    pub(super) fn family_allocation_peak(&self) -> usize {
+        self.family_peak
+    }
+    pub(super) fn classification_ready(&self) -> bool {
+        self.family_peak != 0
+    }
+    pub(super) fn classified_archive(&self, key: &str) -> bool {
+        self.classification_ready()
+            && self
+                .archive_classes
+                .binary_search_by(|(path, _)| path.as_str().cmp(key))
+                .is_ok()
+    }
+
+    /// Charge the owner table, names, compact results and scratch before any
+    /// roster-sized allocation. Refusal retains the existing inventory debt.
+    fn family_bound(&self, index: Option<&ScanIndex>) -> Option<usize> {
+        use crate::heap_layout_bound::Counter;
+        let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        cost.add(self.feed_peak)?;
+        cost.add(self.decode_peak)?;
+        cost.add(self.custody_peak)?;
+        cost.add(codex_compressed_holds::OWNER_LOOKUP_SLACK)?;
+        // Fact vector + grouped families + their name vectors + final compact
+        // results. Names borrow the inventory; key/owner bytes are charged here.
+        let slots = self.headers.len().checked_add(
+            2usize.checked_mul(
+                self.first_read_archives
+                    .len()
+                    .checked_add(self.held_archives.len())?
+                    .checked_add(self.deferred_archives.len())?,
+            )?,
+        )?;
+        cost.add(
+            slots.checked_mul(
+                std::mem::size_of::<(String, u8, Option<&str>)>()
+                    .checked_add(std::mem::size_of::<(String, Family<'_>)>())?,
+            )?,
+        )?;
+        cost.add(
+            self.headers
+                .len()
+                .checked_mul(8 * std::mem::size_of::<Option<&str>>())?,
+        )?;
+        let results = self
+            .headers
+            .len()
+            .checked_add(self.first_read_archives.len())?
+            .checked_add(self.held_archives.len())?
+            .checked_add(self.deferred_archives.len())?;
+        // Exact result capacity, plus the held/deferred Vecs' geometric growth.
+        cost.add(
+            results.checked_mul(
+                std::mem::size_of::<(String, FamilyClass)>()
+                    .checked_add(2 * std::mem::size_of::<(String, bool)>())?
+                    .checked_add(2 * std::mem::size_of::<String>())?,
+            )?,
+        )?;
+        for (path, owner) in self
+            .headers
+            .iter()
+            .map(|h| (h.candidate.path.as_path(), h.owner.len()))
+            .chain(
+                self.first_read_archives
+                    .union(&self.held_archives)
+                    .map(|k| (Path::new(k), 0)),
+            )
+            .chain(self.deferred_archives.iter().map(|k| (Path::new(k), 0)))
+        {
+            // One result key, up to two filename owners (bounded by the
+            // filename), and transient key/owner generation.
+            cost.add(
+                path.as_os_str()
+                    .len()
+                    .checked_mul(2)?
+                    .checked_add(path.file_name().map_or(0, |n| n.len()).checked_mul(4)?)?
+                    .checked_add(owner.checked_mul(2)?)?,
+            )?;
+        }
+        if let Some(index) = index {
+            // Three negative owners per retained file at most (protected + two
+            // filename candidates), plus hash and filename-generation scratch.
+            cost.add(
+                index
+                    .files
+                    .len()
+                    .checked_mul(3 * (std::mem::size_of::<String>() + 64))?,
+            )?;
+            for key in index.files.keys() {
+                cost.add(key.len().checked_mul(2)?)?;
+            }
+        }
+        Some(cost.bytes)
+    }
+
+    pub(super) fn prepare_archive_classification(&mut self, index: &ScanIndex) {
+        let Some(peak) = self.family_bound(Some(index)) else {
+            self.refuse_custody();
+            self.complete = false;
+            self.bounded_out = true;
+            return;
+        };
+        self.classify_bound_archives();
+        if !self.classification_ready() {
+            return;
+        }
+        self.family_peak = peak;
+        // Existing retained owners and plain filename locators are negative
+        // scope only. Build once, instead of a full index walk per archive.
+        let mut carriers = Vec::with_capacity(3 * index.files.len());
+        for (path, entry) in &index.files {
+            if let Some(owner) = &entry.codex_protected_owner {
+                carriers.push(owner.clone());
+            }
+            if !codex_archive_path(Path::new(path)) {
+                for id in codex_session_id_candidates_from_path(Path::new(path)) {
+                    let owner = codex_protected_owner(&id);
+                    if entry.codex_protected_owner.as_ref() != Some(&owner) {
+                        carriers.push(owner);
+                    }
+                }
+            }
+        }
+        carriers.sort_unstable();
+        for (key, class) in &mut self.archive_classes {
+            if archive_owners(key).iter().any(|id| {
+                let owner = codex_protected_owner(id);
+                let own = usize::from(
+                    index
+                        .files
+                        .get(key)
+                        .is_some_and(|e| e.codex_protected_owner.as_ref() == Some(&owner)),
+                );
+                index.codex_counting_tombstones.contains_key(&owner)
+                    || index.codex_counting_moved_evidence.contains_key(&owner)
+                    || carriers.partition_point(|id| id <= &owner)
+                        - carriers.partition_point(|id| id < &owner)
+                        > own
+            }) {
+                class.old_carrier = true;
+            }
+        }
+    }
+
     /// 0a r3 (Lead B 2026-10-29): a bound archive X with a resolved sibling of
     /// its filename owner (a validated plain P, or another bound, invalid or
     /// validated archive) is held by name, quietly: X never decodes and P keeps
     /// publishing exactly as without X. Only unresolved (deferred) siblings
     /// defer X; once they resolve, X takes its one A1 read or is held.
     pub(super) fn classify_bound_archives(&mut self) {
+        self.archive_classes = Vec::new();
+        self.family_peak = 0;
+        let Some(peak) = self.family_bound(None) else {
+            self.refuse_custody();
+            self.complete = false;
+            self.bounded_out = true;
+            return;
+        };
         let table = self.family_table();
+        let mut classes = Vec::with_capacity(
+            self.headers.len()
+                + self.first_read_archives.len()
+                + self.held_archives.len()
+                + self.deferred_archives.len(),
+        );
         let mut held = Vec::new();
         let mut deferred = Vec::new();
         for header in self
@@ -705,15 +910,22 @@ impl HeaderInventory {
             .filter(|h| codex_archive_path(&h.candidate.path))
         {
             let key = local_index_key(&header.candidate.path);
-            let class = table.archive_class(&key);
+            let mut class = table.archive_class(&key);
+            class.validated_sibling = table.validated_class(header).validated_sibling;
+            classes.push((key.clone(), class));
             if class.sibling {
                 held.push((key, class.twin));
             } else if class.deferred {
                 deferred.push(key);
             }
         }
-        for key in &self.first_read_archives {
+        for key in self
+            .first_read_archives
+            .union(&self.held_archives)
+            .chain(&self.deferred_archives)
+        {
             let class = table.archive_class(key);
+            classes.push((key.clone(), class));
             if class.sibling {
                 held.push((key.clone(), class.twin));
             } else if class.deferred {
@@ -721,6 +933,19 @@ impl HeaderInventory {
             }
         }
         drop(table);
+        classes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        classes.dedup_by(|a, b| {
+            if a.0 != b.0 {
+                return false;
+            }
+            b.1.twin |= a.1.twin;
+            b.1.validated_sibling |= a.1.validated_sibling;
+            b.1.sibling |= a.1.sibling;
+            b.1.deferred |= a.1.deferred;
+            true
+        });
+        self.archive_classes = classes;
+        self.family_peak = peak;
         self.family_held.extend(held);
         self.deferred_archives.extend(deferred);
         // A held family owner never holds or refuses its plain member.
@@ -789,6 +1014,8 @@ impl HeaderInventory {
             first_read_archives: BTreeSet::new(),
             deferred_archives: BTreeSet::new(),
             family_held: BTreeMap::new(),
+            archive_classes: Vec::new(),
+            family_peak: 0,
             reuse_hits: 0,
             reuse_misses: 0,
             bytes_avoided: 0,
@@ -848,6 +1075,9 @@ impl HeaderInventory {
                             )
                         })
                 });
+            if held && codex_archive_path(Path::new(path)) {
+                self.held_archives.insert(path.clone());
+            }
             if !held
                 && index
                     .files
@@ -1238,7 +1468,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, decode_after, decode_done, decode_unknown, decode_peak, decode_refused_peak, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
+crate::heap_layout_bound::fields!(HeaderInventory; feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, decode_after, decode_done, decode_unknown, decode_peak, decode_refused_peak, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held, archive_classes, family_peak);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {

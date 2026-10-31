@@ -212,6 +212,8 @@ impl codex_file_join::HeaderInventory {
                     }
                 }
             }
+            self.prepare_archive_classification(index);
+            self.custody_peak = self.custody_peak.max(self.family_allocation_peak());
             self.mark_validated_families();
         }
         let after = self.custody_after.as_ref().map_or(Unbounded, Excluded);
@@ -277,12 +279,111 @@ impl codex_file_join::HeaderInventory {
         self.custody_done = true;
         true
     }
+    /// A disappeared negative locator can release an unread archive stub.
+    /// Accepted carriers and parent debt require an equivalence/parent proof;
+    /// neither a name nor an absent file is such proof.
+    pub(super) fn release_resolved_archive_holds(&mut self, index: &mut ScanIndex) -> bool {
+        if !self.complete
+            || !self.classification_ready()
+            || self.custody_unknown
+            || self.custody_refused
+        {
+            return false;
+        }
+        let mut released = false;
+        for key in &self.held_archives {
+            let Some(entry) = index.files.get(key) else {
+                continue;
+            };
+            let Some(
+                cause @ (CodexZstCause::FamilyUnproven
+                | CodexZstCause::ArchiveEquivalenceUnproven
+                | CodexZstCause::OwnerUnproven),
+            ) = entry.codex_compressed_hold
+            else {
+                continue;
+            };
+            if entry.archive.is_some()
+                || entry.codex_history_is_protected()
+                || entry.last_upload_body_witness.is_some()
+                || entry.last_snapshot_fingerprint.is_some()
+                || index
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|f| !f.is_empty())
+                || index.decode_holds_file(key)
+                || self.old_carrier(key)
+                || self.archive_class(key).sibling
+            {
+                continue;
+            }
+            index
+                .files
+                .get_mut(key)
+                .expect("classified stub")
+                .codex_compressed_hold = None;
+            index.attribute_codex_blocked(key, BTreeSet::new());
+            if let Some(traversal) = index.traversal.as_mut() {
+                if let Some(root) = traversal
+                    .scan_roots
+                    .iter()
+                    .filter(|root| Path::new(key).starts_with(root))
+                    .max_by_key(|root| root.components().count())
+                {
+                    traversal.pending_candidates.push_back(ScanTraversalPath {
+                        order_modified: None,
+                        scan_root: root.clone(),
+                        path: PathBuf::from(key),
+                        census_member: true,
+                        watcher_hint: false,
+                    });
+                }
+            }
+            index.mark_bounded_sweep_unsettled();
+            crate::local_resource_diagnostics::traversal_point(
+                "codex_archive_hold_released",
+                "codex",
+                &BTreeMap::from([(
+                    "codex_archive_hold_released",
+                    BTreeMap::from([(cause, 1_u64)]),
+                )]),
+            );
+            released = true;
+        }
+        if released {
+            // The index revision changed: rebuild its negative projections before
+            // any parser/cache use. Raw custody and read/attempt budgets survive.
+            self.held_archives.retain(|key| {
+                index.files.get(key).is_some_and(|e| {
+                    e.codex_compressed_hold.is_some()
+                        || e.archive.as_ref().is_some_and(|a| {
+                            matches!(a.disposition, ArchiveDisposition::Held { .. })
+                        })
+                })
+            });
+            self.absence_held = BTreeSet::new();
+            self.feed_peak = 0;
+            self.held_owners.clear();
+            self.custody_unknown = false;
+            self.feed_after = None;
+            self.feed_prepared = false;
+            self.custody_after = None;
+            self.custody_next = 0;
+            self.custody_peak = 0;
+            self.custody_done = false;
+            for h in &mut self.headers {
+                h.custody_cause = None;
+            }
+        }
+        released
+    }
+
     pub(super) fn mark_custody_owner(&mut self, owner: &str, cause: CodexZstCause) {
         let first = self.headers.partition_point(|h| h.owner.as_str() < owner);
         let last = self.headers.partition_point(|h| h.owner.as_str() <= owner);
         self.mark_custody_range(first, last, cause);
     }
-    fn mark_custody_range(&mut self, first: usize, last: usize, cause: CodexZstCause) {
+    pub(super) fn mark_custody_range(&mut self, first: usize, last: usize, cause: CodexZstCause) {
         if first == last
             || (cause == CodexZstCause::FamilyUnproven
                 && self.headers[first..last]
@@ -335,7 +436,7 @@ impl codex_file_join::HeaderInventory {
         cost.add(peak)?;
         Some(cost.bytes)
     }
-    fn refuse_custody(&mut self) {
+    pub(super) fn refuse_custody(&mut self) {
         if !self.custody_refused {
             self.custody_refused = true;
             crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::AdmissionRefused);

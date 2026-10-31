@@ -12726,15 +12726,18 @@ fn decoder_production_budget_admits_seven_mib_without_eviction_or_yields() {
                 let mut parser = crate::snapshots::sampled_scan::new_source_parser(
                     File::open(&archive).unwrap(),
                     &candidate,
-                    SnapshotSource::Codex,
-                    &CodexTitleMetadata::default(),
-                    None,
-                    None,
-                    false,
-                    false,
-                    false,
                     &mut ScanIndex::default(),
-                    Some(&cache),
+                    crate::snapshots::sampled_scan::ParserOptions {
+                        source: SnapshotSource::Codex,
+                        metadata: &CodexTitleMetadata::default(),
+                        traces: None,
+                        parents: None,
+                        artifacts: false,
+                        curve: false,
+                        identity_capture: false,
+                        cache: Some(&cache),
+                        archive_scope: None,
+                    },
                 )
                 .expect("production warm cache admits without eviction");
                 assert_eq!(streak(true), 1, "admission reset the archive's streak to 0");

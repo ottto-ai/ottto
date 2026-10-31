@@ -107,48 +107,64 @@ impl OwnedJsonlParser {
         old: Retained<CachedJsonlReduction>,
     ) -> Result<()> {
         anyhow::ensure!(
-            self.reader.reader.is_compressed()
-                && old.checkpoint.is_compressed()
-                && old.state.accumulator.source == self.source,
-            "archive retained source mismatch"
+            self.reader.reader.is_compressed() && old.checkpoint.is_compressed(),
+            "archive retained domain mismatch"
         );
         anyhow::ensure!(
-            old.state
-                .accumulator
-                .codex_observed_priority_turns
-                .as_ref()
-                .is_some_and(|observed| observed.iter().all(|(turn, priority)| *priority
-                    == self
-                        .accumulator
-                        .codex_turn_traces
-                        .as_ref()
-                        .is_some_and(|traces| traces.is_priority_turn(turn)))),
-            "archive priority dependencies changed"
+            self.reduction_reusable(&old.state),
+            "archive dependencies changed"
         );
-        anyhow::ensure!(
-            codex_counting_version::reusable(
-                old.state.accumulator.codex_counting.as_deref(),
-                self.accumulator.codex_counting.as_deref()
-            ),
-            "archive counting dependencies changed"
-        );
+        self.install_reduction(old.state);
+        self.archive_checkpoint = Some(old.checkpoint);
+        self.reader.finished = true;
+        Ok(())
+    }
+
+    fn reduction_reusable(&self, old: &CachedJsonlReduction) -> bool {
+        old.accumulator.source == self.source
+            && codex_counting_version::reusable(
+                old.accumulator.codex_counting.as_deref(),
+                self.accumulator.codex_counting.as_deref(),
+            )
+            && (self.source != SnapshotSource::Codex
+                || old
+                    .accumulator
+                    .codex_observed_priority_turns
+                    .as_ref()
+                    .is_some_and(|observed| {
+                        observed.iter().all(|(turn, priority)| {
+                            *priority
+                                == self
+                                    .accumulator
+                                    .codex_turn_traces
+                                    .as_ref()
+                                    .is_some_and(|traces| traces.is_priority_turn(turn))
+                        })
+                    }))
+    }
+
+    /// Install retained history with this scan's live dependencies. Encoding
+    /// checks and physical ReadPlan authority stay with the acquisition caller.
+    fn install_reduction(&mut self, old: CachedJsonlReduction) {
         let inputs = self.take_live_reduction_inputs();
         let CachedJsonlReduction {
-            accumulator,
+            mut accumulator,
             report,
             recognized_usage_drop_count,
             positive_recognized_usage_count,
             positive_usage_evidence,
-        } = old.state;
+        } = old;
+        accumulator
+            .claude_file_birth
+            .refresh_opened(&self.accumulator.claude_file_birth);
+        accumulator.codex_sidecar_projected_next_ordinal =
+            self.accumulator.codex_sidecar_projected_next_ordinal;
         self.accumulator = accumulator;
         self.restore_live_reduction_inputs(inputs);
         self.reader.report = report;
         self.recognized_usage_drop_count = recognized_usage_drop_count;
         self.positive_recognized_usage_count = positive_recognized_usage_count;
         self.positive_usage_evidence = positive_usage_evidence;
-        self.archive_checkpoint = Some(old.checkpoint);
-        self.reader.finished = true;
-        Ok(())
     }
 
     /// The source mtime this read's checkpoint will carry
@@ -195,35 +211,8 @@ impl OwnedJsonlParser {
             self.reader.reader.buffer().is_empty() && !self.reader.finished,
             "acquisition must begin before native parsing"
         );
-        let old = old.filter(|old| {
-            // Capture is a function of the source (contract 5 always on,
-            // `claude_request_identity::captures`), so the same source keeps
-            // the capture mode its markers were built in.
-            !old.checkpoint.is_compressed()
-                && old.state.accumulator.source == self.source
-                // A retained reduction continues only under the counting rule
-                // this parse's own evidence selects. Both unset while inactive.
-                && codex_counting_version::reusable(
-                    old.state.accumulator.codex_counting.as_deref(),
-                    self.accumulator.codex_counting.as_deref(),
-                )
-                && (self.source != SnapshotSource::Codex
-                    || old
-                        .state
-                        .accumulator
-                        .codex_observed_priority_turns
-                        .as_ref()
-                        .is_some_and(|observed| {
-                            observed.iter().all(|(turn, priority)| {
-                                *priority
-                                    == self
-                                        .accumulator
-                                        .codex_turn_traces
-                                        .as_ref()
-                                        .is_some_and(|traces| traces.is_priority_turn(turn))
-                            })
-                        }))
-        });
+        let old = old
+            .filter(|old| !old.checkpoint.is_compressed() && self.reduction_reusable(&old.state));
         let plan = ReadPlan::prepare(
             self.reader.reader.get_mut(),
             old.as_ref().map(|old| &old.checkpoint),
@@ -236,32 +225,10 @@ impl OwnedJsonlParser {
             self.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
         }
         if !matches!(mode, ReadMode::Full(_)) {
-            let CachedJsonlReduction {
-                accumulator,
-                report,
-                recognized_usage_drop_count,
-                positive_recognized_usage_count,
-                positive_usage_evidence,
-            } = old
-                .expect("reusable acquisition requires native reduction")
-                .state;
-            // These are live native inputs, not immutable retained history.
-            // Known prior trace decisions were compared above; fresh suffixes
-            // use this cycle's traces. Projected EOF advances with appends.
-            let mut accumulator = accumulator;
-            accumulator
-                .claude_file_birth
-                .refresh_opened(&self.accumulator.claude_file_birth);
-            accumulator.codex_turn_traces = self.accumulator.codex_turn_traces.take();
-            accumulator.codex_parent_ownership_ledgers =
-                self.accumulator.codex_parent_ownership_ledgers.take();
-            accumulator.codex_sidecar_projected_next_ordinal =
-                self.accumulator.codex_sidecar_projected_next_ordinal;
-            self.accumulator = accumulator;
-            self.reader.report = report;
-            self.recognized_usage_drop_count = recognized_usage_drop_count;
-            self.positive_recognized_usage_count = positive_recognized_usage_count;
-            self.positive_usage_evidence = positive_usage_evidence;
+            self.install_reduction(
+                old.expect("reusable acquisition requires native reduction")
+                    .state,
+            );
             self.reader.finished = mode == ReadMode::Unchanged;
         }
         self.reader.acquisition = Some(plan);

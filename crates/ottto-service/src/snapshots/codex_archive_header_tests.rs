@@ -561,15 +561,18 @@ fn real_full_admission_refusal_preserves_header_without_redecode() {
         assert!(sampled_scan::new_source_parser(
             File::open(&f.0).unwrap(),
             &f.candidate(),
-            SnapshotSource::Codex,
-            &CodexTitleMetadata::default(),
-            None,
-            None,
-            false,
-            false,
-            false,
             &mut state,
-            Some(&cache)
+            sampled_scan::ParserOptions {
+                source: SnapshotSource::Codex,
+                metadata: &CodexTitleMetadata::default(),
+                traces: None,
+                parents: None,
+                artifacts: false,
+                curve: false,
+                identity_capture: false,
+                cache: Some(&cache),
+                archive_scope: None
+            }
         )
         .is_err());
     });
@@ -2070,7 +2073,7 @@ fn incomplete_archive_inventory_defers_before_frame_or_header_io() {
     });
     assert!(matches!(
         admission,
-        codex_archive_catchup::Admission::Deferred
+        codex_archive_catchup::Admission::Deferred(_)
     ));
     assert!(index.files.is_empty());
     assert_eq!(decoded_archive_bytes(&rows), 0);

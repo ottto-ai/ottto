@@ -103,6 +103,13 @@ impl super::OwnedSourceScan {
         }
         self.index.generation = committed.generation;
         evidence.reservation_saved = true;
+        if evidence.decode_attempts == 1 && !evidence.user_change {
+            crate::local_resource_diagnostics::traversal_point(
+                "codex_zst_first_read",
+                "codex",
+                &serde_json::json!({"codex_zst_first_read": 1}),
+            );
+        }
         if evidence.decode_attempts > 1 && !evidence.user_change {
             crate::local_resource_diagnostics::traversal_point(
                 "codex_zst_first_read_retry",
@@ -792,7 +799,8 @@ impl super::ScanCensus {
         archive: Option<&ArchiveEvidence>,
         cause: CodexZstCause,
     ) {
-        self.archive_terminal_index_keys
+        let first = self
+            .archive_terminal_index_keys
             .insert(super::local_index_key(path));
         self.archive_terminal_sessions
             .extend(super::codex_session_id_candidates_from_path(
@@ -801,6 +809,9 @@ impl super::ScanCensus {
         if let Some(archive) = archive {
             self.archive_terminal_sessions
                 .insert(archive.logical_id.clone());
+        }
+        if !first {
+            return;
         }
         crate::local_resource_diagnostics::traversal_point(
             "archive_terminal_residue",
@@ -2135,15 +2146,18 @@ pub(in crate::snapshots) mod tests {
         let mut parser = sampled_scan::new_source_parser(
             File::open(&f.0).unwrap(),
             &f.candidate(),
-            SnapshotSource::Codex,
-            &metadata,
-            None,
-            None,
-            false,
-            false,
-            false,
             &mut index,
-            Some(&cache),
+            sampled_scan::ParserOptions {
+                source: SnapshotSource::Codex,
+                metadata: &metadata,
+                traces: None,
+                parents: None,
+                artifacts: false,
+                curve: false,
+                identity_capture: false,
+                cache: Some(&cache),
+                archive_scope: None,
+            },
         )
         .unwrap();
         while !parser.step().unwrap() {}
@@ -2158,15 +2172,18 @@ pub(in crate::snapshots) mod tests {
         assert!(sampled_scan::new_source_parser(
             File::open(&modern).unwrap(),
             &candidate,
-            SnapshotSource::Codex,
-            &metadata,
-            None,
-            None,
-            false,
-            false,
-            false,
             &mut index,
-            None
+            sampled_scan::ParserOptions {
+                source: SnapshotSource::Codex,
+                metadata: &metadata,
+                traces: None,
+                parents: None,
+                artifacts: false,
+                curve: false,
+                identity_capture: false,
+                cache: None,
+                archive_scope: None
+            }
         )
         .is_err());
         for id in [
@@ -2283,15 +2300,18 @@ pub(in crate::snapshots) mod tests {
         sampled_scan::new_source_parser(
             File::open(&f.0).unwrap(),
             &f.candidate(),
-            SnapshotSource::Codex,
-            &CodexTitleMetadata::default(),
-            None,
-            None,
-            false,
-            true,
-            false,
             index,
-            cache,
+            sampled_scan::ParserOptions {
+                source: SnapshotSource::Codex,
+                metadata: &CodexTitleMetadata::default(),
+                traces: None,
+                parents: None,
+                artifacts: false,
+                curve: true,
+                identity_capture: false,
+                cache,
+                archive_scope: None,
+            },
         )
     }
     fn assert_pending(index: &ScanIndex, path: &Path, expected: u8) {
