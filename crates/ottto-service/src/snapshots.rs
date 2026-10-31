@@ -26803,7 +26803,6 @@ impl OwnedSourceScan {
             source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(index);
         if growth_active {
             sampled_audit::prune_growth_retention(index, sampled_scan::now_seconds());
-            state_v2::retain_resume_exclusions(index, roots);
         }
         if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
             refresh_terminal_off_discovery(
@@ -27142,21 +27141,14 @@ impl OwnedSourceScan {
         let mut files = pending_paths
             .into_iter()
             .filter_map(|pending| {
-                let candidate = candidate_from_traversal_path(
+                candidate_from_traversal_path(
                     source,
                     pending,
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
                     &mut candidate_discovery,
-                )?;
-                (!growth_active
-                    || !state_v2::resume_selection_held(
-                        candidate_discovery.index,
-                        &local_index_key(&candidate.path),
-                        Some(candidate.size_bytes),
-                    ))
-                .then_some(candidate)
+                )
             })
             .collect::<Vec<_>>();
 
@@ -27357,10 +27349,6 @@ impl OwnedSourceScan {
                 &forced_claude_family_reparses,
             )
             .into_iter()
-            .filter(|path| {
-                !growth_active
-                    || !state_v2::resume_selection_held(index, &local_index_key(path), None)
-            })
             .filter(|path| !already_identified.contains(&local_index_key(path)))
             .collect::<BTreeSet<_>>();
             if let Some(traversal) = index.traversal.as_mut() {
@@ -44289,10 +44277,6 @@ fn reconcile_missing_index_entries_with_side(
     let mut growth_queued = false;
     let account_members = index.observed_account_members();
     for key in &page {
-        if state_v2::resume_key_retained(index, key) {
-            growth_queued = true;
-            continue;
-        }
         let observed = index
             .traversal
             .as_ref()

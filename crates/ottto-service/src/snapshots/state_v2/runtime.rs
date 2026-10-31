@@ -103,41 +103,6 @@ impl Hold {
         hold.into()
     }
 }
-struct ResumeExclusion {
-    first_seen: Instant,
-    retry_at: Instant,
-    passes: u32,
-    failed_generation: u64,
-    observed_len: u64,
-    had_ref: bool,
-}
-impl ResumeExclusion {
-    fn new(generation: u64, len: u64) -> Self {
-        let now = Instant::now();
-        Self {
-            first_seen: now,
-            retry_at: now + Duration::from_secs(60),
-            passes: 0,
-            failed_generation: generation,
-            observed_len: len,
-            had_ref: false,
-        }
-    }
-    /// Repeated (3 passes) or long (6 h) exclusions alarm.
-    fn alarmed(&self, now: Instant) -> bool {
-        self.passes >= 3
-            || now.saturating_duration_since(self.first_seen) > Duration::from_secs(6 * 3600)
-    }
-    /// A short retry until the alarm; then the growth-full pace, so a key whose
-    /// staging fails deterministically cannot abort a page every minute.
-    fn backoff(&self, now: Instant) -> Duration {
-        Duration::from_secs(if self.alarmed(now) {
-            super::super::sampled_audit::GROWTH_FULL_INTERVAL
-        } else {
-            60
-        })
-    }
-}
 struct RouteState {
     pace: Pace,
     latched: bool,
@@ -153,7 +118,6 @@ struct RouteState {
     last_read: Option<(String, u64)>,
     save_retry_completed: bool,
     pass_written_start: Option<u64>,
-    resume_excluded: BTreeMap<String, ResumeExclusion>,
     // Live ACK custody exceeded the companion bound: no collection before this.
     custody_retry_at: Option<Instant>,
 }
@@ -214,7 +178,6 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     last_read: None,
                     save_retry_completed: false,
                     pass_written_start: None,
-                    resume_excluded: BTreeMap::new(),
                     custody_retry_at: None,
                 }))
             })
@@ -317,6 +280,7 @@ fn load_with_custody<M: Mapper>(
     if !route_needed(path, switched, custody)? {
         return Ok(None);
     }
+    let mut load_started = None;
     let result = held(with_state(path, |state| {
         state.inventory_ready = false;
         state.original = None;
@@ -325,6 +289,7 @@ fn load_with_custody<M: Mapper>(
             .then(telemetry::process_written_bytes)
             .flatten();
         if let Some((identity, db_path)) = pair {
+            load_started = Some(Instant::now());
             state.latched = true;
             if !switched {
                 telemetry::event("switch_off_ignored", &1);
@@ -427,6 +392,15 @@ fn load_with_custody<M: Mapper>(
         telemetry::event("route", &"v1");
         Ok(None)
     }));
+    if let Some(started) = load_started {
+        telemetry::event(
+            "load_span",
+            &serde_json::json!({
+                "duration_ms": started.elapsed().as_millis(),
+                "generation": result.as_ref().ok().and_then(|index| index.as_ref()).map(|index| index.generation)
+            }),
+        );
+    }
     if result.is_err() {
         with_state(path, |state| {
             if state.latched || state.current.as_ref().is_some_and(|runtime| runtime.active) {
@@ -490,10 +464,6 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             return Ok(());
         }
         let _gauge = telemetry::Stage::import(path);
-        if let Err(class) = mapper.preflight(index) {
-            pause(state, class);
-            return Ok(());
-        }
         let result = (|| -> Result<KindCx> {
             let original = state.original.as_mut().ok_or(Pause::Mismatch)?;
             original.unchanged()?;
@@ -648,36 +618,12 @@ fn save_with_custody(
                     claim_only,
                 )?;
                 session.stamp = session.db.stamp()?;
-                // Only a freshly committed replacement/finish resolves the
-                // failed key. Unrelated saves and elapsed backoff never do.
-                state.resume_excluded.retain(|key, excluded| {
-                    session
-                        .cx
-                        .committed
-                        .get(key)
-                        .map_or(!excluded.had_ref, |checkpoint| {
-                            checkpoint.file_generation <= excluded.failed_generation
-                        })
-                });
                 // Publish only the complete, unambiguously committed graph.
                 state.cached = Some(index.clone());
                 state.saved_page(session.db.save_over_target(), claim_only);
                 Ok(true)
             });
-        if let Err(error) = &save_result {
-            if let Some(excluded) = error.downcast_ref::<resume::StageExcluded>() {
-                let now = Instant::now();
-                for key in &excluded.0 {
-                    let entry = state.resume_excluded.entry(key.clone()).or_insert_with(|| {
-                        ResumeExclusion::new(
-                            index.generation,
-                            excluded.1.get(key).copied().unwrap_or(0),
-                        )
-                    });
-                    entry.had_ref |= excluded.2.contains(key);
-                    entry.retry_at = now + entry.backoff(now);
-                }
-            }
+        if save_result.is_err() {
             if let Some(hold) = session.db.save_failure() {
                 return Err(hold.into());
             }
@@ -1133,9 +1079,7 @@ pub(in super::super) use tests::erase_published;
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
 #[path = "runtime_ops.rs"]
 mod ops;
-pub(in super::super) use ops::{
-    before_collection, resume_key_retained, resume_selection_held, retain_resume_exclusions,
-};
+pub(in super::super) use ops::before_collection;
 
 /// Read-only custody seam for growth receipts. Callers doing CAS retain the
 /// checkpoint lock; never acquire it recursively from the save hook.

@@ -4,7 +4,7 @@
 //! the accepted kinds, kind dispatch, per-group field mappings, the original
 //! field inventory and the retained-heap side sums. Hand code stays only for
 //! `hook` fields: account-window ordinals, shared-evidence projections, raw
-//! custody and resume publication. Entries keep each group's existing write
+//! custody. Entries keep each group's existing write
 //! order; the heap walk sums monotonically, so its order is not observable.
 use super::*;
 
@@ -93,7 +93,7 @@ macro_rules! scan_index_fields {
             snapshot_activity_at => Files (map check_map) ["accepted.activity"] side,
             claude_desktop_title_files => Files (map check_map) ["v1_field.claude_desktop_title_files"] side,
             confirmed_empty_files => Files (hook check_field) ["file.confirmed_empty"] side,
-            v2 => Files (hook none) ["file.growth_retention", "resume.checkpoint"] own,
+            v2 => Files (hook none) ["file.growth_retention"] own,
             claude_usage_family_pending => Accounts (map check_map) ["usage.pending"] own,
             claude_account_family_witnesses => Accounts (map check_map) ["proof.account"] side,
             claude_usage_family_witnesses => Accounts (map check_map) ["proof.usage"] side,

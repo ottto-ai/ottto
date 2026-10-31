@@ -251,10 +251,8 @@ pub(super) fn map_delta<T: Serialize>(
     next: &BTreeMap<String, T>,
 ) -> Result<()> {
     // Position zero is a required cardinality manifest; members are position one.
-    if kind != "resume.checkpoint" {
-        put(tx, &key(kind, "", 0)?, &next.len())?;
-    }
-    let position = if kind == "resume.checkpoint" { 0 } else { 1 };
+    put(tx, &key(kind, "", 0)?, &next.len())?;
+    let position = 1;
     for name in prev.keys().filter(|name| !next.contains_key(*name)) {
         remove(tx, &key(kind, name, position)?)?;
     }
@@ -276,15 +274,10 @@ pub(super) fn read_map<T: DeserializeOwned + Serialize>(
     kind: &str,
     roots: Option<&BTreeSet<String>>,
 ) -> Result<BTreeMap<String, T>> {
-    let expected = if kind == "resume.checkpoint" {
-        None
-    } else {
-        let manifest = tx
-            .get(&key(kind, "", 0)?)?
-            .context("state_v2_missing_manifest")?;
-        Some(read::<usize>(tx, &manifest)?)
-    };
-    let member_position = if kind == "resume.checkpoint" { 0 } else { 1 };
+    let manifest = tx
+        .get(&key(kind, "", 0)?)?
+        .context("state_v2_missing_manifest")?;
+    let expected = read::<usize>(tx, &manifest)?;
     let mut result = BTreeMap::new();
     let mut count = 0;
     rows(tx, kind, |tx, h| {
@@ -296,11 +289,11 @@ pub(super) fn read_map<T: DeserializeOwned + Serialize>(
         else {
             anyhow::bail!("state_v2_record_key")
         };
-        if expected.is_some() && *position == 0 {
+        if *position == 0 {
             ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
             return Ok(());
         }
-        ensure!(*position == member_position, "state_v2_member_position");
+        ensure!(*position == 1, "state_v2_member_position");
         count += 1;
         let name = family(key_bytes)?;
         if roots.map_or(true, |roots| roots.contains(&name)) {
@@ -308,10 +301,7 @@ pub(super) fn read_map<T: DeserializeOwned + Serialize>(
         }
         Ok(())
     })?;
-    ensure!(
-        expected.map_or(true, |n| count == n),
-        "state_v2_missing_member"
-    );
+    ensure!(count == expected, "state_v2_missing_member");
     Ok(result)
 }
 pub(super) fn private_paths(

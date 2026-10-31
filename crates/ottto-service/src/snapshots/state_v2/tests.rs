@@ -1000,8 +1000,6 @@ fn one_save_commits_all_dirty_rows_above_soft_targets() {
     let mut db = tmp.live_store();
     db.prime_headers().unwrap();
     let mut tx = db.begin(TxnMode::Write).unwrap();
-    // Staging is charged alongside SQL work without allocating a huge fixture.
-    tx.charge_staging(33 * 1024 * 1024).unwrap();
     for row in 0..5_001 {
         put(&mut tx, &traversal(format!("dirty-{row}")), b"evidence");
     }
@@ -1024,9 +1022,17 @@ fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"old");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    sqlite::set_save_ceiling(&mut db, 1024);
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(&mut tx, &key, b"new");
-    let error = tx.charge_staging(256 * 1024 * 1024).unwrap_err();
+    let error = tx
+        .put(RowInput {
+            key: &traversal("over-ceiling".into()),
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &serde_json::to_vec(&"x".repeat(2048)).unwrap(),
+        })
+        .unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::NotPublished);
     assert_eq!(db.save_failure(), Some(Hold::SaveCeiling));
