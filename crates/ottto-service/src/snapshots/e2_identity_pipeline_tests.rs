@@ -1065,7 +1065,8 @@ fn e2_bound_trace_case(
         }
         // The API sidecar stays: a missing pair member is failed evidence.
         "incomplete" => fs::remove_file(&path).unwrap(),
-        // Sparse: the strict reader refuses at open from metadata alone.
+        // Sparse NUL padding is malformed evidence; size alone no longer
+        // refuses pairing or the strict read.
         "oversized" => fs::OpenOptions::new().write(true).open(&path).unwrap()
             .set_len(64 * 1024 * 1024).unwrap(),
         "cap" | "generation" => {
@@ -1098,8 +1099,8 @@ fn e2_bound_trace_case(
     assert_eq!(fired.get(), discarded);
     assert_eq!(
         stats.trace_incomplete_root_count,
-        usize::from(discarded || mode == "malformed"),
-        "unreadable, oversized and incomplete pairs never reach the strict read"
+        usize::from(discarded || matches!(mode, "malformed" | "oversized")),
+        "only unreadable and incomplete pairs skip the strict read"
     );
     // Root 4 + child 1 requests, under this cause only; a listed family has
     // no E2 fold to count.

@@ -3458,7 +3458,11 @@ pub(crate) fn side_calls_page(
                     row.cost_usd_micros,
                     Some(origin),
                     None,
-                    fold.accounts.as_ref().and_then(|a| a.fallback.clone()),
+                    // Its own complete account first; else the session's.
+                    fold.accounts.as_ref().and_then(|a| {
+                        claude_request_identity::side_call_account(row, root)
+                            .or_else(|| a.fallback.clone())
+                    }),
                 )
             });
             fold.side.add(&tokens);
