@@ -1702,7 +1702,10 @@ pub(super) fn x_out_for(source: SnapshotSource, bound: impl FnOnce() -> Option<u
 /// together under the retained lock; release iff `|P*| <= |P_C|` (as
 /// `K' >= C`, exactly when the copy-only prefix suffices), capped at
 /// `|P_C|` at execution. Anything unknown, overflowing, infeasible or over
-/// the bound releases nothing. A Full has no churn bound: X_out is what its
+/// the bound releases nothing. A Full on the legacy decision releases nothing:
+/// with neither X_out nor `F_prev`, nothing proves its finished output fits, so
+/// it could evict residents and then lose its own copy on every page.
+/// A Full has no churn bound: X_out is what its
 /// copy needs to survive finalization, so `|P*|` of strictly older residents
 /// is its cost, fit-or-nothing. It evicts only while the cache is over the
 /// room, so the room it leaves funds the next completion.
@@ -1722,6 +1725,7 @@ pub(super) fn prove_release(
         return granted;
     };
     match x_out {
+        XOut::Legacy if proof.full => granted,
         XOut::Legacy => legacy_release(granted, proof, context, finish_copy_budget, decode_peak),
         XOut::Refused => granted,
         XOut::Bound(x_out) => {

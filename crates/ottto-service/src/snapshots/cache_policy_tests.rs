@@ -1504,8 +1504,8 @@ fn cache_policy_m_a_codex_keeps_the_legacy_release() {
 /// Tail. With residents of equal or newer rank nothing leaves, the copy is
 /// refused and the next page is Full again. Small residents keep `|P*|` above
 /// `|P_C|`, as on a real daemon: a Claude Full takes no churn bound. A Codex
-/// Full proves `K = C` without an X_out (ruling 5), so finalization may still
-/// refuse its copy after the release; the printed receipt shows which.
+/// Full has no X_out (ruling 5), so nothing proves its output fits and it
+/// evicts nothing, whatever the residents' rank.
 #[test]
 fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
     if unexecuted("full_singleton_release") {
@@ -1515,11 +1515,12 @@ fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
     let file_modified = now - 600;
     let newer_modified = now - 300;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        for (idle_modified, releases) in [
+        for (idle_modified, older) in [
             (now - OLD_SECONDS, true),
             (file_modified, false),
             (newer_modified, false),
         ] {
+            let releases = older && source == SnapshotSource::ClaudeCode;
             let label = format!("{source:?} idle_modified={idle_modified}");
             let cache = Arc::new(sampled_scan::SharedCache::default());
             let idle = ScanFixture::new(SnapshotSource::ClaudeCode);
@@ -1599,7 +1600,7 @@ fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
             if releases {
                 assert!(!left.is_empty(), "{label}: older residents leave");
             } else {
-                assert!(left.is_empty(), "{label}: equal or newer residents stay");
+                assert!(left.is_empty(), "{label}: every resident stays");
                 assert!(!admitted, "{label}: the copy is refused");
             }
 
@@ -1612,7 +1613,7 @@ fn cache_policy_full_singleton_releases_only_strictly_older_residents() {
                 assert_eq!(next.modes, (1, 0, 0), "{label}: the next page is Full");
                 assert_eq!(next.state_missing(), 1, "{label}");
             }
-            if source == SnapshotSource::ClaudeCode && releases {
+            if releases {
                 assert!(admitted, "{label}: X_out proves the copy is admitted");
             }
         }
