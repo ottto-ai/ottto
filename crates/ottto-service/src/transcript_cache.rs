@@ -329,6 +329,9 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     pub(crate) fn peek(&self, key: &str) -> Option<&Retained<S>> {
         self.entries.get(key).map(|entry| &entry.retained)
     }
+    pub(crate) fn finalization_charge(&self, key: &str) -> Option<usize> {
+        self.entries.get(key).map(|entry| entry.finalization_charge)
+    }
     #[cfg(test)]
     pub(crate) fn checkpoint(&self, key: &str) -> Option<Checkpoint> {
         self.entries

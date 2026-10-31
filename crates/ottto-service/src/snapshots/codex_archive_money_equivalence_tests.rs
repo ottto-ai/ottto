@@ -9,7 +9,12 @@ fn discovered_scan(f: &ArchiveFixture, mut index: ScanIndex, limit: usize) -> Ow
         &now,
         BACKFILL_WINDOW_DAYS,
     );
-    advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, BACKFILL_WINDOW_DAYS, None);
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        &mut index,
+        BACKFILL_WINDOW_DAYS,
+        None,
+    );
     OwnedSourceScan::new(
         SnapshotSource::Codex,
         &[root],
@@ -476,9 +481,9 @@ fn compressed_only_root_read_once_and_acked_then_quiet_restart() {
     }
 }
 
-/// [money] Read bound: a declared >1 GiB archive is held without a decoder and restart stays quiet.
+/// [money] A declared >1 GiB source without funding stays queued debt across restart.
 #[test]
-fn declared_over_1gib_held_without_decoder_and_restart_is_quiet() {
+fn declared_over_1gib_without_funding_stays_queued_across_restart() {
     let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
     let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0xe0];
     frame.extend_from_slice(&(FIRST_READ_DECODED_LIMIT + 1).to_le_bytes());
@@ -489,14 +494,33 @@ fn declared_over_1gib_held_without_decoder_and_restart_is_quiet() {
         crate::local_resource_diagnostics::capture(|| finish_selector(scan));
     assert_eq!(decodes(&rows), 0);
     assert!(result.snapshots.is_empty());
-    assert_eq!(
-        index.files[&local_index_key(&f.0)].codex_compressed_hold,
-        Some(CodexZstCause::CatchupTooLarge)
-    );
+    let key = local_index_key(&f.0);
+    assert!(!result.census_complete);
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .iter()
+        .any(|c| c.path == f.0));
+    assert!(!index
+        .files
+        .get(&key)
+        .is_some_and(|e| e.codex_compressed_hold == Some(CodexZstCause::CatchupTooLarge)));
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
     let mut scan = discovered_scan(&f, checkpoint(&index), 10);
     archive_power(&mut scan.index.archive_pass, true);
-    let ((_, result), rows) = crate::local_resource_diagnostics::capture(|| finish_selector(scan));
+    let ((index, result), rows) =
+        crate::local_resource_diagnostics::capture(|| finish_selector(scan));
     assert!(result.snapshots.is_empty());
+    assert!(!result.census_complete);
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .iter()
+        .any(|c| c.path == f.0));
     assert_eq!(decodes(&rows), 0);
     assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_frame_header"));
 }

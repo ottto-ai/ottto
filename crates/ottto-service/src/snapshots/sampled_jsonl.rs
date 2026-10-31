@@ -57,8 +57,10 @@ impl CachedJsonlReduction {
     ) -> bool {
         if self.accumulator.source != SnapshotSource::Codex
             || self.accumulator.source_session_id.as_deref() != Some(owner)
+            || self.accumulator.codex_creator_header_id.as_deref() != Some(owner)
             || !self.accumulator.codex_session_meta_seen
             || !self.accumulator.codex_physical_signatures_complete
+            || self.accumulator.codex_physical_signatures.is_empty()
             || !loss_free_source_report(
                 &self.report,
                 self.recognized_usage_drop_count,

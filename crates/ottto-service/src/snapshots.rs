@@ -27969,11 +27969,10 @@ impl OwnedSourceScan {
                     // publication behavior; held archives never enter groups.
                     identified_candidates.retain(|candidate| {
                         let key = local_index_key(&candidate.path);
-                        if inventory.old_carrier(&key)
-                            || index
-                                .files
-                                .get(&key)
-                                .is_some_and(|e| e.custody_retry_due(&candidate.path))
+                        if index
+                            .files
+                            .get(&key)
+                            .is_some_and(|e| e.custody_retry_due(&candidate.path))
                         {
                             return true;
                         }
@@ -30177,6 +30176,7 @@ impl OwnedSourceScan {
                 );
                 // An H3c completion retains nothing: reserve no copy/decode
                 // peak, just as it retires no proof and releases no resident.
+                let archive_proof_budget = if retaining { 0 } else { copy_budget };
                 let finish_copy_budget = if retaining && !h3c_route {
                     parser
                         .accumulator
@@ -30630,7 +30630,7 @@ impl OwnedSourceScan {
                                 &parsed_file,
                                 &archive_usage,
                                 (inventory, &context.cache, &codex_title_metadata),
-                                finish_copy_budget.unwrap_or(0),
+                                finish_copy_budget.unwrap_or(archive_proof_budget),
                             )
                         });
                     if let Some(baselines) = replacement {

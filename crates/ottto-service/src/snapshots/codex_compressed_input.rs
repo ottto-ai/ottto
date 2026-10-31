@@ -563,30 +563,18 @@ impl<R: Read> Drop for BoundedDecoder<R> {
             _ => "ge_1_gib",
         };
         crate::local_resource_diagnostics::traversal_point(
-            "codex_zst_decoded_size",
-            "codex",
-            &serde_json::json!({"codex_zst_decoded_size": {size_bucket: 1}, "codex_zst_decoded_size_complete": u64::from(self.frame_complete && !self.failed)}),
-        );
-        crate::local_resource_diagnostics::traversal_point(
             "codex_zst_input",
             "codex",
-            &std::collections::BTreeMap::from([
-                (
-                    "codex_zst_compressed_bytes",
-                    self.physical_limit - self.input.get_ref().limit(),
-                ),
-                ("codex_zst_compressed_consumed_bytes", self.compressed_bytes),
-                ("codex_zst_decoded_bytes", self.decoded_bytes),
-                ("codex_zst_cpu_micros", self.cpu_micros),
-                (
-                    "codex_zst_decoder_native_peak_bytes",
-                    self.context.peak_bytes() as u64,
-                ),
-                (
-                    "codex_zst_decoder_allocation_refusals",
-                    self.context.allocation_refusals(),
-                ),
-            ]),
+            &serde_json::json!({
+                "codex_zst_compressed_bytes": self.physical_limit - self.input.get_ref().limit(),
+                "codex_zst_compressed_consumed_bytes": self.compressed_bytes,
+                "codex_zst_decoded_bytes": self.decoded_bytes,
+                "codex_zst_cpu_micros": self.cpu_micros,
+                "codex_zst_decoder_native_peak_bytes": self.context.peak_bytes() as u64,
+                "codex_zst_decoder_allocation_refusals": self.context.allocation_refusals(),
+                "codex_zst_decoded_size": { (size_bucket): 1 },
+                "codex_zst_decoded_size_complete": u64::from(self.frame_complete && !self.failed),
+            }),
         );
     }
 }
@@ -813,11 +801,17 @@ impl super::ScanCensus {
     ) {
         let key = super::local_index_key(path);
         let archive = index.files.get(&key).and_then(|e| e.archive.as_deref());
-        if let Some(cause) = archive.and_then(|a| a.terminal_cause()).or_else(|| {
-            cache
-                .is_some_and(|cache| cache.archive_starved_count(Some(&key)) > 0)
-                .then_some(CodexZstCause::AdmissionStarved)
-        }) {
+        if let Some(cause) = index
+            .files
+            .get(&key)
+            .and_then(|e| e.codex_compressed_hold)
+            .or_else(|| archive.and_then(|a| a.terminal_cause()))
+            .or_else(|| {
+                cache
+                    .is_some_and(|cache| cache.archive_starved_count(Some(&key)) > 0)
+                    .then_some(CodexZstCause::AdmissionStarved)
+            })
+        {
             self.archive_residue(path, archive, cause);
         } else {
             self.record_unreadable(normal, 1);
@@ -2030,12 +2024,14 @@ pub(in crate::snapshots) mod tests {
                 state = checkpoint(&saved);
                 retry_due(&mut state, &key);
             } else {
-                assert!(matches!(
-                    state.files[&key].archive.as_ref().unwrap().disposition,
-                    ArchiveDisposition::Held {
-                        cause: CodexZstCause::SettlementStuck
-                    }
-                ));
+                assert!(
+                    matches!(state.files[&key].archive.as_ref().unwrap().disposition,
+                    ArchiveDisposition::Pending { retry_after, .. } if retry_after > sampled_scan::now_seconds())
+                );
+                assert_eq!(
+                    state.files[&key].codex_compressed_hold,
+                    Some(CodexZstCause::SettlementStuck)
+                );
                 assert!(rows.iter().any(|r| r["counts"]["codex_zst_refused"]
                     ["CompressedSettlementStuck"]
                     .as_u64()
@@ -2046,7 +2042,7 @@ pub(in crate::snapshots) mod tests {
                     assert!(result.snapshots.is_empty());
                     assert_eq!(
                         result.unreadable_path_count, 0,
-                        "terminal archive uses scoped residue"
+                        "deferred custody uses scoped residue"
                     );
                     assert!(saved.codex_parent_ownership_ledgers.is_empty());
                     assert!(saved.accepted_snapshot_fingerprints.is_empty());
@@ -2093,17 +2089,18 @@ pub(in crate::snapshots) mod tests {
                     .as_ref()
                     .unwrap()
                     .disposition,
-                ArchiveDisposition::Refused { .. }
+                ArchiveDisposition::Pending { .. }
             ));
             let cause = if limit.is_some() {
                 CodexZstCause::DecodedOverLimit
             } else {
                 CodexZstCause::DecodeFailed
             };
-            assert!(
-                matches!(index.files[&local_index_key(&f.0)].archive.as_ref().unwrap().disposition,
-                ArchiveDisposition::Refused { cause: actual } if actual == cause)
+            assert_eq!(
+                index.files[&local_index_key(&f.0)].codex_compressed_hold,
+                Some(cause)
             );
+            assert!(!index.files[&local_index_key(&f.0)].custody_retry_due(&f.0));
             if let Some(limit) = limit {
                 assert!(rows.iter().any(|r| r["counts"]["codex_zst_decoded_bytes"]
                     .as_u64()
@@ -2114,7 +2111,7 @@ pub(in crate::snapshots) mod tests {
             assert!(result.snapshots.is_empty());
             assert_eq!(
                 result.unreadable_path_count, 0,
-                "terminal archive uses scoped residue"
+                "deferred custody uses scoped residue"
             );
         }
     }
@@ -2264,10 +2261,7 @@ pub(in crate::snapshots) mod tests {
                     .unwrap()
                     .unwrap();
                 if let OpenedInput::Compressed(reader, _) = &input {
-                    assert_eq!(
-                        reader.get_ref().remaining,
-                        FIRST_READ_DECODED_LIMIT.min(max_jsonl_file_bytes(SnapshotSource::Codex))
-                    );
+                    assert_eq!(reader.get_ref().remaining, u64::MAX);
                 }
                 assert_eq!(
                     input.capacity(),
@@ -2491,8 +2485,12 @@ pub(in crate::snapshots) mod tests {
                     .disposition = ArchiveDisposition::Refused { cause };
             }
             let (_, result, rows, _) = archive_pass(&f, checkpoint(&state), true, None);
-            assert_eq!(decodes(&rows), 0);
-            assert!(result.snapshots.is_empty());
+            assert_eq!(
+                decodes(&rows),
+                1,
+                "a legacy terminal hold gets one funded custody retry"
+            );
+            assert_eq!(result.snapshots.len(), 1);
             let mut changed = encoded.clone();
             changed.extend(zstd::stream::encode_all(&vec![b'\n'; n + 1][..], 1).unwrap());
             fs::write(&f.0, changed).unwrap();

@@ -845,7 +845,7 @@ fn claude_retained_reuse_is_unchanged_beside_archive_pressure() {
     assert_eq!(observations[0], observations[1]);
 }
 
-/// [money] Custody precedes the retained take; a growing archive keeps its copy.
+/// [money] Before the custody retry deadline, a growing archive keeps its retained copy.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -863,7 +863,6 @@ fn custody_precedes_retained_take_and_growing_archive_keeps_its_copy() {
     ));
     assert_eq!(first.snapshots.len(), 1);
     assert!(cache.retained_checkpoint(&key).is_some());
-    retry_due(&mut index, &key);
     index.hold_compressed(
         &f.0,
         codex_session_id_candidates_from_path(&f.0)
@@ -946,13 +945,13 @@ fn new_archive_a1_with_exact_accepted_history_counts_reupgrade_full() {
     assert_eq!(archive_event_count(&rows, "archive_reupgrade_full"), 0);
 }
 
-/// [behaviour] The activated funded decoder admits 1 GiB and refuses an unknown-size probe.
+/// [behaviour] The funded stream leaves total size to continuation paging; header probes stay capped.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "funded decoder needs validated heap layout"
 )]
-fn activated_funded_decoder_uses_one_gib_and_unknown_size_probe_refuses() {
+fn activated_funded_decoder_pages_total_size_and_probe_refuses() {
     let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     assert_eq!(FIRST_READ_DECODED_LIMIT, 1 << 30);
@@ -963,7 +962,7 @@ fn activated_funded_decoder_uses_one_gib_and_unknown_size_probe_refuses() {
     let OpenedInput::Compressed(reader, _) = &mut input else {
         panic!("funded archive")
     };
-    assert_eq!(reader.get_ref().remaining, FIRST_READ_DECODED_LIMIT);
+    assert_eq!(reader.get_ref().remaining, u64::MAX);
     // Same production over-limit branch with a tiny synthetic limit; no GiB allocation.
     reader.get_mut().remaining = 8;
     assert!(input.read_to_end(&mut Vec::new()).is_err());

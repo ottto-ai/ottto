@@ -118,12 +118,24 @@ impl ScanIndex {
         let (inventory, cache, metadata) = inputs;
         let key = local_index_key(path);
         if !inventory.old_carrier(&key) {
-            return Some(Vec::new());
+            return (!inventory.archive_class(&key).sibling).then(Vec::new);
         }
         let (owner, ledger) = parsed
             .codex_parent_ownership_ledger
             .as_ref()
             .filter(|(_, l)| l.scan_complete)?;
+        if self
+            .files
+            .get(&key)?
+            .archive
+            .as_ref()?
+            .header_validated
+            .as_ref()?
+            .owner
+            != *owner
+        {
+            return None;
+        }
         if parsed
             .snapshots
             .iter()
@@ -155,7 +167,7 @@ impl ScanIndex {
             {
                 return None;
             }
-            let mut retained = cache.retained().ok()?;
+            let retained = cache.retained().ok()?;
             let prior = retained.peek(carrier)?;
             if !prior
                 .state
@@ -163,23 +175,19 @@ impl ScanIndex {
             {
                 return None;
             }
-            let taken = retained.take(carrier)?;
-            drop(retained);
-            // Reuse the baseline output charge already measured on this exact
-            // retained reduction. No accumulator clone or baseline file read.
+            // Keep the accepted plain proof available for an unACKed archive's
+            // next retry. Fund both the copy and its existing output charge
+            // before cloning; no baseline file read is introduced.
             budget = budget.checked_sub(
-                taken
-                    .finalization_charge
+                crate::heap_layout_bound::completed_bound(&prior.state, budget)?
+                    .checked_add(retained.finalization_charge(carrier)?)?
                     .checked_add(carrier.len())?
                     .checked_add(owner.len())?
                     .checked_add(entry.last_snapshot_fingerprint.as_ref()?.len())?,
             )?;
-            baselines.push(
-                taken
-                    .retained
-                    .state
-                    .into_archive_baseline(carrier, entry, owner, metadata),
-            );
+            let state = prior.state.clone();
+            drop(retained);
+            baselines.push(state.into_archive_baseline(carrier, entry, owner, metadata));
         }
         (!baselines.is_empty()).then_some(baselines)
     }
@@ -234,9 +242,7 @@ impl ScanIndex {
                 CodexZstCause::ArchiveEquivalenceUnproven
             };
             self.hold_compressed(&candidate.path, ids.iter().cloned().collect(), cause);
-            if !old_carrier {
-                return Ok(Admission::Held(cause));
-            }
+            return Ok(Admission::Held(cause));
         }
         // A partial/old intake census is negative scope only. New archive
         // acquisition waits until every configured root has been inventoried.
@@ -248,7 +254,7 @@ impl ScanIndex {
         }
         // Existing reservation/deadline bounds retries; identity and superset
         // proof remain mandatory at completed output, including retained resends.
-        if retry || custody_retry || old_carrier {
+        if retry || custody_retry {
             return Ok(Admission::Read);
         }
         if budget.singleton_remaining(sampled_scan::codex_cursor::Limits::current())
