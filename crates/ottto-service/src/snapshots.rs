@@ -46817,6 +46817,33 @@ fn open_and_identify_scan_candidate(
         sampled_scan::now_seconds(),
     )
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserve the standalone candidate rescue interface shared with Codex group reads"
+)]
+fn open_and_identify_scan_candidate_with_rescue(
+    source: SnapshotSource,
+    candidate: CandidateFile,
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    files: &BTreeMap<String, ScanIndexEntry>,
+    verification_rescue: bool,
+    cache: Option<&sampled_scan::SharedCache>,
+) -> Option<(CandidateFile, File)> {
+    open_and_identify_scan_candidate_with_rescue_at(
+        source,
+        candidate,
+        census,
+        census_unix_seconds,
+        backfill_window_days,
+        files,
+        verification_rescue,
+        sampled_scan::now_seconds(),
+        cache,
+    )
+}
+
 fn open_and_identify_scan_candidate_at(
     source: SnapshotSource,
     candidate: CandidateFile,
