@@ -59,17 +59,15 @@ pub(crate) fn parse_claude_session(
         session_id = format!("{session_id} (subagent:{agent_id})");
     }
 
+    // A transcript made only of already-counted records is skipped.
     let copied = claude_copied_records(&lines, report);
-    if copied.iter().any(|copied| *copied) {
-        if lines
+    if copied.iter().any(|copied| *copied)
+        && lines
             .iter()
             .zip(&copied)
             .all(|(line, copied)| *copied || line.get("uuid").is_none())
-        {
-            report.excluded_not_fresh += 1;
-            return Ok(());
-        }
-        report.copied_history_sessions += 1;
+    {
+        return Ok(());
     }
 
     let ctx = LineCtx::v1();

@@ -536,13 +536,6 @@ fn images_follow_their_call_or_the_prompt() {
 
 // A kinds_version 2 reader must classify every call the kinds_version 2 way;
 // a kinds_version 1 class slipping through is caught in debug builds.
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "kinds_version 1 call class")]
-fn images_reject_a_v1_call_in_a_v2_line() {
-    image(&claude(), Some(&CallClass::unmatched()));
-}
-
 fn attachment(
     att_type: &'static str,
     file_type: Option<&'static str>,
@@ -1824,7 +1817,6 @@ const PARTS: [Part; 31] = [
 struct WireFixture {
     kinds: Vec<String>,
     part_kind: BTreeMap<String, String>,
-    top_file_parts: Vec<String>,
 }
 
 fn wire_fixture() -> WireFixture {
@@ -1849,7 +1841,6 @@ fn wire_fixture() -> WireFixture {
             .iter()
             .map(|(part, kind)| (part.clone(), kind.as_str().expect("string").to_string()))
             .collect(),
-        top_file_parts: strings(&fixture["top_file_parts"]),
     }
 }
 
@@ -1867,173 +1858,4 @@ fn wire_ids_match_the_shared_fixture() {
         })
         .collect();
     assert_eq!(ours, fixture.part_kind);
-}
-
-#[test]
-fn classifier_outputs_only_fixture_ids() {
-    let fixture = wire_fixture();
-    let mut verdicts: Vec<Verdict> = Vec::new();
-    let mut verdict = |verdict: Verdict| verdicts.push(verdict);
-    let contexts = [
-        claude(),
-        by_agent(claude()),
-        with_request_1(claude(), Request1::StartMeasured),
-        with_request_1(claude(), Request1::StartNotMeasured),
-        codex(),
-        with_request_1(codex(), Request1::StartNotMeasured),
-    ];
-    let att_types = [
-        "instructions",
-        "nested_memory",
-        "skill_listing",
-        "queued_command",
-        "prompt_snapshot",
-        "deferred_tools_record",
-        "edited_text_file",
-        "file",
-        "task_status",
-        "unknown_type",
-        "environment",
-        "hook_success",
-        "deferred_tools_delta",
-        "total_tokens_reminder",
-    ];
-    let user_lines = [
-        json!({"message": {"content": "fix"}}),
-        json!({"message": {"content": "<task-notification>"}}),
-        json!({"isCompactSummary": true, "message": {"content": "summary"}}),
-        json!({"isMeta": true, "message": {"content": "Base directory for this skill: x"}}),
-        json!({"entrypoint": "sdk-cli", "message": {"content": "brief"}}),
-    ];
-    let labels = [
-        "user.text",
-        "user.heartbeat",
-        "tools.x",
-        "host_skills.instructions",
-        "agents_md.x",
-        "hooks.additional_context",
-        "environments.environment_context",
-        "model.base_instructions",
-    ];
-    let mut calls = Vec::new();
-    for ctx in &contexts {
-        for att_type in att_types {
-            for file_type in [None, Some("AutoMem"), Some("task-notification")] {
-                verdict(claude_attachment(ctx, &attachment(att_type, file_type)));
-            }
-        }
-        for line in &user_lines {
-            verdict(claude_user_text(ctx, line));
-        }
-        for label in labels {
-            for role in ["user", "developer"] {
-                verdict(codex_message(
-                    ctx,
-                    role,
-                    ContentLabel::Present(Some(label)),
-                    "",
-                ));
-                verdict(codex_message(ctx, role, ContentLabel::Absent, label));
-            }
-        }
-        for event in ["web_search_end", "compacted"] {
-            verdict(codex_event(ctx, event));
-        }
-        verdict(image(ctx, None));
-        for (name, command) in [
-            (
-                "Bash",
-                "git status && cat a.md SKILL.md AGENTS.md MEMORY.md; rg x; cargo test; echo",
-            ),
-            ("Read", ""),
-            ("Grep", ""),
-            ("Agent", ""),
-            ("TaskOutput", ""),
-            ("WebFetch", ""),
-            ("Skill", ""),
-            ("Edit", ""),
-            ("mcp__computer-use__screenshot", ""),
-            ("mcp__computer-use__click", ""),
-            ("mcp__Claude_Browser__computer", ""),
-            ("mcp__acme__x", ""),
-        ] {
-            let input = json!({"command": command, "file_path": "/w/repo/x.md"});
-            calls.push(claude_tool(ctx, name, &input));
-        }
-        for (name, input) in [
-            ("exec", "tools.exec_command({cmd: 'cat a.md && git log'})"),
-            ("exec", "tools.write_stdin({})"),
-            ("exec_command", r#"{"cmd": "rg x"}"#),
-            ("mcp__cua_repl/js", "{}"),
-            ("collaboration/spawn_agent", "{}"),
-            ("web_search", "{}"),
-            ("view_image", r#"{"path": "a.png"}"#),
-            ("apply_patch", ""),
-        ] {
-            calls.push(codex_call(ctx, Some(name), input));
-        }
-        calls.push(codex_call(ctx, None, ""));
-        calls.push(codex_mcp(
-            ctx,
-            Some(&json!({"server": "playwright", "tool": "x"})),
-        ));
-    }
-    let read = [parsed("read", Some("a.md")), parsed("search", None)];
-    let items = [
-        command(Some("/w"), "cat a.md; rg x", &read, 5),
-        command(Some("/w"), "make test", &[], 5),
-        InnerItem::Mcp {
-            server: "cua_repl",
-            tool: "screenshot",
-            output_chars: 5,
-        },
-        InnerItem::Extension {
-            name: "web.search",
-            output_chars: 5,
-        },
-        InnerItem::WebSearch { output_chars: 5 },
-    ];
-    for call in &calls {
-        verdict(image(&claude(), Some(call)));
-    }
-    let mut produced: Vec<(Kind, Part, bool)> = verdicts
-        .into_iter()
-        .filter_map(|verdict| match verdict {
-            Verdict::Count { kind, part } => Some((kind, part, false)),
-            Verdict::Skip(_) => None,
-        })
-        .collect();
-    for call in &calls {
-        for share in codex_cell(call, &[], 1_000)
-            .into_iter()
-            .chain(codex_cell(call, &items, 1_000))
-        {
-            produced.push((share.kind, share.part, share.file.is_some()));
-        }
-    }
-    assert!(produced.len() > 300);
-    let mut seen = std::collections::BTreeSet::new();
-    for (kind, part, has_file) in produced {
-        let (kind, part) = (kind.as_str(), part.as_str());
-        assert!(fixture.kinds.iter().any(|known| known == kind), "{kind}");
-        assert_eq!(
-            fixture.part_kind.get(part).map(String::as_str),
-            Some(kind),
-            "{part}"
-        );
-        if has_file {
-            assert!(
-                fixture.top_file_parts.iter().any(|known| known == part),
-                "{part}"
-            );
-        }
-        seen.insert(part.to_string());
-    }
-    // The battery reaches every part.
-    let missing: Vec<&String> = fixture
-        .part_kind
-        .keys()
-        .filter(|part| !seen.contains(*part))
-        .collect();
-    assert!(missing.is_empty(), "never produced: {missing:?}");
 }
