@@ -162,7 +162,11 @@ fn publish(
             index,
         );
     }
-    with_enabled(|| finish_page(&mut items, index, telemetry));
+    {
+        let _resumed_prefix =
+            crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+        finish_page(&mut items, index, telemetry);
+    }
     items
 }
 fn rows_of(item: &SnapshotItem) -> impl Iterator<Item = &crate::snapshots::SnapshotModelUsage> {
@@ -180,8 +184,10 @@ fn cleanup(paths: &[&Path]) {
 
 #[test]
 fn e2_thinking_300_matches_an_otel_zero_and_rejects_a_different_count() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
-    with_enabled(|| {
+    {
         let p = root_file("thinking");
         let index = ScanIndex::default();
         let mut thinking = line("r", &at(1), 10);
@@ -209,13 +215,15 @@ fn e2_thinking_300_matches_an_otel_zero_and_rejects_a_different_count() {
         assert_eq!(requests(&items[0], None), 1);
         assert_eq!(fold(&items[0]).disclosed, 1, "incompatible row disclosed");
         cleanup(&[&p]);
-    });
+    };
 }
 
 #[test]
 fn e2_model_less_record_attaches_through_its_native_fallback_key() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
-    with_enabled(|| {
+    {
         let p = root_file("model-none");
         let index = ScanIndex::default();
         let mut bare = line("b", &at(2), 20);
@@ -236,13 +244,15 @@ fn e2_model_less_record_attaches_through_its_native_fallback_key() {
         assert_eq!(f.disclosed, 0);
         assert_eq!(f.entity.totals().0.input, 30);
         cleanup(&[&p]);
-    });
+    };
 }
 
 #[test]
 fn e2_untimed_record_attaches_from_the_bucket_fallback() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
-    with_enabled(|| {
+    {
         let p = root_file("untimed");
         let index = ScanIndex::default();
         let mut untimed = line("b", &at(2), 20);
@@ -266,13 +276,15 @@ fn e2_untimed_record_attaches_from_the_bucket_fallback() {
         );
         assert_eq!(fold(&items[0]).disclosed, 1, "the attach discloses nothing");
         cleanup(&[&p]);
-    });
+    };
 }
 
 #[test]
 fn e2_hour_boundary_keeps_the_transcript_hour() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
-    with_enabled(|| {
+    {
         let p = root_file("hour");
         let index = ScanIndex::default();
         let mut items = vec![parse(
@@ -292,13 +304,15 @@ fn e2_hour_boundary_keeps_the_transcript_hour() {
             .collect::<Vec<_>>();
         assert_eq!(buckets, vec![(HOUR, MATCHED)]);
         cleanup(&[&p]);
-    });
+    };
 }
 
 #[test]
 fn e2_otel_only_fast_speed_and_effort_join_the_reported_key() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
-    with_enabled(|| {
+    {
         let p = root_file("speed");
         let index = ScanIndex::default();
         let items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
@@ -323,14 +337,16 @@ fn e2_otel_only_fast_speed_and_effort_join_the_reported_key() {
         let got = publish(items, None, TelemetryRead::Loaded, &index);
         assert!(rows_of(&got[0]).all(|row| row.reasoning_effort.as_deref() == Some("high")));
         cleanup(&[&p]);
-    });
+    };
 }
 
 #[test]
 fn e2_failed_or_missing_telemetry_read_is_never_complete() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         let p = root_file("failed");
         let index = ScanIndex::default();
         let lines = [line("r", &at(1), 10)];
@@ -358,14 +374,16 @@ fn e2_failed_or_missing_telemetry_read_is_never_complete() {
         assert_eq!(unread[0].telemetry_owned_complete, Some(false));
         assert!(unread[0].cost.is_none());
         cleanup(&[&p]);
-    })
+    }
 }
 
 #[test]
 fn e2_oversized_sidecar_is_incomplete_and_attaches_nothing() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         let p = root_file("oversized");
         let index = ScanIndex::default();
         let support = scratch("oversized-support");
@@ -386,14 +404,16 @@ fn e2_oversized_sidecar_is_incomplete_and_attaches_nothing() {
         assert_eq!(got[0].request_count, 1);
         fs::remove_dir_all(support).unwrap();
         cleanup(&[&p]);
-    })
+    }
 }
 
 #[test]
 fn e2_path_twins_attach_the_row_once() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         let first = root_file("twin-a");
         let copy = root_file("twin-b");
         let mut index = ScanIndex::default();
@@ -426,14 +446,16 @@ fn e2_path_twins_attach_the_row_once() {
             );
         }
         cleanup(&[&first, &copy]);
-    })
+    }
 }
 
 #[test]
 fn e2_unpriced_row_is_telemetry_unpriced() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         let p = root_file("unpriced");
         let index = ScanIndex::default();
         let mut unpriced = row("r", 1, 10);
@@ -455,13 +477,15 @@ fn e2_unpriced_row_is_telemetry_unpriced() {
                     == Some("telemetry_unpriced")
         }));
         cleanup(&[&p]);
-    })
+    }
 }
 
 #[test]
 fn e2_priced_and_unpriced_rows_in_one_hour_stay_separate() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
-    with_enabled(|| {
+    {
         let p = root_file("mixed");
         let index = ScanIndex::default();
         let mut unpriced = row("u", 2, 20);
@@ -496,14 +520,16 @@ fn e2_priced_and_unpriced_rows_in_one_hour_stay_separate() {
             BTreeSet::from(["telemetry_matched", "telemetry_unpriced"])
         );
         cleanup(&[&p]);
-    });
+    };
 }
 
 #[test]
 fn e2_move_then_copy_across_restart_counts_each_request_once() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         let a = root_file("move-a");
         let b = root_file("move-b");
         let c = root_file("move-c");
@@ -549,14 +575,16 @@ fn e2_move_then_copy_across_restart_counts_each_request_once() {
             index = restart(&index);
         }
         cleanup(&[&a, &b, &c]);
-    })
+    }
 }
 
 #[test]
 fn e2_restored_twins_both_prebirth_skip_exactly_one_never_both() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         let history = [line("h1", &at(-100), 1), line("h2", &at(-90), 2)];
         for (x_birth, y_birth) in [(0, 5), (5, 0), (0, 0)] {
             let x = root_file("restored-x");
@@ -600,7 +628,7 @@ fn e2_restored_twins_both_prebirth_skip_exactly_one_never_both() {
             assert_eq!(fold(&alone).entity.totals().1, 2);
             cleanup(&[&x, &y]);
         }
-    })
+    }
 }
 
 #[test]
@@ -633,9 +661,11 @@ fn e2_writer_certificate_refuses_mixed_versions_in_either_order() {
 
 #[test]
 fn e2_exact_removal_totals() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         let p = root_file("removal");
         let index = ScanIndex::default();
         let mut copy = line("c", &at(-100), 10);
@@ -665,13 +695,15 @@ fn e2_exact_removal_totals() {
             })
         );
         cleanup(&[&p]);
-    })
+    }
 }
 
 #[test]
 fn e2_side_call_goes_to_the_trace_named_subagent_else_the_root() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
-    with_enabled(|| {
+    {
         let p = root_file("side");
         let agent = p
             .parent()
@@ -730,16 +762,18 @@ fn e2_side_call_goes_to_the_trace_named_subagent_else_the_root() {
             .iter()
             .all(|item| item.telemetry_owned_complete == Some(true)));
         let _ = fs::remove_dir_all(p.parent().unwrap());
-    });
+    };
 }
 
 #[test]
 fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // A trace-named member the walk has not discovered may still have a
     // transcript that counts the row: the root holds rather than count it
     // twice. Once the family directory is listed, a member still without a
     // transcript falls back to the root (COST Q3).
-    with_enabled(|| {
+    {
         let p = root_file("side-wait");
         let family = p.parent().unwrap().join(ROOT);
         let read = sidecar(&[row("r", 1, 10), row("named", 4, 40)]);
@@ -771,7 +805,7 @@ fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory(
             );
         }
         let _ = fs::remove_dir_all(p.parent().unwrap());
-    });
+    };
 }
 
 fn queued_traversal(queued: &[PathBuf], candidates: &[PathBuf]) -> ScanIndex {
@@ -840,9 +874,11 @@ fn e2_gate_on_defers_a_root_whose_family_directory_is_queued() {
 
 #[test]
 fn e2_resolver_conflict_is_counted_and_emitted() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         let p = root_file("conflict");
         let index = ScanIndex::default();
         let a = line("x", &at(1), 10);
@@ -865,11 +901,13 @@ fn e2_resolver_conflict_is_counted_and_emitted() {
             .get("resolver_conflict_count")
             .is_none());
         cleanup(&[&p]);
-    })
+    }
 }
 
 #[test]
 fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     let first = root_file("withheld-a");
     let copy = root_file("withheld-b");
     let index = ScanIndex::default();
@@ -890,10 +928,10 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
     // Held (absent twin, uncertified, ...): both paths stay, untouched, and
     // the session is returned so the caller holds it (owed, not settled).
     // Gate on publishes, so it parses gate on too: dark keeps no grains.
-    let mut items = with_enabled(page);
+    let mut items = page();
     items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
     let before = canonical(&items);
-    let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
+    let withheld = { finish_page(&mut items, &index, TelemetryRead::Loaded) };
     assert_eq!(withheld, BTreeSet::from([ROOT.to_owned()]));
     assert_eq!(items.len(), 2, "no path of a withheld session is dropped");
     assert_eq!(canonical(&items), before);
@@ -901,17 +939,11 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
         .iter()
         .all(|item| item.usage_accounting_contract.is_none()));
     // Not held: one summed body, nothing withheld.
-    let mut items = with_enabled(page);
-    let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
+    let mut items = page();
+    let withheld = { finish_page(&mut items, &index, TelemetryRead::Loaded) };
     assert!(withheld.is_empty());
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].request_count, 2);
-    // Gate off withholds nothing and changes nothing.
-    let mut items = with_disabled(page);
-    items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
-    let before = canonical(&items);
-    assert!(with_disabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded)).is_empty());
-    assert_eq!(canonical(&items), before);
     cleanup(&[&first, &copy]);
 }
 
@@ -999,9 +1031,11 @@ fn e2_diagnostic_fields_are_nonzero_only() {
 
 #[test]
 fn e2_reported_selector_inputs_keep_model_speed_effort_and_hour() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         let p = root_file("selector-parity");
         let index = ScanIndex::default();
         for native_model in [true, false] {
@@ -1066,7 +1100,7 @@ fn e2_reported_selector_inputs_keep_model_speed_effort_and_hour() {
             }
         }
         cleanup(&[&p]);
-    })
+    }
 }
 
 #[test]
@@ -1148,6 +1182,8 @@ fn e2_side_call_key_reuse_is_exact_per_utc_hour() {
 
 #[test]
 fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     use crate::snapshots::claude_request_census::{
         record_claude_request_census, ClaudeRequestCensusParse,
     };
@@ -1160,7 +1196,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
     fs::create_dir_all(&agents).unwrap();
     let mut index = ScanIndex::default();
     let id = |i: usize| format!("req-{i:06}");
-    // The gate is a build constant: each mode parses its own page.
+    // Parse request-owned money through the production resolver.
     let parse_page = |index: &ScanIndex| {
         let mut items = Vec::with_capacity(MEMBERS);
         for member in 0..MEMBERS {
@@ -1184,8 +1220,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         }
         items
     };
-    let items = with_disabled(|| parse_page(&index));
-    let items_enabled = with_enabled(|| parse_page(&index));
+    let items = parse_page(&index);
     // An off-page member is parsed through the native resolver and recorded
     // through the actual census writer, rather than hand-feeding holder sets.
     let off_page_path = agents.join("agent-off-page.jsonl");
@@ -1256,28 +1291,9 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         ROWS * 8
     );
     drop(view);
-    let wire = |items: &[SnapshotItem]| {
-        items
-            .iter()
-            .map(|item| {
-                (
-                    crate::canonical_json::canonicalize(&serde_json::to_value(item).unwrap())
-                        .unwrap(),
-                    item.snapshot_fingerprint.clone(),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    let before = wire(&items);
-    for enabled in [false, true] {
-        let in_mode = |run: &mut dyn FnMut()| {
-            if enabled {
-                with_enabled(run)
-            } else {
-                with_disabled(run)
-            }
-        };
-        let parsed = if enabled { &items_enabled } else { &items };
+    {
+        let enabled = true;
+        let parsed = &items;
         // Wall clock without the allocation probe: its born-pointer table
         // locks and walks on every allocation and free of every thread.
         // Fresh row copies per pass: no fingerprint result carried over.
@@ -1285,29 +1301,24 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         let mut page = parsed.clone();
         take_stages();
         let start = Instant::now();
-        in_mode(&mut || {
+        {
             attach_page(&mut page, &read);
             side_calls_page(&mut page, &api, &trace, &index);
-        });
+        }
         drop(api);
         let enrichment_time = start.elapsed();
         let stages = take_stages();
         // The same work on an identical page, for the born-in-scope peak only.
-        // Dark attach moves the tally, not grains: one probed pass per mode.
+        // Measure one identical request-owned pass.
         let (allocation, probed_time) = {
             let api = api_report(&read);
             let mut probed = parsed.clone();
             let probe_start = Instant::now();
-            let mut allocation = None;
-            in_mode(&mut || {
-                allocation = Some(
-                    crate::retry_allocation_probe::measure_caller_thread(|| {
-                        attach_page(&mut probed, &read);
-                        side_calls_page(&mut probed, &api, &trace, &index);
-                    })
-                    .1,
-                );
-            });
+            let allocation = crate::retry_allocation_probe::measure_caller_thread(|| {
+                attach_page(&mut probed, &read);
+                side_calls_page(&mut probed, &api, &trace, &index);
+            })
+            .1;
             let probed_time = probe_start.elapsed();
             take_stages();
             assert!(page.iter().zip(&probed).all(|(a, b)| {
@@ -1316,7 +1327,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
                     && fold(a).entity.estimated_requests() == fold(b).entity.estimated_requests()
                     && fold(a).side_requests == fold(b).side_requests
             }));
-            (allocation.unwrap(), probed_time)
+            (allocation, probed_time)
         };
         assert!(page
             .iter()
@@ -1335,7 +1346,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
                 .sum::<u64>(),
             (2 * ROWS - MEMBERS - OFF_PAGE) as u64
         );
-        if enabled {
+        {
             // Grain detail exists only with the gate on.
             assert_eq!(
                 page.iter().map(|item| requests(item, MATCHED)).sum::<u64>(),
@@ -1361,23 +1372,15 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         // The bound covers attach and side calls outside the gate, as it
         // always has. Gate on adds the identity owner's root-account
         // inheritance and account-keyed grains: reported by F3_PERF below.
-        assert!(
-            enabled || allocation.requested_peak_with_overlap <= 2 * 1024 * 1024,
-            "attach+side-call born-in-scope allocation peak: {allocation:?}"
-        );
         let finish_start = Instant::now();
-        let withheld = if enabled {
-            with_enabled(|| finish_page(&mut page, &index, TelemetryRead::Loaded))
-        } else {
-            with_disabled(|| finish_page(&mut page, &index, TelemetryRead::Loaded))
-        };
+        let withheld = finish_page(&mut page, &index, TelemetryRead::Loaded);
         assert!(withheld.is_empty());
         let pipeline_time = enrichment_time + finish_start.elapsed();
         assert!(
             pipeline_time < Duration::from_secs(30),
             "real pipeline took {pipeline_time:?}"
         );
-        if enabled {
+        {
             assert_eq!(page.len(), MEMBERS);
             assert_eq!(
                 page.iter().map(|item| item.request_count).sum::<u64>(),
@@ -1386,12 +1389,6 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             assert!(page
                 .iter()
                 .all(|item| item.telemetry_owned_complete == Some(false)));
-        } else {
-            assert_eq!(
-                wire(&page),
-                before,
-                "dark mode preserves all bytes and fingerprints"
-            );
         }
         eprintln!("F3_PERF rows={ROWS} members={MEMBERS} off_page={OFF_PAGE} enabled={enabled} membership_join_us={} attach_side_us={} attach_side_probed_us={} pipeline_us={} born_peak_bytes={} not_rss=true",
             join_time.as_micros(), enrichment_time.as_micros(), probed_time.as_micros(), pipeline_time.as_micros(), allocation.requested_peak_with_overlap);
@@ -1466,9 +1463,11 @@ fn stage_twins(index: &mut ScanIndex, paths: &[(&Path, i128)]) {
 
 #[test]
 fn e2_first_ever_restored_root_twins_stage_before_either_fold() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         for reverse in [false, true] {
             let early = root_file("first-early");
             let later = root_file("first-later");
@@ -1505,7 +1504,7 @@ fn e2_first_ever_restored_root_twins_stage_before_either_fold() {
             assert_eq!(got[0].removed_request_count, Some(2));
             cleanup(&[&early, &later]);
         }
-    })
+    }
 }
 
 fn agent_file(name: &str) -> PathBuf {
@@ -1518,9 +1517,11 @@ fn agent_file(name: &str) -> PathBuf {
 
 #[test]
 fn e2_subagent_twins_identical_and_overlapping_count_once_in_both_orders() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         for overlap in [false, true] {
             for reverse in [false, true] {
                 let early = agent_file("sub-early");
@@ -1573,14 +1574,16 @@ fn e2_subagent_twins_identical_and_overlapping_count_once_in_both_orders() {
                 fs::remove_dir_all(later.ancestors().nth(3).unwrap()).unwrap();
             }
         }
-    })
+    }
 }
 
 #[test]
 fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         for (truncated, partial) in [(false, false), (false, true), (true, false), (true, true)] {
             let early = root_file("stale-early");
             let later = root_file("stale-later");
@@ -1660,7 +1663,7 @@ fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
             assert_eq!(got[0].removed_usage, Some(ClaudeRemovedUsage::default()));
             cleanup(&[&early, &later]);
         }
-    })
+    }
 }
 
 fn without_version(mut value: Value) -> Value {
@@ -1670,9 +1673,11 @@ fn without_version(mut value: Value) -> Value {
 
 #[test]
 fn e2_missing_own_writer_invalidates_known_prefix_and_both_own_orders() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         let path = root_file("missing-writer");
         let index = ScanIndex::default();
         for order in [0, 1, 2, 3, 4] {
@@ -1702,14 +1707,16 @@ fn e2_missing_own_writer_invalidates_known_prefix_and_both_own_orders() {
             assert_eq!(got[0].request_count, lines.len() as u64);
         }
         cleanup(&[&path]);
-    })
+    }
 }
 
 #[test]
 fn e2_all_prebirth_twins_require_known_response_writers() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         for missing in [false, true] {
             let early = root_file("unknown-early");
             let later = root_file("unknown-later");
@@ -1739,7 +1746,7 @@ fn e2_all_prebirth_twins_require_known_response_writers() {
             assert_eq!((got[0].request_count, got[0].input_tokens), (2, 20));
             cleanup(&[&early, &later]);
         }
-    })
+    }
 }
 
 const ORG_A: &str = "11111111-1111-4111-8111-111111111111";
@@ -1824,7 +1831,9 @@ fn assert_evidence_referenced(item: &SnapshotItem) {
 
 #[test]
 fn e2_identity_mixed_login_inherits_earlier_native_request_and_rereads_identically() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-mixed");
         let index = ScanIndex::default();
         // Lexical request-id order is deliberately unrelated to native order.
@@ -1898,12 +1907,14 @@ fn e2_identity_mixed_login_inherits_earlier_native_request_and_rereads_identical
             serde_json::to_vec(&upload_items[0]).unwrap()
         );
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_conflict_preserves_own_and_earlier_orgs() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-conflict");
         let mut index = ScanIndex::default();
         index.session_account_bindings.insert(
@@ -1934,12 +1945,14 @@ fn e2_identity_conflict_preserves_own_and_earlier_orgs() {
         assert!(fold(&item).accounts.as_ref().unwrap().conflict);
         assert_evidence_referenced(&item);
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_subagent_inherits_root_and_unknown_root_stays_unknown() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for known in [true, false] {
             let path = root_file("identity-agent");
             let agent = path
@@ -1986,12 +1999,14 @@ fn e2_identity_subagent_inherits_root_and_unknown_root_stays_unknown() {
             }
             cleanup(&[&path]);
         }
-    });
+    };
 }
 
 #[test]
 fn e2_identity_single_account_bytes_unchanged_by_repeated_same_org_evidence() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-single");
         let index = ScanIndex::default();
         let first = line("a", &at(1), 10);
@@ -2022,12 +2037,14 @@ fn e2_identity_single_account_bytes_unchanged_by_repeated_same_org_evidence() {
         );
         assert!(!fold(&one).accounts.as_ref().unwrap().mixed);
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_later_org_cannot_claim_unknown_start_or_other_session() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-no-lookahead");
         let index = ScanIndex::default();
         let item = tag_owned(
@@ -2068,12 +2085,14 @@ fn e2_identity_later_org_cannot_claim_unknown_start_or_other_session() {
         assert!(!fold(&item).accounts.as_ref().unwrap().conflict);
         assert_evidence_referenced(&item);
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_conflicting_markers_on_one_request_fall_back_without_splitting() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-same-request-conflict");
         let index = ScanIndex::default();
         let item = tag_owned(
@@ -2100,16 +2119,18 @@ fn e2_identity_conflicting_markers_on_one_request_fall_back_without_splitting() 
         );
         assert_evidence_referenced(&item);
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_mid_session_request_with_two_orgs_goes_to_the_starting_account() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // R3-N2 (QUOTA): two different trusted orgs on one later request are
     // never guessed (neither the first nor the last); the request goes to
     // the starting account, counted, and a later markerless request inherits it.
     const ORG_C: &str = "33333333-3333-4333-8333-333333333333";
-    with_enabled(|| {
+    {
         let path = root_file("identity-mid-session-pair");
         let index = ScanIndex::default();
         let item = tag_owned(
@@ -2143,16 +2164,18 @@ fn e2_identity_mid_session_request_with_two_orgs_goes_to_the_starting_account() 
         );
         assert_evidence_referenced(&item);
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_two_org_request_with_its_own_telemetry_login_goes_to_the_starting_account() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // SOURCE R2-N2: the R3-N2 pair request also carries its own exact
     // telemetry login. Two orgs on one request are never guessed, and the
     // login does not move it either: starting account, counted.
     const ORG_C: &str = "33333333-3333-4333-8333-333333333333";
-    with_enabled(|| {
+    {
         let path = root_file("identity-pair-own-login");
         let index = ScanIndex::default();
         let mut items = vec![parse(
@@ -2202,12 +2225,14 @@ fn e2_identity_two_org_request_with_its_own_telemetry_login_goes_to_the_starting
         );
         assert_evidence_referenced(&item);
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_attach_unpriced_and_side_calls_keep_account_partition() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-attached");
         let index = ScanIndex::default();
         let mut items = vec![parse(
@@ -2278,12 +2303,14 @@ fn e2_identity_attach_unpriced_and_side_calls_keep_account_partition() {
         assert!(unpriced.cost_usd.is_none());
         assert_evidence_referenced(&item);
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_telemetry_contradiction_preserves_own_orgs() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         use crate::claude_local_otel::{
             ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin,
             ClaudeIdentityDisposition, ClaudeRequestIdentityEvidence,
@@ -2331,12 +2358,14 @@ fn e2_identity_telemetry_contradiction_preserves_own_orgs() {
         assert!(fold(&item).accounts.as_ref().unwrap().conflict);
         assert_evidence_referenced(&item);
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_copied_requests_leave_only_referenced_new_account_evidence() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-copy");
         let index = ScanIndex::default();
         let item = tag_owned(
@@ -2364,12 +2393,14 @@ fn e2_identity_copied_requests_leave_only_referenced_new_account_evidence() {
         );
         assert_evidence_referenced(&item);
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_final_grouping_includes_disjoint_path_twins_in_either_order() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for reverse in [false, true] {
             let path_a = root_file("identity-twin-a");
             let path_b = root_file("identity-twin-b");
@@ -2396,7 +2427,7 @@ fn e2_identity_final_grouping_includes_disjoint_path_twins_in_either_order() {
             assert_evidence_referenced(&items[0]);
             cleanup(&[&path_a, &path_b]);
         }
-    });
+    };
 }
 
 fn identity_api_row(id: &str, sequence: u64, input: u64, org: &str) -> ClaudeLocalOtelEvidence {
@@ -2422,7 +2453,9 @@ fn identity_api_row(id: &str, sequence: u64, input: u64, org: &str) -> ClaudeLoc
 
 #[test]
 fn e2_identity_twin_native_mapping_survives_side_pass_before_reconciliation() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for reverse in [false, true] {
             let a = root_file("identity-native-a");
             let b = root_file("identity-native-b");
@@ -2464,12 +2497,14 @@ fn e2_identity_twin_native_mapping_survives_side_pass_before_reconciliation() {
             assert_evidence_referenced(&items[0]);
             cleanup(&[&a, &b]);
         }
-    });
+    };
 }
 
 #[test]
 fn e2_identity_marker_cap_keeps_starting_org_with_or_without_different_binding() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for count in [64, 65] {
             for bound in [None, Some("b".repeat(64))] {
                 let path = root_file("identity-marker-cap");
@@ -2505,12 +2540,14 @@ fn e2_identity_marker_cap_keeps_starting_org_with_or_without_different_binding()
                 cleanup(&[&path]);
             }
         }
-    });
+    };
 }
 
 #[test]
 fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         use crate::claude_local_otel::ClaudeIdentityDisposition;
         let path = root_file("identity-account-conflict");
         let index = ScanIndex::default();
@@ -2552,12 +2589,14 @@ fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
         assert!(fold(&item).accounts.as_ref().unwrap().conflict);
         assert_evidence_referenced(&item);
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let a = root_file("identity-cap-a");
         let b = root_file("identity-cap-b");
         let index = ScanIndex::default();
@@ -2597,12 +2636,14 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
         );
         assert_evidence_referenced(&item);
         cleanup(&[&a, &b]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_inherited_counter_streams_union_of_native_twin_requests() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let a = root_file("identity-count-a");
         let b = root_file("identity-count-b");
         let index = ScanIndex::default();
@@ -2634,12 +2675,14 @@ fn e2_identity_inherited_counter_streams_union_of_native_twin_requests() {
             assert_eq!(counts, json!({"claude_inherited_org_requests":2}));
         }
         cleanup(&[&a, &b]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_disjoint_inherited_counter_exceeds_each_twin_in_both_orders() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let a = root_file("identity-count-disjoint-a");
         let b = root_file("identity-count-disjoint-b");
         let index = ScanIndex::default();
@@ -2673,12 +2716,14 @@ fn e2_identity_disjoint_inherited_counter_exceeds_each_twin_in_both_orders() {
             );
         }
         cleanup(&[&a, &b]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_inherited_counter_excludes_held_copies_and_restores_counted_copies() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-count-copy");
         let index = ScanIndex::default();
         for restore in [false, true] {
@@ -2707,12 +2752,14 @@ fn e2_identity_inherited_counter_excludes_held_copies_and_restores_counted_copie
             );
         }
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_external_billing_keeps_cost_without_subscription_identity() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for (field, value) in [("auth_mode", "api_key"), ("billing_provider", "bedrock")] {
             let path = root_file("identity-external");
             let index = ScanIndex::default();
@@ -2748,12 +2795,14 @@ fn e2_identity_external_billing_keeps_cost_without_subscription_identity() {
                 .all(|row| row.evidence_ref.is_none() && row.identity_parts.is_none()));
             cleanup(&[&path]);
         }
-    });
+    };
 }
 
 #[test]
 fn e2_identity_provisional_unknown_twin_does_not_poison_later_marked_twin() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for reverse in [false, true] {
             let a = root_file("identity-retained-a");
             let b = root_file("identity-retained-b");
@@ -2794,12 +2843,14 @@ fn e2_identity_provisional_unknown_twin_does_not_poison_later_marked_twin() {
             assert_evidence_referenced(&items[0]);
             cleanup(&[&a, &b]);
         }
-    });
+    };
 }
 
 #[test]
 fn e2_identity_desktop_request_still_publishes_validated_recent_activity() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-desktop-activity");
         let index = ScanIndex::default();
         let now = time::OffsetDateTime::now_utc()
@@ -2832,12 +2883,14 @@ fn e2_identity_desktop_request_still_publishes_validated_recent_activity() {
             Some(event)
         );
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_recent_desktop_activity_survives_discarded_twin_in_both_orders() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for reverse in [false, true] {
             let cli = root_file("identity-activity-cli-twin");
             let desktop_path = root_file("identity-activity-desktop-twin");
@@ -2910,12 +2963,14 @@ fn e2_identity_recent_desktop_activity_survives_discarded_twin_in_both_orders() 
             );
             cleanup(&[&cli, &desktop_path]);
         }
-    });
+    };
 }
 
 #[test]
 fn e2_identity_unqualified_markerless_twins_use_known_session_start_in_both_orders() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for same_start in [false, true] {
             for reverse in [false, true] {
                 let a = root_file("identity-known-twin");
@@ -2962,12 +3017,14 @@ fn e2_identity_unqualified_markerless_twins_use_known_session_start_in_both_orde
                 cleanup(&[&a, &b]);
             }
         }
-    });
+    };
 }
 
 #[test]
 fn e2_identity_changed_child_only_page_inherits_durable_root_binding_after_restart() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let root = root_file("identity-off-page-root");
         let agent = root
             .parent()
@@ -3014,12 +3071,14 @@ fn e2_identity_changed_child_only_page_inherits_durable_root_binding_after_resta
             assert_evidence_referenced(&item);
         }
         cleanup(&[&root]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_branch_and_resume_prefix_markers_cannot_claim_own_requests() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for operation in ["/branch", "/resume"] {
             for fresh_marker in [false, true] {
                 let path = root_file("identity-prefix-marker");
@@ -3090,12 +3149,14 @@ fn e2_identity_branch_and_resume_prefix_markers_cannot_claim_own_requests() {
                 cleanup(&[&path]);
             }
         }
-    });
+    };
 }
 
 #[test]
 fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-markerless-desktop");
         let index = ScanIndex::default();
         let now = time::OffsetDateTime::now_utc()
@@ -3155,12 +3216,14 @@ fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
             Some(event)
         );
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_failed_tag_restores_activity_and_refusals() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-failed-tag");
         let index = ScanIndex::default();
         let mut items = vec![parse(
@@ -3192,12 +3255,14 @@ fn e2_identity_failed_tag_restores_activity_and_refusals() {
         assert_eq!((outcome.sent, outcome.ineligible), (0, 1));
         assert_eq!(serde_json::to_vec(&items).unwrap(), before);
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_twin_start_fills_only_unmarked_prefix_before_own_org_run() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for reverse in [false, true] {
             let a = root_file("identity-prefix-twin-a");
             let b = root_file("identity-prefix-twin-b");
@@ -3246,12 +3311,14 @@ fn e2_identity_twin_start_fills_only_unmarked_prefix_before_own_org_run() {
             assert_evidence_referenced(&item);
             cleanup(&[&a, &b]);
         }
-    });
+    };
 }
 
 #[test]
 fn e2_identity_retained_session_binding_fills_only_missing_native_shares() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-retained-start");
         let mut index = ScanIndex::default();
         index.session_account_bindings.insert(
@@ -3298,12 +3365,14 @@ fn e2_identity_retained_session_binding_fills_only_missing_native_shares() {
         assert!(!fold(&item).accounts.as_ref().unwrap().conflict);
         assert_evidence_referenced(&item);
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_three_contradictory_start_twins_preserve_own_orgs_deterministically() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let a = root_file("identity-start-conflict-a");
         let b = root_file("identity-start-conflict-b");
         let c = root_file("identity-start-conflict-c");
@@ -3347,12 +3416,14 @@ fn e2_identity_three_contradictory_start_twins_preserve_own_orgs_deterministical
             assert_evidence_referenced(&item);
         }
         cleanup(&[&a, &b, &c]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_copied_prefix_cannot_choose_subagent_or_side_call_start() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let path = root_file("identity-own-start");
         let agent = path
             .parent()
@@ -3423,12 +3494,14 @@ fn e2_identity_copied_prefix_cannot_choose_subagent_or_side_call_start() {
                 .map(String::as_str)
                 == Some("telemetry_reported")));
         cleanup(&[&path]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_marker_overflow_drops_excluded_starting_witness() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for bound in [None, Some("c".repeat(64))] {
             let path = root_file("identity-copy-marker-overflow");
             let index = ScanIndex::default();
@@ -3472,7 +3545,7 @@ fn e2_identity_marker_overflow_drops_excluded_starting_witness() {
             assert_evidence_referenced(&item);
             cleanup(&[&path]);
         }
-    });
+    };
 }
 
 /// Fold final rows by organization, preserving the actual token/request shares.
@@ -3506,7 +3579,9 @@ fn org_amounts(item: &SnapshotItem) -> BTreeMap<String, (u64, u64)> {
 
 #[test]
 fn e2_identity_restored_timed_prefix_keeps_every_counted_org() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for partial in [false, true] {
             let path = root_file("identity-restored-timed");
             let index = ScanIndex::default();
@@ -3542,12 +3617,14 @@ fn e2_identity_restored_timed_prefix_keeps_every_counted_org() {
             assert_evidence_referenced(&item);
             cleanup(&[&path]);
         }
-    });
+    };
 }
 
 #[test]
 fn e2_identity_proven_original_excludes_prefix_without_lending_its_org() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let original = root_file("identity-real-original");
         let copy = root_file("identity-real-branch");
         let mut index = ScanIndex::default();
@@ -3625,12 +3702,14 @@ fn e2_identity_proven_original_excludes_prefix_without_lending_its_org() {
             assert_evidence_referenced(&item);
         }
         cleanup(&[&original, &copy]);
-    });
+    };
 }
 
 #[test]
 fn e2_identity_equal_start_login_org_twins_keep_own_orgs_with_binding() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         // Durable, qualified telemetry and Desktop-bound login variants.
         for login_source in [0, 1, 2] {
             for reverse in [false, true] {
@@ -3718,12 +3797,14 @@ fn e2_identity_equal_start_login_org_twins_keep_own_orgs_with_binding() {
                 cleanup(&[&a, &b]);
             }
         }
-    });
+    };
 }
 
 #[test]
 fn e2_identity_copy_rebuild_keeps_later_marker_boundary_and_cost_attachment() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for bound in [None, Some("c".repeat(64))] {
             let path = root_file("identity-copy-boundary");
             let index = ScanIndex::default();
@@ -3781,12 +3862,14 @@ fn e2_identity_copy_rebuild_keeps_later_marker_boundary_and_cost_attachment() {
             assert_evidence_referenced(&item);
             cleanup(&[&path]);
         }
-    });
+    };
 }
 
 #[test]
 fn e2_identity_conflicting_twin_bindings_clear_root_fallback_in_every_order() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         let a = root_file("identity-bound-conflict-a");
         let b = root_file("identity-bound-conflict-b");
         let c = root_file("identity-bound-conflict-c");
@@ -3867,7 +3950,7 @@ fn e2_identity_conflicting_twin_bindings_clear_root_fallback_in_every_order() {
             assert_evidence_referenced(root);
         }
         cleanup(&[&a, &b, &c]);
-    });
+    };
 }
 
 // ---- I4b ----
@@ -3886,8 +3969,10 @@ fn remove_agent_scratch(paths: &[&Path]) {
 
 #[test]
 fn e2_side_call_named_member_without_transcript_falls_back_to_the_root() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Grain detail exists only with the gate on: dark keeps no grain map.
-    with_enabled(|| {
+    {
         let p = root_file("side-ghost");
         let agent = p
             .parent()
@@ -3918,7 +4003,7 @@ fn e2_side_call_named_member_without_transcript_falls_back_to_the_root() {
         assert_eq!((requests(&items[1], REPORTED), sub.root_fallbacks), (0, 0));
         assert_eq!(root.side.input, 40, "counted once, on the root");
         let _ = fs::remove_dir_all(p.parent().unwrap());
-    });
+    };
 }
 
 #[test]
@@ -3959,9 +4044,11 @@ fn e2_side_call_census_deadline_counts_nothing_and_reports_the_family() {
 
 #[test]
 fn e2_equal_birth_subagent_twins_count_once_in_both_orders() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         for reverse in [false, true] {
             let early = agent_file("equal-sub-a");
             let later = agent_file("equal-sub-b");
@@ -3993,14 +4080,16 @@ fn e2_equal_birth_subagent_twins_count_once_in_both_orders() {
             assert_eq!(got[0].removed_request_count, Some(2));
             remove_agent_scratch(&[&early, &later]);
         }
-    })
+    }
 }
 
 #[test]
 fn e2_absent_subagent_twin_holds_its_session() {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
-    with_enabled(|| {
+    {
         let early = agent_file("absent-sub-early");
         let later = agent_file("absent-sub-later");
         let mut index = ScanIndex::default();
@@ -4020,16 +4109,16 @@ fn e2_absent_subagent_twin_holds_its_session() {
         assert_eq!(session, format!("{ROOT}_agent-abc"));
         // The earlier path is indexed and on disk but not on this page.
         let mut items = vec![page(&index)];
-        let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
+        let withheld = { finish_page(&mut items, &index, TelemetryRead::Loaded) };
         assert_eq!(withheld, BTreeSet::from([session]));
         // Both paths on the page: one body, nothing withheld.
         let mut items = vec![first, page(&index)];
-        let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
+        let withheld = { finish_page(&mut items, &index, TelemetryRead::Loaded) };
         assert!(withheld.is_empty());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].request_count, 2);
         remove_agent_scratch(&[&early, &later]);
-    })
+    }
 }
 
 #[test]
@@ -4214,7 +4303,9 @@ fn e2_fingerprint_check_matches_the_blanked_copy_rule_on_every_shape() {
 
 #[test]
 fn e2_identity_incomplete_clock_survives_discarded_twin_in_both_orders() {
-    with_enabled(|| {
+    let _resumed_prefix =
+        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
+    {
         for reverse in [false, true] {
             let path_a = root_file("identity-clock-twin-a");
             let path_b = root_file("identity-clock-twin-b");
@@ -4246,5 +4337,5 @@ fn e2_identity_incomplete_clock_survives_discarded_twin_in_both_orders() {
             );
             cleanup(&[&path_a, &path_b]);
         }
-    });
+    };
 }

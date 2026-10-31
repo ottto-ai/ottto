@@ -6,6 +6,7 @@
 //! one exact managed root before handing identity/quota verification back to
 //! the existing collector.
 
+use crate::locked_state_dir::{open_private_lock_file, FileLock};
 use ottto_core::{
     default_support_dir, prepare_managed_claude_provisional_root, write_owner_only_file_atomic,
     ClaudeConfigDirSlot, FileClaudeConfigSlotSettingsStore, CLAUDE_MANAGED_ACCOUNTS_DIR_NAME,
@@ -171,17 +172,7 @@ impl Drop for StateGuard {
 }
 
 pub(crate) struct OperationGuard {
-    file: File,
-}
-
-impl Drop for OperationGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
-    }
+    _file: FileLock,
 }
 
 /// Lifetime evidence for a provider process that survives daemon restart.
@@ -3750,33 +3741,16 @@ fn transact<T>(mutation: impl FnOnce(&mut PersistedState) -> T) -> Result<T, std
 }
 
 fn state_guard() -> std::io::Result<StateGuard> {
+    use std::os::fd::AsRawFd;
     let process = STATE_TRANSACTION
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     fs::create_dir_all(default_support_dir())?;
-    #[cfg(unix)]
-    let file = {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(default_support_dir().join(STATE_LOCK_FILE))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        file
-    };
-    #[cfg(not(unix))]
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(default_support_dir().join(STATE_LOCK_FILE))?;
+    let file = open_private_lock_file(&default_support_dir().join(STATE_LOCK_FILE))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(StateGuard {
         _process: process,
         file,
@@ -3786,35 +3760,10 @@ fn state_guard() -> std::io::Result<StateGuard> {
 fn operation_guard(operation_id: &str) -> std::io::Result<Option<OperationGuard>> {
     fs::create_dir_all(default_support_dir())?;
     let path = default_support_dir().join(format!("{OPERATION_LOCK_PREFIX}{operation_id}.lock"));
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result != 0 {
-            return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
-                Ok(None)
-            } else {
-                Err(std::io::Error::last_os_error())
-            };
-        }
-        Ok(Some(OperationGuard { file }))
-    }
-    #[cfg(not(unix))]
-    {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)?;
-        Ok(Some(OperationGuard { file }))
+    match FileLock::try_exclusive(open_private_lock_file(&path)?) {
+        Ok(lock) => Ok(Some(OperationGuard { _file: lock })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -3841,48 +3790,26 @@ fn provider_process_guard(
     operation_id: &str,
     nonblocking: bool,
 ) -> std::io::Result<Option<ProviderProcessGuard>> {
+    use std::os::fd::AsRawFd;
     fs::create_dir_all(default_support_dir())?;
     let path =
         default_support_dir().join(format!("{PROVIDER_PROCESS_LOCK_PREFIX}{operation_id}.lock"));
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        let flags = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
-        let result = unsafe { libc::flock(file.as_raw_fd(), flags) };
-        if result != 0 {
-            return if nonblocking
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
-            {
-                Ok(None)
-            } else {
-                Err(std::io::Error::last_os_error())
-            };
-        }
-        Ok(Some(ProviderProcessGuard {
-            file,
-            unlock_on_drop: true,
-        }))
+    let file = open_private_lock_file(&path)?;
+    let flags = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    let result = unsafe { libc::flock(file.as_raw_fd(), flags) };
+    if result != 0 {
+        return if nonblocking
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+        {
+            Ok(None)
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
     }
-    #[cfg(not(unix))]
-    {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)?;
-        Ok(Some(ProviderProcessGuard {
-            file,
-            unlock_on_drop: true,
-        }))
-    }
+    Ok(Some(ProviderProcessGuard {
+        file,
+        unlock_on_drop: true,
+    }))
 }
 
 fn provider_process_active(operation_id: &str) -> std::io::Result<bool> {
@@ -3893,42 +3820,20 @@ fn provider_process_active(operation_id: &str) -> std::io::Result<bool> {
 }
 
 fn admission_guard() -> std::io::Result<AdmissionGuard> {
+    use std::os::fd::AsRawFd;
     let process = ADMISSION_TRANSACTION
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     fs::create_dir_all(default_support_dir())?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(default_support_dir().join(ADMISSION_LOCK_FILE))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(AdmissionGuard {
-            _process: process,
-            file,
-        })
+    let file = open_private_lock_file(&default_support_dir().join(ADMISSION_LOCK_FILE))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    #[cfg(not(unix))]
-    {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(default_support_dir().join(ADMISSION_LOCK_FILE))?;
-        Ok(AdmissionGuard {
-            _process: process,
-            file,
-        })
-    }
+    Ok(AdmissionGuard {
+        _process: process,
+        file,
+    })
 }
 
 fn unix_seconds() -> u64 {

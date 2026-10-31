@@ -147,7 +147,7 @@ fn decision(
 // re-arm backoff bounds the repeated work.
 #[test]
 fn claude_family_pending_reobservation_stays_exact_within_a_window() {
-    let (root, _, items) = claude_account_family_fixture();
+    let (root, _, items) = claude_account_family_fixture(false);
     let full = items[0].clone();
     let mut prefix = full.clone();
     let last_request = prefix
@@ -343,7 +343,7 @@ fn claude_duplicate_fence_full_rearm_backs_off_and_fails_closed() {
 // backoff and the fence opens once coverage completes.
 #[test]
 fn claude_duplicate_fence_reopens_only_after_full_coverage() {
-    let (root, _, items) = claude_account_family_fixture();
+    let (root, _, items) = claude_account_family_fixture(false);
     let unobserved = "/opaque/unobserved-root.jsonl";
     let mut closed = ScanIndex {
         claude_duplicate_request_witness_overflowed: true,
@@ -464,7 +464,7 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
 // disclosed account deferral, stops blocking traversal progress.
 #[test]
 fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
-    let (root, _, items) = claude_account_family_fixture();
+    let (root, _, items) = claude_account_family_fixture(false);
     let mut held = items[0].clone();
     let revision = hex64('a');
     held.source_file_fingerprint = Some(revision.clone());
