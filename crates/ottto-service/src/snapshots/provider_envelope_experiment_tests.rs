@@ -668,7 +668,6 @@ impl SelectionFixture {
             &[],
             false,
             false,
-            false,
         )
     }
     fn run(mut native: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
@@ -706,7 +705,6 @@ impl NativePreparationFixture {
             false,
             None,
             &[],
-            false,
             false,
             false,
         );
@@ -750,7 +748,6 @@ impl NativePreparationFixture {
             false,
             None,
             &[],
-            false,
             false,
             false,
         );
@@ -1015,7 +1012,6 @@ fn native_recovery_priority_scan(
         &[],
         false,
         false,
-        false,
         paths,
     )
 }
@@ -1127,7 +1123,6 @@ fn native_comparison_terminal_checkpoint_moves_outside_cloneable_scan_result() {
         false,
         None,
         &[],
-        false,
         false,
         false,
     );
@@ -1278,7 +1273,6 @@ fn native_comparison_quiet_bounded_page(
         false,
         None,
         &[],
-        false,
         false,
         false,
     );
@@ -1707,7 +1701,6 @@ fn native_observation_duplicate_fixture() -> (
         &[],
         false,
         false,
-        false,
     );
     let (index, scan) = SelectionFixture::run(native);
     assert!(scan.census_complete);
@@ -1878,7 +1871,6 @@ fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
             false,
             None,
             &[],
-            false,
             false,
             false,
         );
@@ -3109,7 +3101,6 @@ fn finish_native_receipt_component_cursor(fixture: &mut NativePreparationFixture
             false,
             None,
             &[],
-            false,
             false,
             false,
         );

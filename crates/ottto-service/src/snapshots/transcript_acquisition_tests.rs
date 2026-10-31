@@ -89,7 +89,6 @@ fn native_parser_with(
         None,
         None,
         false,
-        true,
     )
     .unwrap();
     (parser, expected, scope)
@@ -1161,7 +1160,6 @@ fn production_scan_page_at_with_setup(
         None,
         &[],
         false,
-        true,
     );
     if let Some(cache) = cache {
         scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
@@ -2914,7 +2912,6 @@ fn cached_scan(
         None,
         &[],
         false,
-        true,
     )
     .with_sampled_acquisition(Arc::clone(cache), Scope("mixed-files".into()));
     setup(&mut scan);
@@ -5199,7 +5196,6 @@ fn terminal_off_overlapping_root_retry_preserves_native_scope_and_reads_no_full(
         None,
         &[],
         false,
-        false,
     )
     .with_sampled_acquisition(cache, Scope("terminal-off-overlap".into()));
     let mut candidate = scan.identified_candidates.front().unwrap().clone();
@@ -5207,7 +5203,7 @@ fn terminal_off_overlapping_root_retry_preserves_native_scope_and_reads_no_full(
     // whereas ordinary directory discovery selects the deepest root.
     candidate.scan_root = roots[0].clone();
     let context = scan.sampling.as_ref().unwrap();
-    let scope = context.file_scope(source, &candidate, "", false, false, &scan.index);
+    let scope = context.file_scope(source, &candidate, "", false, &scan.index);
     let (retained, mode, _, _) = acquire_with(
         &fixture,
         source,
@@ -5241,7 +5237,7 @@ fn terminal_off_overlapping_root_retry_preserves_native_scope_and_reads_no_full(
     assert!(!retry.census_member);
     assert!(retry.watcher_hint);
     candidate.scan_root = retry.scan_root.clone();
-    let retry_scope = context.file_scope(source, &candidate, "", false, false, &scan.index);
+    let retry_scope = context.file_scope(source, &candidate, "", false, &scan.index);
     assert_eq!(retry_scope, scope);
     let (retained, retry_mode, _, _) = acquire_with(
         &fixture,
@@ -5260,7 +5256,7 @@ fn terminal_off_overlapping_root_retry_preserves_native_scope_and_reads_no_full(
     // Discriminator: the former deepest-root reconstruction really does
     // invent an otherwise-unjustified native ScopeChanged Full.
     candidate.scan_root = nested;
-    let wrong_scope = context.file_scope(source, &candidate, "", false, false, &scan.index);
+    let wrong_scope = context.file_scope(source, &candidate, "", false, &scan.index);
     let (_, wrong_mode, _, _) = acquire_with(
         &fixture,
         source,
@@ -5304,7 +5300,6 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
         false,
         None,
         &[],
-        false,
         false,
     );
     let original = scan.identified_candidates.front().unwrap().clone();
@@ -5395,7 +5390,6 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
         &active.candidate,
         &dependencies,
         source != SnapshotSource::ClaudeCode || scan.artifacts_enabled,
-        scan.context_curve_enabled,
         &scan.index,
     );
     assert_eq!(
@@ -5491,7 +5485,6 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
             &retry,
             &retry_dependencies,
             source != SnapshotSource::ClaudeCode || scan.artifacts_enabled,
-            scan.context_curve_enabled,
             &index,
         );
         assert_eq!(

@@ -261,7 +261,6 @@ fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
             None,
             &[],
             false,
-            true,
         )
         .with_sampled_acquisition(hold.cache.clone(), Scope(NAMESPACE.into()));
         assert_eq!(scan.audit_now, due);
@@ -333,7 +332,6 @@ fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
                 None,
                 &[],
                 false,
-                true,
             )
             .with_sampled_acquisition(hold.cache.clone(), Scope(NAMESPACE.into()));
             let slot = scan.index.held_audit_progress.as_ref().unwrap();

@@ -157,14 +157,12 @@ fn identity_pipeline_cycle(
         scan_request_window_days(
             preparation.receipt_window_days,
             preparation.backfill_pending,
-            false,
         ),
         MAX_BACKFILL_FILES_PER_SOURCE,
         preparation.upload_policy.session_artifacts_enabled,
         Some(&support),
         &[],
         false,
-        preparation.context_curve_enabled,
         crate::snapshots::claude_request_identity::captures(source),
     );
     let (mut oracle_index, mut oracle_scan) = loop {

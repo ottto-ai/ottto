@@ -218,7 +218,6 @@ fn native_parser(path: &Path) -> (OwnedJsonlParser, String) {
         None,
         None,
         false,
-        true,
     )
     .unwrap();
     (parser, expected)

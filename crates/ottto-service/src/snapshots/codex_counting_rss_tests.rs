@@ -115,7 +115,6 @@ fn acquire(
             None,
             &[],
             false,
-            false,
         );
         if let Some(cache) = cache {
             scan = scan.with_sampled_acquisition(Arc::clone(cache), Scope("synthetic-rss".into()));

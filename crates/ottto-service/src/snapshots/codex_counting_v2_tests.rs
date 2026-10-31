@@ -196,7 +196,6 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
         None,
         false,
         false,
-        false,
         &ScanIndex::default(),
     )
     .unwrap();

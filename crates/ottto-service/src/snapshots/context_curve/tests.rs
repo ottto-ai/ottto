@@ -12,35 +12,6 @@ fn candidates(count: u64) -> Vec<ContextCurveCandidatePoint> {
 }
 
 #[test]
-fn construction_is_deterministic_and_valid() {
-    let candidates = candidates(6);
-    let boundaries = [ContextCurveCandidateBoundary {
-        observed_at: Some("2026-09-22T12:00:03Z".to_string()),
-        point_count_before: 3,
-    }];
-    let build = || {
-        build_context_curve(
-            "synthetic_parser:v1",
-            "synthetic_owner:v1",
-            "synthetic_model:v1",
-            &candidates,
-            &boundaries,
-            "parser_unsupported",
-        )
-    };
-
-    let first = build();
-    let second = build();
-    assert_eq!(first, second);
-    assert_eq!(
-        serde_json::to_vec(&first).unwrap(),
-        serde_json::to_vec(&second).unwrap()
-    );
-    assert_eq!(first.coverage, "complete");
-    validate_context_curve(0, &first).unwrap();
-}
-
-#[test]
 fn validation_rejects_unsafe_revision_evidence() {
     let curve = build_context_curve(
         "unsafe revision",

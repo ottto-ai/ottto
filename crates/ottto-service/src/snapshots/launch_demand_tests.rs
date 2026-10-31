@@ -149,7 +149,6 @@ fn scan(
         None,
         &[],
         false,
-        true,
     )
     .with_sampled_acquisition(
         Arc::new(sampled_scan::SharedCache::default()),

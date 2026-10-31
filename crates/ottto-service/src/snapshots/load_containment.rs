@@ -903,10 +903,6 @@ impl ScanIndex {
             "local snapshot scan index load: scan_index_rebuild_carried_ack_debt_entries={entries} scan_index_rebuild_carried_ack_debt_bytes={bytes}"
         ));
         self.historical_replay_generation = carry.historical_replay_generation;
-        self.context_curve_capability_enabled = carry.context_curve_capability_enabled;
-        self.context_curve_replay_epoch = carry.context_curve_replay_epoch;
-        self.completed_context_curve_replay_generation =
-            carry.completed_context_curve_replay_generation;
         Ok(())
     }
 

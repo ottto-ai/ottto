@@ -101,7 +101,7 @@ impl ContinuationFixture {
             );
         }
         assert!(!index.legacy_settlement_ledger_needs_migration());
-        let generation = cycle_replay_generation(source, false, &index, CONTINUATION_NAMESPACE);
+        let generation = cycle_replay_generation(source, CONTINUATION_NAMESPACE);
         let now = reason_reoffer::now_unix_seconds();
         let _ = prepare_upload_progress_for_cycle_with_reoffer(
             &mut progress,
@@ -147,7 +147,6 @@ impl ContinuationFixture {
             scan_started_at: "2026-10-24T00:00:00Z".into(),
             activity_hint: continuation_hint(true),
             receipt_window_days: 30,
-            context_curve_enabled: false,
             cache_observations_enabled: false,
             scan_agent_status_collection: std::sync::Arc::new(AgentStatusCollection {
                 snapshots: vec![status.clone()],
@@ -325,7 +324,6 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     assert_eq!(prepared.source, SnapshotSource::Codex);
     assert_eq!(prepared.account_witness, minted.account_witness);
     assert_eq!(prepared.receipt_window_days, minted.receipt_window_days);
-    assert_eq!(prepared.context_curve_enabled, minted.context_curve_enabled);
     assert_eq!(
         prepared.cache_observations_enabled,
         minted.cache_observations_enabled
@@ -386,7 +384,7 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         &mut index,
         &mut progress,
     );
-    let generation = cycle_replay_generation(source, false, &index, CONTINUATION_NAMESPACE);
+    let generation = cycle_replay_generation(source, CONTINUATION_NAMESPACE);
     assert_eq!(prepared.replay_generation, generation);
     let now = reason_reoffer::now_unix_seconds();
     let claimed = prepare_upload_progress_for_cycle_with_reoffer(
@@ -649,7 +647,7 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
     assert!(prepare_upload_progress_for_cycle_with_reoffer(
         &mut selected,
         &index,
-        &cycle_replay_generation(SnapshotSource::Codex, false, &index, CONTINUATION_NAMESPACE),
+        &cycle_replay_generation(SnapshotSource::Codex, CONTINUATION_NAMESPACE),
         false,
         Some(&reason_reoffer::Scope {
             index: &index,

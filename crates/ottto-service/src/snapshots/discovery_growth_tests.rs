@@ -65,7 +65,6 @@ impl Fixture {
                 None,
                 &[],
                 false,
-                true,
             )
             .with_sampled_acquisition(
                 self.cache.clone(),
@@ -599,7 +598,6 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         None,
         &[],
         false,
-        true,
     );
     let (cold_index, cold) = loop {
         match cold_scan.step(None) {

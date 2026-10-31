@@ -1906,7 +1906,6 @@ fn unhealthy_retry_with_held_families_rearms_healthy_history_reproduction() {
                 None,
                 None,
                 false,
-                true,
             )
             .unwrap();
             assert_eq!(
@@ -2100,7 +2099,6 @@ fn scoped_retry_full_reads(index: &ScanIndex, candidates: &[CandidateFile]) -> u
                 None,
                 None,
                 false,
-                true,
             )
             .unwrap();
             assert_eq!(
@@ -3983,7 +3981,6 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
         None,
         &[],
         false,
-        false,
         true,
     );
     assert_eq!(
@@ -4016,7 +4013,6 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
         false,
         None,
         &[],
-        false,
         false,
         false,
     );

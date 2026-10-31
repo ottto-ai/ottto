@@ -1375,7 +1375,6 @@ fn terminal_off_captured_audit_clock_survives_yields_and_owns_rediscovery_deadli
             None,
             &[],
             false,
-            false,
         )
     });
     assert_eq!(page.audit_now, now);

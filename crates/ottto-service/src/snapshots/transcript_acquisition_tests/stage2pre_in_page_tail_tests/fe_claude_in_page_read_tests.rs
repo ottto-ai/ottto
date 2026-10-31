@@ -873,7 +873,6 @@ fn fe_claude_sp11_pi_has_no_in_page_sampled_read() {
         None,
         &[],
         false,
-        true,
     )
     .with_sampled_acquisition(
         Arc::new(sampled_scan::SharedCache::default()),
@@ -2310,7 +2309,6 @@ fn fe_n1_option_b_attachment_uses_captured_audit_time_across_due_edge() {
                 None,
                 &[],
                 false,
-                true,
             );
             assert_eq!(scan.audit_now, captured);
             assert!(

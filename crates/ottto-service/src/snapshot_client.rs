@@ -680,11 +680,6 @@ pub struct ActivityHintResponse {
     pub session_attribution_hmac_key: Option<String>,
     #[serde(default)]
     pub session_attribution_hmac_key_version: Option<String>,
-    /// Durable accepted-log capability for content-free request-index curves.
-    /// Missing/null/unknown is fail-closed: the daemon neither derives nor
-    /// emits curves that the server cannot durably acknowledge.
-    #[serde(default)]
-    pub session_context_curve_contract: Option<String>,
     /// Exact accepted-log cache evidence capability; absent or unknown disables wire emission.
     #[serde(default)]
     pub session_cache_observations_contract: Option<String>,

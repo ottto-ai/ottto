@@ -142,7 +142,6 @@ fn retry_test_page(
         &[],
         false,
         true,
-        true,
     );
     let selected = scan
         .identified_candidates
