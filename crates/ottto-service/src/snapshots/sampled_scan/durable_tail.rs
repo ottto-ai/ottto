@@ -163,8 +163,9 @@ pub(in crate::snapshots) fn record_rederive_refused(source: SnapshotSource, clas
     }
 }
 
-/// A restored Tail (or Pi Unchanged) may report this disposition. The extent is
-/// frozen at native preparation, before index mutations or later appends.
+/// Only a restored read the source's `BelowAccepted` row publishes may report
+/// this disposition. The extent is frozen at native preparation, before index
+/// mutations or later appends.
 pub(in crate::snapshots) fn restored_tail_below_accepted(
     source: SnapshotSource,
     restored: bool,
@@ -172,12 +173,16 @@ pub(in crate::snapshots) fn restored_tail_below_accepted(
     frozen: Option<u64>,
     accepted: Option<u64>,
 ) -> Option<u64> {
+    use crate::snapshots::durable_sources::BelowAccepted;
+    use crate::transcript_acquisition::ReadMode;
+    let publishes = match crate::snapshots::durable_sources::below_accepted(source) {
+        BelowAccepted::Held => false,
+        BelowAccepted::Tail => mode == ReadMode::Tail,
+        BelowAccepted::NoFloor => matches!(mode, ReadMode::Tail | ReadMode::Unchanged),
+    };
     (restart_restore::enabled()
-        && matches!(source, SnapshotSource::Codex | SnapshotSource::Pi)
+        && publishes
         && restored
-        && (mode == crate::transcript_acquisition::ReadMode::Tail
-            || (source == SnapshotSource::Pi
-                && mode == crate::transcript_acquisition::ReadMode::Unchanged))
         && frozen.zip(accepted).is_some_and(|(end, floor)| end < floor))
     .then_some(accepted)
     .flatten()

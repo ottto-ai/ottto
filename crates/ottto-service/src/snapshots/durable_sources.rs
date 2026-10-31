@@ -22,10 +22,24 @@ const fn representations(pin: &'static str) -> [Representation; 1] {
     }]
 }
 
+/// How a durable-restored read that ends strictly below the frozen accepted
+/// extent is treated (`restored_behind_accepted`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BelowAccepted {
+    /// The accepted floor holds the read.
+    Held,
+    /// A restored Tail publishes below it.
+    Tail,
+    /// There is no accepted floor: a restored Tail or Unchanged read publishes
+    /// below it, and a smaller committed index extent also counts.
+    NoFloor,
+}
+
 pub(crate) struct Properties {
     pub(crate) source: DurableSource,
     pub(crate) snapshot: SnapshotSource,
     pub(crate) tag: u8,
+    pub(crate) below_accepted: BelowAccepted,
     pub(crate) write_format: u16,
     pub(crate) representations: &'static [Representation],
     #[cfg(test)]
@@ -52,6 +66,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::ClaudeCode,
         snapshot: SnapshotSource::ClaudeCode,
         tag: 1,
+        below_accepted: BelowAccepted::Held,
         write_format: 3,
         representations: &representations(
             "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2",
@@ -68,6 +83,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::Codex,
         snapshot: SnapshotSource::Codex,
         tag: 2,
+        below_accepted: BelowAccepted::Tail,
         write_format: 3,
         representations: &representations(
             "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
@@ -84,6 +100,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::Pi,
         snapshot: SnapshotSource::Pi,
         tag: 3,
+        below_accepted: BelowAccepted::NoFloor,
         write_format: 3,
         representations: &representations(
             "c4f301b3ec5afe28933bfb8af315fe3061fd6d93184589f559206b38d7f81ce8",
@@ -113,6 +130,13 @@ impl DurableSource {
             .find(|row| row.snapshot == source)
             .map(|row| row.source)
     }
+}
+
+/// A source without a durable row has no restored read to report.
+pub(crate) fn below_accepted(source: SnapshotSource) -> BelowAccepted {
+    DurableSource::from_snapshot(source).map_or(BelowAccepted::Held, |source| {
+        source.properties().below_accepted
+    })
 }
 
 impl Properties {

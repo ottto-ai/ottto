@@ -8701,7 +8701,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .unwrap_or(true)
     });
     // Settle the frozen restore observation after policy and no-op suppression.
-    // Pi also counts a smaller committed selection even without a surviving offer.
+    // A source with no accepted floor also counts a smaller committed selection
+    // even without a surviving offer.
     #[cfg(unix)]
     for pending in &result.pending_finalization {
         let Some(accepted_extent) = pending.restored_behind_accepted else {
@@ -8711,7 +8712,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
             snapshot.source_file_fingerprint.as_deref()
                 == Some(pending.source_file_fingerprint.as_str())
         });
-        let regressed = source == SnapshotSource::Pi
+        let regressed = durable_sources::below_accepted(source)
+            == durable_sources::BelowAccepted::NoFloor
             && index
                 .files
                 .get(&pending.index_key)
@@ -34986,8 +34988,8 @@ impl OwnedSourceScan {
                         let continued = taken_admission.filter(|_| {
                             !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                         });
-                        // Pi has no accepted floor (`Interpretation::of`): this
-                        // read publishes below the extent the entry still holds.
+                        // Per `durable_sources::BelowAccepted`, this read may
+                        // publish below the extent the entry still holds.
                         #[cfg(unix)]
                         let restored_behind_accepted =
                             sampled_scan::durable_tail::restored_tail_below_accepted(
