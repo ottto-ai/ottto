@@ -1,5 +1,5 @@
 {
-  "artifact_id": 13030002873,
+  "artifact_id": 13031099044,
   "artifact_name": "v1-goldens-53d05a43",
   "artifact": {
     "id": null,
@@ -11,9 +11,9 @@
       "case_id": "claude-three-request",
       "envelope_version": 1,
       "expected": {
-        "byte_length": 7500,
+        "byte_length": 7498,
         "path": "expected/claude-three-request.json",
-        "sha256": "c5b7ca9b59da67379126e0bad5d7db03adddbc16e150a25963eb68f2444c9d56"
+        "sha256": "752e41dcd85fa1cd8a45e6c78a423397022922260c5416bc6e0270c3309053b0"
       },
       "expected_facts": {
         "accepted_body_witness": true,
@@ -46,7 +46,7 @@
       },
       "path": "claude-three-request.rec",
       "selector_span": null,
-      "sha256": "3ed5b8b933acb2cf5ae2fd852c2715e57a70045a6ad14859ab14c4faa96a80ca",
+      "sha256": "b758fc296d1d4392735c0fad4eac79642f612b3fc2d92bcd8127956e640ccde5",
       "source_tag": 1
     },
     {
@@ -54,9 +54,9 @@
       "case_id": "claude-selector-unequal",
       "envelope_version": 1,
       "expected": {
-        "byte_length": 7832,
+        "byte_length": 7830,
         "path": "expected/claude-selector-unequal.json",
-        "sha256": "955cd631302ea90f25bb34abc761a4a4cac7f962f1224c1f93bf1f54b4214e16"
+        "sha256": "8f4784431e4f0226f1f17a7493b91f497ea56d524c233394282c44cb920a2caa"
       },
       "expected_facts": {
         "accepted_body_witness": true,
@@ -106,7 +106,7 @@
           "offset": 462
         }
       },
-      "sha256": "69cbdc546139fac5ddae5fde00b781c038a8ed5d42123f27eb199c1fc3341158",
+      "sha256": "d5e204f1986f0c9905da4cf3bfa8923682c89e930312dd9a932d770c09bdc77b",
       "source_tag": 1
     },
     {
@@ -114,9 +114,9 @@
       "case_id": "codex-legacy-acked",
       "envelope_version": 1,
       "expected": {
-        "byte_length": 6457,
+        "byte_length": 6548,
         "path": "expected/codex-legacy-acked.json",
-        "sha256": "c38594370159037b256e331502a5d74fa409c77223d55489b90c8540de4401de"
+        "sha256": "c2df64d48d551ff89fc7579b1e9227dd5c979149d72bffe4579dcbf2b12764ed"
       },
       "expected_facts": {
         "accepted_body_witness": true,
@@ -133,8 +133,12 @@
         "request_2_context_tokens": null,
         "request_3_context_tokens": null,
         "request_count": 2,
-        "selector_context": {},
-        "selector_sources": {},
+        "selector_context": {
+          "model_provider": "openai"
+        },
+        "selector_sources": {
+          "model_provider": "derived_from_codex_source"
+        },
         "source_session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
         "telemetry_cost_micros": null,
         "tier_replay_finished": true,
@@ -149,7 +153,7 @@
       },
       "path": "codex-legacy-acked.rec",
       "selector_span": null,
-      "sha256": "62a6c6f33edf112a7266daba8f09263e3672212779b71f6ae17e5643ec4593f3",
+      "sha256": "bb91ff463c8b857fce256042bc5a685d95a810fc342fa77845f20e892f1c2d31",
       "source_tag": 2
     },
     {
@@ -157,9 +161,9 @@
       "case_id": "codex-v2-24b",
       "envelope_version": 1,
       "expected": {
-        "byte_length": 5237,
+        "byte_length": 5330,
         "path": "expected/codex-v2-24b.json",
-        "sha256": "093a5f4ca4e1ef34ffcc19034c76b56e83769d73be9c523be63c4f2874ba2482"
+        "sha256": "ae45435f525f918e407c6b54850fe01fccc300fd1e6f0308e631856a8bafaf80"
       },
       "expected_facts": {
         "accepted_body_witness": true,
@@ -176,8 +180,12 @@
         "request_2_context_tokens": null,
         "request_3_context_tokens": null,
         "request_count": 1,
-        "selector_context": {},
-        "selector_sources": {},
+        "selector_context": {
+          "model_provider": "openai"
+        },
+        "selector_sources": {
+          "model_provider": "derived_from_codex_source"
+        },
         "source_session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
         "telemetry_cost_micros": null,
         "tier_replay_finished": true,
@@ -192,15 +200,15 @@
       },
       "path": "codex-v2-24b.rec",
       "selector_span": null,
-      "sha256": "ad23dbcd1809cf93a2261ebf919e5efba93e466c689757f3ed146a8d3eccf6f2",
+      "sha256": "12cb895a2a5eedce39b83e216ad2028f3a3be0a41dd6e0e2c271b75fdb05bc2d",
       "source_tag": 2
     }
   ],
-  "generator_commit": "66857ebf4066b4f840cc30214cdcae9f7040c429",
+  "generator_commit": "412cf7a6b8a90f64e5370e70c7011c71fd722dc2",
   "repo": "ottto-ai/ottto",
   "run_attempt": "1",
-  "run_id": "41168313249",
-  "run_url": "https://github.com/ottto-ai/ottto/actions/runs/41168313249",
+  "run_id": "41171662029",
+  "run_url": "https://github.com/ottto-ai/ottto/actions/runs/41171662029",
   "runner_arch": "X64",
   "runner_os": "Linux",
   "rustc": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",

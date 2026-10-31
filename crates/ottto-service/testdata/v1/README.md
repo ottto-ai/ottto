@@ -2,16 +2,22 @@
 
 These four synthetic records were written by the real production writer at
 `53d05a4304f2e87effbaa48661e10286bff01c58`. The throwaway generator commit was
-`66857ebf4066b4f840cc30214cdcae9f7040c429` on `i1/goldens-gen-53d05a43`
+`412cf7a6b8a90f64e5370e70c7011c71fd722dc2` on `i1/goldens-gen-53d05a43`
 (never merged).
 
-Generation evidence: [Actions run 41168313249, attempt 1](https://github.com/ottto-ai/ottto/actions/runs/41168313249/attempts/1),
-workflow `.github/workflows/linux-tests.yml`, artifact **13030002873** named
+Generation evidence: [Actions run 41171662029, attempt 1](https://github.com/ottto-ai/ottto/actions/runs/41171662029/attempts/1),
+workflow `.github/workflows/linux-tests.yml`, artifact **13031099044** named
 `v1-goldens-53d05a43`. The generator log records one passed test. Rust/Cargo
 1.95.0 ran on Ubuntu 24.04.5 LTS, Linux x86_64; the manifest records the full
 rustc identity. Its top-level `artifact_id` and `artifact_name` add the upload
 identity to the original manifest (whose pre-upload `artifact.id` is null).
 All other manifest content and all record/input/expected bytes are unchanged.
+
+This round-3 generator artifact supersedes round-1 artifact **13030002873**
+(run 41168313249): its Codex expected sidecars incorrectly declared empty
+selector maps. Both Codex records carry context `model_provider=openai` and
+source `derived_from_codex_source`. The corrected generator cross-checks all
+16 persisted facts against the real historical reader before emitting them.
 
 The retained artifact's `generator.patch` is the generation recipe, applied to
 the source commit above. Its single test is

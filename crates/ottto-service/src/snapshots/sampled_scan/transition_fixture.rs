@@ -79,7 +79,7 @@ fn validate_v1_goldens<'a>(
         || manifest["source_sha"] != "53d05a4304f2e87effbaa48661e10286bff01c58"
         || manifest["repo"] != "ottto-ai/ottto"
         || manifest["workflow_path"] != ".github/workflows/linux-tests.yml"
-        || manifest["artifact_id"] != 13030002873u64
+        || manifest["artifact_id"] != 13031099044u64
         || manifest["artifact_name"] != "v1-goldens-53d05a43"
         || [
             "generator_commit",

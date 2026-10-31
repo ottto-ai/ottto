@@ -76,7 +76,7 @@
   "binding": {
     "context": "1d43ea64364ef49c916c300341e35ec2b28a0c5498d9ba06e19f0f20a216c4fc",
     "entry": "900764dfed8375bc8fd1597971747f28c730fdeea1b0b3bfb31fa0bce52383d8",
-    "key": "56862e6d75e1de28ddbeeb2ad94fe83ee006f822cde8e2c243e2280917f72999",
+    "key": "ad14b3bbf537cc96695e477dc1bdd27fea0fe3ec72c79b367be4fe289c6fc203",
     "scope": "a5b5793986c9772d0a1b1ce0969614dccd2ce243b17a5422006ea733068feb7a"
   },
   "case_id": "claude-three-request",
@@ -221,8 +221,8 @@
       "effective_upload_body_witness_revision": 3,
       "last_snapshot_fingerprint": "0aec9698e76e734bb7960d504fee5b232f8bca750c24734e26a6f02a655531d4",
       "last_upload_body_witness": "8ba40211992a9bc415ac118c157a16ceddac95ca9e2de38a32f7cff4d5e0e35d",
-      "modified_unix_nanos": 159006969,
-      "modified_unix_seconds": 1793420894,
+      "modified_unix_nanos": 53772981,
+      "modified_unix_seconds": 1793423802,
       "size_bytes": 1149,
       "source_file_fingerprint": "sha256:da726a6b2be20a8de719e0302ab5d5bfa7c076d8b117a54e6000eac892282184"
     },
@@ -241,8 +241,8 @@
       "effective_upload_body_witness_revision": 3,
       "last_snapshot_fingerprint": "0aec9698e76e734bb7960d504fee5b232f8bca750c24734e26a6f02a655531d4",
       "last_upload_body_witness": "8ba40211992a9bc415ac118c157a16ceddac95ca9e2de38a32f7cff4d5e0e35d",
-      "modified_unix_nanos": 159006969,
-      "modified_unix_seconds": 1793420894,
+      "modified_unix_nanos": 53772981,
+      "modified_unix_seconds": 1793423802,
       "size_bytes": 1149,
       "source_file_fingerprint": "sha256:da726a6b2be20a8de719e0302ab5d5bfa7c076d8b117a54e6000eac892282184"
     },
