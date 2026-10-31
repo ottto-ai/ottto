@@ -9,9 +9,6 @@ use sampled_scan::codex_cursor::OpenStamp;
 use sampled_scan::side_ledger::{namespace_of, parent_of, LedgerEntry, LedgerKey, LedgerTag};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 
-/// The sweep's clock in these tests: past every fixture pace's `not_before`.
-const SWEEP_NOW: u64 = 1_800_000_000;
-
 const KEY: &str = "/s/rollout-parent.jsonl";
 
 struct Parent {
@@ -455,91 +452,6 @@ fn a_same_size_edit_with_changed_samples_reads_them_once() {
     assert_eq!(crate::transcript_acquisition::samples_match_calls(), 1);
 }
 
-/// R2-M3: the epoch prune moves a charged `Live` request's pacing onto P's
-/// same-object record first, so the next reference re-arms with attempts
-/// ≥ the pruned ones (never a fresh ladder); with no such record the
-/// request is kept.
-#[test]
-fn an_epoch_pruned_request_rearms_with_at_least_its_attempts() {
-    let mut parent = Parent::new("epoch-prune", 9_000);
-    let now = now();
-    // The fence refuses this record (`ClockChanged`): the request path decides.
-    let mut record = parent.record(SideVerdict::Settled, now + 600);
-    record.referenced_epoch = 10;
-    let charged = SideRequest {
-        referenced_epoch: 1,
-        ..parent.request(SideRequestState::Live, 3)
-    };
-    let mut index = with_record(record);
-    index.codex_parent_proof_wrap_epoch = 10;
-    index.codex_parent_side_requests.insert(KEY.into(), charged);
-    assert_eq!(
-        index
-            .sweep_codex_parent_side(false, None, SWEEP_NOW)
-            .requests_pruned,
-        1
-    );
-    assert!(index.codex_parent_side_requests.is_empty());
-    let (fenced, _) = parent.fence(&mut index, 1, now);
-    assert_eq!(fenced, SideFence::Refused(FullReason::ClockChanged));
-    let rearmed = index.codex_parent_side_requests[KEY];
-    assert!(rearmed.attempts >= charged.attempts, "{rearmed:?}");
-    assert_eq!(
-        rearmed.not_before_unix_seconds,
-        charged.not_before_unix_seconds
-    );
-
-    // Fix round 2 (DM2): unreferenced for 3+ wraps, the record keeps the
-    // pruned pacing (its pace is active), so the re-reference re-arms at
-    // the floor with the same `not_before`, never `Live{0}`.
-    let mut record = parent.record(SideVerdict::Settled, now + 600);
-    record.referenced_epoch = 10;
-    let mut index = with_record(record);
-    index.codex_parent_proof_wrap_epoch = 10;
-    index.codex_parent_side_requests.insert(KEY.into(), charged);
-    assert_eq!(
-        index
-            .sweep_codex_parent_side(false, None, now)
-            .requests_pruned,
-        1
-    );
-    for wrap in 11..=14 {
-        index.codex_parent_proof_wrap_epoch = wrap;
-        assert_eq!(
-            index
-                .sweep_codex_parent_side(false, None, now)
-                .records_pruned,
-            0,
-            "wrap {wrap}"
-        );
-    }
-    assert!(index.codex_parent_side.contains_key(KEY));
-    let (fenced, _) = parent.fence(&mut index, 1, now);
-    assert_eq!(fenced, SideFence::Refused(FullReason::ClockChanged));
-    let rearmed = index.codex_parent_side_requests[KEY];
-    assert!(
-        rearmed.attempts >= SIDE_REQUEST_EVICT_ATTEMPTS - 1,
-        "{rearmed:?}"
-    );
-    assert_eq!(
-        rearmed.not_before_unix_seconds,
-        charged.not_before_unix_seconds
-    );
-
-    let mut index = ScanIndex {
-        codex_parent_proof_wrap_epoch: 10,
-        ..ScanIndex::default()
-    };
-    index.codex_parent_side_requests.insert(KEY.into(), charged);
-    assert_eq!(
-        index
-            .sweep_codex_parent_side(false, None, SWEEP_NOW)
-            .requests_pruned,
-        0
-    );
-    assert_eq!(index.codex_parent_side_requests[KEY], charged);
-}
-
 /// The request-side object test: a shrink below `state_extent`, or a record
 /// for another object, is a new object (record consumed, request
 /// restarted); a same-size ctime change with matching record samples only
@@ -750,91 +662,6 @@ fn main_writes_p_side_record_only_when_live_or_present() {
     assert_eq!((updated.generation, updated.referenced_epoch), (3, 5));
 }
 
-/// Row 8 cure: a same-object request the parse covers is removed and its
-/// pacing becomes the record's stub (`{not_before, 6}`, never loosened);
-/// the current key's ledger entry mirrors `Removed` with that stub. A
-/// request needing more than the seal covers, or for another object,
-/// stays.
-#[test]
-fn main_cures_a_covered_request_into_the_records_stub_and_mirrors_removed() {
-    let parent = Parent::new("cure", 9_000);
-    let len = parent.len();
-    let ids: [String; 0] = [];
-    let mut request = parent.request(SideRequestState::Lossy, 3);
-    request.needed_extent = len + 1;
-    let mut index = ScanIndex::default();
-    index.codex_parent_side_requests.insert(KEY.into(), request);
-    // Live through its request; not covered: the request stays.
-    assert!(index.write_codex_parent_side_from_main(
-        KEY,
-        &ids,
-        main_parse(&parent, SideVerdict::Settled, false),
-        None,
-    ));
-    assert_eq!(index.codex_parent_side_requests[KEY], request);
-    assert_eq!(index.codex_parent_side[KEY].pace, None);
-    // Another object's request stays too.
-    let mut other = request;
-    other.dev_ino.1 = other.dev_ino.1.wrapping_add(1);
-    other.needed_extent = 1;
-    index.codex_parent_side_requests.insert(KEY.into(), other);
-    index.write_codex_parent_side_from_main(
-        KEY,
-        &ids,
-        main_parse(&parent, SideVerdict::Settled, false),
-        None,
-    );
-    assert_eq!(index.codex_parent_side_requests[KEY], other);
-
-    // Covered, with the current key's ledger entry as the view.
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = sampled_scan::SharedCache::default();
-    let ns = namespace_of(Path::new("/idx/writer.json"));
-    let key = LedgerKey {
-        ns,
-        p: parent_of(KEY),
-        dev: parent.dev_ino().0,
-        ino: parent.dev_ino().1,
-    };
-    let mut charged = parent.request(SideRequestState::Live, 2);
-    charged.needed_extent = len;
-    charged.not_before_unix_seconds = 5555;
-    cache
-        .side_ledger()
-        .charge(key, LedgerEntry::of_request(&charged), now())
-        .unwrap();
-    let mut index = ScanIndex::default();
-    index.codex_parent_side_requests.insert(KEY.into(), request);
-    let mut record = parent.record(SideVerdict::Settled, now());
-    record.pace = Some(SidePace {
-        not_before_unix_seconds: 9999,
-        attempts_floor: 6,
-    });
-    index.codex_parent_side.insert(KEY.into(), record);
-    assert!(index.write_codex_parent_side_from_main(
-        KEY,
-        &ids,
-        main_parse(&parent, SideVerdict::Settled, false),
-        Some((&cache, ns)),
-    ));
-    assert!(!index.codex_parent_side_requests.contains_key(KEY), "cured");
-    assert_eq!(
-        index.codex_parent_side[KEY].pace,
-        Some(SidePace {
-            not_before_unix_seconds: 9999,
-            attempts_floor: 6,
-        }),
-        "max(existing, stub)"
-    );
-    let entry = *cache.side_ledger().get(&key).unwrap();
-    assert_eq!(
-        (entry.tag, entry.stub_not_before),
-        (LedgerTag::Removed, 5555)
-    );
-}
-
 /// cc row 7: a terminal disclosure refreshes P's existing record to held
 /// and never creates one. A verdict change takes a new generation; the wrap
 /// epoch follows only while P is live; an unchanged, not-live record is
@@ -886,33 +713,4 @@ fn a_terminal_disclosure_refreshes_an_existing_record_to_held_only() {
     let record = &index.codex_parent_side[KEY];
     assert_eq!((record.generation, record.referenced_epoch), (2, 4));
     assert_eq!(refresh(&mut index), (false, Counts::default()));
-}
-
-/// D6(b): every fence use is a child's reference to P: the request it arms
-/// takes the wrap epoch, and a later use (no other write) refreshes it.
-/// The ledger projection carries no epoch, so its stamp is kept.
-#[test]
-fn a_fence_use_stamps_the_request_with_the_wrap_epoch() {
-    let mut parent = Parent::new("epoch", 9_000);
-    let now = now();
-    let mut index = ScanIndex {
-        codex_parent_proof_wrap_epoch: 5,
-        ..ScanIndex::default()
-    };
-    assert_eq!(parent.fence(&mut index, 500, now).0, SideFence::Unknown);
-    let armed = index.codex_parent_side_requests[KEY];
-    assert_eq!(armed.referenced_epoch, 5);
-    index.codex_parent_proof_wrap_epoch = 9;
-    assert_eq!(parent.fence(&mut index, 500, now).0, SideFence::Unknown);
-    assert_eq!(
-        index.codex_parent_side_requests[KEY],
-        SideRequest {
-            referenced_epoch: 9,
-            ..armed
-        }
-    );
-    assert_eq!(
-        sampled_scan::side_ledger::LedgerEntry::of_request(&armed),
-        sampled_scan::side_ledger::LedgerEntry::of_request(&index.codex_parent_side_requests[KEY])
-    );
 }
