@@ -564,7 +564,7 @@ impl Uploader {
         )?;
         settle_index_after_upload(index, previous, &self.progress);
         let counts = index.accept_file_upload_context_acks(
-            &self.progress.context_receipt_candidates,
+            &self.progress.split_context_receipt_candidates(),
             &self.progress.fresh_context_body_acks,
         );
         Ok((counts.files, counts.bytes))
@@ -703,7 +703,7 @@ impl Uploader {
         )?;
         settle_index_after_upload(index, previous, &self.progress);
         let counts = index.accept_file_upload_context_acks(
-            &self.progress.context_receipt_candidates,
+            &self.progress.split_context_receipt_candidates(),
             &self.progress.fresh_context_body_acks,
         );
         Ok((counts.files, counts.bytes))

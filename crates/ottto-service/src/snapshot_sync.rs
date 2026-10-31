@@ -2185,8 +2185,8 @@ impl SnapshotUploadProgress {
 
     fn contains_body(&self, fingerprint: &str, body_witness: &str) -> bool {
         // Durable exact-body ACKs still resume interrupted uploads. Receipt
-        // adoption separately requires fresh current-context ACKs; it must not
-        // force an already accepted page through the transport again.
+        // adoption separately requires current-context ACKs (fresh, or stamped
+        // in this context); it must not force an accepted page through again.
         if self
             .permanent_rejections
             .get(fingerprint)
@@ -3416,7 +3416,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         )
         .context(CHECKPOINT_ACK_HANDOFF)?;
     let context_rearms = committable.accept_file_upload_context_acks(
-        &progress.context_receipt_candidates,
+        &progress.split_context_receipt_candidates(),
         &progress.fresh_context_body_acks,
     );
     validate_destination().context(CHECKPOINT_VALIDATE_DESTINATION)?;
@@ -8572,7 +8572,7 @@ fn finish_sync_source(
     // correction later in this finish. Retire only that Claude prior index
     // before the full disk-index CAS decode; keep every possible receipt path.
     let context_rearm_counts = index.accept_file_upload_context_acks(
-        &upload_progress.context_receipt_candidates,
+        &upload_progress.split_context_receipt_candidates(),
         &upload_progress.fresh_context_body_acks,
     );
     let retire_prior_index = source == SnapshotSource::ClaudeCode && !comparison_current;
