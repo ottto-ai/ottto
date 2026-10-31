@@ -56411,6 +56411,114 @@ mod tests {
     }
 
     #[test]
+    fn legacy_index_reparses_when_old_sidecar_identity_cannot_be_proven() {
+        let path = PathBuf::from("/redacted/session.jsonl");
+        let candidate = CandidateFile {
+            physical_identity: None,
+            scan_root: PathBuf::from("/redacted"),
+            path: path.clone(),
+            size_bytes: 42,
+            modified_unix_seconds: 1_777_777_777,
+            modified_unix_nanos: 1_777_777_777_000_000_001,
+            source_file_fingerprint: "semantic-sync".to_string(),
+            legacy_source_file_fingerprint: "legacy-current-sidecar".to_string(),
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: "opened".to_string(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
+        };
+        let index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&path),
+                ScanIndexEntry {
+                    codex_fragment: None,
+                    size_bytes: 42,
+                    modified_unix_seconds: 1_777_777_777,
+                    modified_unix_nanos: None,
+                    source_file_fingerprint: "legacy-previous-sidecar".to_string(),
+                    last_snapshot_fingerprint: Some("snapshot".to_string()),
+                    last_upload_body_witness: None,
+                    effective_upload_body_witness_revision: 0,
+                    scan_identity_version: None,
+                    codex_joined_member_set: None,
+                    codex_captured_joined_member_set: None,
+                    codex_protected_owner: None,
+                    codex_applied_tier_receipt: None,
+                    codex_applied_tier_receipt_required: false,
+                    codex_captured_tier_receipt: None,
+                    codex_captured_tier_receipt_required: false,
+                    codex_captured_uncommitted: false,
+                    codex_counting_v2: false,
+                    codex_counting_owner: None,
+                    opened_changed_nanos: 0,
+                    opened_birth_nanos: 0,
+                    upload_context_receipt: None,
+                },
+            )]),
+            ..ScanIndex::default()
+        };
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Parse
+        );
+    }
+
+    #[test]
+    fn legacy_index_targets_config_derived_rows_for_reconciliation() {
+        let path = PathBuf::from("/redacted/session.jsonl");
+        let candidate = CandidateFile {
+            physical_identity: None,
+            scan_root: PathBuf::from("/redacted"),
+            path: path.clone(),
+            size_bytes: 42,
+            modified_unix_seconds: 1_777_777_777,
+            modified_unix_nanos: 1_777_777_777_000_000_001,
+            source_file_fingerprint: "semantic-sync".to_string(),
+            legacy_source_file_fingerprint: "legacy-matching-sidecar".to_string(),
+            legacy_config_reconciliation_required: true,
+            opened_object_identity: "opened".to_string(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
+        };
+        let index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&path),
+                ScanIndexEntry {
+                    codex_fragment: None,
+                    size_bytes: 42,
+                    modified_unix_seconds: 1_777_777_777,
+                    modified_unix_nanos: None,
+                    source_file_fingerprint: "legacy-matching-sidecar".to_string(),
+                    last_snapshot_fingerprint: Some("snapshot".to_string()),
+                    last_upload_body_witness: None,
+                    effective_upload_body_witness_revision: 0,
+                    scan_identity_version: None,
+                    codex_joined_member_set: None,
+                    codex_captured_joined_member_set: None,
+                    codex_protected_owner: None,
+                    codex_applied_tier_receipt: None,
+                    codex_applied_tier_receipt_required: false,
+                    codex_captured_tier_receipt: None,
+                    codex_captured_tier_receipt_required: false,
+                    codex_captured_uncommitted: false,
+                    codex_counting_v2: false,
+                    codex_counting_owner: None,
+                    opened_changed_nanos: 0,
+                    opened_birth_nanos: 0,
+                    upload_context_receipt: None,
+                },
+            )]),
+            ..ScanIndex::default()
+        };
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Parse
+        );
+    }
+
+    #[test]
     fn parsed_semantic_noop_is_not_returned_for_upload() {
         let root = temp_dir("semantic-noop");
         let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
