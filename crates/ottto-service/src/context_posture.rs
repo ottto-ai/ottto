@@ -20,7 +20,6 @@
 //! backend/web derives cost views from the uploaded snapshots instead.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -28,6 +27,7 @@ use ottto_protocol::{AgentContextPostureSummary, AgentContextSessionPeak};
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
+use crate::locked_state_dir::replace_json_cache;
 use crate::snapshots::{SnapshotItem, CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS};
 
 /// Summary lookback: sessions with activity inside this window are analyzed.
@@ -127,15 +127,7 @@ pub fn update_context_posture_cache(
         .with_context(|| format!("create context_posture dir {}", dir.display()))?;
     let payload =
         serde_json::to_vec_pretty(&merged).context("serialize context posture cache to JSON")?;
-    let temp_path = path.with_extension("json.tmp");
-    let mut temp = std::fs::File::create(&temp_path)
-        .with_context(|| format!("create context_posture temp {}", temp_path.display()))?;
-    temp.write_all(&payload)
-        .with_context(|| format!("write context_posture temp {}", temp_path.display()))?;
-    temp.sync_all().ok();
-    std::fs::rename(&temp_path, &path)
-        .with_context(|| format!("rename context_posture cache into place {}", path.display()))?;
-    Ok(())
+    replace_json_cache(&path, &payload, "context_posture", "context_posture cache")
 }
 
 /// The convenience the agent-status collector calls: read the cache and

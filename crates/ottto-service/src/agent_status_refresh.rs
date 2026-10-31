@@ -579,7 +579,7 @@ pub(crate) fn collection(
     expires_at: String,
     manual: bool,
 ) -> Result<Arc<AgentStatusCollection>, LocalApiError> {
-    #[cfg(any(test, feature = "replay-harness"))]
+    #[cfg(test)]
     if let Some(collection) = SCOPED_COLLECTION.with(|slot| slot.borrow().clone()) {
         return Ok(collection);
     }
@@ -642,7 +642,7 @@ pub(crate) fn active() -> bool {
     owner().is_some()
 }
 
-#[cfg(any(test, feature = "replay-harness"))]
+#[cfg(test)]
 thread_local! {
     static SCOPED_COLLECTION: std::cell::RefCell<Option<Arc<AgentStatusCollection>>> =
         const { std::cell::RefCell::new(None) };
@@ -650,7 +650,7 @@ thread_local! {
 
 /// Scoped input for an isolated, synchronous snapshot cycle. Serve never installs
 /// it. Keep the production owner/provider fallback below `collection` unchanged.
-#[cfg(any(test, feature = "replay-harness"))]
+#[cfg(test)]
 pub(crate) fn with_collection<T>(collection: AgentStatusCollection, run: impl FnOnce() -> T) -> T {
     struct Reset(Option<Arc<AgentStatusCollection>>);
     impl Drop for Reset {

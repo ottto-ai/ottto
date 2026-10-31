@@ -2917,13 +2917,7 @@ pub(in crate::snapshots) enum SideVerdict {
         cause: u8,
     },
 }
-impl crate::heap_layout_bound::HeapLayoutBound for SideVerdict {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; SideVerdict);
 
 /// U1a-2a: the one side verdict of a parse of P, used by every side writer.
 /// Held iff the parse is not complete in PR-P's raw terms.
@@ -3029,13 +3023,7 @@ pub(in crate::snapshots) enum SideRequestState {
     /// A certified read ended on an unsealed row with a settled verdict.
     Unsealed,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for SideRequestState {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; SideRequestState);
 
 /// U1a-2a: one paced request that main also parses an unchanged parent P,
 /// so that P's side verdict can be recorded. Keyed by P's index key.
@@ -7466,6 +7454,46 @@ pub struct ClaudeFullRearmSuppressionCounts {
 impl ClaudeFullRearmSuppressionCounts {
     pub(crate) fn is_empty(&self) -> bool {
         self == &Self::default()
+    }
+}
+
+/// E2 requests left Unknown because their family's strict sidecar read was
+/// unhealthy this page (`unhealthy_root_no_fallback_requests{reason}`): no
+/// retained, creator, start or inherited account filled them. Content-free
+/// counts; nothing reads them into a decision. Absent from the line while zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ClaudeUnhealthyRootNoFallbackCounts {
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub discarded: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub oversized: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub unreadable: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub malformed: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub incomplete: u64,
+}
+
+impl ClaudeUnhealthyRootNoFallbackCounts {
+    pub(crate) fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub(crate) fn add(
+        &mut self,
+        reason: claude_request_identity::UnhealthyRootReason,
+        requests: u64,
+    ) {
+        use claude_request_identity::UnhealthyRootReason as Reason;
+        let count = match reason {
+            Reason::Discarded => &mut self.discarded,
+            Reason::Oversized => &mut self.oversized,
+            Reason::Unreadable => &mut self.unreadable,
+            Reason::Malformed => &mut self.malformed,
+            Reason::Incomplete => &mut self.incomplete,
+        };
+        *count = count.saturating_add(requests);
     }
 }
 
@@ -21398,22 +21426,11 @@ fn fact_limit_scratch_bound(producers: usize, collected_at: usize) -> Option<usi
 /// across `finish`. It collects one `u64` per book record with a request id
 /// (every response's stored records, limit-exceeded ones included: at most
 /// `records`) through `flat_map`/`filter_map`/`take`, whose lower size hint
-/// is 0: `Vec` starts at 4 slots and doubles, so its last buffer is the
-/// smallest `4 * 2^k` holding them, with half of it alongside during the
-/// last growth (the allocation probe's overlap). `claude_request_hash` and
+/// is 0 (`heap_layout_bound::pushed_vec_peak`). `claude_request_hash` and
 /// `sort_unstable`/`dedup` allocate nothing. Stack-only, checked; `None` on
 /// overflow.
 fn buffered_request_hashes_bound(records: usize) -> Option<usize> {
-    if records == 0 {
-        return Some(0);
-    }
-    let last = records.checked_next_power_of_two()?.max(4);
-    let slots = if last > 4 {
-        last.checked_add(last / 2)?
-    } else {
-        last
-    };
-    slots.checked_mul(std::mem::size_of::<u64>())
+    crate::heap_layout_bound::pushed_vec_peak::<u64>(records)
 }
 
 /// X_out U1 (#665 r36, AutoReview P2): the most a `len`-byte desktop title
@@ -21444,18 +21461,7 @@ fn buffered_request_hashes_bound(records: usize) -> Option<usize> {
 fn desktop_title_bound(len: usize) -> Option<usize> {
     const MAX_TITLE_CHARS: usize = 255;
     const MAX_DISPLAY_CHARS: usize = 120;
-    let words = match len.div_ceil(2) {
-        0 => 0,
-        words => {
-            let last = words.checked_next_power_of_two()?.max(4);
-            let slots = if last > 4 {
-                last.checked_add(last / 2)?
-            } else {
-                last
-            };
-            slots.checked_mul(std::mem::size_of::<&str>())?
-        }
-    };
+    let words = crate::heap_layout_bound::pushed_vec_peak::<&str>(len.div_ceil(2))?;
     let kept = len.min(4 * MAX_TITLE_CHARS);
     let collect = kept.max(8).checked_mul(3)?;
     let safety = kept.min(4 * MAX_DISPLAY_CHARS).checked_mul(2)?;
@@ -22000,13 +22006,7 @@ const _: () = assert!(
 const _: () = assert!(
     CodexParentUnresolvable::COUNT == crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES
 );
-impl crate::heap_layout_bound::HeapLayoutBound for CodexParentUnresolvable {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; CodexParentUnresolvable);
 
 /// L-5 probe value; `hlb` has no `Result` impl.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22697,13 +22697,7 @@ pub(in crate::snapshots) enum ChildResult {
     /// The child's reader failed.
     Unreadable,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for ChildResult {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; ChildResult);
 
 /// U1a-2a (row 33, rev 2 §2.2, D6(d)): one reader of a proof job, frozen at
 /// its open extent with the existing extent limit (a straddling row is
@@ -23651,13 +23645,7 @@ pub(in crate::snapshots) enum OwedOrigin {
     Child,
     Lineage,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for OwedOrigin {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; OwedOrigin);
 
 /// U1a: proof work a held fork child (or a lineage parent) is owed.
 #[allow(dead_code)] // first production callers are the owe and finish
@@ -32821,8 +32809,6 @@ impl OwnedSourceScan {
             }
             match decision {
                 CandidateDecision::Skip => {
-                    #[cfg(feature = "replay-harness")]
-                    resource_probe.index_reuse_skip();
                     if let Some(phase) = native_comparison.as_mut() {
                         if let Some(credit) = capture_credit.as_deref_mut() {
                             phase.record_actual_skip_paid(
@@ -35797,13 +35783,7 @@ pub(in crate::snapshots) struct RetainRoom {
     pub(in crate::snapshots) salvage: usize,
     pub(in crate::snapshots) refused: bool,
 }
-impl crate::heap_layout_bound::HeapLayoutBound for RetainRoom {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(true; RetainRoom);
 
 impl<R: BufRead> BoundedJsonlReader<R> {
     fn new(reader: R, max_line_bytes: usize, salvage_codex_envelope: bool) -> Self {
@@ -45853,6 +45833,14 @@ impl ScanIndex {
                             // Eligibility is scan-local and exact-body-bound;
                             // neither marker-only imports nor restart restore it.
                         }
+                        // Lead B Addendum 4 (option 1): a body whose owner
+                        // account this scan cleared for a non-discard unhealthy
+                        // read uploads Unknown now; the owner is never rewritten.
+                        (Some(owner), None)
+                            if mixed.permits_unhealthy_unknown(
+                                item,
+                                &owner.account_identifier_hash,
+                            ) => {}
                         (Some(_), _) => {
                             deferred.insert(session_id.clone());
                         }
@@ -85156,21 +85144,15 @@ impl crate::heap_layout_bound::HeapLayoutBound for fn(&Value, &mut SnapshotAccum
         c.add(0)
     }
 }
-macro_rules! inline_scan_enum { ($t:ty; $($pattern:pat),*) => {
-    impl crate::heap_layout_bound::HeapLayoutBound for $t {
-        const STABLE_HEAP: bool = true;
-        fn heap_bound(&self,c:&mut crate::heap_layout_bound::Counter)->Option<()> {
-            match self { $($pattern => c.add(0)),* }
-        }
-    }
-}; }
-inline_scan_enum!(CandidateDecision; Self::Skip,Self::Migrate,Self::Parse,Self::ReconcileLegacy);
-inline_scan_enum!(ClaudeCompactionKind; Self::LegacySummary,Self::CurrentBoundary);
-inline_scan_enum!(SnapshotQuarantineDisposition; Self::RetryPending,Self::UnprovenTerminal,Self::SupersededTerminal);
-inline_scan_enum!(ClaudeUsageAuthorityQuarantineDisposition; Self::RetryPending,Self::UnprovenTerminal);
-inline_scan_enum!(SnapshotSource; Self::Pi,Self::Codex,Self::ClaudeCode);
-inline_scan_enum!(CodexOwnershipBoundary; Self::Undetermined,Self::AllLocal,Self::AwaitingLegacyTrigger,
-    Self::AwaitingParentPrefix,Self::Ordinal { start: _ },Self::NativeCreatedThread,Self::AmbiguousFork);
+crate::heap_layout_bound::unit_enum!(true;
+    CandidateDecision: Skip | Migrate | Parse | ReconcileLegacy;
+    ClaudeCompactionKind: LegacySummary | CurrentBoundary;
+    SnapshotQuarantineDisposition: RetryPending | UnprovenTerminal | SupersededTerminal;
+    ClaudeUsageAuthorityQuarantineDisposition: RetryPending | UnprovenTerminal;
+    SnapshotSource: Pi | Codex | ClaudeCode;
+    CodexOwnershipBoundary: Undetermined | AllLocal | AwaitingLegacyTrigger | AwaitingParentPrefix
+        | Ordinal { start: _ } | NativeCreatedThread | AmbiguousFork;
+);
 
 crate::heap_layout_bound::fields!(JsonlReadReport; physical_line_count, parsed_json_line_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count);
 crate::durable_tail_codec::durable_struct!(JsonlReadReport {
