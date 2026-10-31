@@ -8054,11 +8054,6 @@ pub(crate) fn apply_upload_policy_with_item_limit(
     policy: SnapshotUploadPolicy,
     item_limit: usize,
 ) {
-    let item_limit = if source == SnapshotSource::ClaudeCode {
-        item_limit
-    } else {
-        MAX_SNAPSHOT_ITEM_WIRE_BYTES
-    };
     for item in snapshots {
         let mut fingerprint_needs_refresh = false;
         if !policy.session_titles_enabled
@@ -15774,11 +15769,6 @@ pub(crate) fn validate_snapshot_batch_request_with_item_limit(
     }
     let source = snapshot_source_from_api_slug(&request.source)
         .ok_or_else(|| "unsupported snapshot source".to_string())?;
-    let item_limit = if source == SnapshotSource::ClaudeCode {
-        item_limit
-    } else {
-        MAX_SNAPSHOT_ITEM_WIRE_BYTES
-    };
     for (index, item) in request.snapshots.iter().enumerate() {
         validate_snapshot_item(index, item)?;
         let component_hashes = snapshot_semantic_component_hashes(source, item);

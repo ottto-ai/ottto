@@ -2475,15 +2475,65 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
     let charge = crate::heap_layout_bound::completed_bound(&item, usize::MAX).unwrap();
     assert!(charge > 1_600_000);
     assert!(crate::heap_layout_bound::bound(&item, 655_360).is_none());
-    let mut charged_request = request.clone();
-    charged_request.source = "codex".into();
-    charged_request.snapshots[0].snapshot_fingerprint =
-        snapshot_fingerprint(SnapshotSource::Codex, &charged_request.snapshots[0]);
-    assert!(
-        validate_snapshot_batch_request_with_item_limit(&charged_request, 3_145_728)
-            .unwrap_err()
-            .contains("wire body")
+    // The tagged heap fixture uses a 3 MiB cap. Pad the same untagged base
+    // separately so the generic upload fixture fits the receiver's 2 MiB cap.
+    let (mut generic_item, _) = sticky_pad_to_bytes(&base, 1_000_000);
+    apply_upload_policy_with_item_limit(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_mut(&mut generic_item),
+        SnapshotUploadPolicy::default(),
+        2_097_152,
     );
+    // The receiver advertises the same item limit for every source.
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let mut charged_request = request.clone();
+        charged_request.source = source.api_slug().into();
+        charged_request.snapshots = vec![generic_item.clone()];
+        charged_request.snapshots[0].snapshot_fingerprint =
+            snapshot_fingerprint(source, &charged_request.snapshots[0]);
+        let wire_bytes = snapshot_item_wire_size(
+            source,
+            &charged_request.snapshots[0],
+            SnapshotUploadPolicy::default(),
+        );
+        assert!(
+            (655_361..=2_097_152).contains(&wire_bytes),
+            "{source:?}: {wire_bytes}"
+        );
+        let before = serde_json::to_vec(&charged_request.snapshots).unwrap();
+        apply_upload_policy_with_item_limit(
+            source,
+            &mut charged_request.snapshots,
+            SnapshotUploadPolicy::default(),
+            2_097_152,
+        );
+        assert!(
+            serde_json::to_vec(&charged_request.snapshots).unwrap() == before,
+            "{source:?}: upload policy changed an item that fits the advertised cap"
+        );
+        assert_eq!(charged_request.snapshots.len(), 1);
+        validate_snapshot_batch_request_with_item_limit(&charged_request, 2_097_152).unwrap();
+        assert!(validate_snapshot_batch_request(&charged_request)
+            .unwrap_err()
+            .contains("wire body"));
+        let mut default_items = charged_request.snapshots.clone();
+        let mut no_hint_items = default_items.clone();
+        apply_upload_policy(source, &mut default_items, SnapshotUploadPolicy::default());
+        apply_upload_policy_with_item_limit(
+            source,
+            &mut no_hint_items,
+            SnapshotUploadPolicy::default(),
+            identity::effective_item_cap(None),
+        );
+        assert_eq!(
+            serde_json::to_vec(&no_hint_items).unwrap(),
+            serde_json::to_vec(&default_items).unwrap()
+        );
+    }
     // Lead B's increased-cap last resort: preserve tags and money, and use
     // the existing upload hold instead of sending a smaller stripped revision.
     let mut held = item.clone();
