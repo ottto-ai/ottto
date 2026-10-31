@@ -4104,12 +4104,19 @@ fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
             assert_eq!(identity_count(&counts, "copy_derived_skipped_evidence_unavailable"), 1);
             assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 0);
             assert_eq!(serde_json::to_vec(&ledger).unwrap(), saved, "no tombstone");
-            // A body withheld for unread telemetry leaves the stored one in place.
             if let Some(copy) = body(&page, COPY) {
                 let row = &copy.usage_buckets[0].model_usage[0];
                 assert!(copy.request_identity_refusals > 0 || row.identity_retained, "protection kept");
                 assert_eq!((copy.request_count, copy.removed_request_count), (1, Some(1)));
                 assert_eq!(org_shares(copy).get(&b), None);
+            } else {
+                // Held for unread telemetry: no upload carries this session, so
+                // the stored body stays byte-for-byte the last ACKed one.
+                page.finish();
+                let (result, sent, order) = upload(&page.scan.snapshots, &mut e2_progress(), ack);
+                result.unwrap();
+                assert!(order.iter().flatten().all(|session| session != COPY));
+                assert!(sent.iter().all(|wire| !String::from_utf8_lossy(wire).contains(COPY)));
             }
         });
     }
