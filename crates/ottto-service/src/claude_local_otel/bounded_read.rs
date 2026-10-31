@@ -70,6 +70,8 @@ impl Input {
         #[cfg(not(test))]
         let _ = kind;
         let opened = api_file_generation(&file.metadata().ok()?)?;
+        // This optional whole-input optimization may refuse a large file:
+        // callers fall back to the ordinary streaming evidence reader.
         if before != opened || opened.bytes >= MAX_EVIDENCE_FILE_BYTES {
             return None;
         }
