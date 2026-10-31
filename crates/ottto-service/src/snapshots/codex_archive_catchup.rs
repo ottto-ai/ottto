@@ -85,21 +85,26 @@ impl ScanIndex {
         {
             return Err(CodexZstCause::ArchiveEquivalenceUnproven);
         }
-        if self
-            .archives
+        Ok(())
+    }
+    fn archive_parent_ready(
+        &self,
+        key: &str,
+        validated: Option<&Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    ) -> bool {
+        self.archives
             .get(key)
             .and_then(ArchiveEvidence::header)
             .and_then(|h| h.parent.as_ref())
-            .is_some_and(|parent| {
-                !self
-                    .codex_parent_ownership_ledgers
-                    .get(parent)
-                    .is_some_and(|ledger| ledger.scan_complete)
+            .map_or(true, |parent| {
+                validated
+                    .and_then(|map| map.lock().ok())
+                    .is_some_and(|map| {
+                        map.get(parent).is_some_and(|ledger| {
+                            ledger.scan_complete && !ledger.signatures.is_empty()
+                        })
+                    })
             })
-        {
-            return Err(CodexZstCause::ParentLedgerUnbound);
-        }
-        Ok(())
     }
     /// Save one reservation batch for the admitted page, before constructing
     /// any Full reader. Refused resource work remains eligible next pass.
@@ -108,6 +113,7 @@ impl ScanIndex {
         candidates: &VecDeque<CandidateFile>,
         inventory: &codex_file_join::HeaderInventory,
         budget: &sampled_scan::codex_cursor::PageBudget,
+        validated: Option<&Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     ) {
         if self.archive_pass.prepared {
             return;
@@ -122,6 +128,10 @@ impl ScanIndex {
                 continue;
             }
             if !budget.archive_ready(&self.archive_pass) || !inventory.archive_complete {
+                continue;
+            }
+            if !self.archive_parent_ready(&key, validated) {
+                self.archive_hold(&c.path, CodexZstCause::ParentLedgerUnbound);
                 continue;
             }
             match self.archive_fence(&key, inventory) {
@@ -148,6 +158,7 @@ impl ScanIndex {
         file: &File,
         inventory: Option<&codex_file_join::HeaderInventory>,
         budget: &sampled_scan::codex_cursor::PageBudget,
+        validated: Option<&Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     ) -> Admission {
         let key = local_index_key(&c.path);
         let Some(a) = self.archives.get(&key).filter(|a| a.matches(file)) else {
@@ -162,6 +173,10 @@ impl ScanIndex {
         if !budget.archive_ready(&self.archive_pass) {
             // No Full bytes spent: cancel the unconsumed reservation.
             self.archives.get_mut(&key).unwrap().cancel_reservation();
+            return Admission::Held;
+        }
+        if !self.archive_parent_ready(&key, validated) {
+            self.archive_hold(&c.path, CodexZstCause::ParentLedgerUnbound);
             return Admission::Held;
         }
         if let Err(cause) = inventory

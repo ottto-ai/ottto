@@ -1516,6 +1516,7 @@ pub(in crate::snapshots) mod tests {
             ("plain", Some(CodexZstCause::ArchiveEquivalenceUnproven)),
             ("sibling", Some(CodexZstCause::FamilyUnproven)),
             ("parent", Some(CodexZstCause::ParentLedgerUnbound)),
+            ("stale-parent", Some(CodexZstCause::ParentLedgerUnbound)),
             ("root", Some(CodexZstCause::OwnerUnproven)),
             ("damaged", Some(CodexZstCause::HeaderInvalid)),
         ] {
@@ -1524,7 +1525,7 @@ pub(in crate::snapshots) mod tests {
                 .lines()
                 .map(|l| serde_json::from_str(l).unwrap())
                 .collect();
-            if case == "parent" {
+            if matches!(case, "parent" | "stale-parent") {
                 rows[0]["payload"]["forked_from_id"] = json!("unresolved-parent");
             }
             let bytes = rows.iter().map(|r| format!("{r}\n")).collect::<String>();
@@ -1567,6 +1568,20 @@ pub(in crate::snapshots) mod tests {
                 scan.index
                     .legacy_unresolved_root_file_witnesses
                     .insert("unresolved-root".into());
+            }
+            if case == "stale-parent" {
+                scan.index.codex_parent_ownership_ledgers.insert(
+                    "unresolved-parent".into(),
+                    CodexParentOwnershipLedger {
+                        signatures: vec!["stale".into()],
+                        scan_complete: true,
+                        opened_object_identity: "stale-object".into(),
+                        opened_changed_nanos: 0,
+                        opened_modified_nanos: 0,
+                        opened_birth_nanos: 0,
+                        unresolvable: None,
+                    },
+                );
             }
             let checkpoint = fixture(b"", ".json");
             fs::remove_file(&checkpoint.0).unwrap();
