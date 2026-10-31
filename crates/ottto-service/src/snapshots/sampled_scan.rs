@@ -74,8 +74,8 @@ thread_local! {
 
 /// P1-RETAIN R0: while held, this thread's resident walk waits on the
 /// retained and cursor locks, one at a time, instead of reading contention as
-/// an unbounded resident. Used for a shape-F completion measure only; every
-/// other walk keeps `try_lock`. Restored on drop.
+/// an unbounded resident. Used only for the measure of a releasing completion
+/// (`releases_at_completion`); every other walk keeps `try_lock`. Restored on drop.
 pub(super) struct BlockingResidentMeasure(bool);
 impl BlockingResidentMeasure {
     pub(super) fn enter() -> Self {
@@ -1452,7 +1452,7 @@ pub(super) struct DeferredRelease {
     /// limit, so the insert's entry and key bounds cannot refuse it (e).
     pub(super) entry_limit: usize,
     /// M-a's churn bound: at most `|P_C|` victims (`prove_release`); `None`
-    /// on the legacy path and for a Full, which has no copy to continue.
+    /// on the legacy path and for a Full (`proven_release`).
     max_victims: Option<usize>,
 }
 impl DeferredRelease {
@@ -1655,8 +1655,7 @@ pub(super) struct ReleaseProof {
     finalization_prev: usize,
     /// This read added usage since the take (Q-PR15 (b)).
     usage_grew: bool,
-    /// A Full completion: no copy to continue, so no churn bound
-    /// (`proven_release`).
+    /// A Full completion (`prove_release`, `proven_release`).
     full: bool,
     rank: (i64, i64),
     modified: (i64, i64),
@@ -1705,10 +1704,12 @@ pub(super) fn x_out_for(source: SnapshotSource, bound: impl FnOnce() -> Option<u
 /// the bound releases nothing. A Full on the legacy decision releases nothing:
 /// with neither X_out nor `F_prev`, nothing proves its finished output fits, so
 /// it could evict residents and then lose its own copy on every page.
-/// A Full has no churn bound: X_out is what its
-/// copy needs to survive finalization, so `|P*|` of strictly older residents
-/// is its cost, fit-or-nothing. It evicts only while the cache is over the
-/// room, so the room it leaves funds the next completion.
+/// A Full with X_out has no churn bound. This release is its file's only way
+/// back into RAM, and among many small residents X_out's margin over `C` keeps
+/// `|P*|` above `|P_C|`, so the bound would leave a growing file Full on every
+/// page. It stays fit-or-nothing over strictly older residents, and stops at the
+/// first fit. A Tail or Unchanged read keeps the bound: its refusal costs one
+/// read, since its next growth is a Full that reaches this release.
 pub(super) fn prove_release(
     granted: RetainBudget,
     proof: Option<ReleaseProof>,

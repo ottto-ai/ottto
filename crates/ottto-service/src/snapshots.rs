@@ -29837,8 +29837,9 @@ impl OwnedSourceScan {
                             // #667: the decode peak is reserved from the budget the
                             // copy is admitted against: main's `copy_budget` above for
                             // a granted one. M-a (S-a): only now, after main's proof
-                            // retirement and that reservation, may a shape-F release be
-                            // proven; its `budget_after` is peak-reserved the same way.
+                            // retirement and that reservation, may a releasing completion
+                            // (`releases_at_completion`) prove its release; its
+                            // `budget_after` is peak-reserved the same way.
                             // X_out (#665): Claude's finish-output bound, only for a
                             // proof. The repository identity it measured (U3) is the
                             // one `finish` takes below; a miss refuses.
