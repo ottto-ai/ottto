@@ -642,6 +642,7 @@ fn recovery_emission_boundaries(
     scan.census_complete = true;
     scan.pending_finalization.push(PendingIndexFinalization {
         restored_behind_accepted: false,
+        withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: "synthetic-file".into(),

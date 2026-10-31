@@ -830,6 +830,7 @@ impl OwnedSourceScan {
             opened_object_identity: String::new(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         };
         // Mirror candidate conversion's census observation. An old queued
         // age rejection must not delete a successful recovery at settlement.
@@ -984,6 +985,7 @@ mod tests {
             opened_object_identity: "opened".into(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         }
     }
     fn index() -> ScanIndex {
@@ -993,6 +995,75 @@ mod tests {
         index.confirmed_empty_files.insert(key);
         index
     }
+    /// [behaviour] Virtual recovery keeps grown keys observed without reading before due.
+    #[test]
+    fn virtual_recovery_keeps_grown_keys_observed_without_reading_before_due() {
+        use crate::snapshots::claude_request_census::{
+            ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
+        };
+        let mut index = index();
+        let mut candidate = candidate();
+        let key = local_index_key(&candidate.path);
+        let record =
+            Record::synthetic_for_test(&"a".repeat(64), 1, Shape::IdentityIncomplete, vec![1])
+                .with_unverified_for_test(true);
+        index
+            .claude_request_census_mut_for_test()
+            .insert_for_test(&key, record);
+        let now = 10 * 86_400;
+        let due = now + 100;
+        index.held_audit_progress = Some(HeldAuditProgress {
+            key: key.clone(),
+            due,
+            attempted: false,
+        });
+        candidate.size_bytes += 1;
+        candidate.source_file_fingerprint = "changed".into();
+        assert!(awaits_hold_deadline_restoration(&index, &key));
+        assert!(
+            discovery_retention!(index).owes_with_len(
+                SnapshotSource::ClaudeCode,
+                &candidate.path,
+                candidate.size_bytes
+            ),
+            "growth stays discoverable, never dropped"
+        );
+        let decide = |index: &ScanIndex, candidate: &CandidateFile, at| {
+            index.candidate_decision_in_window(candidate, at, Some(at), 7)
+        };
+        let mut recent = candidate.clone();
+        recent.modified_unix_seconds = now;
+        assert_eq!(
+            decide(&index, &recent, now),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::TranscriptChanged)
+            ),
+            "recent growth preserves main's immediate selection"
+        );
+        assert_eq!(
+            decide(&index, &candidate, due - 1).0,
+            CandidateDecision::Skip,
+            "scheduling future virtual debt cannot acquire the grown file"
+        );
+        assert_eq!(
+            decide(&index, &candidate, due),
+            (CandidateDecision::Parse, Some(CandidateParseReason::Audit)),
+            "due read retains its counted audit cause"
+        );
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        assert_eq!(
+            decide(&index, &candidate, due - 1).0,
+            CandidateDecision::Parse,
+            "genuine external rearm is not hidden by the virtual delay"
+        );
+    }
+
     #[test]
     fn cap_retry_keeps_durable_custody_without_a_traversal_or_marker() {
         let mut index = index();
@@ -1479,6 +1550,7 @@ mod provenance_tests {
             opened_object_identity: "opened".into(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         };
         let key = local_index_key(&candidate.path);
         for reset in [None, Some("semantic_sync:v1"), Some("unknown-provenance")] {
@@ -1563,28 +1635,68 @@ pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) 
     }
 }
 
-// To be replaced by #876's implementation at merge. Exact round-18 copy
-// from e3/withheld-age-exempt at 5df3fc370c10b3ce0e0d9f98ec46f044c2388c54.
 /// Positive removal only: a file or intermediate directory is NotFound beneath
 /// a readable ancestor securely reached from a configured, readable root.
 /// Missing roots, symlinks and permission errors keep the audit and account debt.
 /// This is absence authority, never source verification or census credit.
 pub(super) fn proven_absent(path: &Path, roots: &[PathBuf]) -> bool {
+    absence_parent(path, roots).is_some()
+}
+
+/// Pin the nearest existing parent so its inode cannot be reused between probes.
+/// Depth binds the missing component when an intermediate directory is absent.
+#[derive(Debug)]
+pub(super) struct AbsenceParent {
+    directory: File,
+    depth: usize,
+}
+impl AbsenceParent {
+    pub(super) fn same_parent(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.depth == other.depth
+                && self
+                    .directory
+                    .metadata()
+                    .ok()
+                    .zip(other.directory.metadata().ok())
+                    .is_some_and(|(a, b)| a.dev() == b.dev() && a.ino() == b.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (self, other);
+            false
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for AbsenceParent {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            directory: _,
+            depth: _,
+        } = self;
+        c.add(0)
+    }
+}
+
+pub(super) fn absence_parent(path: &Path, roots: &[PathBuf]) -> Option<AbsenceParent> {
     #[cfg(unix)]
     {
         roots
             .iter()
-            .any(|root| proven_absent_beneath_root(path, root).unwrap_or(false))
+            .find_map(|root| proven_absent_beneath_root(path, root).ok().flatten())
     }
     #[cfg(not(unix))]
     {
         let _ = (path, roots);
-        false
+        None
     }
 }
 
 #[cfg(unix)]
-fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool> {
+fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<Option<AbsenceParent>> {
     fn open_directory(parent: &File, name: &std::ffi::CStr) -> std::io::Result<File> {
         // Match open_candidate_beneath_root: every directory is readable and
         // no component below the configured root may redirect through a link.
@@ -1633,26 +1745,26 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
             .components()
             .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
     {
-        return Ok(false);
+        return Ok(None);
     }
     // Preserve the nofollow check on the root's final component even when its
     // configured spelling has a trailing separator or `/.`.
     let root: PathBuf = root.components().collect();
     let Ok(relative) = path.strip_prefix(&root) else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut names = Vec::new();
     for component in relative.components() {
         let Component::Normal(name) = component else {
-            return Ok(false);
+            return Ok(None);
         };
         let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
-            return Ok(false);
+            return Ok(None);
         };
         names.push(name);
     }
     let Some((final_name, parents)) = names.split_last() else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut root_options = fs::OpenOptions::new();
     root_options
@@ -1673,7 +1785,7 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
         }
     }
     if !name_absent(directories.last().expect("opened ancestor"), missing_name)? {
-        return Ok(false);
+        return Ok(None);
     }
 
     // A removed/replaced ancestor can leave a readable but detached descriptor.
@@ -1682,15 +1794,21 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
     // or recreation (even an empty directory) keeps the debt.
     let mut directory = root_options.open(&root)?;
     if !same_directory(&directory, &directories[0])? {
-        return Ok(false);
+        return Ok(None);
     }
     for (name, original) in parents.iter().zip(&directories[1..]) {
         directory = open_directory(&directory, name)?;
         if !same_directory(&directory, original)? {
-            return Ok(false);
+            return Ok(None);
         }
     }
-    name_absent(&directory, missing_name)
+    if !name_absent(&directory, missing_name)? {
+        return Ok(None);
+    }
+    Ok(Some(AbsenceParent {
+        directory,
+        depth: directories.len(),
+    }))
 }
 
 #[cfg(all(test, unix))]

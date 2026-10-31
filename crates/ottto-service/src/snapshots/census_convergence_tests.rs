@@ -1069,8 +1069,8 @@ fn bound_terminal_hold_skips_until_family_changes() {
     );
 }
 
-// Account holds are durable, bounded, and pruned only by a resolving
-// parse or proved absence.
+/// [format] Account holds are durable, bounded, and pruned only by a resolving
+/// parse or two stable-parent absence observations.
 #[test]
 fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     let dir = crate::test_scratch::ScratchDir::new("account-hold-rooted-proof");
@@ -1088,7 +1088,7 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     index
         .file_snapshot_fingerprints
         .insert(other_key.to_string(), BTreeSet::from(["other".to_string()]));
-    let deferred = BTreeSet::from(["deferred".to_string()]);
+    let deferred = BTreeMap::from([("deferred".to_string(), 7)]);
 
     assert!(index.record_claude_account_deferred_holds(
         [(held_key, "deferred-source"), (other_key, "other-source")],
@@ -1117,22 +1117,25 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     // A parse that resolves the deferral clears it.
     let mut resolved = index.clone();
     assert!(resolved
-        .record_claude_account_deferred_holds([(held_key, "deferred-source")], &BTreeSet::new(),));
+        .record_claude_account_deferred_holds([(held_key, "deferred-source")], &BTreeMap::new(),));
     assert_eq!(resolved.claude_account_deferred_hold_count(), 0);
+    // W4: a release on resolution is counted apart from a deletion.
+    let [released, _, _] = crate::local_resource_diagnostics::withheld_support::take_withheld();
+    assert_eq!(released, BTreeMap::from([("resolved", 1)]));
 
     // Census absence prompts a rooted proof; absence of index/observation
     // membership alone is never enough to release owed usage.
     let mut observed = index.clone();
-    observed.retain_observed_claude_account_deferred_holds(&BTreeSet::from([held_key.to_string()]));
+    observed.probe_absent_claude_account_deferred_holds();
     assert_eq!(observed.claude_account_deferred_hold_count(), 1);
     let mut indexed = index.clone();
     indexed
         .files
         .insert(held_key.to_string(), manifest_index_entry(Some("deferred")));
-    indexed.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    indexed.probe_absent_claude_account_deferred_holds();
     assert_eq!(indexed.claude_account_deferred_hold_count(), 1);
     let mut absent = index.clone();
-    absent.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    absent.probe_absent_claude_account_deferred_holds();
     assert_eq!(
         absent.claude_account_deferred_hold_count(),
         1,
@@ -1149,18 +1152,31 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
         &held_path,
         std::slice::from_ref(&scan_root)
     ));
-    absent.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    absent.probe_absent_claude_account_deferred_holds();
     assert_eq!(
         absent.claude_account_deferred_hold_count(),
         1,
         "still present"
     );
+    crate::snapshots::line_delivery_tests::walk_all(&mut absent, 7);
     fs::remove_file(&held_path).unwrap();
     assert!(sampled_audit::proven_absent(
         &held_path,
         std::slice::from_ref(&scan_root)
     ));
-    absent.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    withheld_account::support::clock(&absent.withheld_memo);
+    sampled_scan::set_test_now(Some(1_000));
+    absent.probe_absent_claude_account_deferred_holds();
+    assert_eq!(absent.claude_account_deferred_hold_count(), 1);
+    crate::snapshots::line_delivery_tests::next_walk(
+        &mut absent,
+        std::slice::from_ref(&scan_root),
+        "2026-10-07T12:00:00Z",
+        7,
+    );
+    sampled_scan::set_test_now(Some(1_600));
+    absent.probe_absent_claude_account_deferred_holds();
+    sampled_scan::set_test_now(None);
     assert_eq!(absent.claude_account_deferred_hold_count(), 0);
 
     // At the bound a new hold cannot be recorded and the caller must keep
@@ -1180,6 +1196,9 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     );
     assert!(!full.record_claude_account_deferred_holds([(other_key, "other-source")], &deferred));
     assert!(!full.claude_account_deferred_holds.contains_key(other_key));
+    // W3: the unrecorded key's withheld tokens are disclosed on the page line.
+    let [_, _, unrecorded] = crate::local_resource_diagnostics::withheld_support::take_withheld();
+    assert_eq!(unrecorded, BTreeMap::from([("events", 1), ("tokens", 7)]));
     assert!(full.record_claude_account_deferred_holds([(held_key, "next-source")], &deferred));
     assert_eq!(
         full.claude_account_deferred_holds

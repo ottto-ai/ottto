@@ -830,6 +830,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
         restored_behind_accepted: false,
+        withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: key.clone(),
@@ -2489,6 +2490,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 opened_object_identity: String::new(),
                 fingerprint_changed_nanos: 0,
                 fingerprint_birth_nanos: 0,
+                withheld_content_stamp: None,
             };
             assert_eq!(
                 loaded.candidate_decision_with_reason(&candidate),
@@ -4852,6 +4854,7 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
                     opened_object_identity: String::new(),
                     fingerprint_changed_nanos: 0,
                     fingerprint_birth_nanos: 0,
+                    withheld_content_stamp: None,
                 };
                 assert_eq!(
                     decoded.candidate_decision_with_reason_at(&candidate, 0),

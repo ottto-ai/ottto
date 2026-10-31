@@ -493,6 +493,7 @@ impl HeaderInventory {
                 opened_object_identity: String::new(),
                 fingerprint_changed_nanos: 0,
                 fingerprint_birth_nanos: 0,
+                withheld_content_stamp: None,
             };
             prepare_owned_scan_candidate(
                 SnapshotSource::Codex,
@@ -3844,7 +3845,7 @@ pub(super) mod tests {
                 &mut census,
                 None,
                 0,
-                &BTreeMap::new(),
+                crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
             )
             .unwrap();
             let parsed = parse_opened_jsonl_file(

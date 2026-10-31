@@ -1044,16 +1044,6 @@ fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
                 other_page(&c, &owner, SnapshotSource::Codex, prior.clone());
             assert_eq!(modes, (0, 1, 0));
             assert_eq!(durable_restores(&owner.cache, SnapshotSource::Codex).1, 1);
-            let evidence = |index: &ScanIndex, scan: &SourceScanResult| {
-                json!({
-                "TierReplay": index.files.iter().map(|(k, e)| (k.clone(), json!({
-                    "applied":e.codex_applied_tier_receipt, "required":e.codex_applied_tier_receipt_required,
-                    "captured":e.codex_captured_tier_receipt, "owner":e.codex_protected_owner,
-                    "v2":e.codex_counting_v2 }))).collect::<BTreeMap<_,_>>(),
-                "token_count": scan.snapshots.iter().map(|s| (s.source_session_id.clone(),
-                    json!([s.input_tokens, s.output_tokens, s.cache_read_tokens,
-                        s.reasoning_output_tokens, s.request_count]))).collect::<BTreeMap<_,_>>() })
-            };
             let mut cold = RouteResult::emitted(
                 Mode::ColdFull,
                 SnapshotSource::Codex,
@@ -1066,8 +1056,8 @@ fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
                 vec![other_wire(SnapshotSource::Codex, &disk_scan)],
                 &disk_scan.snapshots,
             );
-            cold.codex_evidence = evidence(&cold_index, &cold_scan);
-            restored.codex_evidence = evidence(&next, &disk_scan);
+            cold.codex_evidence = fixture::codex_evidence(&cold_index, &cold_scan);
+            restored.codex_evidence = fixture::codex_evidence(&next, &disk_scan);
             money_oracle::assert_equivalent(&cold, &restored);
             assert!(next.files.values().all(|e| e.codex_counting_v2 != legacy));
             prior = disk.commit(&owner.cache, SnapshotSource::Codex, &mut next);
@@ -1218,17 +1208,7 @@ impl TransitionDriver for Codex24b {
             result.io.rederive_head = counters.rederive_head_bytes;
             result.io.rederive_named = counters.rederive_line_bytes;
         }
-        result.codex_evidence = json!({
-            "TierReplay": index.files.iter().map(|(k,e)| (k.clone(), json!({
-                "applied":e.codex_applied_tier_receipt,
-                "required":e.codex_applied_tier_receipt_required,
-                "captured":e.codex_captured_tier_receipt,
-                "owner":e.codex_protected_owner, "v2":e.codex_counting_v2
-            }))).collect::<BTreeMap<_,_>>(),
-            "token_count": scan.snapshots.iter().map(|s| (s.source_session_id.clone(),
-                json!([s.input_tokens,s.output_tokens,s.request_count])))
-                .collect::<BTreeMap<_,_>>()
-        });
+        result.codex_evidence = fixture::codex_evidence(&index, &scan);
         self.observations.insert(
             mode,
             Codex24bObservation {

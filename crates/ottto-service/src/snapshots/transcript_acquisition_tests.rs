@@ -1185,12 +1185,17 @@ type ProductionScanPage = (
 fn production_scan_page_at_with_setup(
     fixture: &ScanFixture,
     source: SnapshotSource,
-    index: ScanIndex,
+    mut index: ScanIndex,
     cache: Option<Arc<sampled_scan::SharedCache>>,
     namespace: &str,
     collected_at: &str,
     setup: impl FnOnce(&mut OwnedSourceScan),
 ) -> ProductionScanPage {
+    if source == SnapshotSource::ClaudeCode {
+        if let Some(cache) = &cache {
+            cache.bind_withheld(&mut index);
+        }
+    }
     let mut scan = OwnedSourceScan::new(
         source,
         std::slice::from_ref(&fixture.root),
@@ -1217,6 +1222,7 @@ fn finish_production_scan_page(
     mut scan: OwnedSourceScan,
     source: SnapshotSource,
 ) -> ProductionScanPage {
+    withheld_account::support::clock(&scan.index.withheld_memo);
     let mut modes = (0, 0, 0);
     let mut metrics = (0, 0);
     loop {
@@ -5836,7 +5842,7 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
             "held-index.json"
         });
         index.save(&path).unwrap();
-        let index = ScanIndex::load(&path).unwrap();
+        let mut index = ScanIndex::load(&path).unwrap();
         let queued = index
             .traversal
             .as_ref()
@@ -5851,7 +5857,7 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
             &mut ScanCensus::default(),
             None,
             183,
-            &index.files,
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
         )
         .unwrap();
         let retry_dependencies = sampled_scan::reduction_dependencies(

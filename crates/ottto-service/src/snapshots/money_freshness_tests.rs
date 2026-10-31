@@ -292,6 +292,7 @@ fn disabled_shadow_has_no_tracker_state_box_or_emission() {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let (_, records) = crate::local_resource_diagnostics::capture(|| {
         shadow::attest_equality_skip(&index, &candidate, &None, NOW);

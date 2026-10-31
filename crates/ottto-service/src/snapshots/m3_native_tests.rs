@@ -149,6 +149,10 @@ fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
         .as_secs();
     let key = local_index_key(&path);
     let discover = |files: &BTreeMap<String, ScanIndexEntry>| {
+        let mut index = ScanIndex {
+            files: files.clone(),
+            ..ScanIndex::default()
+        };
         candidate_from_traversal_path(
             SnapshotSource::ClaudeCode,
             ScanTraversalPath {
@@ -160,7 +164,7 @@ fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
             &mut ScanCensus::default(),
             Some(now),
             30,
-            files,
+            &mut CandidateDiscovery::new(&mut index, None, None),
         )
         .is_some()
     };
