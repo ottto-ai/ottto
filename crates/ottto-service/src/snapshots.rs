@@ -20756,33 +20756,18 @@ impl SnapshotAccumulator {
         .then(|| self.codex_creator_evidence.clone())
         .flatten()
         .filter(|evidence| {
-            let created = evidence
-                .source_created_at
-                .as_deref()
-                .and_then(|timestamp| OffsetDateTime::parse(timestamp, &Rfc3339).ok());
-            created.is_some_and(|created| {
-                [self.started_at.as_deref(), Some(collected_at)]
-                    .into_iter()
-                    .all(|timestamp| {
-                        timestamp
-                            .and_then(|timestamp| OffsetDateTime::parse(timestamp, &Rfc3339).ok())
-                            .is_some_and(|observed| created <= observed)
-                    })
-            })
+            creator_time_precedes_start(
+                evidence.source_created_at.as_deref(),
+                self.started_at.as_deref(),
+            )
         });
         if self.source == SnapshotSource::ClaudeCode {
             let mut evidence = self.claude_desktop_identity.clone().unwrap_or_else(|| {
                 ClaudeTitleMetadata::default().session_account_evidence(&source_session_id)
             });
-            evidence.source_created_at =
-                evidence.source_created_at.as_deref().and_then(|timestamp| {
-                    let created = OffsetDateTime::parse(timestamp, &Rfc3339).ok()?;
-                    let observed =
-                        OffsetDateTime::parse(self.started_at.as_deref()?, &Rfc3339).ok()?;
-                    let collected = OffsetDateTime::parse(collected_at, &Rfc3339).ok()?;
-                    (created.unix_timestamp() >= 0 && created <= observed && observed <= collected)
-                        .then(|| timestamp.to_string())
-                });
+            evidence.source_created_at = evidence.source_created_at.take().filter(|created| {
+                creator_time_precedes_start(Some(created), self.started_at.as_deref())
+            });
             if evidence.source_created_at.is_none()
                 && evidence.identity_disposition == Some("complete")
             {
@@ -37367,6 +37352,19 @@ fn codex_paginated_fork_creation_header(value: &Value, meta: &Value) -> bool {
         && u64_at(value, &["ordinal"]).is_some_and(|ordinal| {
             u64_at(meta, &["history_base", "end_ordinal_exclusive"]) == Some(ordinal)
         })
+}
+
+/// A session's creator time is certified only when it is no later than the
+/// transcript's first retained activity, so a resumed or truncated suffix never
+/// manufactures a creator. The scan's `collected_at` is the cycle start, not
+/// this file's read time: a session born after the cycle started is still read
+/// by it, so `collected_at` is no bound here.
+fn creator_time_precedes_start(created: Option<&str>, started_at: Option<&str>) -> bool {
+    let parse = |timestamp: &str| OffsetDateTime::parse(timestamp, &Rfc3339).ok();
+    match (created.and_then(parse), started_at.and_then(parse)) {
+        (Some(created), Some(started)) => created.unix_timestamp() >= 0 && created <= started,
+        _ => false,
+    }
 }
 
 /// Capture the first physical header before applying the ownership boundary.
@@ -81099,6 +81097,14 @@ mod tests {
     }
 
     fn codex_creator_item(headers: &[Value], path_session_id: &str) -> SnapshotItem {
+        codex_creator_item_collected_at(headers, path_session_id, "2026-09-30T10:05:00Z")
+    }
+
+    fn codex_creator_item_collected_at(
+        headers: &[Value],
+        path_session_id: &str,
+        collected_at: &str,
+    ) -> SnapshotItem {
         // Parallel creator cases share the same session filename. Clock-only
         // directories can collide and mutate another case's opened fixture.
         let root = crate::test_scratch::ScratchDir::new("codex-creator");
@@ -81114,7 +81120,7 @@ mod tests {
         let body = records.iter().map(|v| format!("{v}\n")).collect::<String>();
         fs::write(&path, &body).expect("write creator fixture");
         let source_file_fingerprint = sha256_hex(&["codex_creator_fixture_source:v1"]);
-        parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", source_file_fingerprint)
+        parse_codex_jsonl_file(&path, collected_at, source_file_fingerprint)
             .expect("parse creator fixture")
             .into_iter()
             .next()
@@ -81935,6 +81941,26 @@ mod tests {
             body,
             serde_json::to_value(&legacy).unwrap(),
             "missing evidence retains legacy wire"
+        );
+    }
+
+    /// [regress] CX1 2026-10-31: a rollout born after its scan cycle started
+    /// (`collected_at` = cycle start) but before the page read it lost its
+    /// creator pair, so its first body went out without one (M4: 3 of 231
+    /// Codex first admissions in 14 h).
+    #[test]
+    fn codex_creator_pair_survives_rollout_created_after_cycle_start() {
+        let header = codex_creator_header();
+        let id = header["payload"]["id"].as_str().unwrap();
+        let born_after_cycle_start = codex_creator_item_collected_at(
+            std::slice::from_ref(&header),
+            id,
+            "2026-09-30T09:59:53Z",
+        );
+        assert!(born_after_cycle_start.session_account_evidence.is_some());
+        assert_eq!(
+            born_after_cycle_start.session_account_evidence,
+            codex_creator_item(std::slice::from_ref(&header), id).session_account_evidence
         );
     }
 
