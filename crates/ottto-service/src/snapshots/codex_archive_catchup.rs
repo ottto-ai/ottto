@@ -38,22 +38,21 @@ impl ScanIndex {
         }
         let retry =
             prior.is_some_and(|a| matches!(a.disposition, ArchiveDisposition::Pending { .. }));
-        let family = inventory.is_some_and(|i| {
-            i.headers
-                .iter()
-                .any(|h| h.candidate.path != candidate.path && ids.contains(&h.owner))
-        }) || self.traversal.as_ref().is_some_and(|t| {
-            t.codex_rollout_paths.iter().any(|p| {
-                p != &key
-                    && codex_archive_path(Path::new(p))
-                    && !inventory
-                        .and_then(|i| i.owner_for_path(Path::new(p)))
-                        .is_some_and(|owner| !ids.iter().any(|id| id == owner))
-                    && codex_session_id_candidates_from_path(Path::new(p))
-                        .iter()
-                        .any(|id| ids.contains(id))
-            })
-        });
+        // The table counts this archive, so `sibling` means a second member.
+        // Decode-, feed- and persisted-held archives are not in it: keep the roster.
+        let family = inventory.is_some_and(|i| i.family_table().archive_class(&key).sibling)
+            || self.traversal.as_ref().is_some_and(|t| {
+                t.codex_rollout_paths.iter().any(|p| {
+                    p != &key
+                        && codex_archive_path(Path::new(p))
+                        && !inventory
+                            .and_then(|i| i.owner_for_path(Path::new(p)))
+                            .is_some_and(|owner| !ids.iter().any(|id| id == owner))
+                        && codex_session_id_candidates_from_path(Path::new(p))
+                            .iter()
+                            .any(|id| ids.contains(id))
+                })
+            });
         let old_carrier = ids.iter().any(|id| {
             let owner = codex_protected_owner(id);
             self.codex_counting_tombstones.contains_key(&owner)
