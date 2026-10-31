@@ -236,6 +236,11 @@ fn legacy_count_and_account_changes_reselect_through_the_application_owner() {
     let fixture = Fixture::new();
     let (index, _, walk, _) = fixture.run(ScanIndex::default(), true, None, 100);
     assert!(index.claude_account_family_witnesses.contains_key("root"));
+    // Settle the transition into a newly proven legacy family before testing
+    // its count dependency. Otherwise the legacy-proof transition alone would
+    // select every child even if evidence_request_count were omitted.
+    let (index, _, walk, _) = fixture.run(index, true, Some(walk), 100);
+    assert!(index.claude_account_family_witnesses.contains_key("root"));
     append_pair(&fixture.support, "req-b2", "b", &"a".repeat(64));
     let (mut index, _, walk, selected) = fixture.run(index, true, Some(walk), 100);
     assert_eq!(
