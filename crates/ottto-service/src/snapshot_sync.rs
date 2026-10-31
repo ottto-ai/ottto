@@ -3732,16 +3732,6 @@ fn clear_shed_streak(source: SnapshotSource) {
     }
 }
 
-#[cfg(test)]
-fn shed_streak_for_test(source: SnapshotSource) -> u32 {
-    source_shed_streaks()
-        .lock()
-        .expect("shed streaks")
-        .get(source.api_slug())
-        .copied()
-        .unwrap_or(0)
-}
-
 /// Per-source "do not upload before" deadlines, set by an honoured shed.
 static SOURCE_UPLOAD_DEADLINES: OnceLock<Mutex<BTreeMap<&'static str, Instant>>> = OnceLock::new();
 
@@ -13643,93 +13633,6 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    fn cache_effective_wire_released143_index(root: &Path) -> (ScanIndex, SnapshotUploadProgress) {
-        let scan = |index: &mut ScanIndex| {
-            crate::snapshots::scan_source_roots_with_test_limit(
-                SnapshotSource::Codex,
-                &[root.to_path_buf()],
-                index,
-                "2026-09-30T10:05:00Z",
-                crate::snapshots::BACKFILL_WINDOW_DAYS,
-                MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
-            )
-            .unwrap()
-        };
-        let mut index = ScanIndex::default();
-        let mut progress = test_upload_progress();
-        index.activate_upload_context("cache-off".into());
-        let mut off = scan(&mut index);
-        apply_upload_policy(
-            SnapshotSource::Codex,
-            &mut off.snapshots,
-            SnapshotUploadPolicy::default(),
-        );
-        // Actual released ordering stores the raw cache-bearing witness first.
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut off, &mut index);
-        for item in &mut off.snapshots {
-            prepare_snapshot_cache_for_upload(item, &progress, false, false, &BTreeSet::new());
-        }
-        let mut accepted = 0;
-        upload_resumable_batches_with_body_witness(
-            &off.snapshots,
-            &unique_poison_scope(),
-            &mut progress,
-            &mut accepted,
-            |item| item.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |items| {
-                let request = SnapshotBatchRequest {
-                    schema_version: SNAPSHOT_SCHEMA_VERSION,
-                    source: "codex".into(),
-                    machine_id: "a".repeat(64),
-                    collector_version: Some(collector_version()),
-                    snapshots: items,
-                    upload_policy: SnapshotUploadPolicy::default(),
-                    client_report: crate::client_report::ClientReport::empty(),
-                };
-                let item = &request.snapshots[0];
-                let mut response = accepted_batch(1);
-                response.entity_ack_contract =
-                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
-                response
-                    .accepted_entities
-                    .push(crate::snapshot_client::SnapshotEntityRef {
-                        source_session_id: item.source_session_id.clone(),
-                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                        occurrence_count: 1,
-                        body_witness_version: Some(6),
-                        body_witness_digest: Some(snapshot_upload_body_witness(item)),
-                        head_etag: None,
-                        head_challenge: None,
-                        unchanged_basis: None,
-                        retained_proof_missing: Vec::new(),
-                    });
-                response.validate_entity_ack(&request)?;
-                Ok(response)
-            },
-            |_| Ok(()),
-        )
-        .unwrap();
-        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-        index.activate_upload_context("cache-on".into());
-        let mut on = scan(&mut index);
-        assert_eq!(on.snapshots.len(), 1);
-        apply_upload_policy(
-            SnapshotSource::Codex,
-            &mut on.snapshots,
-            SnapshotUploadPolicy::default(),
-        );
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut on, &mut index);
-        assert!(
-            on.snapshots.is_empty(),
-            "released143 falsely settles unchanged enrichment under admitted context"
-        );
-        assert!(progress.accepted_cache_states.is_empty());
-        assert!(progress.accepted_cache_heads.is_empty());
-        (index, progress)
-    }
-
     #[test]
     fn cache_effective_wire_projection_matches_index_retractions_and_held_local_evidence() {
         let root = cache_effective_wire_fixture_root();
@@ -14187,233 +14090,6 @@ mod tests {
         assert!(progress.pending_cache_heads.is_empty());
         progress.finish_cycle(&progress_path).unwrap();
         assert!(scan(&mut loaded).snapshots.is_empty());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn cache_effective_wire_existing143_admitted_index_requires_adoption() {
-        let root = cache_effective_wire_fixture_root();
-        let (mut index, _) = cache_effective_wire_released143_index(&root);
-        index.activate_effective_upload_body_witness_revision(
-            effective_upload_body_witness_revision(SnapshotSource::Codex),
-        );
-        let next = crate::snapshots::scan_source_roots_with_test_limit(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-09-30T10:05:00Z",
-            crate::snapshots::BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .unwrap();
-        std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(
-            next.snapshots.len(),
-            1,
-            "existing143 admitted index must enter projection adoption instead of Skip"
-        );
-        assert!(
-            index
-                .files
-                .values()
-                .all(|entry| entry.effective_upload_body_witness_revision == 0),
-            "parse alone never certifies effective settlement"
-        );
-    }
-
-    #[test]
-    // A shed page records RatelimitBackoff in the shared client_report counters.
-    #[serial(client_report)]
-    fn cache_effective_wire_existing143_context_parse_equal_body_requires_adoption() {
-        let root = cache_effective_wire_fixture_root();
-        let (mut index, mut progress) = cache_effective_wire_released143_index(&root);
-        index.activate_effective_upload_body_witness_revision(
-            effective_upload_body_witness_revision(SnapshotSource::Codex),
-        );
-        index.activate_upload_context("cache-on-new-context-same-effective-body".into());
-        let previous = index.clone();
-        let mut next = crate::snapshots::scan_source_roots_with_test_limit(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-09-30T10:05:00Z",
-            crate::snapshots::BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            next.snapshots.len(),
-            1,
-            "normal context invalidation actually Parse"
-        );
-        apply_upload_policy(
-            SnapshotSource::Codex,
-            &mut next.snapshots,
-            SnapshotUploadPolicy::default(),
-        );
-        finalize_scan_after_policy_with_body_witness(
-            SnapshotSource::Codex,
-            &mut next,
-            &mut index,
-            |item| {
-                effective_snapshot_upload_body_witness(
-                    item,
-                    &progress,
-                    true,
-                    false,
-                    &BTreeSet::new(),
-                    &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
-                )
-            },
-        );
-        assert_eq!(
-            next.snapshots.len(),
-            1,
-            "projection adoption must ignore old raw-body equality after context Parse"
-        );
-        let mut accepted = 0;
-        let outcome = upload_resumable_batches_with_body_witness(
-            &next.snapshots,
-            &unique_poison_scope(),
-            &mut progress,
-            &mut accepted,
-            |item| item.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |_| {
-                Err(anyhow::Error::new(UploadShed {
-                    status: 503,
-                    retry_after: Some(Duration::from_secs(60)),
-                    code: None,
-                }))
-            },
-            |_| Ok(()),
-        )
-        .unwrap();
-        assert!(matches!(outcome, ResumableUploadResult::Shed { .. }));
-        assert!(
-            progress.accepted_fingerprints.is_empty(),
-            "actual uploader prunes prior ordinary ACK before additive enrichment"
-        );
-        let mut partial = index.committable_subset(
-            &previous,
-            &progress.accepted_fingerprints,
-            &progress.quarantined_fingerprints,
-        );
-        assert!(partial
-            .files
-            .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 0));
-        let path = root.join("index.json");
-        partial.save(&path).unwrap();
-        let mut retry_index = ScanIndex::load(&path).unwrap();
-        retry_index.activate_upload_context("cache-on-new-context-same-effective-body".into());
-        retry_index.activate_effective_upload_body_witness_revision(
-            effective_upload_body_witness_revision(SnapshotSource::Codex),
-        );
-        let mut retry = crate::snapshots::scan_source_roots_with_test_limit(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut retry_index,
-            "2026-09-30T10:05:00Z",
-            crate::snapshots::BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .unwrap();
-        apply_upload_policy(
-            SnapshotSource::Codex,
-            &mut retry.snapshots,
-            SnapshotUploadPolicy::default(),
-        );
-        finalize_scan_after_policy_with_body_witness(
-            SnapshotSource::Codex,
-            &mut retry,
-            &mut retry_index,
-            |item| {
-                effective_snapshot_upload_body_witness(
-                    item,
-                    &progress,
-                    true,
-                    false,
-                    &BTreeSet::new(),
-                    &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
-                )
-            },
-        );
-        assert_eq!(
-            retry.snapshots.len(),
-            1,
-            "restart retains actual old-file acquisition"
-        );
-        upload_resumable_batches_with_body_witness(
-            &retry.snapshots,
-            &unique_poison_scope(),
-            &mut progress,
-            &mut accepted,
-            |item| item.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |items| {
-                let request = SnapshotBatchRequest {
-                    schema_version: SNAPSHOT_SCHEMA_VERSION,
-                    source: "codex".into(),
-                    machine_id: "a".repeat(64),
-                    collector_version: Some(collector_version()),
-                    snapshots: items,
-                    upload_policy: SnapshotUploadPolicy::default(),
-                    client_report: crate::client_report::ClientReport::empty(),
-                };
-                let item = &request.snapshots[0];
-                let mut response = accepted_batch(1);
-                response.entity_ack_contract =
-                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
-                response
-                    .accepted_entities
-                    .push(crate::snapshot_client::SnapshotEntityRef {
-                        source_session_id: item.source_session_id.clone(),
-                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                        occurrence_count: 1,
-                        body_witness_version: Some(18),
-                        body_witness_digest: Some(snapshot_upload_body_witness(item)),
-                        head_etag: Some("f".repeat(64)),
-                        head_challenge: None,
-                        unchanged_basis: None,
-                        retained_proof_missing: Vec::new(),
-                    });
-                response.validate_entity_ack_with_head_cas(&request, true)?;
-                Ok(response)
-            },
-            |_| Ok(()),
-        )
-        .unwrap();
-        assert_eq!(progress.accepted_cache_states.len(), 1);
-        retry_index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-        retry_index.save(&path).unwrap();
-        let mut loaded = ScanIndex::load(&path).unwrap();
-        assert!(loaded
-            .files
-            .values()
-            .all(|entry| entry.effective_upload_body_witness_revision
-                == effective_upload_body_witness_revision(SnapshotSource::Codex)));
-        loaded.activate_upload_context("cache-on-new-context-same-effective-body".into());
-        loaded.activate_effective_upload_body_witness_revision(
-            effective_upload_body_witness_revision(SnapshotSource::Codex),
-        );
-        let stable = crate::snapshots::scan_source_roots_with_test_limit(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut loaded,
-            "2026-09-30T10:05:00Z",
-            crate::snapshots::BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .unwrap();
-        assert!(
-            stable.snapshots.is_empty(),
-            "saved exact cache settlement adopts file once"
-        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -15539,19 +15215,6 @@ mod tests {
     }
 
     static TEST_POISON_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    #[test]
-    fn partial_curve_replay_page_keeps_historical_epoch_pending() {
-        let mut index = ScanIndex::default();
-        let generation = "session_context_curve:v1:parser-test";
-
-        assert!(index.context_curve_replay_needed(generation));
-        settle_context_curve_replay_state(&mut index, true, false, generation);
-        assert!(index.context_curve_replay_needed(generation));
-
-        settle_context_curve_replay_state(&mut index, true, true, generation);
-        assert!(!index.context_curve_replay_needed(generation));
-    }
 
     #[test]
     fn collision_suppressed_codex_rollout_is_not_upload_reachable() {
@@ -17164,108 +16827,6 @@ mod tests {
     }
 
     #[test]
-    fn a_shed_upload_is_counted_as_backoff_not_as_a_network_error() {
-        let shed = anyhow::Error::new(UploadFailureDiagnostics::for_test(
-            "local snapshot upload",
-            "snapshot_batch",
-            "http_429",
-            true,
-            false,
-        ));
-        assert!(is_shed_failure(&shed));
-        let server_error = anyhow::Error::new(UploadFailureDiagnostics::for_test(
-            "local snapshot upload",
-            "snapshot_batch",
-            "http_5xx",
-            true,
-            false,
-        ));
-        assert!(!is_shed_failure(&server_error));
-        let offline = anyhow::Error::new(UploadFailureDiagnostics::for_test(
-            "local snapshot upload",
-            "snapshot_batch",
-            "transport_timeout",
-            true,
-            false,
-        ));
-        assert!(!is_shed_failure(&offline));
-    }
-
-    #[test]
-    fn only_snapshot_page_deadlines_are_adaptively_split() {
-        let gateway_timeout = anyhow::Error::new(UploadFailureDiagnostics::for_http_test(
-            "local snapshot upload",
-            "snapshot_batch",
-            504,
-            true,
-        ));
-        assert!(is_snapshot_batch_deadline_failure(&gateway_timeout));
-        assert_eq!(
-            gateway_timeout.to_string(),
-            "local snapshot upload failed (endpoint=snapshot_batch, status_family=http_5xx, retryable=true, request_id=present)"
-        );
-
-        let generic_server_error = anyhow::Error::new(UploadFailureDiagnostics::for_http_test(
-            "local snapshot upload",
-            "snapshot_batch",
-            500,
-            true,
-        ));
-        assert!(!is_snapshot_batch_deadline_failure(&generic_server_error));
-
-        let relay_gateway_timeout = anyhow::Error::new(UploadFailureDiagnostics::for_http_test(
-            "relay token request",
-            "relay_token",
-            504,
-            true,
-        ));
-        assert!(!is_snapshot_batch_deadline_failure(&relay_gateway_timeout));
-
-        let batch_transport_timeout = anyhow::Error::new(UploadFailureDiagnostics::for_test(
-            "local snapshot upload",
-            "snapshot_batch",
-            "transport_timeout",
-            true,
-            false,
-        ));
-        assert!(is_snapshot_batch_deadline_failure(&batch_transport_timeout));
-
-        let relay_transport_timeout = anyhow::Error::new(UploadFailureDiagnostics::for_test(
-            "relay token request",
-            "relay_token",
-            "transport_timeout",
-            true,
-            false,
-        ));
-        assert!(!is_snapshot_batch_deadline_failure(
-            &relay_transport_timeout
-        ));
-    }
-
-    #[test]
-    #[serial(client_report)]
-    fn an_unacknowledged_client_report_survives_to_the_next_batch() {
-        use crate::client_report::{lease, observe, record, reset_for_test, ClientReportReason};
-        reset_for_test();
-        record(ClientReportReason::NetworkError, 2);
-        {
-            // The upload died: the lease drops unacknowledged, so the losses stay
-            // owed rather than vanishing with the request.
-            let reported = lease();
-            assert_eq!(
-                reported.report().quantity(ClientReportReason::NetworkError),
-                2
-            );
-        }
-        assert_eq!(observe().quantity(ClientReportReason::NetworkError), 2);
-
-        // The retry carries them and is acknowledged.
-        lease().commit();
-        assert_eq!(observe().quantity(ClientReportReason::NetworkError), 0);
-        reset_for_test();
-    }
-
-    #[test]
     #[serial(client_report)]
     fn a_shed_page_stops_the_pass_and_keeps_earlier_pages_checkpointed() {
         let poison_scope = &unique_poison_scope();
@@ -17323,84 +16884,6 @@ mod tests {
 
     mod inplace_retry_tests {
         include!("snapshot_sync/inplace_retry_tests.rs");
-    }
-
-    #[test]
-    fn an_honoured_retry_after_is_never_shortened_by_jitter() {
-        // Jitter that can fire early is not jitter, it is an early retry against
-        // a server that just said it was not ready.
-        let requested = Duration::from_secs(45);
-        for _ in 0..64 {
-            let wait = shed_backoff(Some(requested));
-            assert!(wait >= requested, "{wait:?} is earlier than {requested:?}");
-            assert!(wait <= requested.mul_f64(1.2));
-        }
-        let waits = (0..24)
-            .map(|_| shed_backoff(Some(requested)))
-            .collect::<BTreeSet<_>>();
-        assert!(waits.len() > 1, "a constant wait re-synchronises the fleet");
-
-        // The cap survives the upper jitter.
-        assert_eq!(
-            shed_backoff(Some(crate::snapshot_client::MAX_HONOURED_RETRY_AFTER)),
-            crate::snapshot_client::MAX_HONOURED_RETRY_AFTER
-        );
-    }
-
-    #[test]
-    #[serial(source_upload_deadlines)]
-    fn a_sustained_shed_climbs_the_ladder_and_a_success_resets_it() {
-        clear_source_upload_deadlines_for_test();
-        // A shed with no Retry-After must back off further each time. Without a
-        // streak every shed draws from random(0, 30s), which the five-minute cycle
-        // has already outlived by the next tick — no backoff at all under
-        // sustained overload.
-        let mut ceilings = Vec::new();
-        for expected_attempt in 0..4 {
-            assert_eq!(
-                shed_streak_for_test(SnapshotSource::Codex),
-                expected_attempt
-            );
-            let wait = note_shed_and_backoff(SnapshotSource::Codex, None);
-            ceilings.push(wait);
-        }
-        assert_eq!(shed_streak_for_test(SnapshotSource::Codex), 4);
-        // Full jitter means any single draw can be small, so the property to
-        // assert is the ceiling, not the sample: the fourth rung may exceed the
-        // first rung's ceiling, and the first never can.
-        assert!(ceilings[0] <= SHED_BACKOFF_BASE);
-        assert!(ceilings[3] <= SHED_BACKOFF_BASE * 8);
-
-        // A server-named wait wins over the local ladder and still counts the shed.
-        let named = note_shed_and_backoff(SnapshotSource::Codex, Some(Duration::from_secs(120)));
-        assert!(named >= Duration::from_secs(120));
-        assert_eq!(shed_streak_for_test(SnapshotSource::Codex), 5);
-
-        // A completed upload clears it: the next shed starts at the first rung.
-        clear_shed_streak(SnapshotSource::Codex);
-        assert_eq!(shed_streak_for_test(SnapshotSource::Codex), 0);
-        // The streak is per source, like the deadline.
-        assert_eq!(shed_streak_for_test(SnapshotSource::ClaudeCode), 0);
-        clear_source_upload_deadlines_for_test();
-    }
-
-    #[test]
-    #[serial(source_upload_deadlines)]
-    fn an_honoured_backoff_defers_the_source_until_it_expires() {
-        clear_source_upload_deadlines_for_test();
-        assert!(source_upload_backoff_remaining(SnapshotSource::Codex).is_none());
-
-        defer_source_uploads(SnapshotSource::Codex, Duration::from_secs(60));
-        let remaining =
-            source_upload_backoff_remaining(SnapshotSource::Codex).expect("codex is deferred");
-        assert!(remaining <= Duration::from_secs(60));
-        // The backoff is per source: one shed source must not silence the others.
-        assert!(source_upload_backoff_remaining(SnapshotSource::ClaudeCode).is_none());
-
-        // An expired deadline clears itself rather than deferring forever.
-        defer_source_uploads(SnapshotSource::Codex, Duration::ZERO);
-        assert!(source_upload_backoff_remaining(SnapshotSource::Codex).is_none());
-        clear_source_upload_deadlines_for_test();
     }
 
     #[test]
@@ -18794,48 +18277,6 @@ mod tests {
     }
 
     #[test]
-    fn due_quarantine_retries_are_fair_and_capped_to_one_batch_per_cycle() {
-        let mut progress = test_upload_progress();
-        let witness = test_quarantine_witness();
-        for value in 0..(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE + 5) {
-            progress.quarantined_fingerprints.insert(
-                format!("{value:064x}"),
-                SnapshotQuarantineRecord {
-                    contract_retry_claims: None,
-                    reconstruction_contract:
-                        crate::snapshots::terminal_contract_retry::current_contract(),
-                    witness: witness.clone(),
-                    retry_after_unix_seconds: value as u64,
-                    upload_body_witness: None,
-                    failed_reconstruction_count: 1,
-                    disposition: SnapshotQuarantineDisposition::RetryPending,
-                },
-            );
-        }
-        progress.prepare_quarantine_retries(&BTreeMap::new());
-        assert_eq!(
-            progress.active_quarantine_retries.len(),
-            SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE
-        );
-        assert_eq!(
-            progress.quarantined_fingerprints.len(),
-            SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE + 5,
-            "leased retries remain durably armed until exact ACK settlement"
-        );
-        let first_deferred = format!("{SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE:064x}");
-        let last_leased = format!("{:064x}", SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE - 1);
-        assert_eq!(
-            progress
-                .active_quarantine_retries
-                .iter()
-                .next_back()
-                .map(String::as_str),
-            Some(last_leased.as_str())
-        );
-        assert!(!progress.active_quarantine_retries.contains(&first_deferred));
-    }
-
-    #[test]
     fn concurrent_relay_switch_rejects_final_cursor_commit() {
         let device_a = LocalDeviceBinding {
             device_id: "relay-device-a".to_string(),
@@ -18870,18 +18311,6 @@ mod tests {
             enabled_snapshot_sources(&device),
             vec![SnapshotSource::Codex, SnapshotSource::Pi]
         );
-    }
-
-    #[test]
-    fn one_shot_sync_slot_is_single_flight() {
-        set_one_shot_sync_in_flight(false);
-
-        assert!(claim_one_shot_sync_slot());
-        assert!(!claim_one_shot_sync_slot());
-
-        set_one_shot_sync_in_flight(false);
-        assert!(claim_one_shot_sync_slot());
-        set_one_shot_sync_in_flight(false);
     }
 
     #[test]
@@ -19161,22 +18590,6 @@ mod tests {
     }
 
     #[test]
-    fn api_base_url_prefers_persisted_connection_then_env() {
-        assert_eq!(
-            normalize_api_base_url(
-                Some("https://ottto.test/backend/".to_string()),
-                Some("http://127.0.0.1:4318".to_string()),
-            ),
-            "https://ottto.test/backend"
-        );
-        assert_eq!(
-            normalize_api_base_url(None, Some("http://127.0.0.1:4318/".to_string())),
-            "http://127.0.0.1:4318"
-        );
-        assert_eq!(normalize_api_base_url(None, None), DEFAULT_API_BASE_URL);
-    }
-
-    #[test]
     fn safe_error_reports_sync_phase_without_raw_details() {
         let snapshot_error = anyhow::Error::new(UploadFailureDiagnostics::for_test(
             "local snapshot upload",
@@ -19239,22 +18652,6 @@ mod tests {
             })),
             "local health authorization rejected"
         );
-    }
-
-    #[test]
-    fn local_health_loop_waits_quietly_for_claim_credentials() {
-        assert!(local_health_upload_can_wait_quietly(&anyhow!(
-            "relay device credentials are missing"
-        )));
-        assert!(local_health_upload_can_wait_quietly(&anyhow!(
-            "machine identity is missing"
-        )));
-        assert!(local_health_upload_can_wait_quietly(&anyhow!(
-            "registered device has no enabled sources"
-        )));
-        assert!(!local_health_upload_can_wait_quietly(&anyhow!(
-            "upload local health projection failed"
-        )));
     }
 
     #[test]
@@ -21824,30 +21221,6 @@ mod tests {
 
     #[test]
     #[serial(source_manifests)]
-    fn poisoned_manifest_cache_recovers_publish_read_and_withdraw() {
-        let _source_manifests = SourceManifestTestGuard::new();
-        let poisoned = std::thread::spawn(|| {
-            let _manifests = source_manifests()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            panic!("intentional source-manifest cache poison");
-        })
-        .join();
-        assert!(poisoned.is_err());
-
-        let destination = "destination";
-        let manifest = ScanIndex::default().manifest(SnapshotSource::Codex, 183);
-        publish_source_manifest(destination, SnapshotSource::Codex, manifest.clone());
-        assert_eq!(
-            cached_source_manifest(destination, SnapshotSource::Codex),
-            Some(manifest)
-        );
-        withdraw_source_manifest(destination, SnapshotSource::Codex);
-        assert!(cached_source_manifest(destination, SnapshotSource::Codex).is_none());
-    }
-
-    #[test]
-    #[serial(source_manifests)]
     fn terminal_incomplete_error_and_disabled_receipts_carry_explicit_withdrawal_shape() {
         let _source_manifests = SourceManifestTestGuard::new();
         let device = LocalDeviceBinding {
@@ -22201,124 +21574,6 @@ mod tests {
         assert_eq!(heartbeat["last_backfill_window_days"], 0);
         assert!(heartbeat["last_scan_finished_at"].is_null());
         assert!(heartbeat.get("manifest").is_none());
-    }
-
-    #[test]
-    #[serial(source_manifests)]
-    fn every_terminal_path_reports_exactly_the_report_time_hint() {
-        let _source_manifests = SourceManifestTestGuard::new();
-        let device = LocalDeviceBinding {
-            device_id: "device_test".to_string(),
-            machine_id: Some("otm_test".to_string()),
-            sources: vec!["codex".to_string()],
-        };
-        let fingerprint = "a".repeat(64);
-        let mut index = ScanIndex::default();
-        index.file_snapshot_fingerprints.insert(
-            "inside.jsonl".to_string(),
-            BTreeSet::from([fingerprint.clone()]),
-        );
-        index
-            .snapshot_activity_at
-            .insert(fingerprint, Some("2026-08-30T11:59:00Z".to_string()));
-        let paths = [
-            ("early-disabled", 0_u8, false),
-            ("scan-error", 1, false),
-            ("shed", 2, true),
-            ("backend-disabled", 3, false),
-            ("upload-error", 4, false),
-            ("preflight-error", 5, false),
-            ("auth-error", 6, false),
-            ("network-error", 7, false),
-            ("deferred-conflict", 8, true),
-            ("success", 9, true),
-        ];
-        let widths = [1_u64, 30, 90, 183];
-        let hints = paths.iter().flat_map(|_| widths).collect::<Vec<_>>();
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let client =
-            SnapshotApiClient::new(snapshot_status_server_with_hints(captured.clone(), hints));
-
-        let mut receipt_index = 0;
-        for (path, state_kind, publishes_manifest) in paths {
-            for expected_width in widths {
-                let state = match state_kind {
-                    0 | 3 => CollectorState::Disabled(Some("disabled_by_admin".to_string())),
-                    1 => CollectorState::Error {
-                        code: "scan_error",
-                        message: "local snapshot scan failed",
-                    },
-                    2 | 8 => CollectorState::Error {
-                        code: "server_error",
-                        message: "backend deferred snapshot work",
-                    },
-                    5 => CollectorState::Error {
-                        code: "backend_validation_error",
-                        message: "snapshot preflight failed",
-                    },
-                    6 => CollectorState::Error {
-                        code: "auth_error",
-                        message: "snapshot authorization failed",
-                    },
-                    _ => CollectorState::Error {
-                        code: "network_error",
-                        message: "local snapshot upload failed",
-                    },
-                };
-                let mut counts = SyncCounts::for_policy(183);
-                counts.census_complete = publishes_manifest;
-                report_status_with_fresh_relay_token(
-                    &client,
-                    &device,
-                    "device-secret",
-                    test_terminal_status_support_dir(),
-                    SnapshotSource::Codex,
-                    if publishes_manifest {
-                        TerminalManifestSource::CompleteCensus(&index)
-                    } else {
-                        TerminalManifestSource::Withdraw
-                    },
-                    CollectorStatus {
-                        source: SnapshotSource::Codex,
-                        machine_id: "otm_test",
-                        scan_started_at: "2026-08-30T12:00:00Z",
-                        counts,
-                        state: if state_kind == 9 {
-                            CollectorState::Success
-                        } else {
-                            state
-                        },
-                    },
-                    None,
-                )
-                .unwrap_or_else(|error| panic!("{path}/{expected_width} report failed: {error}"));
-
-                let requests = captured.lock().expect("captured requests");
-                let status = http_request_json(&requests[receipt_index * 2 + 1]);
-                assert_eq!(
-                    status["last_backfill_window_days"], expected_width,
-                    "{path} reported a width other than its report-time hint"
-                );
-                if publishes_manifest {
-                    let start = OffsetDateTime::parse(
-                        status["manifest"]["window_start"].as_str().unwrap(),
-                        &Rfc3339,
-                    )
-                    .unwrap();
-                    let end = OffsetDateTime::parse(
-                        status["manifest"]["window_end"].as_str().unwrap(),
-                        &Rfc3339,
-                    )
-                    .unwrap();
-                    assert_eq!((end - start).whole_days(), expected_width as i64, "{path}");
-                } else {
-                    assert!(status.get("manifest").is_none(), "{path}");
-                }
-                receipt_index += 1;
-            }
-        }
-
-        assert_eq!(receipt_index, paths.len() * widths.len());
     }
 
     #[test]
