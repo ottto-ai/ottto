@@ -13,8 +13,6 @@ mod fence;
 mod import;
 mod runtime;
 pub(super) mod telemetry;
-#[cfg(test)]
-pub(super) use runtime::checkpoint_priority_fixture;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
 pub(super) use runtime::Hold;

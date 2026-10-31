@@ -261,20 +261,6 @@ pub(in super::super) fn published(path: &Path) -> Result<bool> {
     }
     held(fence::evidence(path))
 }
-#[cfg(test)]
-pub(in super::super) fn checkpoint_priority_fixture(path: &Path, active: bool) {
-    with_state(path, |state| {
-        state.latched = active;
-        state.current = active.then(|| {
-            Arc::new(Runtime {
-                active: true,
-                session: Mutex::new(None),
-            })
-        });
-        Ok(())
-    })
-    .unwrap();
-}
 
 fn binding(path: &Path) -> Option<super::super::scan_index_persistence::Binding> {
     super::super::scan_index_integration::scan_index_storage_binding(path)

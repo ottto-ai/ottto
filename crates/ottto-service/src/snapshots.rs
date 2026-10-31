@@ -94612,19 +94612,18 @@ mod state_v2_maintenance_lock_tests {
     /// [behaviour] maintenance reserves the next turn ahead of our normal work.
     #[test]
     fn maintenance_reserves_the_next_turn_ahead_of_our_normal_work() {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-ops-lock-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&root).unwrap();
-        let path = root
-            .join("a".repeat(64))
-            .join("claude_code-test-scan-index.json");
-        state_v2::checkpoint_priority_fixture(&path, true);
+        let root = crate::test_scratch::private_dir("ops-lock");
+        let parent = root.join("snapshots/destinations").join("a".repeat(64));
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("claude_code-test-scan-index.json");
+        let progress = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "destination_namespace_hash": "a".repeat(64),
+        }))
+        .unwrap();
+        // Native published custody: a live route with an open session.
+        let index = state_v2::money_test_support::publish(&ScanIndex::default(), &path, &progress);
+        assert!(state_v2::published(&path).unwrap());
         let normal = CheckpointLock::acquire(&path).unwrap();
         let (entered, acquired) = std::sync::mpsc::channel();
         let (release, finish) = std::sync::mpsc::channel();
@@ -94648,18 +94647,19 @@ mod state_v2_maintenance_lock_tests {
         assert!(owners.maintenance.contains(&path));
         drop(owners);
         assert!(CheckpointLock::acquire(&path).is_err());
-        // A failed reload may clear the active route before releasing its
-        // checkpoint. Maintenance must still clean up the turn it reserved.
-        state_v2::checkpoint_priority_fixture(&path, false);
+        // Custody keeps its latch; releasing the normal owner hands the turn
+        // to the reserved maintenance and new normal work still yields.
         drop(normal);
         acquired
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap();
-        state_v2::checkpoint_priority_fixture(&path, true);
+        assert!(state_v2::published(&path).unwrap());
         assert!(CheckpointLock::acquire(&path).is_err());
         release.send(()).unwrap();
         worker.join().unwrap();
         drop(CheckpointLock::acquire(&path).unwrap());
+        drop(index);
+        state_v2::money_test_support::erase_published(&path);
         fs::remove_dir_all(root).unwrap();
     }
 }
