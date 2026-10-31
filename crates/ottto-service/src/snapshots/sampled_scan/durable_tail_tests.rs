@@ -9494,7 +9494,7 @@ fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
     ));
 }
 
-/// [money] warm shortened old file keeps accepted body floor without publication.
+/// [money] only an independent census proof releases the warm shortened-file floor.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -9507,100 +9507,167 @@ fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
     }
     use std::io::Write;
     assert!(crate::heap_layout_bound::layout_supported());
-    let root = crate::test_scratch::ScratchDir::new("p3-warm-floor");
-    let sessions = root.join("sessions");
-    std::fs::create_dir(&sessions).unwrap();
-    let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
-    native_fixture(&path);
-    let prefix = std::fs::metadata(&path).unwrap().len();
-    let row = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
+    for proved in [true, false] {
+        let root = crate::test_scratch::ScratchDir::new("p3-warm-floor");
+        let sessions = root.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+        native_fixture(&path);
+        let prefix = std::fs::metadata(&path).unwrap().len();
+        let row = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
         "timestamp":"2026-10-07T10:01:00Z","requestId":"req-p3-warm",
         "message":{"id":"msg-p3-warm","model":"fixture-model","usage":{"input_tokens":25,"output_tokens":3}}});
-    writeln!(
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap(),
-        "{row}"
-    )
-    .unwrap();
-    let source = SnapshotSource::ClaudeCode;
-    let namespace = Scope("p3-warm-s2".into());
-    let cache = Arc::new(SharedCache::default());
-    let run = |index| {
-        let mut scan = OwnedSourceScan::new_with_identity_capture(
-            source,
-            std::slice::from_ref(&sessions),
-            index,
-            "2026-10-29T12:00:00Z",
-            365,
-            100,
-            false,
-            None,
-            &[],
-            false,
-            true,
-            true,
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{row}"
         )
-        .with_sampled_acquisition(cache.clone(), namespace.clone());
-        let mut modes = (0, 0, 0);
-        for _ in 0..10_000 {
-            if let Some(context) = scan.sampling.as_ref() {
-                modes = (context.full_files, context.tail_files, context.native_bytes);
-            }
-            match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => scan = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
-            }
+        .unwrap();
+        let source = SnapshotSource::ClaudeCode;
+        let namespace = Scope("p3-warm-s2".into());
+        let cache = Arc::new(SharedCache::default());
+        let run = |cache: Arc<SharedCache>, index| {
+            // The fixed transcript timestamps follow this synthetic file birth.
+            claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+                let mut scan = OwnedSourceScan::new_with_identity_capture(
+                    source,
+                    std::slice::from_ref(&sessions),
+                    index,
+                    "2026-10-29T12:00:00Z",
+                    365,
+                    100,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                    true,
+                )
+                .with_sampled_acquisition(cache.clone(), namespace.clone());
+                let mut modes = (0, 0, 0);
+                for _ in 0..10_000 {
+                    if let Some(context) = scan.sampling.as_ref() {
+                        modes = (context.full_files, context.tail_files, context.native_bytes);
+                    }
+                    match scan.step(None) {
+                        OwnedSourceScanStep::Pending(next) => scan = next,
+                        OwnedSourceScanStep::Complete { index, scan, .. } => {
+                            return (index, scan, modes)
+                        }
+                    }
+                }
+                panic!("warm S2 fixture did not finish");
+            })
+        };
+        let mut initial = ScanIndex::default();
+        // Match sync preparation so publication permits request-owned literals.
+        initial.activate_effective_upload_body_witness_revision(
+            crate::snapshot_sync::effective_upload_body_witness_revision(source),
+        );
+        let (mut accepted, first, _) = run(cache.clone(), initial);
+        let key = local_index_key(&path);
+        assert_eq!(first.snapshots[0].input_tokens, 125);
+        assert!(
+            cache.retained().unwrap().peek(&key).is_some(),
+            "real warm premise"
+        );
+        let entry = serde_json::to_value(&accepted.files[&key]).unwrap();
+        let census = accepted.claude_request_census.get(&key).unwrap().clone();
+        assert!(
+            !census.unverified_for_test(),
+            "real source-verified census premise"
+        );
+        if !proved {
+            // Preserve the accepted entry and the reader's shorter-file observation;
+            // withdraw only the census's independent proof.
+            accepted
+                .claude_request_census
+                .insert_for_test(&key, census.with_unverified_for_test(true));
         }
-        panic!("warm S2 fixture did not finish");
-    };
-    let (accepted, first, _) = run(ScanIndex::default());
-    let key = local_index_key(&path);
-    assert_eq!(first.snapshots[0].input_tokens, 125);
-    assert!(
-        cache.retained().unwrap().peek(&key).is_some(),
-        "real warm premise"
-    );
-    let entry = serde_json::to_value(&accepted.files[&key]).unwrap();
-    let census = accepted.claude_request_census.get(&key).unwrap().clone();
-    let witness = accepted.files[&key].last_upload_body_witness.clone();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_len(prefix)
-        .unwrap();
-    File::open(&path)
-        .unwrap()
-        .set_times(
-            std::fs::FileTimes::new()
-                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
-        )
-        .unwrap();
-    assert!(sampled_audit::path_requires_recovery(
-        source,
-        &accepted.files,
-        &path,
-        prefix
-    ));
-    let (held, body, modes) = run(accepted);
-    assert!(
-        body.snapshots.is_empty(),
-        "cannot publish100 below accepted125"
-    );
-    assert_eq!(
-        body.unreadable_path_count, 0,
-        "known floor is census-neutral"
-    );
-    assert_eq!(
-        modes,
-        (0, 0, 0),
-        "no Full/Tail selection or native body before S2"
-    );
-    assert_eq!(serde_json::to_value(&held.files[&key]).unwrap(), entry);
-    assert_eq!(held.files[&key].last_upload_body_witness, witness);
-    assert_eq!(held.claude_request_census.get(&key), Some(&census));
+        let census = accepted.claude_request_census.get(&key).unwrap().clone();
+        let witness = accepted.files[&key].last_upload_body_witness.clone();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(prefix)
+            .unwrap();
+        File::open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+        assert!(sampled_audit::path_requires_recovery(
+            source,
+            &accepted.files,
+            &path,
+            prefix
+        ));
+        assert_eq!(
+            claude_request_census::proves_indexed_shrink(
+                &accepted,
+                &key,
+                prefix,
+                physical_identity(&std::fs::metadata(&path).unwrap()),
+            ),
+            proved,
+            "proof comes from the census, never the reader's shorter-file observation"
+        );
+        let mut cold_prior = accepted.clone();
+        let (mut held, mut body, modes) = run(cache.clone(), accepted);
+        if proved {
+            assert_eq!(body.snapshots.len(), 1, "proved shrink publishes");
+            assert_eq!(body.snapshots[0].input_tokens, 100);
+            assert_eq!(modes, (1, 0, prefix), "proved edit takes Full");
+            // OFF has no shrink discovery rescue. Give only the cold oracle
+            // the existing verification marker to select this old file; it
+            // grants no read authority. The fresh cache takes ordinary Full.
+            cold_prior
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .set_unverified_deadline(1);
+            let (mut cold_index, mut cold, cold_modes) = {
+                let _cold_restore = crate::snapshots::RestartRestoreForTest::disabled();
+                assert!(sampled_audit::path_requires_recovery(
+                    source,
+                    &cold_prior.files,
+                    &path,
+                    prefix
+                ));
+                run(Arc::new(SharedCache::default()), cold_prior)
+            };
+            assert_eq!(cold_modes, (1, 0, prefix), "independent cold Full");
+            assert_eq!(cold.snapshots.len(), 1);
+            assert_eq!(cold.snapshots[0].input_tokens, 100);
+            assert_eq!(
+                a0h_wire(&root, &mut held, &mut body),
+                a0h_wire(&root, &mut cold_index, &mut cold),
+                "proved-shrink publication money equals cold Full of the shortened file"
+            );
+            continue;
+        }
+        assert!(
+            body.snapshots.is_empty(),
+            "cannot publish 100 below accepted 125 without independent proof"
+        );
+        assert_eq!(
+            body.unreadable_path_count, 0,
+            "known floor is census-neutral"
+        );
+        assert_eq!(
+            modes,
+            (0, 0, 0),
+            "no Full/Tail selection or native body before S2"
+        );
+        assert_eq!(serde_json::to_value(&held.files[&key]).unwrap(), entry);
+        assert_eq!(held.files[&key].last_upload_body_witness, witness);
+        assert_eq!(held.claude_request_census.get(&key), Some(&census));
+    }
 }
 
 struct O3Fixture {
