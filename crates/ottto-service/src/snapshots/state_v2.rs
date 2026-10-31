@@ -1,3 +1,9 @@
+//! Claude's private, default-off state store. Storage rows convey custody, never
+//! acquisition, acceptance, or retirement authority.
+//!
+//! Keep the engine boundary here: callers must not depend on SQLite handles,
+//! statements, SQL, or checkpoint tuples.
+//!
 //! Restart records are R1's; joined by key digest, never referenced here.
 use super::ScanIndex;
 use anyhow::Result;

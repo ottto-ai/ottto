@@ -499,7 +499,7 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
 
 /// [money] a refused COMMIT preserves unsettled custody through subsequent independent saves.
 #[test]
-fn stage_exclusion_discards_settlement_and_preserves_owed_custody() {
+fn refused_commit_preserves_owed_custody_through_independent_saves() {
     let (_scratch, mut db) = Scratch::live_store();
     let mut prev = fixture();
     prev.accepted_rebuild_incidence

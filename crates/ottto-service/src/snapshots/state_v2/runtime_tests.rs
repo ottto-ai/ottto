@@ -1348,7 +1348,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
 
 /// [money] aged growing keys remain readable and retain owed custody.
 #[test]
-fn excluded_key_age_growth_alarm_and_retry_keep_owed_debt() {
+fn aged_published_key_gets_normal_read_and_keeps_owed_debt() {
     use crate::snapshots::{local_index_key, scan_source_roots_with_test_limit, SnapshotSource};
     let f = Fixture::new();
     let roots = f.support.join("transcripts");
