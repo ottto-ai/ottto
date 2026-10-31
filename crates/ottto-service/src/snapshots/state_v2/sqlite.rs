@@ -1797,3 +1797,60 @@ impl Sqlite {
         Ok(generation)
     }
 }
+
+impl Sqlite {
+    /// Membership and generation come from one native read transaction. Kind
+    /// scans bypass the header cache; only the small cardinality row is decoded.
+    pub(super) fn live_key_digests(
+        &mut self,
+        source: crate::durable_tail_store::DurableSource,
+        expected_stamp: (u64, u64),
+    ) -> Result<super::LiveKeys> {
+        let mut tx = self.begin(TxnMode::Read)?;
+        let stamp = tx.store.stamp()?;
+        let generation = stamp.0;
+        if stamp != expected_stamp {
+            let mut keys = super::LiveKeys::incomplete(super::IncompleteReason::Reload);
+            keys.generation = generation;
+            return Ok(keys);
+        }
+        if tx
+            .store
+            .read_control::<u64>("erasure_pending")?
+            .unwrap_or(0)
+            != 0
+        {
+            let mut keys = super::LiveKeys::incomplete(super::IncompleteReason::Hold);
+            keys.generation = generation;
+            return Ok(keys);
+        }
+        let mut digests = BTreeSet::new();
+        let mut expected = None;
+        super::mapper::rows(&mut tx, "file.progress", |tx, header| {
+            let RowKey::Record {
+                key_bytes,
+                position,
+                ..
+            } = &header.key
+            else {
+                bail!("state_v2_record_key");
+            };
+            if *position == 0 {
+                ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
+                expected = Some(super::mapper::read::<usize>(tx, &header)?);
+            } else {
+                ensure!(*position == 1, "state_v2_member_position");
+                let path = super::mapper::family(key_bytes)?;
+                digests.insert(crate::durable_tail_store::key_digest(source, &path));
+            }
+            Ok(())
+        })?;
+        ensure!(expected == Some(digests.len()), "state_v2_missing_member");
+        Ok(super::LiveKeys {
+            complete: true,
+            incomplete_reason: None,
+            generation,
+            digests,
+        })
+    }
+}

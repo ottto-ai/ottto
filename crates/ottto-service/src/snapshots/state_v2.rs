@@ -8,6 +8,15 @@ use std::{collections::BTreeMap, sync::Arc};
 mod fence;
 mod import;
 mod runtime;
+#[cfg_attr(
+    not(test),
+    expect(
+        unused_imports,
+        reason = "R1 consumes this staged crate-visible erasure seam"
+    )
+)]
+pub(crate) use runtime::live_key_digests;
+pub(crate) use runtime::{IncompleteReason, LiveKeys};
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
