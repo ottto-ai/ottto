@@ -17,6 +17,7 @@ use super::*;
 macro_rules! scan_index_fields {
     (each $m:ident) => { scan_index_fields! { @list [each $m] } };
     (heap) => { scan_index_fields! { @list [heap] } };
+    (owned) => { scan_index_fields! { @list [owned] } };
     (@list $ctx:tt) => {
         scan_index_fields! { @apply $ctx
             schema_version => Misc (control check_field) [] side,
@@ -145,5 +146,64 @@ macro_rules! scan_index_fields {
     (@apply [heap] $($f:ident => $g:ident $store:tt [$($kind:literal),*] $heap:ident,)*) => {
         crate::heap_layout_bound::fields!(ScanIndex; $($f),*);
     };
+    (@apply [owned] $($f:ident => $g:ident $store:tt [$($kind:literal),*] $heap:ident,)*) => {
+        &[$($(($kind, Group::$g),)*)*]
+    };
 }
+pub(super) use scan_index_fields;
 scan_index_fields!(heap);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Group {
+    Files,
+    Misc,
+    Accounts,
+    Census,
+}
+/// The closed record catalogue. Accepting a stored kind implies its mapper.
+pub(super) const OWNED: &[(&str, Group)] = scan_index_fields!(owned);
+/// Registered money names without a mapper: accepted as a key, refused by
+/// hydration, so such a row can never silently vanish.
+const RESERVED: &[&str] = &["v1_field.census_money_marks"];
+pub(super) fn group(kind: &str) -> Option<Group> {
+    OWNED
+        .iter()
+        .find(|(owned, _)| *owned == kind)
+        .map(|(_, group)| *group)
+}
+pub(super) fn accepts(kind: &str) -> bool {
+    group(kind).is_some() || RESERVED.contains(&kind)
+}
+/// Original v1 inventory: each stored field keeps its exact typed checker.
+pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
+    field: &str,
+    map: &mut A,
+    model: &ScanIndex,
+) -> std::result::Result<bool, A::Error> {
+    macro_rules! check {
+        ($f:ident, $g:ident, ($codec:ident none), $kinds:tt, $heap:ident) => {};
+        ($f:ident, $g:ident, ($codec:ident $check:ident $($mode:ident)?), $kinds:tt, $heap:ident) => {
+            if field == stringify!($f) {
+                codec::$check(map, &model.$f)?;
+                return Ok(true);
+            }
+        };
+    }
+    scan_index_fields!(each check);
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// [format] every stored kind has exactly one owner; reserved names have none.
+    #[test]
+    fn every_stored_kind_has_one_owner() {
+        let mut kinds = std::collections::BTreeSet::new();
+        for (kind, _) in OWNED {
+            assert!(kinds.insert(*kind), "duplicate kind owner: {kind}");
+        }
+        assert!(RESERVED.iter().all(|kind| group(kind).is_none()));
+        assert_eq!(group("family.requests"), Some(Group::Census));
+    }
+}

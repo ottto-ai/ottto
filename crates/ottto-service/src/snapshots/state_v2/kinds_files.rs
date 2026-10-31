@@ -1,32 +1,11 @@
 //! File-owned records use their original v1 serde types.
+use super::catalogue::scan_index_fields;
 #[cfg(test)]
 pub(super) use super::resume::StagedCheckpoints;
 pub(super) use super::resume::{NoResumeHooks, ResumeCheckpoint, ResumeHooks};
 use super::*;
 use anyhow::{ensure, Context};
 use std::collections::BTreeMap;
-pub(super) const KINDS: &[&str] = &[
-    "file.progress",
-    "file.terminal",
-    "file.confirmed_empty",
-    "file.entities",
-    "file.growth_retention",
-    "accepted.activity",
-    "v1_field.claude_desktop_title_files",
-    "resume.checkpoint",
-];
-macro_rules! maps {
-    ($m:ident) => {
-        $m!(files, "file.progress");
-        $m!(terminal_jsonl_dispositions, "file.terminal");
-        $m!(file_snapshot_fingerprints, "file.entities");
-        $m!(snapshot_activity_at, "accepted.activity");
-        $m!(
-            claude_desktop_title_files,
-            "v1_field.claude_desktop_title_files"
-        );
-    };
-}
 pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
     delta(&ScanIndex::default(), index, tx, cx)
 }
@@ -49,11 +28,12 @@ pub(super) fn delta(
         );
     }
     macro_rules! save {
-        ($field:ident,$kind:literal) => {
-            mapper::map_delta(tx, $kind, &prev.$field, &next.$field)?;
+        ($f:ident, Files, (map $($c:ident)*), [$kind:literal], $h:ident) => {
+            mapper::map_delta(tx, $kind, &prev.$f, &next.$f)?;
         };
+        ($($t:tt)*) => {};
     }
-    maps!(save);
+    scan_index_fields!(each save);
     mapper::map_delta(
         tx,
         "file.growth_retention",
@@ -89,11 +69,12 @@ pub(super) fn hydrate_txn(
     cx: &mut KindCx,
 ) -> Result<()> {
     macro_rules! load {
-        ($field:ident,$kind:literal) => {
-            index.$field = mapper::read_map(tx, $kind, None)?;
+        ($f:ident, Files, (map $($c:ident)*), [$kind:literal], $h:ident) => {
+            index.$f = mapper::read_map(tx, $kind, None)?;
         };
+        ($($t:tt)*) => {};
     }
-    maps!(load);
+    scan_index_fields!(each load);
     index.v2_mut().growth_retention = mapper::read_map(tx, "file.growth_retention", None)?;
     let empty: BTreeMap<String, bool> = mapper::read_map(tx, "file.confirmed_empty", None)?;
     ensure!(empty.values().all(|v| *v), "state_v2_empty_members");
@@ -117,26 +98,4 @@ pub(super) fn merge_growth_cas(tx: &mut dyn Transaction, working: &mut ScanIndex
         &claims,
     );
     Ok(())
-}
-pub(super) use mapper::{private_paths, references};
-
-pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
-    field: &str,
-    map: &mut A,
-    model: &ScanIndex,
-) -> std::result::Result<bool, A::Error> {
-    macro_rules! check {
-        ($field:ident,$kind:literal) => {
-            if field == stringify!($field) {
-                codec::check_map(map, &model.$field)?;
-                return Ok(true);
-            }
-        };
-    }
-    maps!(check);
-    if field == "confirmed_empty_files" {
-        codec::check_field(map, &model.confirmed_empty_files)?;
-        return Ok(true);
-    }
-    Ok(false)
 }

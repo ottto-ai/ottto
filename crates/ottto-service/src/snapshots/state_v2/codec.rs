@@ -272,11 +272,7 @@ pub(super) fn inventory(input: impl Read) -> std::result::Result<(), Pause> {
         ) -> std::result::Result<(), A::Error> {
             let model = ScanIndex::default();
             while let Some(field) = map.next_key::<String>()? {
-                if !(kinds_misc::inventory_field(&field, &mut map, &model)?
-                    || kinds_files::inventory_field(&field, &mut map, &model)?
-                    || kinds_accounts::inventory_field(&field, &mut map, &model)?
-                    || kinds_census::inventory_field(&field, &mut map, &model)?)
-                {
+                if !catalogue::inventory_field(&field, &mut map, &model)? {
                     return Err(serde::de::Error::custom("state_v2_ignored_field"));
                 }
             }

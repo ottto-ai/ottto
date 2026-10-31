@@ -23,8 +23,6 @@ pub(super) use runtime::{
 };
 mod catalogue;
 mod codec;
-#[cfg(test)]
-mod field_coverage;
 mod ignored;
 mod interning;
 mod kinds;
@@ -108,59 +106,13 @@ const VALUE_BYTES: u64 = 64 * 1024 * 1024;
 const WAL_PASSIVE_BYTES: u64 = 8 * 1024 * 1024;
 const WAL_ALARM_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Readable closed record catalogue. Field-backed kinds inherit the original
-/// slot's privacy and presence contract; accepting a name is not a mapper.
+/// Readable closed record catalogue (catalogue.rs). Field-backed kinds inherit
+/// the original slot's privacy and presence contract.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct RecordKind(String);
 impl RecordKind {
     fn parse(name: &str) -> Result<Self> {
-        let known = matches!(
-            name,
-            "file.progress"
-                | "file.receipt"
-                | "file.terminal"
-                | "file.confirmed_empty"
-                | "file.entities"
-                | "file.census"
-                | "file.growth_retention"
-                // V2-only custody has no corresponding v1 positional slot.
-                | "raw_hold.growth_retention"
-                | "account_window"
-                | "account.window_retention"
-                | "account.current"
-                | "account.absent_members"
-                | "usage.pending"
-                | "family.requests"
-                | "proof.account"
-                | "proof.usage"
-                | "proof.owned_start"
-                | "proof.deferred_account"
-                | "accepted.entity"
-                | "accepted.activity"
-                | "accepted.rebuild_incidence"
-                | "accepted.ack_handoff"
-                | "refusal.snapshot"
-                | "refusal.authority"
-                | "resume.checkpoint"
-                | "setting.binding"
-                | "v1_field.census_shadow"
-                | "v1_field.census_money_marks"
-                | "v1_field.repair_provenance"
-                | "v1_field.duplicate_owners"
-                | "v1_field.birth_store"
-        ) || [
-            "raw_hold.",
-            "scan_state.",
-            "v1_field.",
-            "setting.",
-            "tombstone.",
-        ]
-        .iter()
-        .any(|prefix| {
-            name.strip_prefix(prefix)
-                .is_some_and(|slot| super::lenient_decode::FIELDS.contains(&slot))
-        });
-        anyhow::ensure!(known, Hold::UnknownRecordKind);
+        anyhow::ensure!(catalogue::accepts(name), Hold::UnknownRecordKind);
         Ok(Self(name.to_owned()))
     }
     fn name(&self) -> &str {
