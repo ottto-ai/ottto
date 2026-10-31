@@ -69,7 +69,11 @@ pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
 /// Keep returned commitments across pages, including a freshly rebuilt subset.
 pub(crate) fn assert_selected_saves(initial: &ScanIndex, pages: &[ScanIndex]) {
     let scratch = crate::test_scratch::ScratchDir::canonical("selected-row-saves");
-    let mut db = populate(&scratch.join("state.sqlite"), initial, BTreeMap::new());
+    let mut db = populate(
+        &scratch.join("state.v2.sqlite.import"),
+        initial,
+        BTreeMap::new(),
+    );
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     let (previous, mut cx) = kinds::hydrate(&mut db, binding()).unwrap();
     let mut digests = kinds::baseline(&previous, &mut cx).unwrap();

@@ -1022,7 +1022,9 @@ fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let removed = traversal("removed".into());
     put(&mut tx, &removed, b"retained");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    sqlite::set_save_ceiling(&mut db, 1024);
+    // Leave room for both the replacement and deletion, including their
+    // charged metadata, before the oversized row refuses the whole save.
+    sqlite::set_save_ceiling(&mut db, 4096);
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let mut before = mapper::Rows::default();
     before.raw(key.clone(), b"old").unwrap();
@@ -1034,12 +1036,15 @@ fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     };
     rows.raw(key.clone(), b"new").unwrap();
     let pending = rows.finish().unwrap();
+    let header = tx.get(&key).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &header), b"new");
+    assert!(tx.get(&removed).unwrap().is_none());
     let error = tx
         .put(RowInput {
             key: &traversal("over-ceiling".into()),
             fixed: &Fixed::None,
             value_version: 1,
-            value: &serde_json::to_vec(&"x".repeat(2048)).unwrap(),
+            value: &serde_json::to_vec(&"x".repeat(8192)).unwrap(),
         })
         .unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));

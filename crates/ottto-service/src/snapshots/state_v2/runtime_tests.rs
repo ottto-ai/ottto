@@ -1316,10 +1316,9 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
         Ok(())
     })
     .unwrap();
-    let restored = load_locked(&f.path, None, published(&f.path).unwrap())
-        .unwrap()
-        .0
-        .unwrap();
+    // Publication returns a public load, which settles the tombstone marker.
+    // Compare at that same boundary after rollback, including load settlement.
+    let restored = ScanIndex::load(&f.path).unwrap();
     assert_eq!(
         serde_json::to_vec(&restored).unwrap(),
         serde_json::to_vec(&committed).unwrap()
