@@ -142,6 +142,23 @@ pub(in super::super) fn cap_pages(db: &Sqlite) {
     assert_eq!(capped, pages);
 }
 
+/// Make this connection's next COMMIT that writes control row `name` fail with
+/// SQLite's own deferred-constraint refusal; the transaction stays open, as
+/// after a failed durable COMMIT. Temp objects are connection-local, so the
+/// reopen inside commit classification clears the fence.
+pub(in super::super) fn fence_commit_writing(db: &Sqlite, name: &str) {
+    db.conn()
+        .unwrap()
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys=ON;
+             CREATE TEMP TABLE commit_fence_parent(id INTEGER PRIMARY KEY);
+             CREATE TEMP TABLE commit_fence(parent INTEGER REFERENCES commit_fence_parent(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TEMP TRIGGER commit_fence_insert AFTER INSERT ON control WHEN NEW.name='{name}' BEGIN INSERT INTO commit_fence VALUES(1); END;
+             CREATE TEMP TRIGGER commit_fence_update AFTER UPDATE ON control WHEN NEW.name='{name}' BEGIN INSERT INTO commit_fence VALUES(1); END;"
+        ))
+        .unwrap();
+}
+
 /// Damage one checked physical value inside the caller's rollback transaction.
 pub(in super::super) fn remove_value_chunk(tx: &Txn<'_>, header: &Header) {
     let owner = chunk_owner(&header.key).unwrap();

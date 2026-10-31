@@ -337,7 +337,10 @@ fn load_with_custody<M: Mapper>(
                 if let Some(session) = guard.as_mut() {
                     // A store marked for reload refuses reads; reopen it
                     // below instead of probing its stamp.
-                    let stamp = (!session.reload).then(|| session.db.stamp()).transpose()?;
+                    // Either owner may demand a reload; both reopen below.
+                    let stamp = (!session.reload && !session.db.reload_required())
+                        .then(|| session.db.stamp())
+                        .transpose()?;
                     if let Some(stamp) = stamp
                         .filter(|stamp| session.identity == identity && session.stamp == *stamp)
                     {

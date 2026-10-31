@@ -1160,6 +1160,30 @@ fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
     .unwrap();
 }
 
+/// [regress] The store itself may demand a reload outside any save: its
+/// erasure COMMIT was refused. The next load reopens it at the durable
+/// generation instead of failing on the refused stamp read, and the erasure
+/// debt survives (never marked complete).
+#[test]
+fn store_reload_demand_outside_a_save_reopens_on_next_load() {
+    let f = Fixture::new();
+    f.published();
+    let index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    with_session_db(&index, |db| {
+        db.control("erasure_pending", &G).unwrap();
+        db.control("erasure_since", &0_u64).unwrap();
+        sqlite::fence_commit_writing(db, "erasure_purged_epoch");
+        assert!(db.maintenance(true).is_err());
+        assert!(db.reload_required());
+    });
+    let reloaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    assert_eq!(reloaded.generation, G);
+    with_session_db(&reloaded, |db| {
+        assert!(!db.reload_required());
+        assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(G));
+    });
+}
+
 /// [format] unpublished import does not reorder v1 progress admission.
 #[test]
 fn unpublished_import_does_not_reorder_v1_progress_admission() {

@@ -620,6 +620,11 @@ impl Sqlite {
         self.headers = Some(headers);
         Ok(())
     }
+    /// This connection's state is unknown (failed open-transaction ROLLBACK,
+    /// published/ambiguous COMMIT, erasure commit failure): reopen it.
+    pub(super) fn reload_required(&self) -> bool {
+        self.reload
+    }
     fn conn(&self) -> Result<&Connection> {
         ensure!(!self.reload, "current_index_requires_reload");
         self.conn
