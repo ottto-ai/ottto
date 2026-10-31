@@ -264,16 +264,14 @@ def main():
         if "mod money_equivalence_tests" not in tests.read_text():
             tests.write_text(tests.read_text() + include)
         head_binary = None
-        for arm, tree, test_filter in [
-                ("base", base, "money_equivalence_tests::"),
-                ("head", repo, "money_equivalence_tests::"),
-                ("head-on", repo, "terminal_off_on_money_receipts::")]:
+        for arm, tree in [("base", base), ("head", repo), ("head-on", repo)]:
             env = dict(os.environ, CARGO_TARGET_DIR=str(root / f"{arm}-target"),
                        OTTTO_MONEY_EQUIVALENCE_ROOT=str(root / "inputs"),
-                       OTTTO_MONEY_EQUIVALENCE_OUTPUT=str(receipts / arm))
+                       OTTTO_MONEY_EQUIVALENCE_OUTPUT=str(receipts / arm),
+                       OTTTO_MONEY_EQUIVALENCE_TERMINAL_OFF="1" if arm == "head-on" else "0")
             if arm == "head-on":
-                # Same executable, separate process, inputs and output directory.
-                # Only the ON module's scoped guard changes runtime policy.
+                # Same executable, discovery, inputs and parent money guard;
+                # a separate process varies only terminal containment policy.
                 binary = head_binary
             else:
                 build = receipts / f"{arm}-build.jsonl"
@@ -289,8 +287,12 @@ def main():
                     head_binary = binary
             # Native tests must emit a VERIFIED receipt each; Linux's explicit
             # UNEXECUTED line or a zero-match test result cannot pass this job.
-            result = subprocess.run([binary, test_filter, "--nocapture",
-                              "--test-threads=1"], cwd=tree, env=env,
+            args = [binary, "money_equivalence_tests::", "--nocapture", "--test-threads=1"]
+            if arm == "head-on":
+                # Keep the original OFF-only crash suite outside B1, as before.
+                # The seven ignored backlog names remain main's discovery.
+                args += ["--skip", "durable_transition_tests::"]
+            result = subprocess.run(args, cwd=tree, env=env,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             print(result.stdout, flush=True)
             (receipts / f"{arm}.log").write_text(result.stdout)
@@ -313,16 +315,17 @@ def main():
         manifest["terminal_off_on"] = "EXECUTED"
         (receipts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         failures = []
-        for candidate_arm, diff_label in [("head", "MONEY_EQUIVALENCE_DIFF"),
-                                          ("head-on", "MONEY_EQUIVALENCE_ON_DIFF")]:
-            left, right = receipts / "base", receipts / candidate_arm
+        for reference_arm, candidate_arm, diff_label in [
+                ("base", "head", "MONEY_EQUIVALENCE_DIFF"),
+                ("head", "head-on", "MONEY_EQUIVALENCE_ON_DIFF")]:
+            left, right = receipts / reference_arm, receipts / candidate_arm
             names = sorted(p.name for p in left.glob("*.json") if not p.name.endswith(".cross-build.json"))
             if len(names) != 10 or names != sorted(p.name for p in right.glob("*.json") if not p.name.endswith(".cross-build.json")):
                 raise RuntimeError("missing or extra fixture receipts")
             for name in names:
                 inputs = Path(name).with_suffix(".inputs")
                 if (left / inputs).read_bytes() != (right / inputs).read_bytes():
-                    raise RuntimeError(f"synthetic inputs differ across base/{candidate_arm}: {inputs}")
+                    raise RuntimeError(f"synthetic inputs differ across {reference_arm}/{candidate_arm}: {inputs}")
                 # Raw bodies/digests remain artifact evidence. Only the separately
                 # guarded physical-identity exclusion is compared across builds.
                 cross_name = Path(name).with_suffix(".cross-build.json")
@@ -336,16 +339,17 @@ def main():
                                     (right / cross_name).read_bytes())
                 print(f"{diff_label} {name} " + json.dumps(diff, sort_keys=True), flush=True)
                 if has_forbidden_diff(diff):
-                    failures.append(f"{candidate_arm}/{name}")
+                    failures.append(f"{reference_arm}/{candidate_arm}/{name}")
         if failures:
-            raise RuntimeError("base/candidate decoded cross-build bodies differ: " + ", ".join(failures))
+            raise RuntimeError("decoded receipt bodies differ: " + ", ".join(failures))
         manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
         (receipts / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
         with summary.open("a") as f:
             f.write(f"Money equivalence VERIFIED: {len(names)} + {len(DISK_FIXTURES)} disk-restore fixtures, "
-                    f"base-OFF `{base_sha}`, head-OFF and head-ON `{head_sha}` (ON EXECUTED). "
+                    f"base-OFF `{base_sha}` vs head-OFF `{head_sha}`; "
+                    f"B1 head-OFF vs head-ON `{head_sha}` (same parent money guard, ON EXECUTED). "
                     f"{manifest['runtime_seconds']:.1f}s. Family vector/Pi remain ignored.\n")
     finally:
         command(["git", "worktree", "remove", "--force", str(base)])

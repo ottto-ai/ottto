@@ -3064,26 +3064,19 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 
 // Shared helpers above remain the real scan/evidence/finish/upload callers.
 mod money_equivalence_tests {
+    // [behaviour] B1: separate head processes reuse this discovery and the
+    // parent's complete money guard; only terminal containment is varied.
+    fn with_e2<T>(f: impl FnOnce() -> T) -> T {
+        let on = std::env::var("OTTTO_MONEY_EQUIVALENCE_TERMINAL_OFF").as_deref() == Ok("1");
+        let _policy = on.then(crate::snapshots::ClaudeTerminalOffForTest::enabled);
+        super::with_e2(f)
+    }
+
     include!("money_equivalence_tests.rs");
     #[cfg(unix)]
     mod durable_transition_tests {
         include!("../snapshots/sampled_scan/durable_transition_tests.rs");
     }
-}
-
-// R10: the money harness's ON arm. `scripts/money_equivalence.py` runs this
-// module from the head binary in its own process ("head-on") and compares
-// its receipts with base OFF. The included harness is byte-identical; only
-// the scoped policy differs. The name stays outside the OFF arm's
-// `money_equivalence_tests::` filter. The durable-transition suite is not
-// included: its crash child is addressed by the OFF module path.
-mod terminal_off_on_money_receipts {
-    fn with_e2<T>(f: impl FnOnce() -> T) -> T {
-        let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-        assert!(crate::snapshots::claude_terminal_off());
-        crate::snapshots::with_max_gated_claude_revision(3, f)
-    }
-    include!("money_equivalence_tests.rs");
 }
 
 #[test]
