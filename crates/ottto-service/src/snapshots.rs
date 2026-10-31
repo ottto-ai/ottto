@@ -16908,6 +16908,19 @@ impl ClaudeTitleMetadata {
         }
         let (session_files, sweep_complete, next_cursor, next_upper_bound) =
             selection.finish(census.discovered_file_count);
+        // The retained store entries already record which profile sources were
+        // read. Count a profile once when its first valid session is acquired;
+        // later refreshes are not new-source reads. No new persistent registry.
+        let mut new_profiles = store_dirs
+            .iter()
+            .filter(|dir| {
+                !index
+                    .claude_desktop_title_files
+                    .keys()
+                    .any(|path| Path::new(path).starts_with(dir))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let mut original_identity_changed = false;
         let mut lineage_changed = false;
         for path in &session_files {
@@ -16923,6 +16936,14 @@ impl ClaudeTitleMetadata {
                 original_identity,
             ) {
                 Ok(Some(entry)) => {
+                    if let Some(profile) = new_profiles
+                        .iter()
+                        .find(|dir| path.starts_with(dir))
+                        .cloned()
+                    {
+                        new_profiles.remove(&profile);
+                        census.profile_new_source_read_count += 1;
+                    }
                     let previous = index.claude_desktop_title_files.get(&local_index_key(path));
                     original_identity_changed |= previous.map_or(true, |previous| {
                         previous.cli_session_id != entry.cli_session_id
@@ -17383,12 +17404,13 @@ fn read_claude_transcript_live_window(
 fn claude_desktop_store_inventory_is_legacy(inventory: &Option<String>) -> bool {
     inventory
         .as_deref()
-        .is_none_or(|value| value.len() != 64 || !value.starts_with("p1"))
+        .map_or(true, |value| value.len() != 64 || !value.starts_with("p1"))
 }
 
 #[derive(Debug, Default, Serialize)]
 struct ClaudeDesktopStoreCensus {
     profile_read_count: usize,
+    profile_new_source_read_count: usize,
     store_found_count: usize,
     profile_discovery_incomplete_count: usize,
     discovered_file_count: usize,
