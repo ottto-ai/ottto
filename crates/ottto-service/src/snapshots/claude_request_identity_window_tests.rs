@@ -2625,7 +2625,7 @@ fn advertised_cap_retags_previously_stripped_accepted_body() {
                 usage: holder_usage(row, None),
                 identity: RequestIdentity::Tagged(AuthorityKey {
                     login: None,
-                    org: Some(A64.into()),
+                    org: Some(D64.into()),
                     basis: identity::TRANSCRIPT_ORG,
                 }),
             });
