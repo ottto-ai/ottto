@@ -5259,16 +5259,13 @@ impl SharedCache {
         key: &str,
         fingerprint: &str,
     ) -> bool {
-        if !restart_restore::enabled() {
-            return false;
-        }
         let Some(mut stores) = self.durable() else {
             return true;
         };
         let Some(durable_source) = durable_source(source) else {
             return false;
         };
-        if stores.slot(durable_source).is_none() {
+        if restart_restore::enabled() && stores.slot(durable_source).is_none() {
             return false;
         }
         let key = store::key_digest(durable_source, key);
@@ -5296,9 +5293,6 @@ impl SharedCache {
         index: &mut ScanIndex,
         index_path: &Path,
     ) -> usize {
-        if !restart_restore::enabled() {
-            return 0;
-        }
         if !index_path.starts_with(writer.state_dir()) {
             return 0;
         }
@@ -5387,6 +5381,39 @@ impl SharedCache {
         durable_source(snapshot_source)?;
         self.erase_private_labels(writer, snapshot_source, None);
         if !restart_restore::enabled() {
+            // The committed save, not the working index, owns quiet-marker
+            // settlement even without a record. Keep the ordinary second CAS.
+            let source = durable_source(snapshot_source)?;
+            let retiring = self.durable()?.retiring;
+            let mut ready = BTreeSet::new();
+            if let Ok(cache) = self.retained() {
+                for (key, entry) in &index.files {
+                    let digest = store::key_digest(source, key);
+                    if retiring.iter().flatten().any(|pending| {
+                        pending.key == digest
+                            && pending.source == snapshot_source
+                            && pending.fingerprint
+                                == <[u8; 32]>::from(Sha256::digest(
+                                    entry.source_file_fingerprint.as_bytes(),
+                                ))
+                    }) && entry.has_unverified_source()
+                        && !entry.has_prefix_provenance()
+                        && !index.claude_account_deferred_holds.contains_key(key)
+                        && cache.peek(key).is_some_and(|retained| {
+                            retained.checkpoint.audit_debt().is_none()
+                                && certificate_at(key, &retained.checkpoint, index,
+                                    unix_seconds(SystemTime::now()).unwrap_or(0)).is_some()
+                        })
+                    {
+                        ready.insert(digest);
+                    }
+                }
+            }
+            if let Some(mut stores) = self.durable() {
+                for pending in stores.retiring.iter_mut().flatten() {
+                    pending.durable |= ready.contains(&pending.key);
+                }
+            }
             return None;
         }
         let store::LeaseWait::Granted(lease) = self.acquire_active(
