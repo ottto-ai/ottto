@@ -116,7 +116,6 @@ impl RecordKind {
         let known = matches!(
             name,
             "file.progress"
-                | "file.receipt"
                 | "file.terminal"
                 | "file.confirmed_empty"
                 | "file.entities"
@@ -125,7 +124,6 @@ impl RecordKind {
                 // V2-only custody has no corresponding v1 positional slot.
                 | "raw_hold.growth_retention"
                 | "account_window"
-                | "account.window_retention"
                 | "account.current"
                 | "account.absent_members"
                 | "usage.pending"

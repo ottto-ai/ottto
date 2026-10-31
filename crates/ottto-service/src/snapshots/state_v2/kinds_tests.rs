@@ -92,7 +92,13 @@ fn owned_kinds_are_admitted_without_adding_v1_growth_slots() {
     {
         assert_eq!(RecordKind::parse(kind).unwrap().name(), *kind);
     }
-    for kind in ["raw_hold.future", "v1_field.growth_retention"] {
+    // Names no semantic group owns refuse like any other unknown kind.
+    for kind in [
+        "raw_hold.future",
+        "v1_field.growth_retention",
+        "file.receipt",
+        "account.window_retention",
+    ] {
         let error = RecordKind::parse(kind).unwrap_err();
         assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::UnknownRecordKind));
     }
