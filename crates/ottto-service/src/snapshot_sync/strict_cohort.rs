@@ -79,8 +79,12 @@ fn select(
         if !page.contains(root) && next.is_none() {
             next = Some(root.clone());
         }
-        if plan.roots.len() < ROOTS_PER_PASS && reserved.saturating_add(bytes) <= BYTES_PER_PASS {
-            reserved += bytes;
+        // Page roots are never deferred here: the reader's allowance defers a
+        // read it cannot cover through the #932 hold, never as unhealthy.
+        if page.contains(root)
+            || plan.roots.len() < ROOTS_PER_PASS && reserved.saturating_add(bytes) <= BYTES_PER_PASS
+        {
+            reserved = reserved.saturating_add(bytes);
             plan.roots.push(root.clone());
             if !page.contains(root) {
                 next = Some(root.clone());
@@ -178,5 +182,58 @@ mod tests {
                 .all(|root| second.roots.contains(root)),
             "off-page debt receives continuation"
         );
+    }
+
+    /// Sparse API and trace sidecars of the given lengths for `root`.
+    fn write_pair(support: &Path, root: &str, api: u64, trace: u64) {
+        let name = format!("{:x}.jsonl", Sha256::digest(root.as_bytes()));
+        for (store, len) in [
+            ("local-otel/claude-code-effort", api),
+            ("local-otel/claude-code-trace-ownership", trace),
+        ] {
+            let dir = support.join(store);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::File::create(dir.join(&name))
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+        }
+    }
+
+    /// [behaviour] X1: a page root whose pair exceeds the pass allowance is
+    /// planned, and its strict trace read the allowance cannot cover is a
+    /// #932 discard (held for a later pass), never only an oversized file.
+    /// The OFF row is main: every root planned, the read only oversized.
+    #[test]
+    fn strict_allowance_shortfall_defers_page_root_through_discard() {
+        for terminal_off in [true, false] {
+            let _terminal_off =
+                terminal_off.then(crate::snapshots::ClaudeTerminalOffForTest::enabled);
+            let scratch = crate::test_scratch::ScratchDir::new("strict-allowance-shortfall");
+            write_pair(&scratch, "page-small", 0, 0);
+            write_pair(&scratch, "page-over", 0, BYTES_PER_PASS + 1);
+            let roots = vec!["page-over".to_string(), "page-small".to_string()];
+            let page = roots.iter().cloned().collect::<BTreeSet<_>>();
+            let planned = plan(&scratch, roots.clone(), &page, "shortfall");
+            assert_eq!(planned.roots, roots, "terminal_off={terminal_off}");
+            assert!(planned.deferred.is_empty(), "terminal_off={terminal_off}");
+
+            let _allowance =
+                crate::claude_local_otel::strict_budget::StrictReadBudget::new(BYTES_PER_PASS);
+            let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+                &scratch,
+                ["page-over".to_string()],
+            );
+            assert!(!trace.is_complete(), "never complete or absent evidence");
+            assert_eq!(trace.oversized_files, 1);
+            assert_eq!(
+                trace.rows_discarded,
+                crate::claude_local_otel::ClaudeTraceRowsDiscarded {
+                    cap: u64::from(terminal_off),
+                    ..Default::default()
+                },
+                "terminal_off={terminal_off}"
+            );
+        }
     }
 }

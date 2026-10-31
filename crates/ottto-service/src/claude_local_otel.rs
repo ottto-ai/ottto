@@ -355,7 +355,9 @@ pub struct ClaudeTraceOwnershipLoadReport {
 /// read also counts as an oversized file, so the report is never complete.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ClaudeTraceRowsDiscarded {
-    /// Reads that found bytes past the opened length (the file grew).
+    /// Reads that found bytes past the opened length (the file grew). With
+    /// ON, also reads under the per-file cap that the pass allowance no
+    /// longer covers: they wait for a later pass, like a grown file.
     pub cap: u64,
     /// Reads whose opened file or path changed generation while read.
     pub generation: u64,
@@ -1319,6 +1321,10 @@ pub fn load_claude_trace_ownership_evidence(
             continue;
         }
         if metadata.len() >= strict_budget::allowance() {
+            // ON: under the per-file cap, only the pass allowance ran out.
+            if crate::snapshots::claude_terminal_off() && metadata.len() < MAX_EVIDENCE_FILE_BYTES {
+                report.rows_discarded.cap += 1;
+            }
             report.oversized_files += 1;
             continue;
         }
@@ -1341,6 +1347,12 @@ pub fn load_claude_trace_ownership_evidence(
             continue;
         };
         if !opened.is_file() || opened.len() >= strict_budget::allowance() {
+            if crate::snapshots::claude_terminal_off()
+                && opened.is_file()
+                && opened.len() < MAX_EVIDENCE_FILE_BYTES
+            {
+                report.rows_discarded.cap += 1;
+            }
             report.oversized_files += 1;
             continue;
         }
