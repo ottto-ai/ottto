@@ -175,7 +175,8 @@ impl Rearm {
         self.terminal(index, items)
     }
 
-    /// Re-read every re-armed file, recording its current revision.
+    /// Re-read every re-armed (cleared or owed) file, recording its current
+    /// revision.
     fn reread(
         &self,
         index: &mut ScanIndex,
@@ -185,10 +186,12 @@ impl Rearm {
         let mut rearmed_bytes = 0;
         for (key, source) in &self.sources {
             let entry = index.files.get_mut(key).expect("an indexed member");
-            if entry.source_file_fingerprint.is_empty() {
+            if entry.rearmed() {
                 rearmed_files += 1;
                 rearmed_bytes += entry.size_bytes;
                 entry.source_file_fingerprint = source.clone();
+                entry.evidence_owed = false;
+                entry.owed_read = false;
             }
         }
         Terminal {
@@ -522,25 +525,22 @@ fn evidence_owed_settled_latch_clears_without_the_contract_rearm() {
 /// [regress] RF1 round 3 (C5 P6, the #893 fold: the first complete census
 /// clears every family file, ~15.6k on the M4, again on a 1-24 h backoff).
 /// OFF the fold clears exactly as main; ON it owes the same files, keeping
-/// their fingerprints, so the next walk reads nothing it can re-stamp.
+/// their fingerprints, so the owed resolver (re-stamp, restore, paced Full)
+/// decides each one at the next walk.
 #[test]
 fn evidence_owed_first_census_fold_owes_instead_of_clearing() {
     for on in [false, true] {
         let _on = on.then(evidence_owed::EvidenceOwedForTest::on);
         let rearm = Rearm::new();
         let mut index = rearm.index();
-        let first = rearm.terminal(&mut index, &rearm.items);
-        assert!(first.counts.full_rearm, "on={on}: {first:?}");
-        if on {
-            assert_eq!(first.rearmed_files, 0, "{first:?}");
-            for key in rearm.sources.keys() {
-                let entry = &index.files[key];
-                assert!(entry.evidence_owed && entry.rearmed(), "{key}");
-                assert!(!entry.source_file_fingerprint.is_empty());
-            }
-        } else {
-            assert!(first.rearmed_files >= 2, "{first:?}");
-            assert!(index.files.values().all(|entry| !entry.evidence_owed));
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+        let first = rearm.fold(&mut index, &rearm.items, true, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+        assert!(first.duplicate_census.full_rearm, "on={on}");
+        for key in rearm.sources.keys() {
+            let entry = &index.files[key];
+            assert!(entry.rearmed(), "on={on} {key}");
+            assert_eq!(entry.evidence_owed, on, "{key}");
+            assert_eq!(entry.source_file_fingerprint.is_empty(), !on, "{key}");
         }
     }
 }
