@@ -2501,29 +2501,74 @@ fn segment_pieces(live: &SnapshotItem) -> Vec<&SnapshotItem> {
     live.history_cut.iter().chain([live]).collect()
 }
 
-/// [money] One scan, cut or not: every bucket row keeps its exact placement
-/// and money in exactly one entity, top rows and scalars conserve, each
-/// piece reconciles on its own evidence table, and a carried account that
-/// crosses a window boundary stays on its rows.
+/// Per bucket, the (account, workspace) pairs its rows must carry.
+type SegmentTruth = BTreeMap<String, std::collections::BTreeSet<(Option<String>, Option<String>)>>;
+
+/// Ground truth from the scan's own requests (carry already applied).
+fn segment_truth(proof: &[Contribution]) -> SegmentTruth {
+    let mut truth = SegmentTruth::new();
+    for contribution in proof {
+        if let RequestIdentity::Tagged(key) = &contribution.identity {
+            truth
+                .entry(contribution.bucket_start.clone())
+                .or_default()
+                .insert((key.login.clone(), key.org.clone()));
+        }
+    }
+    truth
+}
+
+/// What every piece's bucket rows carry, resolved on its own evidence table.
+fn segment_identities(pieces: &[&SnapshotItem]) -> SegmentTruth {
+    let mut found = SegmentTruth::new();
+    for item in pieces {
+        let org = |reference: Option<u16>| {
+            reference.and_then(|reference| {
+                item.request_evidence[usize::from(reference)]
+                    .provider_workspace_hash
+                    .clone()
+            })
+        };
+        for bucket in &item.usage_buckets {
+            let set = found.entry(bucket.bucket_start.clone()).or_default();
+            for row in &bucket.model_usage {
+                match &row.identity_parts {
+                    Some(parts) => {
+                        for part in parts {
+                            set.insert((
+                                part.account_identifier_hash.clone(),
+                                org(part.evidence_ref),
+                            ));
+                        }
+                    }
+                    None => {
+                        set.insert((row.account_identifier_hash.clone(), org(row.evidence_ref)));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// [money] Valid big history finishes: whole, this session is over the item
+/// limit once tagged, so today it loses identity; cut, every bucket row keeps
+/// its exact account and workspace (the scan's own requests, carry
+/// included) in exactly one entity, each piece reconciles on its own
+/// evidence table, and totals conserve.
 #[test]
 fn settled_history_cut_keeps_whole_session_placement() {
     let (full, proof, now) = segment_session();
     let accepted = identity::AcceptedBuckets::for_test();
     let segments = identity::AcceptedBuckets::segments_for_test();
     let mut whole = full.clone();
-    assert!(matches!(
-        identity::apply_cut_for_test(&mut whole, &proof, &accepted, &segments, None).unwrap(),
-        Tagged::Sent { refusals: 0 }
-    ));
+    identity::apply_cut_for_test(&mut whole, &proof, &accepted, &segments, None).unwrap();
     assert!(whole.history_cut.is_empty() && whole.history_segments.is_none());
     let mut live = full.clone();
-    assert!(matches!(
-        identity::apply_cut_for_test(&mut live, &proof, &accepted, &segments, Some(now)).unwrap(),
-        Tagged::Sent { refusals: 0 }
-    ));
+    identity::apply_cut_for_test(&mut live, &proof, &accepted, &segments, Some(now)).unwrap();
     let pieces = segment_pieces(&live);
     assert!(pieces.len() >= 3, "several settled windows were cut");
-    assert_eq!(segment_placement(&pieces), segment_placement(&[&whole]));
+    assert_eq!(segment_identities(&pieces), segment_truth(&proof));
     let through = live.history_segments.as_ref().unwrap();
     assert_eq!(through.count, live.history_cut.len() as u64);
     let through = OffsetDateTime::parse(&through.through, &Rfc3339).unwrap();
@@ -2563,7 +2608,7 @@ fn settled_history_cut_keeps_whole_session_placement() {
     }
     assert_eq!(
         totals,
-        [whole.input_tokens, whole.request_count, whole.model_usage[0].input_tokens]
+        [full.input_tokens, full.request_count, full.model_usage[0].input_tokens]
     );
     // The first rows of a later window kept the previous window's account.
     let first = &live.history_cut[1].usage_buckets[0].model_usage[0];
@@ -2576,22 +2621,17 @@ fn settled_history_cut_keeps_whole_session_placement() {
     assert_eq!(first_account, previous_account);
 }
 
-/// [money] #909 ledger across the cut. Cut-time tags equal the unsegmented
-/// tags from the same live ledger (per-bucket fallback); after the group
-/// ACK each segment entry and the live entry keep their own buckets,
-/// and tags stay equal.
+/// [money] #909 ledger across the cut: after the group ACK each segment entry
+/// and the live entry keep exactly their own buckets, and a re-cut tagged
+/// from those entries places every row as before.
 #[test]
 fn settled_history_cut_tags_from_own_entry_then_live() {
     let (full, proof, now) = segment_session();
     let mut accepted = identity::AcceptedBuckets::for_test();
     let mut segments = identity::AcceptedBuckets::segments_for_test();
-    let mut whole = full.clone();
-    identity::apply_cut_for_test(&mut whole, &proof, &accepted, &segments, None).unwrap();
-    accepted.record(&serde_json::to_value(&whole).unwrap());
-    let expected = segment_placement(&[&whole]);
     let mut live = full.clone();
     identity::apply_cut_for_test(&mut live, &proof, &accepted, &segments, Some(now)).unwrap();
-    assert_eq!(segment_placement(&segment_pieces(&live)), expected);
+    assert_eq!(segment_identities(&segment_pieces(&live)), segment_truth(&proof));
     for segment in &live.history_cut {
         segments.record(&serde_json::to_value(segment).unwrap());
     }
@@ -2610,7 +2650,10 @@ fn settled_history_cut_tags_from_own_entry_then_live() {
     }
     let mut again = full.clone();
     identity::apply_cut_for_test(&mut again, &proof, &accepted, &segments, Some(now)).unwrap();
-    assert_eq!(segment_placement(&segment_pieces(&again)), expected);
+    assert_eq!(
+        segment_placement(&segment_pieces(&again)),
+        segment_placement(&segment_pieces(&live))
+    );
 }
 
 /// [off=main] Without the capability nothing is cut: the same bytes as an
