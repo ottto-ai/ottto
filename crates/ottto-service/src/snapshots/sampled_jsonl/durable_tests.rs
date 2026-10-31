@@ -20,7 +20,7 @@ const CODEX_SESSION: &str = "0199f7a0-0000-7000-8000-0000000d7a11";
 fn assert_v1_has_no_record(
     golden: &crate::snapshots::sampled_scan::transition_fixture::V1Golden<'_>,
     bytes: &[u8],
-    corrupt: bool,
+    corrupt: Option<bool>,
 ) {
     use crate::durable_tail_store::{DurableSource, DurableTailStore, ReadOutcome, Refusal};
     let scratch = Scratch::new(golden.case_id);
@@ -41,7 +41,37 @@ fn assert_v1_has_no_record(
         "{}",
         golden.case_id
     );
+    // `body` is the existing store hook immediately before body input is
+    // read for verification/decode. No body input means no decoder can run.
+    struct ClearAccess;
+    impl Drop for ClearAccess {
+        fn drop(&mut self) {
+            crate::durable_tail_store::test_hooks::set_before_access(None);
+        }
+    }
+    let clear = ClearAccess;
+    let headers = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = headers.clone();
+    crate::durable_tail_store::test_hooks::set_before_access(Some(Box::new(
+        move |_, operation| {
+            assert_ne!(
+                operation, "body",
+                "retired dispatch must precede body input/decode"
+            );
+            if operation == "header" {
+                seen.set(seen.get() + 1);
+            }
+            Ok(())
+        },
+    )));
     assert_eq!(disk.read(&key), ReadOutcome::Missing, "{}", golden.case_id);
+    assert_eq!(headers.get(), 1, "the header was actually classified");
+    if corrupt.is_none() {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        return; // ClearAccess drops: no body input/decode in this entire row.
+    }
+    drop(clear);
+    let corrupt = corrupt.unwrap();
     assert_eq!(disk.full_hold(&key, corrupt), None);
     assert_eq!(
         disk.full_hold(&key, false),
@@ -74,7 +104,7 @@ fn v1_goldens_retired_pin_dispatches_without_a_record() {
             u64::from_le_bytes(golden.record[171..179].try_into().unwrap()),
             golden.metadata["index_generation"]
         );
-        assert_v1_has_no_record(&golden, golden.record, false);
+        assert_v1_has_no_record(&golden, golden.record, Some(false));
     }
 }
 
@@ -85,7 +115,7 @@ fn v1_goldens_one_byte_body_edit_refuses_a_record() {
     for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
         let mut changed = golden.record.to_vec();
         changed[crate::durable_tail_store::HEADER_BYTES] ^= 1;
-        assert_v1_has_no_record(&golden, &changed, true);
+        assert_v1_has_no_record(&golden, &changed, Some(true));
     }
 }
 
@@ -103,7 +133,7 @@ fn v1_goldens_selector_swap_refuses_a_record() {
         let mut changed = golden.record.to_vec();
         changed[start..start + length].rotate_left(context_len);
         assert_ne!(changed, golden.record);
-        assert_v1_has_no_record(&golden, &changed, true);
+        assert_v1_has_no_record(&golden, &changed, Some(true));
     }
 }
 
@@ -112,6 +142,46 @@ fn resign_v1_mutation(bytes: &mut [u8]) {
     let end = bytes.len() - 32;
     let checksum = Sha256::digest(&bytes[..end]);
     bytes[end..].copy_from_slice(&checksum);
+}
+
+// Attack the current representation too: retired dispatch alone would make
+// every body mutation below vacuous. A changed pin must not launder old bytes.
+fn assert_v1_mutation_refused(
+    golden: &crate::snapshots::sampled_scan::transition_fixture::V1Golden<'_>,
+    bytes: &[u8],
+) {
+    use crate::durable_tail_store::{DurableSource, DurableTailStore, ReadOutcome};
+    assert_v1_has_no_record(golden, bytes, None);
+    let source = if golden.metadata["source_tag"] == 1 {
+        SnapshotSource::ClaudeCode
+    } else {
+        SnapshotSource::Codex
+    };
+    let ds = if source == SnapshotSource::ClaudeCode {
+        DurableSource::ClaudeCode
+    } else {
+        DurableSource::Codex
+    };
+    let mut attack = bytes.to_vec();
+    attack[10..42].copy_from_slice(&allowlist_digest(source));
+    resign_v1_mutation(&mut attack);
+    let scratch = Scratch::new(golden.case_id);
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let key = attack[43..75].try_into().unwrap();
+    let path = scratch.0.join(format!("{}.rec", hex(key)));
+    fs::write(&path, &attack).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut disk = DurableTailStore::new(scratch.0.clone(), ds);
+    assert!(
+        matches!(disk.read(&key), ReadOutcome::Refused(_)),
+        "{}: current-pin attack cannot publish a reduction",
+        golden.case_id
+    );
+    assert_eq!(
+        fs::read(path).unwrap(),
+        attack,
+        "refusal leaves the input immutable"
+    );
 }
 
 /// [money] Opaque serializer-header tokens inside an archived payload, even
@@ -136,7 +206,7 @@ fn pinned_v1_refuses_impl_with_opaque_header_tokens() {
                 let start = crate::durable_tail_store::HEADER_BYTES;
                 changed[start..start + mutation.len()].copy_from_slice(mutation.as_bytes());
                 resign_v1_mutation(&mut changed);
-                assert_v1_has_no_record(&golden, &changed, false);
+                assert_v1_mutation_refused(&golden, &changed);
             }
         }
     }
@@ -166,7 +236,7 @@ fn pinned_v1_refuses_body_publication_and_shadowed_iterator() {
             }
             assert_ne!(changed, golden.record);
             resign_v1_mutation(&mut changed);
-            assert_v1_has_no_record(&golden, &changed, false);
+            assert_v1_mutation_refused(&golden, &changed);
         }
     }
 }

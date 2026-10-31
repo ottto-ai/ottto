@@ -31,5 +31,7 @@ pub(crate) fn seed_pinned_v1(
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
     std::fs::write(slot.store.dir().join(format!("{name}.rec")), &bytes).unwrap();
+    assert_eq!(slot.store.missing_cause(&digest), Some("repin"));
+    assert_eq!(slot.store.read(&digest), ReadOutcome::Missing);
     bytes
 }
