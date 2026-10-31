@@ -4747,6 +4747,20 @@ fn private_label_purge_continues_past_corruption_and_reports_partial_progress() 
         corrupt,
         "corruption never licenses erasing unknown bytes"
     );
+    // Once the unreadable/corrupt records are removed, a multi-page
+    // retention traversal can persist a positive kept inventory and finish.
+    fs::remove_file(&file).unwrap();
+    fs::remove_file(&denied_file).unwrap();
+    let keep = BTreeSet::from([old.key]);
+    for _ in 0..3 {
+        let report = store.purge_private_labels_kept(&lock, &keep, |_| true).unwrap();
+        assert!(report.visited <= 512);
+        assert_eq!(report.refused, 0);
+        assert_eq!(report.erased, 0);
+    }
+    assert_eq!(store.private_label_keys().unwrap(), Some(keep));
+    assert_eq!(fs::read(&old_file).unwrap(), old_bytes);
+    assert_eq!(fs::metadata(&old_file).unwrap().mode() & 0o777, 0o640);
 }
 
 /// [money] private label purge revokes retained completion but keeps candidate owed.

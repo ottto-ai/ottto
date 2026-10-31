@@ -741,6 +741,7 @@ pub(crate) struct DurableTailStore {
     private_purge_entries: Option<fs::ReadDir>,
     private_purge_page: Option<PrivateLabelPage>,
     private_purge_dirty: bool,
+    private_purge_kept: BTreeSet<Digest32>,
     pending: BTreeMap<Digest32, PendingWrite>,
     resource_pause: Option<stream::ResourcePause>,
     stream_dirty: Arc<AtomicU64>,
@@ -810,6 +811,7 @@ impl DurableTailStore {
             private_purge_entries: None,
             private_purge_page: None,
             private_purge_dirty: false,
+            private_purge_kept: BTreeSet::new(),
             pending: BTreeMap::new(),
             resource_pause: None,
             stream_dirty: Arc::default(),
@@ -2444,6 +2446,7 @@ impl DurableTailStore {
         self.private_purge_entries = None;
         self.private_purge_page = None;
         self.private_purge_dirty = false;
+        self.private_purge_kept.clear();
         let mut keys = self.private_label_keys().unwrap_or(None);
         if let Some(keys) = keys.as_mut() {
             keys.insert(key);
@@ -2525,7 +2528,16 @@ impl DurableTailStore {
         }
         report.erased = erased;
         if known.is_none() {
-            self.private_purge_dirty |= report.refused > 0 || !remaining.is_empty();
+            self.private_purge_dirty |= report.refused > 0;
+            // Keep a bounded conservative positive inventory across pages.
+            // A live key is not an erase failure and need not be body-read.
+            for key in &remaining {
+                if self.private_purge_kept.len() < MAX_RECORDS || self.private_purge_kept.contains(key) {
+                    self.private_purge_kept.insert(*key);
+                } else {
+                    self.private_purge_dirty = true;
+                }
+            }
             let complete = self
                 .private_purge_page
                 .take()
@@ -2536,11 +2548,13 @@ impl DurableTailStore {
             }
             self.private_purge_entries = None;
             if std::mem::take(&mut self.private_purge_dirty) {
+                self.private_purge_kept.clear();
                 // Earlier pages may owe retry, but a failure on this page is
                 // already counted. Never count the same refusal twice.
                 report.refused = report.refused.max(1);
                 return Ok(report);
             }
+            remaining = std::mem::take(&mut self.private_purge_kept);
         }
         if self
             .write_private_label_keys(writer, Some(&remaining))
