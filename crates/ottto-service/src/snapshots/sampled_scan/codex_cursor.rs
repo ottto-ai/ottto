@@ -3627,7 +3627,10 @@ pub(in crate::snapshots) fn group_memo_digest(
         receipt_scope.to_owned(),
         group_counting_view(members.iter().copied(), index),
         format!("{}:{}", live.dev, live.ino),
-        if codex.created_thread_census_unscoped_incomplete {
+        if members
+            .iter()
+            .any(|member| codex.created_thread_census_incomplete_for(&member.path))
+        {
             "created_incomplete".to_owned()
         } else {
             "created_complete".to_owned()
@@ -6838,7 +6841,7 @@ pub(in crate::snapshots) fn memo_digest(
         // Class 7: an identity conflict on a candidate changes the blocked
         // ids of any hold, sidecar-woken or not.
         &conflicted_identities(codex, &candidate.path),
-        if codex.created_thread_census_unscoped_incomplete {
+        if codex.created_thread_census_incomplete_for(&candidate.path) {
             "created_incomplete"
         } else {
             "created_complete"
