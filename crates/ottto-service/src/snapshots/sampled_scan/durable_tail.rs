@@ -408,7 +408,7 @@ impl Counters {
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,retired_upgrade_missing,receipt_pending,behind_accepted,repin]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
-             gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
+             gc_records_deleted={} rec_orphans_erased={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              off_v1_invalidated={} off_v1_invalidate_failed={} records_invalidated={} mutation_unproved={} peak_codec_bytes={} t14_rebuild_full_started={} \
              d3_hold[growth_bytes,released_write,released_content,unfunded]={:?} \
              store_write_after_save_failed[files]={} \
@@ -456,6 +456,7 @@ impl Counters {
             store.uninventoried_records,
             store.store_write_skipped,
             store.gc_records_deleted,
+            store.rec_orphans_erased,
             store.gc_records_read,
             store.gc_bytes_read,
             self.gc_keep_peak,
@@ -4790,7 +4791,12 @@ impl SharedCache {
         index: &ScanIndex,
     ) -> Option<store::BatchReceipt> {
         durable_source(snapshot_source)?;
-        self.erase_private_labels(writer, snapshot_source, Ok(None));
+        self.erase_private_labels(
+            writer,
+            snapshot_source,
+            store::PrivateLabelEraseReason::ConsentOrSource,
+            Ok(None),
+        );
         if !restart_restore::enabled() {
             // The committed save, not the working index, owns quiet-marker
             // settlement even without a record. Keep the ordinary second CAS.
@@ -4858,6 +4864,7 @@ impl SharedCache {
         &self,
         writer: &W,
         snapshot_source: SnapshotSource,
+        reason: store::PrivateLabelEraseReason,
         keep: std::io::Result<Option<&BTreeSet<store::Digest32>>>,
     ) {
         let (keep, candidate_error) = match keep {
@@ -4897,9 +4904,12 @@ impl SharedCache {
                     Err(std::io::Error::other("prior OFF unlink barrier"))
                 } else {
                     match keep {
-                        Some(keep) => slot.store.purge_private_labels_kept(writer, keep, |body| {
-                            codec::body_has_skill_labels(body).unwrap_or(true)
-                        }),
+                        Some(keep) => {
+                            slot.store
+                                .purge_private_labels_kept(writer, keep, reason, |body| {
+                                    codec::body_has_skill_labels(body).unwrap_or(true)
+                                })
+                        }
                         None => slot.store.purge_private_labels(writer, |body| {
                             codec::body_has_skill_labels(body).unwrap_or(true)
                         }),
@@ -5332,7 +5342,12 @@ impl SharedCache {
             Ok(false) => return Ok(()),
             Err(()) => {
                 // Count refusal without touching the old slot under new context.
-                self.erase_private_labels(writer, snapshot_source, Ok(None));
+                self.erase_private_labels(
+                    writer,
+                    snapshot_source,
+                    store::PrivateLabelEraseReason::ConsentOrSource,
+                    Ok(None),
+                );
                 return Ok(());
             }
         }
@@ -5354,10 +5369,20 @@ impl SharedCache {
                         .map(|key| store::key_digest(ds, key))
                         .filter(|key| possible.contains(key))
                         .collect();
-                    self.erase_private_labels(writer, snapshot_source, Ok(Some(&keep)));
+                    self.erase_private_labels(
+                        writer,
+                        snapshot_source,
+                        store::PrivateLabelEraseReason::CommittedKeyAbsent,
+                        Ok(Some(&keep)),
+                    );
                 }
                 Some(Err(error)) => {
-                    self.erase_private_labels(writer, snapshot_source, Err(error));
+                    self.erase_private_labels(
+                        writer,
+                        snapshot_source,
+                        store::PrivateLabelEraseReason::CommittedKeyAbsent,
+                        Err(error),
+                    );
                 }
                 None => {}
             }
@@ -5482,7 +5507,12 @@ impl SharedCache {
         writer: &W,
         snapshot_source: SnapshotSource,
     ) -> std::io::Result<()> {
-        self.erase_private_labels(writer, snapshot_source, Ok(Some(&BTreeSet::new())));
+        self.erase_private_labels(
+            writer,
+            snapshot_source,
+            store::PrivateLabelEraseReason::ConsentOrSource,
+            Ok(Some(&BTreeSet::new())),
+        );
         // OFF fresh-index cleanup only erases private labels. It cannot
         // settle v1 failures, especially when an old unlink barrier deferred
         // that erasure; only verified absence/invalidation clears those ages.

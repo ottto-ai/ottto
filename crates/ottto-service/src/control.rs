@@ -23526,7 +23526,7 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    /// [format] OFF forget-installation erases prior private-label artifacts.
+    /// [format] OFF forget-installation erases every destination/source tree, including opaque records and temps.
     fn forget_installation_clears_identity_scope_credentials_and_receipts_only() {
         let _off = crate::snapshots::RestartRestoreForTest::disabled();
         let root = telemetry_key_store_root("forget-installation");
@@ -23534,6 +23534,27 @@ for line in sys.stdin:
         let secret_root = root.join("secrets");
         fs::create_dir_all(support_root.join("snapshots/destinations/old")).unwrap();
         seed_private_literal_canary(&support_root.join("snapshots"));
+        for destination in ["old", "other"] {
+            for source in crate::snapshots::durable_sources::SOURCES {
+                let index = support_root
+                    .join("snapshots/destinations")
+                    .join(destination)
+                    .join(format!("{}-scan-index.json", source.snapshot.api_slug()));
+                let dir = crate::durable_tail_store::store_dir_for_index(&index);
+                fs::create_dir_all(&dir).unwrap();
+                // Whole-tree forget cannot depend on inventory or body decoding.
+                fs::write(
+                    dir.join(format!("{}.rec", "f".repeat(64))),
+                    b"opaque record",
+                )
+                .unwrap();
+                fs::write(dir.join("torn.tmp"), b"unfinished write").unwrap();
+                fs::create_dir_all(dir.join("temp/child")).unwrap();
+                fs::write(dir.join("temp/child/pending"), b"unfinished child").unwrap();
+                fs::write(dir.with_extension("private-labels"), b"opaque marker").unwrap();
+                assert!(dir.exists());
+            }
+        }
         fs::create_dir_all(&secret_root).unwrap();
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
