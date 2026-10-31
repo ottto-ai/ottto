@@ -35170,7 +35170,6 @@ mod usage_checks_paused_tests {
         )]);
         assert!(claude_paused_usage_accounts(&slots, &snapshot, no_breaker, NOW).is_empty());
     }
-
 }
 
 /// Phase 0 of the durable Claude login fix: status passes never spawn a
