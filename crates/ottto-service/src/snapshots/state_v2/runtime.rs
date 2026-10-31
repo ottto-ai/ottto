@@ -25,6 +25,7 @@ pub(in super::super) enum Hold {
     SaveOversize,
     SaveFull,
     ReferenceDrift,
+    AckCustody,
 }
 impl std::fmt::Display for Hold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -41,6 +42,7 @@ impl std::fmt::Display for Hold {
             Self::ReferenceDrift => "state_v2_reference_drift",
             Self::ReloadRequired => "current_index_requires_reload",
             Self::FenceLost => "state_v2_fence_lost",
+            Self::AckCustody => "state_v2_ack_custody_hold",
         })
     }
 }
@@ -119,6 +121,20 @@ impl ResumeExclusion {
             had_ref: false,
         }
     }
+    /// Repeated (3 passes) or long (6 h) exclusions alarm.
+    fn alarmed(&self, now: Instant) -> bool {
+        self.passes >= 3
+            || now.saturating_duration_since(self.first_seen) > Duration::from_secs(6 * 3600)
+    }
+    /// A short retry until the alarm; then the growth-full pace, so a key whose
+    /// staging fails deterministically cannot abort a page every minute.
+    fn backoff(&self, now: Instant) -> Duration {
+        Duration::from_secs(if self.alarmed(now) {
+            super::super::sampled_audit::GROWTH_FULL_INTERVAL
+        } else {
+            60
+        })
+    }
 }
 struct RouteState {
     pace: Pace,
@@ -136,8 +152,13 @@ struct RouteState {
     save_retry_completed: bool,
     pass_written_start: Option<u64>,
     resume_excluded: BTreeMap<String, ResumeExclusion>,
+    // Live ACK custody exceeded the companion bound: no collection before this.
+    custody_retry_at: Option<Instant>,
 }
 impl RouteState {
+    fn custody_held(&self) -> bool {
+        self.custody_retry_at.is_some_and(|at| Instant::now() < at)
+    }
     fn reduce_page(&mut self) {
         let previous = self.page_limit;
         self.page_limit = (self.page_limit / 2).max(1);
@@ -196,6 +217,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     save_retry_completed: false,
                     pass_written_start: None,
                     resume_excluded: BTreeMap::new(),
+                    custody_retry_at: None,
                 }))
             })
             .clone()
@@ -576,19 +598,11 @@ pub(in super::super) fn save_locked(
     progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
     custody: bool,
 ) -> Result<bool> {
-    save_with_custody(
-        path,
-        index,
-        &ClaudeMapper,
-        claim_only,
-        progress_owner,
-        custody,
-    )
+    save_with_custody(path, index, claim_only, progress_owner, custody)
 }
-fn save_with_custody<M: Mapper>(
+fn save_with_custody(
     path: &Path,
     index: &mut ScanIndex,
-    mapper: &M,
     claim_only: bool,
     progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
     custody: bool,
@@ -639,51 +653,26 @@ fn save_with_custody<M: Mapper>(
                     path,
                     owner,
                 )?;
-                let save = if claim_only {
-                    M::save_claim_delta
-                } else {
-                    M::save_delta
-                };
-                let save_result = save(
-                    mapper,
+                ClaudeMapper.save(
                     &mut session.db,
                     &identity,
                     &previous,
                     index,
                     &mut session.cx,
-                );
-                if save_result? {
-                    session.stamp = session.db.stamp()?;
-                    // Only a freshly committed replacement/finish resolves the
-                    // failed key. Unrelated saves and elapsed backoff never do.
-                    state.resume_excluded.retain(|key, excluded| {
-                        session
-                            .cx
-                            .committed
-                            .get(key)
-                            .map_or(!excluded.had_ref, |checkpoint| {
-                                checkpoint.file_generation <= excluded.failed_generation
-                            })
-                    });
-                    state.cached = Some(index.clone());
-                    state.saved_page(session.db.save_over_target(), claim_only);
-                    return Ok(true);
-                }
-                mapper.preflight(index).map_err(|_| Hold::DbUnavailable)?;
-                state.cached = None;
-                let mut tx = session.db.begin(TxnMode::Write)?;
-                // Identity is independently authenticated; generation is atomically
-                // compared again by commit. Hold comparisons remain mapper-owned.
-                mapper.merge_cas(&mut tx, index)?;
-                if !claim_only {
-                    index.retire_committed_claude_account_pending_windows();
-                }
-                lenient_check(index)?;
-                let previous = index.generation;
-                let next = previous.checked_add(1).ok_or(Hold::DbUnavailable)?;
-                mapper.delta(&mut tx, index)?;
-                apply_outcome(index, &mut session.reload, tx.commit(previous, next))?;
+                    claim_only,
+                )?;
                 session.stamp = session.db.stamp()?;
+                // Only a freshly committed replacement/finish resolves the
+                // failed key. Unrelated saves and elapsed backoff never do.
+                state.resume_excluded.retain(|key, excluded| {
+                    session
+                        .cx
+                        .committed
+                        .get(key)
+                        .map_or(!excluded.had_ref, |checkpoint| {
+                            checkpoint.file_generation <= excluded.failed_generation
+                        })
+                });
                 // Publish only the complete, unambiguously committed graph.
                 state.cached = Some(index.clone());
                 state.saved_page(session.db.save_over_target(), claim_only);
@@ -700,7 +689,7 @@ fn save_with_custody<M: Mapper>(
                         )
                     });
                     entry.had_ref |= excluded.2.contains(key);
-                    entry.retry_at = now + Duration::from_secs(60);
+                    entry.retry_at = now + entry.backoff(now);
                 }
             }
             if let Some(hold) = session.db.save_failure() {
@@ -759,32 +748,6 @@ fn save_with_custody<M: Mapper>(
     }
     result
 }
-fn lenient_check(index: &ScanIndex) -> Result<()> {
-    super::super::lenient_decode::check_held_output(index)
-}
-fn apply_outcome(
-    index: &mut ScanIndex,
-    reload: &mut bool,
-    outcome: DurableCommitOutcome,
-) -> Result<()> {
-    match outcome {
-        DurableCommitOutcome::Committed(g) => {
-            index.generation = g;
-            Ok(())
-        }
-        DurableCommitOutcome::NotPublished => bail!("state_v2_not_published"),
-        DurableCommitOutcome::Published(g) => {
-            index.generation = g;
-            *reload = true;
-            bail!("current_index_requires_reload");
-        }
-        DurableCommitOutcome::Ambiguous => {
-            *reload = true;
-            bail!("current_index_requires_reload");
-        }
-    }
-}
-
 pub(in super::super) fn guard_containment_locked(path: &Path) -> Result<()> {
     if binding(path).is_none() || !route_needed(path, false, published(path)?)? {
         return Ok(());
@@ -875,6 +838,34 @@ fn runtime_path(index: &ScanIndex) -> Result<Option<PathBuf>> {
     Ok(Some(
         guard.as_ref().ok_or(Hold::ReloadRequired)?.path.clone(),
     ))
+}
+
+/// Live custody alone exceeds the companion bound. Pace collection at the
+/// growth-full interval: one parse/admission retry per interval, no POST in
+/// between, and owed debt stays in the unchanged index/progress.
+pub(in super::super) fn hold_ack_custody(path: &Path) {
+    let retry_at =
+        Instant::now() + Duration::from_secs(super::super::sampled_audit::GROWTH_FULL_INTERVAL);
+    if with_state(path, |state| {
+        state.custody_retry_at = Some(retry_at);
+        Ok(())
+    })
+    .is_ok()
+    {
+        telemetry::event("hold", &Hold::AckCustody);
+    }
+}
+
+/// Existing routes only: an admission probe never adds a registry slot.
+pub(in super::super) fn ack_custody_held(path: &Path) -> bool {
+    let Some(state) = states()
+        .lock()
+        .ok()
+        .and_then(|states| states.get(path).cloned())
+    else {
+        return false;
+    };
+    state.lock().is_ok_and(|state| state.custody_held())
 }
 
 pub(in super::super) fn save_oversize_active(index: &ScanIndex) -> Result<bool> {

@@ -45,11 +45,15 @@ pub(super) struct IndexState {
     pub(super) persistence_v2: Option<Arc<Runtime>>,
     pub(super) growth_claim_context: Option<Arc<super::sampled_audit::GrowthClaimContext>>,
     pub(super) growth_retention: BTreeMap<String, super::sampled_audit::GrowthRetention>,
+    /// Runtime-only: keys whose growth was revalidated in this graph
+    /// generation. Never persisted, so check-only results write no rows.
+    pub(super) growth_checked: (u64, std::collections::BTreeSet<String>),
 }
 pub(super) static EMPTY_INDEX: IndexState = IndexState {
     persistence_v2: None,
     growth_claim_context: None,
     growth_retention: BTreeMap::new(),
+    growth_checked: (0, std::collections::BTreeSet::new()),
 };
 impl ScanIndex {
     pub(super) fn v2(&self) -> &IndexState {
@@ -59,7 +63,7 @@ impl ScanIndex {
         self.v2.get_or_insert_with(Box::default)
     }
 }
-crate::heap_layout_bound::fields!(IndexState; persistence_v2, growth_claim_context, growth_retention);
+crate::heap_layout_bound::fields!(IndexState; persistence_v2, growth_claim_context, growth_retention, growth_checked);
 
 /// Runtime-only custody carrier. Only the verified v2 load route may install it.
 /// Environment/sentinel state alone must never activate growth retention.

@@ -24723,10 +24723,14 @@ mod tests {
         }
     }
 
-    /// [regress] ACK companion admission refuses an oversized future ledger before POST.
+    /// [money] ACK custody over the companion bound. Phase 1: settled sessions'
+    /// cache evidence saturates the bound; pruning it admits the page and the
+    /// pruned sessions lose their heads (reopen = missing-head bootstrap).
+    /// Phase 2: live (pending-head) evidence alone exceeds the bound; the route
+    /// takes a paced hold, nothing is posted and custody bytes are unchanged.
     #[test]
-    fn v2_companion_budget_refuses_before_post_without_changing_custody() {
-        for bootstrap in [false, true] {
+    fn v2_custody_prunes_settled_cache_evidence_and_holds_live_overflow_without_post() {
+        for (phase, bootstrap) in [(1, false), (1, true), (2, false), (2, true)] {
             let mut f = SameSourceAckFixture::new();
             if bootstrap {
                 let item = &f.items[0];
@@ -24736,12 +24740,38 @@ mod tests {
                 );
             }
             // Reachable cumulative cache evidence; each record stays below 128 KiB.
-            for n in 0..111 {
+            let sessions = (0..111)
+                .map(|n| format!("old-{n}"))
+                .chain(["edge".to_string()])
+                .collect::<Vec<_>>();
+            for session in &sessions[..111] {
                 f.progress.accepted_cache_states.insert(
-                    cache_session_key(&format!("old-{n}")),
+                    cache_session_key(session),
                     serde_json::json!({"observations":[], "value":"x".repeat(100_000)}),
                 );
+                f.progress
+                    .accepted_cache_heads
+                    .insert(cache_session_key(session), "f".repeat(64));
             }
+            // Pending head obligations mark sessions live: one in phase 1, all in 2.
+            let live = if phase == 1 {
+                &sessions[..1]
+            } else {
+                &sessions[..]
+            };
+            f.progress.pending_cache_heads.insert(
+                "pending-file".into(),
+                PendingCacheHeadFile {
+                    source_file_fingerprint: "pending-source".into(),
+                    group_fingerprint: "pending-group".into(),
+                    entities: live
+                        .iter()
+                        .map(|session| (format!("entity-{session}"), cache_session_key(session)))
+                        .collect(),
+                    reselected_heads: BTreeMap::new(),
+                    settled_entities: BTreeSet::new(),
+                },
+            );
             let remaining = 11_182_000 - serde_json::to_vec_pretty(&f.progress).unwrap().len() - 64;
             f.progress.accepted_cache_states.insert(
                 cache_session_key("edge"),
@@ -24756,32 +24786,60 @@ mod tests {
                 f.baseline.generation,
             );
             recovery.admit_progress_bytes(bytes.len() as u64).unwrap();
+            recovery.adopt_synthetic(Some(&bytes));
             f.progress.ack_recovery = Some(Box::new(recovery));
             let before = f.progress.clone();
-            let mut posts = 0;
-            let error = if bootstrap {
-                bootstrap_cache_heads_with_budget(
-                    &f.items[..1],
-                    &unique_poison_scope(),
-                    &mut f.progress,
-                    false,
-                    &mut InplaceRetryBudget::default(),
-                    |items, _| {
-                        posts += 1;
+            let posts = std::cell::Cell::new(0);
+            let attempt = |f: &mut SameSourceAckFixture| {
+                if bootstrap {
+                    bootstrap_cache_heads_with_budget(
+                        &f.items[..1],
+                        &unique_poison_scope(),
+                        &mut f.progress,
+                        false,
+                        &mut InplaceRetryBudget::default(),
+                        |items, _| {
+                            posts.set(posts.get() + 1);
+                            same_source_fixture_ack(items)
+                        },
+                        |progress| progress.save(&f.progress_path),
+                    )
+                    .map(|_| ())
+                } else {
+                    f.send(0, |items| {
+                        posts.set(posts.get() + 1);
                         same_source_fixture_ack(items)
-                    },
-                    |progress| progress.save(&f.progress_path),
-                )
-                .unwrap_err()
-            } else {
-                f.send(0, |items| {
-                    posts += 1;
-                    same_source_fixture_ack(items)
-                })
-                .unwrap_err()
+                    })
+                    .map(|_| ())
+                }
             };
+            if phase == 1 {
+                let _ = attempt(&mut f);
+                assert_eq!(posts.get(), 1, "pruning settled evidence admits the page");
+                let live = cache_session_key("old-0");
+                assert!(f.progress.accepted_cache_states.contains_key(&live));
+                assert!(f.progress.accepted_cache_heads.contains_key(&live));
+                for session in &sessions[1..] {
+                    let key = cache_session_key(session);
+                    assert!(!f.progress.accepted_cache_states.contains_key(&key));
+                    assert!(!f.progress.accepted_cache_heads.contains_key(&key));
+                }
+                assert!(!f.progress.ack_recovery.as_ref().unwrap().custody_held());
+                continue;
+            }
+            let error = attempt(&mut f).unwrap_err();
             assert!(error.is::<ack_retention::AckSettlementRequired>());
-            assert_eq!(posts, 0);
+            assert!(f.progress.ack_recovery.as_ref().unwrap().custody_held());
+            assert_eq!(posts.get(), 0);
+            assert_eq!(f.progress, before);
+            assert_eq!(std::fs::read(&f.progress_path).unwrap(), bytes);
+            assert_eq!(std::fs::read(&f.index_path).unwrap(), index_bytes);
+            // Paced: even once its sessions settle, no retry before the interval.
+            f.progress.pending_cache_heads.clear();
+            let before = f.progress.clone();
+            let error = attempt(&mut f).unwrap_err();
+            assert!(error.is::<ack_retention::AckSettlementRequired>());
+            assert_eq!(posts.get(), 0);
             assert_eq!(f.progress, before);
             assert_eq!(std::fs::read(&f.progress_path).unwrap(), bytes);
             assert_eq!(std::fs::read(&f.index_path).unwrap(), index_bytes);

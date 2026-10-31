@@ -26807,21 +26807,7 @@ impl OwnedSourceScan {
             source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(index);
         if growth_active {
             sampled_audit::prune_growth_retention(index, sampled_scan::now_seconds());
-            if state_v2::retain_resume_exclusions(index, roots).is_err() {
-                let mut blocked = Self::new_continuation(
-                    &[],
-                    owned_index,
-                    collected_at,
-                    requested_backfill_window_days,
-                    0,
-                    artifacts_enabled,
-                    context_curve_enabled,
-                    None,
-                    None,
-                );
-                blocked.source = source;
-                return blocked;
-            }
+            state_v2::retain_resume_exclusions(index, roots);
         }
         if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
             refresh_terminal_off_discovery(
@@ -27181,11 +27167,12 @@ impl OwnedSourceScan {
                 )
             })
             .filter(|candidate| {
-                !state_v2::resume_selection_held(
-                    index,
-                    &local_index_key(&candidate.path),
-                    Some(candidate.size_bytes),
-                )
+                !growth_active
+                    || !state_v2::resume_selection_held(
+                        index,
+                        &local_index_key(&candidate.path),
+                        Some(candidate.size_bytes),
+                    )
             })
             .collect::<Vec<_>>();
 
@@ -27374,7 +27361,10 @@ impl OwnedSourceScan {
                 &forced_claude_family_reparses,
             )
             .into_iter()
-            .filter(|path| !state_v2::resume_selection_held(index, &local_index_key(path), None))
+            .filter(|path| {
+                !growth_active
+                    || !state_v2::resume_selection_held(index, &local_index_key(path), None)
+            })
             .filter(|path| !already_identified.contains(&local_index_key(path)))
             .collect::<BTreeSet<_>>();
             if let Some(traversal) = index.traversal.as_mut() {
@@ -27405,10 +27395,13 @@ impl OwnedSourceScan {
                         watcher_hint: false,
                     },
                     &mut census,
-                    census_unix_seconds,
-                    backfill_window_days,
-                    &index.files,
-                    sampled_audit::growth_active(index).then_some(&index.v2().growth_retention),
+                    CandidateWindow {
+                        census_unix_seconds,
+                        backfill_window_days,
+                        files: &index.files,
+                        growth: sampled_audit::growth_active(index)
+                            .then_some(&index.v2().growth_retention),
+                    },
                 ) else {
                     continue;
                 };
@@ -32484,6 +32477,7 @@ impl OwnedSourceScan {
             let verification_rescue_debt =
                 sampled_audit::progress_debt(index, &rescue_key, audit_now).is_some();
             if source == SnapshotSource::ClaudeCode
+                && sampled_audit::growth_active(index)
                 && !state_v2::save_read_admitted(index, &rescue_key, audit_now).unwrap_or(false)
             {
                 sampled_audit::queue_growth_retry(index, &candidate);
@@ -32500,10 +32494,13 @@ impl OwnedSourceScan {
                     source,
                     candidate,
                     &mut census,
-                    census_unix_seconds,
-                    backfill_window_days,
-                    &index.files,
-                    sampled_audit::growth_active(index).then_some(&index.v2().growth_retention),
+                    CandidateWindow {
+                        census_unix_seconds,
+                        backfill_window_days,
+                        files: &index.files,
+                        growth: sampled_audit::growth_active(index)
+                            .then_some(&index.v2().growth_retention),
+                    },
                     verification_rescue,
                     audit_now,
                     sampling.as_ref().map(|context| context.cache.as_ref()),
@@ -43947,24 +43944,38 @@ fn candidate_from_traversal_path_with_growth(
         disappearance_diagnostics::Site::CandidateWalk,
         pending,
         census,
-        census_unix_seconds,
-        backfill_window_days,
-        files,
-        growth,
+        CandidateWindow {
+            census_unix_seconds,
+            backfill_window_days,
+            files,
+            growth,
+        },
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Pass-level admission inputs shared by traversal and open checks: census
+/// clock, backfill window, committed rows and v2 growth debt (None when OFF).
+#[derive(Clone, Copy)]
+struct CandidateWindow<'a> {
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    files: &'a BTreeMap<String, ScanIndexEntry>,
+    growth: Option<&'a BTreeMap<String, sampled_audit::GrowthRetention>>,
+}
+
 fn candidate_from_traversal_path_at_with_growth(
     source: SnapshotSource,
     site: disappearance_diagnostics::Site,
     pending: ScanTraversalPath,
     census: &mut ScanCensus,
-    census_unix_seconds: Option<u64>,
-    backfill_window_days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
-    growth: Option<&BTreeMap<String, sampled_audit::GrowthRetention>>,
+    window: CandidateWindow<'_>,
 ) -> Option<CandidateFile> {
+    let CandidateWindow {
+        census_unix_seconds,
+        backfill_window_days,
+        files,
+        growth,
+    } = window;
     let metadata = match fs::symlink_metadata(&pending.path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -44569,29 +44580,33 @@ fn open_and_identify_scan_candidate_at(
         source,
         candidate,
         census,
-        census_unix_seconds,
-        backfill_window_days,
-        files,
-        growth,
+        CandidateWindow {
+            census_unix_seconds,
+            backfill_window_days,
+            files,
+            growth,
+        },
         false,
         audit_now,
         None,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn open_and_identify_scan_candidate_with_rescue_at(
     source: SnapshotSource,
     mut candidate: CandidateFile,
     census: &mut ScanCensus,
-    census_unix_seconds: Option<u64>,
-    backfill_window_days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
-    growth: Option<&BTreeMap<String, sampled_audit::GrowthRetention>>,
+    window: CandidateWindow<'_>,
     verification_rescue: bool,
     audit_now: u64,
     cache: Option<&sampled_scan::SharedCache>,
 ) -> Option<(CandidateFile, File)> {
+    let CandidateWindow {
+        census_unix_seconds,
+        backfill_window_days,
+        files,
+        growth,
+    } = window;
     // Common boundary: ordinary discovery, retained retries, forced family
     // preflight and synthetic progress all obey the same failed-open park.
     // Stat change/overflow/restart still fail toward trying the real open.
@@ -50550,6 +50565,7 @@ impl ScanIndex {
                     persistence_v2: state.persistence_v2.clone(),
                     growth_claim_context: state.growth_claim_context.clone(),
                     growth_retention: sampled_audit::growth_subset(self, previous, &safe_keys),
+                    growth_checked: Default::default(),
                 })
             }),
             persistence_root: previous.persistence_root.clone(),
@@ -94454,30 +94470,6 @@ fn open_and_identify_scan_candidate(
         sampled_scan::now_seconds(),
     )
 }
-#[allow(clippy::too_many_arguments)]
-fn open_and_identify_scan_candidate_with_rescue(
-    source: SnapshotSource,
-    candidate: CandidateFile,
-    census: &mut ScanCensus,
-    now: Option<u64>,
-    days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
-    rescue: bool,
-    cache: Option<&sampled_scan::SharedCache>,
-) -> Option<(CandidateFile, File)> {
-    open_and_identify_scan_candidate_with_rescue_at(
-        source,
-        candidate,
-        census,
-        now,
-        days,
-        files,
-        None,
-        rescue,
-        sampled_scan::now_seconds(),
-        cache,
-    )
-}
 
 #[cfg(test)]
 fn candidate_from_traversal_path_at(
@@ -94490,7 +94482,16 @@ fn candidate_from_traversal_path_at(
     files: &BTreeMap<String, ScanIndexEntry>,
 ) -> Option<CandidateFile> {
     candidate_from_traversal_path_at_with_growth(
-        source, site, pending, census, now, days, files, None,
+        source,
+        site,
+        pending,
+        census,
+        CandidateWindow {
+            census_unix_seconds: now,
+            backfill_window_days: days,
+            files,
+            growth: None,
+        },
     )
 }
 

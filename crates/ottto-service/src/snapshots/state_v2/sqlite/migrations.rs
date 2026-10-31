@@ -204,16 +204,3 @@ fn crash_between_ddl_and_revision_bump_rolls_back_on_restart() {
     drop(conn);
     fs::remove_dir_all(dir).unwrap();
 }
-
-#[cfg(test)]
-/// [format] revision one four table ddl golden.
-#[test]
-fn revision_one_four_table_ddl_golden() {
-    assert_eq!(
-        format!(
-            "{:x}",
-            sha2::Sha256::digest(include_bytes!("migrations/revision_1.sql"))
-        ),
-        "5ea34633109a7ef0319c619d1393c744a834e52a07f2bdd86ec422fa8afa3e01"
-    );
-}

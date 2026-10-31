@@ -129,29 +129,17 @@ pub(in super::super) fn owner_for_test(key: &RowKey) -> (&'static str, String, V
     (o.table, o.kind, o.key, o.position)
 }
 
-thread_local! {
-    static NEXT_SAVE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static PART_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static COMMIT_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-pub(in super::super) fn seed_next_save_bytes_for_test(bytes: u64) {
-    NEXT_SAVE_BYTES.with(|v| v.set(bytes));
-}
-pub(super) fn next_save_bytes() -> u64 {
-    NEXT_SAVE_BYTES.with(|v| v.replace(0))
-}
-pub(in super::super) fn fail_commit_full_for_test() {
-    COMMIT_FULL.with(|v| v.set(true));
-}
-pub(super) fn commit_full() -> bool {
-    COMMIT_FULL.with(|v| v.replace(false))
-}
-
-pub(in super::super) fn fail_part_full_for_test() {
-    PART_FULL.with(|v| v.set(true));
-}
-pub(super) fn part_full() -> bool {
-    PART_FULL.with(|v| v.replace(false))
+/// Cap this connection at its current size: the next write that must grow the
+/// database fails with SQLite's own SQLITE_FULL. Reopening clears the cap.
+pub(in super::super) fn cap_pages(db: &Sqlite) {
+    let conn = db.conn().unwrap();
+    let pages: u64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    let capped: u64 = conn
+        .query_row(&format!("PRAGMA max_page_count={pages}"), [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(capped, pages);
 }
 
 /// Damage one checked physical value inside the caller's rollback transaction.
@@ -167,4 +155,7 @@ pub(in super::super) fn remove_value_chunk(tx: &Txn<'_>, header: &Header) {
 // The existing per-store maintenance policy owns synthetic resource admission.
 pub(in super::super) fn set_space_reader(db: &mut Sqlite, read: Option<fn(&Path) -> Option<u64>>) {
     db.purge_policy.space = read.unwrap_or(PurgePolicy::default().space);
+}
+pub(in super::super) fn set_save_ceiling(db: &mut Sqlite, bytes: u64) {
+    db.purge_policy.save_ceiling = bytes;
 }

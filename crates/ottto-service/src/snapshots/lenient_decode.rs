@@ -1248,19 +1248,9 @@ impl Decoder<std::io::Cursor<Vec<u8>>> {
 // Hash a typed v2 row view without buffering its potentially large members.
 // Raw slots use their immutable original bytes instead, through the Decoder.
 fn typed_record_hash(value: &impl Serialize) -> std::result::Result<[u8; 32], Error> {
-    struct HashWriter(Sha256);
-    impl std::io::Write for HashWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.update(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut writer = HashWriter(Sha256::new());
-    serde_json::to_writer(&mut writer, value).map_err(|_| Error::Refused("typed row view"))?;
-    Ok(writer.0.finalize().into())
+    super::serialized_json_digest(value, &[])
+        .map(|digest| digest.finalize().into())
+        .ok_or(Error::Refused("typed row view"))
 }
 
 /// Normalize an unpublished mapped graph with the v1 record codecs and the

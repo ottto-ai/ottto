@@ -1,5 +1,5 @@
-//! Table-agnostic F5–F7 fixtures. The fake mapper carries only generation;
-//! these tests make no condition-b/hydration parity claim.
+//! F5–F7 route fixtures over native stores: the shipped ClaudeMapper writes,
+//! loads and saves every graph; these tests make no hydration parity claim.
 use super::*;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,17 +16,37 @@ pub(in crate::snapshots) fn erase_published(path: &Path) {
 fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Option<ScanIndex>> {
     load_with_custody(path, switched, mapper, published(path)?)
 }
-fn save_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Result<bool> {
-    save_with_mode(path, index, mapper, false, None)
+fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
+    save_with_mode(path, index, false, None)
 }
-fn save_with_mode<M: Mapper>(
+fn save_with_mode(
     path: &Path,
     index: &mut ScanIndex,
-    mapper: &M,
     claim_only: bool,
     owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
 ) -> Result<bool> {
-    save_with_custody(path, index, mapper, claim_only, owner, published(path)?)
+    save_with_custody(path, index, claim_only, owner, published(path)?)
+}
+
+/// Generation of a freshly imported native fixture store.
+const G: u64 = 1;
+
+/// Apply a per-store seam to the live session store behind `index`; the
+/// failed save's reload reopens the store without it.
+pub(super) fn with_session_db(index: &ScanIndex, f: impl FnOnce(&mut sqlite::Sqlite)) {
+    let runtime = index.v2().persistence_v2.as_ref().unwrap();
+    let mut guard = runtime.session.lock().unwrap();
+    f(&mut guard.as_mut().unwrap().db);
+}
+/// Cap the session at its current pages and add enough new rows that the
+/// next save must grow the file: SQLite's own SQLITE_FULL, no fault knob.
+fn fill_session(index: &mut ScanIndex) {
+    with_session_db(index, |db| sqlite::cap_pages(db));
+    for n in 0..2048 {
+        index
+            .accepted_snapshot_fingerprints
+            .insert(format!("{n:064x}"));
+    }
 }
 
 struct Fixture {
@@ -56,17 +76,37 @@ impl Fixture {
             fence_generation: 0,
         }
     }
+    /// Native store: the shipped row mapper writes an empty graph at G.
     fn imported(&self) {
+        self.import(true);
+    }
+    fn import(&self, mapped: bool) {
         let mut db =
             sqlite::Sqlite::create_import(&fence::sibling(&self.path, ".v2.sqlite.import"))
                 .unwrap();
+        db.path_extractor(kinds::private_paths);
+        db.reference_extractor(kinds::references);
         db.control("identity", &self.identity()).unwrap();
         db.control("generation", &0_u64).unwrap();
+        let mut generation = 0;
+        if mapped {
+            let mut cx = KindCx::default();
+            cx.binding = Some(self.identity().binding);
+            let mut tx = db.begin(TxnMode::Write).unwrap();
+            kinds::populate(&ScanIndex::default(), &mut tx, &mut cx).unwrap();
+            assert_eq!(tx.commit(0, G), DurableCommitOutcome::Committed(G));
+            generation = G;
+        }
         db.finish_import().unwrap();
         // Synthetic fixture has no original ledger; seal that exact absence
         // before any publication boundary, as the production importer must.
-        super::super::ack::ProgressRecovery::seal_import(self.identity(), 0, &self.path, None)
-            .unwrap();
+        super::super::ack::ProgressRecovery::seal_import(
+            self.identity(),
+            generation,
+            &self.path,
+            None,
+        )
+        .unwrap();
     }
     fn published(&self) {
         self.imported();
@@ -153,7 +193,9 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     assert_eq!(fs::read(&f.path).unwrap(), before);
     let live = Fixture::new();
     live.published();
-    let index = load_with(&live.path, false, &EmptyMapper).unwrap().unwrap();
+    let index = load_with(&live.path, false, &ClaudeMapper)
+        .unwrap()
+        .unwrap();
     let runtime = index.v2().persistence_v2.as_ref().unwrap();
     assert!(runtime.session.lock().unwrap().is_some());
     let fence = fs::read(&live.path).unwrap();
@@ -162,52 +204,46 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     assert!(guard_external(&live.path, Some(runtime), index.generation).is_err());
     assert_eq!(fs::read(&live.path).unwrap(), fence);
 }
-struct EmptyMapper;
-impl Mapper for EmptyMapper {
+/// Stands in only for the R1 staging hook production does not install yet
+/// (conversion preflight). Inventory, rows, hydration and saves stay native.
+struct R1Installed;
+impl Mapper for R1Installed {
     fn references(
-        _: &Header,
-        _: &dyn Value,
-        _: &mut dyn FnMut(&RowKey) -> Result<()>,
+        header: &Header,
+        value: &dyn Value,
+        refs: &mut dyn FnMut(&RowKey) -> Result<()>,
     ) -> Result<()> {
-        Ok(())
+        ClaudeMapper::references(header, value, refs)
     }
     fn private_paths(
-        _: &Header,
-        _: &dyn Value,
-        _: &mut dyn FnMut(&str) -> Result<()>,
+        header: &Header,
+        value: &dyn Value,
+        paths: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<()> {
-        Ok(())
+        ClaudeMapper::private_paths(header, value, paths)
     }
-    fn inventory(&self, _: &Path) -> std::result::Result<(), Pause> {
-        Ok(())
+    fn inventory_context(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<Option<import::Original>, Pause> {
+        ClaudeMapper.inventory_context(path)
     }
     fn preflight(&self, _: &ScanIndex) -> std::result::Result<(), Pause> {
         Ok(())
     }
+    fn import_generation(&self, index: &ScanIndex) -> Result<u64> {
+        ClaudeMapper.import_generation(index)
+    }
     fn import_graph<S: Store>(
         &self,
-        _: &mut S,
-        _: &ScanIndex,
-        _: Option<&import::Original>,
+        store: &mut S,
+        index: &ScanIndex,
+        original: Option<&import::Original>,
     ) -> Result<KindCx> {
-        Ok(KindCx::default())
+        ClaudeMapper.import_graph(store, index, original)
     }
-    fn hydrate<S: Store>(&self, db: &mut S) -> Result<ScanIndex> {
-        let mut tx = db.begin(TxnMode::Read)?;
-        let h = tx.get(&RowKey::Meta("generation".into()))?.unwrap();
-        let mut packed = Vec::new();
-        tx.read_value(&h, &mut packed)?;
-        let json = packed;
-        Ok(ScanIndex {
-            generation: serde_json::from_slice(&json)?,
-            ..ScanIndex::default()
-        })
-    }
-    fn merge_cas<T: Transaction>(&self, _: &mut T, _: &mut ScanIndex) -> Result<()> {
-        Ok(())
-    }
-    fn delta<T: Transaction>(&self, _: &mut T, _: &ScanIndex) -> Result<()> {
-        Ok(())
+    fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
+        ClaudeMapper.hydrate_context(store)
     }
 }
 /// [format] f5 missing v1 garbled fences never authenticate final db.
@@ -228,13 +264,13 @@ fn f5_missing_v1_garbled_fences_never_authenticate_final_db() {
         let db = fence::sibling(&f.path, ".v2.sqlite");
         let before = fs::read(&db).unwrap();
         assert_eq!(
-            load_with(&f.path, false, &EmptyMapper)
+            load_with(&f.path, false, &ClaudeMapper)
                 .unwrap_err()
                 .downcast_ref::<Hold>(),
             Some(&Hold::FenceLost)
         );
         assert!(guard_containment_locked(&f.path).is_err());
-        assert!(save_with(&f.path, &mut ScanIndex::default(), &EmptyMapper).is_err());
+        assert!(save_with(&f.path, &mut ScanIndex::default()).is_err());
         assert_eq!(fs::read(db).unwrap(), before);
         assert!(!fence::sibling(&f.path, ".v2.sqlite.import").exists());
     }
@@ -273,44 +309,32 @@ fn f7_publication_failures_keep_latch_and_artifacts_and_restart_recovers() {
                 .unwrap();
             assert_eq!(pair.0, f.identity());
             assert!(pair.1.exists());
-            assert!(load_with(&f.path, false, &EmptyMapper).unwrap().is_some());
+            assert!(load_with(&f.path, false, &ClaudeMapper).unwrap().is_some());
             assert!(guard_containment_locked(&f.path).is_err());
         }
     }
 }
-/// [format] f7 off after publication and ambiguous commits cannot ack or fallback.
+/// [format] f7 off after publication saves through the one semantic save and
+/// published custody without semantic rows holds.
 #[test]
-fn f7_off_after_publication_and_ambiguous_commits_cannot_ack_or_fallback() {
+fn f7_off_after_publication_saves_natively_and_unmapped_custody_holds() {
     let f = Fixture::new();
     f.published();
-    let mut index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
-    assert!(save_with(&f.path, &mut index, &EmptyMapper).unwrap());
-    assert_eq!(index.generation, 1);
-    for outcome in [
-        DurableCommitOutcome::Published(2),
-        DurableCommitOutcome::Ambiguous,
-    ] {
-        let mut index = index.clone();
-        let mut reload = false;
-        assert!(apply_outcome(&mut index, &mut reload, outcome).is_err());
-        assert!(reload);
-    }
-    let mut reload = false;
-    assert!(apply_outcome(&mut index, &mut reload, DurableCommitOutcome::NotPublished).is_err());
-    assert!(!reload);
-    assert_eq!(index.generation, 1);
-    // EmptyMapper deliberately caches a graph without semantic custody rows.
-    // Use a fresh route so the production mapper must decode those missing rows.
+    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    assert!(save_with(&f.path, &mut index).unwrap());
+    assert_eq!(index.generation, G + 1);
+    // A fresh route must decode the missing semantic rows, never treat them as empty.
     let f = Fixture::new();
-    f.published();
-    assert!(load_locked(&f.path, None, published(&f.path).unwrap()).is_err()); // unmapped published custody holds
+    f.import(false);
+    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    assert!(load_locked(&f.path, None, published(&f.path).unwrap()).is_err());
 }
 /// [format] f6 explicit forget deletes all artifacts and invalidates stale clones.
 #[test]
 fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     let f = Fixture::new();
     f.published();
-    let index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    let index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
     let mut stale = index.clone();
     assert!(fence::sibling(&f.path, ".v2.sqlite.owner").exists());
     for suffix in [
@@ -357,8 +381,8 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     ] {
         assert!(!fence::sibling(&f.path, suffix).exists());
     }
-    assert!(save_with(&f.path, &mut stale, &EmptyMapper).is_err());
-    assert!(load_with(&f.path, false, &EmptyMapper).is_err());
+    assert!(save_with(&f.path, &mut stale).is_err());
+    assert!(load_with(&f.path, false, &ClaudeMapper).is_err());
 }
 /// [format] publication pending pause does not touch v1 and off cancels inventory slot.
 #[test]
@@ -371,11 +395,13 @@ fn publication_pending_pause_does_not_touch_v1_and_off_cancels_inventory_slot() 
     import_with(&f.path, &mut index, &ClaudeMapper).unwrap();
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
+    // With the conversion hook installed, only the OFF load cancels the slot.
     let f = Fixture::new();
     fs::write(&f.path, &bytes).unwrap();
-    assert!(load_with(&f.path, true, &EmptyMapper).unwrap().is_none());
-    assert!(load_with(&f.path, false, &EmptyMapper).unwrap().is_none());
-    import_with(&f.path, &mut index, &EmptyMapper).unwrap();
+    assert!(load_with(&f.path, true, &R1Installed).unwrap().is_none());
+    assert!(load_with(&f.path, false, &R1Installed).unwrap().is_none());
+    import_with(&f.path, &mut index, &R1Installed).unwrap();
+    assert!(index.v2().persistence_v2.is_none());
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
 }
 
@@ -407,7 +433,7 @@ fn damaged_and_oversized_fence_claims_hold_before_v1_containment() {
     ] {
         let f = Fixture::new();
         fs::write(&f.path, &bytes).unwrap();
-        assert!(load_with(&f.path, false, &EmptyMapper).is_err());
+        assert!(load_with(&f.path, false, &ClaudeMapper).is_err());
         assert!(guard_containment_locked(&f.path).is_err());
         assert_eq!(fs::read(&f.path).unwrap(), bytes);
     }
@@ -419,7 +445,7 @@ fn generation_and_capability_are_checked_before_external_effects() {
     for future_writer in [false, true] {
         let f = Fixture::new();
         f.published();
-        let index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+        let index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
         let check = crate::snapshots::state_v2_side_effect_guard(&f.path, &index);
         check().unwrap();
         {
@@ -435,7 +461,7 @@ fn generation_and_capability_are_checked_before_external_effects() {
             if future_writer {
                 sqlite::future_writer_for_test(&mut session.db);
             } else {
-                session.db.control("generation", &1_u64).unwrap();
+                session.db.control("generation", &(G + 1)).unwrap();
             }
         }
         assert!(check().is_err());
@@ -447,13 +473,13 @@ fn generation_and_capability_are_checked_before_external_effects() {
 fn another_graph_save_cannot_advance_a_stale_external_guard() {
     let f = Fixture::new();
     f.published();
-    let mut first = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
-    let second = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    let mut first = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    let second = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
     let stale = crate::snapshots::state_v2_side_effect_guard(&f.path, &second);
     stale().unwrap();
-    assert!(save_with(&f.path, &mut first, &EmptyMapper).unwrap());
-    assert_eq!(second.generation, 0);
-    assert_eq!(first.generation, 1);
+    assert!(save_with(&f.path, &mut first).unwrap());
+    assert_eq!(second.generation, G);
+    assert_eq!(first.generation, G + 1);
     assert!(stale().is_err());
     crate::snapshots::state_v2_side_effect_guard(&f.path, &first)().unwrap();
 }
@@ -465,10 +491,10 @@ fn route_replays_receipt_before_fresh_or_cached_graph_and_missing_receipt_holds(
         let f = Fixture::new();
         f.published();
         if cached {
-            load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+            load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
         }
         let recovery =
-            super::super::ack::ProgressRecovery::seal_import(f.identity(), 0, &f.path, None)
+            super::super::ack::ProgressRecovery::seal_import(f.identity(), G, &f.path, None)
                 .unwrap();
         let progress = f.path.with_file_name(format!(
             "{}-upload-progress.json",
@@ -480,10 +506,10 @@ fn route_replays_receipt_before_fresh_or_cached_graph_and_missing_receipt_holds(
         // Holds the same owner lock as the production load entry point; replay
         // must not recursively acquire it through the external side-effect guard.
         let _lock = super::super::super::CheckpointLock::acquire(&f.path).unwrap();
-        assert!(load_with(&f.path, false, &EmptyMapper).unwrap().is_some());
+        assert!(load_with(&f.path, false, &ClaudeMapper).unwrap().is_some());
         assert_eq!(fs::read(&progress).unwrap(), next);
         fs::remove_file(fence::sibling(&f.path, ".v2-ack-receipt")).unwrap();
-        assert!(load_with(&f.path, false, &EmptyMapper).is_err());
+        assert!(load_with(&f.path, false, &ClaudeMapper).is_err());
         assert_eq!(fs::read(&progress).unwrap(), next);
         assert!(guard_containment_locked(&f.path).is_err());
     }
@@ -493,19 +519,7 @@ fn route_replays_receipt_before_fresh_or_cached_graph_and_missing_receipt_holds(
 #[test]
 fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
     let f = Fixture::new();
-    let mut db =
-        sqlite::Sqlite::create_import(&fence::sibling(&f.path, ".v2.sqlite.import")).unwrap();
-    db.path_extractor(kinds::private_paths);
-    db.reference_extractor(kinds::references);
-    db.control("identity", &f.identity()).unwrap();
-    let mut cx = KindCx::default();
-    cx.binding = Some(f.identity().binding);
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    kinds::populate(&ScanIndex::default(), &mut tx, &mut cx).unwrap();
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    db.finish_import().unwrap();
-    super::super::ack::ProgressRecovery::seal_import(f.identity(), 1, &f.path, None).unwrap();
-    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    f.published();
     let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
     index.upload_context_fingerprint = Some("synthetic-policy".into());
     index.active_upload_context_fingerprint = Some("active-synthetic-policy".into());
@@ -518,7 +532,7 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         published(&f.path).unwrap()
     )
     .unwrap());
-    assert_eq!(index.generation, 2);
+    assert_eq!(index.generation, G + 1);
     assert_eq!(
         index.active_upload_context_fingerprint.as_deref(),
         Some("active-synthetic-policy")
@@ -537,31 +551,33 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
 fn newly_adopted_import_can_save_without_an_intervening_load() {
     let f = Fixture::new();
     fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
-    // Use the real inventory/publication path so import seals the external
-    // progress receipt. EmptyMapper only stands in for semantic row mapping.
+    // Use the real inventory/import/publication path so import seals the
+    // external progress receipt; R1Installed only passes conversion preflight.
     assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
     let mut index = ScanIndex::default();
-    import_with(&f.path, &mut index, &EmptyMapper).unwrap();
+    import_with(&f.path, &mut index, &R1Installed).unwrap();
     assert!(index.v2().persistence_v2.is_some());
     assert!(fence::sibling(&f.path, ".v2-ack-receipt").is_file());
-    let runtime = index.v2().persistence_v2.clone().unwrap();
-    assert!(save_with(&f.path, &mut index, &EmptyMapper).unwrap());
     assert_eq!(index.generation, 1);
+    let runtime = index.v2().persistence_v2.clone().unwrap();
+    assert!(save_with(&f.path, &mut index).unwrap());
+    assert_eq!(index.generation, 2);
     assert!(Arc::ptr_eq(
         &runtime,
         index.v2().persistence_v2.as_ref().unwrap()
     ));
 }
 
-/// [format] import without original inventory refuses publication.
+/// [format] import without original inventory refuses publication, even with
+/// the conversion hook installed.
 #[test]
 fn import_without_original_inventory_refuses_publication() {
     let f = Fixture::new();
     let bytes = b"synthetic-v1-authority";
     fs::write(&f.path, bytes).unwrap();
-    assert!(load_with(&f.path, true, &EmptyMapper).unwrap().is_none());
+    assert!(load_with(&f.path, true, &R1Installed).unwrap().is_none());
     let mut index = ScanIndex::default();
-    import_with(&f.path, &mut index, &EmptyMapper).unwrap();
+    import_with(&f.path, &mut index, &R1Installed).unwrap();
     assert!(index.v2().persistence_v2.is_none());
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     for (suffix, _, _) in fence::ARTIFACTS
@@ -574,8 +590,7 @@ fn import_without_original_inventory_refuses_publication() {
     assert!(!fence::sibling(&f.path, ".v2-ack-receipt").exists());
 }
 
-// Real mapper coverage for the raw decoder/load route (the fixtures above use
-// EmptyMapper only to isolate publication and recovery).
+// Real mapper coverage for the raw decoder/load route.
 mod hydrate_parity {
     use super::*;
     use crate::snapshots as s;
@@ -714,9 +729,9 @@ mod hydrate_parity {
             let mut guard = runtime.session.lock().unwrap();
             let session = guard.as_mut().unwrap();
             let mut tx = session.db.begin(TxnMode::Read).unwrap();
-            import::ClaudeMapper
-                .merge_cas(&mut tx, &mut working)
-                .unwrap();
+            let generation = working.generation;
+            kinds_misc::merge_cas_at(&mut tx, &mut working, generation).unwrap();
+            kinds_files::merge_growth_cas(&mut tx, &mut working).unwrap();
             assert!(working.decode_holds.same_as(&actual.decode_holds));
             assert_eq!(
                 working.decode_holds.v2_provenance(),
@@ -1044,10 +1059,10 @@ mod hydrate_parity {
 fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
     let f = Fixture::new();
     f.published();
-    let mut index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
     assert_eq!(collection_page_limit(&index, 250), 250);
-    sqlite::seed_next_save_bytes_for_test(256 * 1024 * 1024);
-    let error = save_with(&f.path, &mut index, &EmptyMapper).unwrap_err();
+    with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
     assert_eq!(collection_page_limit(&index, 250), 125);
     assert!(guard_external(
@@ -1056,8 +1071,8 @@ fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
         index.generation
     )
     .is_err());
-    let mut retry = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
-    assert_eq!(retry.generation, 0);
+    let mut retry = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    assert_eq!(retry.generation, G);
     // Reopen cannot clear a failed-save upload fence.
     assert!(guard_external(
         &f.path,
@@ -1069,8 +1084,8 @@ fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
         .unwrap()
         .unwrap();
     recovery().unwrap();
-    assert!(save_with(&f.path, &mut retry, &EmptyMapper).unwrap());
-    assert_eq!(retry.generation, 1);
+    assert!(save_with(&f.path, &mut retry).unwrap());
+    assert_eq!(retry.generation, G + 1);
     assert_eq!(collection_page_limit(&retry, 250), 150);
     guard_external(
         &f.path,
@@ -1079,7 +1094,7 @@ fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
     )
     .unwrap();
     for expected in [175, 200, 225, 250, 250] {
-        save_with(&f.path, &mut retry, &EmptyMapper).unwrap();
+        save_with(&f.path, &mut retry).unwrap();
         assert_eq!(collection_page_limit(&retry, 250), expected);
     }
 }
@@ -1089,13 +1104,13 @@ fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
 fn page_one_oversize_holds_and_fences_upload_ack_and_publication() {
     let f = Fixture::new();
     f.published();
-    let mut index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
     assert_eq!(collection_page_limit(&index, 1), 1);
-    sqlite::seed_next_save_bytes_for_test(256 * 1024 * 1024);
-    let error = save_with(&f.path, &mut index, &EmptyMapper).unwrap_err();
+    with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveOversize));
-    let current = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
-    assert_eq!(current.generation, 0);
+    let current = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    assert_eq!(current.generation, G);
     assert_eq!(collection_page_limit(&current, 1), 1);
     // This is the production external boundary used before uploads and ACKs.
     let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &current);
@@ -1114,18 +1129,18 @@ fn page_one_oversize_holds_and_fences_upload_ack_and_publication() {
 fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
     let f = Fixture::new();
     f.published();
-    let mut index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
-    sqlite::fail_commit_full_for_test();
-    let error = save_with(&f.path, &mut index, &EmptyMapper).unwrap_err();
+    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    fill_session(&mut index);
+    let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveFull));
-    let mut retry = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
-    assert_eq!(retry.generation, 0);
+    let mut retry = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    assert_eq!(retry.generation, G);
     let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &retry);
     assert_eq!(
         guard().unwrap_err().downcast_ref::<Hold>(),
         Some(&Hold::SaveFull)
     );
-    assert!(save_with_mode(&f.path, &mut retry, &EmptyMapper, true, None).unwrap());
+    assert!(save_with_mode(&f.path, &mut retry, true, None).unwrap());
     assert_eq!(
         guard_external(
             &f.path,
@@ -1140,7 +1155,7 @@ fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
         .unwrap()
         .unwrap();
     recovery().unwrap();
-    assert!(save_with(&f.path, &mut retry, &EmptyMapper).unwrap());
+    assert!(save_with(&f.path, &mut retry).unwrap());
     guard_external(
         &f.path,
         retry.v2().persistence_v2.as_ref(),
@@ -1154,7 +1169,7 @@ fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
 fn unpublished_import_does_not_reorder_v1_progress_admission() {
     let f = Fixture::new();
     fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
-    assert!(load_with(&f.path, true, &EmptyMapper).unwrap().is_none());
+    assert!(load_with(&f.path, true, &ClaudeMapper).unwrap().is_none());
     assert!(states().lock().unwrap().contains_key(&f.path));
     assert!(!published(&f.path).unwrap());
     f.published();
@@ -1191,7 +1206,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let committed_generation = current.generation;
     let committed_context = current.upload_context_fingerprint.clone();
     current.upload_context_fingerprint = Some("uncommitted-context".into());
-    sqlite::fail_commit_full_for_test();
+    fill_session(&mut current);
     assert!(save_locked(
         &f.path,
         &mut current,
@@ -1253,16 +1268,16 @@ fn resume_exclusion_survives_reload_and_skips_transcript_before_parse() {
         let transcript = roots.join(format!("{root_id}.jsonl"));
         fs::write(&transcript, b"invalid json\n").unwrap();
         let key = super::super::super::local_index_key(&transcript);
-        let _index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+        let _index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
         with_state(&f.path, |state| {
             state
                 .resume_excluded
-                .insert(key.clone(), ResumeExclusion::new(0, 0));
+                .insert(key.clone(), ResumeExclusion::new(G, 0));
             state.cached = None;
             Ok(())
         })
         .unwrap();
-        let mut index = load_with(&f.path, false, &EmptyMapper).unwrap().unwrap();
+        let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
         if forced_family {
             assert!(super::super::super::claude_index_path_family_member(&transcript).is_some());
             index.claude_usage_authority_quarantine.insert(
@@ -1293,6 +1308,32 @@ fn resume_exclusion_survives_reload_and_skips_transcript_before_parse() {
         assert_eq!(scan.malformed_json_line_count, 0);
         assert!(!index.files.contains_key(&key));
     }
+}
+
+/// [regress] N3: a failure while retaining R1 exclusions holds the route for
+/// the collection guard, never selecting through an empty continuation.
+#[test]
+fn resume_exclusion_failure_is_a_collection_hold() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    super::before_collection(&index).unwrap();
+    // A holder panicked: this route's state is poisoned.
+    let _ = std::panic::catch_unwind(|| {
+        with_state(&f.path, |_| -> Result<()> {
+            panic!("synthetic route-state panic")
+        })
+    });
+    retain_resume_exclusions(&mut index, &[]);
+    // A fresh route slot isolates the hold to the retained-exclusion failure.
+    states().lock().unwrap().remove(&f.path);
+    assert_eq!(
+        super::before_collection(&index)
+            .unwrap_err()
+            .downcast_ref::<Hold>(),
+        Some(&Hold::DbUnavailable)
+    );
+    assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &index)().is_err());
 }
 
 /// [regress] R1 backoff keeps aged keys and owed debt discoverable, counts growth,
@@ -1385,6 +1426,21 @@ fn excluded_key_age_growth_alarm_and_retry_keep_owed_debt() {
         index.accepted_rebuild_incidence[&key],
         BTreeSet::from(["owed".into()])
     );
+}
+
+/// [regress] N2: after the 3-pass / 6 h alarm, a deterministically failing
+/// staging key retries at the growth-full pace instead of every minute.
+#[test]
+fn alarmed_resume_exclusion_backs_off_to_growth_full_interval() {
+    let now = Instant::now();
+    let growth_full = Duration::from_secs(super::super::super::sampled_audit::GROWTH_FULL_INTERVAL);
+    let mut excluded = ResumeExclusion::new(G, 0);
+    assert_eq!(excluded.backoff(now), Duration::from_secs(60));
+    excluded.passes = 3;
+    assert_eq!(excluded.backoff(now), growth_full);
+    let mut aged = ResumeExclusion::new(G, 0);
+    aged.first_seen = now - Duration::from_secs(6 * 3600 + 1);
+    assert_eq!(aged.backoff(now), growth_full);
 }
 
 /// [off=main] a bound v1-only source never opens, creates or migrates SQLite custody.

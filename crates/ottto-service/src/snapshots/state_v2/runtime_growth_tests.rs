@@ -440,7 +440,7 @@ fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     let f = Fixture::new();
     let mut index = f.load();
     assert_eq!(collection_page_limit(&index, 250), 250);
-    sqlite::seed_next_save_bytes_for_test(256 * 1024 * 1024);
+    super::tests::with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
     assert!(index.save(&f.path).is_err());
     let mut index = f.load();
     assert_eq!(collection_page_limit(&index, 250), 125);
@@ -455,7 +455,7 @@ fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     })
     .unwrap();
     assert!(save_read_admitted(&index, &f.key, NOW).unwrap());
-    sqlite::seed_next_save_bytes_for_test(256 * 1024 * 1024);
+    super::tests::with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
     assert!(index.save(&f.path).is_err());
     let mut index = f.load();
     assert!(save_oversize_active(&index).unwrap());

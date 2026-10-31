@@ -3305,11 +3305,7 @@ fn revalidate_retirement_growth(index: &mut ScanIndex, census: &ClaudeRequestCen
         .filter(|(key, record)| {
             transcript_retirement_age(&index.files, cutoff, key, record).is_some()
                 && !super::sampled_audit::growth_retirement_excluded(index, key)
-                && !index
-                    .v2()
-                    .growth_retention
-                    .get(*key)
-                    .is_some_and(|growth| growth.checked_generation == Some(index.generation))
+                && !super::sampled_audit::growth_checked(index, key)
         })
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();

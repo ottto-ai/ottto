@@ -376,10 +376,12 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
             SnapshotSource::ClaudeCode,
             candidate.clone(),
             &mut ScanCensus::default(),
-            None,
-            183,
-            &index.files,
-            None,
+            CandidateWindow {
+                census_unix_seconds: None,
+                backfill_window_days: 183,
+                files: &index.files,
+                growth: None,
+            },
             true,
             now,
             None
@@ -402,10 +404,12 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
         SnapshotSource::ClaudeCode,
         candidate,
         &mut ScanCensus::default(),
-        None,
-        183,
-        &index.files,
-        None,
+        CandidateWindow {
+            census_unix_seconds: None,
+            backfill_window_days: 183,
+            files: &index.files,
+            growth: None,
+        },
         true,
         now,
         None

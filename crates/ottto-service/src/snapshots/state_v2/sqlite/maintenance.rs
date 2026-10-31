@@ -8,6 +8,8 @@ pub(in super::super) struct PurgePolicy {
     pub(in super::super) deadline: Duration,
     pub(in super::super) work: Duration,
     pub(super) space: fn(&Path) -> Option<u64>,
+    /// Hard charged-work ceiling for one save.
+    pub(super) save_ceiling: u64,
 }
 impl Default for PurgePolicy {
     fn default() -> Self {
@@ -15,6 +17,7 @@ impl Default for PurgePolicy {
             deadline: Duration::from_secs(24 * 60 * 60),
             work: Duration::from_secs(2),
             space: free_space,
+            save_ceiling: SAVE_CEILING_BYTES,
         }
     }
 }
