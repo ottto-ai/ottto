@@ -294,28 +294,28 @@ pub(crate) enum WithheldEvent {
 }
 /// Recorded after the decision; never a gate input.
 pub(crate) fn withheld_event(event: WithheldEvent, amount: u64) {
-    line_unselected("claude_code", event as usize, |slot| {
+    source_count("claude_code", event as usize, |slot| {
         slot.fetch_add(amount, Relaxed)
     });
 }
 fn drain(source: &str, slots: &[(&'static str, usize)]) -> BTreeMap<&'static str, u64> {
     slots
         .iter()
-        .map(|&(key, slot)| (key, line_unselected(source, slot, |n| n.swap(0, Relaxed))))
+        .map(|&(key, slot)| (key, source_count(source, slot, |n| n.swap(0, Relaxed))))
         .filter(|(_, count)| *count > 0)
         .collect()
 }
 pub(crate) fn audit_retired_absent(source: &str) {
-    line_unselected(source, 12, |slot| slot.fetch_add(1, Relaxed));
+    source_count(source, 12, |slot| slot.fetch_add(1, Relaxed));
 }
 /// One aged gate retained a grown indexed file (not a unique-file count).
 pub(crate) fn discovery_retained_grown(source: &str) {
-    line_unselected(source, 10, |slot| slot.fetch_add(1, Relaxed));
+    source_count(source, 10, |slot| slot.fetch_add(1, Relaxed));
 }
 /// Actual aged, unchanged fragment-only Tail completions; bytes exclude samples.
 pub(crate) fn codex_fragment_tail_repeat(bytes: u64) {
-    line_unselected("codex", 13, |slot| slot.fetch_add(1, Relaxed));
-    line_unselected("codex", 14, |slot| slot.fetch_add(bytes, Relaxed));
+    source_count("codex", 13, |slot| slot.fetch_add(1, Relaxed));
+    source_count("codex", 14, |slot| slot.fetch_add(bytes, Relaxed));
 }
 /// Post-save fate and current estimated age of this page's observed growth.
 pub(crate) fn discovery_growth_fate(
