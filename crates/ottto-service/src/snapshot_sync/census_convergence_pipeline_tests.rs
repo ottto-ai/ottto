@@ -1869,12 +1869,74 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
             !terminal.scan.census_complete,
             "the held family owes a clean follow-up"
         );
-        // The bound authority evidence and witness are retained exactly.
+        // The bound authority evidence and witness are retained exactly at
+        // the walk's end. `traversal` runs PIPELINE_MAX_PAGES pages because
+        // the census never completes, so `last` is the first page of the
+        // clean follow-up walk: it re-reads the unanchored root before that
+        // walk reaches the subagents, and during a replay reset the record
+        // binds only the family members read so far (snapshots.rs:10137).
+        let terminal_at = pages
+            .iter()
+            .position(|page| !page.index.scan_traversal_in_progress_for_test())
+            .expect("the walk's terminal page");
+        let pages_diag = pages
+            .iter()
+            .enumerate()
+            .map(|(number, page)| {
+                format!(
+                    "p{number}:in_progress={} held={} unsettled={} members={}",
+                    page.index.scan_traversal_in_progress_for_test(),
+                    page.held.len(),
+                    page.index.bounded_sweep_had_unsettled_upload(),
+                    page.index
+                        .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+                        .map_or(0, |members| members.len()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
         assert_eq!(
-            last.index
+            terminal
+                .index
                 .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT),
-            Some(bound_before)
+            Some(bound_before.clone()),
+            "the walk's terminal page keeps the exact bound family; {pages_diag}"
         );
+        assert_eq!(
+            terminal
+                .index
+                .claude_usage_family_witness_digest_for_test(TERMINAL_FAMILY_ROOT),
+            Some(witness_before.clone())
+        );
+        // After the walk, every member is either bound at its exact revision
+        // or still blocked by the replay-reset hold: no index entry, an
+        // unsettled sweep, and no census to prune it.
+        assert!(terminal_at < pages.len() - 1, "{pages_diag}");
+        let last_members = last
+            .index
+            .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+            .expect("terminal quarantine retained");
+        assert_eq!(
+            last_members.get(TERMINAL_FAMILY_ROOT),
+            bound_before.get(TERMINAL_FAMILY_ROOT)
+        );
+        for (member, revision) in &bound_before {
+            match last_members.get(member) {
+                Some(bound) => assert_eq!(bound, revision, "{pages_diag}"),
+                None => {
+                    let agent = member
+                        .rsplit_once("_agent-")
+                        .map(|(_, agent)| agent)
+                        .expect("an unbound member is a subagent");
+                    assert_eq!(PipelineFixture::subagent_key(&last.index, agent), None);
+                    assert!(
+                        last.index.bounded_sweep_had_unsettled_upload(),
+                        "{pages_diag}"
+                    );
+                    assert!(!last.scan.census_complete);
+                }
+            }
+        }
         assert_eq!(
             last.index
                 .claude_usage_family_witness_digest_for_test(TERMINAL_FAMILY_ROOT),
