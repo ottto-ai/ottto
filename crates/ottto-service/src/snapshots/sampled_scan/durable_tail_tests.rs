@@ -12408,14 +12408,19 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
             vec![PendingRecord {
                 acquisition: (source == SnapshotSource::Pi).then_some(store::AcquisitionFields {
                     acquired_revision: 1,
-                    protocol: AcquisitionProtocol::WriteAhead,
+                    protocol: AcquisitionProtocol::Legacy,
                 }),
                 binding: Binding {
                     source: ds,
                     key,
                     context: [1; 32],
                     scope: [2; 32],
-                    entry: [3; 32],
+                    // A v3 record with acquisition fields carries no v1 entry digest.
+                    entry: if source == SnapshotSource::Pi {
+                        [0; 32]
+                    } else {
+                        [3; 32]
+                    },
                 },
                 certificate: certificate(&path, &scope),
                 body,
