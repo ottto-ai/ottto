@@ -1,0 +1,3 @@
+[env]
+# Test threads use the same stack as the production scan worker (SNAPSHOT_SYNC_WORKER_STACK_BYTES).
+RUST_MIN_STACK = "8388608"

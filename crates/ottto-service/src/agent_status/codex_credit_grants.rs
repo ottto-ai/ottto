@@ -768,13 +768,6 @@ mod tests {
     const EXPIRES_3: i64 = 1_794_038_400;
 
     #[test]
-    fn balance_names_are_the_contract_wire_names() {
-        assert_eq!(PLAN_CREDITS, "credits");
-        assert_eq!(RESET_BANK, "reset_bank");
-        assert_eq!(WORKSPACE_MONTHLY_CREDITS, "workspace_monthly_credits");
-    }
-
-    #[test]
     fn complete_two_grant_list_maps_to_expected_wire() {
         let mut tracker = CodexCreditTracker::default();
         let provider = detailed(

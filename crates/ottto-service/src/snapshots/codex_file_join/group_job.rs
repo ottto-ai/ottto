@@ -417,7 +417,7 @@ impl GroupBoot {
                 backfill_window_days: 0,
                 // The entry's stored ctime lets a ctime-only change keep the
                 // stored fingerprint (fresh samples hashed, no re-read).
-                files: &index.files,
+                retention: discovery_retention!(index),
                 growth: None,
             },
             false,

@@ -1,9 +1,9 @@
 //! Native custody fixtures. Execution belongs to CI; no production save bypass.
 use super::*;
 use crate::snapshots::{
-    candidate_from_traversal_path_with_growth, local_index_key,
-    open_and_identify_scan_candidate_at, sampled_audit, sampled_scan, CandidateFile, ScanCensus,
-    ScanTraversalPath, SnapshotSource, LOCAL_SCAN_INDEX_IDENTITY_VERSION,
+    candidate_from_traversal_path, local_index_key, open_and_identify_scan_candidate_at,
+    sampled_audit, sampled_scan, CandidateFile, ScanCensus, ScanTraversalPath, SnapshotSource,
+    LOCAL_SCAN_INDEX_IDENTITY_VERSION,
 };
 use crate::transcript_acquisition::{FullReason, ReadMode};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,24 +87,26 @@ impl Fixture {
             census_member: true,
             watcher_hint: false,
         };
-        let candidate = candidate_from_traversal_path_with_growth(
+        let candidate = candidate_from_traversal_path(
             SnapshotSource::ClaudeCode,
             pending,
             &mut census,
             None,
             30,
-            &index.files,
-            Some(&index.v2().growth_retention),
+            // v2 growth follows the index (production derivation).
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
         )
         .unwrap();
         open_and_identify_scan_candidate_at(
             SnapshotSource::ClaudeCode,
             candidate,
             &mut census,
-            None,
-            30,
-            &index.files,
-            Some(&index.v2().growth_retention),
+            crate::snapshots::CandidateWindow {
+                census_unix_seconds: None,
+                backfill_window_days: 30,
+                retention: crate::snapshots::DiscoveryRetention::unverified(&index.files),
+                growth: Some(&index.v2().growth_retention),
+            },
             sampled_scan::now_seconds(),
         )
         .unwrap()

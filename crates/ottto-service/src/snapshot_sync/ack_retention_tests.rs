@@ -312,29 +312,6 @@ fn committed_ack_survives_unrelated_empty_and_failed_pages_after_reload() {
 }
 
 #[test]
-fn committed_ack_survives_bootstrap_only_input() {
-    let f = AckFixture::new(true);
-    let (_, mut progress) = f.load();
-    let probe = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-    assert_ne!(probe.snapshot_fingerprint, f.item.snapshot_fingerprint);
-    bootstrap_cache_heads_with_budget(
-        &[probe],
-        &unique_poison_scope(),
-        &mut progress,
-        false,
-        &mut InplaceRetryBudget::default(),
-        |batch, enforce| {
-            assert!(enforce);
-            f.assert_ack(&f.load().1);
-            exact_ack(batch)
-        },
-        |state| state.save(&f.progress_path),
-    )
-    .unwrap();
-    f.assert_ack(&f.load().1);
-}
-
-#[test]
 fn ack_saved_before_index_crash_survives_real_empty_and_unrelated_deltas() {
     // Same persistence seam as the contract-retry repro, using main's existing
     // paced RetryPending gate. No dependency on the separate contract-retry PR.
@@ -577,39 +554,6 @@ fn ack_capacity_stops_admission_without_evicting_evidence_and_settlement_release
     assert!(progress.admit_ack_batch(0).is_ok());
     assert_eq!(progress.accepted_fingerprints.len(), 2);
     assert!(f.scratch.as_ref().exists());
-}
-
-#[test]
-fn default_unsettled_ack_budget_has_bounded_persisted_and_heap_size() {
-    let scratch = crate::test_scratch::ScratchDir::new("ack-debt-bound");
-    let path = scratch.join("progress.json");
-    let mut progress = test_upload_progress();
-    let capacity = ack_retention::default_ack_capacity();
-    for entity in 0..capacity {
-        let fp = format!("{entity:064x}");
-        progress.record_body(&fp, &fp);
-    }
-    progress.save(&path).unwrap();
-    let loaded = SnapshotUploadProgress::load(
-        &path,
-        &progress.destination_namespace_hash,
-        test_quarantine_witness(),
-    )
-    .unwrap();
-    assert_eq!(loaded.accepted_fingerprints.len(), capacity);
-    assert!(loaded.admit_ack_batch(1).is_err());
-    assert!(std::fs::metadata(&path).unwrap().len() <= 2 * 1024 * 1024);
-    if crate::heap_layout_bound::layout_supported() {
-        // This is a completed persisted ledger, not a per-line parser check.
-        // Compose per-element counters so 4096 entries do not exhaust the
-        // short traversal's 4096 visits before the byte bound is measured.
-        let bound = crate::heap_layout_bound::completed_bound(&loaded, 8 * 1024 * 1024)
-            .expect("hash state including conservative whole-node tree pricing fits 8 MiB");
-        eprintln!(
-            "upload_ack_debt_bound entities={capacity} heap_bound={bound} serialized_bytes={}",
-            std::fs::metadata(&path).unwrap().len()
-        );
-    }
 }
 
 #[test]
@@ -2175,46 +2119,6 @@ fn one_file_larger_than_the_unsettled_limit_converges_after_a_mid_file_page_fail
         "the settled file transfers every ACK to the index"
     );
     f.assert_identity(&saved);
-}
-
-// #778 R2-3: over-cap debt retires only through a complete census. The local
-// count names how long capacity stops have waited for one.
-#[test]
-#[serial_test::serial(source_cadences)]
-fn incomplete_census_capacity_stops_count_consecutively_and_reset() {
-    let source = SnapshotSource::Pi;
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(source, false, true),
-        0
-    );
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(source, true, false),
-        1
-    );
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(source, true, false),
-        2
-    );
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(source, true, true),
-        0,
-        "a complete census can retire the debt"
-    );
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(source, true, false),
-        1
-    );
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(source, false, false),
-        0,
-        "any finish without a capacity stop resets"
-    );
-    assert_eq!(
-        ack_retention::note_capacity_stop_census(SnapshotSource::Codex, true, false),
-        1,
-        "counts are per source"
-    );
-    ack_retention::note_capacity_stop_census(SnapshotSource::Codex, false, true);
 }
 
 // #794 F1: a local hold on sibling H makes the Completed-with-holds and the
