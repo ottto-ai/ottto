@@ -4533,12 +4533,27 @@ mod terminal_off_admission_tests {
                 .admission
                 .as_ref()
                 .unwrap();
+            // R7 (Lead B, 2026-10-31): resume never re-arms the witness-bound
+            // `roots[0]`, so each 128-root batch ends one root later than main
+            // and the last batch ends at the last root.
             let covered = ((batch + 1) * 128).min(385);
             assert_eq!(
                 state.after_root.as_deref(),
-                Some(fixture.roots[covered - 1].as_str())
+                Some(fixture.roots[covered.min(384)].as_str())
             );
             assert!(state.progressed);
+            // The skipped family's debt stays owed: pending, RetryPending, with
+            // its retry deadline still set.
+            let held = &fixture.index.claude_usage_authority_quarantine[&fixture.roots[0]];
+            assert_eq!(
+                held.disposition,
+                ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+            );
+            assert_ne!(held.retry_after_unix_seconds, 0, "retry deadline kept");
+            assert!(fixture
+                .index
+                .claude_usage_family_pending
+                .contains_key(&fixture.roots[0]));
             assert_eq!(
                 fixture.index.traversal.as_ref().unwrap().census_window_end,
                 window
