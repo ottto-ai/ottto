@@ -56264,6 +56264,96 @@ mod tests {
     }
 
     #[test]
+    fn legacy_codex_config_presence_forces_one_corrective_snapshot() {
+        let home = temp_dir("legacy-config-cutover");
+        let codex_dir = home.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions");
+        // The current parser extracts no selector from this valid config. Its
+        // mere presence still cannot prove what the old stat-only index saw.
+        fs::write(
+            codex_dir.join("config.toml"),
+            "personality = \"pragmatic\"\n",
+        )
+        .expect("write config");
+        let path = sessions_dir.join("rollout-019e253c-6666-7000-9000-aaaaaaaaaaaa.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-aaaaaaaaaaaa\"}}\n",
+                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write transcript");
+        let file_metadata = fs::metadata(&path).expect("metadata");
+        let modified_unix_seconds = file_metadata
+            .modified()
+            .ok()
+            .and_then(unix_seconds)
+            .expect("mtime seconds");
+        let legacy_metadata =
+            CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
+        assert!(legacy_metadata.legacy_config_file_present);
+        let legacy_file_fingerprint = source_file_fingerprint_with_context(
+            &path,
+            file_metadata.len(),
+            modified_unix_seconds,
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            &legacy_metadata.legacy_sidecar_fingerprint,
+        );
+        let mut index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&path),
+                ScanIndexEntry {
+                    codex_fragment: None,
+                    size_bytes: file_metadata.len(),
+                    modified_unix_seconds,
+                    modified_unix_nanos: None,
+                    source_file_fingerprint: legacy_file_fingerprint,
+                    last_snapshot_fingerprint: Some("legacy-snapshot".to_string()),
+                    last_upload_body_witness: None,
+                    effective_upload_body_witness_revision: 0,
+                    scan_identity_version: None,
+                    codex_joined_member_set: None,
+                    codex_captured_joined_member_set: None,
+                    codex_protected_owner: None,
+                    codex_applied_tier_receipt: None,
+                    codex_applied_tier_receipt_required: false,
+                    codex_captured_tier_receipt: None,
+                    codex_captured_tier_receipt_required: false,
+                    codex_captured_uncommitted: false,
+                    codex_counting_v2: false,
+                    codex_counting_owner: None,
+                    opened_changed_nanos: 0,
+                    opened_birth_nanos: 0,
+                    upload_context_receipt: None,
+                },
+            )]),
+            ..ScanIndex::default()
+        };
+
+        let scan = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions_dir),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan");
+        assert_eq!(scan.snapshots.len(), 1);
+        assert!(scan.snapshots[0].model_usage[0].selector_context.is_empty());
+        assert_eq!(
+            index
+                .files
+                .get(&local_index_key(&path))
+                .and_then(|entry| entry.scan_identity_version.as_deref()),
+            Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn nanosecond_mtime_change_forces_parse_inside_same_second() {
         let path = PathBuf::from("/redacted/session.jsonl");
         let candidate = CandidateFile {
