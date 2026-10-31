@@ -82476,9 +82476,15 @@ mod tests {
         // missing prior files behind. Rebuild the next subset before saving it.
         let retry = scanned.committable_subset_with_local_holds(
             &committable,
-            &BTreeSet::from(["bb".to_string(), "cc".to_string()]),
+            &BTreeSet::from(["bb".to_string()]),
             &BTreeMap::new(),
-            &BTreeSet::from(["pending.jsonl".to_string()]),
+            &BTreeSet::from(["cc".to_string()]),
+        );
+        assert_eq!(
+            retry.files["pending.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("old")
         );
         let accepted_retry = scanned.committable_subset(
             &retry,
