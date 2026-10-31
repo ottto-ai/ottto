@@ -85,7 +85,7 @@ impl ClaudeAccountFamilyPending {
     }
 
     pub(super) fn history_summary(&self) -> HistorySummary {
-        HistorySummary::fold(&self.previous_windows)
+        HistorySummary::from_windows(&self.previous_windows)
     }
 
     pub(super) fn retain_previous_window(&mut self, old: ClaudeAccountFamilyPendingWindow) {
@@ -97,8 +97,8 @@ impl ClaudeAccountFamilyPending {
     }
 
     fn apply_checked_plan(&mut self, retained: Vec<usize>) -> Option<usize> {
-        if HistorySummary::fold(&self.previous_windows)
-            != HistorySummary::fold(retained.iter().map(|&i| &self.previous_windows[i]))
+        if HistorySummary::from_windows(&self.previous_windows)
+            != HistorySummary::from_windows(retained.iter().map(|&i| &self.previous_windows[i]))
         {
             return None;
         }
@@ -181,58 +181,62 @@ fn retain_run_endpoint(
     windows.push(old);
 }
 
-/// Per-root decision summary of the archived windows: whether any exist, the
-/// newest boundary, whether any boundary is unparsable, and each member's
-/// winning boundary/account/invalid/revision (first wins on ties). Retirement
-/// reads it with the current window; the load self-check compares it alone.
+/// Per-root decision summary of the archived windows: the newest boundary,
+/// whether any boundary is unparsable, and each member's winning
+/// boundary/account/invalid/revision (first wins on ties). Retirement reads it
+/// with the current window; the load self-check compares it alone.
 /// Current-window gates and family-level holds are untouched.
 #[derive(Default, PartialEq, Eq)]
 pub(super) struct HistorySummary {
-    history_nonempty: bool,
     newest_boundary: Option<u64>,
     unparsable: bool,
-    latest: BTreeMap<String, (u64, String, bool, Option<String>)>,
+    latest: BTreeMap<String, Latest>,
 }
+/// A member's winning (boundary, account, invalid, revision).
+pub(super) type Latest = (u64, String, bool, Option<String>);
 impl HistorySummary {
-    fn fold<'a>(windows: impl IntoIterator<Item = &'a ClaudeAccountFamilyPendingWindow>) -> Self {
+    fn from_windows<'a>(
+        windows: impl IntoIterator<Item = &'a ClaudeAccountFamilyPendingWindow>,
+    ) -> Self {
         let mut summary = Self::default();
-        for window in windows {
-            summary.history_nonempty = true;
-            let Some(time) = rfc3339_unix_seconds(&window.census_window_end) else {
-                summary.unparsable = true;
-                continue;
-            };
-            summary.newest_boundary = summary.newest_boundary.max(Some(time));
-            let projection = window.consumer_projection();
-            for (member, revision) in projection.members() {
-                if summary
-                    .latest
-                    .get(member)
-                    .map_or(true, |(previous, _, _, _)| time > *previous)
-                {
-                    summary.latest.insert(
-                        member.clone(),
-                        (
-                            time,
-                            projection.account_identifier_hash.to_owned(),
-                            projection.invalid,
-                            revision.cloned(),
-                        ),
-                    );
-                }
-            }
-        }
+        windows.into_iter().for_each(|window| summary.fold(window));
         summary
     }
 
-    /// Each member's newest evidence across the archive and `current`, as
-    /// (member, account, invalid, revision). `None` refuses the family: a
-    /// boundary is unparsable or an archived window is not older than
-    /// current. Current is then strictly newest and wins its own members.
-    pub(super) fn members_with<'a>(
-        &'a self,
-        current: &'a ClaudeAccountFamilyPendingWindow,
-    ) -> Option<impl Iterator<Item = (&'a String, &'a str, bool, Option<&'a String>)>> {
+    fn fold(&mut self, window: &ClaudeAccountFamilyPendingWindow) {
+        let Some(time) = rfc3339_unix_seconds(&window.census_window_end) else {
+            self.unparsable = true;
+            return;
+        };
+        self.newest_boundary = self.newest_boundary.max(Some(time));
+        let projection = window.consumer_projection();
+        for (member, revision) in projection.members() {
+            if self
+                .latest
+                .get(member)
+                .map_or(true, |(previous, _, _, _)| time > *previous)
+            {
+                self.latest.insert(
+                    member.clone(),
+                    (
+                        time,
+                        projection.account_identifier_hash.to_owned(),
+                        projection.invalid,
+                        revision.cloned(),
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Each member's newest (boundary, account, invalid, revision) across the
+    /// archive and `current`. `None` refuses the family: a boundary is
+    /// unparsable or an archived window is not older than current. Current
+    /// is then strictly newest, so folding it wins its own members.
+    pub(super) fn with_current(
+        mut self,
+        current: &ClaudeAccountFamilyPendingWindow,
+    ) -> Option<BTreeMap<String, Latest>> {
         let current_end = rfc3339_unix_seconds(&current.census_window_end)?;
         if self.unparsable
             || self
@@ -241,27 +245,8 @@ impl HistorySummary {
         {
             return None;
         }
-        let current = current.consumer_projection();
-        let archived = self
-            .latest
-            .iter()
-            .filter(move |(member, _)| !current.member_keys.contains_key(*member))
-            .map(|(member, (_, account, invalid, revision))| {
-                (member, account.as_str(), *invalid, revision.as_ref())
-            });
-        Some(
-            current
-                .members()
-                .map(move |(member, revision)| {
-                    (
-                        member,
-                        current.account_identifier_hash,
-                        current.invalid,
-                        revision,
-                    )
-                })
-                .chain(archived),
-        )
+        self.fold(current);
+        Some(self.latest)
     }
 }
 

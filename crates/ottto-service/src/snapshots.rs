@@ -49426,21 +49426,20 @@ impl ScanIndex {
             }) {
                 continue;
             }
-            let history = pending.history_summary();
-            let Some(members) = history.members_with(pending) else {
+            let Some(latest) = pending.history_summary().with_current(pending) else {
                 continue;
             };
             let mut revisions = BTreeMap::new();
             let mut valid = true;
-            for (member, account, invalid, revision) in members {
+            for (member, (_, account, invalid, revision)) in latest {
                 if !live_members
                     .get(root)
-                    .is_some_and(|members| members.contains(member))
+                    .is_some_and(|members| members.contains(&member))
                 {
-                    if !pending.confirmed_absent_members.contains(member)
+                    if !pending.confirmed_absent_members.contains(&member)
                         && !empty_members
                             .get(root)
-                            .is_some_and(|members| members.contains(member))
+                            .is_some_and(|members| members.contains(&member))
                     {
                         valid = false;
                         break;
@@ -49449,7 +49448,7 @@ impl ScanIndex {
                 }
                 match revision {
                     Some(revision) if !invalid && account == pending.account_identifier_hash => {
-                        revisions.insert(member.clone(), revision.clone());
+                        revisions.insert(member, revision);
                     }
                     _ => {
                         valid = false;
