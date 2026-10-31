@@ -580,17 +580,9 @@ fn c1b_repair_and_gain_recorded_request(fixture: &RearmFixture) {
 
 /// The recoverable member change in a fix arm and a BASE arm on pages of
 /// `page_files` files, as (fix, BASE, cancellations, terminal holds) with the
-/// fix arm's counter deltas.
-fn c1b_recoverable_change_arms(
-    case: &'static str,
-    page_files: usize,
-) -> (C1bRun, C1bRun, usize, usize) {
-    c1b_recoverable_change_arms_listed(case, page_files, false)
-}
-
-/// `c1b_recoverable_change_arms`; with `listed`, both arms list the family
-/// (a real list the retry's pages load) after the unlisted closing and red
-/// windows, so the member change is read on ordinary money.
+/// fix arm's counter deltas. With `listed`, both arms list the family (a real
+/// list the retry's pages load) after the unlisted closing and red windows, so
+/// the member change is read on ordinary money.
 fn c1b_recoverable_change_arms_listed(
     case: &'static str,
     page_files: usize,
