@@ -1136,6 +1136,10 @@ fn decode_api_sidecar(
         anyhow::bail!("Claude effort evidence is not a regular file");
     }
     if metadata.len() >= cap() {
+        // ON: under the per-file cap, only the pass allowance ran out.
+        if terminal_off && metadata.len() < MAX_EVIDENCE_FILE_BYTES {
+            strict_budget::defer(session_id);
+        }
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1167,6 +1171,9 @@ fn decode_api_sidecar(
         anyhow::bail!("opened Claude effort evidence is not a regular file");
     }
     if opened.len() >= cap() {
+        if terminal_off && opened.len() < MAX_EVIDENCE_FILE_BYTES {
+            strict_budget::defer(session_id);
+        }
         health.oversized_files += 1;
         return Ok(empty(health));
     }

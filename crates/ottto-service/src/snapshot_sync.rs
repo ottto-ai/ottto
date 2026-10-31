@@ -9679,7 +9679,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_incomplete_root_count += 1;
         }
         stats.trace_rows_discarded.add(&trace.rows_discarded);
-        if !trace.rows_discarded.is_empty() {
+        // ON: an API read the pass allowance could not cover is held like a
+        // discarded trace read, never refused as unhealthy.
+        if !trace.rows_discarded.is_empty()
+            || strict_budget
+                .as_ref()
+                .is_some_and(|budget| budget.deferred(&root_session_id))
+        {
             trace_discarded_roots.insert(root_session_id.clone());
         }
         if !api.health.is_complete() || !trace.is_complete() {

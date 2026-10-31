@@ -210,38 +210,60 @@ mod tests {
     }
 
     /// [behaviour] X1: a page root whose pair exceeds the pass allowance is
-    /// planned, and its strict trace read the allowance cannot cover is a
-    /// #932 discard (held for a later pass), never only an oversized file.
-    /// The OFF row is main: every root planned, the read only oversized.
+    /// planned, and a strict read the allowance cannot cover is deferred to
+    /// the #932 hold (a trace cap discard, or the pass's deferred API read),
+    /// never only an oversized file. OFF rows are main: only oversized.
     #[test]
     fn strict_allowance_shortfall_defers_page_root_through_discard() {
-        for terminal_off in [true, false] {
+        // (terminal_off, the API sidecar is over the allowance, else the trace)
+        for (terminal_off, api_over) in [(true, false), (false, false), (true, true), (false, true)]
+        {
             let _terminal_off =
                 terminal_off.then(crate::snapshots::ClaudeTerminalOffForTest::enabled);
             let scratch = crate::test_scratch::ScratchDir::new("strict-allowance-shortfall");
+            let over = BYTES_PER_PASS + 1;
+            let (api_len, trace_len) = if api_over { (over, 0) } else { (0, over) };
             write_pair(&scratch, "page-small", 0, 0);
-            write_pair(&scratch, "page-over", 0, BYTES_PER_PASS + 1);
+            write_pair(&scratch, "page-over", api_len, trace_len);
             let roots = vec!["page-over".to_string(), "page-small".to_string()];
             let page = roots.iter().cloned().collect::<BTreeSet<_>>();
             let planned = plan(&scratch, roots.clone(), &page, "shortfall");
             assert_eq!(planned.roots, roots, "terminal_off={terminal_off}");
             assert!(planned.deferred.is_empty(), "terminal_off={terminal_off}");
 
-            let _allowance =
+            let row = format!("terminal_off={terminal_off} api_over={api_over}");
+            let allowance =
                 crate::claude_local_otel::strict_budget::StrictReadBudget::new(BYTES_PER_PASS);
+            let api = crate::claude_local_otel::load_claude_api_request_evidence_report(
+                &scratch,
+                ["page-over".to_string()],
+            );
             let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
                 &scratch,
                 ["page-over".to_string()],
             );
-            assert!(!trace.is_complete(), "never complete or absent evidence");
-            assert_eq!(trace.oversized_files, 1);
+            // The short read is never complete or absent evidence.
+            assert_eq!(api.health.is_complete(), !api_over, "{row}");
+            // OFF (main) bounds the API read by the per-file cap only.
+            assert_eq!(
+                api.health.oversized_files,
+                u64::from(terminal_off && api_over),
+                "{row}"
+            );
+            assert_eq!(trace.is_complete(), api_over, "{row}");
+            assert_eq!(trace.oversized_files, u64::from(!api_over), "{row}");
             assert_eq!(
                 trace.rows_discarded,
                 crate::claude_local_otel::ClaudeTraceRowsDiscarded {
-                    cap: u64::from(terminal_off),
+                    cap: u64::from(terminal_off && !api_over),
                     ..Default::default()
                 },
-                "terminal_off={terminal_off}"
+                "{row}"
+            );
+            assert_eq!(
+                allowance.deferred("page-over"),
+                terminal_off && api_over,
+                "{row}"
             );
         }
     }
