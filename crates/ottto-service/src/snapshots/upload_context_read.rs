@@ -6,6 +6,7 @@ pub(crate) struct LocalCounts {
     pub files: u64,
     pub local_bytes: u64,
     pub wire_allowance: usize,
+    pub transport_reservation_refused: bool,
 }
 #[derive(Debug)]
 pub(super) struct Budget {
@@ -114,6 +115,9 @@ impl Budget {
         }
         let alone = ordinary.is_empty() && self.admitted.is_empty();
         if wire > wire_left && !(alone && wire > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES) {
+            if source == SnapshotSource::Codex {
+                index.context_read_counts.transport_reservation_refused = true;
+            }
             return false;
         }
         self.wire_reserved = self.wire_reserved.saturating_add(wire);
@@ -218,7 +222,7 @@ pub(super) fn with_read_limit<T>(limit: u64, f: impl FnOnce() -> T) -> (T, Vec<P
     let order = TEST_READ_ORDER.with(|order| order.replace(None).unwrap());
     (result, order)
 }
-crate::heap_layout_bound::fields!(LocalCounts; files, local_bytes, wire_allowance);
+crate::heap_layout_bound::fields!(LocalCounts; files, local_bytes, wire_allowance, transport_reservation_refused);
 crate::heap_layout_bound::fields!(Budget; native_limit, native_read, native_reserved, wire_reserved, admitted, read_files, cursor_ordinary_charged, deferred);
 
 #[cfg(test)]
