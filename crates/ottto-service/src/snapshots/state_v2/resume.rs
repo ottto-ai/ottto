@@ -453,10 +453,7 @@ impl KindCx {
             checkpoints.insert(path, checkpoint);
         }
         for (path, checkpoint) in &checkpoints {
-            let entry = next
-                .files
-                .get(path)
-                .context("state_v2_resume_finish_required")?;
+            let entry = next.files.get(path).context(Hold::FinishRequired)?;
             checkpoint.validate(path, entry, next.generation, binding)?;
         }
         // R1 must cover every changed, still-active file, including first admission.
@@ -491,7 +488,9 @@ impl KindCx {
                     .take()
                     .context("state_v2_resume_preflight_required")?;
                 self.committed = prepared.checkpoints;
-                let result = hooks.post_commit(*generation, &self.committed);
+                let result = hooks
+                    .post_commit(*generation, &self.committed)
+                    .map_err(|_| anyhow::Error::from(Hold::PostCommitRetire));
                 if result.is_err() {
                     self.ambiguous = true;
                 }

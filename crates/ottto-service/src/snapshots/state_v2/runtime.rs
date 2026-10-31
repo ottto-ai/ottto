@@ -26,6 +26,8 @@ pub(in super::super) enum Hold {
     SaveFull,
     ReferenceDrift,
     AckCustody,
+    FinishRequired,
+    PostCommitRetire,
 }
 impl std::fmt::Display for Hold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -43,6 +45,8 @@ impl std::fmt::Display for Hold {
             Self::ReloadRequired => "current_index_requires_reload",
             Self::FenceLost => "state_v2_fence_lost",
             Self::AckCustody => "state_v2_ack_custody_hold",
+            Self::FinishRequired => "state_v2_resume_finish_required",
+            Self::PostCommitRetire => "state_v2_resume_post_commit_retire",
         })
     }
 }
@@ -51,11 +55,17 @@ impl Hold {
     pub(super) fn storage(error: anyhow::Error) -> anyhow::Error {
         // Keep only the content-free typed cause, including through SQLite's
         // conversion wrapper; arbitrary engine messages still stay private.
-        if error
+        if let Some(hold) = error
             .chain()
-            .any(|cause| matches!(cause.downcast_ref::<Self>(), Some(Self::UnknownRecordKind)))
+            .filter_map(|cause| cause.downcast_ref::<Self>())
+            .find(|hold| {
+                matches!(
+                    hold,
+                    Self::UnknownRecordKind | Self::FinishRequired | Self::PostCommitRetire
+                )
+            })
         {
-            return Self::UnknownRecordKind.into();
+            return (*hold).into();
         }
         if let Some(hold) = error.downcast_ref::<Self>() {
             return (*hold).into();
