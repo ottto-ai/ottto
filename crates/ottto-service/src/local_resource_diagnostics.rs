@@ -20,6 +20,9 @@ pub(crate) mod rearm_cause;
 /// detector deliberately does not expose the unnamed/dropped labels.
 #[inline(never)]
 pub(crate) fn skill_label_native_dropped(source: &str, set: &'static str, reason: &'static str) {
+    if !crate::snapshots::restart_restore::enabled() {
+        return;
+    }
     static COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
     let source_slot = match source {
         "claude_code" => 0,

@@ -200,6 +200,9 @@ pub(in crate::snapshots) fn record_native_phase_input(
     bytes: u64,
 ) {
     use crate::transcript_acquisition::ReadMode;
+    if !restart_restore::enabled() {
+        return;
+    }
     let phase = match mode {
         ReadMode::Tail => 0,
         ReadMode::Full(_) => 1,
@@ -770,6 +773,34 @@ impl Default for Stores {
 }
 
 impl Stores {
+    /// Inspect only keys whose approved OFF invalidation previously failed.
+    fn off_v1_failure_age(&mut self, source: DurableSource, at: std::time::Instant)
+        -> (u64, std::time::Duration, bool)
+    {
+        let Stores {
+            slots, key_debt, ..
+        } = self;
+        let Some(slot) = slots[source.slot()].as_mut() else {
+            return (0, std::time::Duration::ZERO, false);
+        };
+        let mut failed_keys = 0;
+        let mut oldest_failure = std::time::Duration::ZERO;
+        key_debt.retain(|key, debt| {
+            let mut removed = false;
+            if let Some((_, since)) = debt.off_v1_failed_since.filter(|(s, _)| *s == source) {
+                if slot.store.record_missing(key) {
+                    debt.off_v1_failed_since = None;
+                    removed = true;
+                } else {
+                    failed_keys += 1;
+                    oldest_failure = oldest_failure.max(at.saturating_duration_since(since));
+                }
+            }
+            !removed || !debt.is_empty()
+        });
+        (failed_keys, oldest_failure, slot.off_v1_failed_age_untracked)
+    }
+
     /// Called only after an exact successor receipt or verified retirement.
     /// Native receipts precede the pass directory barrier: retain the witness
     /// while an earlier unlink still owes that barrier.
@@ -5487,6 +5518,14 @@ impl SharedCache {
                 ] {
                     *stores.counters.not_persisted.entry(class).or_default() += count;
                 }
+                if visited + scanned + erased + failed > 0 {
+                    crate::local_resource_diagnostics::durable_tail_alarm(
+                        snapshot_source.api_slug(),
+                        &serde_json::json!({"skill_label_entries_visited":visited,
+                            "skill_label_scanned":scanned, "skill_label_verified":verified,
+                            "skill_label_purged":erased, "skill_label_purge_failed":failed}),
+                    );
+                }
                 if alarm {
                     crate::local_resource_diagnostics::durable_tail_alarm(
                         snapshot_source.api_slug(),
@@ -6125,6 +6164,26 @@ impl SharedCache {
     }
 
     pub(crate) fn durable_alarm_at(&self, snapshot_source: SnapshotSource, at: std::time::Instant) {
+        if !restart_restore::enabled() {
+            let Some(source) = durable_source(snapshot_source) else { return; };
+            let Some(mut stores) = self.durable() else { return; };
+            let (keys, age, untracked) = stores.off_v1_failure_age(source, at);
+            let Some(slot) = stores.slot(source).as_ref() else { return; };
+            let counts = slot.store.counters();
+            if counts.off_v1_invalidated > 0 || counts.off_v1_invalidate_failed > 0 {
+                crate::local_resource_diagnostics::durable_tail_alarm(
+                    snapshot_source.api_slug(),
+                    &serde_json::json!({
+                        "off_v1_invalidated": counts.off_v1_invalidated,
+                        "off_v1_invalidate_failed": counts.off_v1_invalidate_failed,
+                        "off_v1_invalidate_failed_age": {"keys": keys, "oldest_age": age.as_secs()},
+                        "off_v1_invalidate_failed_alarm": age > RESTART_FULL_ALARM_WINDOW || untracked,
+                        "off_v1_failed_age_untracked": untracked,
+                    }),
+                );
+            }
+            return;
+        }
         self.durable_restart_full_alarm(snapshot_source, at);
         #[derive(serde::Serialize)]
         struct HoldAlarm {
@@ -6241,32 +6300,11 @@ impl SharedCache {
             .get("restore_unavailable.layout")
             .copied()
             .unwrap_or(0);
-        // Walk only already-funded diagnostic keys. No directory inventory or
-        // body acquisition; confirmed record removal clears its age marker.
-        let Stores {
-            slots, key_debt, ..
-        } = &mut *stores;
-        let Some(slot) = slots[source.slot()].as_mut() else {
-            return;
-        };
-        let mut failed_keys = 0;
-        let mut oldest_failure = std::time::Duration::ZERO;
-        key_debt.retain(|key, debt| {
-            let mut removed = false;
-            if let Some((_, since)) = debt.off_v1_failed_since.filter(|(s, _)| *s == source) {
-                if slot.store.record_missing(key) {
-                    debt.off_v1_failed_since = None;
-                    removed = true;
-                } else {
-                    failed_keys += 1;
-                    oldest_failure = oldest_failure.max(at.saturating_duration_since(since));
-                }
-            }
-            !removed || !debt.is_empty()
-        });
-        let off_v1_failed_age_untracked = slot.off_v1_failed_age_untracked;
+        let (failed_keys, oldest_failure, off_v1_failed_age_untracked) =
+            stores.off_v1_failure_age(source, at);
         let off_v1_invalidate_failed_alarm =
             oldest_failure > RESTART_FULL_ALARM_WINDOW || off_v1_failed_age_untracked;
+        let Some(slot) = stores.slot(source).as_mut() else { return; };
         let hold_changed = std::mem::replace(&mut slot.d3_reported, hold_keys) != hold_keys;
         let (store, disabled) = (slot.store.counters(), slot.store.disabled());
         let now = [

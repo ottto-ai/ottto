@@ -326,10 +326,12 @@ impl OwnedJsonlParser {
             Ok(())
         })();
         if let Err(error) = checked {
-            crate::local_resource_diagnostics::durable_tail_alarm(
-                self.source.api_slug(),
-                &serde_json::json!({"prepare_invariant": 1}),
-            );
+            if restart_restore::enabled() {
+                crate::local_resource_diagnostics::durable_tail_alarm(
+                    self.source.api_slug(),
+                    &serde_json::json!({"prepare_invariant": 1}),
+                );
+            }
             return Err(PrepareRejected {
                 error,
                 taken,

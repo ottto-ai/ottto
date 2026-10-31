@@ -3305,8 +3305,10 @@ pub(crate) fn durable_after_save(
         None => cache.durable_note_unlocked(source),
     }
     let _ = cache.durable_flush_pass(source);
-    if let Some((counters, store)) = cache.durable_counters(source) {
-        eprintln!("{}", counters.summary(source, &store));
+    if restart_restore::enabled() {
+        if let Some((counters, store)) = cache.durable_counters(source) {
+            eprintln!("{}", counters.summary(source, &store));
+        }
     }
     cache.durable_alarm(source);
     cache.durable_rederive_proxies(source);
@@ -36339,12 +36341,13 @@ impl OwnedJsonlParser {
     ) -> Result<bool> {
         anyhow::ensure!(self.pending_taken.is_none(), "acquisition return pending");
         #[cfg(unix)]
-        let before = self.reader.consumed_bytes();
-        #[cfg(unix)]
-        let mode = self.reader.acquisition.as_ref().map(|plan| plan.mode());
+        let observation = restart_restore::enabled().then(|| (
+            self.reader.consumed_bytes(),
+            self.reader.acquisition.as_ref().map(|plan| plan.mode()),
+        ));
         let step = self.with_line_sink(observe, |reader, sink| reader.step_lines(sink, on_line));
         #[cfg(unix)]
-        if let Some(mode) = mode {
+        if let Some((before, Some(mode))) = observation {
             sampled_scan::durable_tail::record_native_phase_input(
                 self.source,
                 mode,
