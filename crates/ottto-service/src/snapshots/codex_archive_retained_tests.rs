@@ -644,9 +644,10 @@ fn compressed_retained_save_never_writes_a_durable_record() {
     assert_eq!(cache.durable_selected_count_for_test(), 0);
     cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
     assert_eq!(cache.durable_selected_count_for_test(), 0);
-    // Force a hostile touch: the actual writer must independently fence this.
+    // Force a hostile touch: the save path must independently fence this.
     cache.durable_touch_for_test(&key);
     index.save(&index_path).unwrap();
+    cache.durable_fence_archives(writer, SnapshotSource::Codex);
     cache.durable_write_after_save(writer, SnapshotSource::Codex, &index);
     cache
         .durable_gc(writer, SnapshotSource::Codex, &index)

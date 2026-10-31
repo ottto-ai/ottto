@@ -3266,6 +3266,7 @@ pub(crate) fn durable_after_save(
 ) {
     match crate::locked_state_dir::held_for(support_dir) {
         Some(writer) => {
+            cache.durable_fence_archives(writer, source);
             let _ = cache.durable_write_after_save(writer, source, index);
             let _ = cache.durable_gc(writer, source, index);
         }
