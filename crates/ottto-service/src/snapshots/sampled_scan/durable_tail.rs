@@ -4190,11 +4190,7 @@ impl SharedCache {
                 v.index
                     .files
                     .get(path.to_string_lossy().as_ref())
-                    .filter(|e| {
-                        source != SnapshotSource::ClaudeCode
-                            || !e.has_unverified_source()
-                            || length >= e.size_bytes
-                    })
+                    .filter(|e| !e.has_unverified_source() || length >= e.size_bytes)
                     .map(|e| e.size_bytes)
             })
             // A lossy extent is not an accepted prefix. Growth beyond the
