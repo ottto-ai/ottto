@@ -20,6 +20,11 @@ in-process state such as environment variables or statics.
 
 Both groups print to this step's log as they run. The step fails if either
 group fails, or if the lib test counts show a test ran twice or not at all.
+
+If neither group prints anything for --idle-limit seconds (libtest itself
+reports any test running over 60 s), the step dumps what each process is
+blocked on, kills both groups and fails, instead of holding the runner until
+the job timeout.
 """
 
 from __future__ import annotations
@@ -27,9 +32,12 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 SERVICE_SRC = Path("crates/ottto-service/src")
@@ -164,11 +172,18 @@ def capture(command: list[str]) -> str:
     return done.stdout
 
 
-def start(label: str, command: list[str], out_lock: threading.Lock):
-    """Start `command`, copy its output to stdout line by line, keep the lines."""
+def start(label: str, command: list[str], out_lock: threading.Lock, last_output: list[float]):
+    """Start `command`, copy its output to stdout line by line, keep the lines.
+
+    Each group gets its own process group (session) so a hung group can be
+    killed with its test binaries. `last_output[0]` is the monotonic time of
+    the latest line from any group.
+    """
     with out_lock:
         print(f"== {label}: {' '.join(command[:10])} ...", flush=True)
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True
+    )
     lines: list[str] = []
 
     def relay() -> None:
@@ -177,6 +192,7 @@ def start(label: str, command: list[str], out_lock: threading.Lock):
             with out_lock:
                 sys.stdout.buffer.write(raw)
                 sys.stdout.buffer.flush()
+                last_output[0] = time.monotonic()
             lines.append(raw.decode("utf-8", "replace"))
 
     thread = threading.Thread(target=relay, daemon=True)
@@ -184,11 +200,83 @@ def start(label: str, command: list[str], out_lock: threading.Lock):
     return process, thread, lines
 
 
+def group_processes(pgids: set[int]) -> list[tuple[int, str]]:
+    """(pid, command) of every live process in the given process groups."""
+    listing = subprocess.run(
+        ["ps", "-A", "-o", "pid=,pgid=,stat=,etime=,command="],
+        stdout=subprocess.PIPE, text=True, errors="replace", check=False,
+    ).stdout
+    found = []
+    for row in listing.splitlines():
+        fields = row.split(None, 4)
+        if len(fields) == 5 and fields[1].isdigit() and int(fields[1]) in pgids:
+            found.append((int(fields[0]), row.strip()))
+    return found
+
+
+def dump_stuck_state(pgids: set[int]) -> None:
+    """Best effort: print each process and the thread stacks of test binaries."""
+    for pid, row in group_processes(pgids):
+        print(f"ci_runtime_tests: still running: {row[:300]}", flush=True)
+        if "/deps/" not in row:
+            continue
+        if sys.platform == "darwin":
+            command = ["sample", str(pid), "2"]
+        elif shutil.which("gdb"):
+            command = ["sudo", "-n", "gdb", "-batch", "-p", str(pid), "-ex", "thread apply all bt"]
+        else:
+            command = ["sh", "-c", f'for t in /proc/{pid}/task/*; do echo "$t $(cat $t/comm) $(cat $t/wchan)"; done']
+        try:
+            stacks = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="replace", timeout=120, check=False,
+            ).stdout
+        except (OSError, subprocess.TimeoutExpired) as error:
+            stacks = f"{command[0]} failed: {error}"
+        print("\n".join(stacks.splitlines()[:600]), flush=True)
+
+
+def wait_groups(runs, last_output: list[float], idle_limit: float, poll: float = 5.0) -> list[str]:
+    """Wait for every (label, (process, thread, lines)) run.
+
+    Returns problems. A group that exits non-zero is a problem; so is a stretch
+    of `idle_limit` seconds with no output from any group, after which every
+    still-running group is killed.
+    """
+    problems: list[str] = []
+    while any(process.poll() is None for _, (process, _, _) in runs):
+        idle = time.monotonic() - last_output[0]
+        if idle >= idle_limit:
+            live = {process.pid for _, (process, _, _) in runs if process.poll() is None}
+            print(f"ci_runtime_tests: no test output for {idle:.0f} s; dumping state and stopping", flush=True)
+            dump_stuck_state(live)
+            for label, (process, _, _) in runs:
+                if process.poll() is None:
+                    problems.append(f"{label}: killed after {idle:.0f} s without output (hung)")
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            break
+        time.sleep(min(poll, max(idle_limit - idle, 0.05)))
+    for label, (process, thread, _) in runs:
+        status = process.wait()
+        # A leftover child of a killed or crashed test can keep the pipe open.
+        thread.join(timeout=30)
+        if status != 0 and not any(problem.startswith(f"{label}: killed") for problem in problems):
+            problems.append(f"{label}: cargo test exited {status}")
+    return problems
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--threads", type=int, required=True, help="main group --test-threads")
     parser.add_argument("--serial-threads", type=int, default=1, help="serial group --test-threads")
     parser.add_argument("--no-fail-fast", action="store_true", help="main group keeps going past a failing target")
+    parser.add_argument(
+        "--idle-limit", type=float, default=600,
+        help="seconds without output from either group before both are dumped and killed",
+    )
     args = parser.parse_args()
 
     cargo = os.environ.get("CARGO", "cargo")
@@ -213,11 +301,13 @@ def main() -> int:
     )
 
     out_lock = threading.Lock()
+    last_output = [time.monotonic()]
     serial_run = start(
         "serial group",
         [cargo, "test", "-p", "ottto-service", "--lib", "--locked", "--", "--exact", "--nocapture",
          f"--test-threads={args.serial_threads}", *serial],
         out_lock,
+        last_output,
     )
     skips = [arg for name in serial for arg in ("--skip", name)]
     main_run = start(
@@ -225,14 +315,12 @@ def main() -> int:
         [cargo, "test", "--workspace", "--locked", *(["--no-fail-fast"] if args.no_fail_fast else []), "--",
          "--nocapture", f"--test-threads={args.threads}", "--exact", *skips],
         out_lock,
+        last_output,
     )
 
-    problems: list[str] = []
-    for label, (process, thread, _) in (("main group", main_run), ("serial group", serial_run)):
-        status = process.wait()
-        thread.join()
-        if status != 0:
-            problems.append(f"{label}: cargo test exited {status}")
+    problems = wait_groups(
+        [("main group", main_run), ("serial group", serial_run)], last_output, args.idle_limit
+    )
     problems += check_counts(
         "serial group", lib_summary(serial_run[2], whole_stream=True), len(serial), len(lib_tests) - len(serial)
     )
