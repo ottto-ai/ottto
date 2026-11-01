@@ -96,14 +96,7 @@ impl Hold {
         let hold = if sqlite::disk_full(&error) {
             telemetry::event("sqlite_full", &1);
             Self::SaveFull
-        } else if error.chain().any(|e| {
-            matches!(
-                e.to_string().as_str(),
-                "state_v2_save_ceiling"
-                    | "state_v2_path_diff_admission"
-                    | "state_v2_value_admission"
-            )
-        }) {
+        } else if Self::ceiling_cause(&error).is_some() {
             Self::SaveCeiling
         } else if error
             .chain()
@@ -128,6 +121,15 @@ impl Hold {
         };
         // Do not retain arbitrary engine messages/paths in public health output.
         hold.into()
+    }
+    /// Content-free cause of save pressure: the charged-work ceiling or one
+    /// logical row over its value cap. Both hold as `SaveCeiling`.
+    fn ceiling_cause(error: &anyhow::Error) -> Option<&'static str> {
+        error.chain().find_map(|e| match e.to_string().as_str() {
+            "state_v2_save_ceiling" => Some("charged_work"),
+            "state_v2_value_admission" => Some("value_admission"),
+            _ => None,
+        })
     }
 }
 struct RouteState {
@@ -660,6 +662,7 @@ fn with_save_session<T>(
 ) -> Result<Option<T>> {
     let binding = binding_for(path)?;
     let mut stale_graph = false;
+    let mut ceiling = None;
     let mut result = held(with_state(path, |state| {
         let pair = fence::reconcile(path, &binding, state.latched)?;
         let Some(runtime) = runtime else {
@@ -682,7 +685,11 @@ fn with_save_session<T>(
             stale_graph = true;
             bail!(Hold::ReloadRequired);
         }
-        write(state, session, identity).map(Some)
+        let written = write(state, session, identity);
+        if let Err(error) = &written {
+            ceiling = Hold::ceiling_cause(error).map(|c| (c, session.db.refused_save_bytes()));
+        }
+        written.map(Some)
     }));
     if let Err(error) = &result {
         if stale_graph {
@@ -691,6 +698,13 @@ fn with_save_session<T>(
         with_state(path, |state| {
             state.save_digests = None;
             state.save_retry_completed = false;
+            if let (Some(Hold::SaveCeiling), Some((cause, bytes))) =
+                (error.downcast_ref::<Hold>(), ceiling)
+            {
+                // A save-pressure hold is never silent: alarm with its fixed cause.
+                telemetry::event("save_ceiling_alarm", &bytes);
+                telemetry::event("save_ceiling_cause", &cause);
+            }
             if (!claim_only || state.save_hold != Some(Hold::SaveOversize))
                 && matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveCeiling))
             {

@@ -1123,6 +1123,10 @@ mod application_cases {
                     .unwrap_err();
             // Value admission is save pressure: the paced named hold, not DbUnavailable.
             assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
+            assert_eq!(
+                telemetry::latest_for_test("save_ceiling_cause"),
+                Some(serde_json::json!("value_admission"))
+            );
             let reloaded = super::super::runtime::load_locked(&c.path, None, true)
                 .unwrap()
                 .0
