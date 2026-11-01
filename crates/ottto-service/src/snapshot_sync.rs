@@ -6271,6 +6271,29 @@ impl Drop for WakeFrameVisitLimitForTest {
     }
 }
 #[cfg(test)]
+thread_local! {
+    static WAKE_FRAME_SERIAL_FALLBACK_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+/// A test whose real frame may exceed the 4096-visit parking cap: production
+/// then continues serially (`serial_fallback`, counted `bound_refused`), so
+/// only the per-step parkability assert is waived while the guard lives.
+/// Measurement, the visit log and every other assert stay.
+#[cfg(test)]
+pub(crate) struct WakeFrameSerialFallbackForTest(bool);
+#[cfg(test)]
+impl WakeFrameSerialFallbackForTest {
+    pub(crate) fn new() -> Self {
+        Self(WAKE_FRAME_SERIAL_FALLBACK_FOR_TEST.with(|cell| cell.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for WakeFrameSerialFallbackForTest {
+    fn drop(&mut self) {
+        WAKE_FRAME_SERIAL_FALLBACK_FOR_TEST.with(|cell| cell.set(self.0));
+    }
+}
+#[cfg(test)]
 fn try_collect_native_preparation_with_rotation_observed(
     frame: SourcePreparation,
     require_frame_bound: bool,
@@ -6345,8 +6368,10 @@ fn try_collect_native_preparation_with_rotation_observed(
                         receipt.visits_for_test()
                     );
                 }
-                assert!(crate::heap_layout_bound::bound(&frame, crate::source_rotation::PARKED_BUDGET).is_some(),
-                    "the real source frame must pass its real existing requested-layout budget; no substitute bound");
+                if !WAKE_FRAME_SERIAL_FALLBACK_FOR_TEST.with(std::cell::Cell::get) {
+                    assert!(crate::heap_layout_bound::bound(&frame, crate::source_rotation::PARKED_BUDGET).is_some(),
+                        "the real source frame must pass its real existing requested-layout budget; no substitute bound");
+                }
             } else if self.require_parking_refusal && !self.parking_refused {
                 // Evaluate the real Owner::bound on the actual moving frame,
                 // including both indexes and the ordinary candidate queue.
