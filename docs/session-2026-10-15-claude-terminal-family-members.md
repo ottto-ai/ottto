@@ -26,7 +26,7 @@ The entry keeps only file identity (size, modification time, source fingerprint,
 
 Consequences:
 
-- The unchanged member is skipped at the authority quarantine gate, exactly like a committed terminal member.
+- The unchanged member is skipped at the authority quarantine gate, exactly like a committed terminal member; nonzero terminal deadlines at or before 2026-10-28T06:00Z allow one E2 recovery, whose failed fold writes a fresh terminal deadline and whose success removes the authority record.
 - `complete_claude_usage_family_members` sees the true present membership, so resolution still requires every member to be proven, and the witness and quarantine are retained.
 - The traversal settles, the census completes, the upload context is adopted, and the next unchanged traversal parses nothing.
 
