@@ -228,22 +228,19 @@ pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_lim
 pub(crate) use sampled_scan::codex_cursor::{CodexCursorPort, CodexCursorTicket};
 
 #[cfg(test)]
-pub(crate) use context_curve::CONTEXT_CURVE_CONTRACT_VERSION;
-use context_curve::{
-    prune_one_context_curve_fill_point, unavailable_context_curve, validate_context_curve,
-    ContextCurveCandidateBoundary, ContextCurveCandidatePoint,
-};
-pub use context_curve::{
-    SnapshotContextCurve, SnapshotContextCurveBoundary, SnapshotContextCurveModelWindow,
-    SnapshotContextCurvePoint,
-};
+pub(crate) use context_curve::v1::CONTEXT_CURVE_CONTRACT_VERSION;
 #[cfg(test)]
-use context_curve::{
+use context_curve::v1::{
     CONTEXT_CURVE_RETENTION_ANCHOR, CONTEXT_CURVE_RETENTION_COMPACTION_AFTER,
     CONTEXT_CURVE_RETENTION_COMPACTION_BEFORE, CONTEXT_CURVE_RETENTION_FILL,
     CONTEXT_CURVE_RETENTION_PEAK, CONTEXT_CURVE_RETENTION_TAIL, CONTEXT_CURVE_SAMPLING_REVISION,
     MAX_CONTEXT_CURVE_BOUNDARIES, MAX_CONTEXT_CURVE_MODEL_WINDOWS, MAX_CONTEXT_CURVE_POINTS,
     MAX_CONTEXT_CURVE_WIRE_BYTES,
+};
+use context_curve::{ContextCurveCandidateBoundary, ContextCurveCandidatePoint};
+pub use context_curve::{
+    SnapshotContextCurve, SnapshotContextCurveBoundary, SnapshotContextCurveModelWindow,
+    SnapshotContextCurvePoint,
 };
 
 pub fn collector_version() -> String {
@@ -8234,15 +8231,6 @@ pub fn apply_upload_policy(
     snapshots: &mut [SnapshotItem],
     policy: SnapshotUploadPolicy,
 ) {
-    apply_upload_policy_with_item_limit(source, snapshots, policy, MAX_SNAPSHOT_ITEM_WIRE_BYTES);
-}
-
-pub(crate) fn apply_upload_policy_with_item_limit(
-    source: SnapshotSource,
-    snapshots: &mut [SnapshotItem],
-    policy: SnapshotUploadPolicy,
-    item_limit: usize,
-) {
     for item in snapshots {
         let mut fingerprint_needs_refresh = false;
         if !policy.session_titles_enabled
@@ -8295,7 +8283,6 @@ pub(crate) fn apply_upload_policy_with_item_limit(
         if fingerprint_needs_refresh {
             item.snapshot_fingerprint = snapshot_fingerprint(source, item);
         }
-        fit_context_curve_to_snapshot_item_budget(source, item, policy, item_limit);
     }
 }
 
@@ -8310,55 +8297,6 @@ pub(crate) fn snapshot_item_wire_size(
     })
     .map(|encoded| encoded.len())
     .unwrap_or(usize::MAX)
-}
-
-fn fit_context_curve_to_snapshot_item_budget(
-    source: SnapshotSource,
-    item: &mut SnapshotItem,
-    policy: SnapshotUploadPolicy,
-    item_wire_budget: usize,
-) {
-    fit_context_curve(item, |item| {
-        snapshot_item_wire_size(source, item, policy) <= item_wire_budget
-    });
-}
-
-/// Prune fill points newest first, then fall back to an unavailable curve,
-/// until `fits` holds. The curve is display data: it yields to everything else.
-fn fit_context_curve(item: &mut SnapshotItem, fits: impl Fn(&SnapshotItem) -> bool) {
-    if item.context_curve.is_none() || fits(item) {
-        return;
-    }
-    while item
-        .context_curve
-        .as_mut()
-        .is_some_and(prune_one_context_curve_fill_point)
-    {
-        if fits(item) {
-            return;
-        }
-    }
-    let Some(curve) = item.context_curve.as_ref() else {
-        return;
-    };
-    item.context_curve = Some(unavailable_context_curve(
-        &curve.parser_revision,
-        &curve.ownership_revision,
-        "payload_budget_exceeded",
-        0,
-        0,
-    ));
-}
-
-fn snapshot_item_wire_size_is_allowed(
-    item_size: usize,
-    item_without_curve_size: usize,
-    context_curve_coverage: Option<&str>,
-) -> bool {
-    item_size <= MAX_SNAPSHOT_ITEM_WIRE_BYTES
-        || (context_curve_coverage == Some("payload_budget_exceeded")
-            && item_without_curve_size <= MAX_SNAPSHOT_ITEM_WIRE_BYTES
-            && item_size <= MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES)
 }
 
 /// Bind incremental state to the exact bytes/semantics that will go on the
@@ -15949,21 +15887,9 @@ pub(crate) fn validate_snapshot_batch_request_with_item_limit(
         })
         .map_err(|error| format!("snapshot[{index}] wire encoding: {error}"))?
         .len();
-        let mut item_without_curve = item.clone();
-        item_without_curve.context_curve = None;
-        let item_without_curve_size =
-            snapshot_item_wire_size(source, &item_without_curve, request.upload_policy);
-        if item_size > item_limit
-            && !snapshot_item_wire_size_is_allowed(
-                item_size,
-                item_without_curve_size,
-                item.context_curve
-                    .as_ref()
-                    .map(|curve| curve.coverage.as_str()),
-            )
-        {
+        if item_size > item_limit && item_size > MAX_SNAPSHOT_ITEM_WIRE_BYTES {
             return Err(format!(
-                "snapshot[{index}] wire body is {item_size} bytes; maximum is {item_limit} (or {MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES} only for an explicit payload_budget_exceeded clear whose ordinary item fits)"
+                "snapshot[{index}] wire body is {item_size} bytes; maximum is {item_limit}"
             ));
         }
     }
@@ -15993,16 +15919,6 @@ fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), Strin
         return Err(format!(
             "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_events"
         ));
-    }
-    if let Some(curve) = item.context_curve.as_ref() {
-        validate_context_curve(index, curve)?;
-        if item.provenance.collector == "codex_state_sqlite"
-            && matches!(curve.coverage.as_str(), "complete" | "sampled")
-        {
-            return Err(format!(
-                "snapshot[{index}] state-only Codex evidence cannot carry an available context_curve"
-            ));
-        }
     }
     crate::session_attribution::validate_fact_limits(&item.attribution_facts)
         .map_err(|error| format!("snapshot[{index}] {error}"))?;
@@ -56374,30 +56290,14 @@ mod tests {
     fn snapshot_admission_boundaries_match_backend_640_kib() {
         assert_eq!(MAX_SNAPSHOT_ITEM_WIRE_BYTES, 655_360);
         assert_eq!(MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES, 656_384);
-        for size in [128 * 1024, 128 * 1024 + 1, 640 * 1024] {
-            assert!(snapshot_item_wire_size_is_allowed(size, size, None));
+        for (size, allowed) in [
+            (128 * 1024, true),
+            (128 * 1024 + 1, true),
+            (640 * 1024, true),
+            (655_361, false),
+        ] {
+            assert_eq!(size <= MAX_SNAPSHOT_ITEM_WIRE_BYTES, allowed);
         }
-        assert!(!snapshot_item_wire_size_is_allowed(655_361, 655_361, None));
-        assert!(snapshot_item_wire_size_is_allowed(
-            656_384,
-            655_360,
-            Some("payload_budget_exceeded")
-        ));
-        assert!(!snapshot_item_wire_size_is_allowed(
-            656_385,
-            655_360,
-            Some("payload_budget_exceeded")
-        ));
-        assert!(!snapshot_item_wire_size_is_allowed(
-            656_384,
-            655_361,
-            Some("payload_budget_exceeded")
-        ));
-        assert!(!snapshot_item_wire_size_is_allowed(
-            656_384,
-            655_360,
-            Some("sampled")
-        ));
     }
 
     #[test]
@@ -71290,7 +71190,6 @@ mod tests {
             point.owned_request_ordinal == 1_300
                 && point.retention_flags & CONTEXT_CURVE_RETENTION_TAIL != 0
         }));
-        validate_context_curve(0, &first).expect("sampled curve validates");
 
         let mut item = valid_v6_batch_request().snapshots.remove(0);
         let before = snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, &item);
@@ -71427,121 +71326,6 @@ mod tests {
         ] {
             assert!(!encoded.contains(forbidden), "curve leaked {forbidden}");
         }
-    }
-
-    #[test]
-    fn context_curve_yields_to_the_whole_snapshot_item_budget() {
-        let mut request = valid_v6_batch_request();
-        let policy = request.upload_policy;
-        let item = &mut request.snapshots[0];
-        item.context_curve = Some(max_fractional_context_curve_fixture());
-        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
-        let original_points = item
-            .context_curve
-            .as_ref()
-            .expect("curve")
-            .retained_point_count;
-        let current_size = snapshot_item_wire_size(SnapshotSource::ClaudeCode, item, policy);
-        let synthetic_budget = current_size - 2_048;
-        fit_context_curve_to_snapshot_item_budget(
-            SnapshotSource::ClaudeCode,
-            item,
-            policy,
-            synthetic_budget,
-        );
-        let fitted = item
-            .context_curve
-            .as_ref()
-            .expect("fitted curve remains explicit");
-        assert_eq!(fitted.coverage, "sampled");
-        assert!(fitted.retained_point_count < original_points);
-        assert!(
-            snapshot_item_wire_size(SnapshotSource::ClaudeCode, item, policy) <= synthetic_budget
-        );
-        validate_snapshot_batch_request(&request).expect("pruned curve keeps snapshot uploadable");
-
-        let mut mandatory_request = valid_v6_batch_request();
-        let policy = mandatory_request.upload_policy;
-        let mandatory_item = &mut mandatory_request.snapshots[0];
-        let mut mandatory_curve = max_fractional_context_curve_fixture();
-        while prune_one_context_curve_fill_point(&mut mandatory_curve) {}
-        mandatory_item.context_curve = Some(mandatory_curve);
-        mandatory_item.snapshot_fingerprint =
-            snapshot_fingerprint(SnapshotSource::ClaudeCode, mandatory_item);
-        let mandatory_size =
-            snapshot_item_wire_size(SnapshotSource::ClaudeCode, mandatory_item, policy);
-        let mut unavailable_probe = mandatory_item.clone();
-        let mandatory_curve = unavailable_probe.context_curve.as_ref().expect("curve");
-        unavailable_probe.context_curve = Some(unavailable_context_curve(
-            &mandatory_curve.parser_revision,
-            &mandatory_curve.ownership_revision,
-            "payload_budget_exceeded",
-            0,
-            0,
-        ));
-        let unavailable_size =
-            snapshot_item_wire_size(SnapshotSource::ClaudeCode, &unavailable_probe, policy);
-        assert!(mandatory_size > unavailable_size);
-        fit_context_curve_to_snapshot_item_budget(
-            SnapshotSource::ClaudeCode,
-            mandatory_item,
-            policy,
-            unavailable_size,
-        );
-        let unavailable = mandatory_item
-            .context_curve
-            .as_ref()
-            .expect("budget reason remains explicit");
-        assert_eq!(unavailable.coverage, "payload_budget_exceeded");
-        assert_eq!(unavailable.total_owned_request_count, 0);
-        assert!(unavailable.points.is_empty());
-        assert!(
-            snapshot_item_wire_size(SnapshotSource::ClaudeCode, mandatory_item, policy)
-                <= unavailable_size
-        );
-        validate_snapshot_batch_request(&mandatory_request)
-            .expect("unavailable curve never quarantines ordinary snapshot evidence");
-
-        let mut reserve_item = unavailable_probe;
-        let mut reserve_base = reserve_item.clone();
-        reserve_base.context_curve = None;
-        let reserve_base_size =
-            snapshot_item_wire_size(SnapshotSource::ClaudeCode, &reserve_base, policy);
-        let near_limit_budget = reserve_base_size + 1;
-        fit_context_curve_to_snapshot_item_budget(
-            SnapshotSource::ClaudeCode,
-            &mut reserve_item,
-            policy,
-            near_limit_budget,
-        );
-        assert_eq!(
-            reserve_item
-                .context_curve
-                .as_ref()
-                .expect("explicit clear is never omitted")
-                .coverage,
-            "payload_budget_exceeded"
-        );
-        let reserve_item_size =
-            snapshot_item_wire_size(SnapshotSource::ClaudeCode, &reserve_item, policy);
-        assert!(reserve_item_size > near_limit_budget);
-        assert!(reserve_item_size <= near_limit_budget + 1_024);
-
-        assert!(snapshot_item_wire_size_is_allowed(
-            MAX_SNAPSHOT_ITEM_WIRE_BYTES + 1,
-            MAX_SNAPSHOT_ITEM_WIRE_BYTES,
-            Some("payload_budget_exceeded")
-        ));
-        assert!(!snapshot_item_wire_size_is_allowed(
-            MAX_SNAPSHOT_ITEM_WIRE_BYTES + 1,
-            MAX_SNAPSHOT_ITEM_WIRE_BYTES,
-            Some("sampled")
-        ));
-        assert!(!snapshot_item_wire_size_is_allowed(
-            MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES + 1,
-            MAX_SNAPSHOT_ITEM_WIRE_BYTES,
-            Some("payload_budget_exceeded")
-        ));
     }
 
     #[test]
@@ -81061,9 +80845,9 @@ mod tests {
     }
 
     #[test]
-    fn v6_snapshot_preflight_rejects_invalid_compaction_and_curve() {
+    fn v6_snapshot_preflight_rejects_invalid_compaction() {
         type Case = (fn(&mut SnapshotBatchRequest), &'static str);
-        let cases: [Case; 3] = [
+        let cases: [Case; 2] = [
             (
                 |request: &mut SnapshotBatchRequest| {
                     request.snapshots[0].compaction_timestamps =
@@ -81084,24 +80868,6 @@ mod tests {
                     ];
                 },
                 "more than 64 compaction_events",
-            ),
-            (
-                |request: &mut SnapshotBatchRequest| {
-                    request.source = SnapshotSource::Codex.api_slug().to_string();
-                    let item = &mut request.snapshots[0];
-                    item.provenance.collector = "codex_state_sqlite".to_string();
-                    item.context_curve = Some(single_request_context_curve(
-                        CODEX_SNAPSHOT_PARSER_VERSION,
-                        "codex_owned_rollout_occurrences:v1",
-                        "codex_token_count_model_context_window:v1",
-                        "2026-08-20T12:00:01Z",
-                        10,
-                        "gpt-5.5",
-                        Some(258_400),
-                    ));
-                    item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, item);
-                },
-                "state-only Codex evidence",
             ),
         ];
         for (mutate, expected) in cases {

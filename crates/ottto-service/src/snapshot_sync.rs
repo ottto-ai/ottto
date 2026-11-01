@@ -601,31 +601,15 @@ fn note_claude_history_cutoff_for_cycle(
     );
 }
 
-/// The historical replays one cycle arms (StateMissing H1, N2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReplayArming {
-    /// The source's bootstrap for this destination is pending.
-    backfill_pending: bool,
-}
-
-impl ReplayArming {
-    /// One decision for production and the history pipeline tests. An
-    /// unreadable backfill state arms no Claude replay (its history is
-    /// unknown, and a replay would drop the index's entries); Codex and Pi
-    /// replays are not affected.
-    fn decide(
-        source: SnapshotSource,
-        backfill_state: &crate::backfill::BackfillState,
-        destination_namespace: &str,
-    ) -> Self {
-        Self {
-            backfill_pending: pending_backfill_sources_for_destination(
-                backfill_state,
-                destination_namespace,
-            )
-            .contains(&source),
-        }
-    }
+/// Whether the source's bootstrap for this destination is pending, which arms
+/// its historical replay (StateMissing H1, N2).
+fn backfill_replay_pending(
+    source: SnapshotSource,
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+) -> bool {
+    pending_backfill_sources_for_destination(backfill_state, destination_namespace)
+        .contains(&source)
 }
 
 /// Claude only: the unreadable backfill state suppresses replays until a
@@ -5898,7 +5882,6 @@ struct SourcePreparation {
     committed_index: ScanIndex,
     backfill_state: crate::backfill::BackfillState,
     backfill_pending: bool,
-    replay_generation: String,
     legacy_reconciliation_pending: BTreeSet<String>,
     active_legacy_reconciliation: BTreeSet<String>,
     scan: Option<crate::snapshots::OwnedSourceScan>,
@@ -6888,10 +6871,9 @@ fn prepare_sync_source_inner(
     let replay_generation = cycle_replay_generation(source, &upload_destination_namespace);
     // An unreadable backfill state arms no Claude replay and no replay-wide
     // scan window (StateMissing H1, N2).
-    let ReplayArming { backfill_pending } =
-        ReplayArming::decide(source, &backfill_state, &upload_destination_namespace);
-    let historical_replay_pending = backfill_pending;
-    if !historical_replay_pending
+    let backfill_pending =
+        backfill_replay_pending(source, &backfill_state, &upload_destination_namespace);
+    if !backfill_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
     {
         // Persist the one-shot policy adoption before progress or scan can
@@ -6901,7 +6883,7 @@ fn prepare_sync_source_inner(
     let admission_reoffer_pending =
         index.snapshot_admission_reoffer_pending_for_scan(source, receipt_window_days);
     let mut legacy_reconciliation_pending = BTreeSet::new();
-    if !historical_replay_pending && index.legacy_settlement_ledger_needs_migration() {
+    if !backfill_pending && index.legacy_settlement_ledger_needs_migration() {
         let (armed, changed) = index.prepare_legacy_settlement_reconciliation(
             source,
             LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE,
@@ -6934,7 +6916,7 @@ fn prepare_sync_source_inner(
         &mut upload_progress,
         &index,
         &replay_generation,
-        historical_replay_pending,
+        backfill_pending,
         Some(&reoffer_scope),
     ) {
         // Claim the new generation before the potentially long historical
@@ -6960,7 +6942,7 @@ fn prepare_sync_source_inner(
     // scan is built.
     let replay_dropped_entries = crate::snapshots::prepare_historical_replay_with_side(
         &mut index,
-        historical_replay_pending,
+        backfill_pending,
         replay_generation.clone(),
         source,
         &daemon.transcript_cache,
@@ -7012,7 +6994,7 @@ fn prepare_sync_source_inner(
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
     // A replay re-reads everything and neither re-offers nor defers.
-    index.activate_reason_reoffer_cooldowns(if historical_replay_pending {
+    index.activate_reason_reoffer_cooldowns(if backfill_pending {
         BTreeMap::new()
     } else {
         upload_progress.reason_reoffer_cooldowns(reoffer_now)
@@ -7124,7 +7106,6 @@ fn prepare_sync_source_inner(
         committed_index,
         backfill_state,
         backfill_pending,
-        replay_generation,
         legacy_reconciliation_pending,
         active_legacy_reconciliation,
         scan: Some(scan),
@@ -7397,12 +7378,11 @@ fn prepare_continuation_source(
     upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
     let replay_generation = cycle_replay_generation(source, &inputs.upload_destination_namespace);
-    let arming = ReplayArming::decide(
+    if backfill_replay_pending(
         source,
         &backfill_state,
         &inputs.upload_destination_namespace,
-    );
-    if arming.backfill_pending {
+    ) {
         return Ok(Err(ContinuationRefusal::HistoricalReplay));
     }
     if index.snapshot_admission_reoffer_pending() {
@@ -7521,7 +7501,6 @@ fn prepare_continuation_source(
         committed_index,
         backfill_state,
         backfill_pending: false,
-        replay_generation,
         legacy_reconciliation_pending: BTreeSet::new(),
         active_legacy_reconciliation: BTreeSet::new(),
         scan: Some(scan),
@@ -7655,7 +7634,6 @@ fn finish_sync_source(
         mut committed_index,
         backfill_state,
         backfill_pending,
-        replay_generation: _,
         legacy_reconciliation_pending,
         active_legacy_reconciliation,
         scan: _,
@@ -7907,12 +7885,7 @@ fn finish_sync_source(
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
 
-    crate::snapshots::apply_upload_policy_with_item_limit(
-        source,
-        &mut scan_result.snapshots,
-        upload_policy,
-        identity_item_cap,
-    );
+    crate::snapshots::apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
 
     // Account-switch backfill cutoff (server-issued at claim completion): a
     // machine claimed by a different same-org user must not re-attribute the
@@ -7947,12 +7920,7 @@ fn finish_sync_source(
         machine_id,
         |index, snapshots| {
             index.bind_session_accounts(source, machine_id, snapshots, &current_codex_bindings);
-            crate::snapshots::apply_upload_policy_with_item_limit(
-                source,
-                snapshots,
-                upload_policy,
-                identity_item_cap,
-            );
+            crate::snapshots::apply_upload_policy(source, snapshots, upload_policy);
             apply_backfill_cutoff(snapshots, &backfill_state);
         },
     );
@@ -24758,7 +24726,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 
