@@ -12807,9 +12807,9 @@ fn structural_restore_page_defer_does_not_spend_full_pace() {
         fixture.append(session, &token_line(9));
     }
     let key_bytes = local_index_key(&fixture.file(SESSION)).len() as u64;
-    let limit = store::RESTORE_INPUT_BYTES
-        + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
-        + 4 * key_bytes;
+    let limit =
+        store::RESTORE_INPUT_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES as u64 + 4 * key_bytes
+            - 1;
     store::active::set_active_budget_for_test(Some(limit));
     let size = fixture.len(SESSION).max(fixture.len(SESSION_B));
     with_test_limits(1 << 20, size + size / 2, 64, || {

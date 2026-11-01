@@ -5,11 +5,19 @@ use std::time::{Duration, Instant};
 pub(crate) const ACTIVE_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(test)]
 thread_local! {
+    static REFUSE_NEXT_CHARGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 #[cfg(test)]
 pub(crate) fn set_active_budget_for_test(bytes: Option<u64>) {
     TEST_BUDGET.with(|budget| budget.set(bytes));
+    if bytes.is_none() {
+        REFUSE_NEXT_CHARGE.with(|slot| slot.set(false));
+    }
+}
+#[cfg(test)]
+pub(crate) fn refuse_next_charge() {
+    REFUSE_NEXT_CHARGE.with(|slot| slot.set(true));
 }
 fn active_budget() -> u64 {
     #[cfg(test)]
@@ -101,6 +109,11 @@ impl ActiveLease {
         }
     }
     pub(crate) fn charge(&mut self, bytes: u64) -> Result<(), ActiveOverBudget> {
+        #[cfg(test)]
+        if REFUSE_NEXT_CHARGE.with(|slot| slot.replace(false)) {
+            event(self.source, "active_budget_refused", 1);
+            return Err(ActiveOverBudget);
+        }
         let total = self
             .bytes
             .checked_add(bytes)

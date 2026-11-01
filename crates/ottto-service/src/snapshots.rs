@@ -85,6 +85,24 @@ impl DurableCustody {
     }
 }
 
+/// A correct early exit drops parser storage before returning transfer credit.
+#[cfg(unix)]
+struct ActiveRestoreCredit(Option<crate::durable_tail_store::ActiveLease>);
+#[cfg(unix)]
+impl ActiveRestoreCredit {
+    fn take(&mut self) -> Option<crate::durable_tail_store::ActiveLease> {
+        self.0.take()
+    }
+}
+#[cfg(unix)]
+impl Drop for ActiveRestoreCredit {
+    fn drop(&mut self) {
+        if let Some(lease) = self.0.take() {
+            lease.release();
+        }
+    }
+}
+
 /// The owed-key `DiscoveryRetention` of a `ScanIndex`, borrowing only its
 /// registered fields so the traversal can stay mutably borrowed.
 macro_rules! discovery_retention {
@@ -34201,6 +34219,8 @@ impl OwnedSourceScan {
                     }
                 };
                 #[cfg(unix)]
+                let mut preparation_lease = ActiveRestoreCredit(preparation_lease.take());
+                #[cfg(unix)]
                 if let Some((taken, receipt)) = taken.as_mut().zip(receipt.as_ref()) {
                     if let Some(owed) = taken.durable.take_owed() {
                         match context.cache.discharge_owed(owed, receipt) {
@@ -34557,14 +34577,23 @@ impl OwnedSourceScan {
                                                 index,
                                                 &interpretation,
                                                 |bytes| {
+                                                    #[cfg(test)]
+                                                let step =
+                                                    sampled_scan::test_hooks::active_restore_step(
+                                                        context, step, bytes,
+                                                    );
                                                     sampled_scan::reserve_active_restore(
                                                         context, &incoming, step, bytes,
                                                     )
                                                 },
                                             ),
-                                            Err(_) => {
-                                                sampled_scan::durable_tail::RestoreOutcome::Pending
-                                            }
+                                            Err(_) => context.cache.restore_resource_pending(
+                                                source,
+                                                "active_restore_descriptor",
+                                                &key,
+                                                incoming.parser.reader.reader.get_ref(),
+                                                index,
+                                            ),
                                         };
                                     parser = incoming.parser;
                                     restore
@@ -34586,7 +34615,7 @@ impl OwnedSourceScan {
                                         taken,
                                         lease,
                                     ) => {
-                                        preparation_lease = Some(lease);
+                                        preparation_lease.0 = Some(lease);
                                         restored_durable = restart_restore::enabled();
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
@@ -34773,6 +34802,9 @@ impl OwnedSourceScan {
                         // under its lease and take that Full without re-admission.
                         #[cfg(unix)]
                         if cap_full && restored_durable {
+                            if source == SnapshotSource::ClaudeCode {
+                                claude_request_census::retain_held(index, &candidate);
+                            }
                             drop(retained.take());
                             if let Some(lease) = preparation_lease.take() {
                                 lease.release();
@@ -34892,7 +34924,7 @@ impl OwnedSourceScan {
                             Err(rejected) => {
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
-                                let refusal = match rejected.refusal {
+                                let mut refusal = match rejected.refusal {
                                     sampled_jsonl::PreparationRefusal::Transient => None,
                                     sampled_jsonl::PreparationRefusal::NonTransient(reason) => {
                                         Some(reason)
@@ -34904,6 +34936,31 @@ impl OwnedSourceScan {
                                     {
                                         claude_request_census::retain_held(index, &candidate);
                                     }
+                                    #[cfg(unix)]
+                                    if restored_durable {
+                                        // Cold state need not fit retained admission. Preserve
+                                        // growth via native Full or the counted resource pace.
+                                        drop(taken);
+                                        if let Some(lease) = preparation_lease.take() {
+                                            lease.release();
+                                        }
+                                        restored_durable = false;
+                                        retained_offset = None;
+                                        if refusal.is_none() {
+                                            match context.cache.restore_resource_pending(source, "active_restore_prepare", &key,
+                                                parser.reader.reader.get_ref(), index) {
+                                                sampled_scan::durable_tail::RestoreOutcome::Miss(_) => {
+                                                    refusal = Some("active_restore_prepare");
+                                                    if source == SnapshotSource::Codex { resource_full_pending = refusal; }
+                                                }
+                                                _ => { pending!(); }
+                                            }
+                                        }
+                                        returned_refusal = refusal;
+                                    } else {
+                                        return_original!(taken, refusal);
+                                    }
+                                    #[cfg(not(unix))]
                                     return_original!(taken, refusal);
                                 }
                                 if restart_restore::enabled() && refusal.is_some() {
@@ -34989,7 +35046,9 @@ impl OwnedSourceScan {
                         }
                         #[cfg(unix)]
                         if restored_durable {
-                            active_restore_lease = preparation_lease.take();
+                            active_restore_lease = preparation_lease
+                                .take()
+                                .map(|lease| ActiveRestoreCredit(Some(lease)));
                         } else if let Some(lease) = preparation_lease.take() {
                             lease.release();
                         }
@@ -35224,9 +35283,7 @@ impl OwnedSourceScan {
             // The graph now belongs to OwnedActiveFile and its ordinary state
             // walk. Transfer credit is released only after that handoff.
             #[cfg(unix)]
-            if let Some(lease) = active_restore_lease.take() {
-                lease.release();
-            }
+            drop(active_restore_lease.take());
             if let Some(context) = sampling
                 .as_ref()
                 .filter(|_| source == SnapshotSource::Codex)

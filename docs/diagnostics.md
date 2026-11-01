@@ -1481,7 +1481,7 @@ Miss keys are fixed, content-free class labels. Dots below are part of the
 JSON class key, not extra nested objects:
 
 - `unavailable`, `no_entry`, `missing`;
-- `resource_full.{decode,cache_transit,stores_unavailable,input,cache_key,certificate_scope,rederive_unfunded}` records a growing-file resource refusal returning an ordinary Full miss; it grants no independent read permission;
+- `resource_full.{decode,active_restore_no_room,active_restore_descriptor,active_restore_prepare,stores_unavailable,input,cache_key,certificate_scope,rederive_unfunded}` records a growing-file resource refusal returning an ordinary Full miss; it grants no independent read permission;
 - `ineligible.{selection_cleared,history_owed,source,key,context,scope,generation_ahead,entry_changed}`;
 - `refused_record.{newer,unknown,undecodable,unbindable,corrupt,receipt_pending}`, `corrupt_body`;
 - `certificate_refused.{replaced,shrunk,same_size_edit,head_changed,boundary_changed,invalid_checkpoint,read_error}`;

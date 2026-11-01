@@ -48,6 +48,7 @@ pub(super) mod preparation_tests {
     type Hook = Box<dyn FnMut(&crate::transcript_cache::Taken<CachedJsonlReduction>) -> Result<()>>;
     thread_local! {
         static FAULT: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+        static REJECTION: std::cell::Cell<Option<PreparationRefusal>> = const { std::cell::Cell::new(None) };
         pub(super) static HEAP_REFUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     pub(super) fn check(
@@ -60,7 +61,16 @@ pub(super) mod preparation_tests {
                 .map_or(Ok(()), |fault| fault(taken))
         })
     }
+    pub(in crate::snapshots) fn reject_once(refusal: PreparationRefusal) {
+        REJECTION.with(|slot| slot.set(Some(refusal)));
+    }
+    pub(super) fn rejection() -> Option<PreparationRefusal> {
+        REJECTION.with(|slot| slot.take())
+    }
     pub(in crate::snapshots) fn set(hook: Option<Hook>) {
+        if hook.is_none() {
+            REJECTION.with(|slot| slot.set(None));
+        }
         FAULT.with(|fault| *fault.borrow_mut() = hook);
     }
     pub(in crate::snapshots) fn refuse_heap(value: bool) {
@@ -240,6 +250,13 @@ impl OwnedJsonlParser {
     ) -> std::result::Result<ReadMode, PrepareRejected> {
         #[cfg(test)]
         if let Some(original) = taken.as_ref() {
+            if let Some(refusal) = preparation_tests::rejection() {
+                return Err(PrepareRejected {
+                    error: anyhow::anyhow!("fixture preparation refusal"),
+                    taken,
+                    refusal,
+                });
+            }
             if let Err(error) = preparation_tests::check(original) {
                 return Err(PrepareRejected {
                     error,

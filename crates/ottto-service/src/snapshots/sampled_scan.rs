@@ -1097,8 +1097,6 @@ pub(super) fn reserve_active_restore(
     step: StepMeasure,
     bytes: usize,
 ) -> bool {
-    #[cfg(test)]
-    let step = test_hooks::active_restore_step(context, step, bytes);
     context_overhead(context)
         .zip(step.used)
         .and_then(|(overhead, used)| overhead.checked_add(used)?.checked_add(bytes))
@@ -2016,6 +2014,8 @@ pub(super) mod test_hooks {
         BeforeRestoredIdentity,
         /// Verification finished; before either active restore budget is used.
         BeforeActiveRestore,
+        BeforeRestoreDecode,
+        BeforeRestoreRederive,
         /// The first opened-object identity sample has actually been read.
         AfterIdentityHead,
         /// Content replay succeeded, before its final accepted-floor check.
@@ -2099,7 +2099,7 @@ pub(super) mod test_hooks {
     pub(in crate::snapshots) fn active_restore_room(room: Option<usize>) {
         ACTIVE_RESTORE_ROOM.with(|slot| slot.set(room));
     }
-    pub(super) fn active_restore_step(
+    pub(in crate::snapshots) fn active_restore_step(
         context: &super::Context,
         step: super::StepMeasure,
         bytes: usize,
