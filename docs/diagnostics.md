@@ -576,6 +576,13 @@ owed source (a Codex owed-residue set, a compressed hold) registers as one field
 plus its lines in `discovery_retention!`, `unverified` and `owes`; it adds no
 separate exemption.
 
+The `local_resources` stage `oversized_discovery_alarm` reports oversized debt
+per source, per page: `outstanding_file_count`, `outstanding_bytes` (last
+observed total size) and `first_seen_oversized_age_seconds` (oldest first-seen
+age in the current traversal). The row is omitted at zero outstanding files.
+Debt follows the existing traversal checkpoint lifetime. Older checkpoints
+without these scalars default bytes to zero and first-seen to load time.
+
 `counts.line_delivery_unselected` counts discovery skip decisions for the page's
 source: `age` (outside the backfill window, not held for verification and not
 withheld for an unresolved Claude account) and `size` (over the source's

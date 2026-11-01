@@ -31947,6 +31947,7 @@ impl OwnedSourceScan {
                 }
                 if let Some(traversal) = index.traversal.as_mut() {
                     traversal.counts.caps.drain(source.api_slug());
+                    oversized_discovery::alarm(source, &traversal.oversized_discovery);
                 }
                 let traversal_snapshot = index
                     .traversal
@@ -44015,6 +44016,7 @@ fn refresh_retained_codex_roster(
                     source,
                     &scan_root,
                     &path,
+                    metadata.len(),
                     &mut traversal.oversized_discovery,
                 );
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
@@ -44588,6 +44590,7 @@ fn advance_bounded_directory_traversal_with_budget(
                     source,
                     &directory.scan_root,
                     &path,
+                    metadata.len(),
                     &mut traversal.oversized_discovery,
                 );
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
@@ -44816,6 +44819,7 @@ fn candidate_from_traversal_path_at(
                 source,
                 &pending.scan_root,
                 &pending.path,
+                metadata.len(),
                 &mut census.oversized_discovery,
             );
             retention.note_withheld_oversized(source, &pending.path);
@@ -45153,7 +45157,13 @@ fn collect_recent_jsonl_files(
         // opened, keeping the scan's memory bounded without aborting it.
         if metadata.len() > max_jsonl_file_bytes(source) {
             census.oversized_file_count += 1;
-            oversized_discovery::record(source, scan_root, &path, &mut census.oversized_discovery);
+            oversized_discovery::record(
+                source,
+                scan_root,
+                &path,
+                metadata.len(),
+                &mut census.oversized_discovery,
+            );
             continue;
         }
         selection.insert(CandidateFile {
@@ -45576,6 +45586,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
                 source,
                 &candidate.scan_root,
                 &candidate.path,
+                candidate.size_bytes,
                 &mut census.oversized_discovery,
             );
             retention.note_withheld_oversized(source, &candidate.path);
