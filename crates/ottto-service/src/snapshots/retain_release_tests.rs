@@ -599,6 +599,7 @@ fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
         cache.insert(
             key(&fixture),
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint: taken.retained.checkpoint,
                 reduction: Some(taken.retained.state),
                 released: None,
@@ -1250,6 +1251,7 @@ fn u3_measured_repository_identity_is_the_finished_value() {
         "f".repeat(64),
         None,
         Some(u3_identity("measured")),
+        false,
     );
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].repository_hash.as_deref(), Some("hash-measured"));

@@ -989,7 +989,13 @@ fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
             .pending_directories
             .is_empty()
         {
-            advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, &mut index, 30, None);
+            advance_bounded_directory_traversal(
+                SnapshotSource::ClaudeCode,
+                &mut index,
+                30,
+                None,
+                None,
+            );
         }
         let counts = &index.traversal.as_ref().unwrap().counts;
         let decided = (
@@ -1033,7 +1039,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 30, None);
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 30, None, None);
     }
     unselected_page("codex");
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1054,6 +1060,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
             index.traversal.as_mut().unwrap(),
             30,
             discovery_retention!(index),
+            (&index.files).into(),
         );
         let counts = &index.traversal.as_ref().unwrap().counts;
         let decided = (
@@ -1090,7 +1097,7 @@ pub(in crate::snapshots) fn walk_all(index: &mut ScanIndex, days: u64) {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, index, days, None);
+        advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, index, days, None, None);
     }
 }
 
@@ -1217,6 +1224,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                     ..ScanIndex::default()
                 },
                 None,
+                None,
             ),
         )
         .map(|candidate| {
@@ -1267,7 +1275,12 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
 /// Gate counters are decisions, and overlapping owed arms count only once.
 #[test]
 fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    for (source, recovery_overlap) in [
+        (SnapshotSource::ClaudeCode, false),
+        (SnapshotSource::Codex, false),
+        (SnapshotSource::ClaudeCode, true),
+        (SnapshotSource::Codex, true),
+    ] {
         let root = Root::new("ld-grown-gates");
         let directory = root.projects().join("2026/10/01");
         fs::create_dir_all(&directory).unwrap();
@@ -1279,6 +1292,10 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
             let mut entry = super::tests::manifest_index_entry(None);
             entry.size_bytes = committed;
             assert!(!entry.has_unverified_source());
+            if recovery_overlap && name == "grown" {
+                entry.set_unverified_deadline(0);
+                assert!(entry.has_unverified_source());
+            }
             index.files.insert(local_index_key(&path(name)), entry);
         }
         // Both arms apply to the same reverted committed entry.
@@ -1306,7 +1323,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
             .pending_directories
             .is_empty()
         {
-            advance_bounded_directory_traversal(source, &mut index, 7, None);
+            advance_bounded_directory_traversal(source, &mut index, 7, None, None);
         }
         assert_eq!(candidates(&index), vec![path("grown"), path("held")]);
         assert_eq!(
@@ -1358,7 +1375,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 &mut census,
                 rfc3339_unix_seconds(NOW),
                 7,
-                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
             );
             assert_eq!(candidate.is_some(), retained, "candidate {name}");
             assert_eq!(
@@ -1367,6 +1384,13 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                     .contains(&local_index_key(&path(name))),
                 retained
             );
+            if recovery_overlap && name == "grown" {
+                assert_eq!(
+                    discovery_page(source.api_slug())["discovery_retained"],
+                    json!({"grown": 1}),
+                    "candidate counts growth once despite recovery"
+                );
+            }
             // Obtain a recent-window candidate independently so even the
             // rejected controls exercise the opened-object age gate.
             let candidate = candidate_from_traversal_path(
@@ -1380,9 +1404,37 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 &mut ScanCensus::default(),
                 None,
                 7,
-                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
             )
             .unwrap();
+            if recovery_overlap && name == "grown" {
+                assert!(
+                    discovery_page(source.api_slug())
+                        .get("discovery_retained")
+                        .is_none(),
+                    "recent candidate does not count growth"
+                );
+                assert!(open_and_identify_scan_candidate_with_rescue_at(
+                    source,
+                    candidate.clone(),
+                    &mut ScanCensus::default(),
+                    CandidateWindow {
+                        census_unix_seconds: rfc3339_unix_seconds(NOW),
+                        backfill_window_days: 7,
+                        retention: discovery_retention!(index),
+                        growth: None,
+                    },
+                    true,
+                    None,
+                )
+                .is_some());
+                assert!(
+                    discovery_page(source.api_slug())
+                        .get("discovery_retained")
+                        .is_none(),
+                    "caller verification rescue keeps its counter boundary"
+                );
+            }
             assert_eq!(
                 open_and_identify_scan_candidate(
                     source,
@@ -1396,6 +1448,13 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 retained,
                 "open {name}"
             );
+            if recovery_overlap && name == "grown" {
+                assert_eq!(
+                    discovery_page(source.api_slug())["discovery_retained"],
+                    json!({"grown": 1}),
+                    "open counts growth once despite recovery"
+                );
+            }
             if source == SnapshotSource::Codex {
                 assert_eq!(
                     codex_parent_outside_window(
@@ -1403,17 +1462,32 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                         &path(name),
                         &File::open(path(name)).unwrap(),
                         rfc3339_unix_seconds(NOW),
-                        7
+                        7,
+                        (&index.files).into(),
                     ),
                     !retained,
                     "Codex parent {name}"
                 );
+                if recovery_overlap && name == "grown" {
+                    assert_eq!(
+                        discovery_page(source.api_slug())["discovery_retained"],
+                        json!({"grown": 1}),
+                        "parent counts growth once despite recovery"
+                    );
+                }
             }
         }
         let expected = if source == SnapshotSource::Codex {
             6
         } else {
             4
+        };
+        // In the overlap case the grown key's per-gate events were drained above;
+        // the held key still contributes once at each of the same gates.
+        let expected = if recovery_overlap {
+            expected / 2
+        } else {
+            expected
         };
         assert_eq!(
             discovery_page(source.api_slug())["discovery_retained"],
@@ -1426,6 +1500,33 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 .is_none(),
             "page deltas drain to zero"
         );
+
+        if recovery_overlap && source == SnapshotSource::Codex {
+            // Make the indexed grown key newly visible to the retained roster.
+            index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .codex_rollout_paths
+                .remove(&local_index_key(&path("grown")));
+            File::open(&directory)
+                .unwrap()
+                .set_modified(UNIX_EPOCH)
+                .unwrap();
+            refresh_retained_codex_roster(
+                source,
+                index.traversal.as_mut().unwrap(),
+                7,
+                discovery_retention!(index),
+                (&index.files).into(),
+            );
+            assert!(candidates(&index).contains(&path("grown")));
+            assert_eq!(
+                discovery_page(source.api_slug())["discovery_retained"],
+                json!({"grown": 1}),
+                "roster counts growth once despite recovery"
+            );
+        }
     }
 }
 
@@ -1452,7 +1553,7 @@ fn codex_roster_retains_aged_indexed_growth() {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None);
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None, None);
     }
     discovery_page("codex");
     // Match the existing roster fixture's directory-change granularity.
@@ -1474,6 +1575,7 @@ fn codex_roster_retains_aged_indexed_growth() {
         index.traversal.as_mut().unwrap(),
         7,
         discovery_retention!(index),
+        (&index.files).into(),
     );
     assert!(candidates(&index).contains(&path));
     assert!(index
@@ -2210,7 +2312,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
                 &mut ScanCensus::default(),
                 rfc3339_unix_seconds(&at),
                 1_000,
-                &mut CandidateDiscovery::new(&mut active, None),
+                &mut CandidateDiscovery::new(&mut active, None, None),
             );
             assert!(
                 candidate.is_none(),

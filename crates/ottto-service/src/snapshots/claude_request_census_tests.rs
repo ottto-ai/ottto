@@ -463,6 +463,7 @@ fn census_unchanged_preserves_only_matching_verified_records() {
             record_claude_request_census(
                 &mut index,
                 ClaudeRequestCensusParse {
+                    held_index_keys: &BTreeSet::new(),
                     path,
                     index_key: &key,
                     source_file_fingerprint: &fingerprint,
@@ -1746,7 +1747,7 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
         &mut ScanCensus::default(),
         None,
         365,
-        &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
     )
     .unwrap();
     candidate.physical_identity = Some([metadata.dev(), metadata.ino()]);
@@ -1838,6 +1839,7 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
 #[cfg(unix)]
 #[test]
 fn held_original_production_exit_conserves_copy_money_while_committed_entry_unchanged() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let scratch = crate::test_scratch::ScratchDir::new("held-census-production");
     let root = scratch.join("projects");
@@ -2019,7 +2021,8 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
         };
         match arm {
             "cold" => {
-                assert_eq!(counts.durable_held, [0; 5]);
+                assert_eq!(counts.durable_held, [0; 9]);
+                assert_eq!(counts.durable_held[6], 0, "no pending receipt");
                 assert_eq!(copy_status, ClaudeCensusMemberStatus::SharesHash);
                 // Money conservation premise: a cold read of the unchanged
                 // original emits nothing new; its accepted body stands.
@@ -2063,5 +2066,116 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
     assert!(
         record.birth().is_some(),
         "macOS records carry an opened birth"
+    );
+}
+
+/// [money] paced restore residue prevents 35 day census retirement until catchup.
+#[test]
+fn paced_restore_residue_prevents_35_day_census_retirement_until_catchup() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    let scratch = crate::test_scratch::ScratchDir::new("census-paced-retention");
+    let root = scratch.join("projects");
+    census_write(
+        &root,
+        "paced.jsonl",
+        &[census_response(
+            "paced",
+            Some("req_paced"),
+            "msg_paced",
+            1,
+            10,
+        )],
+    );
+    let mut index = ScanIndex::default();
+    census_scan(&root, &mut index, "2026-10-29T09:00:00Z");
+    let key = census_key(&index, &root, "paced.jsonl");
+    let before = index
+        .claude_request_census_for_test()
+        .record_for_test(&key)
+        .unwrap();
+    assert_eq!(before.retired_for_test(), None);
+    let held = BTreeSet::from([key.clone()]);
+    claude_request_census::settle_claude_request_census_terminal(
+        &mut index,
+        &held,
+        &held,
+        "2027-03-01T09:00:00Z",
+    );
+    assert_eq!(
+        index
+            .claude_request_census_for_test()
+            .record_for_test(&key)
+            .unwrap()
+            .retired_for_test(),
+        None,
+        "paced unread residue retains exact hashes past 35 days"
+    );
+    claude_request_census::settle_claude_request_census_terminal(
+        &mut index,
+        &held,
+        &BTreeSet::new(),
+        "2027-03-01T09:00:00Z",
+    );
+    assert_eq!(
+        index
+            .claude_request_census_for_test()
+            .record_for_test(&key)
+            .unwrap()
+            .retired_for_test(),
+        Some(1),
+        "negative control: ordinary quiet retirement remains enabled after catch-up"
+    );
+}
+
+/// [money] native shrink requires exact committed census and opened object.
+#[test]
+#[cfg(unix)]
+fn native_shrink_requires_exact_committed_census_and_opened_object() {
+    use std::os::unix::fs::MetadataExt;
+    let scratch = crate::test_scratch::ScratchDir::new("census-native-shrink");
+    let root = scratch.join("projects");
+    census_write(
+        &root,
+        "shrink.jsonl",
+        &[census_response("shrink", Some("r"), "m", 1, 10)],
+    );
+    let mut index = ScanIndex::default();
+    census_scan(&root, &mut index, "2026-10-29T09:00:00Z");
+    let key = census_key(&index, &root, "shrink.jsonl");
+    let metadata = std::fs::metadata(&key).unwrap();
+    let physical = Some([metadata.dev(), metadata.ino()]);
+    let length = index.files[&key].size_bytes;
+    assert!(length > 0);
+    let proves = |index: &ScanIndex, length, physical| {
+        claude_request_census::proves_indexed_shrink(index, &key, length, physical)
+    };
+    assert!(proves(&index, length - 1, physical));
+    assert!(
+        !proves(&index, length, physical),
+        "no change, no permission"
+    );
+    assert!(
+        !proves(&index, length - 1, None),
+        "unknown object remains held"
+    );
+    assert!(
+        !proves(
+            &index,
+            length - 1,
+            Some([metadata.dev(), metadata.ino() ^ 1])
+        ),
+        "wrong object remains held"
+    );
+    let fingerprint = index.files[&key].source_file_fingerprint.clone();
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = "unbound".into();
+    assert!(
+        !proves(&index, length - 1, physical),
+        "stale original cannot grant Full"
+    );
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = fingerprint;
+    index.files.get_mut(&key).unwrap().modified_unix_seconds += 1;
+    assert!(
+        !proves(&index, length - 1, physical),
+        "wrong committed stamp remains held"
     );
 }

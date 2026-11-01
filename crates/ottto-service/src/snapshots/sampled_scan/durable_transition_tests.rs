@@ -24,13 +24,9 @@ struct M1 {
 impl M1 {
     fn old_writer(name: &str, pin: &str) -> Self {
         let mut c = corpus(name);
-        // A closed three-request start window gives a populated nested fold.
-        let text = [
-            line(ROOT, "r1", AT, 10),
-            line(ROOT, "r2", AT, 20),
-            line(ROOT, "r3", AT, 30),
-        ]
-        .concat();
+        // Stage 1 grows two accepted requests to the original three-request
+        // baseline. All stage-2 money expectations therefore stay unchanged.
+        let text = [line(ROOT, "r1", AT, 10), line(ROOT, "r2", AT, 20)].concat();
         let path = c.root(ROOT, &text);
         input_clock(&path);
         c.evidence(
@@ -44,7 +40,6 @@ impl M1 {
         assert_eq!(warm.modes, (1, 0, 0));
         warm.enrich(&c);
         warm.finish();
-        literal(&warm);
         let (status, bodies, _) = upload(&warm.scan.snapshots, &mut e2_progress(), ack);
         assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
         let result = RouteResult::emitted(Mode::ColdFull, SOURCE, bodies, &warm.scan.snapshots);
@@ -73,19 +68,20 @@ impl M1 {
         );
         let prior = disk.commit(&warm.cache, SOURCE, &mut warm.index);
         assert_eq!(disk.records(), 1, "native warm reduction must be persisted");
-        // Check the actual pinned main-writer v1 artifact without relabeling it.
+        // Install an archived body/old pin, relocating only its scratch-path key.
+        // M3 dispatches this as a missing reduction (Repin), not a restore.
+        // Only key/checksum relocation is allowed: this is a rebuild fixture.
         let key = fixture::local_key(&path);
-        // The writer binds the live post-save index. Loading `prior` clears
-        // runtime upload-context and projection inputs, so it is for restart,
-        // not for independently checking the artifact just written.
-        let old = fixture::seed_old_writer(&ram.cache, SOURCE, &key, &warm.index, pin);
+        let old = fixture::seed_old_writer(&ram.cache, SOURCE, &key, pin);
         assert_eq!(&old[..8], b"ottto-dt");
         assert_eq!(u16::from_le_bytes(old[8..10].try_into().unwrap()), 1);
         let old_bytes = disk.record_bytes();
         assert_eq!(old_bytes.values().next().unwrap(), &old);
-        fixture::arm_crashes();
-        fixture::reach(CrashPoint::OldWriter);
-        Self {
+        if std::env::var("OTTTO_TRANSITION_CRASH").as_deref() == Ok("OldWriter") {
+            fixture::arm_crashes();
+            fixture::reach(CrashPoint::OldWriter);
+        }
+        let mut driver = Self {
             c,
             disk,
             path,
@@ -95,7 +91,58 @@ impl M1 {
             pages: BTreeMap::new(),
             old_bytes,
             restarts: 0,
+        };
+        driver.grow("r3", 30);
+        let cold = driver.emit_bodies(Mode::ColdFull);
+        let rebuilt = driver.emit_bodies(Mode::DiskRestore);
+        assert_eq!(rebuilt.modes, (1, 0, 0), "one retired-pin rebuild Full");
+        assert_eq!(rebuilt.restored, 0, "v1 is never restored");
+        assert!(
+            !rebuilt.batches.is_empty(),
+            "the rebuild emits changed money"
+        );
+        money_oracle::assert_equivalent(&cold, &rebuilt);
+        let page = &driver.pages[&Mode::DiskRestore];
+        literal(page);
+        let counters = page.cache.durable_counters(SOURCE).unwrap().0;
+        assert_eq!(counters.upgrade_missing_full, 1);
+        assert_eq!(counters.resource_full.get("repin"), Some(&1));
+        driver.ram.cache = page.cache.clone();
+        driver.save_gc(Mode::DiskRestore);
+        // The actual native v3 successor, never an archived body relabelled v3.
+        driver.assert_current_predecessor();
+        let quiet = driver
+            .c
+            .raw(&driver.ram, driver.prior.clone(), 100, true, &[]);
+        assert_eq!(quiet.modes.0, 0, "a second pass cannot rebuild again");
+        assert_eq!(
+            quiet
+                .cache
+                .durable_counters(SOURCE)
+                .unwrap()
+                .0
+                .upgrade_missing_full,
+            1
+        );
+        driver.pages.clear();
+        fixture::arm_crashes();
+        driver
+    }
+
+    fn assert_current_predecessor(&self) {
+        assert_eq!(self.old_bytes.len(), 1);
+        for bytes in self.old_bytes.values() {
+            assert_eq!(
+                u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+                crate::durable_tail_store::FORMAT_V3
+            );
         }
+    }
+
+    // Counterfactual routes fork the same committed native predecessor. A
+    // prior route's pre-ACK native write must not seed the next route.
+    fn restore_predecessor(&self) {
+        fixture::native_cold::restore_records(&self.disk.index, &self.old_bytes);
     }
 
     fn grow(&self, request: &str, tokens: u64) {
@@ -107,14 +154,13 @@ impl M1 {
             fixture::reach(CrashPoint::BeforeRename);
             Ok(())
         })));
-        crate::durable_tail_store::test_hooks::set_before_dir_sync(Some(Box::new(|_| {
-            fixture::reach(CrashPoint::BeforeDirectorySync);
-            Ok(())
-        })));
     }
 }
 impl TransitionDriver for M1 {
     fn emit_bodies(&mut self, mode: Mode) -> RouteResult {
+        if mode != Mode::ColdFull {
+            self.restore_predecessor();
+        }
         let fresh;
         let scanner = match mode {
             Mode::Ram => {
@@ -135,6 +181,12 @@ impl TransitionDriver for M1 {
                 &fresh
             }
         };
+        let dir = crate::durable_tail_store::store_dir_for_index(&self.disk.index);
+        self.old_bytes = self
+            .old_bytes
+            .iter()
+            .map(|(path, bytes)| (dir.join(path.file_name().unwrap()), bytes.clone()))
+            .collect();
         let before = scanner
             .cache
             .durable_counters(SOURCE)
@@ -218,14 +270,20 @@ impl TransitionDriver for M1 {
             .expect("store pass began");
         assert_eq!(receipt.budget_refused, 0);
         assert_eq!(
-            receipt.written, 1,
-            "appended transition must write a real successor"
+            receipt.written, 0,
+            "native completion already wrote the successor"
+        );
+        let (_, native) = page.cache.durable_counters(SOURCE).unwrap();
+        assert!(
+            native.records_written >= 1,
+            "real native write, before ACK/index save"
         );
         fixture::reach(CrashPoint::Receipt);
         page.cache.durable_gc(writer, SOURCE, &page.index).unwrap();
         fixture::reach(CrashPoint::SaveGc);
         assert_eq!(self.disk.records(), 1);
         self.prior = ScanIndex::load(&self.disk.index).unwrap();
+        self.old_bytes = self.disk.record_bytes();
         for item in &page.scan.snapshots {
             self.accepted.insert(
                 item.source_session_id.clone(),
@@ -267,137 +325,103 @@ impl Drop for Hooks {
     fn drop(&mut self) {
         crate::durable_tail_store::test_hooks::set_before_rename(None);
         crate::durable_tail_store::test_hooks::set_before_dir_sync(None);
+        crate::durable_tail_store::test_hooks::set_write_failure(None);
     }
 }
 
+/// What a shared row body needs from a source's driver beyond its routes.
+pub(super) trait SharedSource: TransitionDriver {
+    /// Whether bounded head rederive reads through the native reader, so its
+    /// bytes are part of `io.consumed` (Claude), or by pread (Pi).
+    const HEAD_REDERIVE_CONSUMED: bool;
+    /// The session entity the row follows.
+    fn entity(&self) -> &str;
+    /// Appends billed growth number `n`; returns the bytes past the committed
+    /// extent.
+    fn append(&mut self, n: u64) -> u64;
+}
+impl SharedSource for M1 {
+    const HEAD_REDERIVE_CONSUMED: bool = true;
+    fn entity(&self) -> &str {
+        ROOT
+    }
+    fn append(&mut self, n: u64) -> u64 {
+        let old_size = self.prior.files[&fixture::local_key(&self.path)].size_bytes;
+        self.grow(&format!("r{}", 4 + n), 40 + n);
+        std::fs::metadata(&self.path).unwrap().len() - old_size
+    }
+}
+
+/// Three appended pages: every warm route reads only the Tail and equals cold
+/// Full; the restarted route's save is the next predecessor, across two
+/// restarts.
+pub(super) fn tail_routes_across_two_restarts<D: SharedSource>(f: &mut D) {
+    for page in 0..3 {
+        let tail_bytes = f.append(page);
+        assert!(tail_bytes > 0);
+        let cold = f.emit_bodies(Mode::ColdFull);
+        assert_eq!(cold.modes, (1, 0, 0));
+        assert!(!cold.batches.is_empty());
+        for mode in [Mode::Ram, Mode::DiskRestore, Mode::EvictRetry] {
+            let route = f.emit_bodies(mode);
+            assert_eq!(route.modes, (0, 1, 0), "page {page} {mode:?}");
+            if mode != Mode::Ram || page > 0 {
+                assert_eq!(route.restored, 1);
+            }
+            let head = if D::HEAD_REDERIVE_CONSUMED {
+                route.io.rederive_head
+            } else {
+                0
+            };
+            assert_eq!(
+                route.io.consumed,
+                tail_bytes + head,
+                "actual reader bytes = Tail + head rederive read through the reader"
+            );
+            money_oracle::assert_equivalent(&cold, &route);
+        }
+        let restart = f.emit_bodies(Mode::Restart);
+        assert_eq!(restart.restored, 1);
+        money_oracle::assert_no_smaller_reemit(f.entity(), &cold, &restart, &cold, false);
+        // Native completion writes before ACK; save reconciles it.
+        f.save_gc(Mode::Restart);
+        if page < 2 {
+            f.restart();
+        }
+    }
+}
+
+/// [money] shared old writer tail receipt gc and two restarts, for every
+/// Claude writer and for Pi (no old writer: its warm native receipt).
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_old_writer_tail_receipt_gc_and_two_restarts() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_transition") {
         return;
     }
     with_e2(|| {
         for pin in WRITERS {
             let mut f = M1::old_writer(&format!("transition-{pin}"), pin);
-            for (page, request) in ["r4", "r5", "r6"].iter().enumerate() {
-                let old_size = f.prior.files[&fixture::local_key(&f.path)].size_bytes;
-                f.grow(request, 40 + page as u64);
-                let tail_bytes = std::fs::metadata(&f.path).unwrap().len() - old_size;
-                assert!(tail_bytes > 0);
-                let cold = f.emit_bodies(Mode::ColdFull);
-                assert_eq!(cold.modes, (1, 0, 0));
-                assert!(!cold.batches.is_empty());
-                for mode in [Mode::Ram, Mode::DiskRestore, Mode::EvictRetry] {
-                    let route = f.emit_bodies(mode);
-                    assert_eq!(route.modes, (0, 1, 0), "{pin} {mode:?}");
-                    if mode != Mode::Ram || page > 0 {
-                        assert_eq!(route.restored, 1);
-                    }
-                    assert_eq!(
-                        route.io.consumed,
-                        tail_bytes + route.io.rederive_head,
-                        "actual reader bytes = Tail + separately counted M1 head rederive"
-                    );
-                    money_oracle::assert_equivalent(&cold, &route);
-                }
-                let restart = f.emit_bodies(Mode::Restart);
-                assert_eq!(restart.restored, 1);
-                money_oracle::assert_no_smaller_reemit(ROOT, &cold, &restart, &cold, false);
-                // Real store read must not have mutated the old record.
-                if page == 0 {
-                    assert_eq!(f.disk.record_bytes(), f.old_bytes);
-                }
-                f.save_gc(Mode::Restart);
-                if page < 2 {
-                    f.restart();
-                }
-            }
+            tail_routes_across_two_restarts(&mut f);
             assert_eq!(f.restarts, 2);
         }
     });
+    let mut pi = super::durable_transition_pi_tests::PiDriver::warm("transition-pi", &pi_seed());
+    tail_routes_across_two_restarts(&mut pi);
 }
 
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "M1 requires qualified native heap layout"
-)]
-fn shared_quiet_restart_discloses_m1_io_gap_instead_of_claiming_zero() {
-    if !supported("shared_quiet") {
-        return;
-    }
-    with_e2(|| {
-        let mut f = M1::old_writer("transition-quiet", WRITERS[0]);
-        let before = f.disk.record_bytes();
-        assert!(!f.prior.file_snapshot_fingerprints.is_empty());
-        assert!(!f.prior.snapshot_activity_at.is_empty());
-        f.prior.snapshot_activity_at.clear();
-        let quiet = f.emit_bodies(Mode::Restart);
-        assert_eq!(quiet.modes, (0, 0, 1));
-        assert_eq!(quiet.restored, 1);
-        // M1 re-fold may emit an unchanged body; neither this nor certificate
-        // I/O is silently treated as a zero-byte/no-POST release receipt.
-        assert!(quiet.io.cheap_checks.is_none());
-        assert!(quiet.io.other_reads.is_none());
-        assert!(
-            std::panic::catch_unwind(|| money_oracle::assert_quiet_restart_zero_bytes(&quiet))
-                .is_err()
-        );
-        assert_eq!(f.disk.record_bytes(), before);
-    });
-}
-
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "M1 requires qualified native heap layout"
-)]
-fn shared_selection_cleared_is_an_explicit_m1_gap_for_859() {
-    if !supported("shared_selection_clear") {
-        return;
-    }
-    with_e2(|| {
-        let mut f = M1::old_writer("transition-selection-clear", WRITERS[0]);
-        f.grow("r4", 40);
-        let cold = f.emit_bodies(Mode::ColdFull);
-        let key = fixture::local_key(&f.path);
-        assert!(!f.prior.files[&key].source_file_fingerprint.is_empty());
-        let accepted_witness = f.prior.files[&key].last_upload_body_witness.clone();
-        assert!(accepted_witness.is_some());
-        f.prior
-            .files
-            .get_mut(&key)
-            .unwrap()
-            .source_file_fingerprint
-            .clear();
-        let restored = f.emit_bodies(Mode::DiskRestore);
-        assert_eq!(
-            restored.modes,
-            (1, 0, 0),
-            "M1 baseline; 5b changes this to Tail"
-        );
-        assert_eq!(restored.restored, 0);
-        let counts = f.pages[&Mode::DiskRestore]
-            .cache
-            .durable_counters(SOURCE)
-            .unwrap()
-            .0;
-        assert_eq!(counts.ineligible.get("selection_cleared"), Some(&1));
-        money_oracle::assert_equivalent(&cold, &restored);
-        // 5b/a1 extension: assert 0 Full, restored=1, fresh-window census.
-        assert_eq!(f.disk.record_bytes(), f.old_bytes);
-    });
-}
-
+/// [money] shared unknown record holds last accepted body and survives gc.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_unknown_hold") {
         return;
     }
@@ -429,6 +453,7 @@ fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
         );
         f.prior = f.disk.commit(&warm.cache, SOURCE, &mut warm.index);
         assert_eq!(f.disk.records(), 2);
+        f.old_bytes = f.disk.record_bytes();
         append(&sibling, &line(SIBLING, "s2", AT, 80));
         input_clock(&sibling);
         let sibling_text = std::fs::read_to_string(&sibling).unwrap();
@@ -470,6 +495,7 @@ fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
         assert_eq!(sibling_item.request_count, sibling_requests + 1);
         unknown[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
         std::fs::write(&path, &unknown).unwrap();
+        f.old_bytes = f.disk.record_bytes();
         for _ in 0..5 {
             let held = f.emit_bodies(Mode::DiskRestore);
             assert_eq!(held.modes, (0, 1, 0));
@@ -493,12 +519,14 @@ fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
     });
 }
 
+/// [money] shared failed rename preserves predecessor and retry money.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_failed_rename_preserves_predecessor_and_retry_money() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_rename_retry") {
         return;
     }
@@ -506,30 +534,45 @@ fn shared_failed_rename_preserves_predecessor_and_retry_money() {
         let mut f = M1::old_writer("transition-failed-rename", WRITERS[0]);
         f.grow("r4", 40);
         let cold = f.emit_bodies(Mode::ColdFull);
+        let _hooks = Hooks;
+        let fault = fixture::fail_store_at(CrashPoint::BeforeRename, 1);
+        crate::durable_tail_store::test_hooks::set_write_failure(Some("native_cleanup"));
+        let held = f.emit_bodies(Mode::DiskRestore);
+        assert_eq!(fault.hits(), 1, "the real native commit reached rename");
+        money_oracle::assert_held(ROOT, &cold, &held, &cold);
+        assert!(
+            held.batches.is_empty(),
+            "a failed native barrier cannot POST"
+        );
+        assert_eq!(f.disk.record_bytes(), f.old_bytes);
+        let key = fixture::local_key(&f.path);
+        assert_eq!(
+            NativeAcceptedState::of(&f.pages[&Mode::DiskRestore].index, &key),
+            NativeAcceptedState::of(&f.prior, &key)
+        );
+        drop(fault);
+        crate::durable_tail_store::test_hooks::set_write_failure(None);
         let route = f.emit_bodies(Mode::DiskRestore);
         money_oracle::assert_equivalent(&cold, &route);
-        let _hooks = Hooks;
-        crate::durable_tail_store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
-            Err(std::io::Error::other("synthetic rename failure"))
-        })));
         let page = f.pages.get_mut(&Mode::DiskRestore).unwrap();
         page.index.save(&f.disk.index).unwrap();
-        let key = fixture::local_key(&f.path);
         let committed = NativeAcceptedState::of(&page.index, &key);
         assert!(!committed.accepted.is_empty());
         assert!(committed.group.is_some() && committed.body_witness.is_some());
         let effects_before = fixture::native_effects(&page.index, &page.scan);
         let writer = crate::locked_state_dir::held_for(&f.disk.index).unwrap();
-        assert!(page
-            .cache
-            .durable_write_after_save(writer, SOURCE, &page.index)
-            .is_none());
+        assert_eq!(
+            page.cache
+                .durable_write_after_save(writer, SOURCE, &page.index)
+                .expect("native receipt reconciliation")
+                .written,
+            0
+        );
         assert_eq!(
             fixture::native_effects(&page.index, &page.scan),
             effects_before
         );
-        assert_eq!(f.disk.record_bytes(), f.old_bytes);
-        crate::durable_tail_store::test_hooks::set_before_rename(None);
+        f.old_bytes = f.disk.record_bytes();
         // Select completed RAM under the actual saved post-ACK index; only
         // activity is missing. Neither money debt nor an ACK is fabricated.
         let mut scanner = E2ScanFixture::default();
@@ -602,18 +645,23 @@ fn shared_failed_rename_preserves_predecessor_and_retry_money() {
         f.grow("r5", 50);
         let cold = f.emit_bodies(Mode::ColdFull);
         let restarted = f.emit_bodies(Mode::Restart);
-        // deferred: M3 D3 store-fault work (E1) adds the deferred-key requeue after write_after_save failure (durable_tail.rs:1113–1125); current behaviour = predecessor preserved, refused by S2 floor on restart (one Full per restart, no money risk)
-        // counted by `store_write_failed_restart_full{files, bytes}` + 24 h alarm (ottto-ai/ottto#904, E1); requeue + restored==1 fixture: M3 D3 (E1)
+        assert_eq!(
+            restarted.modes.0, 0,
+            "the recovered native successor needs no Full"
+        );
+        assert_eq!(restarted.restored, 1);
         money_oracle::assert_equivalent(&cold, &restarted);
     });
 }
 
+/// [format] shared failed rename unacked retry resends identical body once.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(supported("shared_unacked_rename_retry"));
     with_e2(|| {
         let mut f = M1::old_writer("transition-unacked-rename", WRITERS[0]);
@@ -628,6 +676,7 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
             .disk
             .commit(&warm_page.cache, SOURCE, &mut warm_page.index);
         assert_eq!(f.disk.records(), 2);
+        f.old_bytes = f.disk.record_bytes();
         let key = fixture::local_key(&f.path);
         let sibling_key = fixture::local_key(&sibling);
         let prior_root_acks = f.prior.file_snapshot_fingerprints[&key].clone();
@@ -640,7 +689,37 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
         append(&sibling, &line(SIBLING, "s2", AT, 80));
         input_clock(&sibling);
         f.disk.begin(&f.ram, SOURCE);
+        let _hooks = Hooks;
+        let sibling_digest = crate::durable_tail_store::key_digest(
+            crate::durable_tail_store::DurableSource::ClaudeCode,
+            &sibling_key,
+        );
+        let sibling_name = sibling_digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + ".rec";
+        let rename_hits = std::rc::Rc::new(std::cell::Cell::new(0));
+        let hits = rename_hits.clone();
+        crate::durable_tail_store::test_hooks::set_before_rename(Some(Box::new(
+            move |_, target| {
+                if target.file_name().unwrap() == sibling_name.as_str() {
+                    hits.set(hits.get() + 1);
+                    Err(std::io::Error::other(
+                        "synthetic native sibling rename failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )));
         let mut attempt = f.c.raw(&f.ram, f.prior.clone(), 100, true, &[]);
+        assert_eq!(
+            rename_hits.get(),
+            1,
+            "real native sibling rename, before POST"
+        );
+        crate::durable_tail_store::test_hooks::set_before_rename(None);
         attempt.enrich(&f.c);
         let holds = attempt.finish();
         assert!(!holds.any());
@@ -693,8 +772,8 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
         assert!(first.snapshots.contains_key(SIBLING));
 
         // Native partial settlement keeps the old root, never an unACKed r4.
-        // The independently ACKed sibling supplies a real eligible record
-        // whose rename can fail AFTER the safe partial index save.
+        // The sibling's real native rename failed before either POST; partial
+        // index settlement still grants no acceptance to the failed root POST.
         let mut partial = attempt.index.committable_subset(
             &attempt.committed,
             &progress.accepted_fingerprints,
@@ -730,15 +809,12 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
         assert!(!fixture::accepted_fingerprints(&partial).contains(&root.snapshot_fingerprint));
         partial.save(&f.disk.index).unwrap();
         let before = fixture::native_effects(&partial, &attempt.scan);
-        let fault = fixture::fail_store_at(CrashPoint::BeforeRename, 1);
         let writer = crate::locked_state_dir::held_for(&f.disk.index).unwrap();
-        assert!(attempt
+        attempt
             .cache
             .durable_write_after_save(writer, SOURCE, &partial)
-            .is_none());
-        assert_eq!(fault.hits(), 1);
+            .expect("partial native receipt reconciliation");
         assert_eq!(fixture::native_effects(&partial, &attempt.scan), before);
-        drop(fault);
         assert!(!fixture::accepted_fingerprints(&partial).contains(&root.snapshot_fingerprint));
 
         let mut cold_page =
@@ -878,8 +954,10 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
 }
 
 /// Runs ONLY as a new test process. Every edge is checked by the parent.
+/// [format] shared transition crash child.
 #[test]
 fn shared_transition_crash_child() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if std::env::var_os("OTTTO_TRANSITION_CRASH").is_none() {
         return;
     }
@@ -903,16 +981,33 @@ fn shared_transition_crash_child() {
     panic!("requested crash point was never reached");
 }
 
+/// [format] shared transition crash edges reach sigkill and keep a valid survivor.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_crash") {
         return;
     }
-    for point in CrashPoint::ALL {
+    // M3 is plain flush: the retired M1 temp-write/file-fsync/dir-fsync
+    // rows have no corresponding boundary. Keep every real native/driver edge.
+    for point in [
+        CrashPoint::OldWriter,
+        CrashPoint::Restore,
+        CrashPoint::Tail,
+        CrashPoint::BeforeAck,
+        CrashPoint::AfterAck,
+        CrashPoint::BeforeIndexSave,
+        CrashPoint::AfterIndexSave,
+        CrashPoint::BeforeRename,
+        CrashPoint::Receipt,
+        CrashPoint::SaveGc,
+        CrashPoint::RestartOne,
+        CrashPoint::RestartTwo,
+    ] {
         let root = crate::test_scratch::private_dir("ottto-transition-crash");
         let marker = root.join("reached");
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -925,7 +1020,12 @@ fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
             .status()
             .unwrap();
         fixture::assert_child_killed(status, &marker, point);
-        let state = root.join("transition-crash-child/durable-state");
+        let mut state = root.join("transition-crash-child/durable-state");
+        // Disk::owner forks each independent native arm; inspect the actual
+        // newest survivor, not the archived ancestor left in an earlier fork.
+        while state.join("restart").is_dir() {
+            state = state.join("restart");
+        }
         let index = ScanIndex::load(&state.join("scan-index.json")).unwrap();
         assert!(!index.files.is_empty());
         let mut store = crate::durable_tail_store::DurableTailStore::new(
@@ -938,15 +1038,24 @@ fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
             1,
             "{point:?}: predecessor or successor survives"
         );
-        match store.read(inventory.iter().next().unwrap()) {
-            crate::durable_tail_store::ReadOutcome::Found(record) => {
-                assert_eq!(record.record.allowlist, fixture::allowlist_digest(SOURCE));
+        let digest = inventory.iter().next().unwrap();
+        if point == CrashPoint::OldWriter {
+            assert_eq!(store.missing_cause(digest), Some("repin"));
+            assert_eq!(
+                store.read(digest),
+                crate::durable_tail_store::ReadOutcome::Missing
+            );
+        } else {
+            match store.read(digest) {
+                crate::durable_tail_store::ReadOutcome::Found(record) => {
+                    assert_eq!(record.record.allowlist, fixture::allowlist_digest(SOURCE));
+                }
+                other => panic!("{point:?}: survivor not structurally verified: {other:?}"),
             }
-            other => panic!("{point:?}: survivor not structurally verified: {other:?}"),
         }
         // Restart the native pipeline over the actual survivor, then append.
-        // A post-index-save/pre-record crash may need M1's Full fallback; it
-        // must still emit current money, never the older record's smaller body.
+        // A crash may leave an un-ACKed native successor. Recovery must emit
+        // current money, never the smaller accepted predecessor's body.
         with_e2(|| {
             let base = root.join("transition-crash-child");
             let path = base.join("projects").join(format!("{ROOT}.jsonl"));
@@ -957,11 +1066,23 @@ fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
                 births: BTreeMap::from([(path.clone(), nanos("2026-08-02T07:00:00Z"))]),
             };
             grow(&path, "recovery-append", 90);
-            let disk = Disk::new(&c);
+            crate::locked_state_dir::test_locks::hold(&state);
+            let mut disk = Disk {
+                dir: state.clone(),
+                index: state.join("scan-index.json"),
+            };
             let mut cold = c.raw(&E2ScanFixture::default(), index.clone(), 100, true, &[]);
             let owner = disk.owner(SOURCE);
             let mut recovered = c.raw(&owner, index, 100, true, &[]);
             assert_eq!(cold.modes, (1, 0, 0));
+            assert!(recovered.modes.0 <= 1, "at most one recovery Full");
+            if point == CrashPoint::OldWriter {
+                assert_eq!(recovered.modes, (1, 0, 0), "retired survivor rebuilds once");
+                let counters = owner.cache.durable_counters(SOURCE).unwrap().0;
+                assert_eq!(counters.restored, 0);
+                assert_eq!(counters.upgrade_missing_full, 1);
+                assert_eq!(counters.resource_full.get("repin"), Some(&1));
+            }
             for page in [&mut cold, &mut recovered] {
                 page.enrich(&c);
                 page.finish();
@@ -975,18 +1096,34 @@ fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
                 &emission(Mode::ColdFull, &cold),
                 &emission(Mode::Restart, &recovered),
             );
+            recovered.index.record_accepted_snapshot_fingerprints(
+                &recovered
+                    .scan
+                    .snapshots
+                    .iter()
+                    .map(|s| s.snapshot_fingerprint.clone())
+                    .collect(),
+            );
+            disk.commit(&recovered.cache, SOURCE, &mut recovered.index);
+            assert!(disk
+                .record_bytes()
+                .values()
+                .all(|bytes| u16::from_le_bytes(bytes[8..10].try_into().unwrap())
+                    == crate::durable_tail_store::FORMAT_V3));
         });
-        // M1's ACK/index-save precede its write; a1 supplies write-ahead rows.
+        // Native writes precede POST/ACK; index save reconciles the receipt.
         std::fs::remove_dir_all(root).unwrap();
     }
 }
 
+/// [format] shared codex dated legacy and v2 receipts survive two restarts.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_codex") {
         return;
     }
@@ -996,7 +1133,7 @@ fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
         } else {
             "transition-codex-v2"
         });
-        let disk = Disk::new(&c);
+        let mut disk = Disk::new(&c);
         let path = c.root.join("rollout.jsonl");
         let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
             "payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}})
@@ -1068,12 +1205,14 @@ fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
     }
 }
 
+/// [money] shared money oracle reports each field and rejects false holds.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_money_oracle_reports_each_field_and_rejects_false_holds() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_oracle_controls") {
         return;
     }
@@ -1130,20 +1269,13 @@ fn shared_money_oracle_reports_each_field_and_rejects_false_holds() {
     });
 }
 
-/// First consumer: 24b observes the restored native state at the real EOF seam.
-/// Main still has the approved card-F content re-derivation: record it separately
-/// and leave the strict zero-old-byte target visibly unexecuted below.
+/// 24b observes version state at the real growth/EOF seam after a retired-pin
+/// rebuild, then tails the native successor through two committed restarts.
 struct Codex24b {
     c: Corpus,
     disk: Disk,
     prior: ScanIndex,
     pages: BTreeMap<Mode, (E2ScanFixture, ScanIndex)>,
-    observations: BTreeMap<Mode, Codex24bObservation>,
-}
-
-struct Codex24bObservation {
-    raw: Vec<SnapshotItem>,
-    semantic_noops: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1176,13 +1308,30 @@ impl TransitionDriver for Codex24b {
         } else {
             self.disk.owner(source)
         };
+        if mode != Mode::ColdFull
+            && self
+                .disk
+                .record_bytes()
+                .values()
+                .any(|bytes| u16::from_le_bytes(bytes[8..10].try_into().unwrap()) == 1)
+        {
+            let ds = crate::durable_tail_store::DurableSource::Codex;
+            let mut store = crate::durable_tail_store::DurableTailStore::new(
+                crate::durable_tail_store::store_dir_for_index(&self.disk.index),
+                ds,
+            );
+            assert_eq!(
+                store.missing_cause(&crate::durable_tail_store::key_digest(
+                    ds,
+                    &fixture::local_key(&self.c.root.join("rollout.jsonl"))
+                )),
+                Some("repin"),
+                "restart must still contain the exact retired writer before scan"
+            );
+        }
         scanner.versions = Some(feed.clone());
-        let mut raw = Vec::new();
-        let ((index, scan, modes), consumed) = fixture::observe_consumed(|| {
-            other_page_observing_raw(&self.c, &scanner, source, self.prior.clone(), |items| {
-                raw = items.to_vec();
-            })
-        });
+        let ((mut index, scan, modes), consumed) =
+            fixture::observe_consumed(|| other_page(&self.c, &scanner, source, self.prior.clone()));
         let (sample, observed, rejected) = feed.snapshot();
         let sample = sample.expect("production EOF observes restored SessionStartState");
         assert_eq!(sample.version(), Some("0.148.9"));
@@ -1192,13 +1341,24 @@ impl TransitionDriver for Codex24b {
         );
         assert_eq!((observed, rejected), (1, 0));
         crate::mcp_inventory::transition_fixture::assert_version(&self.c.base, &feed, "0.148.9");
-        // Missing activity selects a file but does not revoke its accepted
-        // body witness. Finalization suppresses an unchanged body, so record
-        // actual zero emission rather than constructing an empty upload.
+        // Retain the emitted Codex wire, and settle only its exact ACK before
+        // saving the native successor's index. No accepted receipt is invented.
         let bodies = if scan.snapshots.is_empty() {
             Vec::new()
         } else {
-            vec![other_wire(source, &scan)]
+            let bytes = other_wire(source, &scan);
+            let mut typed = request(&scan.snapshots);
+            typed.source = source.api_slug().into();
+            let response = ack(&scan.snapshots).unwrap();
+            response.validate_entity_ack(&typed).unwrap();
+            index.record_accepted_snapshot_fingerprints(
+                &scan
+                    .snapshots
+                    .iter()
+                    .map(|s| s.snapshot_fingerprint.clone())
+                    .collect(),
+            );
+            vec![bytes]
         };
         let mut result = RouteResult::emitted(mode, source, bodies, &scan.snapshots);
         result.modes = modes;
@@ -1210,13 +1370,6 @@ impl TransitionDriver for Codex24b {
             result.io.rederive_named = counters.rederive_line_bytes;
         }
         result.codex_evidence = fixture::codex_evidence(&index, &scan);
-        self.observations.insert(
-            mode,
-            Codex24bObservation {
-                raw,
-                semantic_noops: scan.semantic_noop_count,
-            },
-        );
         self.pages.insert(mode, (scanner, index));
         result
     }
@@ -1229,12 +1382,11 @@ impl TransitionDriver for Codex24b {
     }
     fn restart(&mut self) {
         self.pages.clear();
-        self.observations.clear();
         self.prior = ScanIndex::load(&self.disk.index).unwrap();
     }
 }
 
-fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
+fn codex_24b_old_writer_row() {
     let mut c = corpus("transition-codex-24b");
     c.root = c.base.join(".codex/sessions");
     std::fs::create_dir_all(&c.root).unwrap();
@@ -1245,7 +1397,7 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         + "\n";
     std::fs::write(&path, header + &codex_rows("initial", 10)).unwrap();
     input_clock(&path);
-    let disk = Disk::new(&c);
+    let mut disk = Disk::new(&c);
     let source = SnapshotSource::Codex;
     let _cutover = crate::snapshots::TestCutover::set(0);
     let writer = disk.owner(source);
@@ -1264,7 +1416,6 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         &writer.cache,
         source,
         &fixture::local_key(&path),
-        &index,
         WRITERS[0],
     );
     assert_eq!(disk.record_bytes().values().next().unwrap(), &old);
@@ -1274,8 +1425,35 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         disk,
         prior,
         pages: BTreeMap::new(),
-        observations: BTreeMap::new(),
     };
+    append(&path, &codex_rows("golden-rebuild", 5));
+    input_clock(&path);
+    let cold = driver.emit_bodies(Mode::ColdFull);
+    let rebuilt = driver.emit_bodies(Mode::DiskRestore);
+    assert_eq!(rebuilt.modes, (1, 0, 0));
+    assert_eq!(rebuilt.restored, 0, "the archived v1 is never restored");
+    assert!(!rebuilt.batches.is_empty());
+    money_oracle::assert_equivalent(&cold, &rebuilt);
+    let counters = driver.pages[&Mode::DiskRestore]
+        .0
+        .cache
+        .durable_counters(source)
+        .unwrap()
+        .0;
+    // The public projection zeros this Claude-only scalar for Codex. Repin
+    // owns its named cause, not Q11's retail-exhaustion recovery counter.
+    // The mode above and dedicated cause below both require exactly one Full.
+    assert_eq!(counters.upgrade_missing_full, 0);
+    assert_eq!(counters.retail_full, [0; 3]);
+    assert_eq!(counters.resource_full.get("repin"), Some(&1));
+    driver.save_gc(Mode::DiskRestore);
+    assert!(driver
+        .disk
+        .record_bytes()
+        .values()
+        .all(|bytes| u16::from_le_bytes(bytes[8..10].try_into().unwrap())
+            == crate::durable_tail_store::FORMAT_V3));
+    driver.restart();
     for restart in 0..2 {
         let suffix = codex_rows(&format!("appended-{restart}"), 20 + restart);
         assert!(!suffix.contains("session_meta"));
@@ -1291,17 +1469,10 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         assert_eq!(tail.modes, (0, 1, 0));
         assert_eq!(tail.restored, 1);
         assert_eq!(tail.io.rederive_named, 0);
-        assert_eq!(
-            tail.io.consumed,
-            suffix.len() as u64 + tail.io.rederive_head
-        );
+        // Stream consumption excludes the separately counted bounded header replay.
+        assert_eq!(tail.io.consumed, suffix.len() as u64);
+        assert!(tail.io.rederive_head > 0);
         assert!(tail.io.rederive_head <= old_size);
-        if require_zero_old_bytes {
-            assert_eq!(
-                tail.io.rederive_head, 0,
-                "card-F zero-byte target remains unmet"
-            );
-        }
         money_oracle::assert_equivalent(&cold, &tail);
         driver.save_gc(Mode::DiskRestore);
         let key = fixture::local_key(&path);
@@ -1310,102 +1481,158 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         assert!(committed.group.is_some() && committed.body_witness.is_some());
         driver.restart();
         assert_eq!(NativeAcceptedState::of(&driver.prior, &key), committed);
-        // Select the unchanged file for EOF version observation without
-        // changing its replay binding or accepted money. Give BOTH the cold
-        // reference and restored arm this same post-commit selection input.
-        assert!(!driver.prior.file_snapshot_fingerprints.is_empty());
-        assert!(!driver.prior.snapshot_activity_at.is_empty());
-        driver.prior.snapshot_activity_at.clear();
-        let quiet_cold = driver.emit_bodies(Mode::ColdFull);
-        assert_eq!(quiet_cold.modes, (1, 0, 0));
-        assert_eq!(quiet_cold.restored, 0);
-        assert!(
-            quiet_cold.snapshots.is_empty(),
-            "accepted body is unchanged"
-        );
-        assert!(quiet_cold.batches.is_empty());
-        assert_eq!(quiet_cold.snapshots.len(), 0);
-        assert_eq!(quiet_cold.batches.len(), 0);
-        let quiet = driver.emit_bodies(Mode::Restart);
-        assert_eq!(quiet.modes, (0, 0, 1));
-        assert_eq!(quiet.restored, 1);
-        assert_eq!(quiet.io.rederive_named, 0);
-        assert_eq!(quiet.io.consumed, quiet.io.rederive_head);
-        // The successor's opening-window mark can advance into this suffix.
-        assert!(quiet.io.rederive_head <= old_size + suffix.len() as u64);
-        if require_zero_old_bytes {
-            assert_eq!(quiet.io.consumed, 0);
-        }
+        // M3's unchanged restart performs no acquisition/body decode. The
+        // M1 raw-restored-EOF/version-observation subarm has no M3 equivalent.
+        let owner = driver.disk.owner(source);
+        let (quiet_index, quiet, modes) =
+            other_page(&driver.c, &owner, source, driver.prior.clone());
+        assert_eq!(modes.0, 0);
         assert!(
             quiet.snapshots.is_empty(),
             "quiet EOF must not re-emit money"
         );
-        assert!(quiet.batches.is_empty());
-        assert_eq!(quiet.snapshots.len(), 0);
-        assert_eq!(quiet.batches.len(), 0);
-        // Mirror #870: prove native bodies exist before finalization, every
-        // item was suppressed specifically as a semantic no-op, and the
-        // committed ACK/group/body witnesses survive on BOTH independent arms.
-        let mut raw_bodies = BTreeMap::new();
-        for mode in [Mode::ColdFull, Mode::Restart] {
-            let observation = &driver.observations[&mode];
-            assert!(!observation.raw.is_empty(), "{mode:?}: native body exists");
-            assert_eq!(
-                observation.semantic_noops,
-                observation.raw.len(),
-                "{mode:?}: every raw item was suppressed as a semantic no-op"
-            );
-            let bodies = observation
-                .raw
-                .iter()
-                .map(|item| {
-                    assert!(item.request_count > 0);
-                    (
-                        item.source_session_id.clone(),
-                        serde_json::to_value(item).unwrap(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-            assert_eq!(bodies.len(), observation.raw.len(), "unique raw entities");
-            raw_bodies.insert(mode, bodies);
-            assert_eq!(
-                NativeAcceptedState::of(&driver.pages[&mode].1, &key),
-                committed,
-                "{mode:?}: native accepted/group/body witnesses unchanged"
-            );
-        }
-        let cold_raw = &raw_bodies[&Mode::ColdFull];
-        let restored_raw = &raw_bodies[&Mode::Restart];
+        let (status, batches, _) = upload(&quiet.snapshots, &mut e2_progress(), |_| {
+            panic!("quiet restart must not POST")
+        });
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        assert!(batches.is_empty());
+        assert_eq!(NativeAcceptedState::of(&quiet_index, &key), committed);
         assert_eq!(
-            cold_raw.keys().collect::<Vec<_>>(),
-            restored_raw.keys().collect::<Vec<_>>()
+            owner
+                .cache
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .upgrade_missing_full,
+            0
         );
-        for (entity, cold_body) in cold_raw {
-            for field in money_oracle::FIELDS {
-                assert_eq!(
-                    cold_body[*field], restored_raw[entity][*field],
-                    "raw entity/{entity}/{field}"
-                );
-            }
-        }
-        // quiet arm: empty finalized set is the expected outcome; money proof is the raw FIELDS equality (a) + zero-entity/zero-batch asserts on both arms
-        driver.save_gc(Mode::Restart);
     }
 }
 
+/// [format] shared 24b old writer restored version tail and unchanged restart twice.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "M1 requires qualified native heap layout"
 )]
 fn shared_24b_old_writer_restored_version_tail_and_unchanged_restart_twice() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(supported("shared_24b"));
-    codex_24b_old_writer_row(false);
+    codex_24b_old_writer_row();
 }
 
+/// M3 uses the shared native pipeline and its single money oracle. Each
+/// comparison arm starts from the same accepted index and exact predecessor,
+/// rather than letting an earlier arm's pre-ACK write seed a later arm.
+struct M3 {
+    inner: M1,
+}
+impl M3 {
+    fn old_writer(name: &str) -> Self {
+        Self {
+            inner: M1::old_writer(name, WRITERS[0]),
+        }
+    }
+}
+impl TransitionDriver for M3 {
+    fn emit_bodies(&mut self, mode: Mode) -> RouteResult {
+        let reached = std::rc::Rc::new(std::cell::Cell::new(0_u64));
+        let _native_observer = if mode != Mode::ColdFull {
+            let index = if matches!(mode, Mode::DiskRestore | Mode::Restart) {
+                self.inner.disk.dir.join("restart/scan-index.json")
+            } else {
+                self.inner.disk.index.clone()
+            };
+            let dir = crate::durable_tail_store::store_dir_for_index(&index);
+            let paths: Vec<_> = self
+                .inner
+                .old_bytes
+                .iter()
+                .map(|(path, bytes)| (dir.join(path.file_name().unwrap()), bytes.clone()))
+                .collect();
+            let reached = reached.clone();
+            // Actual native settlement, before cursor/body/index effects and
+            // before the existing pipeline can construct a POST or ACK it.
+            Some(fixture::NativeEffectsObserver::new(move || {
+                for (path, predecessor) in &paths {
+                    let bytes = std::fs::read(path).unwrap();
+                    assert_ne!(
+                        &bytes, predecessor,
+                        "native successor must replace its actual predecessor before effects"
+                    );
+                    assert_eq!(&bytes[..8], b"ottto-dt");
+                    assert_eq!(
+                        u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+                        crate::durable_tail_store::FORMAT_V3,
+                        "the native v3 successor already exists before effects/ACK"
+                    );
+                }
+                reached.set(reached.get() + 1);
+            }))
+        } else {
+            None
+        };
+        let result = self.inner.emit_bodies(mode);
+        if mode != Mode::ColdFull {
+            assert_eq!(reached.get(), 1, "one actual native pre-ACK settlement");
+            let page = &self.inner.pages[&mode];
+            let (_, store) = page.cache.durable_counters(SOURCE).unwrap();
+            assert!(store.records_written >= 1);
+            assert_eq!(store.receipt_pending_records, 0);
+        }
+        result
+    }
+
+    fn save_gc(&mut self, mode: Mode) {
+        self.inner.save_gc(mode);
+        self.inner.assert_current_predecessor();
+    }
+
+    fn restart(&mut self) {
+        self.inner.restart();
+    }
+}
+
+/// [money] shared m3 native receipt precedes ack and five routes match money.
 #[test]
-#[cfg(target_os = "macos")]
-#[ignore = "needs card-F retirement: main v1 restore re-derives SessionStartState prelude (DoD 6)"]
-fn shared_24b_old_writer_zero_old_bytes_target() {
-    codex_24b_old_writer_row(true);
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "M3 native retained transitions require qualified heap layout"
+)]
+fn shared_m3_native_receipt_precedes_ack_and_five_routes_match_money() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("shared_m3_native") {
+        return;
+    }
+    with_e2(|| {
+        let mut driver = M3::old_writer("shared-m3-native");
+        driver.inner.grow("r4", 40);
+        let cold = driver.emit_bodies(Mode::ColdFull);
+        assert!(!cold.batches.is_empty());
+        for mode in [
+            Mode::Ram,
+            Mode::DiskRestore,
+            Mode::EvictRetry,
+            Mode::Restart,
+        ] {
+            if mode == Mode::Restart {
+                driver.restart();
+            }
+            let actual = driver.emit_bodies(mode);
+            money_oracle::assert_equivalent(&cold, &actual);
+            assert_eq!(
+                actual.modes.0, 0,
+                "{mode:?}: no Full after a valid predecessor"
+            );
+        }
+        driver.save_gc(Mode::Restart);
+        driver.restart();
+        driver.inner.grow("r5", 50);
+        let cold = driver.emit_bodies(Mode::ColdFull);
+        let restarted = driver.emit_bodies(Mode::Restart);
+        money_oracle::assert_equivalent(&cold, &restarted);
+        assert_eq!(restarted.modes.0, 0);
+        assert_eq!(restarted.restored, 1);
+        driver.save_gc(Mode::Restart);
+    });
 }

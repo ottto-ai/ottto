@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 import tempfile
 
-from money_equivalence import (decode_receipt, has_forbidden_diff, receipt_diff,
-                               require_base_scan_fixture)
+from money_equivalence import (PI_FIXTURES, check_pi_capability, decode_receipt,
+                               has_forbidden_diff, receipt_diff, require_base_scan_fixture)
 
 
 CONTRACT = "usage_decrease_hold_ack_contract"
@@ -337,9 +337,22 @@ class MoneyEquivalenceTests(unittest.TestCase):
         for private in ("cost", "total_cost_usd", "PRIVATE_BEFORE", "PRIVATE_AFTER"):
             self.assertNotIn(private, json.dumps(self.compare()))
 
+    def test_empty_pages_remain_distinct_from_emitted_envelopes(self):
+        """[regress] Empty Pi pages were rejected by the receipt decoder."""
+        empty = receipt([], claude=False)
+        self.assertEqual(decode_receipt(empty), ([[]], set()))
+        self.assertFalse(has_forbidden_diff(receipt_diff(empty, empty)))
+        emitted = receipt(self.base, claude=False)
+        for left, right in ((empty, emitted), (emitted, empty)):
+            with self.subTest(empty_on_left=left == empty):
+                diff = receipt_diff(left, right)
+                self.assertTrue(has_forbidden_diff(diff))
+                self.assertEqual(diff["changed"], ["/0"])
+
     def test_invalid_receipts_fail_closed_without_values(self):
+        """[format] Malformed receipts refuse without exposing their values."""
         for invalid in (b'[]', b'{}', b'[[true]]', b'[[256]]', b'[[255]]',
-                        b'[[123]]', json.dumps([encode([])]),
+                        b'[[123]]',
                         json.dumps([encode([encode(42)])]),
                         json.dumps([list(b'{"x":1,"x":2}')]),
                         json.dumps([list(b'{"x":NaN}')]),
@@ -370,6 +383,27 @@ class TransplantTests(unittest.TestCase):
             fixture.unlink()
             with self.assertRaises(FileNotFoundError):
                 require_base_scan_fixture(base)
+
+
+def pi_capabilities(status):
+    return [(name, status) for name in PI_FIXTURES]
+
+
+class PiCapabilityTests(unittest.TestCase):
+    def test_base_without_durable_pi_compares_and_head_must_support_it(self):
+        """[behaviour] A base that predates durable Pi reports UNSUPPORTED."""
+        check_pi_capability("base", pi_capabilities("UNSUPPORTED"))
+        with self.assertRaisesRegex(RuntimeError, "invalid head Pi capability"):
+            check_pi_capability("head", pi_capabilities("UNSUPPORTED"))
+
+    def test_base_with_durable_pi_compares_and_mixed_support_fails(self):
+        """[behaviour] A base cut after durable Pi reports SUPPORTED."""
+        check_pi_capability("base", pi_capabilities("SUPPORTED"))
+        check_pi_capability("head", pi_capabilities("SUPPORTED"))
+        mixed = pi_capabilities("SUPPORTED")
+        mixed[0] = (mixed[0][0], "UNSUPPORTED")
+        with self.assertRaisesRegex(RuntimeError, "invalid base Pi capability"):
+            check_pi_capability("base", mixed)
 
 
 if __name__ == "__main__":

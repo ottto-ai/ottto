@@ -218,17 +218,78 @@ impl<R: Read> Drop for BoundedDecoder<R> {
 /// validation. Compressed input exposes decoded bytes, but never a seek API:
 /// sampled plain-file offsets cannot be applied to compressed data. Method
 /// names match the `BufReader<File>` calls the parser already makes.
+#[allow(clippy::large_enum_variant)] // Keep main's inline Plain buffer; M3 custody allocates only ON.
 pub(super) enum OpenedInput {
     Plain(BufReader<File>),
+    Durable(Box<BufReader<NativeFile>>),
     Compressed(
         Box<BufReader<BoundedDecoder<File>>>,
         Option<super::sampled_scan::codex_cursor::DecoderOwner>,
     ),
 }
 
+pub(super) struct NativeFile {
+    file: File,
+    custody: super::DurableCustody,
+}
+impl Read for NativeFile {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        if let Some(attempt) = self.custody.retail_mut() {
+            return attempt.read(&mut self.file, bytes);
+        }
+        let read = self.file.read(bytes);
+        #[cfg(all(test, unix))]
+        super::sampled_scan::durable_tail::tests::a0h_record_read(&read);
+        read
+    }
+}
+impl io::Seek for NativeFile {
+    fn seek(&mut self, at: io::SeekFrom) -> io::Result<u64> {
+        self.file.seek(at)
+    }
+}
+
 impl OpenedInput {
     pub(super) fn plain(file: File) -> Self {
-        Self::Plain(BufReader::new(file))
+        if super::restart_restore::enabled() {
+            Self::Durable(Box::new(BufReader::new(NativeFile {
+                file,
+                custody: Default::default(),
+            })))
+        } else {
+            Self::Plain(BufReader::new(file))
+        }
+    }
+
+    pub(super) fn take_durable(&mut self) -> super::DurableCustody {
+        match self {
+            Self::Durable(reader) => std::mem::take(&mut reader.get_mut().custody),
+            Self::Plain(_) | Self::Compressed(..) => Default::default(),
+        }
+    }
+    pub(super) fn accepts_durable(&self) -> bool {
+        match self {
+            Self::Plain(_) => true,
+            Self::Durable(reader) => reader.get_ref().custody.is_empty(),
+            Self::Compressed(..) => false,
+        }
+    }
+    pub(super) fn put_durable(&mut self, durable: super::DurableCustody) {
+        match self {
+            Self::Plain(_) if durable.is_empty() => {}
+            Self::Durable(reader) if reader.get_ref().custody.is_empty() => {
+                reader.get_mut().custody = durable
+            }
+            _ => unreachable!("validated empty Plain owner"),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn put_retail(&mut self, attempt: super::sampled_scan::durable_tail::RetailAttempt) {
+        if let Self::Durable(reader) = self {
+            reader.get_mut().custody.put_retail(attempt);
+        }
     }
 
     /// `credit` must cover `compressed_input_credit()`. `decoded_limit` is the
@@ -283,6 +344,7 @@ impl OpenedInput {
     pub(super) fn get_ref(&self) -> &File {
         match self {
             Self::Plain(reader) => reader.get_ref(),
+            Self::Durable(reader) => &reader.get_ref().file,
             Self::Compressed(reader, _) => reader.get_ref().input.get_ref(),
         }
     }
@@ -290,6 +352,7 @@ impl OpenedInput {
     pub(super) fn get_mut(&mut self) -> &mut File {
         match self {
             Self::Plain(reader) => reader.get_mut(),
+            Self::Durable(reader) => &mut reader.get_mut().file,
             Self::Compressed(reader, _) => reader.get_mut().input.get_mut(),
         }
     }
@@ -297,6 +360,7 @@ impl OpenedInput {
     pub(super) fn buffer(&self) -> &[u8] {
         match self {
             Self::Plain(reader) => reader.buffer(),
+            Self::Durable(reader) => reader.buffer(),
             Self::Compressed(reader, _) => reader.buffer(),
         }
     }
@@ -304,9 +368,24 @@ impl OpenedInput {
     /// Funded decoder memory is charged by its outstanding SharedCache claim.
     /// Unfunded synthetic input charges its box, buffer and full decoder credit;
     /// plain input charges only its buffer.
+    pub(super) fn custody_heap_bound(
+        &self,
+        c: &mut crate::heap_layout_bound::Counter,
+    ) -> Option<()> {
+        use crate::heap_layout_bound::HeapLayoutBound;
+        if let Self::Durable(reader) = self {
+            reader.get_ref().custody.heap_bound(c)?;
+        }
+        Some(())
+    }
+
     pub(super) fn capacity(&self) -> usize {
         match self {
             Self::Plain(reader) => reader.capacity(),
+            Self::Durable(reader) => reader
+                .capacity()
+                .saturating_add(size_of::<BufReader<NativeFile>>())
+                .saturating_add(std::mem::align_of::<BufReader<NativeFile>>()),
             Self::Compressed(_, Some(_)) => 0, // existing outstanding cache reservation
             Self::Compressed(reader, _) => {
                 let boxed = size_of::<BufReader<BoundedDecoder<File>>>();
@@ -322,6 +401,7 @@ impl Read for OpenedInput {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Plain(reader) => reader.read(output),
+            Self::Durable(reader) => reader.read(output),
             Self::Compressed(reader, _) => reader.read(output),
         }
     }
@@ -331,6 +411,7 @@ impl BufRead for OpenedInput {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         match self {
             Self::Plain(reader) => reader.fill_buf(),
+            Self::Durable(reader) => reader.fill_buf(),
             Self::Compressed(reader, _) => reader.fill_buf(),
         }
     }
@@ -338,6 +419,7 @@ impl BufRead for OpenedInput {
     fn consume(&mut self, amount: usize) {
         match self {
             Self::Plain(reader) => reader.consume(amount),
+            Self::Durable(reader) => reader.consume(amount),
             Self::Compressed(reader, _) => reader.consume(amount),
         }
     }

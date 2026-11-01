@@ -846,6 +846,12 @@ impl ReadPlan {
             scope,
             now,
             |at| {
+                #[cfg(test)]
+                if OLD_SAMPLE_IO_ERROR.with(std::cell::Cell::get) {
+                    return Err(io::Error::other(
+                        "injected persistent old-checkpoint sample I/O",
+                    ));
+                }
                 let old = checkpoint.expect("samples are compared only with a checkpoint");
                 match at {
                     SampleAt::Head => sample_at(file, 0, &old.samples.head, &mut guard_bytes_read),
@@ -1576,7 +1582,7 @@ impl DurableCertificate {
     /// FD; the caller's read plan positions it again before any native read.
     #[cfg(test)]
     pub(crate) fn admits(&self, file: &mut File) -> Result<DurableAdmission, FullReason> {
-        self.admit_samples(file)
+        self.admit_samples(file, false)
             .map(|(admission, ..)| admission)
             .map_err(|refusal| match refusal {
                 CertificateRefusal::Changed(reason) => reason,
@@ -1589,12 +1595,32 @@ impl DurableCertificate {
     /// input), `scope`, the sample windows just re-read and verified from the
     /// held FD, and the certified audit clock and debt. `select_mode` then
     /// decides Unchanged, Tail or Full exactly as for a RAM checkpoint.
+    #[cfg(test)]
     pub(crate) fn restore(
         &self,
         file: &mut File,
         scope: Scope,
     ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
-        let (admission, head, boundary, current) = self.admit_samples(file)?;
+        self.restore_with_append(file, scope, false)
+    }
+
+    /// M3's grown path permits concurrent appends outside the certified prefix.
+    /// The legacy certificate fixture above keeps its exact metadata guard.
+    pub(crate) fn restore_grown(
+        &self,
+        file: &mut File,
+        scope: Scope,
+    ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
+        self.restore_with_append(file, scope, true)
+    }
+
+    fn restore_with_append(
+        &self,
+        file: &mut File,
+        scope: Scope,
+        allow_append: bool,
+    ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
+        let (admission, head, boundary, current) = self.admit_samples(file, allow_append)?;
         let checkpoint = Checkpoint {
             stamp: FileStamp {
                 length: self.length,
@@ -1620,11 +1646,48 @@ impl DurableCertificate {
         Ok((checkpoint, admission))
     }
 
-    #[allow(clippy::type_complexity)]
-    fn admit_samples(
+    /// A stale interpretation cannot hide independent physical/content edits.
+    /// Mtime alone is deliberately excluded: compare the existing bounded
+    /// samples even when the unchanged-length mtime moved.
+    pub(crate) fn independent_edit(
         &self,
         file: &mut File,
-    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), CertificateRefusal> {
+    ) -> Result<Option<FullReason>, CertificateRefusal> {
+        let stamp = file
+            .metadata()
+            .and_then(FileStamp::capture)
+            .map_err(|_| CertificateRefusal::ReadError)?;
+        if stamp.device == self.device
+            && stamp.inode == self.inode
+            && stamp.length == self.length
+            && stamp.modified == self.modified
+            && (self.birth_nanos == 0
+                || birth_unix_nanos(&file.metadata().map_err(|_| CertificateRefusal::ReadError)?)
+                    == self.birth_nanos)
+        {
+            return Ok(None);
+        }
+        let mut probe = self.clone();
+        probe.modified = stamp.modified;
+        match probe.admit_samples(file, false) {
+            Err(CertificateRefusal::Changed(
+                reason @ (FullReason::Replaced
+                | FullReason::Shrunk
+                | FullReason::HeadChanged
+                | FullReason::BoundaryChanged),
+            )) => Ok(Some(reason)),
+            Ok(_) | Err(CertificateRefusal::Changed(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The existing allocation-free certificate edits. Keep these before
+    /// typed decode/rederive admission so resource pressure cannot hide A2.
+    pub(crate) fn check_metadata(&self, file: &File) -> Result<(), CertificateRefusal> {
+        self.checked_stamp(file).map(|_| ())
+    }
+
+    fn checked_stamp(&self, file: &File) -> Result<FileStamp, CertificateRefusal> {
         let metadata = file.metadata().map_err(|_| CertificateRefusal::ReadError)?;
         let stamp =
             FileStamp::capture(metadata.clone()).map_err(|_| CertificateRefusal::ReadError)?;
@@ -1643,10 +1706,20 @@ impl DurableCertificate {
         if stamp.length < self.length {
             return Err(CertificateRefusal::Changed(FullReason::Shrunk));
         }
-        let unchanged = stamp.length == self.length;
-        if unchanged && stamp.modified != self.modified {
+        if stamp.length == self.length && stamp.modified != self.modified {
             return Err(CertificateRefusal::Changed(FullReason::SameSizeEdit));
         }
+        Ok(stamp)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn admit_samples(
+        &self,
+        file: &mut File,
+        allow_append: bool,
+    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), CertificateRefusal> {
+        let stamp = self.checked_stamp(file)?;
+        let unchanged = stamp.length == self.length;
         let len = self.sample_len as usize;
         let mut read = 0;
         #[cfg(test)]
@@ -1672,11 +1745,11 @@ impl DurableCertificate {
             .metadata()
             .and_then(FileStamp::capture)
             .map_err(|_| CertificateRefusal::ReadError)?;
-        if after.device != stamp.device
-            || after.inode != stamp.inode
-            || after.length != stamp.length
-            || after.modified != stamp.modified
-        {
+        if if allow_append {
+            !append_compatible(&stamp, &after)
+        } else {
+            !stamp.same_content(&after)
+        } {
             return Err(CertificateRefusal::Changed(FullReason::Replaced));
         }
         Ok((
@@ -1693,6 +1766,7 @@ impl DurableCertificate {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static OLD_SAMPLE_IO_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SAMPLES_MATCH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BETWEEN_GUARDS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
@@ -1927,17 +2001,21 @@ mod tests {
             let key = store::key_digest(source, "certificate-roundtrip");
             // The store preserves unknown shapes, so use the shipped v1
             // Codex allowlist and its existing real-codec fixture body.
-            let pin = "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1";
+            let pin = "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0";
             let allowlist =
                 std::array::from_fn(|i| u8::from_str_radix(&pin[2 * i..2 * i + 2], 16).unwrap());
             let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
             let saved = store::PendingRecord {
+                acquisition: Some(store::AcquisitionFields {
+                    acquired_revision: 3,
+                    protocol: crate::snapshots::AcquisitionProtocol::Legacy,
+                }),
                 binding: store::Binding {
                     source,
                     key,
                     context: store::context_digest("certificate-fixture", None),
                     scope: store::scope_digest(&scope().0, &allowlist, "", ""),
-                    entry: store::entry_digest("certificate-fixture", None),
+                    entry: [0; 32],
                 },
                 certificate: cp.durable_certificate(0).unwrap(),
                 body: crate::snapshots::durable_store_fixture_body(
@@ -1948,7 +2026,7 @@ mod tests {
                 allowlist,
             };
             assert_eq!(
-                disk.write_after_save(&lock, 1, vec![saved])
+                disk.write_after_save(&lock, 1, 0, vec![saved])
                     .unwrap()
                     .written,
                 1

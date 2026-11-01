@@ -3023,6 +3023,7 @@ fn codex_observed_unindexed_file_is_read_once_after_restart() {
         &mut orphaned,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     let traversal = orphaned.traversal.as_mut().unwrap();
     assert!(traversal.observed_index_keys.contains(&key));

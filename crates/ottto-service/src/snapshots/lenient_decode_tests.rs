@@ -703,6 +703,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     .unwrap();
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
+        restored_behind_accepted: None,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
@@ -1614,6 +1615,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
 
 #[test]
 fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
+    let _on = RestartRestoreForTest::enabled();
     let index = every_persisted_field_fixture();
     let bytes = serde_json::to_vec_pretty(&index).unwrap();
     let encoded: BTreeMap<String, &serde_json::value::RawValue> =
@@ -1644,6 +1646,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
 /// [format] historical named and positional writers preserve appended v1 fields.
 #[test]
 fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
+    let _on = RestartRestoreForTest::enabled();
     // Main shipped audit progress first. The earlier E2 writer saved a named
     // map with birth storage but no audit progress. Neither may lose custody.
     let seed = every_persisted_field_fixture();
@@ -1758,6 +1761,7 @@ fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts(
 
 #[test]
 fn desktop_inventory_keeps_existing_positional_index_slots() {
+    let _on = RestartRestoreForTest::enabled();
     let current = serde_json::to_value(every_persisted_field_fixture()).unwrap();
     let fields = lenient_decode::FIELDS;
     let tombstone_slot = fields.len() - 2;
@@ -4186,6 +4190,7 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
 /// another read.
 #[test]
 fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
+    let _on = RestartRestoreForTest::enabled();
     let seed = every_persisted_field_fixture();
     let expected = serde_json::to_vec(&seed).unwrap();
     let census = serde_json::to_vec(&seed.claude_request_census).unwrap();
@@ -4355,6 +4360,7 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
 /// Pin the absent-field downgrade contract while preserving the census bytes.
 #[test]
 fn retired_reread_new_writer_keeps_previous_default_contract() {
+    let _on = RestartRestoreForTest::enabled();
     #[derive(Default, serde::Deserialize)]
     #[serde(default)]
     struct PreviousCounts {
@@ -4549,5 +4555,95 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
             "claude_copy_removals",
         ]
+    );
+}
+
+/// Pi's restored-behind-accepted count settles at finalization: it follows the
+/// flag and needs either an offer or a smaller committed index selection.
+/// These facts are independent of the native layout a restore needs.
+/// [behaviour] Pi reports a restored predecessor only when finalization offers or regresses it.
+#[test]
+fn restored_behind_accepted_counts_pi_offers_or_index_regressions() {
+    use crate::local_resource_diagnostics::capture;
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-pi-behind-accepted");
+    let key = "/synthetic/0.jsonl".to_string();
+    let mut body = tests::sample_session_artifact_item();
+    body.source_file_fingerprint = Some("source".into());
+    let mut index = fixture();
+    let mut finalize = |extent, body: Option<&SnapshotItem>, previous: (_, _), complete| {
+        let mut empty_index = ScanIndex::default();
+        let mut scan = scan_source_roots_with_test_limit(
+            SnapshotSource::Pi,
+            &[scratch.as_ref().to_path_buf()],
+            &mut empty_index,
+            "2026-10-22T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            4,
+            false,
+        )
+        .unwrap();
+        scan.snapshots = body.into_iter().cloned().collect();
+        scan.pending_finalization.push(PendingIndexFinalization {
+            withheld_content: None,
+            sampled_audit_verified: false,
+            codex_pending_recovery: false,
+            index_key: key.clone(),
+            source_file_fingerprint: "source".into(),
+            previous_snapshot_fingerprint: previous.0,
+            previous_upload_body_witness: previous.1,
+            parse_complete: complete,
+            diagnostic_reason: FileReason::Complete,
+            parsed_snapshot_count: 1,
+            effective_upload_body_witness_revision: 0,
+            restored_behind_accepted: extent,
+        });
+        let (_, counts) =
+            capture(|| finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index));
+        let entry = &index.files[&key];
+        (
+            counts
+                .iter()
+                .filter_map(|r| r["counts"]["restored_behind_accepted"]["published"].as_u64())
+                .sum::<u64>(),
+            scan.snapshots.len(),
+            entry.last_snapshot_fingerprint.clone(),
+            entry.last_upload_body_witness.clone(),
+        )
+    };
+    let none = || (None, None);
+    assert_eq!(
+        finalize(None, Some(&body), none(), true).0,
+        0,
+        "not flagged"
+    );
+    let (count, offered, group, witness) = finalize(Some(0), Some(&body), none(), true);
+    assert_eq!((count, offered), (1, 1), "the offered body");
+    let (count, offered, group, witness) = finalize(Some(0), Some(&body), (group, witness), true);
+    assert_eq!((count, offered), (0, 0), "semantic no-op, nothing offered");
+    let (count, offered, ..) = finalize(Some(u64::MAX), Some(&body), (group, witness), true);
+    assert_eq!(
+        (count, offered),
+        (1, 0),
+        "complete no-op still counts an index regression"
+    );
+    assert_eq!(
+        finalize(Some(u64::MAX), Some(&body), none(), false).0,
+        0,
+        "incomplete reconstruction counts neither an offer nor an index regression"
+    );
+    assert_eq!(
+        finalize(Some(u64::MAX), None, none(), false).0,
+        0,
+        "an index regression alone cannot bypass complete finalization"
+    );
+    assert_eq!(
+        finalize(Some(0), None, none(), true).0,
+        0,
+        "no body for this file"
+    );
+    assert_eq!(
+        finalize(Some(u64::MAX), None, none(), true).0,
+        1,
+        "a smaller committed index selection counts even without an offer"
     );
 }
