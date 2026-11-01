@@ -77825,18 +77825,17 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
-    /// [behaviour] An idle WAL database with a second hard link is refused
-    /// for good (not retried), with nothing created. Any database that is
-    /// not an idle WAL file takes the plain open, which reads live WAL frames
-    /// and writes nothing beside the database, also through a symlinked name,
-    /// which is read through its target. With no connection attached, an
-    /// existing `-shm` keeps its bytes (a writable open would truncate it)
-    /// and the frames are read through a private index; a `-wal` without its
-    /// `-shm` fails closed (CANTOPEN, retried) with no file created. SQLite
-    /// keeps one `-shm` mapping per file per process, so a reader beside this
-    /// in-process writer uses the writer's writable mapping and cannot show
-    /// what `readonly_shm` does for a separate Codex process; the byte checks
-    /// therefore use copies with no connection attached.
+    /// [behaviour] Routing by name. A database with a second hard link is
+    /// refused for good (not retried), and a link added after a snapshot was
+    /// taken fails that snapshot's rows as busy. An idle database reached
+    /// through a symlink is read as a snapshot of its target. A database with
+    /// a `-wal` takes the plain open: with no connection attached, its frames
+    /// are read through a private index, also through a symlink, and an
+    /// existing `-shm` keeps its bytes; a `-wal` without its `-shm` fails
+    /// closed (CANTOPEN, retried) with no file created. SQLite keeps one
+    /// `-shm` mapping per file per process, so a `-shm` that this process's
+    /// writer opened read-write is refused rather than marked, and the live
+    /// reads use copies made while that writer was attached.
     #[cfg(unix)]
     #[test]
     fn codex_sidecar_plain_open_reads_live_wal_without_writing_beside_it() {
@@ -77850,6 +77849,14 @@ mod tests {
             codex_idle_wal_history(&codex_dir, "01a04e22-49cf-7460-9fd7-f7dbfd2f05e4");
         let alias_path = codex_dir.join("alias.sqlite");
         std::os::unix::fs::symlink(&history_path, &alias_path).expect("link history fixture");
+        let (ordinal, open) = rollout_ordinal(&alias_path);
+        assert_eq!(
+            ordinal.expect("read idle database through symlink"),
+            Some(3)
+        );
+        assert_eq!(open.snapshots, 1);
+        assert_eq!(sqlite_wal_and_shm_exist(&history_path), [false, false]);
+
         let other_name = codex_dir.join("other.sqlite");
         fs::hard_link(&history_path, &other_name).expect("hard-link history fixture");
         let (ordinal, open) = rollout_ordinal(&history_path);
@@ -77868,6 +77875,36 @@ mod tests {
         assert_eq!(sqlite_wal_and_shm_exist(&history_path), [false, false]);
         fs::remove_file(&other_name).expect("unlink second name");
 
+        let snapshot = codex_sqlite_read::CodexSqliteRead::open(
+            &history_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open idle snapshot");
+        assert!(snapshot.is_snapshot());
+        fs::hard_link(&history_path, &other_name).expect("hard-link after the snapshot");
+        let other_writer = Connection::open(&other_name).expect("open writer by other name");
+        other_writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;\
+                 UPDATE thread_history_projection_state SET next_rollout_ordinal = 9;",
+            )
+            .expect("write beside the other name");
+        let stale = snapshot.read(|connection| {
+            Ok(connection.query_row(
+                "SELECT next_rollout_ordinal FROM thread_history_projection_state",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        });
+        assert!(matches!(
+            stale.expect_err("old snapshot row").downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        drop(snapshot);
+        drop(other_writer);
+        fs::remove_file(&other_name).expect("unlink other name");
+
         let writer = Connection::open(&history_path).expect("open history writer");
         writer
             .execute_batch(
@@ -77876,12 +77913,8 @@ mod tests {
             )
             .expect("write an uncheckpointed frame");
         let (ordinal, open) = rollout_ordinal(&history_path);
-        assert_eq!(ordinal.expect("read live WAL database"), Some(4));
+        assert!(ordinal.is_err(), "writable -shm mapping refused");
         assert_eq!(open.snapshots, 0);
-        let (ordinal, open) = rollout_ordinal(&alias_path);
-        assert_eq!(ordinal.expect("read live WAL through symlink"), Some(4));
-        assert_eq!(open.snapshots, 0);
-        assert_eq!(sqlite_wal_and_shm_exist(&alias_path), [false, false]);
         let copies = [(&indexed, true), (&bare, false)].map(|(dir, with_shm)| {
             let copy = dir.join("thread_history_1.sqlite");
             fs::copy(&history_path, &copy).expect("copy main file");
@@ -77904,9 +77937,14 @@ mod tests {
         drop(writer);
 
         let [(indexed_path, indexed_bytes), (bare_path, bare_bytes)] = copies;
-        let (ordinal, open) = rollout_ordinal(&indexed_path);
-        assert_eq!(ordinal.expect("read copied WAL with -shm"), Some(4));
-        assert_eq!(open.snapshots, 0);
+        let indexed_alias = home.join("indexed-alias.sqlite");
+        std::os::unix::fs::symlink(&indexed_path, &indexed_alias).expect("link live copy");
+        for path in [&indexed_path, &indexed_alias] {
+            let (ordinal, open) = rollout_ordinal(path);
+            assert_eq!(ordinal.expect("read copied WAL with -shm"), Some(4));
+            assert_eq!(open.snapshots, 0);
+        }
+        assert_eq!(sqlite_wal_and_shm_exist(&indexed_alias), [false, false]);
         let (ordinal, open) = rollout_ordinal(&bare_path);
         assert!(matches!(
             ordinal.expect_err("-wal without -shm").downcast_ref::<rusqlite::Error>(),

@@ -710,7 +710,8 @@ pub(crate) struct LoaderEvidence {
     /// the roots that completed only after one.
     pub transient_retries: u32,
     pub completed_after_retry: u32,
-    /// Opens of an idle WAL database read as a snapshot of its main file.
+    /// Opens of an idle database (no `-wal` or `-journal`) read as a snapshot of
+    /// its main file.
     pub snapshot_fallbacks: u32,
 }
 /// One root's database open counts before its census result.
@@ -855,7 +856,7 @@ impl std::fmt::Display for IncompleteShape {
 }
 impl std::error::Error for IncompleteShape {}
 
-/// An idle-looking WAL database with another hard link: refused, not retried.
+/// A Codex database with another hard link: refused, not retried.
 #[derive(Debug)]
 pub(crate) struct LinkedDatabase;
 impl std::fmt::Display for LinkedDatabase {
