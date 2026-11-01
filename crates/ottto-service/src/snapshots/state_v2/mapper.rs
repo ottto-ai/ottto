@@ -233,11 +233,9 @@ pub(super) fn put<T: Serialize + ?Sized>(
         })?;
     }
     tx.diff_refs(&old_refs, &projection.refs)?;
-    telemetry::row_cap(kind, json.len() as u64, value_cap(key));
-    ensure!(
-        json.len() as u64 <= value_cap(key),
-        "state_v2_value_admission"
-    );
+    let cap = value_cap(key);
+    telemetry::row_cap(kind, json.len() as u64, cap);
+    ensure!(json.len() as u64 <= cap, "state_v2_value_admission");
     let encoded = codec::encode(&json)?;
     tx.put(RowInput {
         key,

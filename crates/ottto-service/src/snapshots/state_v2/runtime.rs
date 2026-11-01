@@ -526,6 +526,8 @@ fn import_with<M: Mapper>(path: &Path, index: &mut ScanIndex, mapper: &M) -> Res
             original.publish_import(path, &identity, db, &mut state.latched)?;
             Ok(cx)
         })();
+        // One gauge per import attempt, including one refused for an over-cap row.
+        telemetry::row_cap_save();
         let mut cx = match result {
             Ok(cx) => {
                 telemetry::event("import_done", &1);
