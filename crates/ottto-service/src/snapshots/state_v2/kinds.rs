@@ -14,6 +14,9 @@ pub(super) struct KindCx {
     pub(super) account_ids: BTreeMap<String, Vec<u64>>,
     pub(super) digests: mapper::Digests,
     pub(super) account_controls: usize,
+    /// Per cold family, the last rollover a committed save wrote. A sibling
+    /// graph (checkpoint subset, retry working graph) skips what it names.
+    pub(super) cold_rolled: BTreeMap<String, u64>,
     valid: bool,
 }
 

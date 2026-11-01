@@ -628,6 +628,9 @@ fn save_with_custody(
                 let (previous, mut cx) = Mapper.hydrate_context(&mut session.db)?;
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
                 let digests = kinds::baseline(&previous, &mut cx)?;
+                // Committed rollovers outlive the dropped baseline: a sibling
+                // graph saved after a claim-only save still skips them.
+                cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
                 session.cx = cx;
                 digests
             }

@@ -45,9 +45,19 @@ pub(super) fn rows(
         // only the tail its rollovers replay is in RAM.
         let (kept, tail) = match wanted.map(|p| &p.previous_windows) {
             Some(ArchivedWindows::Cold(cold)) => {
-                cold_archive(rows, family, cold, previous, seeded.as_deref())?
+                let committed = cold.committed(cx.cold_rolled.get(family).copied());
+                let archive =
+                    cold_archive(rows, family, cold, previous, seeded.as_deref(), committed)?;
+                if let Some(last) = cold.last_roll() {
+                    cx.cold_rolled.insert(family.clone(), last);
+                }
+                archive
             }
-            Some(ArchivedWindows::Resident(_)) | None => (Vec::new(), Vec::new()),
+            Some(ArchivedWindows::Resident(_)) | None => {
+                // A resident or removed family's rows are not a cold lineage.
+                cx.cold_rolled.remove(family);
+                (Vec::new(), Vec::new())
+            }
         };
         let values: Vec<Option<&ClaudeAccountFamilyPendingWindow>> = kept
             .iter()
@@ -178,12 +188,17 @@ pub(super) fn rows(
 /// hydrate that built it. Only rows the endpoint rule may replace are read:
 /// at most the last two, by key, and only when windows rolled. Anything that
 /// does not match the baseline is Unknown and refuses the save.
+///
+/// `committed` counts this graph's queued rollovers a sibling's committed
+/// save already wrote (a clone shares them): the stored archive is then that
+/// save's, so its base is adopted and only the rest replay.
 fn cold_archive(
     rows: &mut mapper::Rows<'_>,
     family: &str,
     cold: &ColdWindows,
     previous: Option<&WindowBaseline>,
     seeded: Option<&[u64]>,
+    committed: Option<usize>,
 ) -> Result<(Vec<[u8; 32]>, Vec<ClaudeAccountFamilyPendingWindow>)> {
     let unknown = || {
         telemetry::count("cold_row_unknown", 1);
@@ -196,9 +211,10 @@ fn cold_archive(
     };
     let archived = ids.split_last().map(|(_, archived)| archived);
     let archived = archived.ok_or_else(unknown)?;
-    if (archived.len(), archived.last().copied()) != cold.base() {
+    if committed.is_none() && (archived.len(), archived.last().copied()) != cold.base() {
         return Err(unknown());
     }
+    let skip = committed.unwrap_or(0);
     let mut digests = match (seeded, previous) {
         (None, Some(previous)) => previous.digests[..archived.len()].to_vec(),
         _ => archived
@@ -209,7 +225,7 @@ fn cold_archive(
             })
             .collect::<Result<_>>()?,
     };
-    if !cold.has_rolled() {
+    if !cold.rolls_after(skip) {
         return Ok((digests, Vec::new()));
     }
     let from = archived.len().saturating_sub(2);
@@ -229,7 +245,7 @@ fn cold_archive(
         tail.push(window);
     }
     digests.truncate(from);
-    Ok((digests, cold.replay(tail)))
+    Ok((digests, cold.replay(tail, skip)))
 }
 pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,

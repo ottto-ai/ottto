@@ -187,14 +187,18 @@ impl std::fmt::Debug for ColdWindows {
     }
 }
 /// One rollover under a cold archive, with the arguments the resident
-/// archive would have applied it with.
+/// archive would have applied it with. `seq` is unique in the process and
+/// survives clones, so a save of a sibling graph names the rollovers it
+/// committed.
 #[derive(Clone, PartialEq, Eq)]
 struct Rolled {
     window: ClaudeAccountFamilyPendingWindow,
     strict: bool,
     current_end: String,
+    seq: u64,
 }
-crate::heap_layout_bound::fields!(Rolled; window, strict, current_end);
+crate::heap_layout_bound::fields!(Rolled; window, strict, current_end, seq);
+static ROLL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 impl ColdWindows {
     /// Stored archived rows and the last one's id.
     pub(super) fn base(&self) -> (usize, Option<u64>) {
@@ -205,14 +209,34 @@ impl ColdWindows {
         !self.rolled.is_empty()
     }
 
+    /// Whether rollovers remain queued after the first `skip`.
+    pub(super) fn rolls_after(&self, skip: usize) -> bool {
+        self.rolled.len() > skip
+    }
+
+    /// The last queued rollover's sequence.
+    pub(super) fn last_roll(&self) -> Option<u64> {
+        self.rolled.last().map(|rolled| rolled.seq)
+    }
+
+    /// How many queued rollovers a committed save of this graph or a clone
+    /// already wrote, given the last one it wrote; None if none of ours.
+    pub(super) fn committed(&self, last: Option<u64>) -> Option<usize> {
+        let last = last?;
+        let at = self.rolled.iter().position(|rolled| rolled.seq == last)?;
+        Some(at + 1)
+    }
+
     /// `tail` is the stored archive's last (at most two) windows, oldest
     /// first. The endpoint rule reads only those, so the result ends exactly
-    /// as the resident archive would after the same rollovers.
+    /// as the resident archive would after the same rollovers. The first
+    /// `skip` rollovers are already in the store.
     pub(super) fn replay(
         &self,
         mut tail: Vec<ClaudeAccountFamilyPendingWindow>,
+        skip: usize,
     ) -> Vec<ClaudeAccountFamilyPendingWindow> {
-        for rolled in &self.rolled {
+        for rolled in &self.rolled[skip..] {
             let window = rolled.window.clone();
             if rolled.strict {
                 retain_run_endpoint(&mut tail, window, &rolled.current_end);
@@ -286,6 +310,7 @@ impl ClaudeAccountFamilyPending {
                     window: old,
                     strict,
                     current_end: current_end.clone(),
+                    seq: ROLL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 });
             }
         }
