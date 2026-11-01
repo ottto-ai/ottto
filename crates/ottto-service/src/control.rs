@@ -1072,9 +1072,11 @@ fn handle_command(
             // Doctor only: ordinary status polls must not walk the store.
             #[cfg(unix)]
             if retry_relay_authorization {
-                let (files, bytes) =
-                    crate::claude_local_otel::support_health::store_size(&default_support_dir());
-                value["local_otel"] = serde_json::json!({"files": files, "bytes": bytes});
+                if let Ok((files, bytes)) =
+                    crate::claude_local_otel::support_health::store_size(&default_support_dir())
+                {
+                    value["local_otel"] = serde_json::json!({"files": files, "bytes": bytes});
+                }
             }
             Ok(value)
         }

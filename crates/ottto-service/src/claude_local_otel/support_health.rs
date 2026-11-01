@@ -426,27 +426,25 @@ fn health_items(h: Health) -> RedactedValue {
     RedactedValue::Object(fields)
 }
 /// Doctor-only footprint of everything under `local-otel`: regular files and
-/// their bytes. Symlinks are not followed; unreadable entries are skipped.
-pub(crate) fn store_size(support: &Path) -> (u64, u64) {
-    fn walk(dir: &Path, files: &mut u64, bytes: &mut u64) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
+/// their bytes. Symlinks are not followed. Any I/O error, including a missing
+/// store, yields no footprint rather than a partial one.
+pub(crate) fn store_size(support: &Path) -> std::io::Result<(u64, u64)> {
+    fn walk(dir: &Path, total: &mut (u64, u64)) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
             if meta.is_dir() {
-                walk(&entry.path(), files, bytes);
+                walk(&entry.path(), total)?;
             } else if meta.is_file() {
-                *files += 1;
-                *bytes += meta.len();
+                total.0 += 1;
+                total.1 += meta.len();
             }
         }
+        Ok(())
     }
-    let (mut files, mut bytes) = (0, 0);
-    walk(&support.join("local-otel"), &mut files, &mut bytes);
-    (files, bytes)
+    let mut total = (0, 0);
+    walk(&support.join("local-otel"), &mut total)?;
+    Ok(total)
 }
 pub(crate) fn diagnostics_items(
     support: &Path,
@@ -849,15 +847,15 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// [behaviour] Doctor footprint: nested regular files and bytes, missing
-    /// store is 0/0, symlinks are not followed.
+    /// [behaviour] Doctor footprint: nested regular files and bytes, symlinks
+    /// not followed, a missing store is an error rather than 0/0.
     #[test]
     fn store_size_counts_nested_files_without_following_symlinks() {
         let dir = scratch();
         let outside = dir.join("outside");
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("x.jsonl"), b"0123456789").unwrap();
-        assert_eq!(store_size(&dir), (0, 0));
+        assert!(store_size(&dir).is_err());
         fs::create_dir_all(dir.join("local-otel/claude-code-effort")).unwrap();
         fs::create_dir_all(dir.join("local-otel/claude-code-trace-ownership")).unwrap();
         fs::write(dir.join("local-otel/claude-code-effort/a.jsonl"), b"abc").unwrap();
@@ -867,7 +865,7 @@ mod tests {
         )
         .unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("local-otel/link")).unwrap();
-        assert_eq!(store_size(&dir), (2, 8));
+        assert_eq!(store_size(&dir).unwrap(), (2, 8));
         fs::remove_dir_all(dir).unwrap();
     }
 }
