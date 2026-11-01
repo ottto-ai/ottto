@@ -166,7 +166,7 @@ pub(crate) const MAX_PARTS_PER_ITEM: usize = 2_048;
 pub(crate) const MAX_ROWS: usize = 100;
 /// Receiver `MAX_SNAPSHOT_ITEM_BYTES`, measured on sorted compact JSON.
 pub(crate) const MAX_ITEM_BYTES: usize = super::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
-pub(crate) const MAX_ADVERTISED_ITEM_BYTES: usize = 3 * 1024 * 1024;
+pub(crate) const MAX_ADVERTISED_ITEM_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) fn effective_item_cap(advertised: Option<u64>) -> usize {
     advertised

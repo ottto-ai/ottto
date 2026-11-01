@@ -615,7 +615,8 @@ pub(crate) const SNAPSHOT_REVISION_V2_CONTRACT_VERSION: &str = "snapshot_revisio
 pub(crate) const MAX_SEMANTIC_ENVELOPE_BYTES: usize = 2 * 1024;
 pub(crate) const MAX_SNAPSHOT_ITEM_WIRE_BYTES: usize = 640 * 1024;
 pub(crate) const MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES: usize = 641 * 1024;
-pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 4 * 1024 * 1024;
+/// Receiver request cap: one largest advertised item plus the batch envelope.
+pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
 const MAX_TOOL_USAGE_NAMES: usize = 200;
 const CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD: &str = "attribution_mcp_tool";
@@ -81869,7 +81870,7 @@ mod tests {
         for index in 0..40 {
             let mut item = batch.snapshots[0].clone();
             item.source_session_id = format!("large-session-{index}");
-            item.session_display_name = Some("y".repeat(110 * 1024));
+            item.session_display_name = Some("y".repeat(300 * 1024));
             item.snapshot_fingerprint = snapshot_fingerprint(source, &item);
             items.push(item);
         }

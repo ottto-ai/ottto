@@ -1,5 +1,5 @@
 {
-  "fixture_revision": "session_identity_w0:r5",
+  "fixture_revision": "session_identity_w0:r6",
   "canonicalization": "session_identity_leaf:v3",
   "new_collector": "claude_code_jsonl:own_request_identity_rows:v1",
   "bases": [
@@ -18,17 +18,17 @@
     "evidence_entries": 16,
     "authority_keys": 16,
     "parts_per_row": 17,
-    "total_parts": 2048,
-    "total_parts_byte_cap_ceiling": 3395,
+    "total_parts": 26214,
+    "total_parts_byte_cap_ceiling": 43464,
     "money_max_usd": "1000000000",
     "bucket_rows": 100,
     "top_level_rows": 100,
-    "item_bytes": 655360,
+    "item_bytes": 8388608,
     "cost_fraction_digits": 6
   },
   "receiver_limits": {
     "snapshot_item_bytes": {
-      "value": 655360,
+      "value": 8388608,
       "code": "app/schemas/agent_session_snapshots.py:164 MAX_SNAPSHOT_ITEM_BYTES (sorted compact JSON)"
     },
     "snapshots_per_batch": {
@@ -52,11 +52,11 @@
       "code": "app/schemas/agent_session_snapshots.py:2331 MAX_ACTIVITY_BUCKETS_PER_BATCH"
     },
     "log_body_bytes": {
-      "value": 4194304,
+      "value": 10485760,
       "code": "app/services/ingest_log/append.py:301 MAX_LOG_BODY_BYTES"
     },
     "log_aggregate_body_bytes": {
-      "value": 4194304,
+      "value": 10485760,
       "code": "app/services/ingest_log/append.py:302 MAX_LOG_AGGREGATE_BODY_BYTES"
     },
     "entities_per_append": {
@@ -64,8 +64,8 @@
       "code": "app/services/ingest_log/append.py:303 MAX_ENTITIES_PER_APPEND"
     },
     "gzip_decoded_request_bytes": {
-      "value": 1048576,
-      "code": "app/main.py:264 GZipRequestMiddleware.MAX_DECOMPRESSED_SIZE"
+      "value": 10485760,
+      "code": "app/main.py GZipRequestMiddleware.SNAPSHOT_MAX_DECOMPRESSED_SIZE (snapshot batch route)"
     }
   },
   "rate_card": {
@@ -4358,7 +4358,7 @@
       "identity_leaf_sha256": "275e58e59ba11c0df9437522ce98ab6e0f57ddb9ceb0f485ee7e046488720ec4",
       "item_bytes": 5563,
       "expected": {
-        "binding": "list",
+        "binding": "unknown",
         "alarm": "basis_unknown",
         "rows": [
           {
@@ -13134,16 +13134,16 @@
         "evidence_entries": 2,
         "authority_keys": 2,
         "max_parts_per_row": 2,
-        "total_parts": 1084,
-        "max_bucket_rows": 1,
-        "top_level_rows": 1,
-        "item_bytes": 655360
+        "total_parts": 14824,
+        "max_bucket_rows": 2,
+        "top_level_rows": 2,
+        "item_bytes": 8388608
       },
-      "tagged_canonical_sha256": "068b8ed5d8bdec150278cf1b39fadfcee5e485edae18ba3cd9584416526e1d96",
-      "emitted_canonical_sha256": "068b8ed5d8bdec150278cf1b39fadfcee5e485edae18ba3cd9584416526e1d96",
+      "tagged_canonical_sha256": "96c0e30e07dbd5f686c571df0da005390e2218af9fbf76eef19c8e4bee7c5d2a",
+      "emitted_canonical_sha256": "96c0e30e07dbd5f686c571df0da005390e2218af9fbf76eef19c8e4bee7c5d2a",
       "expected": {
         "emitted": "tagged",
-        "item_bytes": 655360
+        "item_bytes": 8388608
       }
     },
     "gen-byte-cap-over": {
@@ -13151,33 +13151,33 @@
         "evidence_entries": 2,
         "authority_keys": 2,
         "max_parts_per_row": 2,
-        "total_parts": 1084,
-        "max_bucket_rows": 1,
-        "top_level_rows": 1,
-        "item_bytes": 655361
+        "total_parts": 14824,
+        "max_bucket_rows": 2,
+        "top_level_rows": 2,
+        "item_bytes": 8388609
       },
-      "tagged_canonical_sha256": "9c1f9e37dc6b16c3b66043af27d2afc6ad563d16ad6a88d7ae8fc09c48f30a84",
-      "emitted_canonical_sha256": "0c140014a189021dd0808388e521fc5805d0399436931e436895458eea0aa3d8",
+      "tagged_canonical_sha256": "9f925c690f203411808c40a015042d9d7b31d601438a4f56bacaee6d2ec15360",
+      "emitted_canonical_sha256": "2fcc2c644a906a63d4f9406eb4e2e44e73df6434421ad0fa2cb0a931aa9d5c50",
       "expected": {
         "emitted": "fallback",
         "over_cap": [
           "bytes"
         ],
-        "item_bytes": 655361
+        "item_bytes": 8388609
       }
     },
     "gen-total-parts-over": {
       "tagged_shape": {
-        "evidence_entries": 1,
-        "authority_keys": 1,
-        "max_parts_per_row": 2,
-        "total_parts": 2052,
-        "max_bucket_rows": 1,
-        "top_level_rows": 1,
-        "item_bytes": 1119245
+        "evidence_entries": 2,
+        "authority_keys": 2,
+        "max_parts_per_row": 3,
+        "total_parts": 26226,
+        "max_bucket_rows": 2,
+        "top_level_rows": 2,
+        "item_bytes": 11742638
       },
-      "tagged_canonical_sha256": "8fd37074b292c3be3621cea281ed124d5a8ee3294715e0162874af93041fa3d0",
-      "emitted_canonical_sha256": "8891d3c1e62eb1977eee5e930005c8da6665e620602433ca52800a3ea9c79255",
+      "tagged_canonical_sha256": "6ce7fde61d2636296cc7d5c101a20377bb7fa79dcdead48fd0419f1134b3e00c",
+      "emitted_canonical_sha256": "18ce85ba0b8961ba5f1e7d88332eb6b0a84a4ca91aaa86a04b26a98a80e7368e",
       "expected": {
         "emitted": "fallback",
         "over_cap": [
@@ -14306,11 +14306,11 @@
     },
     "L-sole-login-on-terminal": {
       "section": "lookup",
-      "title": "transcript_sole_login on a terminal/SDK body (Phase 1)",
+      "title": "transcript_sole_login on a terminal/SDK body (forward-only since 2026-10-28)",
       "bodies": [
         "new-cost-golden-veto"
       ],
-      "expected": "Unknown request_basis_refused",
+      "expected": "Unknown request_first_seen_cutoff (usage before the sole-login cutoff); after it, the Desktop rules (body and mapped-login vetoes)",
       "server_state": "same rows, origin.entrypoint = cli"
     },
     "H-reorder-same": {
@@ -14675,7 +14675,7 @@
     },
     "CAP-bytes-at": {
       "section": "cap",
-      "title": "final encoding exactly 655,360 bytes incl. request_evidence, parts and refusal field",
+      "title": "final encoding exactly 8,388,608 bytes incl. request_evidence, parts and refusal field",
       "bodies": [
         "gen-byte-cap-at"
       ],
@@ -14691,7 +14691,7 @@
     },
     "CAP-total-parts": {
       "section": "cap",
-      "title": "more than 2048 parts in one item (declared bound)",
+      "title": "more than 26214 parts in one item (declared bound)",
       "bodies": [
         "gen-total-parts-over"
       ],
