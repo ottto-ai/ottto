@@ -381,7 +381,8 @@ impl Memo {
             // Heap admission does not reserve descriptors. Keep at least seven
             // eighths of the soft limit for ordinary daemon I/O, and never retain
             // more than 32 pins. The existing memo owns the population accounting.
-            let limit = crate::fd_guard::descriptor_limit().map_or(0, |n| (n / 8).min(32));
+            let limit =
+                crate::control_plane_health::descriptor_limit().map_or(0, |n| (n / 8).min(32));
             if state
                 .entries
                 .values()

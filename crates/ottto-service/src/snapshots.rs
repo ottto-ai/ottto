@@ -7,7 +7,7 @@ use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
 use crate::local_resource_diagnostics::claude_reread::IgnoredVeto;
 use crate::local_resource_diagnostics::rearm_cause;
-use crate::local_resource_diagnostics::{line_delivery_unselected, UnselectedReason};
+use crate::local_resource_diagnostics::{line_delivery_unselected, CapCounts, UnselectedReason};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::ser::SerializeStruct;
@@ -2579,6 +2579,11 @@ struct ScanTraversalCounts {
     retired_reread_budget_refused: serde::de::IgnoredAny,
     #[serde(skip_serializing_if = "ownership::Counts::is_empty")]
     causes: ownership::Counts,
+    #[serde(
+        skip_serializing_if = "CapCounts::is_empty",
+        deserialize_with = "deserialize_lenient_default"
+    )]
+    caps: CapCounts,
     /// Bounded roster visits, also the rotation offset for the next refresh.
     #[serde(skip_serializing_if = "is_zero_u64")]
     codex_roster_refresh_visited: u64,
@@ -7793,6 +7798,7 @@ pub struct SourceScanResult {
     pending_finalization: Vec<PendingIndexFinalization>,
     /// RAM-only observations of this bounded page; never serialized or uploaded.
     discovery_growth: discovery_growth::Page,
+    pub(crate) cap_counts: CapCounts,
     pub(crate) local_codex_diagnostics: Option<CodexScanDiagnostics>,
     /// Local-only V2 counting receipts of this scan, moved out of its census.
     /// `None` when no configured counting parse finished (never a zero block).
@@ -17732,6 +17738,7 @@ fn is_claude_desktop_session_id(value: &str) -> bool {
 /// decisions after traces expire without extending them to new contributions.
 #[derive(Debug, Clone, Default)]
 struct CodexTurnTraceMap {
+    since_epoch: i64,
     priority_turns: BTreeSet<String>,
     /// A present trace DB failed to load, or its row cap was reached: absent
     /// turns are unknown, not standard (R2-H1). A paged job treats a flipped
@@ -19181,6 +19188,9 @@ impl SnapshotAccumulator {
     fn buffer_codex_boundary_record(&mut self, value: &Value) {
         const MAX_BOUNDARY_BUFFER_RECORDS: usize = 64;
         if self.codex_boundary_buffer_len() == MAX_BOUNDARY_BUFFER_RECORDS {
+            if !self.codex_proof_decision_only {
+                CapCounts::record(self.source.api_slug(), 0, 1);
+            }
             self.clear_codex_boundary_buffer();
             self.codex_legacy_bootstrap_valid = false;
             self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
@@ -19240,6 +19250,7 @@ impl SnapshotAccumulator {
                 return;
             }
             if self.codex_legacy_bootstrap_buffer.len() == MAX_BOOTSTRAP_RECORDS {
+                CapCounts::record(self.source.api_slug(), 1, 1);
                 self.codex_legacy_bootstrap_buffer.clear();
                 self.codex_legacy_bootstrap_valid = false;
                 return;
@@ -19337,6 +19348,7 @@ impl SnapshotAccumulator {
             return;
         };
         if self.codex_physical_signatures.len() == MAX_CODEX_PARENT_LEDGER_SIGNATURES {
+            CapCounts::record(self.source.api_slug(), 2, 1);
             self.codex_physical_signatures.clear();
             self.codex_physical_signatures_complete = false;
             return;
@@ -31591,6 +31603,11 @@ impl OwnedSourceScan {
             let Some(mut candidate) = identified_candidates.pop_front() else {
                 context_read_budget.flush(index, &codex_selected_flags);
                 if codex_page.continuation() {
+                    let cap_counts = index
+                        .traversal
+                        .as_mut()
+                        .map(|t| t.counts.caps.drain(source.api_slug()))
+                        .unwrap_or_default();
                     let continuation_evidence = codex_join_inventory.map(|inventory| {
                         Arc::new(Mutex::new(Some(CodexContinuationEvidence {
                             inventory,
@@ -31603,6 +31620,7 @@ impl OwnedSourceScan {
                         index: index_storage,
                         terminal_native_traversal: None,
                         scan: SourceScanResult {
+                            cap_counts,
                             discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                             continuation_ticket,
                             continuation_evidence,
@@ -31965,6 +31983,9 @@ impl OwnedSourceScan {
                                     .is_some_and(|boot| boot.group.owner == owner)
                         });
                     }
+                }
+                if let Some(traversal) = index.traversal.as_mut() {
+                    traversal.counts.caps.drain(source.api_slug());
                 }
                 let traversal_snapshot = index
                     .traversal
@@ -32334,7 +32355,32 @@ impl OwnedSourceScan {
                             && !index.bounded_sweep_had_unsettled_upload,
                     );
                 }
-                let local_diagnostics = codex_title_metadata.local_diagnostics;
+                let mut local_diagnostics = codex_title_metadata.local_diagnostics;
+                if source == SnapshotSource::Codex {
+                    let cutoff = codex_turn_traces
+                        .as_ref()
+                        .map_or(0, |traces| traces.since_epoch as u64);
+                    local_diagnostics.price_tier_old_files_without_receipt = index
+                        .file_snapshot_fingerprints
+                        .iter()
+                        .filter(|(key, fingerprints)| {
+                            index
+                                .files
+                                .get(*key)
+                                .is_some_and(|entry| entry.codex_applied_tier_receipt.is_none())
+                                && !fingerprints.is_empty()
+                                && fingerprints.iter().all(|fingerprint| {
+                                    index
+                                        .snapshot_activity_at
+                                        .get(fingerprint)
+                                        .and_then(Option::as_deref)
+                                        .and_then(rfc3339_unix_seconds)
+                                        .is_some_and(|activity| activity < cutoff)
+                                })
+                        })
+                        .count()
+                        as u64;
+                }
                 let continuation_evidence = (codex_join_completed.is_empty()
                     && continuation_ticket.is_some())
                 .then(|| codex_join_inventory.take())
@@ -32356,6 +32402,7 @@ impl OwnedSourceScan {
                     );
                 }
                 let scan = SourceScanResult {
+                    cap_counts: counts.caps,
                     discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                     strict_cohort_deferred_root_count: 0,
                     source,
@@ -41204,6 +41251,7 @@ impl CodexTurnTraceMap {
             }
         }
         let since_epoch = codex_logs2_since_epoch(backfill_window_days);
+        map.since_epoch = since_epoch;
         for codex_dir in codex_dirs {
             // The live DB lives directly under ~/.codex; a `sqlite/` subdir copy
             // exists on some installs. Read whichever is present.
@@ -41279,6 +41327,9 @@ fn load_codex_logs2_priority_turns(
         if let Some(turn_id) = codex_logs2_priority_turn_from_body(&body) {
             priority_turns.insert(turn_id);
         }
+    }
+    if read == CODEX_LOGS2_MAX_ROWS as u64 {
+        CapCounts::record("codex", 3, 1);
     }
     complete && read < CODEX_LOGS2_MAX_ROWS as u64
 }
@@ -44146,6 +44197,19 @@ fn record_codex_inventory_hold(
         || hold.refused_headers.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
         || hold.outside_roster.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
     {
+        // Count distinct discarded keys across the three overlapping sets.
+        let keys = hold.owed.len()
+            + hold
+                .refused_headers
+                .keys()
+                .filter(|key| !hold.owed.contains(*key))
+                .count()
+            + hold
+                .outside_roster
+                .keys()
+                .filter(|key| !hold.owed.contains(*key) && !hold.refused_headers.contains_key(*key))
+                .count();
+        CapCounts::record("codex", 5, keys as u64);
         // Past the bound only the next walk re-selects them, as before.
         traversal.residue.codex_inventory_hold = None;
     }
@@ -52304,6 +52368,8 @@ impl ScanIndex {
         if fits {
             self.codex_parent_ownership_refs
                 .insert(resolve_codex_identity(parent));
+        } else {
+            CapCounts::record("codex", 4, 1);
         }
         fits
     }
@@ -78974,6 +79040,8 @@ mod tests {
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions");
         let clock = ParentlessClock::now();
+        // Keep birth-time proof real while the owning header predates the test epoch.
+        let _cutover = codex_counting_version::TestCutover::set(clock.base_ms + 1);
         let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let admitted = "01a04e11-49cf-7460-9fd7-f7dbfd2f05e4";
         let wrapped = "01a04e12-49cf-7460-9fd7-f7dbfd2f05e4";
@@ -84351,7 +84419,7 @@ crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ord
 crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_failed_homes, created_thread_scoped, legacy_sidecar_fingerprint, legacy_config_file_present);
-crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns, incomplete);
+crate::heap_layout_bound::fields!(CodexTurnTraceMap; since_epoch, priority_turns, incomplete);
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
     ownership_incomplete_file_count, cause, zero_snapshot_usage_evidence, dropped_usage_record_count,
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
@@ -84381,7 +84449,7 @@ crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, context_inputs);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; codex_roster_refresh_visited, codex_roster_growth_enqueued, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, codex_roster_refresh_visited, codex_roster_growth_enqueued, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);

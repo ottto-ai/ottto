@@ -3502,23 +3502,14 @@ fn collect_codex_usage_for_home(
     }
 }
 
-/// One provider read of a Codex home's quota: the app-server, or the legacy
-/// OAuth endpoint where that is still allowed. Callers go through
-/// [`codex_saved_quota::read_provider_and_save`], which saves the outcome.
+/// One provider read of a Codex home's quota from its local app-server.
+/// Callers go through [`codex_saved_quota::read_provider_and_save`], which
+/// saves the outcome.
 fn read_codex_usage_from_provider(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
 ) -> Result<CodexUsageProbe, String> {
-    let allow_legacy_oauth = home_trust == CodexHomeTrust::ProviderDefault;
-    match collect_codex_app_server_usage_for_home(codex_home, home_trust) {
-        Ok(usage) => Ok(usage),
-        Err(app_server_message) if legacy_codex_oauth_fallback_allowed(allow_legacy_oauth) => {
-            collect_codex_oauth_usage_at(codex_home, home_trust).map_err(|oauth_message| {
-                format!("{app_server_message} Legacy OAuth usage fallback failed: {oauth_message}")
-            })
-        }
-        Err(message) => Err(message),
-    }
+    collect_codex_app_server_usage_for_home(codex_home, home_trust)
 }
 
 fn stamp_codex_meter_identity(snapshot: &mut AgentStatusSnapshot) {
@@ -16816,8 +16807,8 @@ fn codex_app_server_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
 
 /// Parse Codex's effective workspace monthly credit limit.
 ///
-/// The supported app-server surface calls this `individualLimit`; the legacy
-/// `wham/usage` fallback uses `individual_limit`. It is a recurring budget, not
+/// The app-server surface calls this `individualLimit`; the snake_case
+/// `individual_limit` spelling is also accepted. It is a recurring budget, not
 /// the earned reset bank and not the sparse `credits.balance`, so it gets a
 /// stable, separate identity downstream.
 fn codex_monthly_credit_limit_from_snapshot(container: &Value) -> Option<AgentCreditBalance> {
@@ -16887,8 +16878,8 @@ fn codex_credit_balance_from_credits_snapshot(
     let has_credits = has_credits_claim.unwrap_or(false);
     // `credits` sits beside `primary`/`secondary` on the rate-limit snapshot; the
     // sibling `spend_control_reached`, `rate_limit_reached_type`, and `limit_id`
-    // fields (e.g. `limitId: "codex"`) live on that container. Mirror the OAuth
-    // wham/usage path so both collectors carry the spend-cap contract.
+    // fields (e.g. `limitId: "codex"`) live on that container and carry the
+    // spend-cap contract.
     let spend_control_reached =
         json_bool(container, &["spend_control_reached", "spendControlReached"]);
     let rate_limit_reached_type = codex_rate_limit_reached_type(container);
@@ -16971,123 +16962,6 @@ fn codex_credit_balance_status(
     }
 }
 
-fn legacy_codex_oauth_usage_enabled() -> bool {
-    std::env::var("OTTTO_CODEX_LEGACY_OAUTH_USAGE")
-        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
-fn legacy_codex_oauth_fallback_allowed(is_default_slot: bool) -> bool {
-    is_default_slot && legacy_codex_oauth_usage_enabled()
-}
-
-fn collect_codex_oauth_usage_at(
-    codex_home: &Path,
-    home_trust: CodexHomeTrust,
-) -> Result<CodexUsageProbe, String> {
-    let credentials = read_codex_auth_credentials_at(codex_home, home_trust)
-        .map_err(|_| "Codex OAuth credentials could not be read safely.".to_string())?
-        .ok_or_else(|| "Codex OAuth credentials were not found.".to_string())?;
-    let access_token = credentials
-        .access_token
-        .as_deref()
-        .ok_or_else(|| "Codex OAuth access token was not available.".to_string())?;
-    let authorization = format!("Bearer {access_token}");
-    let mut request = crate::retry_tls::agent()
-        .get("https://chatgpt.com/backend-api/wham/usage")
-        .set("Accept", "application/json")
-        .set("Authorization", &authorization)
-        .timeout(COMMAND_TIMEOUT);
-    if let Some(account_id) = credentials.account_id.as_deref() {
-        request = request.set("ChatGPT-Account-Id", account_id);
-    }
-    let call_started = Instant::now();
-    let response = request.call();
-    crate::provider_calls::record(crate::provider_calls::ProviderCall::observed(
-        crate::provider_calls::Provider::Openai,
-        crate::provider_calls::CallKind::CodexWhamUsage,
-        crate::provider_calls::trigger_or(crate::provider_calls::Trigger::Other),
-        codex_credential_claimed_account_hash(&credentials).as_deref(),
-        crate::provider_calls::http_result(&response),
-        call_started.elapsed(),
-    ));
-    let value: Value = response
-        .map_err(codex_usage_probe_error)?
-        .into_json()
-        .map_err(|_| "Codex usage endpoint returned an unreadable response.".to_string())?;
-    let response_completed_at = rfc3339_from_unix_seconds(current_unix_seconds());
-    let identity = validated_codex_identity(&credentials, None, None, true);
-    let mut quota_windows = codex_usage_quota_windows(&value);
-    for window in &mut quota_windows {
-        window.observed_at = response_completed_at.clone();
-    }
-    let mut credit_balances = codex_usage_credit_balances(&value);
-    codex_credit_grants::stamp_codex_balance_kinds(&mut credit_balances);
-    Ok(CodexUsageProbe {
-        quota_windows,
-        credit_balances,
-        account: None,
-        identity,
-        saved_identity: None,
-        credential_read_failed: false,
-        response_completed_at: None,
-        reset_credit_detail_summary: None,
-        rate_limit_pool_summary: None,
-    })
-}
-
-fn codex_usage_probe_error(error: ureq::Error) -> String {
-    match error {
-        ureq::Error::Status(status, _) if status == 401 || status == 403 => {
-            "Codex usage endpoint rejected the local OAuth session.".to_string()
-        }
-        ureq::Error::Status(status, _) => {
-            format!("Codex usage endpoint returned HTTP {status}.")
-        }
-        ureq::Error::Transport(_) => "Codex usage endpoint was unreachable.".to_string(),
-    }
-}
-
-fn codex_usage_quota_windows(value: &Value) -> Vec<AgentQuotaWindow> {
-    // The wham/usage payload historically nested the windows under `rate_limit`
-    // with `primary_window`/`secondary_window` keys. Since OpenAI's 2026-07-12
-    // change the fields can arrive top-level as `primary`/`secondary` (with the
-    // primary window now weekly and secondary null). Locate the container either
-    // way, then accept both the legacy and current key names.
-    let container = value
-        .get("rate_limit")
-        .filter(|value| value.is_object())
-        .unwrap_or(value);
-    let mut windows = Vec::new();
-    if let Some(primary) = container
-        .get("primary_window")
-        .or_else(|| container.get("primary"))
-    {
-        if let Some(window) = codex_usage_quota_window("primary", primary) {
-            windows.push(window);
-        }
-    }
-    if let Some(secondary) = container
-        .get("secondary_window")
-        .or_else(|| container.get("secondary"))
-    {
-        if let Some(window) = codex_usage_quota_window("secondary", secondary) {
-            windows.push(window);
-        }
-    }
-    windows
-}
-
-/// Window duration in seconds, reading `*_seconds` first and falling back to the
-/// minutes-denominated fields (`limit_window_minutes`/`window_minutes`) that the
-/// current wham/usage payload reports.
-fn codex_usage_window_seconds(value: &Value) -> Option<u64> {
-    json_u64(value, &["limit_window_seconds", "window_seconds"]).or_else(|| {
-        json_u64(value, &["limit_window_minutes", "window_minutes"])
-            .and_then(|minutes| minutes.checked_mul(60))
-    })
-}
-
 fn codex_usage_window_key(
     limit_id: &str,
     window_key: &str,
@@ -17129,111 +17003,6 @@ fn codex_bucket_component(value: &str) -> String {
         }
     }
     encoded
-}
-
-fn codex_usage_quota_window(window_key: &str, value: &Value) -> Option<AgentQuotaWindow> {
-    let used_percent = json_u8(value, &["used_percent", "usedPercent"]);
-    let left_percent = used_percent.map(|used| 100_u8.saturating_sub(used));
-    let resets_at = json_timestamp_rfc3339(value, &["reset_at", "resets_at", "resetAt"]);
-    let window_seconds = codex_usage_window_seconds(value);
-    let started_at = resets_at
-        .as_deref()
-        .zip(window_seconds)
-        .and_then(|(reset, seconds)| rfc3339_minus_seconds(reset, seconds));
-    if used_percent.is_none() && resets_at.is_none() && window_seconds.is_none() {
-        return None;
-    }
-    Some(AgentQuotaWindow {
-        name: codex_usage_window_key("legacy", window_key, window_seconds, resets_at.is_some()),
-        scope: AgentQuotaWindowScope::Account,
-        status: match left_percent {
-            Some(0) => AgentQuotaWindowStatus::Exhausted,
-            Some(value) if value <= 20 => AgentQuotaWindowStatus::NearLimit,
-            Some(_) => AgentQuotaWindowStatus::Ok,
-            None => AgentQuotaWindowStatus::Unknown,
-        },
-        freshness: AgentQuotaWindowFreshness::Fresh,
-        model: None,
-        account_label: None,
-        window_seconds,
-        started_at_basis: started_at.as_ref().map(|_| "provider_duration".to_string()),
-        started_at,
-        resets_at,
-        quota: None,
-        remaining: None,
-        used_percent,
-        left_percent,
-        ..Default::default()
-    })
-}
-
-fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
-    // `credits` sits beside `primary`/`secondary`; the sibling `spend_control_reached`,
-    // `rate_limit_reached_type`, and `limit_id` fields live on the same container.
-    let container = value
-        .get("rate_limit")
-        .filter(|value| value.is_object())
-        .unwrap_or(value);
-    let mut balances = Vec::new();
-    let Some(credits) = container.get("credits") else {
-        return codex_monthly_credit_limit_from_snapshot(container)
-            .into_iter()
-            .collect();
-    };
-    let remaining = json_u64(credits, &["balance", "remaining", "credits"]);
-    let unlimited = json_bool(credits, &["unlimited"]);
-    let has_credits_claim = json_bool(credits, &["has_credits", "hasCredits"]);
-    let has_credits = has_credits_claim.unwrap_or(false);
-    let spend_control_reached =
-        json_bool(container, &["spend_control_reached", "spendControlReached"]);
-    let rate_limit_reached_type = first_json_string(
-        container,
-        &["rate_limit_reached_type", "rateLimitReachedType"],
-    );
-    let limit_id = first_json_string(container, &["limit_id", "limitId"]);
-    if (remaining.is_none()
-        && unlimited.is_none()
-        && !has_credits
-        && spend_control_reached != Some(true))
-        || codex_credits_do_not_apply(
-            has_credits_claim,
-            unlimited,
-            remaining,
-            spend_control_reached,
-        )
-    {
-        if let Some(monthly) = codex_monthly_credit_limit_from_snapshot(container) {
-            balances.push(monthly);
-        }
-        return balances;
-    }
-    // A reached spend control means the account is spend-capped even if a nominal
-    // credit figure remains, so treat it as exhausted regardless of the balance.
-    let status = if spend_control_reached == Some(true) {
-        AgentCreditBalanceStatus::Exhausted
-    } else {
-        codex_credit_balance_status(remaining, unlimited, has_credits)
-    };
-    balances.push(AgentCreditBalance {
-        name: codex_credit_grants::PLAN_CREDITS.to_string(),
-        status,
-        freshness: AgentQuotaWindowFreshness::Fresh,
-        unit: AgentCreditBalanceUnit::Credits,
-        account_label: None,
-        remaining,
-        used: None,
-        quota: None,
-        unlimited,
-        updated_at: None,
-        spend_control_reached,
-        rate_limit_reached_type,
-        limit_id,
-        ..Default::default()
-    });
-    if let Some(monthly) = codex_monthly_credit_limit_from_snapshot(container) {
-        balances.push(monthly);
-    }
-    balances
 }
 
 #[derive(Debug, Clone)]
@@ -24377,15 +24146,6 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn managed_slot_never_enables_private_oauth_fallback() {
-        let _guard = EnvVarGuard::set_os("OTTTO_CODEX_LEGACY_OAUTH_USAGE", OsString::from("true"));
-
-        assert!(legacy_codex_oauth_fallback_allowed(true));
-        assert!(!legacy_codex_oauth_fallback_allowed(false));
-    }
-
-    #[test]
-    #[serial]
     fn codex_slots_pin_sqlite_home_and_drop_all_ambient_credentials() {
         let dir =
             std::env::temp_dir().join(format!("ottto-codex-exact-home-{}", std::process::id()));
@@ -26292,49 +26052,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_usage_parser_extracts_windows_and_credits() {
-        let json = serde_json::json!({
-            "rate_limit": {
-                "primary_window": {
-                    "used_percent": 3,
-                    "reset_at": 1779049800,
-                    "limit_window_seconds": 18000
-                },
-                "secondary_window": {
-                    "used_percent": 1,
-                    "reset_at": "1779613200",
-                    "limit_window_seconds": 604800
-                },
-                "credits": {
-                    "has_credits": true,
-                    "unlimited": false,
-                    "balance": 0
-                }
-            }
-        });
-
-        let windows = codex_usage_quota_windows(&json);
-        let credits = codex_usage_credit_balances(&json);
-
-        assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0].name, "legacy_primary_five_hour_reset_known");
-        assert_eq!(windows[0].left_percent, Some(97));
-        assert_eq!(
-            windows[0].started_at.as_deref(),
-            Some("2026-05-17T15:30:00Z")
-        );
-        assert_eq!(windows[1].name, "legacy_secondary_weekly_reset_known");
-        assert_eq!(windows[1].left_percent, Some(99));
-        assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
-        assert_eq!(credits[0].remaining, Some(0));
-        // The legacy payload carries none of the 2026-07 credit metadata.
-        assert_eq!(credits[0].spend_control_reached, None);
-        assert_eq!(credits[0].rate_limit_reached_type, None);
-        assert_eq!(credits[0].limit_id, None);
-    }
-
-    #[test]
     fn codex_app_server_prefers_effective_snapshot_over_internal_limit_map() {
         let json = serde_json::json!({
             "rateLimits": {
@@ -26469,8 +26186,8 @@ for line in sys.stdin:
 
     #[test]
     fn codex_app_server_parser_carries_credit_spend_control_fields() {
-        // The app-server snapshot is the PRIMARY collector (the OAuth wham/usage
-        // path is legacy fallback), so it must carry the spend-cap contract too.
+        // The app-server snapshot is the only Codex quota collector, so it must
+        // carry the spend-cap contract.
         let json = serde_json::json!({
             "rateLimitsByLimitId": {
                 "codex": {

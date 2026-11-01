@@ -71,6 +71,11 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
         crate::local_resource_diagnostics::claude_state_v2(&*stats);
     }
 }
+/// Test evidence only: the latest value of a content-free event.
+#[cfg(test)]
+pub(super) fn latest_for_test(name: &str) -> Option<serde_json::Value> {
+    stats().lock().ok()?.latest.get(name).cloned()
+}
 /// Cumulative process-lifetime count, kept in the same inventory as events.
 pub(super) fn count(name: &'static str, n: u64) {
     if let Ok(mut stats) = stats().lock() {
