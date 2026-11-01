@@ -33897,6 +33897,8 @@ impl OwnedSourceScan {
                 }
                 CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
             }
+            #[cfg(test)]
+            sampled_scan::test_hooks::after_selection(index, parse_reason);
             if parse_reason == Some(CandidateParseReason::UploadContext)
                 && index
                     .confirmed_empty_files

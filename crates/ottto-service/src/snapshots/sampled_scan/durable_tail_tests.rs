@@ -4870,7 +4870,17 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
     assert!(crate::heap_layout_bound::layout_supported());
     const SESSION: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
     let source = SnapshotSource::ClaudeCode;
-    for changed in [false, true] {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ContractChange {
+        Unchanged,
+        Placeholder,
+        BodyWitness,
+    }
+    for change in [
+        ContractChange::Unchanged,
+        ContractChange::Placeholder,
+        ContractChange::BodyWitness,
+    ] {
         let mut disk = fixture::NativeColdStore::with_scope(
             source,
             "owed-rearmed-restore",
@@ -4882,9 +4892,9 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         let read = |disk: &fixture::NativeColdStore,
                     index: ScanIndex,
                     cache: Arc<SharedCache>,
-                    changed: bool| {
+                    change: ContractChange| {
             claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
-                let mut owned = OwnedSourceScan::new_with_identity_capture(
+                let owned = OwnedSourceScan::new_with_identity_capture(
                     source,
                     std::slice::from_ref(&disk.sessions),
                     index,
@@ -4898,12 +4908,36 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
                     true,
                 )
                 .with_sampled_acquisition(cache, disk.namespace.clone());
-                if changed {
-                    // Change after traversal construction, which records its starting contract.
-                    owned.index.claude_request_identity_contract =
-                        Some(CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL.into());
-                }
-                let (mut index, mut scan, modes) = fixture::scan_modes(owned, 100_000);
+                let key = disk.key(SESSION);
+                let (mut index, mut scan, modes) =
+                    crate::snapshots::sampled_scan::test_hooks::with_after_selection(
+                        move |index, reason| {
+                            if change != ContractChange::Unchanged {
+                                assert_eq!(reason, Some(CandidateParseReason::Rearmed));
+                                assert!(index.files[&key].evidence_owed);
+                            }
+                            match change {
+                                ContractChange::Unchanged => {}
+                                ContractChange::Placeholder => {
+                                    index.claude_request_identity_contract = Some(
+                                        CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL
+                                            .into(),
+                                    );
+                                    // Make the audit due after owed selection, so the resolver
+                                    // owns the read and the stale-binding fallback may read Full.
+                                    index
+                                        .files
+                                        .get_mut(&key)
+                                        .unwrap()
+                                        .set_unverified_deadline(1);
+                                }
+                                ContractChange::BodyWitness => {
+                                    index.active_effective_upload_body_witness_revision += 1;
+                                }
+                            }
+                        },
+                        || fixture::scan_modes(owned, 100_000),
+                    );
                 crate::snapshot_sync::apply_claude_local_evidence_to_scan(
                     &disk.root, &mut scan, &mut index,
                 );
@@ -4916,10 +4950,14 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
             ),
             ..Default::default()
         };
-        seed.activate_effective_upload_body_witness_revision(effective_revision(source));
+        // Exercise a real change between two admitted body-witness revisions.
+        seed.activate_effective_upload_body_witness_revision(
+            effective_revision(source) - u64::from(change == ContractChange::BodyWitness),
+        );
         disk.cache
             .durable_begin_pass(source, &disk.index_path, &disk.namespace, true);
-        let (mut index, mut initial, modes) = read(&disk, seed, disk.cache.clone(), false);
+        let (mut index, mut initial, modes) =
+            read(&disk, seed, disk.cache.clone(), ContractChange::Unchanged);
         assert_eq!(modes, (1, 0, 0));
         assert_eq!(initial.snapshots.len(), 1);
         assert_eq!(initial.snapshots[0].input_tokens, 100);
@@ -4942,18 +4980,6 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         index.save(&disk.index_path).unwrap();
         assert_native_write_before_save(&disk.cache, disk.writer, source, &index, &key);
         let mut prior = index;
-        if changed {
-            // A stale unchanged record is held without a Full obligation. Stage
-            // its due audit while the entry still has an observed revision.
-            let fingerprint = prior.files[&key].observed_fingerprint().to_owned();
-            assert!(prior.stage_sampled_audit(
-                &key,
-                &fingerprint,
-                crate::transcript_acquisition::AuditDebt {
-                    due_unix_seconds: 1
-                },
-            ));
-        }
         // Lose the pending occurrences so only the record can restore their evidence.
         // Keep the physical file and its revision unchanged across the re-arm.
         prior.claude_usage_family_pending.clear();
@@ -4972,10 +4998,23 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
             &disk,
             prior.clone(),
             Arc::new(SharedCache::default()),
-            changed,
+            change,
         );
         assert_eq!(cold_modes, (1, 0, 0));
-        let (index, restored, modes) = read(&disk, prior, disk.cache.clone(), changed);
+        let ((index, restored, modes), events) = crate::local_resource_diagnostics::capture(|| {
+            read(&disk, prior, disk.cache.clone(), change)
+        });
+        let owed_count = |name: &str| {
+            events
+                .iter()
+                .filter(|event| event["stage"] == "native_collection_page")
+                .filter_map(|event| event["counts"]["evidence_owed"][name].as_u64())
+                .sum::<u64>()
+        };
+        assert_eq!(owed_count("read"), 1);
+        assert_eq!(owed_count("restamped"), 0);
+        assert_eq!(owed_count("restamped_from_record"), 0);
+        assert_eq!(owed_count("selected_by_other_reason"), 0);
         money_oracle::assert_equivalent(
             &scan_money(source, &cold_index, &cold),
             &scan_money(source, &index, &restored),
@@ -4988,16 +5027,26 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         assert!(!index.files[&key].evidence_owed);
         assert!(!index.files[&key].observed_fingerprint().is_empty());
         let counts = disk.cache.durable_counters(source).unwrap().0;
-        if changed {
-            assert_eq!(counts.restored, 0);
-            assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
-            assert_eq!(modes, (1, 0, 0));
-            assert_eq!(current, None, "a stale record never supplies its old stamp");
-        } else {
-            assert_eq!(counts.restored, 1);
-            assert_eq!(modes, (0, 0, 1));
-            assert!(current.is_some());
-            assert_eq!(current, stamped);
+        match change {
+            ContractChange::Unchanged => {
+                assert_eq!(counts.restored, 1);
+                assert_eq!(modes, (0, 0, 1));
+                assert!(current.is_some());
+                assert_eq!(current, stamped);
+            }
+            ContractChange::Placeholder => {
+                assert_eq!(counts.restored, 0);
+                assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
+                assert_eq!(modes, (1, 0, 0));
+                assert_eq!(current, None, "a stale record never supplies its old stamp");
+            }
+            ContractChange::BodyWitness => {
+                assert_eq!(counts.restored, 0);
+                assert_eq!(counts.ineligible.get("history_owed"), Some(&1));
+                assert_eq!(modes, (1, 0, 0));
+                assert!(current.is_some());
+                assert_ne!(current, stamped);
+            }
         }
     }
 }
