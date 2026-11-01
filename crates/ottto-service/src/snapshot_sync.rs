@@ -6250,6 +6250,27 @@ fn collect_unparkable_preparation_with_rotation(
         .expect("ordinary serial owned source completion")
 }
 #[cfg(test)]
+thread_local! {
+    static WAKE_FRAME_VISIT_LIMIT_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+/// A test's own visit ceiling, below the walk's 4096 cap, checked on every
+/// measured wake frame while the guard lives.
+#[cfg(test)]
+pub(crate) struct WakeFrameVisitLimitForTest(Option<usize>);
+#[cfg(test)]
+impl WakeFrameVisitLimitForTest {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self(WAKE_FRAME_VISIT_LIMIT_FOR_TEST.with(|cell| cell.replace(Some(limit))))
+    }
+}
+#[cfg(test)]
+impl Drop for WakeFrameVisitLimitForTest {
+    fn drop(&mut self) {
+        WAKE_FRAME_VISIT_LIMIT_FOR_TEST.with(|cell| cell.set(self.0));
+    }
+}
+#[cfg(test)]
 fn try_collect_native_preparation_with_rotation_observed(
     frame: SourcePreparation,
     require_frame_bound: bool,
@@ -6316,6 +6337,14 @@ fn try_collect_native_preparation_with_rotation_observed(
                     receipt.visits_for_test(),
                     measured.is_some()
                 );
+                if let Some(limit) = WAKE_FRAME_VISIT_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
+                    assert!(
+                        receipt.visits_for_test() <= limit,
+                        "codex_wake_frame step {} used {} visits; this test keeps them at or under {limit}",
+                        self.steps,
+                        receipt.visits_for_test()
+                    );
+                }
                 assert!(crate::heap_layout_bound::bound(&frame, crate::source_rotation::PARKED_BUDGET).is_some(),
                     "the real source frame must pass its real existing requested-layout budget; no substitute bound");
             } else if self.require_parking_refusal && !self.parking_refused {

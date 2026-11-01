@@ -32653,20 +32653,28 @@ impl OwnedSourceScan {
             // revision passes the list, the no-list birth hold, the family
             // skip, the stop latch and this page's budget (reserved once per
             // file). A held file that only owes the upgrade is skipped with
-            // its old stamp. A held file selected for another reason (upload
-            // context, re-arm, family, audit, authority, a rebuilt or replayed
-            // index) still parses for its local work, but none of its bodies
+            // its old stamp, and so is one that also owes only its upload
+            // context. A held file selected for another reason (re-arm,
+            // family, audit, authority, a rebuilt or replayed index) still
+            // parses for its local work, but none of its bodies
             // is emitted and its upload tuple stays (`veto_claude_history_emission`).
             // A skipped Claude file held only by this page's budget is queued
             // again as a re-read for the next page of the walk. Codex and Pi
             // keep the adoption-only page budget.
             if decision == CandidateDecision::Parse {
+                // A Claude history hold defers upload-context debt with the
+                // revision: the gate vetoes every body of a held file, so its
+                // read could never earn a receipt. The file stays owed and
+                // pays both when the hold releases and it is exact-ACKed.
                 let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
-                    && (index.candidate_requires_only_body_witness_adoption(&candidate, audit_now)
-                        || (source == SnapshotSource::ClaudeCode
-                            && claude_copy_prefix_reread::unchanged_requested(
-                                index, &candidate, audit_now,
-                            )));
+                    && (index.candidate_requires_only_body_witness_adoption(
+                        &candidate,
+                        audit_now,
+                        source != SnapshotSource::ClaudeCode,
+                    ) || (source == SnapshotSource::ClaudeCode
+                        && claude_copy_prefix_reread::unchanged_requested(
+                            index, &candidate, audit_now,
+                        )));
                 let history = if source == SnapshotSource::ClaudeCode {
                     index.claude_history_upgrade_decision(
                         &candidate,
@@ -52165,16 +52173,25 @@ impl ScanIndex {
     }
 
     /// True when only the body-witness revision selects this candidate: the
-    /// same decision without that gate skips the file.
+    /// same decision without that gate skips the file. With
+    /// `upload_context_adoption: false`, upload-context debt does not count
+    /// as another reason to read.
     fn candidate_requires_only_body_witness_adoption(
         &self,
         candidate: &CandidateFile,
         now: u64,
+        upload_context_adoption: bool,
     ) -> bool {
         self.effective_upload_body_witness_revision_requires_adoption(&local_index_key(
             &candidate.path,
         )) && self
-            .candidate_decision_with_reason_gated(candidate, now, false, true, false)
+            .candidate_decision_with_reason_gated(
+                candidate,
+                now,
+                false,
+                upload_context_adoption,
+                false,
+            )
             .0
             == CandidateDecision::Skip
     }

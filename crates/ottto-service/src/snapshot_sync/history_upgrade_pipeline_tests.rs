@@ -604,8 +604,9 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
 
 /// Addendum 1 item 1 (secondary): existing revision-1 entries, an
 /// independent second reason on every file (a changed upload context), no
-/// list. Nothing is emitted, the old upload tuple stays, and the reason
-/// settles: the next cycle reads nothing.
+/// list. Nothing is emitted, the old upload tuple stays, and nothing is read:
+/// the gate would veto every body, so a read could not earn a per-file
+/// receipt. The context debt stays owed and is paid when the hold releases.
 #[test]
 fn upload_context_change_does_not_carry_history_past_the_gate() {
     // Positive control: the current reader uploads the same shape on a fresh destination.
@@ -629,8 +630,19 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
                 ..HISTORY_CURRENT
             },
         );
-        assert_eq!(changed.scan.scanned_file_count, HISTORY_SESSIONS.len());
+        // Was one read per held file: the retired global gate settled the
+        // context after that read. A per-file receipt needs an exact ACK of
+        // an emitted body, so the held files are skipped and stay owed.
+        assert_eq!(
+            changed.scan.scanned_file_count, 0,
+            "held history is not read"
+        );
         assert!(changed.uploaded.is_empty(), "{:?}", changed.uploaded);
+        assert_eq!(
+            changed.index.upload_context_owed_file_count(),
+            HISTORY_SESSIONS.len(),
+            "deferred, never credited"
+        );
         for (key, entry) in &changed.index.files {
             let before = &baseline.files[key];
             assert_eq!(entry.effective_upload_body_witness_revision, 1);
@@ -651,7 +663,10 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
                 ..HISTORY_CURRENT
             },
         );
-        assert_eq!(again.scan.scanned_file_count, 0, "parsed at most once");
+        assert_eq!(
+            again.scan.scanned_file_count, 0,
+            "still not read while held"
+        );
         assert!(again.uploaded.is_empty());
     });
 }
