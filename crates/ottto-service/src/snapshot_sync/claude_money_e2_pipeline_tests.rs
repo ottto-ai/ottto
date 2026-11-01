@@ -3609,7 +3609,7 @@ fn e2_pipeline_certified_resume_keeps_its_timestamp_skip() {
 /// later hours and its holder in an earlier accepted member. Its re-read of
 /// the same bytes removes exactly the copied requests; every token counter is
 /// conserved (kept + removed = the released body), the own turns
-/// keep their money, and an unrelated session's body is unchanged. Scheduling
+/// keep their money, and an unrelated session's money is unchanged. Scheduling
 /// the paced re-read is the `claude_copy_prefix_reread` tests' concern.
 #[test]
 fn e2_pipeline_audit_shaped_resume_reread_removes_exactly_its_copies() {
@@ -3642,7 +3642,20 @@ fn e2_pipeline_audit_shaped_resume_reread_removes_exactly_its_copies() {
             (4, 0),
             "the released body accepted the copied prefix"
         );
-        let unrelated = canonical(body(&off, OTHER).unwrap());
+        // The released read is another corpus: compare money, not bytes.
+        let money = |item: &SnapshotItem| {
+            json!([
+                item.request_count,
+                item.removed_request_count,
+                item.input_tokens,
+                item.output_tokens,
+                item.cache_read_tokens,
+                item.cache_creation_5m_tokens,
+                item.cache_creation_1h_tokens,
+                item.cost
+            ])
+        };
+        let unrelated = money(body(&off, OTHER).unwrap());
         let on = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
         let copy = body(&on, COPY).unwrap();
         assert_eq!(
@@ -3678,9 +3691,9 @@ fn e2_pipeline_audit_shaped_resume_reread_removes_exactly_its_copies() {
             "the two own turns keep their tokens"
         );
         assert_eq!(
-            canonical(body(&on, OTHER).unwrap()),
+            money(body(&on, OTHER).unwrap()),
             unrelated,
-            "unrelated body unchanged"
+            "unrelated money unchanged"
         );
     });
 }
