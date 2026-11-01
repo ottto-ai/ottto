@@ -728,7 +728,7 @@ pub(super) fn borrows_only_retained_reduction(active: &OwnedActiveFile) -> bool 
 /// A completion that may release lower-ranked residents for its copy
 /// (`tail_completion_budget`): shape F, or a sampled Full singleton whose file
 /// grew since its last read. The index still holds the pre-read size here;
-/// a first read, shrink or same-size re-read cannot displace residents.
+/// a first read, shrink or same-size re-read releases nothing at completion.
 pub(super) fn releases_at_completion(active: &OwnedActiveFile, index: &ScanIndex) -> bool {
     borrows_only_retained_reduction(active)
         || (active.sampling.as_ref().is_some_and(|sampling| {
