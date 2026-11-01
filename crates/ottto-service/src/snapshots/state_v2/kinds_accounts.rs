@@ -212,7 +212,9 @@ fn cold_archive(
     let archived = ids.split_last().map(|(_, archived)| archived);
     let archived = archived.ok_or_else(unknown)?;
     if committed.is_none() && (archived.len(), archived.last().copied()) != cold.base() {
-        return Err(unknown());
+        // Not damage: this graph's view predates a commit it has no lineage to.
+        telemetry::count("cold_lineage_miss", 1);
+        anyhow::bail!("state_v2_cold_lineage_miss");
     }
     let skip = committed.unwrap_or(0);
     let mut digests = match (seeded, previous) {
