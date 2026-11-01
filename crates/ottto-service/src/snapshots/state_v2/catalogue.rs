@@ -62,7 +62,7 @@ macro_rules! scan_index_fields {
             bounded_sweep_had_unsettled_upload => Misc (misc check_field Field) ["scan_state.bounded_sweep_had_unsettled_upload" => 1] side,
             bounded_sweep_unsettled_causes => Misc (misc check_field Field) ["scan_state.bounded_sweep_unsettled_causes" => 1] side,
             traversal => Misc (misc check_field Field) ["scan_state.traversal" => 1] side,
-            oversized_discovery => Misc (misc check_field Map) ["scan_state.oversized_discovery" => 3] side,
+            oversized_discovery => Misc (misc check_field Field) ["scan_state.oversized_discovery" => 3] side,
             claude_stale_family_carry => Misc (misc check_field Field) ["scan_state.claude_stale_family_carry" => 1] side,
             scan_residue_witness => Misc (misc check_field Field) ["scan_state.scan_residue_witness" => 1] side,
             historical_replay_generation => Misc (misc check_field Field) ["setting.historical_replay_generation" => 1] side,
