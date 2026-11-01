@@ -928,7 +928,8 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
 /// [money] A cold archive replays the endpoint rule over at most its last two
 /// stored rows to the rows a resident save writes, replaced endpoints
 /// included. A stored tail that no longer matches the baseline is Unknown:
-/// the save refuses, counted, and removes nothing.
+/// the save refuses, counted, and removes nothing. A stale base with no
+/// shared rollover refuses as a lineage miss, counted separately.
 #[test]
 fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
     const FAMILY: &str = "synthetic-family";
@@ -995,18 +996,40 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
     let mut changed = graph.claude_account_family_pending[FAMILY].current.clone();
     changed.evidence_request_count += 1;
     mapper::put(&mut tx, &key, &changed).unwrap();
-    let count = || {
-        telemetry::latest_for_test("cold_row_unknown")
+    let count = |name: &str| {
+        telemetry::latest_for_test(name)
             .and_then(|count| count.as_u64())
             .unwrap_or(0)
     };
-    let before = count();
+    let before = count("cold_row_unknown");
     let error = delta(previous, &graph, &mut tx, &mut cx).err().unwrap();
     assert!(format!("{error:#}").contains("state_v2_cold_row_unknown"));
-    assert!(count() > before);
+    assert!(count("cold_row_unknown") > before);
     drop(tx);
     let restored = hydrate(&mut cold_db, Scratch::binding()).unwrap().0;
     assert_eq!(serde_json::to_vec(&restored).unwrap(), saved[1]);
+
+    // Lineage miss: a graph whose base predates a commit it shares no
+    // rollover with refuses, counted apart from row damage.
+    let mut tx = cold_db.begin(TxnMode::Read).unwrap();
+    let (mut stale, mut cx) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
+    drop(tx);
+    let previous = baseline(&stale, &mut cx).unwrap();
+    stale.generation += 1;
+    roll(&mut stale, &at(7), true);
+    let mut tx = cold_db.begin(TxnMode::Write).unwrap();
+    delta(previous, &stale, &mut tx, &mut cx).unwrap();
+    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
+    let mut tx = cold_db.begin(TxnMode::Read).unwrap();
+    let (current, mut fresh) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
+    drop(tx);
+    let previous = baseline(&current, &mut fresh).unwrap();
+    roll(&mut stale, &at(8), true);
+    let before = count("cold_lineage_miss");
+    let mut tx = cold_db.begin(TxnMode::Write).unwrap();
+    let error = delta(previous, &stale, &mut tx, &mut fresh).err().unwrap();
+    assert!(format!("{error:#}").contains("state_v2_cold_lineage_miss"));
+    assert!(count("cold_lineage_miss") > before);
 }
 
 /// [behaviour] A complete hydrate keeps one summary per archive: 1 or 200
