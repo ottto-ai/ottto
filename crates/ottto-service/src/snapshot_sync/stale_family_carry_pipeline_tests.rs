@@ -1466,7 +1466,9 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
                     let _base = base.then(crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new);
                     let mut fixture = c1a_fixture("e3-latch-contract-money");
                     fixture.owned_base_preparation = true;
-                    // Keep the real frame within the ordinary parking walk budget.
+                    // One page holds the whole family (the overflow needs it),
+                    // and 64 files keep the real frame within its walk budget.
+                    fixture.native_file_limit = 64;
                     let session = "e7000000-0000-4000-8000-000000000007";
                     let path = fixture.root.join(format!("{session}.jsonl"));
                     std::fs::write(
