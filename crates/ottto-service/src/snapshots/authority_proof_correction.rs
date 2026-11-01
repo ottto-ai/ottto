@@ -322,7 +322,7 @@ impl ScanIndex {
             let Some(entry) = self.files.get(&pending.index_key) else {
                 continue;
             };
-            if entry.source_file_fingerprint != pending.source_file_fingerprint
+            if entry.observed_fingerprint() != pending.source_file_fingerprint
                 || entry.last_snapshot_fingerprint.is_some()
                 || self
                     .file_snapshot_fingerprints
@@ -372,7 +372,7 @@ impl ScanIndex {
                 continue;
             };
             if !self.files.get(key).is_some_and(|entry| {
-                entry.source_file_fingerprint == *revision
+                entry.observed_fingerprint() == *revision
                     && entry.last_snapshot_fingerprint.is_none()
             }) || self
                 .file_snapshot_fingerprints
@@ -403,7 +403,7 @@ impl ScanIndex {
         for advance in advances {
             let carried = self.confirmed_empty_files.contains(&advance.key)
                 && self.files.get(&advance.key).is_some_and(|entry| {
-                    entry.source_file_fingerprint == advance.revision
+                    entry.observed_fingerprint() == advance.revision
                         && entry.last_snapshot_fingerprint.is_none()
                 })
                 && !self
@@ -465,7 +465,7 @@ impl ScanIndex {
         let (carried, reverted): (Vec<_>, Vec<_>) = drains.into_iter().partition(|drain| {
             self.files
                 .get(&drain.key)
-                .is_some_and(|entry| entry.source_file_fingerprint == drain.revision)
+                .is_some_and(|entry| entry.observed_fingerprint() == drain.revision)
                 && self.file_snapshot_fingerprints.get(&drain.key) == Some(&drain.fingerprints)
         });
         for drain in &reverted {
@@ -564,7 +564,7 @@ impl ScanIndex {
                 let correction = record.proof_correction.as_ref()?;
                 let entry = self.files.get(key)?;
                 (correction.owed_member_ids.contains(&member)
-                    && !entry.source_file_fingerprint.is_empty()
+                    && !entry.rearmed()
                     && record.member_source_file_fingerprints.get(&member)
                         == Some(&entry.source_file_fingerprint)
                     && entry.last_snapshot_fingerprint.is_none()
@@ -626,7 +626,7 @@ impl ScanIndex {
             let known_current = record.member_source_file_fingerprints.get(&member)
                 == Some(&entry.source_file_fingerprint);
             if !known_current
-                || entry.source_file_fingerprint.is_empty()
+                || entry.rearmed()
                 || self
                     .file_snapshot_fingerprints
                     .get(key)
@@ -636,7 +636,7 @@ impl ScanIndex {
                     pending.index_key == *key
                         && (!pending.parse_complete
                             || pending.parsed_snapshot_count != 0
-                            || pending.source_file_fingerprint != entry.source_file_fingerprint)
+                            || pending.source_file_fingerprint != entry.observed_fingerprint())
                 })
             {
                 continue;
@@ -839,7 +839,7 @@ impl ScanIndex {
                 .get(&candidate.root)
                 .is_some_and(|witness| claude_usage_authority_preserves_pending(record, witness))
                 || !self.files.get(&candidate.index_key).is_some_and(|entry| {
-                    entry.source_file_fingerprint == candidate.revision
+                    entry.observed_fingerprint() == candidate.revision
                         && entry.last_snapshot_fingerprint.is_none()
                 })
                 || !self.confirmed_empty_files.contains(&candidate.index_key)
@@ -932,7 +932,7 @@ impl ScanIndex {
                 || !self
                     .files
                     .get(key)
-                    .is_some_and(|entry| entry.source_file_fingerprint == candidate.revision)
+                    .is_some_and(|entry| entry.observed_fingerprint() == candidate.revision)
             {
                 continue;
             }
