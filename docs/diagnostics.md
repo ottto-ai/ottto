@@ -1968,18 +1968,22 @@ proved rows sent with different proof.
 Each source emits one `local_resources` `freshness_alarm` point when a root walk
 ends and one on every failed pass. With `basis: "walk"`, `age_s` is the largest
 `now - live mtime` over indexed files whose live listing stamp differs from the
-stored settled stamp, `changed_files` and `over_6h_files` count them, and
-`unindexed_over_6h` counts files with no index entry older than six hours (no
-alarm bit). A failed pass may never reach the walk, so with `basis: "last_ack"`
-`age_s` is the time since the source's newest accepted upload receipt, the file
-counts are 0, and no receipt in the bounded ring gives `age_s: null`. `alarm` is
-true when `age_s` is null or above 21,600 seconds. Both inputs are durable and
-nothing new is stored, so the first complete walk after a restart reports the
-true age; only the in-progress fold is process-local, so a restart mid-walk
-under-reports for one walk and a retried page can count a file twice. A file
-appended to continuously reads as fresh until it pauses. Refused or quarantined
-files settle without acceptance and stay with the terminal counters. The row
-carries counts only, and the `money_freshness_disabled` marker does not affect it.
+stored settled stamp, and `changed_files` and `over_6h_files` count them.
+Members of an `UnprovenTerminal` Claude usage-authority family are reported
+apart, in `authority_terminal_files` and `authority_terminal_oldest_age_s`: their
+hold keeps the pre-growth stamp and no read reaches the growth, so they are real
+unuploaded data, never counted as accepted or $0. A failed pass may never reach
+the walk, so with `basis: "last_ack"` `age_s` is the time since the source's
+newest accepted upload receipt, the file counts are 0, and no receipt in the
+bounded ring gives `age_s: null`. `alarm` is true when `age_s` is null or above
+21,600 seconds, or when `authority_terminal_files` is above 0 at any age, which
+lasts until those files settle. Both inputs are durable and nothing new is
+stored, so the first complete walk after a restart reports the true age; only the
+in-progress fold is process-local, so a restart mid-walk under-reports for one
+walk and a retried page can count a file twice. A file appended to continuously
+reads as fresh until it pauses. Files refused by snapshot quarantine settle
+without acceptance and stay with the terminal counters. The row carries counts
+only, and the `money_freshness_disabled` marker does not affect it.
 
 ### Money freshness (Claude queue and replay)
 

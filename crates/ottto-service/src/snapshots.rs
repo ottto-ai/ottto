@@ -42796,7 +42796,7 @@ fn scan_traversal_context_fingerprint_with(
     format!("{:x}", digest.finalize())
 }
 
-fn rfc3339_unix_seconds(value: &str) -> Option<u64> {
+pub(crate) fn rfc3339_unix_seconds(value: &str) -> Option<u64> {
     OffsetDateTime::parse(value, &Rfc3339)
         .ok()?
         .unix_timestamp()
@@ -44523,13 +44523,16 @@ fn advance_bounded_directory_traversal_with_budget(
                 modified_unix_seconds,
                 codex_fragment::Stamp::metadata(&metadata),
             );
-            freshness.file(
-                index
-                    .files
-                    .get(&local_index_key(&path))
-                    .map(|entry| entry.same_listing_stamp_as(&metadata)),
-                listed_at.saturating_sub(modified_unix_seconds),
-            );
+            if index
+                .files
+                .get(&local_index_key(&path))
+                .is_some_and(|entry| !entry.same_listing_stamp_as(&metadata))
+            {
+                freshness.changed_file(
+                    index.authority_terminal_member(&path),
+                    listed_at.saturating_sub(modified_unix_seconds),
+                );
+            }
             if census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
             }) && !retention.owes_stamped(
@@ -49473,6 +49476,16 @@ impl ScanIndex {
             .get(&local_index_key(path))
             .is_some_and(|entry| entry.same_listing_stamp_as(metadata))
             && !sampled_audit::path_requires_verification(&self.files, path)
+    }
+
+    /// A member of a terminal authority family: a Skip before any growth
+    /// handling, and a hold revert that keeps the pre-growth stamp.
+    fn authority_terminal_member(&self, path: &Path) -> bool {
+        claude_index_path_member_ref(path)
+            .and_then(|member| self.claude_usage_authority_quarantine.get(member.root))
+            .is_some_and(|record| {
+                record.disposition == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+            })
     }
 
     /// A watcher hint needs no read: the file is unchanged and not owed, and

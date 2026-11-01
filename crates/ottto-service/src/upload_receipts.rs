@@ -864,8 +864,7 @@ pub(crate) fn newest_accepted_unix_seconds(state_dir: &Path, source: SourceKind)
         .receipts
         .iter()
         .find(|receipt| receipt.accepted_count > 0)
-        .and_then(|receipt| OffsetDateTime::parse(&receipt.uploaded_at, &Rfc3339).ok())
-        .and_then(|uploaded_at| u64::try_from(uploaded_at.unix_timestamp()).ok())
+        .and_then(|receipt| crate::snapshots::rfc3339_unix_seconds(&receipt.uploaded_at))
 }
 
 fn empty_receipt(

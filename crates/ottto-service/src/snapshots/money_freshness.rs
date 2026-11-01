@@ -5,7 +5,6 @@
 //! policy probes only its support-directory sentinel once.
 use super::SnapshotSource;
 use serde::Serialize;
-use std::path::Path;
 
 const ALARM_AFTER: u64 = 6 * 60 * 60;
 
@@ -18,31 +17,32 @@ pub(super) struct WalkFold {
     age_s: u64,
     changed_files: u64,
     over_6h_files: u64,
-    unindexed_over_6h: u64,
+    authority_terminal_files: u64,
+    authority_terminal_oldest_age_s: u64,
 }
 impl WalkFold {
     const EMPTY: Self = Self {
         age_s: 0,
         changed_files: 0,
         over_6h_files: 0,
-        unindexed_over_6h: 0,
+        authority_terminal_files: 0,
+        authority_terminal_oldest_age_s: 0,
     };
 
     pub(super) fn resume(source: SnapshotSource) -> Self {
         with_walks(|walks| std::mem::replace(&mut walks[source as usize], Self::EMPTY))
     }
 
-    /// `settled` is whether the stored stamp matches; None is an unindexed file.
-    pub(super) fn file(&mut self, settled: Option<bool>, age_s: u64) {
-        let over_6h = u64::from(age_s > ALARM_AFTER);
-        match settled {
-            Some(true) => {}
-            Some(false) => {
-                self.age_s = self.age_s.max(age_s);
-                self.changed_files += 1;
-                self.over_6h_files += over_6h;
-            }
-            None => self.unindexed_over_6h += over_6h,
+    /// An authority-terminal file has real unuploaded growth that no read can
+    /// reach, so it carries its own label rather than the generic ages.
+    pub(super) fn changed_file(&mut self, authority_terminal: bool, age_s: u64) {
+        if authority_terminal {
+            self.authority_terminal_files += 1;
+            self.authority_terminal_oldest_age_s = self.authority_terminal_oldest_age_s.max(age_s);
+        } else {
+            self.age_s = self.age_s.max(age_s);
+            self.changed_files += 1;
+            self.over_6h_files += u64::from(age_s > ALARM_AFTER);
         }
     }
 
@@ -78,7 +78,8 @@ fn with_walks<T>(body: impl FnOnce(&mut [WalkFold; 3]) -> T) -> T {
     WALKS_FOR_TEST.with(|walks| body(&mut walks.borrow_mut()))
 }
 
-/// Unknown age alarms: it never reads as fresh.
+/// Unknown age alarms: it never reads as fresh. So does any authority-terminal
+/// file, at any age, until its stamp settles.
 fn emit(source: SnapshotSource, age_s: Option<u64>, fold: WalkFold, basis: &'static str) {
     crate::local_resource_diagnostics::traversal_point(
         "freshness_alarm",
@@ -87,18 +88,19 @@ fn emit(source: SnapshotSource, age_s: Option<u64>, fold: WalkFold, basis: &'sta
             "age_s": age_s,
             "changed_files": fold.changed_files,
             "over_6h_files": fold.over_6h_files,
-            "unindexed_over_6h": fold.unindexed_over_6h,
+            "authority_terminal_files": fold.authority_terminal_files,
+            "authority_terminal_oldest_age_s": fold.authority_terminal_oldest_age_s,
             "basis": basis,
-            "alarm": age_s.map_or(true, |age| age > ALARM_AFTER),
+            "alarm": age_s.map_or(true, |age| age > ALARM_AFTER)
+                || fold.authority_terminal_files > 0,
         }),
     );
 }
 
 /// A failed pass may never reach the walk: its age is the newest acceptance.
-pub(crate) fn report_failed_pass(source: SnapshotSource, state_dir: &Path) {
-    let kind = crate::snapshot_client::receipt_source(source.api_slug());
-    let age_s = crate::upload_receipts::newest_accepted_unix_seconds(state_dir, kind)
-        .map(|accepted| super::sampled_scan::now_seconds().saturating_sub(accepted));
+pub(crate) fn report_failed_pass(source: SnapshotSource, last_ack_unix_seconds: Option<u64>) {
+    let age_s =
+        last_ack_unix_seconds.map(|at| super::sampled_scan::now_seconds().saturating_sub(at));
     emit(source, age_s, WalkFold::EMPTY, "last_ack");
 }
 

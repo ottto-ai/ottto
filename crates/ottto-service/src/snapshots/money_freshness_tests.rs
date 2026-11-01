@@ -79,9 +79,7 @@ fn measure(
 fn each_gauge_is_distinct_and_read_free() {
     let mut index = fixture();
     queue(&mut index, 0, false);
-    for n in 1..=4 {
-        queue(&mut index, n, true);
-    }
+    queue(&mut index, 1, true);
     let mut stamps = shadow::FirstPending::default();
     stamp(&mut stamps, &index, NOW);
     // Duplicate queue+replay occurrence must not double-count a tracked file.
@@ -89,13 +87,13 @@ fn each_gauge_is_distinct_and_read_free() {
     let before = serde_json::to_vec(&index).unwrap();
     let row = with_transcript_io_denied(|| measure(&index, &mut stamps, NOW + DAY + 1));
     assert_eq!(serde_json::to_vec(&index).unwrap(), before);
-    assert_eq!(row.tracked, 5);
+    assert_eq!(row.tracked, 2);
     assert_eq!(row.oldest_age_s, DAY + 1);
-    assert_eq!(row.over_24h, 5);
+    assert_eq!(row.over_24h, 2);
     assert_eq!(row.freshness.discovered_unread_tracked_files, 1);
     assert_eq!(row.freshness.discovered_unread_over_24h_tracked_files, 1);
     assert_eq!(row.freshness.oldest_discovered_unread_age_seconds, DAY + 1);
-    assert_eq!(row.freshness.indexed_or_replay_tracked_files, 4);
+    assert_eq!(row.freshness.indexed_or_replay_tracked_files, 1);
     assert!(row.freshness.ages_are_process_local_lower_bounds);
     assert_eq!(measure(&index, &mut stamps, NOW + DAY).over_24h, 0);
 }
@@ -257,6 +255,38 @@ fn alarm_rows(rows: &[serde_json::Value]) -> Vec<&serde_json::Value> {
         .collect()
 }
 
+fn age_a_week(path: &Path) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(SystemTime::now() - std::time::Duration::from_secs(7 * DAY))
+        .unwrap();
+}
+
+fn stored_entry(path: &Path) -> ScanIndexEntry {
+    let live = std::fs::metadata(path).unwrap();
+    let mut stored = crate::snapshots::tests::manifest_index_entry(None);
+    stored.size_bytes = live.len();
+    stored.modified_unix_nanos = live.modified().ok().and_then(unix_nanos);
+    stored
+}
+
+fn start_walk(source: SnapshotSource, root: &Path, index: &mut ScanIndex) {
+    index.traversal = None;
+    ensure_bounded_traversal(
+        source,
+        &[root.to_path_buf()],
+        index,
+        "2026-10-30T00:00:00Z",
+        BACKFILL_WINDOW_DAYS,
+    );
+}
+
+fn walk_page(source: SnapshotSource, index: &mut ScanIndex) {
+    advance_bounded_directory_traversal_with_budget(source, index, BACKFILL_WINDOW_DAYS, 2, None);
+}
+
 /// [regress] The old gauge restarted with the process: the first walk of a new process
 /// reads the true age from the stored stamp and live mtime, across pages that reload the index.
 #[test]
@@ -270,67 +300,97 @@ fn first_walk_after_restart_reports_the_durable_age_across_pages() {
         let root = scratch.join("root");
         std::fs::create_dir_all(root.join("a")).unwrap();
         std::fs::create_dir_all(root.join("b")).unwrap();
-        let grown = root.join("a/grown.jsonl");
-        std::fs::write(&grown, b"{}\n{}\n").unwrap();
-        std::fs::write(root.join("b/settled.jsonl"), b"{}\n").unwrap();
-        std::fs::write(root.join("b/unindexed.jsonl"), b"{}\n").unwrap();
-        let week_old = SystemTime::now() - std::time::Duration::from_secs(7 * DAY);
-        for path in [&grown, &root.join("b/unindexed.jsonl")] {
-            std::fs::File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_modified(week_old)
-                .unwrap();
-        }
-        let mut index = ScanIndex::default();
-        ensure_bounded_traversal(
-            source,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-10-30T00:00:00Z",
-            BACKFILL_WINDOW_DAYS,
+        let (grown, settled, unindexed) = (
+            root.join("a/grown.jsonl"),
+            root.join("b/settled.jsonl"),
+            root.join("b/unindexed.jsonl"),
         );
-        let stored = crate::snapshots::tests::manifest_index_entry(None);
-        index.files.insert(local_index_key(&grown), stored);
-        let settled = root.join("b/settled.jsonl");
-        let live = std::fs::metadata(&settled).unwrap();
-        let mut stored = crate::snapshots::tests::manifest_index_entry(None);
-        stored.size_bytes = live.len();
-        stored.modified_unix_nanos = live.modified().ok().and_then(unix_nanos);
-        index.files.insert(local_index_key(&settled), stored);
+        std::fs::write(&grown, b"{}\n{}\n").unwrap();
+        std::fs::write(&settled, b"{}\n").unwrap();
+        std::fs::write(&unindexed, b"{}\n").unwrap();
+        age_a_week(&grown);
+        age_a_week(&unindexed);
+        let mut index = ScanIndex::default();
+        start_walk(source, &root, &mut index);
+        let stale = crate::snapshots::tests::manifest_index_entry(None);
+        index.files.insert(local_index_key(&grown), stale);
+        index
+            .files
+            .insert(local_index_key(&settled), stored_entry(&settled));
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
             // Budget 2: the root, directory a, then directory b, each pass reloading the index.
             for _ in 0..3 {
-                advance_bounded_directory_traversal_with_budget(
-                    source,
-                    &mut index,
-                    BACKFILL_WINDOW_DAYS,
-                    2,
-                    None,
-                );
+                walk_page(source, &mut index);
                 index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
             }
+            // A directory refreshed after the walk is marked: it is not a walk.
+            let traversal = index.traversal.as_mut().unwrap();
+            traversal.pending_directories.push_back(ScanTraversalPath {
+                scan_root: root.clone(),
+                path: root.join("a"),
+                census_member: true,
+                watcher_hint: true,
+            });
+            walk_page(source, &mut index);
         });
         let rows = alarm_rows(&rows);
         assert_eq!(rows.len(), 1, "one row per walk");
         assert!(rows[0]["age_s"].as_u64().unwrap() > 6 * DAY);
         assert_eq!(rows[0]["changed_files"], 1);
         assert_eq!(rows[0]["over_6h_files"], 1);
-        assert_eq!(rows[0]["unindexed_over_6h"], 1);
+        assert_eq!(rows[0]["authority_terminal_files"], 0);
         assert_eq!(rows[0]["basis"], "walk");
         assert_eq!(rows[0]["alarm"], true);
     }
 }
 
+/// [behaviour] Authority-terminal growth alarms under its own label until its stamp settles.
+#[test]
+fn authority_terminal_growth_has_its_own_label_until_settled() {
+    let source = SnapshotSource::ClaudeCode;
+    let scratch = crate::test_scratch::ScratchDir::new("freshness-alarm-terminal");
+    let root = scratch.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let held = root.join("family.jsonl");
+    std::fs::write(&held, b"{}\n{}\n").unwrap();
+    age_a_week(&held);
+    let mut index = ScanIndex::default();
+    let stale = crate::snapshots::tests::manifest_index_entry(None);
+    index.files.insert(local_index_key(&held), stale);
+    index.insert_unproven_terminal_claude_authority_for_test("family", &"1".repeat(64));
+    let walk = |index: &mut ScanIndex| {
+        start_walk(source, &root, index);
+        crate::local_resource_diagnostics::capture(|| walk_page(source, index)).1
+    };
+    let rows = walk(&mut index);
+    let row = alarm_rows(&rows)[0];
+    assert_eq!(row["authority_terminal_files"], 1);
+    assert!(row["authority_terminal_oldest_age_s"].as_u64().unwrap() > 6 * DAY);
+    assert_eq!(row["age_s"], 0);
+    assert_eq!(row["changed_files"], 0);
+    assert_eq!(row["over_6h_files"], 0);
+    assert_eq!(row["alarm"], true);
+    index
+        .files
+        .insert(local_index_key(&held), stored_entry(&held));
+    let rows = walk(&mut index);
+    let row = alarm_rows(&rows)[0];
+    assert_eq!(row["authority_terminal_files"], 0);
+    assert_eq!(row["alarm"], false);
+}
+
 /// [behaviour] A failed pass ages from the newest acceptance for its source; none is unknown.
 #[test]
 fn failed_pass_reports_the_last_ack_and_unknown_alarms() {
+    use crate::upload_receipts::newest_accepted_unix_seconds;
     use ottto_protocol::SourceKind;
     let scratch = crate::test_scratch::ScratchDir::new("freshness-alarm-failed-pass");
     let report = || {
         crate::local_resource_diagnostics::capture(|| {
-            report_failed_pass(SnapshotSource::Pi, &scratch)
+            report_failed_pass(
+                SnapshotSource::Pi,
+                newest_accepted_unix_seconds(&scratch, SourceKind::Pi),
+            )
         })
         .1
     };
