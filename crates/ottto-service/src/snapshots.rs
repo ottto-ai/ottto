@@ -51728,7 +51728,7 @@ impl ScanIndex {
         }
         result.restore_claude_empty_map_advances(empty_advances);
         result.retain_quarantined_fingerprints(&retained_quarantine);
-        result.reconcile_codex_recovery_settlement(previous, accepted);
+        result.reconcile_codex_recovery_settlement(previous, &accepted);
         result
     }
 
