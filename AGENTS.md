@@ -53,7 +53,9 @@
   macOS-only tests, `scripts/mac_batch.py detect` exit 10): `gh workflow run ci.yml
   --ref <branch>`. Every macOS dispatch (full, `rust_test_filter` partial or
   `money_equivalence`) runs once per head and only after `Rust tests (Linux)` is
-  green on that head; never restart a run because it is queued. Do not put `[skip ci]` in PR commits. Merge
+  green on that head (the `Linux green first` job fails the dispatch otherwise);
+  never restart a run because it is queued. A `linux-tests.yml` dispatch on a head
+  that already passed or is still running skips its jobs. Do not put `[skip ci]` in PR commits. Merge
   only after a green pull-request run on the final head.
 - Several PRs waiting for macOS evidence share one run:
   `scripts/mac_batch.py plan <pr> <pr>...` merges their heads onto `main` in
