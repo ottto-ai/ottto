@@ -281,9 +281,13 @@ unsafe fn name_path<'a>(name: *const c_char) -> Option<&'a Path> {
     Some(Path::new(OsStr::from_bytes(bytes)))
 }
 
-/// Whether SQLite can open this `-wal` or `-shm` without changing it. It
-/// chmods an existing zero-length one whose mode differs from the main
-/// file's, and chowns every one when running as root.
+/// Whether SQLite can open this `-wal` or `-shm` without changing it.
+/// SQLite's open chmods a sidecar that is zero-length when it opens it and
+/// whose mode differs from the main file's. The length can drop to zero
+/// after this check (a checkpoint truncate), so a sidecar whose mode differs
+/// is refused whatever its length; then the chmod can never apply. The open's
+/// only other changes are a chown when running as root (refused here) and an
+/// unlink that needs an exclusive create (never passed by the guard).
 fn sidecar_open_changes_nothing(main: &Path, sidecar: &Path, missing_ok: bool) -> bool {
     // SAFETY: `geteuid` has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
@@ -293,9 +297,7 @@ fn sidecar_open_changes_nothing(main: &Path, sidecar: &Path, missing_ok: bool) -
         return false;
     };
     match fs::symlink_metadata(sidecar) {
-        Ok(file) => {
-            file.is_file() && (file.len() != 0 || file.mode() & 0o777 == main.mode() & 0o777)
-        }
+        Ok(file) => file.is_file() && file.mode() & 0o777 == main.mode() & 0o777,
         Err(error) => missing_ok && error.kind() == ErrorKind::NotFound,
     }
 }
@@ -605,7 +607,11 @@ mod tests {
     ///   create it), refused CANTOPEN, after which the retry snapshots;
     /// - a `-wal` beside an empty main file (SQLite would delete it);
     /// - a zero-length `-wal` or `-shm` whose mode differs from the main
-    ///   file's (SQLite would chmod it on open);
+    ///   file's (SQLite would chmod it on open), and a nonempty `-wal` whose
+    ///   mode differs (it could be truncated to zero between the check and
+    ///   the open). A truncate-between race needs no fixture of its own:
+    ///   any mode mismatch is refused whatever the length, so the chmod's
+    ///   precondition can never hold at the open;
     /// - a `-wal` without its `-shm` (SQLite would create it);
     /// - on an open live database: writes, truncates, syncs, write locks,
     ///   `-shm` growth and exclusive `-shm` locks on the main file and the
@@ -662,6 +668,13 @@ mod tests {
                 }
             }
         }
+        // A nonempty `-wal` whose mode differs, beside a `-shm` whose mode
+        // matches, so only the `-wal` mode refuses it.
+        for (suffix, mode) in [("", 0o644), ("-wal", 0o600), ("-shm", 0o644)] {
+            let copy = sidecar(&at("wal-mode-full.sqlite"), suffix);
+            fs::copy(sidecar(&source, suffix), &copy).expect("copy live fixture");
+            set_mode(&copy, mode);
+        }
         drop(writer);
         drop(wal_database(&at("idle.sqlite"), 5));
         let raced_writer = wal_database(&at("raced.sqlite"), 6);
@@ -693,6 +706,7 @@ mod tests {
         for name in [
             "empty.sqlite",
             "wal-mode.sqlite",
+            "wal-mode-full.sqlite",
             "shm-mode.sqlite",
             "bare.sqlite",
         ] {

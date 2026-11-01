@@ -77348,7 +77348,12 @@ mod tests {
                 .map(|suffix| {
                     let bytes = fs::read(state_v2::sidecar(&history_path, suffix))
                         .expect("read live sidecar");
-                    fs::write(state_v2::sidecar(&copy, suffix), &bytes).expect("copy sidecar");
+                    let sidecar = state_v2::sidecar(&copy, suffix);
+                    fs::write(&sidecar, &bytes).expect("copy sidecar");
+                    // The guard refuses a sidecar whose mode differs from
+                    // the main file's.
+                    let main = fs::metadata(&copy).expect("stat main copy");
+                    fs::set_permissions(&sidecar, main.permissions()).expect("match sidecar mode");
                     (*suffix, bytes)
                 })
                 .collect::<Vec<_>>();
