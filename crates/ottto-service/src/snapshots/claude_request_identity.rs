@@ -167,6 +167,30 @@ pub(crate) const MAX_PARTS_PER_ITEM: usize = 2_048;
 pub(crate) const MAX_ROWS: usize = 100;
 /// Receiver `MAX_SNAPSHOT_ITEM_BYTES`, measured on sorted compact JSON.
 pub(crate) const MAX_ITEM_BYTES: usize = 640 * 1024;
+pub(crate) const MAX_ADVERTISED_ITEM_BYTES: usize = 3 * 1024 * 1024;
+
+pub(crate) fn effective_item_cap(advertised: Option<u64>) -> usize {
+    advertised
+        .filter(|bytes| *bytes >= MAX_ITEM_BYTES as u64)
+        .map_or(MAX_ITEM_BYTES, |bytes| {
+            bytes.min(MAX_ADVERTISED_ITEM_BYTES as u64) as usize
+        })
+}
+
+/// This pass's receiver limit and the existing cache reconciliation reserve.
+#[derive(Clone, Copy)]
+pub(crate) struct WireBudget<'a> {
+    pub(crate) max_item_bytes: usize,
+    pub(crate) reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
+}
+impl Default for WireBudget<'_> {
+    fn default() -> Self {
+        Self {
+            max_item_bytes: MAX_ITEM_BYTES,
+            reservation: None,
+        }
+    }
+}
 const MICRO_PICOS: u128 = USD_PICO_SCALE / 1_000_000;
 const MAX_MONEY_PICOS: u128 = 1_000_000_000 * USD_PICO_SCALE;
 
@@ -289,10 +313,14 @@ pub(crate) enum OverCap {
     PartsPerItem,
     Rows,
     Bytes,
+    NearCap,
+    IdentityHeld,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Tagged {
+    /// Increased-cap body remains owed; no revision may be uploaded.
+    Held,
     /// Tagged body (possibly with every row untagged).
     Sent { refusals: u64 },
     /// Today's untagged shape under the new collector with refusals.
@@ -871,7 +899,7 @@ pub(crate) fn apply_with_accepted_for_test(
     contributions: &[Contribution],
     accepted: &AcceptedBuckets,
 ) -> Result<Tagged, Ineligible> {
-    apply_with_reserved_bytes_for_test(item, contributions, accepted, 0)
+    apply_with_reserved_bytes_for_test(item, contributions, accepted, 0, None)
 }
 
 #[cfg(test)]
@@ -880,6 +908,7 @@ pub(crate) fn apply_with_reserved_bytes_for_test(
     contributions: &[Contribution],
     accepted: &AcceptedBuckets,
     extra_wire_bytes: usize,
+    advertised_item_bytes: Option<u64>,
 ) -> Result<Tagged, Ineligible> {
     let mut grouping = Grouping::new(bucket_row_count(item));
     grouping.extra_wire_bytes = extra_wire_bytes;
@@ -894,7 +923,13 @@ pub(crate) fn apply_with_reserved_bytes_for_test(
     }
     let known = accepted.get(&item.source_session_id);
     grouping.accepted_miss = accepted.miss_cause();
-    apply_grouped_with_accepted(item, grouping, known, accepted.retained_enabled())
+    apply_grouped_with_accepted(
+        item,
+        grouping,
+        known,
+        accepted.retained_enabled(),
+        effective_item_cap(advertised_item_bytes),
+    )
 }
 
 /// `apply_with_accepted_for_test` through the settled-history cut: `now`
@@ -980,7 +1015,13 @@ pub(crate) fn apply_copy_invalidated_for_test(
     }
     let known = accepted.get(&item.source_session_id);
     grouping.accepted_miss = accepted.miss_cause();
-    apply_grouped_with_accepted(item, grouping, known, accepted.retained_enabled())
+    apply_grouped_with_accepted(
+        item,
+        grouping,
+        known,
+        accepted.retained_enabled(),
+        MAX_ITEM_BYTES,
+    )
 }
 
 /// `apply` with each request's own transcript time (`None`: auxiliary),
@@ -1012,7 +1053,7 @@ pub(crate) fn apply_grouped(
     item: &mut SnapshotItem,
     grouping: Grouping,
 ) -> Result<Tagged, Ineligible> {
-    apply_grouped_with_accepted(item, grouping, None, false)
+    apply_grouped_with_accepted(item, grouping, None, false, MAX_ITEM_BYTES)
 }
 
 /// `retained` is option (ii): the server retains proof per bucket row, so the
@@ -1023,8 +1064,16 @@ fn apply_grouped_with_accepted(
     grouping: Grouping,
     known: Option<&accepted::AcceptedSession>,
     retained: bool,
+    max_item_bytes: usize,
 ) -> Result<Tagged, Ineligible> {
-    apply_grouped_trimmed(item, grouping, known, retained, &mut BTreeSet::new())
+    apply_grouped_trimmed(
+        item,
+        grouping,
+        known,
+        retained,
+        max_item_bytes,
+        &mut BTreeSet::new(),
+    )
 }
 
 /// `apply_grouped_with_accepted`; `trimmed` gets the caps behind a `Sent`
@@ -1034,6 +1083,7 @@ fn apply_grouped_trimmed(
     mut grouping: Grouping,
     known: Option<&accepted::AcceptedSession>,
     retained: bool,
+    max_item_bytes: usize,
     trimmed: &mut BTreeSet<OverCap>,
 ) -> Result<Tagged, Ineligible> {
     let retained = retained && super::claude_history_upgrade::is_request_owned_literal(item);
@@ -1217,18 +1267,47 @@ fn apply_grouped_trimmed(
     // below must satisfy the same wire bounds and reconciliation rules.
     install(item, &evidence, top_identities, bucket_identities, refusals);
     let attempted_bytes = grouping.item_bytes(item);
-    let components = (attempted_bytes > MAX_ITEM_BYTES)
-        .then(|| shed_display_leaves(item, &grouping, attempted_bytes));
+    if max_item_bytes > MAX_ITEM_BYTES && attempted_bytes > max_item_bytes / 2 {
+        crate::local_resource_diagnostics::claude_identity_over_cap(
+            &BTreeSet::from([OverCap::NearCap]),
+            attempted_bytes,
+            None,
+        );
+    }
+    let components = (attempted_bytes > max_item_bytes)
+        .then(|| shed_display_leaves(item, &grouping, attempted_bytes, max_item_bytes));
     if let Some(bytes) = &components {
-        if bytes.after_shed > MAX_ITEM_BYTES {
+        if bytes.after_shed > max_item_bytes {
             over_cap.insert(OverCap::Bytes);
         } else if over_cap.is_empty() {
-            // Shedding alone fit: record it, since no strip will.
             crate::local_resource_diagnostics::claude_identity_over_cap(
                 &over_cap,
                 attempted_bytes,
                 Some(bytes),
             );
+        }
+    }
+    if max_item_bytes > MAX_ITEM_BYTES && over_cap.is_empty() {
+        let new_shares = grouping
+            .groups
+            .values()
+            .flat_map(BTreeMap::values)
+            .filter(|group| group.by_key.keys().any(Option::is_some))
+            .map(|group| group.by_key.len())
+            .sum::<usize>();
+        if item.usage_buckets.len() > accepted::MAX_BUCKETS
+            || known.map_or(new_shares > accepted::max_shares(max_item_bytes), |state| {
+                state.exceeds_share_bound(item, max_item_bytes, new_shares)
+            })
+        {
+            over_cap.insert(OverCap::PartsPerItem);
+            budget::record(&budget::Counts {
+                accepted_state_unknown: 1,
+                accepted_state_unknown_cause: budget::UnknownCauses::one(
+                    accepted::UnknownCause::Incomplete,
+                ),
+                ..Default::default()
+            });
         }
     }
     let unpriced = over_cap
@@ -1237,7 +1316,7 @@ fn apply_grouped_trimmed(
         .flatten();
     if let Some(unpriced) = unpriced {
         // Stripping only removes tags; the wire bound is still re-checked.
-        if grouping.item_bytes(item) <= MAX_ITEM_BYTES {
+        if grouping.item_bytes(item) <= max_item_bytes {
             let mut counts = cap_counts(item, &grouping, accepted, None);
             unpriced.count(&mut counts);
             deferred.drop_stripped(item, &unpriced.keys);
@@ -1257,6 +1336,18 @@ fn apply_grouped_trimmed(
             });
         }
         over_cap.insert(OverCap::Bytes);
+    }
+    // All cap reasons share one exit after display shedding: bytes, authority
+    // keys, parts, rows and evidence entries preserve the same owed custody.
+    if max_item_bytes > MAX_ITEM_BYTES && !over_cap.is_empty() {
+        over_cap.insert(OverCap::IdentityHeld);
+        crate::local_resource_diagnostics::claude_identity_over_cap(
+            &over_cap,
+            attempted_bytes,
+            components.as_ref(),
+        );
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        return Ok(Tagged::Held);
     }
     crate::local_resource_diagnostics::claude_identity_over_cap(
         &over_cap,
@@ -1279,7 +1370,7 @@ fn apply_grouped_trimmed(
         })
         .count() as u64;
     let selected = (!grouping.upstream_proof_lost)
-        .then(|| budget::select(item, &grouping, prior_refusals, accepted))
+        .then(|| budget::select(item, &grouping, prior_refusals, accepted, max_item_bytes))
         .flatten()
         .and_then(|(kept, mut measurement)| {
             let unpriced = untag_unpriced_parts(item, &grouping, accepted)?;
@@ -1288,7 +1379,7 @@ fn apply_grouped_trimmed(
                 measurement.accepted_retained =
                     cap_counts(item, &grouping, accepted, None).retained_buckets;
             }
-            (grouping.item_bytes(item) <= MAX_ITEM_BYTES).then_some((kept, measurement, unpriced))
+            (grouping.item_bytes(item) <= max_item_bytes).then_some((kept, measurement, unpriced))
         });
     if let Some((kept, measurement, unpriced)) = selected {
         let mut counts = cap_counts(item, &grouping, accepted, Some(&measurement));
@@ -1357,7 +1448,7 @@ fn apply_grouped_trimmed(
             .item_bytes(item)
             .saturating_sub(deferred.marker_bytes())
             .saturating_sub(flags);
-        copy_marks.keep_newest(MAX_ITEM_BYTES.saturating_sub(unflagged), &mut counts);
+        copy_marks.keep_newest(max_item_bytes.saturating_sub(unflagged), &mut counts);
         grouping.extra_wire_bytes -= flags - copy_marks.bytes();
     }
     let dropped = if deferred.rows.is_empty() {
@@ -1368,7 +1459,7 @@ fn apply_grouped_trimmed(
         let unmarked = grouping
             .item_bytes(item)
             .saturating_sub(deferred.marker_bytes());
-        deferred.keep_newest(MAX_ITEM_BYTES.saturating_sub(unmarked))
+        deferred.keep_newest(max_item_bytes.saturating_sub(unmarked))
     };
     let refusals = refusals.saturating_add(dropped);
     deferred.mark(item);
@@ -1894,6 +1985,7 @@ pub(crate) fn measure_identity_cap(
                 &grouping,
                 item.request_identity_refusals,
                 known,
+                MAX_ITEM_BYTES,
             )
         })
         .flatten();
@@ -2355,6 +2447,7 @@ fn shed_display_leaves(
     item: &mut SnapshotItem,
     grouping: &Grouping,
     attempted: usize,
+    max_item_bytes: usize,
 ) -> crate::local_resource_diagnostics::ClaudeIdentityOverCapBytes {
     let mut probe = item.clone();
     probe.context_curve = None;
@@ -2366,8 +2459,8 @@ fn shed_display_leaves(
     probe.usage_buckets.clear();
     let rest = grouping.item_bytes(&probe);
     drop(probe);
-    let fits = |item: &SnapshotItem| grouping.item_bytes(item) <= MAX_ITEM_BYTES;
-    if without_curve > MAX_ITEM_BYTES {
+    let fits = |item: &SnapshotItem| grouping.item_bytes(item) <= max_item_bytes;
+    if without_curve > max_item_bytes {
         // No curve can fit: go straight to the unavailable curve without
         // measuring the whole body once per pruned point.
         super::fit_context_curve(item, |_| false);
@@ -4130,7 +4223,7 @@ pub(crate) struct ScanEvidence<'a> {
     /// Sessions whose settled history cannot keep its identity even in
     /// one-day windows: held by the caller this pass.
     pub(crate) history_held: std::cell::RefCell<BTreeSet<String>>,
-    wire_size_reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
+    wire_budget: WireBudget<'a>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -4220,11 +4313,8 @@ impl<'a> ScanEvidence<'a> {
         self
     }
 
-    pub(crate) fn with_wire_size_reservation(
-        mut self,
-        reservation: Option<&'a dyn Fn(&SnapshotItem) -> usize>,
-    ) -> Self {
-        self.wire_size_reservation = reservation;
+    pub(crate) fn with_wire_budget(mut self, budget: WireBudget<'a>) -> Self {
+        self.wire_budget = budget;
         self
     }
 
@@ -5057,6 +5147,7 @@ pub(crate) struct ScanOutcome {
     pub(crate) sent: usize,
     pub(crate) fallback: usize,
     pub(crate) ineligible: usize,
+    pub(crate) held: BTreeSet<String>,
     /// Copy-derived accepted rows this pass's bodies treat as never accepted,
     /// for the sync loop to tombstone through `AcceptedBuckets` before upload.
     pub(crate) copy_invalidated: Vec<CopyInvalidation>,
@@ -5233,6 +5324,9 @@ pub(crate) fn apply_scan_with_ownership(
             ownership,
             &mut outcome.copy_invalidated,
         ) {
+            Some(Ok(Tagged::Held)) => {
+                outcome.held.insert(item.source_session_id.clone());
+            }
             Some(Ok(Tagged::Sent { .. })) => outcome.sent += 1,
             Some(Ok(Tagged::Fallback { .. })) => outcome.fallback += 1,
             Some(Err(_)) | None => outcome.ineligible += 1,
@@ -5476,8 +5570,9 @@ fn apply_cut(
     retained: bool,
     invalidated_rows: &mut Vec<CopyInvalidation>,
 ) -> Result<Tagged, Ineligible> {
+    let max_item_bytes = evidence.wire_budget.max_item_bytes;
     let Some(now) = evidence.history_segments_now else {
-        return apply_grouped_with_accepted(item, grouping, accepted, retained);
+        return apply_grouped_with_accepted(item, grouping, accepted, retained, max_item_bytes);
     };
     let original = item.clone();
     let starts = |piece: &SnapshotItem| {
@@ -5489,7 +5584,7 @@ fn apply_cut(
     };
     let everything = starts(&*item);
     let whole = grouping.piece(&everything.iter().map(String::as_str).collect(), true);
-    let tagged = apply_grouped_with_accepted(item, whole, accepted, retained);
+    let tagged = apply_grouped_with_accepted(item, whole, accepted, retained, max_item_bytes);
     let sent = matches!(tagged, Ok(Tagged::Sent { .. }));
     if tagged.is_err() || (sent && grouping.item_bytes(item) <= history_segments::trigger_bytes()) {
         return tagged;
@@ -5500,7 +5595,7 @@ fn apply_cut(
         &original,
         history_segments::trigger_bytes() + 1,
         now,
-        MAX_ITEM_BYTES,
+        max_item_bytes,
     )
     .and_then(|plan| history_segments::split(SnapshotSource::ClaudeCode, &original, &plan)) else {
         return tagged;
@@ -5535,19 +5630,25 @@ fn apply_cut(
             .map(|own| own.invalidated(&derived));
         let view = accepted::segment_view(own_invalidated.as_ref().or(own), accepted, &keys);
         let mut trimmed = BTreeSet::new();
-        let caps =
-            match apply_grouped_trimmed(segment, piece, view.as_ref(), retained, &mut trimmed) {
-                Ok(Tagged::Sent { .. }) => trimmed.into_iter().collect(),
-                Ok(Tagged::Fallback { over_cap, .. }) if !over_cap.is_empty() => over_cap,
-                // Any other cause is the whole session's too: today's path.
-                _ => {
-                    history_segments::alarm(
-                        SnapshotSource::ClaudeCode,
-                        history_segments::Skipped::PieceFailed,
-                    );
-                    return tagged;
-                }
-            };
+        let caps = match apply_grouped_trimmed(
+            segment,
+            piece,
+            view.as_ref(),
+            retained,
+            max_item_bytes,
+            &mut trimmed,
+        ) {
+            Ok(Tagged::Sent { .. }) => trimmed.into_iter().collect(),
+            Ok(Tagged::Fallback { over_cap, .. }) if !over_cap.is_empty() => over_cap,
+            // Any other cause is the whole session's too: today's path.
+            _ => {
+                history_segments::alarm(
+                    SnapshotSource::ClaudeCode,
+                    history_segments::Skipped::PieceFailed,
+                );
+                return tagged;
+            }
+        };
         #[cfg(test)]
         let caps = if history_segments::held_windows_for_test() {
             vec![OverCap::Bytes]
@@ -5589,7 +5690,7 @@ fn apply_cut(
     }
     let owned = starts(&live);
     let piece = grouping.piece(&owned.iter().map(String::as_str).collect(), true);
-    match apply_grouped_with_accepted(&mut live, piece, accepted, retained) {
+    match apply_grouped_with_accepted(&mut live, piece, accepted, retained, max_item_bytes) {
         Ok(result) => {
             live.history_cut = segments;
             *item = live;
@@ -5643,7 +5744,8 @@ fn tag_item(
         );
         normalize_activity(item);
         grouping.extra_wire_bytes = evidence
-            .wire_size_reservation
+            .wire_budget
+            .reservation
             .map_or(0, |reserve| reserve(item));
         grouping.accepted_miss = miss;
         let copy_derived = copy_derived_rows(item, &grouping, accepted);
@@ -5732,7 +5834,8 @@ fn tag_item(
     );
     normalize_activity(item);
     grouping.extra_wire_bytes = evidence
-        .wire_size_reservation
+        .wire_budget
+        .reservation
         .map_or(0, |reserve| reserve(item));
     let desktop_recent = std::mem::take(&mut grouping.desktop_recent);
     let owned = !grouping.unowned_request;

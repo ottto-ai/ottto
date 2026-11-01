@@ -7,127 +7,146 @@ pub(super) use mapper::family as dependency_family;
 use std::collections::BTreeSet;
 // Metadata, not a second account schema: current id, next ordinal, archive ids.
 type Positions = (Option<u64>, u64, Vec<u64>);
-fn windows(
-    prev: Option<&ClaudeAccountFamilyPending>,
-    next: Option<&ClaudeAccountFamilyPending>,
-    family: &str,
-    tx: &mut dyn Transaction,
-) -> Result<bool> {
-    let control = mapper::key("account.current", family, 1)?;
-    let created = tx.get(&control)?.is_none();
-    let (old_current, mut high, ids): Positions = match tx.get(&control)? {
-        Some(h) => mapper::read(tx, &h)?,
-        None => (None, 1, Vec::new()),
-    };
-    let old: Vec<_> = prev
-        .into_iter()
-        .flat_map(|p| p.previous_windows.iter().chain(std::iter::once(&p.current)))
-        .collect();
-    ensure!(
-        old.len() == ids.len()
-            && ids.last().copied() == old_current
-            && ids.iter().all(|id| *id > 0 && *id < high),
-        "accounts_window_inventory"
-    );
-    let wanted: Vec<_> = next
-        .into_iter()
-        .flat_map(|p| p.previous_windows.iter().chain(std::iter::once(&p.current)))
-        .collect();
-    let mut plan = Vec::new();
-    let mut after = 0;
-    for (ordinal, w) in wanted.iter().enumerate() {
-        let current = old.len().checked_sub(1).filter(|at| {
-            ordinal + 1 == wanted.len()
-                && *at >= after
-                && old[*at].census_window_end == w.census_window_end
-        });
-        let found = if ordinal + 1 == wanted.len() {
-            current.map(|at| (at, &old[at]))
-        } else {
-            old.iter()
-                .enumerate()
-                .skip(after)
-                .find(|(_, old)| *old == w)
-        };
-        let id = if let Some((at, _)) = found {
-            after = at + 1;
-            ids[at]
-        } else {
-            ensure!(high <= i64::MAX as u64, "accounts_ordinal_exhausted");
-            let id = high;
-            high += 1;
-            id
-        };
-        ensure!(
-            plan.last().map_or(true, |last| *last < id),
-            "accounts_window_order"
-        );
-        if found.map(|(at, _)| old[at]) != Some(*w) {
-            mapper::put(tx, &mapper::key("account_window", family, id)?, *w)?;
-        }
-        plan.push(id);
-    }
-    for id in ids.iter().filter(|id| !plan.contains(id)) {
-        mapper::remove(tx, &mapper::key("account_window", family, *id)?)?;
-    }
-    // Retain the high-water mark when a family disappears, preventing id reuse.
-    mapper::put(tx, &control, &(plan.last().copied(), high, &plan))?;
-    if let Some(p) = next {
-        mapper::put(
-            tx,
-            &mapper::key("account.absent_members", family, 1)?,
-            &p.confirmed_absent_members,
-        )?;
-    } else {
-        mapper::remove(tx, &mapper::key("account.absent_members", family, 1)?)?;
-    }
-    Ok(created)
+#[derive(Default)]
+pub(super) struct WindowBaseline {
+    pub(super) ids: Vec<u64>,
+    digests: Vec<[u8; 32]>,
+    current_end: Option<String>,
 }
-pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
-    delta(&ScanIndex::default(), index, tx, cx)
-}
-pub(super) fn delta(
-    prev: &ScanIndex,
+pub(super) fn rows(
     next: &ScanIndex,
-    tx: &mut dyn Transaction,
-    _cx: &mut KindCx,
-) -> Result<()> {
+    rows: &mut mapper::Rows<'_>,
+    old: &std::collections::BTreeMap<String, WindowBaseline>,
+    cx: &mut KindCx,
+) -> Result<std::collections::BTreeMap<String, WindowBaseline>> {
     macro_rules! save {
         ($f:ident, Accounts, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            mapper::map_delta(tx, $kind, &prev.$f, &next.$f)?;
+            rows.map($kind, &next.$f)?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each save);
-    // Count inactive high-water controls too: losing one must not permit ID reuse.
     let manifest = mapper::key("account.current", "", 0)?;
-    let mut controls = match tx.get(&manifest)? {
-        Some(h) => mapper::read::<(usize, usize)>(tx, &h)?.1,
-        None => 0,
-    };
-    let families: BTreeSet<_> = prev
-        .claude_account_family_pending
+    let mut controls = cx.account_controls;
+    let mut pending = std::collections::BTreeMap::new();
+    let families: BTreeSet<_> = old
         .keys()
         .chain(next.claude_account_family_pending.keys())
         .collect();
     for family in families {
-        if prev.claude_account_family_pending.get(family)
-            != next.claude_account_family_pending.get(family)
+        let previous = old.get(family);
+        let wanted = next.claude_account_family_pending.get(family);
+        let values: Vec<_> = wanted
+            .into_iter()
+            .flat_map(|p| p.previous_windows.iter().chain(std::iter::once(&p.current)))
+            .collect();
+        let seeded = rows
+            .tx
+            .is_none()
+            .then(|| cx.account_ids.remove(family).unwrap_or_default());
+        let digests = values
+            .iter()
+            .enumerate()
+            .map(|(n, w)| match seeded.as_ref().and_then(|ids| ids.get(n)) {
+                Some(id) => rows.digest(&mapper::key("account_window", family, *id)?, *w),
+                None => mapper::digest(*w),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let current_end = wanted.map(|p| p.census_window_end.clone());
+        let control = mapper::key("account.current", family, 1)?;
+        let ids = if let Some(ids) = seeded {
+            ensure!(ids.len() == values.len(), "accounts_window_inventory");
+            ids
+        } else if let Some(previous) =
+            previous.filter(|p| p.digests == digests && p.current_end == current_end)
         {
-            controls += usize::from(windows(
-                prev.claude_account_family_pending.get(family),
-                next.claude_account_family_pending.get(family),
-                family,
-                tx,
-            )?);
+            // No changed window needs a control read or ID allocation.
+            previous.ids.clone()
+        } else {
+            let tx = rows.tx.as_deref_mut().context("state_v2_save_tx")?;
+            let header = tx.get(&control)?;
+            controls += usize::from(header.is_none());
+            let created = header.is_none();
+            let (current, mut high, ids): Positions = match header {
+                Some(h) => mapper::read(tx, &h, None)?,
+                None => (None, 1, Vec::new()),
+            };
+            let old_ids = previous.map(|p| p.ids.as_slice()).unwrap_or_default();
+            ensure!(
+                ids == old_ids
+                    && ids.last().copied() == current
+                    && ids.iter().all(|id| *id > 0 && *id < high),
+                "accounts_window_inventory"
+            );
+            let old_high = high;
+            let mut plan = Vec::new();
+            let mut after = 0;
+            for (ordinal, digest) in digests.iter().enumerate() {
+                let found = previous.and_then(|p| {
+                    if ordinal + 1 == digests.len() {
+                        p.ids
+                            .len()
+                            .checked_sub(1)
+                            .filter(|at| *at >= after && p.current_end == current_end)
+                    } else {
+                        p.digests
+                            .iter()
+                            .enumerate()
+                            .skip(after)
+                            .find(|(_, old)| *old == digest)
+                            .map(|(at, _)| at)
+                    }
+                });
+                let id = if let Some(at) = found {
+                    after = at + 1;
+                    ids[at]
+                } else {
+                    ensure!(high <= i64::MAX as u64, "accounts_ordinal_exhausted");
+                    let id = high;
+                    high += 1;
+                    id
+                };
+                ensure!(
+                    plan.last().map_or(true, |last| *last < id),
+                    "accounts_window_order"
+                );
+                plan.push(id);
+            }
+            // Inactive controls retain their high-water mark forever. They are
+            // not logical graph rows and are never swept by row deletion.
+            if created || current != plan.last().copied() || high != old_high || ids != plan {
+                mapper::put(
+                    rows.tx.as_deref_mut().context("state_v2_save_tx")?,
+                    &control,
+                    &(plan.last().copied(), high, &plan),
+                )?;
+            }
+            plan
+        };
+        for ((id, value), digest) in ids.iter().zip(values).zip(&digests) {
+            rows.put_digest(mapper::key("account_window", family, *id)?, value, *digest)?;
+        }
+        if let Some(p) = wanted {
+            rows.put(
+                mapper::key("account.absent_members", family, 1)?,
+                &p.confirmed_absent_members,
+            )?;
+            pending.insert(
+                family.clone(),
+                WindowBaseline {
+                    ids,
+                    digests,
+                    current_end,
+                },
+            );
         }
     }
-    mapper::put(
-        tx,
-        &manifest,
+    rows.put(
+        manifest,
         &(next.claude_account_family_pending.len(), controls),
     )?;
-    Ok(())
+    cx.account_controls = controls;
+    Ok(pending)
 }
 pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,
@@ -139,13 +158,15 @@ pub(super) fn hydrate_txn(
 pub(super) fn hydrate_filtered(
     tx: &mut dyn Transaction,
     index: &mut ScanIndex,
-    _cx: &mut KindCx,
+    cx: &mut KindCx,
     filter: Option<(&BTreeSet<String>, bool)>,
 ) -> Result<()> {
     let roots = filter.map(|(roots, _)| roots);
+    // Only a complete hydrate seeds a baseline; CAS views stay unhashed.
+    let mut seed = filter.is_none().then_some(&mut cx.digests);
     macro_rules! load {
         ($f:ident, Accounts, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = mapper::read_map(tx, $kind, roots)?;
+            index.$f = mapper::read_map(tx, $kind, roots, seed.as_deref_mut())?;
         };
         ($($t:tt)*) => {};
     }
@@ -153,7 +174,7 @@ pub(super) fn hydrate_filtered(
     let h = tx
         .get(&mapper::key("account.current", "", 0)?)?
         .context("accounts_missing_manifest")?;
-    let expected: (usize, usize) = mapper::read(tx, &h)?;
+    let expected: (usize, usize) = mapper::read(tx, &h, seed.as_deref_mut())?;
     let mut count = 0;
     let mut controls = 0;
     let mut seen = BTreeSet::new();
@@ -173,7 +194,7 @@ pub(super) fn hydrate_filtered(
         ensure!(*position == 1, "accounts_position");
         controls += 1;
         let family = dependency_family(key_bytes)?;
-        let (current, high, ids): Positions = mapper::read(tx, &h)?;
+        let (current, high, ids): Positions = mapper::read(tx, &h, None)?;
         ensure!(
             ids.windows(2).all(|w| w[0] < w[1])
                 && ids.iter().all(|id| *id > 0 && *id < high)
@@ -192,14 +213,19 @@ pub(super) fn hydrate_filtered(
         for id in &ids {
             let key = mapper::key("account_window", &family, *id)?;
             let h = tx.get(&key)?.context("accounts_missing_window")?;
-            windows.push(mapper::read::<ClaudeAccountFamilyPendingWindow>(tx, &h)?);
+            windows.push(mapper::read::<ClaudeAccountFamilyPendingWindow>(
+                tx,
+                &h,
+                seed.as_deref_mut(),
+            )?);
             seen.insert(key);
         }
         let h = tx
             .get(&mapper::key("account.absent_members", &family, 1)?)?
             .context("accounts_missing_absent")?;
-        let absent = mapper::read(tx, &h)?;
+        let absent = mapper::read(tx, &h, seed.as_deref_mut())?;
         let current = windows.pop().context("accounts_current")?;
+        cx.account_ids.insert(family.clone(), ids);
         index.claude_account_family_pending.insert(
             family,
             ClaudeAccountFamilyPending {
@@ -211,6 +237,7 @@ pub(super) fn hydrate_filtered(
         Ok(())
     })?;
     ensure!((count, controls) == expected, "accounts_missing_family");
+    cx.account_controls = controls;
     // Unreferenced windows must not silently disappear on hydration.
     mapper::rows(tx, "account_window", |_, h| {
         let RowKey::Record { key_bytes, .. } = &h.key else {

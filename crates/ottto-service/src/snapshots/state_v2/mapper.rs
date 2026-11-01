@@ -169,9 +169,13 @@ fn shared_json(
         created,
     })
 }
+/// Row commitments recorded while one hydrate decodes; its seed consumes them.
+pub(super) type Digests = BTreeMap<RowKey, [u8; 32]>;
+const ROW_DOMAIN: &[u8] = b"ottto.state-v2.row.v1\0";
 pub(super) fn read<T: DeserializeOwned + Serialize>(
     tx: &mut dyn Transaction,
     h: &Header,
+    seed: Option<&mut Digests>,
 ) -> Result<T> {
     let stored = bytes(tx, h)?;
     let json = codec::expand(&stored, value_cap(&h.key))?;
@@ -180,7 +184,17 @@ pub(super) fn read<T: DeserializeOwned + Serialize>(
         _ => "",
     };
     let projection = shared_json(tx, kind, &json, false)?;
-    codec::exact_json(&projection.json)
+    let (value, canonical) = codec::exact_json(&projection.json)?;
+    if let Some(seed) = seed {
+        // Same bytes and domain as `digest(&value)`, without serializing again.
+        use sha2::Digest;
+        let digest = sha2::Sha256::new()
+            .chain_update(ROW_DOMAIN)
+            .chain_update(&canonical)
+            .finalize();
+        seed.insert(h.key.clone(), digest.into());
+    }
+    Ok(value)
 }
 pub(super) fn put<T: Serialize + ?Sized>(
     tx: &mut dyn Transaction,
@@ -244,40 +258,107 @@ pub(super) fn remove(tx: &mut dyn Transaction, key: &RowKey) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn map_delta<T: Serialize>(
-    tx: &mut dyn Transaction,
-    kind: &str,
-    prev: &BTreeMap<String, T>,
-    next: &BTreeMap<String, T>,
-) -> Result<()> {
-    // Position zero is a required cardinality manifest; members are position one.
-    put(tx, &key(kind, "", 0)?, &next.len())?;
-    let position = 1;
-    for name in prev.keys().filter(|name| !next.contains_key(*name)) {
-        remove(tx, &key(kind, name, position)?)?;
+/// Expanded logical rows, before evidence projection or compression. Consuming
+/// the old inventory makes deletions independent of how a subset was rebuilt.
+#[derive(Default)]
+pub(super) struct Rows<'a> {
+    pub(super) tx: Option<&'a mut dyn Transaction>,
+    pub(super) old: BTreeMap<RowKey, [u8; 32]>,
+    pub(super) next: BTreeMap<RowKey, [u8; 32]>,
+    /// Baseline seed only: digests recorded when these rows were decoded.
+    pub(super) seed: Digests,
+}
+pub(super) fn digest<T: Serialize + ?Sized>(value: &T) -> Result<[u8; 32]> {
+    use sha2::Digest;
+    Ok(super::super::serialized_json_digest(value, ROW_DOMAIN)
+        .context("state_v2_row_serialize")?
+        .finalize()
+        .into())
+}
+impl Rows<'_> {
+    pub(super) fn put<T: Serialize + ?Sized>(&mut self, key: RowKey, value: &T) -> Result<()> {
+        let digest = self.digest(&key, value)?;
+        self.put_digest(key, value, digest)
     }
-    for (name, value) in next {
-        let changed = prev
-            .get(name)
-            .map(|p| codec::json(p, input_cap(&key(kind, name, position)?)))
-            .transpose()?;
-        if changed.as_deref()
-            != Some(codec::json(value, input_cap(&key(kind, name, position)?))?.as_slice())
-        {
-            put(tx, &key(kind, name, position)?, value)?;
+    /// A decoded digest commits to the row as stored. Should it ever differ
+    /// from the enumerated value's, the next save sees a mismatch and writes
+    /// the row: the seed can add a write, never skip one.
+    pub(super) fn digest<T: Serialize + ?Sized>(
+        &mut self,
+        key: &RowKey,
+        value: &T,
+    ) -> Result<[u8; 32]> {
+        match self.seed.remove(key) {
+            Some(digest) => Ok(digest),
+            None => digest(value),
         }
     }
-    Ok(())
+    pub(super) fn put_digest<T: Serialize + ?Sized>(
+        &mut self,
+        key: RowKey,
+        value: &T,
+        digest: [u8; 32],
+    ) -> Result<()> {
+        if self.old.remove(&key) != Some(digest) {
+            if let Some(tx) = self.tx.as_deref_mut() {
+                put(tx, &key, value)?;
+            }
+        }
+        ensure!(
+            self.next.insert(key, digest).is_none(),
+            "state_v2_duplicate_row"
+        );
+        Ok(())
+    }
+    pub(super) fn raw(&mut self, key: RowKey, value: &[u8]) -> Result<()> {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(value).into();
+        if self.old.remove(&key) != Some(digest) {
+            if let Some(tx) = self.tx.as_deref_mut() {
+                tx.put(RowInput {
+                    key: &key,
+                    fixed: &Fixed::None,
+                    value_version: 1,
+                    value,
+                })?;
+            }
+        }
+        ensure!(
+            self.next.insert(key, digest).is_none(),
+            "state_v2_duplicate_row"
+        );
+        Ok(())
+    }
+    pub(super) fn map<T: Serialize>(
+        &mut self,
+        kind: &str,
+        values: &BTreeMap<String, T>,
+    ) -> Result<()> {
+        self.put(key(kind, "", 0)?, &values.len())?;
+        for (name, value) in values {
+            self.put(key(kind, name, 1)?, value)?;
+        }
+        Ok(())
+    }
+    pub(super) fn finish(mut self) -> Result<BTreeMap<RowKey, [u8; 32]>> {
+        if let Some(tx) = self.tx.as_deref_mut() {
+            for key in self.old.keys() {
+                remove(tx, key)?;
+            }
+        }
+        Ok(self.next)
+    }
 }
 pub(super) fn read_map<T: DeserializeOwned + Serialize>(
     tx: &mut dyn Transaction,
     kind: &str,
     roots: Option<&BTreeSet<String>>,
+    mut seed: Option<&mut Digests>,
 ) -> Result<BTreeMap<String, T>> {
     let manifest = tx
         .get(&key(kind, "", 0)?)?
         .context("state_v2_missing_manifest")?;
-    let expected = read::<usize>(tx, &manifest)?;
+    let expected = read::<usize>(tx, &manifest, seed.as_deref_mut())?;
     let mut result = BTreeMap::new();
     let mut count = 0;
     rows(tx, kind, |tx, h| {
@@ -297,7 +378,7 @@ pub(super) fn read_map<T: DeserializeOwned + Serialize>(
         count += 1;
         let name = family(key_bytes)?;
         if roots.map_or(true, |roots| roots.contains(&name)) {
-            result.insert(name, read(tx, &h)?);
+            result.insert(name, read(tx, &h, seed.as_deref_mut())?);
         }
         Ok(())
     })?;
@@ -364,66 +445,36 @@ pub(super) enum Members {
 }
 /// Split only a collection's immediate members. Structs remain one value.
 pub(super) fn field_write<T: Serialize + ?Sized>(
-    tx: &mut dyn Transaction,
-    cx: &mut KindCx,
+    rows: &mut Rows<'_>,
     kind: &str,
     value: &T,
     mode: Members,
 ) -> Result<()> {
-    let json = codec::json(value, VALUE_BYTES)?;
     let entries: BTreeMap<String, Box<serde_json::value::RawValue>> = match mode {
-        Members::Field => {
-            let key = key(kind, "", 0)?;
-            let h = put(tx, &key, value)?;
-            cx.misc_rows.insert(key, (h, true));
-            return Ok(());
-        }
-        Members::Map => serde_json::from_slice(&json)?,
-        Members::Set => serde_json::from_slice::<Vec<Box<serde_json::value::RawValue>>>(&json)?
-            .into_iter()
-            .map(|v| Ok((serde_json::from_str(v.get())?, v)))
-            .collect::<Result<_>>()?,
+        Members::Field => return rows.put(key(kind, "", 0)?, value),
+        Members::Map => serde_json::from_slice(&codec::json(value, VALUE_BYTES)?)?,
+        Members::Set => serde_json::from_slice::<Vec<Box<serde_json::value::RawValue>>>(
+            &codec::json(value, VALUE_BYTES)?,
+        )?
+        .into_iter()
+        .map(|v| Ok((serde_json::from_str(v.get())?, v)))
+        .collect::<Result<_>>()?,
     };
-    let mut live = BTreeSet::new();
-    let root = key(kind, "", 0)?;
-    let h = put(tx, &root, &entries.len())?;
-    cx.misc_rows.insert(root.clone(), (h, true));
-    live.insert(root);
-    for (name, value) in entries {
-        let key = key(kind, &name, 1)?;
-        let h = put(tx, &key, &value)?;
-        cx.misc_rows.insert(key.clone(), (h, true));
-        live.insert(key);
-    }
-    let dead: Vec<_> = cx
-        .misc_rows
-        .keys()
-        .filter(|k| matches!(k,RowKey::Record{kind:k,..} if k.name()==kind) && !live.contains(*k))
-        .cloned()
-        .collect();
-    for k in dead {
-        remove(tx, &k)?;
-        cx.misc_rows.remove(&k);
-    }
-    Ok(())
+    rows.map(kind, &entries)
 }
 pub(super) fn field_read<T: DeserializeOwned + Serialize>(
     tx: &mut dyn Transaction,
-    cx: &mut KindCx,
     kind: &str,
     mode: Members,
+    seed: Option<&mut Digests>,
 ) -> Result<T> {
     let root = key(kind, "", 0)?;
     let h = tx.get(&root)?.context("state_v2_missing_field")?;
-    cx.misc_rows.insert(root, (h.clone(), true));
     if matches!(mode, Members::Field) {
-        return read(tx, &h);
+        return read(tx, &h, seed);
     }
-    let entries: BTreeMap<String, Box<serde_json::value::RawValue>> = read_map(tx, kind, None)?;
-    rows(tx, kind, |_, h| {
-        cx.misc_rows.insert(h.key.clone(), (h, true));
-        Ok(())
-    })?;
+    let entries: BTreeMap<String, Box<serde_json::value::RawValue>> =
+        read_map(tx, kind, None, seed)?;
     let json = match mode {
         Members::Map => serde_json::to_vec(&entries)?,
         Members::Set => serde_json::to_vec(&entries.values().collect::<Vec<_>>())?,

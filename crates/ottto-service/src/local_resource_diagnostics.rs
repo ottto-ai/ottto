@@ -109,10 +109,10 @@ mod footprint;
 pub(crate) mod rearm_cause;
 
 #[cfg(not(test))]
-static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 #[cfg(test)]
 thread_local! {
-    static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] };
+    static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 8] = const { [const { AtomicU64::new(0) }; 8] };
 }
 
 /// Append-only reason labels, cumulative per process (not distinct sessions).
@@ -123,15 +123,17 @@ pub(crate) fn claude_identity_over_cap(
     components: Option<&ClaudeIdentityOverCapBytes>,
 ) {
     use crate::snapshots::claude_request_identity::OverCap;
-    const LABELS: [&str; 6] = [
+    const LABELS: [&str; 8] = [
         "evidence_entries",
         "authority_keys",
         "parts_per_row",
         "parts_per_item",
         "rows",
         "bytes",
+        "near_cap",
+        "identity_over_cap_held",
     ];
-    let record = |counters: &[AtomicU64; 6]| {
+    let record = |counters: &[AtomicU64; 8]| {
         for reason in reasons {
             let index = match reason {
                 OverCap::EvidenceEntries => 0,
@@ -140,6 +142,8 @@ pub(crate) fn claude_identity_over_cap(
                 OverCap::PartsPerItem => 3,
                 OverCap::Rows => 4,
                 OverCap::Bytes => 5,
+                OverCap::NearCap => 6,
+                OverCap::IdentityHeld => 7,
             };
             let _ = counters[index].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
         }
@@ -158,6 +162,9 @@ pub(crate) fn claude_identity_over_cap(
                 claude_request_identity_over_cap: LABELS
                     .into_iter()
                     .zip(counters.iter().map(|n| n.load(Relaxed)))
+                    .filter(|(label, count)| {
+                        !matches!(*label, "near_cap" | "identity_over_cap_held") || *count != 0
+                    })
                     .collect(),
                 claude_request_identity_last_over_cap_item_bytes: item_bytes,
                 claude_request_identity_last_over_cap_components: components,
@@ -873,7 +880,7 @@ impl Probe {
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
-                Default::default()
+                self.page_events.with_current().retained_cache_only()
             },
             collection: counts,
             pending,
@@ -2581,6 +2588,12 @@ mod tests {
                     full_causes: Default::default(),
                 },
             );
+            // Another source's page: its retained-cache events and nothing else.
+            let scope = claude_reread::Scope::begin(true);
+            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
+            cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+            let mut probe = Probe::start();
+            probe.page_events.merge(scope.finish());
             probe.collection(
                 "codex",
                 CollectionCounts {
@@ -2603,9 +2616,10 @@ mod tests {
             1
         );
         assert!(rows[1]["counts"].get("claude_reread").is_none());
-        assert!(rows[1]["counts"]
-            .get("retained_cache_page_events")
-            .is_none());
+        assert_eq!(
+            rows[1]["counts"]["retained_cache_page_events"]["take_hit"],
+            1
+        );
         assert_eq!(rows[2]["stage"], "native_comparison_decision");
         assert_eq!(
             rows[2]["counts"]["claude_reread"]["restored_empty_sibling"],

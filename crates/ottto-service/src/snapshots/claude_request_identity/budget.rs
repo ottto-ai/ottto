@@ -344,6 +344,7 @@ fn intrinsically_fits(
     base: usize,
     additional_refusal_rows: usize,
     mandatory_refusals: u64,
+    max_item_bytes: usize,
 ) -> bool {
     let minimum = || -> Option<Metrics> {
         let mut total = Metrics::default();
@@ -420,7 +421,7 @@ fn intrinsically_fits(
         minimum.parts <= MAX_PARTS_PER_ITEM
             && base
                 .checked_add(minimum.bytes)
-                .is_some_and(|bytes| bytes <= MAX_ITEM_BYTES)
+                .is_some_and(|bytes| bytes <= max_item_bytes)
     })
 }
 
@@ -521,6 +522,7 @@ fn fits(
     selection: &Selection,
     base_bytes: usize,
     prior_refusals: u64,
+    max_item_bytes: usize,
 ) -> Option<usize> {
     for (row, groups) in item.model_usage.iter().zip(&selection.top) {
         let mut total = Amounts::default();
@@ -531,10 +533,15 @@ fn fits(
         }
         reproduces(row, &total).ok()?;
     }
-    fits_caps(selection, base_bytes, prior_refusals)
+    fits_caps(selection, base_bytes, prior_refusals, max_item_bytes)
 }
 
-fn fits_caps(selection: &Selection, base_bytes: usize, prior_refusals: u64) -> Option<usize> {
+fn fits_caps(
+    selection: &Selection,
+    base_bytes: usize,
+    prior_refusals: u64,
+    max_item_bytes: usize,
+) -> Option<usize> {
     if selection.metrics.parts > MAX_PARTS_PER_ITEM {
         return None;
     }
@@ -558,7 +565,7 @@ fn fits_caps(selection: &Selection, base_bytes: usize, prior_refusals: u64) -> O
             &evidence,
             prior_refusals.saturating_add(selection.refused_rows),
         )?)?;
-    (bytes <= MAX_ITEM_BYTES).then_some(bytes)
+    (bytes <= max_item_bytes).then_some(bytes)
 }
 
 /// Pure allocation over current proof; mutates only the supplied output body.
@@ -570,6 +577,7 @@ pub(super) fn select(
     grouping: &Grouping,
     prior_refusals: u64,
     accepted: Option<&accepted::AcceptedSession>,
+    max_item_bytes: usize,
 ) -> Option<(Vec<bool>, Measurement)> {
     let is_accepted = item
         .usage_buckets
@@ -686,6 +694,7 @@ pub(super) fn select(
                     base_bytes,
                     additional_refusal_rows,
                     mandatory_refusals,
+                    max_item_bytes,
                 )
         })
         .collect::<Vec<_>>();
@@ -703,7 +712,7 @@ pub(super) fn select(
         bucket_identities[index] = rows;
     }
     for &index in accepted_order.iter().rev() {
-        if fits(item, &selection, base_bytes, prior_refusals).is_some() {
+        if fits(item, &selection, base_bytes, prior_refusals, max_item_bytes).is_some() {
             break;
         }
         if !kept[index] {
@@ -774,7 +783,7 @@ pub(super) fn select(
                 trial = next;
                 added.push((member, identities));
             }
-            if !valid || fits(item, &trial, base_bytes, prior_refusals).is_none() {
+            if !valid || fits(item, &trial, base_bytes, prior_refusals, max_item_bytes).is_none() {
                 continue;
             }
             admitted = Some((trial, added));
@@ -825,7 +834,7 @@ pub(super) fn select(
         item_bytes: grouping.item_bytes(item),
         ..Default::default()
     };
-    if measurement.item_bytes > MAX_ITEM_BYTES {
+    if measurement.item_bytes > max_item_bytes {
         return None;
     }
     for (index, keep) in kept.iter().enumerate() {

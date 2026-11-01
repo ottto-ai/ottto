@@ -91,7 +91,6 @@ fn codex_prelude_ld_and_mcp_eof_share_one_primary_read() {
         None,
         &[],
         false,
-        true,
     )
     .with_line_observer("codex_prelude", preludes.observer(roots))
     .with_codex_versions(versions.clone());

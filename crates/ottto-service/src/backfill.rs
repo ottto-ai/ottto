@@ -589,7 +589,6 @@ pub fn run_backfill(
             artifacts_enabled,
             attribution_context,
             None,
-            false,
             &[],
             false,
         )?;

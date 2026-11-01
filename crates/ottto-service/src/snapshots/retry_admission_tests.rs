@@ -142,7 +142,6 @@ fn retry_test_page(
         &[],
         false,
         true,
-        true,
     );
     let selected = scan
         .identified_candidates
@@ -943,7 +942,6 @@ fn retry_offer_clock_credits_missing_paths_once_across_reload_and_64_path_seed()
             Some(&root.join("support")),
             &[],
             false,
-            true,
             true,
         );
         assert!(
