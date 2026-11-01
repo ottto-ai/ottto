@@ -2725,6 +2725,29 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         }
         let ds = durable_source(source).unwrap();
         let digest = store::key_digest(ds, &key);
+        let cache = fixture::cache(source, &index_path, &namespace, false);
+        // Capture requires an eligible predecessor before the later storage fault.
+        let binding = {
+            let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source)
+            else {
+                panic!("native fixture binding lease")
+            };
+            let counting = acquired::ImmutableCounting::from_reduction(&reduction).unwrap();
+            let binding = cache
+                .live_binding(
+                    ds,
+                    source,
+                    &key,
+                    checkpoint.scope(),
+                    &ScanIndex::default(),
+                    effective_revision(source),
+                    &counting,
+                    &mut lease,
+                )
+                .expect("native fixture binding");
+            lease.release();
+            binding
+        };
         let mut disk = fixture::store(&index_path, ds);
         disk.write_after_save(
             lock,
@@ -2732,13 +2755,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
             0,
             vec![PendingRecord {
                 acquisition: fixture_acquisition(source),
-                binding: Binding {
-                    source: ds,
-                    key: digest,
-                    context: [0; 32],
-                    scope: [0; 32],
-                    entry: [0; 32],
-                },
+                binding,
                 certificate: certificate(&path, &namespace),
                 body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
                 allowlist: codec::allowlist_digest(source),
@@ -2754,7 +2771,6 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         ));
         // Acquire genuine native custody while the predecessor is still valid.
         // The following corruption is a later storage fault, not capture authority.
-        let cache = fixture::cache(source, &index_path, &namespace, false);
         let completed = if arm == "codec" {
             native_v3_completion(&cache, &path, source, reduction, checkpoint)
         } else {
