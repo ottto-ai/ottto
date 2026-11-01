@@ -77826,18 +77826,24 @@ mod tests {
 
     /// [behaviour] Any database that is not an idle WAL file with one name
     /// takes the plain open, which reads live WAL frames and writes nothing
-    /// beside the database: an existing `-shm` keeps its bytes, a symlinked
-    /// name reads its target's live WAL instead of a stale snapshot, and a
-    /// `-wal` without its `-shm` fails closed (CANTOPEN, retried) with no
-    /// file created.
+    /// beside the database. A symlinked name with no `-wal` of its own is
+    /// refused rather than snapshotted. With no connection attached, an
+    /// existing `-shm` keeps its bytes (a writable open would truncate it)
+    /// and the frames are read through a private index; a `-wal` without its
+    /// `-shm` fails closed (CANTOPEN, retried) with no file created. SQLite
+    /// keeps one `-shm` mapping per file per process, so a reader beside this
+    /// in-process writer uses the writer's writable mapping and cannot show
+    /// what `readonly_shm` does for a separate Codex process; the byte checks
+    /// therefore use copies with no connection attached.
     #[cfg(unix)]
     #[test]
     fn codex_sidecar_plain_open_reads_live_wal_without_writing_beside_it() {
         let home = temp_dir("codex-live-wal-plain-open");
         let codex_dir = home.join(".codex");
-        let copy_dir = home.join("copy");
-        fs::create_dir_all(&codex_dir).expect("create history fixture root");
-        fs::create_dir_all(&copy_dir).expect("create copy fixture root");
+        let [indexed, bare] = ["indexed", "bare"].map(|name| home.join(name));
+        for dir in [&codex_dir, &indexed, &bare] {
+            fs::create_dir_all(dir).expect("create history fixture root");
+        }
         let history_path =
             codex_idle_wal_history(&codex_dir, "01a04e22-49cf-7460-9fd7-f7dbfd2f05e4");
         let alias_path = codex_dir.join("alias.sqlite");
@@ -77850,32 +77856,43 @@ mod tests {
                  UPDATE thread_history_projection_state SET next_rollout_ordinal = 4;",
             )
             .expect("write an uncheckpointed frame");
-        let shm = fs::read(state_v2::sidecar(&history_path, "-shm")).expect("read live -shm");
-        for path in [&history_path, &alias_path] {
-            let (ordinal, open) = rollout_ordinal(path);
-            assert_eq!(ordinal.expect("read live WAL database"), Some(4));
-            assert_eq!(open.snapshots, 0);
-        }
-        assert_eq!(
-            fs::read(state_v2::sidecar(&history_path, "-shm")).expect("reread live -shm"),
-            shm
-        );
+        let (ordinal, open) = rollout_ordinal(&history_path);
+        assert_eq!(ordinal.expect("read live WAL database"), Some(4));
+        assert_eq!(open.snapshots, 0);
+        let (ordinal, open) = rollout_ordinal(&alias_path);
+        assert!(matches!(
+            ordinal.expect_err("linked name refused").downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        assert_eq!(open.snapshots, 0);
         assert_eq!(sqlite_wal_and_shm_exist(&alias_path), [false, false]);
+        let copies = [(&indexed, true), (&bare, false)].map(|(dir, with_shm)| {
+            let copy = dir.join("thread_history_1.sqlite");
+            fs::copy(&history_path, &copy).expect("copy main file");
+            let suffixes: &[&str] = if with_shm {
+                &["-wal", "-shm"]
+            } else {
+                &["-wal"]
+            };
+            let bytes = suffixes
+                .iter()
+                .map(|suffix| {
+                    let bytes = fs::read(state_v2::sidecar(&history_path, suffix))
+                        .expect("read live sidecar");
+                    fs::write(state_v2::sidecar(&copy, suffix), &bytes).expect("copy sidecar");
+                    (*suffix, bytes)
+                })
+                .collect::<Vec<_>>();
+            (copy, bytes)
+        });
         drop(writer);
 
-        let writer = Connection::open(&history_path).expect("reopen history writer");
-        writer
-            .execute_batch(
-                "PRAGMA wal_autocheckpoint=0;\
-                 UPDATE thread_history_projection_state SET next_rollout_ordinal = 5;",
-            )
-            .expect("write another uncheckpointed frame");
-        let copy_path = copy_dir.join("thread_history_1.sqlite");
-        fs::copy(&history_path, &copy_path).expect("copy main file");
-        let wal = fs::read(state_v2::sidecar(&history_path, "-wal")).expect("read live -wal");
-        fs::write(state_v2::sidecar(&copy_path, "-wal"), &wal).expect("copy -wal");
-        drop(writer);
-        let (ordinal, open) = rollout_ordinal(&copy_path);
+        let [(indexed_path, indexed_bytes), (bare_path, bare_bytes)] = copies;
+        let (ordinal, open) = rollout_ordinal(&indexed_path);
+        assert_eq!(ordinal.expect("read copied WAL with -shm"), Some(4));
+        assert_eq!(open.snapshots, 0);
+        let (ordinal, open) = rollout_ordinal(&bare_path);
         assert!(matches!(
             ordinal.expect_err("-wal without -shm").downcast_ref::<rusqlite::Error>(),
             Some(rusqlite::Error::SqliteFailure(failure, _))
@@ -77885,11 +77902,13 @@ mod tests {
             (open.retries, open.snapshots),
             (CODEX_SIDECAR_OPEN_RETRIES, 0)
         );
-        assert_eq!(sqlite_wal_and_shm_exist(&copy_path), [true, false]);
-        assert_eq!(
-            fs::read(state_v2::sidecar(&copy_path, "-wal")).expect("reread copied -wal"),
-            wal
-        );
+        assert_eq!(sqlite_wal_and_shm_exist(&bare_path), [true, false]);
+        for (path, bytes) in [(&indexed_path, &indexed_bytes), (&bare_path, &bare_bytes)] {
+            for (suffix, before) in bytes {
+                let after = fs::read(state_v2::sidecar(path, suffix)).expect("reread sidecar");
+                assert_eq!(&after, before, "{suffix} changed");
+            }
+        }
         let _ = fs::remove_dir_all(home);
     }
 

@@ -11,6 +11,8 @@
 //! `-wal` appears; `read` checks that after the rows are read and before the
 //! caller uses them. The check relies on the filesystem's mtime resolution.
 //!
+//! An idle-looking WAL database reached through a symlink or a second hard
+//! link is refused (busy): its live `-wal` may sit beside another name.
 //! Every other database takes the plain open with `readonly_shm`, so SQLite
 //! never creates, truncates or marks the `-shm`; a `-wal` without its `-shm`
 //! fails CANTOPEN, which the caller retries. A plain open still creates an
@@ -48,7 +50,11 @@ impl CodexSqliteRead {
     /// Open and read the schema. `flags` must be read-only; `SQLITE_OPEN_URI`
     /// is added. A lock held by Codex fails the probe as busy at once.
     pub(crate) fn open(path: &Path, flags: OpenFlags) -> Result<Self> {
-        let stamp = idle_wal_stamp(path);
+        let stamp = match route(path) {
+            Route::Snapshot(stamp) => Some(stamp),
+            Route::Plain => None,
+            Route::Refuse => return Err(moved()).context(LoaderStage::Open),
+        };
         let uri = sqlite_uri(path).context(LoaderStage::Open)?;
         let uri = if stamp.is_some() {
             uri
@@ -107,35 +113,53 @@ impl CodexSqliteRead {
         if unchanged {
             return Ok(());
         }
-        Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-            Some("database changed during a snapshot read".to_string()),
-        )
-        .into())
+        Err(moved())
     }
 }
 
-/// The main file's stamp when it is a WAL-mode database with no `-wal`;
-/// `None` sends every other database, or one that can't be inspected, to the
-/// plain open.
-fn idle_wal_stamp(path: &Path) -> Option<FileStamp> {
+fn moved() -> anyhow::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some("database not readable as a current snapshot".to_string()),
+    )
+    .into()
+}
+
+enum Route {
+    Snapshot(FileStamp),
+    Plain,
+    Refuse,
+}
+
+/// `Snapshot` for a WAL-mode database with no `-wal` and one name. A WAL
+/// database with no `-wal` beside this name but reached through a symlink or
+/// another hard link is refused: its live `-wal` may sit beside a name not
+/// checked here, and a plain open of an idle one would create a `-wal`.
+/// Every other database, or one that can't be inspected, takes the plain
+/// open.
+fn route(path: &Path) -> Route {
     if !wal_absent(path) {
-        return None;
+        return Route::Plain;
     }
-    // Only a regular file with one name: SQLite keeps the `-wal` beside a
-    // symlink's target, and another hard link's name has its own `-wal`, so
-    // a live WAL could hide from the check beside `path`.
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if metadata.nlink() != 1 {
-        return None;
-    }
-    let stamp = FileStamp::capture(metadata).ok()?;
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Route::Plain;
+    };
     // Header bytes 18 and 19 are the file format write and read versions;
     // 2 means WAL. A rollback-journal database keeps the plain open, which
     // honours a hot journal.
     let mut header = [0_u8; 20];
-    File::open(path).ok()?.read_exact(&mut header).ok()?;
-    (header[18] == 2 && header[19] == 2).then_some(stamp)
+    let wal_mode = File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok()
+        && header[18] == 2
+        && header[19] == 2;
+    if !wal_mode {
+        return Route::Plain;
+    }
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Route::Refuse;
+    }
+    FileStamp::capture(metadata).map_or(Route::Plain, Route::Snapshot)
 }
 
 fn wal_absent(path: &Path) -> bool {
