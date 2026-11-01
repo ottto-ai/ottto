@@ -49767,7 +49767,8 @@ impl ScanIndex {
             ));
         }
         let _lock = CheckpointLock::acquire_with_custody(path, false, custody)?;
-        let (v2_index, sample_v1) = state_v2::load_locked(path, support_dir, _lock.custody)?;
+        let (v2_index, try_import) =
+            state_v2::load_locked(path, support_dir.is_some(), _lock.custody)?;
         if let Some(mut index) = v2_index {
             let file = File::open(path)?;
             let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
@@ -49778,7 +49779,6 @@ impl ScanIndex {
             }
             return Ok((index, LoadOrigin::Loaded(opened)));
         }
-        let v1_gauge = state_v2::telemetry::Stage::v1(path, sample_v1);
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
         let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)
@@ -49837,10 +49837,7 @@ impl ScanIndex {
                     )
                     .map(|index| (index, LoadOrigin::Quarantined));
                 }
-                if let Some(gauge) = v1_gauge {
-                    gauge.finish();
-                }
-                if sample_v1 {
+                if try_import {
                     state_v2::after_v1_locked(path, &mut index)?;
                 }
                 Ok((index, LoadOrigin::Loaded(opened)))
