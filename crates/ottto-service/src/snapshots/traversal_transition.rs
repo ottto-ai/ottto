@@ -6,7 +6,7 @@ use super::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,17 +165,16 @@ impl Starting {
             context_change_owed: 0,
             contract_unproven_families: index
                 .claude_usage_family_pending
-                .values()
-                .filter(|pending| super::evidence_owed::enabled() && pending.contract_unproven)
+                .views()
+                .filter(|(_, pending)| {
+                    super::evidence_owed::enabled() && pending.contract_unproven()
+                })
                 .count(),
             stale_pending_occurrences: index
                 .claude_usage_family_pending
-                .values()
-                .filter(|pending| {
-                    super::evidence_owed::enabled() && pending.census_window_end != now
-                })
-                .flat_map(|pending| pending.member_occurrences.values())
-                .map(BTreeMap::len)
+                .views()
+                .filter(|(_, pending)| super::evidence_owed::enabled() && pending.window() != now)
+                .map(|(_, pending)| pending.occurrences())
                 .fold(0, usize::saturating_add),
         }
     }

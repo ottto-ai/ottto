@@ -281,11 +281,9 @@ fn stamp_families<T>(
         .map(|root| {
             let before = index
                 .claude_usage_family_pending
-                .get(&root)
-                .filter(|pending| {
-                    pending.census_window_end == census_window_end && !evidence_free(pending)
-                })
-                .map(|pending| pending.identity_contract);
+                .view(&root)
+                .filter(|pending| pending.window() == census_window_end && !pending.evidence_free())
+                .map(|pending| pending.identity_contract());
             (root, before)
         })
         .collect::<BTreeMap<_, _>>();
@@ -293,9 +291,12 @@ fn stamp_families<T>(
     for (root, before) in prior {
         // A pending this accumulation left in another window was not rebuilt:
         // its stamp is not touched.
+        // An Unknown family accumulated nothing (the page refused): no stamp.
         if let Some(pending) = index
             .claude_usage_family_pending
-            .get_mut(&root)
+            .family_mut(&root)
+            .ok()
+            .flatten()
             .filter(|pending| pending.census_window_end == census_window_end)
         {
             pending.identity_contract = match before {
@@ -326,15 +327,15 @@ fn kept_member(
     key: &str,
     entry: &ScanIndexEntry,
     root: &str,
-    pending: &ClaudeUsageFamilyPending,
+    pending: super::usage_pending::UsageView<'_>,
 ) -> bool {
-    let Some(window) = rfc3339_unix_seconds(&pending.census_window_end) else {
+    let Some(window) = rfc3339_unix_seconds(pending.window()) else {
         return false;
     };
     index.persistence_available()
         && index.claude_duplicate_request_witness_overflowed
-        && pending.invalid
-        && evidence_free(pending)
+        && pending.invalid()
+        && pending.evidence_free()
         && !index.claude_usage_authority_quarantine.contains_key(root)
         && !index.decode_holds_family(root)
         && !index.claude_account_deferred_holds.contains_key(key)
@@ -378,14 +379,9 @@ fn family<'a>(
 /// Cap room: the family's recorded requests fit the pending
 /// occurrence cap after what is already retained; admitted in selection order.
 fn cap_room(index: &ScanIndex, page: &mut Page, key: &str, root: &str) -> bool {
-    let retained = *page.retained.get_or_insert_with(|| {
-        index
-            .claude_usage_family_pending
-            .values()
-            .flat_map(|pending| pending.member_occurrences.values())
-            .map(BTreeMap::len)
-            .fold(0_usize, usize::saturating_add)
-    });
+    let retained = *page
+        .retained
+        .get_or_insert_with(|| index.claude_usage_family_pending.total_occurrences());
     let requests = family(index, key, root)
         .filter_map(|(key, _)| index.claude_request_census.retry_carry_record(key))
         .map(|record| record.request_hashes().len())
@@ -418,7 +414,6 @@ pub(super) fn resolve(
     else {
         return;
     };
-    let family = claude_index_path_family_member(&candidate.path);
     if enabled() {
         note_age(
             index,
@@ -430,9 +425,12 @@ pub(super) fn resolve(
         // A real change parses fresh evidence, never against its carried copy.
         if let Some((root, member)) = family.filter(|_| enabled()) {
             claude_contract::note(|c| c.evidence_owed.changed += 1);
+            // Loaded above.
             if let Some(pending) = index
                 .claude_usage_family_pending
-                .get_mut(&root)
+                .family_mut(&root)
+                .ok()
+                .flatten()
                 .filter(|pending| pending.census_window_end == census_window_end)
             {
                 pending.member_occurrences.remove(&member);
@@ -496,7 +494,7 @@ pub(super) fn resolve(
         && member.is_some_and(|root| {
             index
                 .claude_usage_family_pending
-                .get(root)
+                .view(root)
                 .is_some_and(|pending| kept_member(index, &key, entry, root, pending))
         });
     let arm = match member.filter(|_| kept) {
@@ -548,8 +546,8 @@ pub(super) fn resolve(
 /// Age of this owed member's family evidence window against this census.
 fn note_age(index: &ScanIndex, root: Option<&str>, census_window_end: &str) {
     let age = root
-        .and_then(|root| index.claude_usage_family_pending.get(root))
-        .and_then(|pending| rfc3339_unix_seconds(&pending.census_window_end))
+        .and_then(|root| index.claude_usage_family_pending.view(root))
+        .and_then(|pending| rfc3339_unix_seconds(pending.window()))
         .zip(rfc3339_unix_seconds(census_window_end))
         .map(|(stored, now)| now.saturating_sub(stored));
     claude_contract::note(|c| {
@@ -604,7 +602,12 @@ fn restamp(
 ) -> Result<Restamp, Refusal> {
     let (Some(entry), Some(pending)) = (
         index.files.get(key),
-        index.claude_usage_family_pending.get(root),
+        // Loaded by `resolve`; a cold family it could not load refused there.
+        index
+            .claude_usage_family_pending
+            .family(root)
+            .ok()
+            .flatten(),
     ) else {
         return Err(Refusal::NoPending);
     };
@@ -652,7 +655,7 @@ fn restamp(
         if !others_owed {
             return Err(Refusal::FamilyUnverified);
         }
-        if let Some(pending) = index.claude_usage_family_pending.get_mut(root) {
+        if let Ok(Some(pending)) = index.claude_usage_family_pending.family_mut(root) {
             pending.census_window_end = window.to_owned();
         }
     }

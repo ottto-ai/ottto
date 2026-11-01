@@ -251,11 +251,11 @@ impl TerminalOffStaleClears {
     }
 }
 process_memo!(fn with_terminal_off_stale_clears,
-    static TERMINAL_OFF_STALE_CLEARS: TerminalOffStaleClears = TerminalOffStaleClears {
-        keys: BTreeSet::new(),
-        order: VecDeque::new(),
-        evictions: 0,
-    });
+static TERMINAL_OFF_STALE_CLEARS: TerminalOffStaleClears = TerminalOffStaleClears {
+    keys: BTreeSet::new(),
+    order: VecDeque::new(),
+    evictions: 0,
+});
 fn terminal_off_stale_clear_key(
     index: &ScanIndex,
     context: &str,
@@ -266,7 +266,10 @@ fn terminal_off_stale_clear_key(
     for value in [
         "terminal-off-stale-clear:v1",
         context,
-        index.upload_context_fingerprint.as_deref().unwrap_or("none"),
+        index
+            .upload_context_fingerprint
+            .as_deref()
+            .unwrap_or("none"),
         index
             .active_upload_context_fingerprint
             .as_deref()
@@ -334,8 +337,8 @@ fn terminal_off_stale_clear_memo_len_for_test() -> (usize, u64) {
 fn claude_terminal_stale_roots(index: &ScanIndex, window: &str) -> BTreeSet<String> {
     index
         .claude_usage_family_pending
-        .iter()
-        .filter(|(_, p)| p.census_window_end != window)
+        .views()
+        .filter(|(_, p)| p.window() != window)
         .map(|(root, _)| root.clone())
         .collect()
 }
@@ -347,8 +350,8 @@ fn claude_terminal_unproven(index: &ScanIndex, window: &str) {
 
     let stale = index
         .claude_usage_family_pending
-        .values()
-        .filter(|p| p.census_window_end != window)
+        .views()
+        .filter(|(_, p)| p.window() != window)
         .count();
     eprintln!("ALARM claude_terminal_off unproven_families={stale}: stale pending retains UNPROVEN custody until paged reconstruction");
 }
@@ -473,11 +476,11 @@ impl TerminalOffEmptyContexts {
     }
 }
 process_memo!(fn with_terminal_off_empty_contexts,
-    static TERMINAL_OFF_EMPTY_CONTEXTS: TerminalOffEmptyContexts = TerminalOffEmptyContexts {
-        keys: BTreeSet::new(),
-        order: VecDeque::new(),
-        evictions: 0,
-    });
+static TERMINAL_OFF_EMPTY_CONTEXTS: TerminalOffEmptyContexts = TerminalOffEmptyContexts {
+    keys: BTreeSet::new(),
+    order: VecDeque::new(),
+    evictions: 0,
+});
 #[cfg(test)]
 thread_local! {
     static TERMINAL_OFF_EMPTY_REPARSES_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -644,12 +647,12 @@ fn carry_admission_debt(index: &ScanIndex, at: &str) -> (usize, u64) {
     let now = rfc3339_unix_seconds(at).unwrap_or_default();
     let mut families = 0;
     let mut oldest = now;
-    for (root, pending) in &index.claude_usage_family_pending {
-        if pending.census_window_end != traversal.census_window_end
+    for (root, pending) in index.claude_usage_family_pending.views() {
+        if pending.window() != traversal.census_window_end
             && !index.claude_stale_family_carry.contains(root)
         {
             families += 1;
-            if let Some(time) = rfc3339_unix_seconds(&pending.census_window_end) {
+            if let Some(time) = rfc3339_unix_seconds(pending.window()) {
                 oldest = oldest.min(time);
             }
         }
@@ -717,17 +720,17 @@ fn resume_claude_retry_admission(index: &mut ScanIndex, at: &str) {
     else {
         return;
     };
-    let lower = previous
-        .after_root
-        .clone()
-        .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
     let stale = index
         .claude_usage_family_pending
-        .range((
-            lower,
-            std::ops::Bound::Included(previous.upper_root.clone()),
-        ))
-        .filter(|(_, p)| p.census_window_end != window)
+        .views()
+        .filter(|(root, _)| {
+            previous
+                .after_root
+                .as_ref()
+                .map_or(true, |after| *root > after)
+                && **root <= previous.upper_root
+        })
+        .filter(|(_, p)| p.window() != window)
         .take(CLAUDE_RETRY_ADMISSION_ROOTS + 1)
         .map(|(root, _)| root.clone())
         .collect();
@@ -971,8 +974,8 @@ impl ScanIndex {
         for (root, record) in &self.claude_usage_authority_quarantine {
             let clock = self
                 .claude_usage_family_pending
-                .get(root)
-                .and_then(|p| rfc3339_unix_seconds(&p.census_window_end));
+                .view(root)
+                .and_then(|p| rfc3339_unix_seconds(p.window()));
             if record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending {
                 // Presence/absence remains UNPROVEN; count every retained owner,
                 // including possible absence, rather than stat the corpus here.
@@ -988,15 +991,12 @@ impl ScanIndex {
         // An older witness does not settle this pending census or prove a
         // changed revision. Count all retained pending, including future
         // correction/reconstruction debt behind an existing witness.
-        for pending in self.claude_usage_family_pending.values() {
+        for (_, pending) in self.claude_usage_family_pending.views() {
             // This optional extra gauge has potentially corpus-sized occurrence
             // maps. Do not serialize them every page for diagnostics alone.
             debt.delayed_proof_families.bytes = None;
-            debt.delayed_proof_families.observe(
-                1,
-                rfc3339_unix_seconds(&pending.census_window_end),
-                now,
-            );
+            debt.delayed_proof_families
+                .observe(1, rfc3339_unix_seconds(pending.window()), now);
         }
         for (key, entry) in &self.files {
             let clock = (entry.modified_unix_seconds > 0).then_some(entry.modified_unix_seconds);

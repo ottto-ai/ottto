@@ -5791,9 +5791,8 @@ fn claude_stale_family_carry_scratch_cost(
     }
     let stale_request_hashes = stale
         .iter()
-        .filter_map(|root_session_id| index.claude_usage_family_pending.get(root_session_id))
-        .flat_map(|pending| pending.member_request_id_hashes.values())
-        .map(BTreeSet::len)
+        .filter_map(|root_session_id| index.claude_usage_family_pending.view(root_session_id))
+        .map(|pending| pending.request_hash_count())
         .fold(0_usize, usize::saturating_add);
     let families = stale.len();
     let (Some(family_paths), Some(legacy_bytes), Some(string_bytes)) = (
@@ -5893,8 +5892,8 @@ fn claude_stale_rearm_can_reopen_fence(index: &ScanIndex, stale: &BTreeSet<Strin
         && stale.iter().all(|root| {
             index
                 .claude_usage_family_pending
-                .get(root)
-                .is_some_and(|pending| !pending.invalid)
+                .view(root)
+                .is_some_and(|pending| !pending.invalid())
         })
         && index.files.iter().all(|(key, entry)| {
             let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
@@ -6003,7 +6002,7 @@ fn claude_stale_member_accepted_retry_evidence(
     index: &ScanIndex,
     key: &str,
     entry: &ScanIndexEntry,
-    pending: &ClaudeUsageFamilyPending,
+    pending: usage_pending::UsageView<'_>,
     debt_scope: Option<&BTreeSet<String>>,
 ) -> bool {
     if !index.persistence_available() {
@@ -6011,7 +6010,7 @@ fn claude_stale_member_accepted_retry_evidence(
     }
 
     if index.claude_request_identity_contract_changed
-        && (pending.invalid
+        && (pending.invalid()
             || !debt_scope.is_some_and(|roots| {
                 claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
                     roots.is_empty() || !roots.contains(&claude_full_rearm_root_digest(member.root))
@@ -6021,8 +6020,9 @@ fn claude_stale_member_accepted_retry_evidence(
     {
         return false;
     }
-    let idless = pending.invalid
-        && pending.idless_revision == Some(claude_idless_revision(&entry.source_file_fingerprint));
+    let idless = pending.invalid()
+        && pending.idless_revision()
+            == Some(claude_idless_revision(&entry.source_file_fingerprint));
     claude_stale_member_independently_accepted(index, key, entry)
         && !entry.rearmed()
         && !index.claude_account_deferred_holds.contains_key(key)
@@ -6033,7 +6033,7 @@ fn claude_stale_member_accepted_retry_evidence(
                 record.current_for(&entry.source_file_fingerprint)
                     || idless && record.idless_native_for(&entry.source_file_fingerprint)
             })
-        && (!pending.invalid
+        && (!pending.invalid()
             || idless
                 && index
                     .claude_request_census
@@ -6175,17 +6175,16 @@ fn claude_stream_accepted_retry_carry_inner(
         let end = after + members[after..].partition_point(|(m, _)| m.root == root);
         let family = &members[after..end];
         after = end;
-        let Some(pending) = index.claude_usage_family_pending.get(root) else {
+        let Some(pending) = index.claude_usage_family_pending.view(root) else {
             continue;
         };
         if index.claude_usage_authority_quarantine.contains_key(root)
             || family[0].0.subagent_stem.is_some()
             || family.windows(2).any(|pair| pair[0].0 == pair[1].0)
-            || pending.invalid && (family.len() != 1 || pending.idless_revision.is_none())
+            || pending.invalid() && (family.len() != 1 || pending.idless_revision().is_none())
             || !pending
-                .member_request_id_hashes
-                .keys()
-                .chain(pending.member_occurrences.keys())
+                .hash_members()
+                .chain(pending.occurrence_members())
                 .all(|member| {
                     ClaudeIndexPathMemberRef::of_family_member(root, member).is_some_and(|member| {
                         family
@@ -6303,6 +6302,12 @@ fn claude_fence_closed_retry_carry_observed(
         );
         return ClaudeStaleFamilyCarry::default();
     }
+    // The carry joins every family's requests. Cold families are loaded at
+    // traversal start; without them nothing is carried (every family re-arms).
+    let Ok(all_pending) = index.claude_usage_family_pending.all() else {
+        diagnostics.reject(StaleCarryRejection::MemberEvidence, stale.len());
+        return ClaudeStaleFamilyCarry::default();
+    };
     let mut blocked = BTreeMap::<&str, (bool, bool)>::new();
     for (index_key, entry) in &index.files {
         let Some(member_ref) = claude_index_path_member_ref(Path::new(index_key)) else {
@@ -6341,7 +6346,7 @@ fn claude_fence_closed_retry_carry_observed(
         status.1 |= refused
             || !index
                 .claude_usage_family_pending
-                .get(root_session_id)
+                .view(root_session_id)
                 .is_some_and(|pending| {
                     claude_stale_member_accepted_retry_evidence(
                         index, index_key, entry, pending, debt_scope,
@@ -6360,7 +6365,7 @@ fn claude_fence_closed_retry_carry_observed(
     })
     .into_iter()
     .filter(|(root_session_id, members)| {
-        let Some(pending) = index.claude_usage_family_pending.get(root_session_id) else {
+        let Some(pending) = all_pending.get(root_session_id) else {
             return false;
         };
         if index
@@ -6432,7 +6437,7 @@ fn claude_fence_closed_retry_carry_observed(
     let request_owners = carried
         .iter()
         .flat_map(|root_session_id| {
-            index.claude_usage_family_pending[root_session_id]
+            all_pending[root_session_id]
                 .member_request_id_hashes
                 .values()
                 .flatten()
@@ -6440,7 +6445,7 @@ fn claude_fence_closed_retry_carry_observed(
         })
         .collect::<BTreeMap<_, _>>();
     let mut shared_owners = BTreeSet::new();
-    for (root_session_id, pending) in &index.claude_usage_family_pending {
+    for (root_session_id, pending) in all_pending {
         for request_hash in pending
             .member_request_id_hashes
             .values()
@@ -6937,20 +6942,16 @@ fn cancel_claude_family_carry_for_member_parse(
     let carried = index.claude_stale_family_carry.contains(root_session_id)
         && index
             .claude_usage_family_pending
-            .get(root_session_id)
+            .view(root_session_id)
             .is_some_and(|pending| {
-                pending.census_window_end != census_window_end
-                    && pending.member_occurrences.is_empty()
-                    && pending
-                        .member_request_id_hashes
-                        .values()
-                        .all(BTreeSet::is_empty)
+                pending.window() != census_window_end
+                    && pending.evidence_free()
                     && (index
                         .claude_stale_family_carry
                         .capped_roots
                         .contains(root_session_id)
-                        || !pending.invalid
-                        || pending.idless_revision.is_some())
+                        || !pending.invalid()
+                        || pending.idless_revision().is_some())
             })
         && !index
             .claude_usage_authority_quarantine
@@ -7488,7 +7489,7 @@ impl ClaudeFullRearmProgress {
     fn observe_page(
         &mut self,
         snapshots: &[SnapshotItem],
-        pending: &BTreeMap<String, ClaudeUsageFamilyPending>,
+        pending: &UsagePending,
         census_window_end: &str,
         counts: &ClaudeDuplicateCensusCounts,
         other_evidence_cause: bool,
@@ -7519,8 +7520,8 @@ impl ClaudeFullRearmProgress {
             .filter(|item| claude_member_invalidity_is_structural(item))
             .map(claude_snapshot_family_root)
             .filter(|root_session_id| {
-                pending.get(root_session_id).is_some_and(|pending| {
-                    pending.invalid && pending.census_window_end == census_window_end
+                pending.view(root_session_id).is_some_and(|pending| {
+                    pending.invalid() && pending.window() == census_window_end
                 })
             })
             .map(|root_session_id| claude_full_rearm_root_digest(&root_session_id))
@@ -9121,7 +9122,7 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
                     .any(|requests| requests.identity_revision.is_none())
         })
         .map(|(root, _)| root)
-        .chain(index.claude_usage_family_pending.keys())
+        .chain(index.claude_usage_family_pending.roots())
         .chain(index.claude_usage_family_witnesses.keys())
         .chain(
             index
@@ -9258,6 +9259,7 @@ pub(crate) fn record_claude_native_observations(
     }
 
     ClaudeNativeObservations {
+        // The inactive driver is v1 only: a cold graph accumulates nothing.
         counts: evidence_owed::stamped(index, &scan.snapshots, &scan.census_window_end, |index| {
             accumulate_claude_usage_family_pending_with_limit(
                 &scan.snapshots,
@@ -9479,14 +9481,26 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             );
             observed.counts
         }
-        None => evidence_owed::stamped(index, snapshots, census_window_end, |index| {
+        None => match evidence_owed::stamped(index, snapshots, census_window_end, |index| {
             accumulate_claude_usage_family_pending_with_limit(
                 snapshots,
                 &mut index.claude_usage_family_pending,
                 census_window_end,
                 max_pending_occurrences,
             )
-        }),
+        }) {
+            Ok(counts) => counts,
+            // The page's families were loaded above, so nothing accumulated.
+            Err(usage_pending::Unknown) => {
+                return ClaudeUsageAuthorityDisposition {
+                    quarantined_source_session_ids: snapshots
+                        .iter()
+                        .map(|s| s.source_session_id.clone())
+                        .collect(),
+                    ..Default::default()
+                }
+            }
+        },
     };
     duplicate_census.census_complete = census_complete;
     let mut rearm_full_suppressed = u64::from(claude_terminal_off());
@@ -9838,10 +9852,10 @@ fn apply_claude_reported_usage_with_negative_dependencies(
     let duplicate_census_invalid =
         index
             .claude_usage_family_pending
-            .iter()
+            .views()
             .any(|(root_session_id, pending)| {
-                if pending.census_window_end == census_window_end {
-                    return pending.invalid;
+                if pending.window() == census_window_end {
+                    return pending.invalid();
                 }
                 claude_stale_pending_keeps_census_invalid(
                     index,
@@ -10063,10 +10077,8 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             && (census_complete || claude_owned_start_was_census_verified(item, index))
             && !index
                 .claude_usage_family_pending
-                .get(&root_session_id)
-                .is_some_and(|pending| {
-                    pending.invalid || pending.census_window_end != census_window_end
-                })
+                .view(&root_session_id)
+                .is_some_and(|pending| pending.invalid() || pending.window() != census_window_end)
         {
             let owned = item
                 .cache_requests
@@ -10921,7 +10933,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
         index
             .claude_usage_authority_quarantine
             .remove(&root_session_id);
-        index.claude_usage_family_pending.remove(&root_session_id);
+        index.claude_usage_family_pending.discard(&root_session_id);
     }
     // SOURCE/COST/SI Round 12: a returning family's tombstone clears once its
     // proof settles, on the page whose members all carry the reported-usage
@@ -10961,7 +10973,7 @@ fn apply_claude_reported_usage_with_negative_dependencies(
 fn claude_stale_pending_keeps_census_invalid(
     index: &ScanIndex,
     root_session_id: &str,
-    pending: &ClaudeUsageFamilyPending,
+    pending: usage_pending::UsageView<'_>,
     census_complete: bool,
     indexed_claude_family_ids: &BTreeSet<String>,
 ) -> bool {
@@ -10971,9 +10983,8 @@ fn claude_stale_pending_keeps_census_invalid(
     if census_complete
         && !indexed_claude_family_ids.contains(root_session_id)
         && pending
-            .member_request_id_hashes
-            .keys()
-            .chain(pending.member_occurrences.keys())
+            .hash_members()
+            .chain(pending.occurrence_members())
             .all(|member| !indexed_claude_family_ids.contains(member))
     {
         return false;
@@ -11232,13 +11243,13 @@ fn claude_family_members_unobserved_where(
 
     let covered = index
         .claude_usage_family_pending
-        .values()
-        .filter(|pending| !pending.invalid && pending.census_window_end == census_window_end)
+        .views()
+        .map(|(_, pending)| pending)
+        .filter(|pending| !pending.invalid() && pending.window() == census_window_end)
         .flat_map(|pending| {
             pending
-                .member_request_id_hashes
-                .keys()
-                .filter(move |member| pending.member_occurrences.contains_key(*member))
+                .hash_members()
+                .filter(move |member| pending.has_occurrence_member(member))
         })
         .collect::<BTreeSet<_>>();
     index
@@ -11316,12 +11327,12 @@ fn claude_full_rearm_structural_terminal(
     let observed = progress.observed_window.as_deref() == Some(census_window_end);
     let mut current = BTreeSet::new();
     let mut other = (observed && progress.other_invalidation_observed) || !owners_within_bound;
-    for (root_session_id, pending) in &index.claude_usage_family_pending {
+    for (root_session_id, pending) in index.claude_usage_family_pending.views() {
         if other {
             break;
         }
-        if pending.census_window_end == census_window_end {
-            if pending.invalid {
+        if pending.window() == census_window_end {
+            if pending.invalid() {
                 let root_digest = claude_full_rearm_root_digest(root_session_id);
                 if observed && progress.structural_roots.contains(&root_digest) {
                     current.insert(root_digest);
@@ -43329,10 +43340,8 @@ fn ensure_bounded_traversal(
                         .filter(|root| {
                             index
                                 .claude_usage_family_pending
-                                .get(*root)
-                                .is_some_and(|pending| {
-                                    window_ends.contains(&pending.census_window_end)
-                                })
+                                .view(root)
+                                .is_some_and(|pending| window_ends.contains(pending.window()))
                         })
                         .cloned()
                         .collect::<BTreeSet<_>>()
@@ -48924,7 +48933,7 @@ impl ScanIndex {
                     refused += 1;
                     return true;
                 }
-                family_pending.remove(root_session_id);
+                family_pending.discard(root_session_id);
                 retired += 1;
                 false
             });
@@ -49022,7 +49031,7 @@ impl ScanIndex {
                 if absent
                     && tombstone_retired_claude_family(tombstones, root_session_id, retired_at)
                 {
-                    family_pending.remove(root_session_id);
+                    family_pending.discard(root_session_id);
                     retired += 1;
                     return false;
                 }
