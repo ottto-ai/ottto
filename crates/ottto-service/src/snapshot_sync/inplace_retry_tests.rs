@@ -766,7 +766,7 @@ fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
     })
     .unwrap()
     .expect("a due Claude cycle prepares a scan");
-    let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+    let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
     assert!(!scan.snapshots.is_empty(), "the synthetic session uploads");
     let index_path = preparation.index_path.clone();
     let (result, waits) = with_inplace_retry_test_clock(None, || {

@@ -6256,17 +6256,14 @@ impl SourcePreparation {
 #[cfg(test)]
 fn collect_native_preparation_with_rotation(
     frame: SourcePreparation,
-    require_frame_bound: bool,
 ) -> (SourcePreparation, ScanIndex, SourceScanResult) {
-    try_collect_native_preparation_with_rotation(frame, require_frame_bound)
-        .expect("owned source completion")
+    try_collect_native_preparation_with_rotation(frame).expect("owned source completion")
 }
 #[cfg(test)]
 fn try_collect_native_preparation_with_rotation(
     frame: SourcePreparation,
-    require_frame_bound: bool,
 ) -> Result<(SourcePreparation, ScanIndex, SourceScanResult)> {
-    try_collect_native_preparation_with_rotation_observed(frame, require_frame_bound, false)
+    try_collect_native_preparation_with_rotation_observed(frame, false)
 }
 #[cfg(test)]
 fn collect_unparkable_preparation_with_rotation(
@@ -6275,41 +6272,18 @@ fn collect_unparkable_preparation_with_rotation(
     // source_rotation.rs:186-188,293-315: parking is optional overlap; an
     // unparkable ordinary active frame continues serially with the same owner.
     // Only the large-history starvation regression selects this adapter.
-    try_collect_native_preparation_with_rotation_observed(frame, false, true)
+    try_collect_native_preparation_with_rotation_observed(frame, true)
         .expect("ordinary serial owned source completion")
-}
-#[cfg(test)]
-thread_local! {
-    static WAKE_FRAME_VISIT_LIMIT_FOR_TEST: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
-}
-/// A test's own visit ceiling, below the walk's 4096 cap, checked on every
-/// measured wake frame while the guard lives.
-#[cfg(test)]
-pub(crate) struct WakeFrameVisitLimitForTest(Option<usize>);
-#[cfg(test)]
-impl WakeFrameVisitLimitForTest {
-    pub(crate) fn new(limit: usize) -> Self {
-        Self(WAKE_FRAME_VISIT_LIMIT_FOR_TEST.with(|cell| cell.replace(Some(limit))))
-    }
-}
-#[cfg(test)]
-impl Drop for WakeFrameVisitLimitForTest {
-    fn drop(&mut self) {
-        WAKE_FRAME_VISIT_LIMIT_FOR_TEST.with(|cell| cell.set(self.0));
-    }
 }
 #[cfg(test)]
 fn try_collect_native_preparation_with_rotation_observed(
     frame: SourcePreparation,
-    require_frame_bound: bool,
     require_parking_refusal: bool,
 ) -> Result<(SourcePreparation, ScanIndex, SourceScanResult)> {
     struct Collect {
         frame: Option<SourcePreparation>,
         completed: Option<(SourcePreparation, ScanIndex, SourceScanResult)>,
         failure: Option<anyhow::Error>,
-        require_bound: bool,
         require_parking_refusal: bool,
         parking_refused: bool,
         parked_frames: usize,
@@ -6353,30 +6327,7 @@ fn try_collect_native_preparation_with_rotation_observed(
                 "same owned scanner must finish within existing fixture steps"
             );
             frame.accept_native_rotation_turn(remaining);
-            if self.require_bound {
-                let mut receipt =
-                    crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
-                let measured = receipt.add(std::mem::size_of_val(&frame)).and_then(|()| {
-                    crate::heap_layout_bound::HeapLayoutBound::heap_bound(&frame, &mut receipt)
-                });
-                eprintln!(
-                    "codex_wake_frame: step={} bytes={} visits={} bounded={}",
-                    self.steps,
-                    receipt.bytes,
-                    receipt.visits_for_test(),
-                    measured.is_some()
-                );
-                if let Some(limit) = WAKE_FRAME_VISIT_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
-                    assert!(
-                        receipt.visits_for_test() <= limit,
-                        "codex_wake_frame step {} used {} visits; this test keeps them at or under {limit}",
-                        self.steps,
-                        receipt.visits_for_test()
-                    );
-                }
-                assert!(crate::heap_layout_bound::bound(&frame, crate::source_rotation::PARKED_BUDGET).is_some(),
-                    "the real source frame must pass its real existing requested-layout budget; no substitute bound");
-            } else if self.require_parking_refusal && !self.parking_refused {
+            if self.require_parking_refusal && !self.parking_refused {
                 // Evaluate the real Owner::bound on the actual moving frame,
                 // including both indexes and the ordinary candidate queue.
                 self.parking_refused = self
@@ -6427,7 +6378,6 @@ fn try_collect_native_preparation_with_rotation_observed(
         frame: Some(frame),
         completed: None,
         failure: None,
-        require_bound: require_frame_bound,
         require_parking_refusal,
         parking_refused: false,
         parked_frames: 0,

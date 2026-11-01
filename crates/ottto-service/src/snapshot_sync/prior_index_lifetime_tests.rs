@@ -226,9 +226,8 @@ fn e2_real_caller_parity_at_tight_allowances() {
         })
         .unwrap()
         .expect("actual due preparation");
-        let ((mut preparation, index, scan), allowance) = with_rotation_budget(budget, || {
-            collect_native_preparation_with_rotation(frame, false)
-        });
+        let ((mut preparation, index, scan), allowance) =
+            with_rotation_budget(budget, || collect_native_preparation_with_rotation(frame));
         let (index, scan) = if shared {
             let (index, scan, started) = common
                 .entry((budget, conflict))
