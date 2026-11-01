@@ -335,23 +335,31 @@ fn load_with_custody(path: &Path, switched: bool, custody: bool) -> Result<Optio
                         // Reuse the connection, but hydrate the durable graph each pass.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
                         let (mut index, mut cx) = Mapper.hydrate_context(&mut session.db)?;
-                        ensure!(index.generation == stamp.0, Hold::DbUnavailable);
-                        // Digest the exact persisted image: a save then also
-                        // persists whatever normalization changes.
-                        let digests = kinds::baseline(&index, &mut cx)?;
-                        normalize_hydrated(&mut index)?;
-                        session.stamp = session.db.stamp()?;
-                        ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
-                        state.save_digests = Some(digests);
-                        // Same session and stamp: rollovers its commits wrote
-                        // stay committed for graphs that outlive this load.
-                        if !session.cx.ambiguous {
-                            cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
+                        #[cfg(test)]
+                        if tests::COMMIT_DURING_HYDRATE.with(|commit| commit.replace(false)) {
+                            sqlite::commit_elsewhere_for_test(&session.db);
                         }
-                        session.cx = cx;
-                        index.v2_mut().persistence_v2 = Some(runtime.clone());
-                        telemetry::event("route", &"v2");
-                        return Ok(Some(index));
+                        ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                        // The image read must be the stamp this session holds:
+                        // after a commit from elsewhere neither its baseline
+                        // nor its lineage is adopted; reopen below.
+                        if session.db.stamp()? == stamp {
+                            // Digest the exact persisted image: a save then
+                            // also persists whatever normalization changes.
+                            let digests = kinds::baseline(&index, &mut cx)?;
+                            normalize_hydrated(&mut index)?;
+                            state.save_digests = Some(digests);
+                            // Same session and stamp: rollovers its commits
+                            // wrote stay committed for graphs that outlive
+                            // this load.
+                            if !session.cx.ambiguous {
+                                cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
+                            }
+                            session.cx = cx;
+                            index.v2_mut().persistence_v2 = Some(runtime.clone());
+                            telemetry::event("route", &"v2");
+                            return Ok(Some(index));
+                        }
                     }
                 }
                 // Invalidate every old clone before replacing the connection.

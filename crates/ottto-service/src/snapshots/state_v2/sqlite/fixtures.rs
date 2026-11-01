@@ -64,6 +64,16 @@ pub(in super::super) fn delete_row_for_test(db: &Sqlite, key: &RowKey) {
     let values = key.values().unwrap();
     assert_eq!(conn.execute(&sql, params_from_iter(values)).unwrap(), 1);
 }
+/// A committed write from another connection: the data version moves, the
+/// generation does not.
+pub(in super::super) fn commit_elsewhere_for_test(db: &Sqlite) {
+    let conn = Connection::open(&db.path).unwrap();
+    conn.busy_timeout(BUSY).unwrap();
+    let changed = conn
+        .execute("UPDATE control SET value=value WHERE name='generation'", [])
+        .unwrap();
+    assert_eq!(changed, 1);
+}
 pub(in super::super) fn corrupt_row_header_for_test(db: &Sqlite, key: &RowKey) {
     let table = key.table();
     let sql = format!(

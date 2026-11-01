@@ -29,6 +29,13 @@ fn save_with_mode(
 
 /// Generation of a freshly imported native fixture store.
 const G: u64 = 1;
+
+thread_local! {
+    /// Commit from another connection right after the next reused-session
+    /// hydrate, before its stamp is re-read.
+    pub(super) static COMMIT_DURING_HYDRATE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 use crate::snapshots::account_pending_retention::ArchivedWindows;
 
 /// A loaded graph with its cold archives read back from the session store.
@@ -380,7 +387,7 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
         let old = std::mem::replace(&mut family.current, window(day, 'b', &[A, B]));
         family.archive(old, true);
     }
-    let run = |cold: bool| {
+    let run = |cold: bool, race: bool| {
         let f = Fixture::new();
         let mut pre = ScanIndex::default();
         for (key, c) in [(A, '1'), (B, '2')] {
@@ -428,6 +435,7 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
             &BTreeSet::from([fingerprint('4')]),
         );
         assert!(save_with(&f.path, &mut subset).unwrap());
+        COMMIT_DURING_HYDRATE.with(|commit| commit.set(race));
         let mut claim = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
         assert_eq!(
             claim.files[A].last_snapshot_fingerprint,
@@ -452,17 +460,25 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
             &BTreeMap::new(),
             &BTreeSet::new(),
         );
-        assert!(save_with(&f.path, &mut checkpoint).unwrap());
+        let saved = save_with(&f.path, &mut checkpoint);
+        if race {
+            // The store moved during that load's hydrate: the load reopened
+            // and carried no lineage, so the graph that outlived it refuses.
+            assert!(saved.is_err());
+            return None;
+        }
+        assert!(saved.unwrap());
         let reloaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
         assert_eq!(
             reloaded.files[B].last_snapshot_fingerprint,
             Some(fingerprint('4'))
         );
         let mut view = materialized(&reloaded);
-        family(&mut view).clone()
+        Some(family(&mut view).clone())
     };
-    let cold = run(true);
-    assert_eq!(cold, run(false));
+    let cold = run(true, false).unwrap();
+    assert_eq!(cold, run(false, false).unwrap());
+    assert!(run(true, true).is_none());
     let archive = cold.previous_windows.resident();
     assert_eq!(
         archive,
