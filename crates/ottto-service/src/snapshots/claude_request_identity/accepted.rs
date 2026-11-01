@@ -39,20 +39,22 @@ impl std::fmt::Debug for FingerprintKey {
         f.write_str("FingerprintKey([redacted])")
     }
 }
-/// Third field: epoch changed this pass; fourth: per-cycle retained
-/// capability; fifth: runtime receiver item cap; sixth: per-cycle
-/// account-source capability; seventh: the sibling settled-history segment
-/// ledger, which has no session cap and no recency eviction.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct AcceptedBuckets(
-    BTreeMap<String, AcceptedSession>,
-    Option<FingerprintKey>,
-    bool,
-    bool,
-    usize,
-    bool,
-    bool,
-);
+pub(crate) struct AcceptedBuckets {
+    sessions: BTreeMap<String, AcceptedSession>,
+    key: Option<FingerprintKey>,
+    /// The key epoch changed this pass.
+    epoch_changed: bool,
+    /// Per-cycle retained capability.
+    retained: bool,
+    /// Runtime receiver item cap.
+    item_cap: usize,
+    /// Per-cycle account-source capability.
+    account_source: bool,
+    /// The sibling settled-history segment ledger: no session cap and no
+    /// recency eviction.
+    segments: bool,
+}
 /// Why a tagging attempt had no complete accepted state (local diagnostics).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum UnknownCause {
@@ -72,7 +74,7 @@ fn fixture_key() -> FingerprintKey {
 }
 impl Serialize for AcceptedBuckets {
     fn serialize<S: Serializer>(&self, encoder: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(encoder)
+        self.sessions.serialize(encoder)
     }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,7 +592,7 @@ impl AcceptedSession {
 }
 impl<'de> Deserialize<'de> for AcceptedBuckets {
     fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        decoder.deserialize_any(Hints { segments: false })
+        Self::decode(decoder, MAX_SESSIONS)
     }
 }
 /// The sibling `accepted_identity_segments` field: every valid entry decodes,
@@ -598,132 +600,122 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
 pub(crate) fn decode_segments<'de, D: Deserializer<'de>>(
     decoder: D,
 ) -> Result<AcceptedBuckets, D::Error> {
-    decoder.deserialize_any(Hints { segments: true })
+    let mut ledger = AcceptedBuckets::decode(decoder, usize::MAX)?;
+    ledger.segments = true;
+    Ok(ledger)
 }
-struct Hints {
-    segments: bool,
-}
-impl<'de> Visitor<'de> for Hints {
-    type Value = AcceptedBuckets;
-    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("optional accepted identity hints")
-    }
-    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
-        let mut states = BTreeMap::new();
-        while let Some(session) = map.next_key::<String>()? {
-            if !hash_is_valid(&session) || (!self.segments && states.len() == MAX_SESSIONS) {
-                map.next_value::<IgnoredAny>()?;
-                continue;
+impl AcceptedBuckets {
+    /// At most `max_sessions` valid entries.
+    fn decode<'de, D: Deserializer<'de>>(
+        decoder: D,
+        max_sessions: usize,
+    ) -> Result<Self, D::Error> {
+        struct Hints(usize);
+        impl<'de> Visitor<'de> for Hints {
+            type Value = AcceptedBuckets;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("optional accepted identity hints")
             }
-            // At most one session Value tree, consumed without cloning.
-            // Malformed/old hints never invalidate neighbouring ordinary ACKs.
-            let value = map.next_value::<Value>()?;
-            let Ok(mut state) = serde_json::from_value::<AcceptedSession>(value) else {
-                continue;
-            };
-            if state.starts.len() > MAX_BUCKETS
-                || state.shares.len() > max_shares(MAX_ADVERTISED_ITEM_BYTES)
-                || state.proved.len() > MAX_PROVED_ROWS
-                || state.missing.len() > MAX_PENDING_MISSING
-            {
-                continue;
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut states = BTreeMap::new();
+                while let Some(session) = map.next_key::<String>()? {
+                    if !hash_is_valid(&session) || states.len() == self.0 {
+                        map.next_value::<IgnoredAny>()?;
+                        continue;
+                    }
+                    // At most one session Value tree, consumed without cloning.
+                    // Malformed/old hints never invalidate neighbouring ordinary ACKs.
+                    let value = map.next_value::<Value>()?;
+                    let Ok(mut state) = serde_json::from_value::<AcceptedSession>(value) else {
+                        continue;
+                    };
+                    if state.starts.len() > MAX_BUCKETS
+                        || state.shares.len() > max_shares(MAX_ADVERTISED_ITEM_BYTES)
+                        || state.proved.len() > MAX_PROVED_ROWS
+                        || state.missing.len() > MAX_PENDING_MISSING
+                    {
+                        continue;
+                    }
+                    state.proved.sort_unstable();
+                    state.proved.dedup_by_key(|entry| (entry.bucket, entry.row));
+                    state.missing.sort_unstable();
+                    state.missing.dedup();
+                    state.starts.sort_unstable();
+                    state.starts.dedup();
+                    state.shares.sort_unstable();
+                    state.shares.dedup();
+                    if state
+                        .shares
+                        .iter()
+                        .any(|share| state.starts.binary_search(&share.bucket).is_err())
+                    {
+                        continue;
+                    }
+                    state.starts = state.starts.into_boxed_slice().into_vec();
+                    state.shares = state.shares.into_boxed_slice().into_vec();
+                    state.proved = state.proved.into_boxed_slice().into_vec();
+                    state.missing = state.missing.into_boxed_slice().into_vec();
+                    states.insert(session, state);
+                }
+                Ok(AcceptedBuckets {
+                    sessions: states,
+                    ..Default::default()
+                })
             }
-            state.proved.sort_unstable();
-            state.proved.dedup_by_key(|entry| (entry.bucket, entry.row));
-            state.missing.sort_unstable();
-            state.missing.dedup();
-            state.starts.sort_unstable();
-            state.starts.dedup();
-            state.shares.sort_unstable();
-            state.shares.dedup();
-            if state
-                .shares
-                .iter()
-                .any(|share| state.starts.binary_search(&share.bucket).is_err())
-            {
-                continue;
+            fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(AcceptedBuckets::default())
             }
-            state.starts = state.starts.into_boxed_slice().into_vec();
-            state.shares = state.shares.into_boxed_slice().into_vec();
-            state.proved = state.proved.into_boxed_slice().into_vec();
-            state.missing = state.missing.into_boxed_slice().into_vec();
-            states.insert(session, state);
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(AcceptedBuckets::default())
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
         }
-        Ok(AcceptedBuckets(
-            states,
-            None,
-            false,
-            false,
-            0,
-            false,
-            self.segments,
-        ))
-    }
-    fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        self.visit_unit()
-    }
-    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-        Ok(AcceptedBuckets(
-            BTreeMap::new(),
-            None,
-            false,
-            false,
-            0,
-            false,
-            self.segments,
-        ))
-    }
-    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
-        self.visit_unit()
-    }
-    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
-        self.visit_unit()
-    }
-    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
-        self.visit_unit()
-    }
-    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
-        self.visit_unit()
-    }
-    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
-        self.visit_unit()
+        decoder.deserialize_any(Hints(max_sessions))
     }
 }
 impl AcceptedBuckets {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(
-            BTreeMap::new(),
-            Some(fixture_key()),
-            false,
-            false,
-            0,
-            false,
-            false,
-        )
+        Self {
+            key: Some(fixture_key()),
+            ..Default::default()
+        }
     }
     #[cfg(test)]
     pub(crate) fn segments_for_test() -> Self {
-        Self(
-            BTreeMap::new(),
-            Some(fixture_key()),
-            false,
-            false,
-            0,
-            false,
-            true,
-        )
+        Self {
+            key: Some(fixture_key()),
+            segments: true,
+            ..Default::default()
+        }
     }
     /// An empty sibling segment ledger.
     pub(crate) fn segments() -> Self {
-        Self(BTreeMap::new(), None, false, false, 0, false, true)
+        Self {
+            segments: true,
+            ..Default::default()
+        }
     }
     #[cfg(test)]
     pub(crate) fn maximum_for_test() -> Self {
         let key = fixture_key();
-        Self(
-            (0..MAX_SESSIONS)
+        Self {
+            sessions: (0..MAX_SESSIONS)
                 .map(|session| {
                     let starts = (0..MAX_BUCKETS)
                         .map(|n| i64::MIN + n as i64)
@@ -763,13 +755,9 @@ impl AcceptedBuckets {
                     )
                 })
                 .collect(),
-            Some(key),
-            false,
-            false,
-            0,
-            false,
-            false,
-        )
+            key: Some(key),
+            ..Default::default()
+        }
     }
     #[cfg(test)]
     pub(crate) fn restore_for_test(bytes: &[u8]) -> Self {
@@ -791,55 +779,58 @@ impl AcceptedBuckets {
     }
     fn bind_key(&mut self, key: Option<FingerprintKey>) {
         let epoch = key.as_ref().map(key_epoch);
-        let rotated = self.0.values().any(|state| Some(state.key_epoch) != epoch);
+        let rotated = self
+            .sessions
+            .values()
+            .any(|state| Some(state.key_epoch) != epoch);
         if epoch.is_none() || rotated {
-            self.0.clear();
+            self.sessions.clear();
         }
-        self.2 = epoch.is_some() && rotated;
-        for state in self.0.values_mut() {
+        self.epoch_changed = epoch.is_some() && rotated;
+        for state in self.sessions.values_mut() {
             state.key = key.clone();
         }
-        self.1 = key;
+        self.key = key;
     }
     /// A copy reread from disk has no key, and may still hold hints this
     /// cycle's bind discarded. Rebind it like the live ledger before comparing.
     pub(crate) fn adopt_runtime_from(&mut self, live: &Self) {
-        self.bind_key(live.1.clone());
-        self.2 = live.2;
-        self.3 = live.3;
-        self.4 = live.4;
-        self.5 = live.5;
+        self.bind_key(live.key.clone());
+        self.epoch_changed = live.epoch_changed;
+        self.retained = live.retained;
+        self.item_cap = live.item_cap;
+        self.account_source = live.account_source;
     }
     /// Runtime-only receiver cap; never serialized as accepted proof.
     pub(crate) fn set_item_cap(&mut self, item_cap: usize) {
-        self.4 = item_cap;
+        self.item_cap = item_cap;
     }
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.sessions.is_empty()
     }
     /// Option (ii) activation for this cycle: only the server's exact
     /// capability token turns on `identity_retained` rows and recent order.
     pub(crate) fn set_retained_enabled(&mut self, enabled: bool) {
-        self.3 = enabled;
+        self.retained = enabled;
     }
     /// Why `get(session)` found no state; meaningful only when it returned `None`.
     pub(crate) fn miss_cause(&self) -> UnknownCause {
-        match (&self.1, self.2) {
+        match (&self.key, self.epoch_changed) {
             (None, _) => UnknownCause::NoKey,
             (Some(_), true) => UnknownCause::EpochChanged,
             (Some(_), false) => UnknownCause::UntrackedSession,
         }
     }
     pub(crate) fn retained_enabled(&self) -> bool {
-        self.3
+        self.retained
     }
     /// Account carry marking for this cycle: only the server's exact
     /// capability token emits `account_source`; absent keeps main's bytes.
     pub(crate) fn set_account_source_enabled(&mut self, enabled: bool) {
-        self.5 = enabled;
+        self.account_source = enabled;
     }
     pub(crate) fn account_source_enabled(&self) -> bool {
-        self.5
+        self.account_source
     }
     #[cfg(test)]
     pub(crate) fn forget_share_hints_for_test(&mut self, session: &str) {
@@ -857,7 +848,7 @@ impl AcceptedBuckets {
         })
     }
     pub(crate) fn has_retained(&self) -> bool {
-        self.0
+        self.sessions
             .values()
             .any(|state| !state.proved.is_empty() || !state.missing.is_empty())
     }
@@ -867,7 +858,7 @@ impl AcceptedBuckets {
         if !self.has_retained() {
             return;
         }
-        for state in self.0.values_mut() {
+        for state in self.sessions.values_mut() {
             state.proved = Vec::new();
             state.missing = Vec::new();
         }
@@ -903,40 +894,43 @@ impl AcceptedBuckets {
         invalidated > 0
     }
     fn session_mut(&mut self, session: &str) -> Option<&mut AcceptedSession> {
-        let key = self.1.as_ref()?;
+        let key = self.key.as_ref()?;
         let epoch = key_epoch(key);
-        self.0
+        self.sessions
             .get_mut(&session_key(key, session))
             .filter(|state| state.key_epoch == epoch)
     }
     /// The session's entry, refreshed as the last ACK; a full ledger evicts
     /// its least recently ACKed session (#909 LRU).
     fn session_entry(&mut self, session: &str, report: bool) -> Option<&mut AcceptedSession> {
-        let fingerprint_key = self.1.as_ref()?;
+        let fingerprint_key = self.key.as_ref()?;
         let key = session_key(fingerprint_key, session);
         let last_ack = self
-            .0
+            .sessions
             .values()
             .map(|state| state.last_ack)
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        if self.6 {
+        if self.segments {
             // Segment entries leave only with their session's cut (`retire`).
-            if !self.0.contains_key(&key) && self.0.len() >= SEGMENT_DESIGN_MAX && report {
+            if !self.sessions.contains_key(&key)
+                && self.sessions.len() >= SEGMENT_DESIGN_MAX
+                && report
+            {
                 super::budget::record(&super::budget::Counts {
                     accepted_segments_over_design: 1,
                     ..Default::default()
                 });
             }
-        } else if !self.0.contains_key(&key) && self.0.len() == MAX_SESSIONS {
+        } else if !self.sessions.contains_key(&key) && self.sessions.len() == MAX_SESSIONS {
             let oldest = self
-                .0
+                .sessions
                 .iter()
                 .min_by_key(|(key, state)| (state.last_ack, *key))
                 .map(|(key, _)| key.clone())
                 .expect("full ledger");
-            self.0.remove(&oldest);
+            self.sessions.remove(&oldest);
             if report {
                 super::budget::record(&super::budget::Counts {
                     accepted_state_evicted: 1,
@@ -944,7 +938,7 @@ impl AcceptedBuckets {
                 });
             }
         }
-        let entry = self.0.entry(key).or_insert_with(|| AcceptedSession {
+        let entry = self.sessions.entry(key).or_insert_with(|| AcceptedSession {
             key_epoch: key_epoch(fingerprint_key),
             key: Some(fingerprint_key.clone()),
             ..Default::default()
@@ -1119,18 +1113,18 @@ impl AcceptedBuckets {
     /// `through` (or all of them when it carries none: a whole body retired
     /// the segments) leave. Never by count or recency.
     pub(crate) fn retire(&mut self, live_body: &Value) {
-        let (Some(key), Some(live)) = (self.1.as_ref(), live_body["source_session_id"].as_str())
+        let (Some(key), Some(live)) = (self.key.as_ref(), live_body["source_session_id"].as_str())
         else {
             return;
         };
-        if !self.6 || live_body["history_segment"].is_object() {
+        if !self.segments || live_body["history_segment"].is_object() {
             return;
         }
         let of = session_key(key, live);
         let through = live_body["history_segments"]["through"]
             .as_str()
             .and_then(bucket_key);
-        self.0.retain(|_, entry| {
+        self.sessions.retain(|_, entry| {
             entry.of.as_deref() != Some(of.as_str())
                 || through
                     .is_some_and(|through| entry.starts.last().map_or(true, |last| *last < through))
@@ -1141,17 +1135,17 @@ impl AcceptedBuckets {
     /// session that still has one referenced segment, or any item on this
     /// page (`page`: live session ids), keeps all of them.
     pub(crate) fn retire_absent(&mut self, absent: &BTreeSet<String>, page: &BTreeSet<&str>) {
-        if !self.6 || absent.is_empty() {
+        if !self.segments || absent.is_empty() {
             return;
         }
-        let Some(key) = self.1.as_ref() else {
+        let Some(key) = self.key.as_ref() else {
             return;
         };
         let mut present = page
             .iter()
             .map(|live| session_key(key, live))
             .collect::<BTreeSet<_>>();
-        for entry in self.0.values() {
+        for entry in self.sessions.values() {
             if !entry
                 .fingerprint
                 .as_ref()
@@ -1160,12 +1154,12 @@ impl AcceptedBuckets {
                 present.extend(entry.of.clone());
             }
         }
-        self.0
+        self.sessions
             .retain(|_, entry| entry.of.as_ref().map_or(true, |of| present.contains(of)));
     }
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.sessions.len()
     }
     /// Copy-prefix ENABLE guard (Lead B F3): whether a stored-body ACK
     /// may have frozen `session`'s bucket at `bucket_start`. Known hints
@@ -1180,8 +1174,8 @@ impl AcceptedBuckets {
         })
     }
     pub(crate) fn get(&self, session: &str) -> Option<&AcceptedSession> {
-        let key = self.1.as_ref()?;
-        self.0
+        let key = self.key.as_ref()?;
+        self.sessions
             .get(&session_key(key, session))
             .filter(|state| state.key_epoch == key_epoch(key))
     }
@@ -1195,7 +1189,7 @@ impl AcceptedBuckets {
         self.record_with_diagnostics(body, false);
     }
     fn record_with_diagnostics(&mut self, body: &Value, report: bool) {
-        if self.1.is_none() {
+        if self.key.is_none() {
             return;
         }
         if body["provenance"]["collector"].as_str() != Some(COLLECTOR) {
@@ -1210,12 +1204,12 @@ impl AcceptedBuckets {
         if buckets.len() > MAX_BUCKETS {
             return;
         }
-        let item_cap = self.4;
+        let item_cap = self.item_cap;
         let limit = max_shares(item_cap);
-        let segments = self.6;
+        let segments = self.segments;
         let segment_of = body["history_segment"]["of"]
             .as_str()
-            .zip(self.1.as_ref())
+            .zip(self.key.as_ref())
             .map(|(live, key)| session_key(key, live));
         let entry = self
             .session_entry(session, report)
@@ -1338,7 +1332,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for AcceptedSession {
 }
 impl crate::heap_layout_bound::HeapLayoutBound for AcceptedBuckets {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.0, c)
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.sessions, c)
     }
 }
 
@@ -1379,7 +1373,7 @@ mod tests {
             })
             .collect::<serde_json::Map<_, _>>();
         let decoded: AcceptedBuckets = serde_json::from_value(Value::Object(raw)).unwrap();
-        assert_eq!(decoded.0.len(), MAX_SESSIONS);
+        assert_eq!(decoded.sessions.len(), MAX_SESSIONS);
         let decoded: AcceptedBuckets =
             serde_json::from_value(json!({"a".repeat(64):oversized})).unwrap();
         assert!(decoded.is_empty());
@@ -1389,7 +1383,7 @@ mod tests {
             value["source_session_id"] = json!(format!("session-{i}"));
             state.record(&value);
         }
-        assert_eq!(state.0.len(), MAX_SESSIONS);
+        assert_eq!(state.sessions.len(), MAX_SESSIONS);
         assert!(state.get("never-acknowledged").is_none());
         assert_eq!(
             state.get(&format!("session-{MAX_SESSIONS}")).unwrap().len(),
@@ -1404,8 +1398,8 @@ mod heap_tests {
     use crate::heap_layout_bound::{Counter, HeapLayoutBound};
     #[test]
     fn maximum_priority_ledger_has_a_three_mib_heap_bound() {
-        let state = AcceptedBuckets(
-            (0..MAX_SESSIONS)
+        let state = AcceptedBuckets {
+            sessions: (0..MAX_SESSIONS)
                 .map(|n| {
                     (
                         format!("{n:064x}"),
@@ -1431,13 +1425,8 @@ mod heap_tests {
                     )
                 })
                 .collect(),
-            None,
-            false,
-            false,
-            0,
-            false,
-            false,
-        );
+            ..Default::default()
+        };
         let mut counter = Counter::new(3 * 1024 * 1024);
         counter.add(std::mem::size_of_val(&state)).unwrap();
         state.heap_bound(&mut counter).unwrap();
@@ -1454,7 +1443,11 @@ mod heap_tests {
             counter.bytes
         );
         assert_eq!(
-            state.0.values().map(|state| state.len()).sum::<usize>(),
+            state
+                .sessions
+                .values()
+                .map(|state| state.len())
+                .sum::<usize>(),
             MAX_SESSIONS * MAX_BUCKETS
         );
     }
@@ -1646,7 +1639,7 @@ mod keyed_tests {
         state.record(&tests::body(true));
         assert!(state.is_empty());
         state.bind_context(Some(&context));
-        assert_eq!(state.1.as_ref(), Some(&fixture_key()));
+        assert_eq!(state.key.as_ref(), Some(&fixture_key()));
         state.record(&tests::body(true));
         let bytes = serde_json::to_vec(&state).unwrap();
         let mut restored: AcceptedBuckets = serde_json::from_slice(&bytes).unwrap();
@@ -1696,7 +1689,7 @@ mod eviction_tests {
         );
         assert_eq!(
             restored
-                .0
+                .sessions
                 .values()
                 .map(|entry| entry.proved.len())
                 .sum::<usize>(),
@@ -1709,7 +1702,7 @@ mod eviction_tests {
         let counts = serde_json::to_value(super::super::take_identity_counts()).unwrap();
         assert_eq!(counts["identity_cap"]["accepted_state_evicted"], 1);
         assert_eq!(counts["identity_cap"]["accepted_state_unknown"], 0);
-        assert_eq!(restored.0.len(), MAX_SESSIONS);
+        assert_eq!(restored.sessions.len(), MAX_SESSIONS);
     }
 }
 
@@ -1897,8 +1890,8 @@ mod retained_heap_tests {
     use crate::heap_layout_bound::{Counter, HeapLayoutBound};
     #[test]
     fn maximum_ledger_with_proved_rows_has_a_four_mib_heap_bound() {
-        let state = AcceptedBuckets(
-            (0..MAX_SESSIONS)
+        let state = AcceptedBuckets {
+            sessions: (0..MAX_SESSIONS)
                 .map(|n| {
                     (
                         format!("{n:064x}"),
@@ -1932,13 +1925,8 @@ mod retained_heap_tests {
                     )
                 })
                 .collect(),
-            None,
-            false,
-            false,
-            0,
-            false,
-            false,
-        );
+            ..Default::default()
+        };
         let mut counter = Counter::new(4 * 1024 * 1024);
         counter.add(std::mem::size_of_val(&state)).unwrap();
         state.heap_bound(&mut counter).unwrap();
@@ -2110,7 +2098,7 @@ mod segment_heap_tests {
         let mut state = AcceptedBuckets::segments_for_test();
         for n in 0..SEGMENT_DESIGN_MAX {
             let starts = (0..MAX_SHARES as i64).collect::<Vec<_>>();
-            state.0.insert(
+            state.sessions.insert(
                 session_key(&key, &format!("max-{n}#w20260827")),
                 AcceptedSession {
                     key_epoch: key_epoch(&key),

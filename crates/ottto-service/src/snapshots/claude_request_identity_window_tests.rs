@@ -2457,52 +2457,47 @@ fn sticky_no_emitted_rollup_or_bucket_part_omits_a_cost_its_row_carries() {
 
 // Settled-history segments (`session_history_segments:v1`), on the sticky
 // fixture with one account per day, so accounts change across windows.
+use crate::snapshots::history_segments::{Cut, TRIGGER_BYTES};
+use crate::snapshots::sampled_scan::transition_fixture::{
+    money_oracle::assert_placement_equivalent, Mode, RouteResult,
+};
 
-/// Each bucket row's money placement (money-check placement fields, evidence
-/// resolved through its own item's table), keyed by bucket and row; a row
-/// carried by two pieces fails.
-fn segment_placement(pieces: &[&SnapshotItem]) -> BTreeMap<(String, RowKey), Value> {
-    let mut placement = BTreeMap::new();
+/// Every bucket row of `pieces` as its own entity, with only the evidence it
+/// names, so main's placement oracle compares a whole body and its cut row
+/// by row. A row carried by two pieces fails.
+fn bucket_route(pieces: &[&SnapshotItem]) -> RouteResult {
+    let mut route = RouteResult::emitted(Mode::ColdFull, SnapshotSource::ClaudeCode, vec![], &[]);
     for item in pieces {
-        let resolve = |reference: Option<u16>| {
-            reference.map(|reference| {
-                let evidence = &item.request_evidence[usize::from(reference)];
-                json!([evidence.identity_basis, evidence.provider_workspace_hash])
-            })
-        };
-        for bucket in &item.usage_buckets {
-            for row in &bucket.model_usage {
-                let parts = row.identity_parts.as_ref().map(|parts| {
-                    parts
-                        .iter()
-                        .map(|part| {
-                            json!([part.account_identifier_hash, resolve(part.evidence_ref),
-                                part.input_tokens, part.request_count, part.cost_usd])
-                        })
-                        .collect::<Vec<_>>()
-                });
-                let value = json!({
-                    "account_identifier_hash": row.account_identifier_hash,
-                    "evidence": resolve(row.evidence_ref),
-                    "identity_parts": parts,
-                    "identity_retained": row.identity_retained,
-                    "auth_mode": row.auth_mode,
-                    "billing_channel": row.billing_channel,
-                    "billing_provider": row.billing_provider,
-                    "subscription_product": row.subscription_product,
-                    "counts": [row.input_tokens, row.output_tokens, row.request_count],
-                    "cost_usd": row.cost_usd,
-                });
+        let value = serde_json::to_value(item).unwrap();
+        let buckets = value["usage_buckets"].as_array().unwrap();
+        for (bucket, wire) in item.usage_buckets.iter().zip(buckets) {
+            let rows = wire["model_usage"].as_array().unwrap();
+            for (row, wire) in bucket.model_usage.iter().zip(rows) {
+                let mut evidence = Vec::<Value>::new();
+                let mut local = |leaf: &mut Value| {
+                    if let Some(at) = leaf.get("evidence_ref").and_then(Value::as_u64) {
+                        evidence.push(value["request_evidence"][at as usize].clone());
+                        leaf["evidence_ref"] = json!(evidence.len() - 1);
+                    }
+                };
+                let mut wire = wire.clone();
+                local(&mut wire);
+                let parts = wire.get_mut("identity_parts");
+                if let Some(parts) = parts.and_then(Value::as_array_mut) {
+                    parts.iter_mut().for_each(&mut local);
+                }
+                let key = row_key_from_model_usage(row);
+                let entity = format!("{}/{key:?}", bucket.bucket_start);
+                let body = json!({"request_evidence": evidence, "usage_buckets":
+                    [{"bucket_start": bucket.bucket_start, "model_usage": [wire]}]});
                 assert!(
-                    placement
-                        .insert((bucket.bucket_start.clone(), row_key_from_model_usage(row)), value)
-                        .is_none(),
+                    route.snapshots.insert(entity, body).is_none(),
                     "a bucket row is in exactly one entity"
                 );
             }
         }
     }
-    placement
+    route
 }
 
 /// A sticky session whose every request on day `d` ran on account `d % 3`,
@@ -2511,7 +2506,7 @@ fn segment_placement(pieces: &[&SnapshotItem]) -> BTreeMap<(String, RowKey), Val
 /// Grown until its untagged body crosses the cut trigger.
 fn segment_session() -> (SnapshotItem, Vec<Contribution>, i64) {
     segment_session_until(24 * 21, |item, _| {
-        identity::item_bytes(item) > crate::snapshots::history_segments::TRIGGER_BYTES
+        identity::item_bytes(item) > TRIGGER_BYTES
     })
 }
 
@@ -2681,10 +2676,16 @@ fn settled_history_cut_keeps_whole_session_placement() {
     let accepted = identity::AcceptedBuckets::for_test();
     let segments = identity::AcceptedBuckets::segments_for_test();
     let mut whole = full.clone();
-    identity::apply_cut_for_test(&mut whole, &proof, &accepted, &segments, None).unwrap();
+    identity::cut_for_test::apply_cut(&mut whole, &proof, &accepted, &segments, None).unwrap();
     assert!(whole.history_cut.is_empty() && whole.history_segments.is_none());
     let mut live = full.clone();
-    identity::apply_cut_for_test(&mut live, &proof, &accepted, &segments, Some(now)).unwrap();
+    identity::cut_for_test::apply_cut(
+        &mut live,
+        &proof,
+        &accepted,
+        &segments,
+        Some(Cut::at(now)),
+    ).unwrap();
     let pieces = segment_pieces(&live);
     assert!(pieces.len() >= 3, "several settled windows were cut");
     assert_eq!(segment_identities(&pieces), segment_truth(&proof));
@@ -2740,7 +2741,13 @@ fn settled_history_cut_tags_from_own_entry_then_live() {
     let mut accepted = identity::AcceptedBuckets::for_test();
     let mut segments = identity::AcceptedBuckets::segments_for_test();
     let mut live = full.clone();
-    identity::apply_cut_for_test(&mut live, &proof, &accepted, &segments, Some(now)).unwrap();
+    identity::cut_for_test::apply_cut(
+        &mut live,
+        &proof,
+        &accepted,
+        &segments,
+        Some(Cut::at(now)),
+    ).unwrap();
     assert_eq!(segment_identities(&segment_pieces(&live)), segment_truth(&proof));
     for segment in &live.history_cut {
         segments.record(&serde_json::to_value(segment).unwrap());
@@ -2759,10 +2766,16 @@ fn settled_history_cut_tags_from_own_entry_then_live() {
         );
     }
     let mut again = full.clone();
-    identity::apply_cut_for_test(&mut again, &proof, &accepted, &segments, Some(now)).unwrap();
-    assert_eq!(
-        segment_placement(&segment_pieces(&again)),
-        segment_placement(&segment_pieces(&live))
+    identity::cut_for_test::apply_cut(
+        &mut again,
+        &proof,
+        &accepted,
+        &segments,
+        Some(Cut::at(now)),
+    ).unwrap();
+    assert_placement_equivalent(
+        &bucket_route(&segment_pieces(&live)),
+        &bucket_route(&segment_pieces(&again)),
     );
 }
 
@@ -2773,19 +2786,46 @@ fn settled_history_cut_tags_from_own_entry_then_live() {
 fn settled_history_cut_measures_the_tagged_body() {
     let accepted = identity::AcceptedBuckets::for_test();
     let segments = identity::AcceptedBuckets::segments_for_test();
-    let trigger = crate::snapshots::history_segments::TRIGGER_BYTES;
+    let trigger = TRIGGER_BYTES;
     let tagged_bytes = |item: &SnapshotItem, proof: &[Contribution]| {
         let mut whole = item.clone();
-        identity::apply_cut_for_test(&mut whole, proof, &accepted, &segments, None).unwrap();
+        identity::cut_for_test::apply_cut(&mut whole, proof, &accepted, &segments, None).unwrap();
         identity::item_bytes(&whole)
     };
     let (full, proof, now) =
         segment_session_until(24 * 14, |item, proof| tagged_bytes(item, proof) > trigger);
     assert!(identity::item_bytes(&full) <= trigger, "untagged it is under");
     let mut live = full.clone();
-    identity::apply_cut_for_test(&mut live, &proof, &accepted, &segments, Some(now)).unwrap();
+    identity::cut_for_test::apply_cut(
+        &mut live,
+        &proof,
+        &accepted,
+        &segments,
+        Some(Cut::at(now)),
+    ).unwrap();
     assert!(live.history_segments.is_some() && !live.history_cut.is_empty());
     assert_eq!(segment_identities(&segment_pieces(&live)), segment_truth(&proof));
+    // Cut-time tags equal the unsegmented tags from the same ledger state:
+    // empty, then the whole body ACKed (the segments read the live entry).
+    let mut ledger = identity::AcceptedBuckets::for_test();
+    for round in 0..2 {
+        let mut whole = full.clone();
+        identity::cut_for_test::apply_cut(&mut whole, &proof, &ledger, &segments, None).unwrap();
+        let mut live = full.clone();
+        identity::cut_for_test::apply_cut(
+            &mut live,
+            &proof,
+            &ledger,
+            &segments,
+            Some(Cut::at(now)),
+        ).unwrap();
+        assert!(!live.history_cut.is_empty(), "round {round} cuts");
+        assert_placement_equivalent(
+            &bucket_route(&[&whole]),
+            &bucket_route(&segment_pieces(&live)),
+        );
+        ledger.record(&serde_json::to_value(&whole).unwrap());
+    }
 }
 
 /// [money] A settled window over a size cap once tagged holds the session for
@@ -2798,11 +2838,16 @@ fn settled_history_window_over_a_size_cap_holds_the_session() {
     let segments = identity::AcceptedBuckets::segments_for_test();
     // Whole, the parts budget keeps only some buckets tagged (today's path).
     let mut whole = full.clone();
-    let uncut = identity::apply_cut_for_test(&mut whole, &proof, &accepted, &segments, None);
+    let uncut = identity::cut_for_test::apply_cut(&mut whole, &proof, &accepted, &segments, None);
     assert!(matches!(uncut, Ok(Tagged::Sent { .. })), "{uncut:?}");
     let mut item = full.clone();
-    let (tagged, held) =
-        identity::apply_cut_held_for_test(&mut item, &proof, &accepted, &segments, Some(now));
+    let (tagged, held) = identity::cut_for_test::apply_cut_held(
+        &mut item,
+        &proof,
+        &accepted,
+        &segments,
+        Some(Cut::at(now)),
+    );
     assert_eq!(tagged, uncut);
     assert_eq!(held, BTreeSet::from([full.source_session_id.clone()]));
     assert!(item.history_cut.is_empty() && item.history_segments.is_none());
@@ -2820,7 +2865,7 @@ fn settled_history_cut_off_keeps_main_bytes() {
     let (full, proof, _) = segment_session();
     let accepted = identity::AcceptedBuckets::for_test();
     let mut off = full.clone();
-    identity::apply_cut_for_test(
+    identity::cut_for_test::apply_cut(
         &mut off,
         &proof,
         &accepted,

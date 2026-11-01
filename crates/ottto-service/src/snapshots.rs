@@ -5306,8 +5306,10 @@ impl ClaudeUsageAuthorityDisposition {
     /// session never uploads part of its group.
     pub(crate) fn hold_segments_with_live(&mut self, snapshots: &[SnapshotItem]) {
         for segment in snapshots {
-            let Some(live) =
-                history_segments::group_of(segment).filter(|_| segment.history_segment.is_some())
+            let Some(live) = segment
+                .history_segment
+                .as_ref()
+                .map(|window| window.of.as_str())
             else {
                 continue;
             };

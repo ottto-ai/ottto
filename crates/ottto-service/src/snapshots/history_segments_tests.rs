@@ -90,6 +90,10 @@ fn now(item: &SnapshotItem) -> i64 {
     bucket_unix(item.usage_buckets.last().unwrap()).unwrap() + 3_600
 }
 
+fn cut_of(item: &SnapshotItem) -> Cut {
+    Cut::at(now(item))
+}
+
 /// Every bucket row as sent, keyed by bucket and model; once per entity.
 fn rows(pieces: &[&SnapshotItem]) -> BTreeMap<(String, String), Value> {
     let mut rows = BTreeMap::new();
@@ -145,7 +149,7 @@ fn assert_conserved(full: &SnapshotItem, segments: &[SnapshotItem], live: &Snaps
         assert_eq!((counts, costs), (full_row.counts, Some(full_row.costs)));
     }
     let cost = |piece: &SnapshotItem| {
-        picos(
+        wire_usd_picos(
             piece
                 .cost
                 .as_ref()
@@ -183,7 +187,7 @@ fn assert_conserved(full: &SnapshotItem, segments: &[SnapshotItem], live: &Snaps
 fn shared_cut_conserves_money_and_placement_for_every_source() {
     for source in SOURCES {
         let full = session(source, 30);
-        let cut = plan(source, &full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
+        let cut = plan(source, &full, TRIGGER_BYTES + 1, cut_of(&full), usize::MAX).unwrap();
         let (segments, live) = split(source, &full, &cut).unwrap();
         assert_eq!(segments.len(), 4, "{source:?}");
         assert_conserved(&full, &segments, &live);
@@ -273,7 +277,7 @@ fn segments_carry_only_receiver_segment_fields() {
         full.source_file_fingerprint = Some("synthetic-file".into());
         full.source_started_at = Some(full.usage_buckets[0].bucket_start.clone());
         full.source_last_activity_at = Some(full.collected_at.clone());
-        let cut = plan(source, &full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
+        let cut = plan(source, &full, TRIGGER_BYTES + 1, cut_of(&full), usize::MAX).unwrap();
         let (segments, live) = split(source, &full, &cut).unwrap();
         assert_eq!(live.copy_unproven_counts, full.copy_unproven_counts);
         assert_eq!(live.source_file_fingerprint, full.source_file_fingerprint);
@@ -299,8 +303,15 @@ fn shared_cut_keeps_whole_windows_and_skips_small_or_recent_bodies() {
     let codex = SnapshotSource::Codex;
     let full = session(codex, 30);
     let day_bytes = serde_json::to_vec(&full.usage_buckets[..24]).unwrap().len();
-    assert!(plan(codex, &full, TRIGGER_BYTES + 1, now(&full), 4 * day_bytes).is_none());
-    let cut = plan(codex, &full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
+    assert!(plan(
+        codex,
+        &full,
+        TRIGGER_BYTES + 1,
+        cut_of(&full),
+        4 * day_bytes
+    )
+    .is_none());
+    let cut = plan(codex, &full, TRIGGER_BYTES + 1, cut_of(&full), usize::MAX).unwrap();
     for piece in &cut.segments {
         assert_eq!(piece.start.rem_euclid(WINDOW_SECONDS), 0);
         assert_eq!(piece.end - piece.start, WINDOW_SECONDS);
@@ -312,9 +323,16 @@ fn shared_cut_keeps_whole_windows_and_skips_small_or_recent_bodies() {
         .collect::<BTreeSet<_>>();
     assert_eq!(ids.len(), segments.len());
     assert_conserved(&full, &segments, &live);
-    assert!(plan(codex, &full, TRIGGER_BYTES, now(&full), usize::MAX).is_none());
+    assert!(plan(codex, &full, TRIGGER_BYTES, cut_of(&full), usize::MAX).is_none());
     let recent = session(codex, 3);
-    assert!(plan(codex, &recent, TRIGGER_BYTES + 1, now(&recent), usize::MAX).is_none());
+    assert!(plan(
+        codex,
+        &recent,
+        TRIGGER_BYTES + 1,
+        cut_of(&recent),
+        usize::MAX
+    )
+    .is_none());
     // Top rows that do not re-sum exactly keep today's whole body.
     let mut unbalanced = full.clone();
     unbalanced.model_usage[1].input_tokens += 1;
@@ -330,7 +348,7 @@ fn shared_cut_keeps_partially_priced_rows() {
         let mut full = session(source, 30);
         full.usage_buckets[5].model_usage[1].cost_usd = None;
         full.model_usage[1].cost_usd = None;
-        let cut = plan(source, &full, TRIGGER_BYTES + 1, now(&full), usize::MAX).unwrap();
+        let cut = plan(source, &full, TRIGGER_BYTES + 1, cut_of(&full), usize::MAX).unwrap();
         let (segments, live) = split(source, &full, &cut).unwrap();
         assert_eq!(segments.len(), 4, "{source:?}");
         assert_conserved(&full, &segments, &live);
@@ -373,7 +391,7 @@ fn shared_cut_off_keeps_the_page() {
             serde_json::to_vec(&page).unwrap()
         );
         let mut on = page.clone();
-        expand_page(source, &mut on, Some(now(&page[0])), policy);
+        expand_page(source, &mut on, Some(cut_of(&page[0])), policy);
         assert!(
             on.len() > 1 && on.last().unwrap().history_segments.is_some(),
             "{source:?}"

@@ -39,6 +39,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 mod accepted;
 mod budget;
+#[cfg(test)]
+pub(crate) mod cut_for_test;
 pub(crate) use accepted::{decode_segments, AcceptedBuckets};
 pub(crate) use budget::Measurement as CapMeasurement;
 
@@ -951,53 +953,6 @@ pub(crate) fn apply_with_reserved_bytes_for_test(
     )
 }
 
-/// `apply_with_accepted_for_test` through the settled-history cut: `now`
-/// is the capability's clock, `segments` the sibling segment ledger.
-#[cfg(test)]
-pub(crate) fn apply_cut_for_test(
-    item: &mut SnapshotItem,
-    contributions: &[Contribution],
-    accepted: &AcceptedBuckets,
-    segments: &AcceptedBuckets,
-    now: Option<i64>,
-) -> Result<Tagged, Ineligible> {
-    apply_cut_held_for_test(item, contributions, accepted, segments, now).0
-}
-
-/// `apply_cut_for_test`, with the sessions the cut held this pass.
-#[cfg(test)]
-pub(crate) fn apply_cut_held_for_test(
-    item: &mut SnapshotItem,
-    contributions: &[Contribution],
-    accepted: &AcceptedBuckets,
-    segments: &AcceptedBuckets,
-    now: Option<i64>,
-) -> (Result<Tagged, Ineligible>, BTreeSet<String>) {
-    let mut grouping = Grouping::new(bucket_row_count(item));
-    for c in contributions {
-        grouping.add_at(
-            &c.bucket_start,
-            &c.row_key,
-            &c.usage,
-            c.identity.as_ref(),
-            Some(&c.bucket_start),
-        );
-    }
-    grouping.accepted_miss = accepted.miss_cause();
-    let evidence = ScanEvidence::default()
-        .with_accepted_buckets(Some(accepted))
-        .with_history_segments(Some(segments), now);
-    let tagged = apply_cut(
-        item,
-        grouping,
-        &evidence,
-        accepted.get(&item.source_session_id),
-        accepted.retained_enabled(),
-        &mut Vec::new(),
-    );
-    (tagged, evidence.history_held.take())
-}
-
 /// `apply_with_reserved_bytes_for_test` with `flagged` buckets' rows marked
 /// `copy_invalidated` and, for `fallback`, upstream proof lost.
 #[cfg(test)]
@@ -1085,26 +1040,18 @@ fn apply_grouped_with_accepted(
     retained: bool,
     max_item_bytes: usize,
 ) -> Result<Tagged, Ineligible> {
-    apply_grouped_trimmed(
-        item,
-        grouping,
-        known,
-        retained,
-        max_item_bytes,
-        &mut BTreeSet::new(),
-    )
+    apply_grouped_trimmed(item, grouping, known, retained, max_item_bytes).map(|(tagged, _)| tagged)
 }
 
-/// `apply_grouped_with_accepted`; `trimmed` gets the caps behind a `Sent`
-/// body that kept only the budget's buckets tagged (the rest stripped).
+/// `apply_grouped_with_accepted`, with the caps behind a `Sent` body that
+/// kept only the budget's buckets tagged (the rest stripped).
 fn apply_grouped_trimmed(
     item: &mut SnapshotItem,
     mut grouping: Grouping,
     known: Option<&accepted::AcceptedSession>,
     retained: bool,
     max_item_bytes: usize,
-    trimmed: &mut BTreeSet<OverCap>,
-) -> Result<Tagged, Ineligible> {
+) -> Result<(Tagged, BTreeSet<OverCap>), Ineligible> {
     let retained = retained && super::claude_history_upgrade::is_request_owned_literal(item);
     let (accepted, proved) = if retained {
         (None, known)
@@ -1350,9 +1297,8 @@ fn apply_grouped_trimmed(
                 &grouping,
                 grouping.unowned_request,
             )));
-            return Ok(Tagged::Sent {
-                refusals: item.request_identity_refusals,
-            });
+            let refusals = item.request_identity_refusals;
+            return Ok((Tagged::Sent { refusals }, BTreeSet::new()));
         }
         over_cap.insert(OverCap::Bytes);
     }
@@ -1366,7 +1312,7 @@ fn apply_grouped_trimmed(
             components.as_ref(),
         );
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
-        return Ok(Tagged::Held);
+        return Ok((Tagged::Held, BTreeSet::new()));
     }
     crate::local_resource_diagnostics::claude_identity_over_cap(
         &over_cap,
@@ -1428,10 +1374,8 @@ fn apply_grouped_trimmed(
         // Withholding only that request must not anonymize retained history.
         item.claude_account_display =
             Some(Box::new(account_display(&visible, visible.unowned_request)));
-        *trimmed = over_cap;
-        return Ok(Tagged::Sent {
-            refusals: item.request_identity_refusals,
-        });
+        let refusals = item.request_identity_refusals;
+        return Ok((Tagged::Sent { refusals }, over_cap));
     }
     let mut counts = attempted_counts;
     counts.accepted_overflow.differs = accepted_tagged_attempted;
@@ -1489,10 +1433,8 @@ fn apply_grouped_trimmed(
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
     // The rows carry no identity, so neither may the display.
     item.claude_account_display = Some(Box::new(account_display(&grouping, true)));
-    Ok(Tagged::Fallback {
-        over_cap: over_cap.into_iter().collect(),
-        refusals,
-    })
+    let over_cap = over_cap.into_iter().collect();
+    Ok((Tagged::Fallback { over_cap, refusals }, BTreeSet::new()))
 }
 
 /// Bytes one `identity_retained` member adds to a compact wire row.
@@ -4569,8 +4511,8 @@ pub(crate) struct ScanEvidence<'a> {
     accepted_buckets: Option<&'a AcceptedBuckets>,
     /// Settled-history segment entries, a sibling of `accepted_buckets`.
     accepted_segments: Option<&'a AcceptedBuckets>,
-    /// `session_history_segments:v1` on: this pass's clock (unix seconds).
-    history_segments_now: Option<i64>,
+    /// `session_history_segments:v1` on: this pass's cut.
+    history_cut: Option<history_segments::Cut>,
     /// Sessions whose settled history cannot keep its identity even in
     /// one-day windows: held by the caller this pass.
     pub(crate) history_held: std::cell::RefCell<BTreeSet<String>>,
@@ -4653,14 +4595,14 @@ impl<'a> ScanEvidence<'a> {
         self
     }
 
-    /// Segment entries and the cut clock; `now` is `None` with the capability off.
+    /// Segment entries and the cut; `cut` is `None` with the capability off.
     pub(crate) fn with_history_segments(
         mut self,
         accepted: Option<&'a AcceptedBuckets>,
-        now: Option<i64>,
+        cut: Option<history_segments::Cut>,
     ) -> Self {
         self.accepted_segments = accepted;
-        self.history_segments_now = now;
+        self.history_cut = cut;
         self
     }
 
@@ -5937,7 +5879,7 @@ fn apply_cut(
     invalidated_rows: &mut Vec<CopyInvalidation>,
 ) -> Result<Tagged, Ineligible> {
     let max_item_bytes = evidence.wire_budget.max_item_bytes;
-    let Some(now) = evidence.history_segments_now else {
+    let Some(cut) = evidence.history_cut else {
         return apply_grouped_with_accepted(item, grouping, accepted, retained, max_item_bytes);
     };
     let original = item.clone();
@@ -5952,18 +5894,25 @@ fn apply_cut(
     let whole = grouping.piece(&everything.iter().map(String::as_str).collect(), true);
     let tagged = apply_grouped_with_accepted(item, whole, accepted, retained, max_item_bytes);
     let sent = matches!(tagged, Ok(Tagged::Sent { .. }));
-    if tagged.is_err() || (sent && grouping.item_bytes(item) <= history_segments::trigger_bytes()) {
+    if tagged.is_err() || (sent && grouping.item_bytes(item) <= cut.trigger) {
         return tagged;
     }
     let mut segment_rows = Vec::new();
     let Some((mut segments, mut live)) = history_segments::plan(
         SnapshotSource::ClaudeCode,
         &original,
-        history_segments::trigger_bytes() + 1,
-        now,
+        cut.trigger + 1,
+        cut,
         max_item_bytes,
     )
     .and_then(|plan| history_segments::split(SnapshotSource::ClaudeCode, &original, &plan)) else {
+        // The whole body's item-limit hold stands with nothing to cut.
+        if matches!(tagged, Ok(Tagged::Held)) {
+            history_segments::alarm(
+                SnapshotSource::ClaudeCode,
+                history_segments::Skipped::WholeHeld,
+            );
+        }
         return tagged;
     };
     for segment in &mut segments {
@@ -5979,48 +5928,26 @@ fn apply_cut(
         // The whole body's lent slots, against the rows this entry holds.
         let derived = copy_derived_rows(&original, &piece, own);
         if retained && super::claude_request_money::e2::resumed_prefix_enabled() {
-            // A segment with its own entry is flagged from that entry alone.
-            if own.is_some() {
-                piece.copy_invalidated.clear();
-            }
-            for (start, rows) in copy_invalidated_rows(segment, &derived, own) {
-                piece
-                    .copy_invalidated
-                    .entry(start)
-                    .or_default()
-                    .extend(rows);
-            }
+            // A segment is flagged from its own entry alone (none: no flags).
+            piece.copy_invalidated = copy_invalidated_rows(segment, &derived, own);
         }
         let own_invalidated = own
             .filter(|_| !derived.is_empty())
             .map(|own| own.invalidated(&derived));
         let view = accepted::segment_view(own_invalidated.as_ref().or(own), accepted, &keys);
-        let mut trimmed = BTreeSet::new();
-        let caps = match apply_grouped_trimmed(
-            segment,
-            piece,
-            view.as_ref(),
-            retained,
-            max_item_bytes,
-            &mut trimmed,
-        ) {
-            Ok(Tagged::Sent { .. }) => trimmed.into_iter().collect(),
-            Ok(Tagged::Fallback { over_cap, .. }) if !over_cap.is_empty() => over_cap,
-            // Any other cause is the whole session's too: today's path.
-            _ => {
-                history_segments::alarm(
-                    SnapshotSource::ClaudeCode,
-                    history_segments::Skipped::PieceFailed,
-                );
-                return tagged;
-            }
-        };
-        #[cfg(test)]
-        let caps = if history_segments::held_windows_for_test() {
-            vec![OverCap::Bytes]
-        } else {
-            caps
-        };
+        let caps =
+            match apply_grouped_trimmed(segment, piece, view.as_ref(), retained, max_item_bytes) {
+                Ok((Tagged::Sent { .. }, trimmed)) => trimmed.into_iter().collect(),
+                Ok((Tagged::Fallback { over_cap, .. }, _)) if !over_cap.is_empty() => over_cap,
+                // Any other cause is the whole session's too: today's path.
+                _ => {
+                    history_segments::alarm(
+                        SnapshotSource::ClaudeCode,
+                        history_segments::Skipped::PieceFailed,
+                    );
+                    return tagged;
+                }
+            };
         segment_rows.extend(derived.into_iter().map(|(bucket, row)| CopyInvalidation {
             session: segment.source_session_id.clone(),
             bucket,

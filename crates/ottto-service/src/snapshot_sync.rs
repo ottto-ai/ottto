@@ -5022,7 +5022,7 @@ fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> Result<Sna
 fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
     if item.cache_observations.is_some()
         || item.cache_base_head_etag.is_some()
-        || crate::snapshots::history_segments::group_of(item).is_some()
+        || crate::snapshots::history_segments::history_group(item).is_some()
     {
         return None;
     }
@@ -7646,9 +7646,11 @@ fn finish_sync_source(
                 == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
         );
     // Settled-history segments: only the server's exact token cuts a body.
-    let history_segments_now = (activity_hint.session_history_segments_contract.as_deref()
+    let history_cut = (activity_hint.session_history_segments_contract.as_deref()
         == Some(crate::snapshots::history_segments::CONTRACT))
-    .then(|| OffsetDateTime::now_utc().unix_timestamp());
+    .then(|| {
+        crate::snapshots::history_segments::Cut::at(OffsetDateTime::now_utc().unix_timestamp())
+    });
     let _state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
@@ -7787,7 +7789,7 @@ fn finish_sync_source(
             native_comparison_lease.as_ref(),
             Some((&daemon.transcript_cache, &committed_index)),
             Some(&upload_progress.accepted_identity_buckets),
-            history_segments_now.map(|now| (&upload_progress.accepted_identity_segments, now)),
+            history_cut.map(|cut| (&upload_progress.accepted_identity_segments, cut)),
             crate::snapshots::claude_request_identity::WireBudget {
                 max_item_bytes: identity_item_cap,
                 reservation: Some(&reserve_cache_bytes),
@@ -7932,7 +7934,7 @@ fn finish_sync_source(
     crate::snapshots::history_segments::expand_page(
         source,
         &mut scan_result.snapshots,
-        history_segments_now,
+        history_cut,
         upload_policy,
     );
     claude_authority_disposition.hold_segments_with_live(&scan_result.snapshots);
@@ -8213,8 +8215,8 @@ fn finish_sync_source(
         .snapshots
         .iter()
         .map(|item| {
-            crate::snapshots::history_segments::group_of(item)
-                .unwrap_or(item.source_session_id.as_str())
+            crate::snapshots::history_segments::history_group(item)
+                .map_or(item.source_session_id.as_str(), |(live, _)| live)
         })
         .collect::<BTreeSet<_>>();
     upload_progress
@@ -9922,7 +9924,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
     history_segments: Option<(
         &crate::snapshots::claude_request_identity::AcceptedBuckets,
-        i64,
+        crate::snapshots::history_segments::Cut,
     )>,
     wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
 ) -> std::result::Result<
@@ -10310,7 +10312,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .with_accepted_buckets(accepted_identity_buckets)
         .with_history_segments(
             history_segments.map(|(segments, _)| segments),
-            history_segments.map(|(_, now)| now),
+            history_segments.map(|(_, cut)| cut),
         )
         .with_wire_budget(wire_budget)
     });

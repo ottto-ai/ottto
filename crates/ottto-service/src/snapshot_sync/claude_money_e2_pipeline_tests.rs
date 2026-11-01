@@ -257,14 +257,14 @@ impl Page {
         self.enrich_full(corpus, accepted, None, wire_budget)
     }
     /// `segments`: `session_history_segments:v1` on, with its sibling
-    /// ledger and clock; the shared cut then runs where the driver runs it.
+    /// ledger and cut; the shared cut then runs where the driver runs it.
     fn enrich_with_segments(
         &mut self,
         corpus: &Corpus,
         accepted: Option<&mut crate::snapshots::claude_request_identity::AcceptedBuckets>,
         segments: Option<(
             &mut crate::snapshots::claude_request_identity::AcceptedBuckets,
-            i64,
+            crate::snapshots::history_segments::Cut,
         )>,
     ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
         self.enrich_full(corpus, accepted, segments, Default::default())
@@ -275,7 +275,7 @@ impl Page {
         accepted: Option<&mut crate::snapshots::claude_request_identity::AcceptedBuckets>,
         mut segments: Option<(
             &mut crate::snapshots::claude_request_identity::AcceptedBuckets,
-            i64,
+            crate::snapshots::history_segments::Cut,
         )>,
         wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
     ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
@@ -290,7 +290,7 @@ impl Page {
                     None,
                     Some((&self.cache, &self.committed)),
                     accepted.as_deref(),
-                    segments.as_ref().map(|(ledger, now)| (&**ledger, *now)),
+                    segments.as_ref().map(|(ledger, cut)| (&**ledger, *cut)),
                     wire_budget,
                 )
                 .unwrap()
@@ -330,7 +330,7 @@ impl Page {
         crate::snapshots::history_segments::expand_page(
             SnapshotSource::ClaudeCode,
             &mut self.scan.snapshots,
-            segments.map(|(_, now)| now),
+            segments.map(|(_, cut)| cut),
             SnapshotUploadPolicy::default(),
         );
         disposition.hold_segments_with_live(&self.scan.snapshots);
@@ -4531,7 +4531,7 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
             // in that entry, never the live one, and the segment sends it
             // with today's attribution.
             {
-                use crate::snapshots::history_segments::{segment_id, with_trigger_for_test};
+                use crate::snapshots::history_segments::{segment_id, Cut};
                 let window = 1_785_369_600; // 2026-07-30, an aligned window start
                 let id = segment_id(COPY, window).unwrap();
                 let mut segments = AcceptedBuckets::segments_for_test();
@@ -4549,13 +4549,11 @@ fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
                 let untouched = serde_json::to_vec(&live).unwrap();
                 let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
                 take_identity_counts();
-                with_trigger_for_test(1, || {
-                    page.enrich_with_segments(
-                        &c,
-                        Some(&mut live),
-                        Some((&mut segments, window + 21 * 86_400)),
-                    )
-                });
+                let cut = Cut {
+                    now: window + 21 * 86_400,
+                    trigger: 1,
+                };
+                page.enrich_with_segments(&c, Some(&mut live), Some((&mut segments, cut)));
                 let counts = serde_json::to_value(take_identity_counts()).unwrap();
                 assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 1);
                 assert_eq!(serde_json::to_vec(&live).unwrap(), untouched);

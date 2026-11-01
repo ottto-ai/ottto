@@ -988,7 +988,7 @@ impl SnapshotBatchResponse {
                 if !request.snapshots.iter().any(|item| {
                     item.source_session_id == rejection.source_session_id
                         && item.snapshot_fingerprint == rejection.snapshot_fingerprint
-                        && crate::snapshots::history_segments::group_of(item).is_some()
+                        && crate::snapshots::history_segments::history_group(item).is_some()
                 }) {
                     return Err(anyhow!(
                         "snapshot ACK holds a body outside a settled-history group"

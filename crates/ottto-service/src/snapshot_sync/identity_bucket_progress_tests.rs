@@ -594,7 +594,9 @@ fn group_page_at(
 /// ACK lost (conflicted), nothing of the group is recorded or settled, so
 /// the moved bucket stays protected by the live entry and the segment is
 /// offered again; once the whole group ACKs, the segment records into its own
-/// sibling entry before the live body drops the moved bucket.
+/// sibling entry before the live body drops the moved bucket. A restart
+/// between the passes (saved progress) changes none of it: each bucket is
+/// held by exactly one entry, once.
 #[test]
 fn history_group_settles_whole_segments_before_live() {
     let mut progress = progress();
@@ -628,6 +630,14 @@ fn history_group_settles_whole_segments_before_live() {
             .len(),
         2
     );
+    let mut progress: SnapshotUploadProgress =
+        serde_json::from_slice(&serde_json::to_vec(&progress).unwrap()).unwrap();
+    for ledger in [
+        &mut progress.accepted_identity_buckets,
+        &mut progress.accepted_identity_segments,
+    ] {
+        ledger.bind_test_key(Some([0x42; 32]));
+    }
     progress.active_quarantine_retries.clear();
     progress.quarantined_fingerprints.clear();
     group_page(&mut progress, &items, &[]);

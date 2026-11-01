@@ -11,7 +11,7 @@
 //! body exactly, else nothing is cut. Contract-5 Claude bodies are cut only
 //! by their tagger (`claude_request_identity`), which tags every piece from
 //! the whole-session grouping, so each piece carries its own evidence table.
-use super::claude_request_identity::{row_costs, row_counts};
+use super::claude_request_identity::{row_costs, row_counts, wire_usd_picos};
 use super::{SnapshotCost, SnapshotItem, SnapshotModelUsage, SnapshotSource, SnapshotUsageBucket};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,54 +27,21 @@ pub(crate) const TRIGGER_BYTES: usize = 512 * 1024;
 /// travel in one request, so at most this many.
 pub(crate) const GROUP_MAX_ITEMS: usize = 100;
 
-#[cfg(test)]
-thread_local! {
-    static TRIGGER_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-    static HOLD_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// One pass's cut with the capability on: its clock (unix seconds) and the
+/// full-body size over which a session is cut.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Cut {
+    pub(crate) now: i64,
+    pub(crate) trigger: usize,
 }
 
-/// `TRIGGER_BYTES`; a test may lower it for its own thread.
-pub(crate) fn trigger_bytes() -> usize {
-    #[cfg(test)]
-    {
-        if let Some(bytes) = TRIGGER_FOR_TEST.get() {
-            return bytes;
+impl Cut {
+    pub(crate) fn at(now: i64) -> Self {
+        Self {
+            now,
+            trigger: TRIGGER_BYTES,
         }
     }
-    TRIGGER_BYTES
-}
-
-/// Run `f` with the cut trigger at `bytes` on this thread, so a pipeline
-/// test reaches the cut with a session small enough to stay retained.
-#[cfg(test)]
-pub(crate) fn with_trigger_for_test<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
-    struct Restore(Option<usize>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            TRIGGER_FOR_TEST.set(self.0);
-        }
-    }
-    let _restore = Restore(TRIGGER_FOR_TEST.replace(Some(bytes)));
-    f()
-}
-
-/// Run `f` with every settled window over a size cap once tagged, so a
-/// pipeline test reaches the size hold without a window that large.
-#[cfg(test)]
-pub(crate) fn with_held_windows_for_test<T>(f: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            HOLD_FOR_TEST.set(self.0);
-        }
-    }
-    let _restore = Restore(HOLD_FOR_TEST.replace(true));
-    f()
-}
-
-#[cfg(test)]
-pub(crate) fn held_windows_for_test() -> bool {
-    HOLD_FOR_TEST.get()
 }
 
 /// Whether one request carrying a group's unACKed members, `bytes` their
@@ -149,6 +116,9 @@ pub(crate) enum Skipped {
     /// A group member's exact bytes are refused for good: the group is not
     /// sent without it (counted deferred, never resent each pass).
     PartRefused,
+    /// The whole body is held over an item limit (the account-source hold)
+    /// and has no settled window to cut: the session stays owed.
+    WholeHeld,
     /// A cut live body with no cache head sent its usage without its
     /// non-empty cache patch (counted once per prepared page); the patch
     /// goes again with the session's next upload, never recorded as
@@ -219,7 +189,9 @@ pub(crate) fn segment_id(live: &str, start: i64) -> Option<String> {
 /// family. A group's unACKed members travel in one request, segments oldest
 /// first and the live body last (`group_fits`).
 pub(crate) fn packing_unit(item: &SnapshotItem) -> Option<&str> {
-    group_of(item).or_else(|| super::claude_request_money::request_owned_family_root(item))
+    history_group(item)
+        .map(|(live, _)| live)
+        .or_else(|| super::claude_request_money::request_owned_family_root(item))
 }
 
 /// Each segment's local files, keyed by segment id: the
@@ -275,11 +247,6 @@ pub(crate) fn history_group(item: &SnapshotItem) -> Option<(&str, Option<u64>)> 
     }
 }
 
-/// The live session id of a cut session's group. `None` outside any cut.
-pub(crate) fn group_of(item: &SnapshotItem) -> Option<&str> {
-    history_group(item).map(|(live, _)| live)
-}
-
 /// Plan the cut of a full body measuring `full_bytes`, or `None` when it
 /// stays one body. `item_limit` is the per-item wire limit: the receiver
 /// takes whole 7-day windows only, so a window over half of it keeps the
@@ -288,16 +255,16 @@ pub(crate) fn plan(
     source: SnapshotSource,
     item: &SnapshotItem,
     full_bytes: usize,
-    now: i64,
+    cut: Cut,
     item_limit: usize,
 ) -> Option<Plan> {
-    if full_bytes <= trigger_bytes()
+    if full_bytes <= cut.trigger
         || item.history_segment.is_some()
         || item.source_session_id.contains(SEPARATOR)
     {
         return None;
     }
-    let settled_before = now.checked_sub(SETTLED_SECONDS)?;
+    let settled_before = cut.now.checked_sub(SETTLED_SECONDS)?;
     let mut windows = BTreeMap::<i64, Vec<usize>>::new();
     for (index, bucket) in item.usage_buckets.iter().enumerate() {
         let start = bucket_unix(bucket)?;
@@ -329,11 +296,6 @@ pub(crate) fn plan(
     Some(Plan { segments, through })
 }
 
-/// Exact wire money: digits with at most 12 decimals, as picodollars.
-fn picos(text: &str) -> Option<u128> {
-    super::claude_request_identity::wire_usd_picos(text)
-}
-
 /// One row's eight counts and five optional costs.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct RowSum {
@@ -352,7 +314,7 @@ impl RowSum {
         }
         for (total, text) in self.costs.iter_mut().zip(row_costs(row)) {
             let value = match text.as_deref() {
-                Some(text) => Some(picos(text)?),
+                Some(text) => Some(wire_usd_picos(text)?),
                 None => None,
             };
             *total = if self.rows == 0 {
@@ -689,13 +651,13 @@ fn split_conserving(full: &SnapshotItem, plan: &Plan) -> Option<(Vec<SnapshotIte
             let Some(text) = slot.as_deref() else {
                 continue;
             };
-            let mut value = picos(text)?;
+            let mut value = wire_usd_picos(text)?;
             for segment in &segments {
                 let part = segment
                     .cost
                     .as_ref()
                     .and_then(|cost| cost_fields(cost)[field].as_deref());
-                value = value.checked_sub(picos(part?)?)?;
+                value = value.checked_sub(wire_usd_picos(part?)?)?;
             }
             *slot = Some(super::usd_picos_string(value));
         }
@@ -735,15 +697,17 @@ fn rows_self_contained(item: &SnapshotItem) -> bool {
 
 /// The shared cut, after policy and the account cutoff and before
 /// finalization: tagger-cut segments join the page ahead of their live body;
-/// other oversized bodies are planned and cut here. `now` is `Some` only
-/// with the capability; off, the page is untouched.
+/// other oversized bodies are planned and cut here. `cut` is `Some` only
+/// with the capability; off, the page is untouched. No non-Claude body is
+/// near the trigger today (theoretical); the path stays shared so every
+/// source cuts the same way.
 pub(crate) fn expand_page(
     source: SnapshotSource,
     snapshots: &mut Vec<SnapshotItem>,
-    now: Option<i64>,
+    cut: Option<Cut>,
     policy: super::SnapshotUploadPolicy,
 ) {
-    let Some(now) = now else {
+    let Some(cut) = cut else {
         return;
     };
     let mut page = Vec::with_capacity(snapshots.len());
@@ -755,7 +719,7 @@ pub(crate) fn expand_page(
                 source,
                 &item,
                 bytes,
-                now,
+                cut,
                 super::MAX_SNAPSHOT_ITEM_WIRE_BYTES,
             )
             .and_then(|plan| split(source, &item, &plan))
