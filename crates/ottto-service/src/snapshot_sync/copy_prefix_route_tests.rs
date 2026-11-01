@@ -42,6 +42,17 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
             (copy.request_count, copy.removed_request_count),
             (1, Some(2))
         );
+        // The page is delivered: its exact ACKs earn per-file upload-context
+        // receipts as the service records them, so only the grown copy is
+        // read on the next pages.
+        let mut progress = e2_progress();
+        let (status, _, _) = upload(&first.scan.snapshots, &mut progress, ack);
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        accept_upload_context_acks_for_test(
+            &mut first.index,
+            &first.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
         let prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
         let mut priors = [prior.clone(), prior.clone(), prior];
         let mut bodies = Vec::new();

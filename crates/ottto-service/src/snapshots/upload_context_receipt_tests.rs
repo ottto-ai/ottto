@@ -623,7 +623,10 @@ fn empty_file_proof_is_local_and_never_ack_evidence() {
     f.index
         .set_copy_prefix_base_upload_context(Some(base.clone()));
     assert_eq!(f.index.copy_prefix_base_upload_context, Some(base));
-    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    // The same base keeps this empty file's local proof, but it is never ACK
+    // evidence of the base for the scoped copy-prefix admission.
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+    assert!(!f.index.copy_prefix_base_context_proven(&f.key()));
 }
 
 /// [format] An old decoder drops the per-entity stamp. Missing means owed, and
