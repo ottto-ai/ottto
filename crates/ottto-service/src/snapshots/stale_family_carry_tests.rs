@@ -5003,8 +5003,8 @@ fn real_record(
     scoped_retry_record(key, record)
 }
 
-/// Resolve each owed candidate in `window`; records and returns the ones it
-/// reads.
+/// Resolve each owed candidate in `window`, then record the ones it reads as
+/// the scan does after their parse; returns them.
 fn owed_reads(index: &mut ScanIndex, candidates: &[CandidateFile], window: &str) -> Vec<PathBuf> {
     let mut reads = Vec::new();
     for candidate in candidates {
@@ -5018,10 +5018,11 @@ fn owed_reads(index: &mut ScanIndex, candidates: &[CandidateFile], window: &str)
             &mut reason,
         );
         if decision == CandidateDecision::Parse {
-            // A read records its revision as observed, as the scan does.
-            index.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
             reads.push(candidate.path.clone());
         }
+    }
+    for candidate in candidates.iter().filter(|candidate| reads.contains(&candidate.path)) {
+        index.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
     }
     reads
 }
