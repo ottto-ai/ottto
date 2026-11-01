@@ -27442,6 +27442,12 @@ for line in sys.stdin:
             "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
             support.as_os_str().to_os_string(),
         );
+        FileClaudeConfigSlotSettingsStore::default()
+            .set_upkeep_consent(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                false,
+            )
+            .expect("consent off");
         let before = calls();
         let owner = with_claude_pass(false, current_unix_seconds(), || {
             resolve_claude_default_home_owner(&mut stable("owner-check-token-d"), known)

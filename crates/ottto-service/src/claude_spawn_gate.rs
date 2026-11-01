@@ -347,7 +347,7 @@ pub(crate) mod probe {
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
-    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
     use std::thread::{self, JoinHandle};
     use std::time::Instant;
@@ -634,23 +634,6 @@ pub(crate) mod probe {
             )
         }
 
-        pub(crate) fn stdout(&mut self) -> &mut File {
-            self.packet
-                .as_mut()
-                .expect("owned probe")
-                .stdout
-                .as_mut()
-                .expect("probe output")
-        }
-
-        pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-            #[cfg(test)]
-            if test_support::take_probe_fault(test_support::ProbeFault::Status) {
-                return Err(io::Error::other("injected status failure"));
-            }
-            self.packet.as_mut().expect("owned probe").child.try_wait()
-        }
-
         pub(crate) fn finish(mut self, deadline: Instant) {
             self.settle(deadline);
         }
@@ -858,7 +841,6 @@ pub(crate) mod test_support {
         Prepare,
         Read,
         Write,
-        Status,
         FillStdin,
     }
 
@@ -878,12 +860,7 @@ pub(crate) mod test_support {
         let taken = PROBE_FAULT
             .compare_exchange(fault as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
-        if taken
-            && matches!(
-                fault,
-                ProbeFault::Read | ProbeFault::Write | ProbeFault::Status
-            )
-        {
+        if taken && matches!(fault, ProbeFault::Read | ProbeFault::Write) {
             // Inject an error after admission while retaining a synthetic
             // protected credential; no real keychain may resolve the test.
             for policy in PROBE_POLICIES
@@ -1186,12 +1163,6 @@ pub(crate) mod test_support {
             if self.fake.root.join("direct").exists() {
                 self.wait_until(|| !Self::alive(self.pid("direct")));
             }
-        }
-
-        pub(crate) fn command(&self) -> std::process::Command {
-            let mut command = std::process::Command::new(&self.script);
-            command.env_clear();
-            command
         }
     }
 
