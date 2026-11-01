@@ -2,7 +2,7 @@
 use super::*;
 use crate::snapshots::{
     candidate_from_traversal_path, local_index_key, open_and_identify_scan_candidate_at,
-    sampled_audit, sampled_scan, CandidateFile, ScanCensus, ScanTraversalPath, SnapshotSource,
+    sampled_audit, CandidateFile, ScanCensus, ScanTraversalPath, SnapshotSource,
     LOCAL_SCAN_INDEX_IDENTITY_VERSION,
 };
 use crate::transcript_acquisition::{FullReason, ReadMode};
@@ -107,7 +107,6 @@ impl Fixture {
                 retention: crate::snapshots::DiscoveryRetention::unverified(&index.files),
                 growth: Some(&index.v2().growth_retention),
             },
-            sampled_scan::now_seconds(),
         )
         .unwrap()
         .0
@@ -336,7 +335,7 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
     let durable_claim = {
         let runtime = claim.v2().persistence_v2.as_ref().unwrap();
         let mut guard = runtime.session.lock().unwrap();
-        import::ClaudeMapper
+        import::Mapper
             .hydrate_context(&mut guard.as_mut().unwrap().db)
             .unwrap()
             .0

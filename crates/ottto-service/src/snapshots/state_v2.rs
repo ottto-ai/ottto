@@ -111,6 +111,14 @@ struct Identity {
     binding: super::scan_index_persistence::Binding,
     fence_generation: u64,
 }
+
+/// Sources whose index routes through this store. The set only grows: a
+/// published route's custody wins, and dropping its source here would let v1
+/// load the frozen JSON. Removing a source needs an explicit export back to
+/// v1, never an edit to this set.
+fn v2_on(source: super::scan_index_persistence::Source) -> bool {
+    matches!(source, super::scan_index_persistence::Source::Claude)
+}
 const INLINE_BYTES: usize = 512;
 const PART_BYTES: usize = 256 * 1024;
 const VALUE_BYTES: u64 = 64 * 1024 * 1024;
@@ -280,6 +288,15 @@ pub(super) trait Transaction {
         &mut self,
         kind: &RecordKind,
         after: Option<&RowKey>,
+        limit: usize,
+    ) -> Result<Vec<Header>>;
+    /// One exact key's rows in position order, from position 0 unless a cursor
+    /// is given (exclusive). No other key's header is read.
+    fn scan_record_key(
+        &mut self,
+        kind: &RecordKind,
+        key_bytes: &[u8],
+        after_position: Option<u64>,
         limit: usize,
     ) -> Result<Vec<Header>>;
     fn commit(self, expected_generation: u64, next_generation: u64) -> DurableCommitOutcome;
