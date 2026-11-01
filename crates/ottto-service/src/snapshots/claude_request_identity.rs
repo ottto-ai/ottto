@@ -165,7 +165,7 @@ pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
 pub(crate) const MAX_PARTS_PER_ITEM: usize = 2_048;
 pub(crate) const MAX_ROWS: usize = 100;
 /// Receiver `MAX_SNAPSHOT_ITEM_BYTES`, measured on sorted compact JSON.
-pub(crate) const MAX_ITEM_BYTES: usize = 640 * 1024;
+pub(crate) const MAX_ITEM_BYTES: usize = super::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
 pub(crate) const MAX_ADVERTISED_ITEM_BYTES: usize = 3 * 1024 * 1024;
 
 pub(crate) fn effective_item_cap(advertised: Option<u64>) -> usize {
@@ -1748,7 +1748,7 @@ pub(crate) struct CopyInvalidation {
     row: RowKey,
 }
 
-/// SOURCE 2026-10-31 (#944 xPR F5): proof a copied marker lent must not keep
+/// Copy-derived rows (#944): proof a copied marker lent must not keep
 /// placing. A frozen row whose shares change and are only accounts copied
 /// markers lent to that very row's requests (ones the copy-prefix switch
 /// re-derived without them) is copy-derived: it is treated as never accepted
@@ -3059,7 +3059,7 @@ pub(crate) struct RequestAccounts {
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis, account_source);
 crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, unhealthy_no_fallback, unhealthy_cleared_account, copied_marker_lent, carried);
 
-/// Requests placed by Ron's carry rule (class N, local counts line).
+/// Requests placed by the carry rule (class N, local counts line).
 #[derive(Clone, Copy, Debug, Default)]
 struct CarryCounts {
     forward: u64,
@@ -3076,8 +3076,8 @@ struct CarryCounts {
 }
 crate::heap_layout_bound::fields!(CarryCounts; forward, backward, ambiguous_gap, no_seed, blocked_no_account, keys_over_cap);
 
-/// Ron's rule under `session_request_account_source:v1`, within one
-/// transcript in native order (SOURCE 2026-10-31): a gap (a request with no
+/// The carry rule under `session_request_account_source:v1`, within one
+/// transcript in native order: a gap (a request with no
 /// telemetry row) takes the account the latest earlier request's own
 /// telemetry named, marked `carried_forward`; gaps before the first such
 /// request take it, marked `carried_backward`. Only own telemetry seeds, never

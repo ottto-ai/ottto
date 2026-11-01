@@ -2103,7 +2103,7 @@ pub struct SnapshotRequestEvidence {
 /// Missing/null/unknown keeps existing wire bytes for every source.
 pub(crate) const ACCOUNT_SOURCE_CONTRACT: &str = "session_request_account_source:v1";
 
-/// How a carried account reached a request (SOURCE 2026-10-31, class N).
+/// How a carried account reached a request (class N).
 /// Shared wire shape for source reducers; unmarked provenance stays absent.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -2375,7 +2375,7 @@ struct ClaudeFullRearmProgress {
     /// skip stays vetoed until one runs or the fence opens.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     first_proof_hold_since_full_rearm: bool,
-    /// Option A (SOURCE 2026-10-27): root digests of the families whose local
+    /// Root digests of the families whose local
     /// holds stamped `CompletedBlockingHolds` in this sweep, at most
     /// `MAX_SCOPED_HELD_FAMILY_ROOTS`. `Some` only while every stamp of the
     /// sweep flag named its held families; read only through
@@ -5227,7 +5227,7 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// Contract-5 only: each rebuilt item's requests, classified and folded
     /// into bounded row x authority-key groups during the rebuild.
     pub(crate) request_groupings: BTreeMap<String, claude_request_identity::Grouping>,
-    /// SOURCE 2026-10-31 (#944 xPR F5): the copy-derived accepted rows this
+    /// Copy-derived rows (#944): the accepted rows this
     /// pass's bodies treat as never accepted. The sync loop tombstones them
     /// through `AcceptedBuckets` and saves before any upload.
     pub(crate) copy_invalidated: Vec<claude_request_identity::CopyInvalidation>,
@@ -41730,7 +41730,7 @@ fn record_codex_identity_key(
     key
 }
 
-/// Bounded retries of a transient sidecar open: on Ron's M4 (2026-10-31)
+/// Bounded retries of a transient sidecar open: on a real install (2026-10-31)
 /// `~/.codex/state_5.sqlite` failed SQLITE_CANTOPEN at its first prepare on 11
 /// of 175 Codex pages while Codex itself kept it open. BUSY is not retried:
 /// rusqlite's connection busy timeout already waits for it.
