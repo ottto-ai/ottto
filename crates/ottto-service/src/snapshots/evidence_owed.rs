@@ -410,7 +410,12 @@ pub(super) fn resolve(
     reason: &mut Option<CandidateParseReason>,
 ) {
     let key = local_index_key(&candidate.path);
-    let Some(entry) = index.files.get(&key).filter(|entry| entry.evidence_owed) else {
+    // An owed entry main's clear later emptied is main's debt, read as main.
+    let Some(entry) = index
+        .files
+        .get(&key)
+        .filter(|entry| entry.evidence_owed && !entry.source_file_fingerprint.is_empty())
+    else {
         return;
     };
     let family = claude_index_path_family_member(&candidate.path);
