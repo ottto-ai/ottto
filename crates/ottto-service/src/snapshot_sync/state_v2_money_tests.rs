@@ -191,10 +191,21 @@ fn condition_b(class: &str) {
         // flags. Only the candidate passes through composed populate/hydrate.
         let mut v1: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&prior).unwrap()).unwrap();
-        let v2 =
-            crate::snapshots::state_v2_money_roundtrip(&v1, &c.base.canonicalize().unwrap().join("money.v2.sqlite.import"));
+        // The restore arm loads as a live pass does, archives cold; its
+        // resident view is read back for the custody comparison only.
+        let (mut store, v2, v2_view) = crate::snapshots::StateV2ColdStore::roundtrip(
+            &v1,
+            &c.base
+                .canonicalize()
+                .unwrap()
+                .join("money.v2.sqlite.import"),
+        );
         v1.generation = v2.generation;
-        assert_eq!(canonical(&v1), canonical(&v2), "all custody and join keys");
+        assert_eq!(
+            canonical(&v1),
+            canonical(&v2_view),
+            "all custody and join keys"
+        );
         grow(&path, "r2", 20);
         c.evidence(
             &[
@@ -323,11 +334,58 @@ fn condition_b(class: &str) {
                 assert!(sent.is_empty());
             }
         }
+        if class == "pending" {
+            // Restart arm: the family rolls inside the page; the cold page
+            // saves through the production delta, reloads cold and scans the
+            // next page. v1 takes the same rollover through its own save/load.
+            let end = "2026-10-30T00:00:00Z";
+            let mut resident: ScanIndex =
+                serde_json::from_slice(&serde_json::to_vec(&pages[0].index).unwrap()).unwrap();
+            crate::snapshots::state_v2_roll_account_families(&mut resident, end);
+            let resident: ScanIndex =
+                serde_json::from_slice(&serde_json::to_vec(&resident).unwrap()).unwrap();
+            let [_, _, disk] = pages;
+            let mut page = disk.index;
+            let (cold, view) = store.roll_save_reload(&mut page, end);
+            assert!(crate::snapshots::state_v2_has_cold_archive(&cold));
+            let placement = |index: &ScanIndex| {
+                serde_json::to_value(index).unwrap()["claude_account_family_pending"].clone()
+            };
+            assert_eq!(placement(&view), placement(&resident), "account placement");
+            grow(&path, "r3", 30);
+            c.evidence(
+                &[
+                    tagged_api("r1", 10, Some(&"a".repeat(64))),
+                    tagged_api("r2", 20, None),
+                    tagged_api("r3", 30, Some(&"a".repeat(64))),
+                ],
+                &[trace("r1", ""), trace("r2", ""), trace("r3", "")],
+            );
+            let mut next = [resident.clone(), resident, cold].map(|prior| {
+                c.raw(
+                    &E2ScanFixture::with_identity_capture(false),
+                    prior,
+                    100,
+                    false,
+                    &[],
+                )
+            });
+            finish_claude_pages(&c, &mut next);
+            for candidate in &next[1..] {
+                assert_eq!(candidate.receipt(), next[0].receipt(), "restart join keys");
+                assert_eq!(
+                    canonical(&candidate.scan.snapshots),
+                    canonical(&next[0].scan.snapshots),
+                    "restart totals and account tags"
+                );
+            }
+            compare_claude_uploads(&next);
+        }
     });
 }
 
 macro_rules! classes {
-    ($($test:ident => $class:literal),+ $(,)?) => {$(#[doc = "[money] Preserve the next upload and ACK custody for this persisted money class."] #[test] fn $test() { condition_b($class); })+};
+    ($($test:ident => $class:literal),+ $(,)?) => {$(#[doc = "[money] Preserve the next upload and ACK custody for this persisted money class, restored cold."] #[test] fn $test() { condition_b($class); })+};
 }
 classes! {
     v2_census_and_920_keep_emit_identical_next_body => "census_keep",
@@ -395,7 +453,10 @@ fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload()
         recovery.adopt_synthetic(Some(&bytes));
         let v2 = crate::snapshots::state_v2_money_roundtrip(
             &warm.index,
-            &c.base.canonicalize().unwrap().join("accepted.v2.sqlite.import"),
+            &c.base
+                .canonicalize()
+                .unwrap()
+                .join("accepted.v2.sqlite.import"),
         );
         recovery.recover(&progress_path).unwrap();
         assert_eq!(

@@ -1,6 +1,7 @@
 //! Test-only bridge from emitted-body fixtures to the composed semantic mapper.
 //! Publication is deliberately not simulated: this proves row custody, while
 //! the import fixtures separately exercise the production publication route.
+use super::super::account_pending_retention::ArchivedWindows;
 use super::*;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -59,22 +60,80 @@ pub(super) fn populate(
 }
 
 pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
-    // Feed v1 bytes through its decoder, rather than smuggling runtime state
-    // into the oracle. Runtime leases and in-process flags are not custody.
-    let bytes = serde_json::to_vec(index).unwrap();
-    let mut expected: ScanIndex = serde_json::from_slice(&bytes).unwrap();
-    let restored = roundtrip_rows(&expected, path);
-    expected.generation += 1;
-    assert_eq!(
-        serde_json::to_vec(&restored).unwrap(),
-        serde_json::to_vec(&expected).unwrap(),
-        "composed money custody changed v1 fields or join keys"
-    );
-    assert_eq!(
-        restored.decode_holds.v2_provenance(),
-        expected.decode_holds.v2_provenance()
-    );
-    restored
+    ColdStore::roundtrip(index, path).2
+}
+
+/// Condition b's v2 store. Its graphs load as a live pass loads them, with
+/// cold archives; resident views are read back for comparisons only.
+pub(crate) struct ColdStore {
+    db: sqlite::Sqlite,
+}
+impl ColdStore {
+    /// (store, its cold graph, the same graph read back resident).
+    pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> (Self, ScanIndex, ScanIndex) {
+        // Feed v1 bytes through its decoder, rather than smuggling runtime
+        // state into the oracle. Leases and in-process flags are not custody.
+        let bytes = serde_json::to_vec(index).unwrap();
+        let mut expected: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+        let mut db = populate(path, &expected, BTreeMap::new());
+        let cold = import::ClaudeMapper.hydrate_context(&mut db).unwrap().0;
+        let restored = hydrate_resident(&mut db);
+        expected.generation += 1;
+        assert_eq!(
+            serde_json::to_vec(&restored).unwrap(),
+            serde_json::to_vec(&expected).unwrap(),
+            "composed money custody changed v1 fields or join keys"
+        );
+        assert_eq!(
+            restored.decode_holds.v2_provenance(),
+            expected.decode_holds.v2_provenance()
+        );
+        (Self { db }, cold, restored)
+    }
+
+    /// Roll every account family inside `page` (scanned from this store's
+    /// graph), save it through the production delta and reload: (cold graph,
+    /// resident view).
+    pub(crate) fn roll_save_reload(
+        &mut self,
+        page: &mut ScanIndex,
+        end: &str,
+    ) -> (ScanIndex, ScanIndex) {
+        let identity = self
+            .db
+            .read_control::<Identity>("identity")
+            .unwrap()
+            .unwrap();
+        let (stored, mut cx) = import::ClaudeMapper.hydrate_context(&mut self.db).unwrap();
+        let baseline = kinds::baseline(&stored, &mut cx).unwrap();
+        roll_account_families(page, end);
+        kinds::save_graph(&mut self.db, &identity, baseline, page, &mut cx).unwrap();
+        let cold = import::ClaudeMapper
+            .hydrate_context(&mut self.db)
+            .unwrap()
+            .0;
+        (cold, hydrate_resident(&mut self.db))
+    }
+}
+
+/// Every account family's current window rolls to `end`, as a scan rollover
+/// with strict runs would: resident archives apply the endpoint rule, cold
+/// ones queue it.
+pub(crate) fn roll_account_families(index: &mut ScanIndex, end: &str) {
+    for family in index.claude_account_family_pending.values_mut() {
+        let mut current = family.current.clone();
+        current.census_window_end = end.into();
+        let old = std::mem::replace(&mut family.current, current);
+        family.archive(old, true);
+    }
+}
+
+/// Whether some account family's archive loaded cold.
+pub(crate) fn has_cold_archive(index: &ScanIndex) -> bool {
+    index
+        .claude_account_family_pending
+        .values()
+        .any(|family| matches!(family.previous_windows, ArchivedWindows::Cold(_)))
 }
 
 /// Compare each selected page with the graph the full-clone saver received.
