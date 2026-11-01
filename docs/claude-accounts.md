@@ -387,7 +387,10 @@ this Mac: the default login, registered slots and accounts read through a
 slot alike. Stored readings are still served and age as usual; a login with no
 stored reading says background limit refresh is off. A person's **Refresh
 limits**, setup and account checks still read, as does a collection outside the
-lane. Nothing new is read, stored or uploaded.
+lane. Nothing new is read, stored or uploaded. The same setting gates the
+default login's owner check (`oauth/profile`), which runs only when a valid
+token's plan contradicts `.claude.json`: with it off, no call is made and that
+login fails closed (`claude_login_owner_unproven`).
 
 The setting keeps its name and wire contract
 (`claude_account_set_upkeep_consent`, `consent`). A status that carries
