@@ -1294,6 +1294,33 @@ fn capture_deferred_cache_head_identities(
         .collect()
 }
 
+/// The page's network projection. A cut live body without a cache head
+/// sends no cache patch; a non-empty one withheld is counted, never silent.
+fn prepare_page_cache_for_upload(
+    source: SnapshotSource,
+    snapshot: &mut SnapshotItem,
+    progress: &SnapshotUploadProgress,
+    enabled: bool,
+    head_cas_required: bool,
+    legacy_pending: &BTreeSet<String>,
+) {
+    let cut_patch =
+        enabled && snapshot.history_segments.is_some() && snapshot.cache_observations.is_some();
+    prepare_snapshot_cache_for_upload(
+        snapshot,
+        progress,
+        enabled,
+        head_cas_required,
+        legacy_pending,
+    );
+    if cut_patch && snapshot.cache_base_head_etag.is_none() {
+        crate::snapshots::history_segments::alarm(
+            source,
+            crate::snapshots::history_segments::Skipped::CachePatchWithheld,
+        );
+    }
+}
+
 /// Pure projection shared by no-op/index witnesses and the network boundary.
 /// Local consumers retain the original cache patch and provisional state.
 fn prepare_snapshot_cache_for_upload(
@@ -8137,7 +8164,8 @@ fn finish_sync_source(
                 missing_required_head,
             )?;
         }
-        prepare_snapshot_cache_for_upload(
+        prepare_page_cache_for_upload(
+            source,
             snapshot,
             &upload_progress,
             cache_observations_enabled,
@@ -11800,6 +11828,7 @@ where
     let mut batch = Vec::new();
     let mut batch_bytes = 2usize;
     let mut current_batch_class = None;
+    let mut current_history = false;
     let mut unit_start = 0;
     for (unit_end, catchup) in unit_ends {
         let unit = &order[unit_start..unit_end];
@@ -11808,14 +11837,22 @@ where
             .iter()
             .fold(0usize, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
         let unit_class = (unit[0].2, catchup);
+        // A settled-history group travels alone: no other body's cache patch
+        // makes its request declare head-CAS, which a headless live fails.
+        let history = unit
+            .iter()
+            .any(|(index, _, _)| history_group(&items[*index]).is_some());
         if !batch.is_empty()
             && (batch.len() + unit.len() > SNAPSHOT_BATCH_LIMIT
                 || batch_bytes.saturating_add(unit_bytes) > SNAPSHOT_BATCH_MAX_BYTES
-                || current_batch_class != Some(unit_class))
+                || current_batch_class != Some(unit_class)
+                || history
+                || current_history)
         {
             batches.push_back((std::mem::take(&mut batch), false));
             batch_bytes = 2;
         }
+        current_history = history;
         current_batch_class = Some(unit_class);
         batch.extend(unit.iter().map(|(index, _, _)| *index));
         batch_bytes = batch_bytes.saturating_add(unit_bytes);

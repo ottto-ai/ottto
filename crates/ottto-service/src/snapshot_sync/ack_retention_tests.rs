@@ -1470,6 +1470,32 @@ fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
     let (committed, mut progress) = f.load();
     let mut item = f.item.clone();
     item.cache_observations = pending_head_index_item().1.cache_observations;
+    // [money] A headless cut live body sends its usage without its
+    // non-empty cache patch, counted once (never silent).
+    let mut cut = item.clone();
+    cut.history_segments = Some(crate::snapshots::history_segments::SnapshotHistorySegments {
+        through: "2026-08-27T00:00:00Z".into(),
+        count: 1,
+    });
+    let ((), rows) = crate::local_resource_diagnostics::capture(|| {
+        prepare_page_cache_for_upload(
+            SnapshotSource::ClaudeCode,
+            &mut cut,
+            &progress,
+            true,
+            false,
+            &BTreeSet::new(),
+        )
+    });
+    assert!(cut.cache_observations.is_none() && cut.cache_base_head_etag.is_none());
+    assert_eq!(cut.input_tokens, item.input_tokens);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["stage"] == "history_segments_skipped"
+                && row["counts"]["skipped"] == "cache_patch_withheld")
+            .count(),
+        1
+    );
     prepare_snapshot_cache_for_upload(&mut item, &progress, true, false, &BTreeSet::new());
     let probe = cache_head_probe(&item);
     assert_ne!(

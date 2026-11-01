@@ -926,12 +926,15 @@ fn history_group_goes_in_one_request_up_to_the_receiver_limit() {
         }
     }
 
-    // A 422 on a mixed batch retries the group whole and the other body
-    // alone; no request ever carries a segment without its live body.
+    // A group never shares a request with another body: a headless live's
+    // request carries no other body's cache patch, so it declares no
+    // head-CAS and cannot conflict; the group's money lands. The other
+    // body's 422 stays its own; no request carries a segment without its
+    // live body.
     let mut mixed = group(3);
     mixed.push(
         json!({"source_session_id": other, "snapshot_fingerprint": "c".repeat(64),
-        "input_tokens": 1}),
+        "input_tokens": 1, "cache_observations": {"cache_read_tokens": 1}}),
     );
     let mut progress = fresh();
     let mut stored = BTreeSet::new();
@@ -944,6 +947,14 @@ fn history_group_goes_in_one_request_up_to_the_receiver_limit() {
                 .any(|value| value["source_session_id"] == other)
     }));
     assert!(requests.iter().any(|request| request.len() == 1));
+    assert!(requests.iter().all(|request| {
+        request
+            .iter()
+            .all(|value| value["source_session_id"] == other)
+            || !request
+                .iter()
+                .any(|value| value["source_session_id"] == other)
+    }));
     assert!(!requests.iter().any(segment_only));
     assert_eq!(stored.len(), 3);
     for item in &mixed[..4] {

@@ -149,6 +149,10 @@ pub(crate) enum Skipped {
     /// A group member's exact bytes are refused for good: the group is not
     /// sent without it (counted deferred, never resent each pass).
     PartRefused,
+    /// A cut live body with no cache head sent its usage without its
+    /// non-empty cache patch; the patch goes again with the session's next
+    /// upload (never recorded as delivered).
+    CachePatchWithheld,
 }
 
 #[derive(Serialize)]
