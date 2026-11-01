@@ -1465,7 +1465,10 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
                     let _base = base.then(crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new);
                     let mut fixture = c1a_fixture("e3-latch-contract-money");
                     fixture.owned_base_preparation = true;
-                    fixture.native_file_limit = 100;
+                    // Per-file receipts now ride both indexes of the native
+                    // frame; 16 files per page keep it inside the 4096-visit
+                    // layout bound the real source frame must pass.
+                    fixture.native_file_limit = 16;
                     let session = "e7000000-0000-4000-8000-000000000007";
                     let path = fixture.root.join(format!("{session}.jsonl"));
                     std::fs::write(

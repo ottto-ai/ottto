@@ -180,7 +180,31 @@ impl PipelineFixture {
     ) -> PipelinePage {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
         self.cache.bind_withheld(&mut index);
-        index.activate_upload_context(cycle.upload_context.to_string());
+        // Production order (`finish_sync_source`): the upload ledger loads
+        // under the context's quarantine witness, and one activation binds
+        // the context to the index and the ledger before the scan. Contexts
+        // are fingerprint-shaped on the wire and in the durable ledger.
+        let upload_context = format!("{:x}", Sha256::digest(cycle.upload_context.as_bytes()));
+        let progress_path = self.base.join("upload-progress.json");
+        let mut progress = if self.durable_progress {
+            SnapshotUploadProgress::load(
+                &progress_path,
+                &format!("{:064x}", 99),
+                crate::snapshots::snapshot_quarantine_witness_for_context(
+                    SnapshotSource::ClaudeCode,
+                    &upload_context,
+                ),
+            )
+            .expect("load durable synthetic upload progress")
+        } else {
+            test_upload_progress()
+        };
+        activate_source_upload_context(
+            SnapshotSource::ClaudeCode,
+            upload_context,
+            &mut index,
+            &mut progress,
+        );
         if cycle.historical_replay {
             index.prepare_historical_replay(cycle.replay_generation.to_string());
         }
@@ -237,17 +261,6 @@ impl PipelineFixture {
             &mut scan.snapshots,
             SnapshotUploadPolicy::default(),
         );
-        let progress_path = self.base.join("upload-progress.json");
-        let mut progress = if self.durable_progress {
-            SnapshotUploadProgress::load(
-                &progress_path,
-                &format!("{:064x}", 99),
-                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-            )
-            .expect("load durable synthetic upload progress")
-        } else {
-            test_upload_progress()
-        };
         exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
         finalize_scan_after_policy_with_body_witness(
             SnapshotSource::ClaudeCode,
