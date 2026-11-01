@@ -108,10 +108,7 @@ impl ColdStore {
         let baseline = kinds::baseline(&stored, &mut cx).unwrap();
         roll_account_families(page, end);
         kinds::save_graph(&mut self.db, &identity, baseline, page, &mut cx).unwrap();
-        let cold = import::Mapper
-            .hydrate_context(&mut self.db)
-            .unwrap()
-            .0;
+        let cold = import::Mapper.hydrate_context(&mut self.db).unwrap().0;
         (cold, hydrate_resident(&mut self.db))
     }
 }
