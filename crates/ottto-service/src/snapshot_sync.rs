@@ -3608,7 +3608,7 @@ fn checkpoint_partial_snapshot_index_with_refusals(
     } else {
         progress_owner
     };
-    let mut durable: SnapshotUploadProgress = match match read_limit {
+    let durable: SnapshotUploadProgress = match match read_limit {
         Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
         None => std::fs::read(progress_path),
     } {
@@ -3629,22 +3629,12 @@ fn checkpoint_partial_snapshot_index_with_refusals(
         }
         Err(error) => return Err(error).context("read snapshot progress for partial checkpoint"),
     };
-    // These fields are runtime leases, not persisted settlement evidence.
-    durable.ack_recovery = progress.ack_recovery.clone();
-    durable.active_quarantine_witness = progress.active_quarantine_witness.clone();
-    durable.active_quarantine_retries = progress.active_quarantine_retries.clone();
-    durable.active_reason_reoffers = progress.active_reason_reoffers.clone();
-    durable.attempted_reason_reoffers = progress.attempted_reason_reoffers.clone();
-    durable.reason_reoffer_counts = progress.reason_reoffer_counts;
-    durable.ack_capacity = progress.ack_capacity;
-    durable.retained_stale_ack_count = progress.retained_stale_ack_count;
-    durable.fresh_context_body_acks = progress.fresh_context_body_acks.clone();
-    durable.context_receipt_candidates = progress.context_receipt_candidates.clone();
-    durable.context_resend = progress.context_resend.clone();
-    durable
-        .accepted_identity_buckets
-        .adopt_runtime_from(&progress.accepted_identity_buckets);
-    if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
+    // The same concurrent-writer stamp as `save()`. Settlement below reads
+    // only this durable ledger, never in-memory-only progress state.
+    if durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+        || durable.generation != progress.generation
+        || durable.destination_namespace_hash != progress.destination_namespace_hash
+    {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
         ));
@@ -3737,9 +3727,9 @@ fn checkpoint_partial_snapshot_index_with_refusals(
         &progress.fresh_context_body_acks,
     );
     committable.stamp_entity_upload_context_acks(
-        &progress.destination_namespace_hash,
-        &progress.accepted_body_witnesses,
-        &progress.accepted_body_contexts,
+        &durable.destination_namespace_hash,
+        &durable.accepted_body_witnesses,
+        &durable.accepted_body_contexts,
     );
     validate_destination().context(CHECKPOINT_VALIDATE_DESTINATION)?;
     committable
