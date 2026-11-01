@@ -325,6 +325,9 @@ are `null`. Unix observation time and process id support comparison with an
 independently measured matching process. Never subtract or sum overlapping
 windows or infer allocation ownership: the finish window contains its batch-call
 windows.
+Claude Code's local-evidence stage adds three such footprint records (empty
+counts, none on panic), v1 and v2 alike: `claude_local_evidence` wraps the
+sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
 
 There is one bounded observation per completed page, batch call and normally
 returned prepare or finish, with two CPU/lifetime-RSS samples per observation,

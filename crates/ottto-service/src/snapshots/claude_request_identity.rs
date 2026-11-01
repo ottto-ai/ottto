@@ -167,7 +167,7 @@ pub(crate) const MAX_PARTS_PER_ITEM: usize = 2_048;
 pub(crate) const MAX_ROWS: usize = 100;
 /// Receiver `MAX_SNAPSHOT_ITEM_BYTES`, measured on sorted compact JSON.
 pub(crate) const MAX_ITEM_BYTES: usize = super::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
-pub(crate) const MAX_ADVERTISED_ITEM_BYTES: usize = 3 * 1024 * 1024;
+pub(crate) const MAX_ADVERTISED_ITEM_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) fn effective_item_cap(advertised: Option<u64>) -> usize {
     advertised
@@ -510,8 +510,8 @@ pub(crate) struct Grouping {
     /// Why the caller found no accepted state, when it found none.
     accepted_miss: accepted::UnknownCause,
     /// Bucket rows sent with `copy_invalidated`,
-    /// by bucket start. Empty unless the copy-prefix switch is on and the
-    /// receiver advertised option (ii) retention.
+    /// by bucket start. Empty unless the receiver advertised option (ii)
+    /// retention.
     copy_invalidated: BTreeMap<String, BTreeSet<RowKey>>,
     failed: Option<Ineligible>,
     /// Requests a `RequestSink` admitted: those the item's transcript holds,
@@ -1751,7 +1751,7 @@ pub(crate) struct CopyInvalidation {
 
 /// Copy-derived rows (#944): proof a copied marker lent must not keep
 /// placing. A frozen row whose shares change and are only accounts copied
-/// markers lent to that very row's requests (ones the copy-prefix switch
+/// markers lent to that very row's requests (ones copy-prefix dedupe
 /// re-derived without them) is copy-derived: it is treated as never accepted
 /// (fresh own tags or untagged, never a refusal or marker). Other changed
 /// rows keep #909's refusal, and rows their own evidence still proves are
@@ -3071,10 +3071,12 @@ struct CarryCounts {
     no_seed: u64,
     /// Own telemetry that names no valid account (API key, cloud, placeholder).
     blocked_no_account: u64,
+    /// Transcripts where incomplete occurrence coverage disabled carry.
+    skipped_incomplete: u64,
     /// Runtime-only resource verdict, propagated into the existing item HOLD.
     keys_over_cap: bool,
 }
-crate::heap_layout_bound::fields!(CarryCounts; forward, backward, ambiguous_gap, no_seed, blocked_no_account, keys_over_cap);
+crate::heap_layout_bound::fields!(CarryCounts; forward, backward, ambiguous_gap, no_seed, blocked_no_account, skipped_incomplete, keys_over_cap);
 
 /// The carry rule under `session_request_account_source:v1`, within one
 /// transcript in native order: a gap (a request with no
@@ -3114,7 +3116,10 @@ impl Carry<'_> {
             run: 0,
             pending: Vec::new(),
             closed: 0,
-            counts: CarryCounts::default(),
+            counts: CarryCounts {
+                skipped_incomplete: u64::from(on && !complete),
+                ..CarryCounts::default()
+            },
         }
     }
 
@@ -3701,11 +3706,26 @@ pub(crate) fn reconcile_request_accounts(
         }
         // Existing occurrence storage owns these requests. The temporary sort
         // is 16 bytes per resolved request, at most 1 MiB (native 65,536 cap).
-        // Check while the item's request map is still present; draining it
-        // first would make every nonempty transcript look incomplete.
+        // Carry covers identified occurrences, not census cardinality.
+        // Zero-usage responses have ids but no counted row; counts can also
+        // include responses without a usable id. Proven copies no longer
+        // count. Check before draining the occurrence map.
         let mut carry = Carry::new(
             evidence.carries_accounts(),
-            !evidence.carries_accounts() || !super::claude_member_invalidity_is_structural(item),
+            !evidence.carries_accounts()
+                || (item
+                    .claude_usage_occurrences
+                    .keys()
+                    .eq(item.claude_usage_request_ids.iter())
+                    && item
+                        .claude_usage_occurrences
+                        .values()
+                        .filter(|occurrence| {
+                            !fold.is_skipped(occurrence.sequence) && !occurrence.usage.is_zero()
+                        })
+                        .map(|occurrence| occurrence.usage.request_count)
+                        .try_fold(0_u64, u64::checked_add)
+                        .is_some_and(|requests| requests <= item.request_count)),
         );
         let mut occurrences = std::mem::take(&mut item.claude_usage_occurrences);
         let mut requests = occurrences.iter_mut().collect::<Vec<_>>();
@@ -4234,6 +4254,7 @@ pub(crate) fn page_identity_counts(items: &[SnapshotItem]) -> IdentityCounts {
                 ambiguous_gap: most.ambiguous_gap.max(next.ambiguous_gap),
                 no_seed: most.no_seed.max(next.no_seed),
                 blocked_no_account: most.blocked_no_account.max(next.blocked_no_account),
+                skipped_incomplete: most.skipped_incomplete.max(next.skipped_incomplete),
                 keys_over_cap: most.keys_over_cap || next.keys_over_cap,
             });
         counts.claude_carried_forward_requests += carried.forward;
@@ -4241,6 +4262,7 @@ pub(crate) fn page_identity_counts(items: &[SnapshotItem]) -> IdentityCounts {
         counts.claude_carry_ambiguous_gap_requests += carried.ambiguous_gap;
         counts.claude_carry_no_seed_requests += carried.no_seed;
         counts.claude_carry_blocked_no_account_requests += carried.blocked_no_account;
+        counts.claude_carry_skipped_incomplete_transcripts += carried.skipped_incomplete;
     }
     counts
 }
@@ -4262,6 +4284,7 @@ pub(crate) fn record_page_identity_counts(items: &[SnapshotItem]) {
         counts.claude_carry_ambiguous_gap_requests,
         counts.claude_carry_no_seed_requests,
         counts.claude_carry_blocked_no_account_requests,
+        counts.claude_carry_skipped_incomplete_transcripts,
     ]) {
         if value != 0 {
             counter.fetch_add(value, std::sync::atomic::Ordering::Relaxed);
@@ -4269,8 +4292,8 @@ pub(crate) fn record_page_identity_counts(items: &[SnapshotItem]) {
     }
 }
 
-static IDENTITY_COUNTS: [std::sync::atomic::AtomicU64; 10] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+static IDENTITY_COUNTS: [std::sync::atomic::AtomicU64; 11] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 pub(crate) fn record_listed_legacy_counts(families: u64, files: u64) {
     // Current loaded-list inventory, not process-total sums across cycles.
@@ -4301,12 +4324,14 @@ pub(crate) struct IdentityCounts {
     claude_carry_no_seed_requests: u64,
     #[serde(skip_serializing_if = "is_zero")]
     claude_carry_blocked_no_account_requests: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_carry_skipped_incomplete_transcripts: u64,
 }
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 pub(crate) fn take_identity_counts() -> IdentityCounts {
-    let [mixed, inherited, conflicts, families, files, forward, backward, ambiguous, no_seed, blocked] =
+    let [mixed, inherited, conflicts, families, files, forward, backward, ambiguous, no_seed, blocked, incomplete] =
         IDENTITY_COUNTS
             .each_ref()
             .map(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed));
@@ -4322,6 +4347,7 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
         claude_carry_ambiguous_gap_requests: ambiguous,
         claude_carry_no_seed_requests: no_seed,
         claude_carry_blocked_no_account_requests: blocked,
+        claude_carry_skipped_incomplete_transcripts: incomplete,
     }
 }
 
@@ -5876,8 +5902,8 @@ fn tag_item(
         let copy_derived = copy_derived_rows(item, &grouping, accepted);
         // Like `identity_retained`, only a receiver advertising option (ii)
         // retention mirrors the flag in its identity leaf (and only it holds
-        // proof to drop). Switch off sends no flag, so its bytes stay main's.
-        if retained && super::claude_request_money::e2::resumed_prefix_enabled() {
+        // proof to drop).
+        if retained {
             grouping.copy_invalidated = copy_invalidated_rows(item, &copy_derived, accepted);
         }
         let invalidated = accepted
