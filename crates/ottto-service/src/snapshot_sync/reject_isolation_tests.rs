@@ -438,7 +438,9 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                 )
                 .index;
                 settle_index_after_upload(&mut settled, &page.committed, &progress);
-                let mut reopened = c.reload(&mut settled);
+                // One index file per row: each row is its own install.
+                let mut reopened =
+                    c.reload_in(&mut settled, &format!("restart-identity-{identity}.json"));
                 let record = reopened
                     .quarantined_snapshot_fingerprints
                     .get_mut(&fp)
