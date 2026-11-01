@@ -14,7 +14,7 @@ fn receipt_first_replaces_only_exact_predecessor_and_replays_idempotently() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-receipt-first");
     let index = scratch.join("index");
     let path = scratch.join("progress");
-    let binding = ProgressRecovery::synthetic(&index, &"a".repeat(64), 10);
+    let binding = ProgressRecovery::synthetic(Source::Claude, &index, &"a".repeat(64), 10);
     let old = progress(4, "old");
     let new = progress(5, "new");
     write(&path, &old);
@@ -31,7 +31,8 @@ fn receipt_first_replaces_only_exact_predecessor_and_replays_idempotently() {
 fn mismatched_identity_generation_and_same_generation_forks_hold_without_changes() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-refuse");
     let path = scratch.join("progress");
-    let binding = ProgressRecovery::synthetic(&scratch.join("index"), &"a".repeat(64), 10);
+    let binding =
+        ProgressRecovery::synthetic(Source::Claude, &scratch.join("index"), &"a".repeat(64), 10);
     let old = progress(4, "old");
     write(&path, &old);
     binding.adopt(Some(&old)).unwrap();
@@ -65,7 +66,8 @@ fn mismatched_identity_generation_and_same_generation_forks_hold_without_changes
 fn absent_initial_progress_is_only_a_binding_marker_and_next_receipt_can_recover_it() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-missing");
     let path = scratch.join("progress");
-    let binding = ProgressRecovery::synthetic(&scratch.join("index"), &"a".repeat(64), 10);
+    let binding =
+        ProgressRecovery::synthetic(Source::Claude, &scratch.join("index"), &"a".repeat(64), 10);
     binding.adopt(None).unwrap();
     binding.recover(&path).unwrap();
     assert!(!path.exists());
@@ -79,7 +81,8 @@ fn absent_initial_progress_is_only_a_binding_marker_and_next_receipt_can_recover
 fn missing_or_damaged_receipt_never_falls_back_to_unbound_progress() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-corrupt");
     let path = scratch.join("progress");
-    let binding = ProgressRecovery::synthetic(&scratch.join("index"), &"a".repeat(64), 10);
+    let binding =
+        ProgressRecovery::synthetic(Source::Claude, &scratch.join("index"), &"a".repeat(64), 10);
     let old = progress(4, "old");
     write(&path, &old);
     assert!(binding.recover(&path).is_err());
@@ -96,7 +99,7 @@ fn missing_or_damaged_receipt_never_falls_back_to_unbound_progress() {
 fn import_sealing_is_idempotent_but_never_rebinds_a_different_db_or_progress() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-import-seal");
     let index = scratch.join("index");
-    let binding = ProgressRecovery::synthetic(&index, &"a".repeat(64), 10);
+    let binding = ProgressRecovery::synthetic(Source::Claude, &index, &"a".repeat(64), 10);
     let old = progress(4, "old");
     let identity = binding.scope.identity.clone();
     ProgressRecovery::seal_import(identity.clone(), 10, &index, Some(&old)).unwrap();
@@ -119,7 +122,8 @@ fn post_commit_cleanup_receipt_binds_latest_db_generation_and_refuses_rollback()
     let scratch = crate::test_scratch::ScratchDir::canonical("v2-ack-postcommit-generation");
     let path = scratch.join("progress");
     let db_path = scratch.join("db.v2.sqlite.import");
-    let mut binding = ProgressRecovery::synthetic(&scratch.join("index"), &"a".repeat(64), 0);
+    let mut binding =
+        ProgressRecovery::synthetic(Source::Claude, &scratch.join("index"), &"a".repeat(64), 0);
     let before = progress(1, "accepted-body");
     write(&path, &before);
     binding.adopt(Some(&before)).unwrap();
@@ -159,7 +163,7 @@ fn v1_readable_progress_seals_without_rewriting_bytes() {
     std::fs::write(&path, &bytes).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let original = OriginalProgress::capture(&index).unwrap();
-    let binding = ProgressRecovery::synthetic(&index, &"a".repeat(64), 1);
+    let binding = ProgressRecovery::synthetic(Source::Claude, &index, &"a".repeat(64), 1);
     assert!(original
         .retry_identity(binding.scope.identity.clone())
         .is_ok());
@@ -191,7 +195,7 @@ fn obsolete_unpublished_seal_preserves_custody_then_retries_after_v1_advances() 
     };
     let old = progress(1);
     write(&path, &old);
-    let previous = ProgressRecovery::synthetic(&index, &"a".repeat(64), 1);
+    let previous = ProgressRecovery::synthetic(Source::Claude, &index, &"a".repeat(64), 1);
     let mut identity = previous.scope.identity.clone();
     identity.fence_generation = 1;
     ProgressRecovery::seal_import(identity.clone(), 1, &index, Some(&old)).unwrap();

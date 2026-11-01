@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(in super::super) enum Hold {
+pub(crate) enum Hold {
     Future,
     UnknownRecordKind,
     DbUnavailable,
@@ -281,7 +281,7 @@ pub(in super::super) fn load_locked(
     importable: bool,
     custody: bool,
 ) -> Result<(Option<ScanIndex>, bool)> {
-    // Do not probe the Claude sentinel for Codex, Pi or unbound paths.
+    // Unbound paths and sources outside `v2_on` never probe the store.
     let Some(binding) = binding(path) else {
         return Ok((None, false));
     };
@@ -341,7 +341,7 @@ fn load_with_custody(
                             // Digest the exact persisted image: a save then
                             // also persists whatever normalization changes.
                             let digests = kinds::baseline(&index, &mut cx)?;
-                            normalize_hydrated(&mut index)?;
+                            normalize_hydrated(&mut index, binding.source)?;
                             state.save_digests = Some(digests);
                             // Same session and stamp: rollovers its commits
                             // wrote stay committed for graphs that outlive
@@ -372,7 +372,7 @@ fn load_with_custody(
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             let digests = kinds::baseline(&index, &mut cx)?;
-            normalize_hydrated(&mut index).context("state_v2_open_normalize")?;
+            normalize_hydrated(&mut index, binding.source).context("state_v2_open_normalize")?;
             db.audit_headers().context("state_v2_open_audit_headers")?;
             state.save_digests = Some(digests);
             index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
@@ -447,16 +447,23 @@ fn load_with_custody(
     }
     result
 }
-fn normalize_hydrated(index: &mut ScanIndex) -> Result<()> {
-    use super::super::lenient_decode;
-    lenient_decode::post_decode_hydrated(index, "load", "claude_code").map_err(
-        |error| match error {
-            lenient_decode::Error::Refused("schema_version" | "accepted-ledger version") => {
-                Hold::Future.into()
-            }
-            error => error.into(),
-        },
-    )
+fn normalize_hydrated(
+    index: &mut ScanIndex,
+    source: super::super::scan_index_persistence::Source,
+) -> Result<()> {
+    use super::super::{lenient_decode, scan_index_persistence::Source, SnapshotSource};
+    let slug = match source {
+        Source::Claude => SnapshotSource::ClaudeCode,
+        Source::Codex => SnapshotSource::Codex,
+        Source::Pi => SnapshotSource::Pi,
+    }
+    .api_slug();
+    lenient_decode::post_decode_hydrated(index, "load", slug).map_err(|error| match error {
+        lenient_decode::Error::Refused("schema_version" | "accepted-ledger version") => {
+            Hold::Future.into()
+        }
+        error => error.into(),
+    })
 }
 
 fn pause(state: &mut RouteState, class: Pause) {

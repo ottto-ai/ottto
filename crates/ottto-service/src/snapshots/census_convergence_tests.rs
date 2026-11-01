@@ -627,7 +627,11 @@ fn retry_pending_root_is_never_an_unchanged_proof_root() {
     // the family as a head (Unknown, not absent), and the terminal join,
     // run after a whole-kind load, decides as the resident view does.
     let dir = crate::test_scratch::canonical_private_dir("unchanged-proof-cold");
-    let (custody, cold) = state_v2::money_test_support::ColdSession::publish(&held, &dir);
+    let (custody, cold) = state_v2::money_test_support::ColdSession::publish(
+        scan_index_persistence::Source::Claude,
+        &held,
+        &dir,
+    );
     assert!(cold.claude_usage_family_pending.family(&root).is_err());
     let resident = state_v2::money_test_support::resident(&cold);
     let joined = |index: &ScanIndex| {
@@ -683,7 +687,8 @@ fn cold_usage_row_missing_at_a_matching_stamp_refuses_the_whole_page() {
             .insert(family.to_string(), pending(family));
     }
     let scratch = crate::test_scratch::canonical_private_dir("usage-row-missing");
-    let (custody, cold) = v2::ColdSession::publish(&index, &scratch);
+    let (custody, cold) =
+        v2::ColdSession::publish(scan_index_persistence::Source::Claude, &index, &scratch);
     let page = |index: &mut ScanIndex| {
         let mut snapshots = vec![items[0].clone(), other.clone()];
         apply_claude_reported_usage_with_identity(

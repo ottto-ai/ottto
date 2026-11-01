@@ -212,6 +212,7 @@ fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
     assert!(json_bytes <= 7_900_000, "json={json_bytes}");
     assert!(load_peak <= 13_500_000, "peak={load_peak}");
     let recovery = crate::snapshots::ProgressRecovery::synthetic(
+        crate::snapshots::scan_index_persistence::Source::Claude,
         &root.join("index.json"),
         &progress.destination_namespace_hash,
         0,

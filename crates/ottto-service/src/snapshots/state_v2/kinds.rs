@@ -394,4 +394,4 @@ thread_local! {
 
 #[cfg(test)]
 #[path = "kinds_tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -603,14 +603,19 @@ fn control<T: serde::de::DeserializeOwned>(tx: &mut dyn Transaction, name: &str)
 }
 #[cfg(test)]
 impl ProgressRecovery {
-    pub(crate) fn synthetic(index_path: &Path, namespace: &str, generation: u64) -> Self {
+    pub(crate) fn synthetic(
+        source: super::super::scan_index_persistence::Source,
+        index_path: &Path,
+        namespace: &str,
+        generation: u64,
+    ) -> Self {
         Self {
             scope: Scope {
                 identity: Identity {
                     format: FORMAT,
                     db_id: "synthetic-ack-db".into(),
                     binding: super::super::scan_index_persistence::Binding {
-                        source: super::super::scan_index_persistence::Source::Claude,
+                        source,
                         namespace_hash: namespace.into(),
                     },
                     fence_generation: 0,

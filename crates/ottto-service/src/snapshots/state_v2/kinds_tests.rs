@@ -85,7 +85,7 @@ fn assert_persisted(db: &mut sqlite::Sqlite, expected: &ScanIndex) {
         expected.v2().growth_retention
     );
 }
-fn fixture() -> ScanIndex {
+pub(in crate::snapshots::state_v2) fn fixture() -> ScanIndex {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/scan_index/real-shaped-v1.json"
     ))

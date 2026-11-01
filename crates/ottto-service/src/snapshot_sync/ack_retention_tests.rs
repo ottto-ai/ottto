@@ -2028,7 +2028,12 @@ fn bound_progress(
         namespace.into(),
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     );
-    let recovery = crate::snapshots::ProgressRecovery::synthetic(index_path, namespace, 0);
+    let recovery = crate::snapshots::ProgressRecovery::synthetic(
+        crate::snapshots::scan_index_persistence::Source::Claude,
+        index_path,
+        namespace,
+        0,
+    );
     recovery.adopt_synthetic(None);
     progress.ack_recovery = Some(Box::new(recovery));
     progress.save(progress_path).unwrap();
@@ -2219,6 +2224,7 @@ fn v2_runtime_binding_preserves_existing_progress_bytes_and_off_performs_no_rece
     progress.record_body(&"b".repeat(64), &"c".repeat(64));
     let existing_bytes = serde_json::to_vec_pretty(&progress).unwrap();
     progress.ack_recovery = Some(Box::new(crate::snapshots::ProgressRecovery::synthetic(
+        crate::snapshots::scan_index_persistence::Source::Claude,
         &index_path,
         &"a".repeat(64),
         0,
@@ -2240,8 +2246,12 @@ fn v2_runtime_binding_preserves_existing_progress_bytes_and_off_performs_no_rece
 fn v2_bound_invalid_progress_holds_without_legacy_quarantine_or_reset() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-no-quarantine");
     let path = scratch.join("progress");
-    let recovery =
-        crate::snapshots::ProgressRecovery::synthetic(&scratch.join("index"), &"a".repeat(64), 0);
+    let recovery = crate::snapshots::ProgressRecovery::synthetic(
+        crate::snapshots::scan_index_persistence::Source::Claude,
+        &scratch.join("index"),
+        &"a".repeat(64),
+        0,
+    );
     let invalid = SnapshotUploadProgress::new(
         "b".repeat(64),
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),

@@ -720,6 +720,21 @@ fn cold_usage_pending_out_of_band_delete_refuses_the_whole_page() {
 /// and exposes only committed file membership to the restart-record sweep.
 #[test]
 fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
+    use crate::durable_tail_store::DurableSource;
+    use crate::snapshots::scan_index_persistence::Source;
+    for (source, keys) in [
+        (Source::Claude, Some(DurableSource::ClaudeCode)),
+        (Source::Codex, Some(DurableSource::Codex)),
+        // Pi has no key mapping: never an empty complete set that a sweep could erase by.
+        (Source::Pi, None),
+    ] {
+        f6_forget(source, keys);
+    }
+}
+fn f6_forget(
+    source: crate::snapshots::scan_index_persistence::Source,
+    keys: Option<crate::durable_tail_store::DurableSource>,
+) {
     let mut f = Fixture::new();
     // This API is binding-scoped (source + namespace dir name), so a shared
     // literal namespace collides with parallel fixtures: use a unique one.
@@ -732,19 +747,19 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     };
     let parent = f.path.parent().unwrap().with_file_name(namespace);
     fs::rename(f.path.parent().unwrap(), &parent).unwrap();
-    f.path = parent.join(f.path.file_name().unwrap());
+    f.path = parent.join(super::super::money_test_support::synthetic_file(
+        source, ".json",
+    ));
     let live = || {
         let _owner = super::super::super::CheckpointLock::acquire(&f.path).unwrap();
         crate::snapshots::state_v2::live_key_digests(&f.path).unwrap()
     };
     assert_eq!(live().incomplete_reason, Some(IncompleteReason::Off));
-    // Pi has no key mapping: never an empty complete set that a sweep could erase by.
-    let pi = crate::snapshots::state_v2::live_key_digests(
-        &f.path.with_file_name("pi-test-scan-index.json"),
-    )
-    .unwrap();
-    assert!(!pi.complete && pi.digests.is_empty());
-    assert_eq!(pi.incomplete_reason, Some(IncompleteReason::Off));
+    let Some(keys) = keys else {
+        let off = live();
+        assert!(!off.complete && off.digests.is_empty());
+        return;
+    };
     f.published();
     // Published custody before this process's first load: v1 JSON is stale.
     assert_eq!(live().incomplete_reason, Some(IncompleteReason::Import));
@@ -757,10 +772,7 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     .unwrap();
     index.files.insert("committed".into(), file);
     save_with(&f.path, &mut index).unwrap();
-    let digest = crate::durable_tail_store::key_digest(
-        crate::durable_tail_store::DurableSource::ClaudeCode,
-        "committed",
-    );
+    let digest = crate::durable_tail_store::key_digest(keys, "committed");
     let committed = live();
     assert!(committed.complete);
     assert_eq!(committed.incomplete_reason, None);

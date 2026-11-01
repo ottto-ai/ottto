@@ -1574,6 +1574,7 @@ mod codec_mapper_regressions {
         }))
         .unwrap();
         let mut db = money_test_support::populate(
+            super::super::super::scan_index_persistence::Source::Claude,
             &scratch.join("state.v2.sqlite.import"),
             &index,
             Default::default(),

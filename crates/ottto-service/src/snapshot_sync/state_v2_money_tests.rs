@@ -202,6 +202,7 @@ fn condition_b(class: &str) {
         // The restore arm loads as a live pass does, archives cold; its
         // resident view is read back for the custody comparison only.
         let (mut store, v2, v2_view) = crate::snapshots::StateV2ColdStore::roundtrip(
+            crate::snapshots::scan_index_persistence::Source::Claude,
             &v1,
             &c.base
                 .canonicalize()
@@ -518,12 +519,14 @@ fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload()
         let progress_path = c.base.join("claude_code-upload-progress.json");
         ottto_core::write_owner_only_file_atomic(&progress_path, &bytes).unwrap();
         let recovery = crate::snapshots::ProgressRecovery::synthetic(
+            crate::snapshots::scan_index_persistence::Source::Claude,
             &c.base.join("index"),
             &"a".repeat(64),
             warm.index.generation,
         );
         recovery.adopt_synthetic(Some(&bytes));
         let v2 = crate::snapshots::state_v2_money_roundtrip(
+            crate::snapshots::scan_index_persistence::Source::Claude,
             &warm.index,
             &c.base
                 .canonicalize()
@@ -683,6 +686,7 @@ fn cold_row(name: &str) {
         let mut v1: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&prior).unwrap()).unwrap();
         let (custody, v2) = crate::snapshots::StateV2ColdSession::publish(
+            crate::snapshots::scan_index_persistence::Source::Claude,
             &v1,
             &c.base.canonicalize().unwrap().join("cold-session"),
         );

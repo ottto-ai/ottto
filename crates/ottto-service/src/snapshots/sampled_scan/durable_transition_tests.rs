@@ -1234,7 +1234,7 @@ impl TransitionDriver for Codex24b {
     }
 }
 
-fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
+fn codex_24b_old_writer_row(require_zero_old_bytes: bool, v2: bool) {
     let mut c = corpus("transition-codex-24b");
     c.root = c.base.join(".codex/sessions");
     std::fs::create_dir_all(&c.root).unwrap();
@@ -1245,11 +1245,24 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         + "\n";
     std::fs::write(&path, header + &codex_rows("initial", 10)).unwrap();
     input_clock(&path);
-    let disk = Disk::new(&c);
+    let mut disk = Disk::new(&c);
+    // Codex-ON: on a published state v2 route every save and reload below
+    // goes through the store; dropping the custody erases it.
+    let (custody, start) = if v2 {
+        let (custody, start) = crate::snapshots::StateV2ColdSession::publish(
+            crate::snapshots::scan_index_persistence::Source::Codex,
+            &ScanIndex::default(),
+            &disk.dir.canonicalize().unwrap(),
+        );
+        disk.index = custody.path().to_owned();
+        (Some(custody), start)
+    } else {
+        (None, ScanIndex::default())
+    };
     let source = SnapshotSource::Codex;
     let _cutover = crate::snapshots::TestCutover::set(0);
     let writer = disk.owner(source);
-    let (mut index, scan, modes) = other_page(&c, &writer, source, ScanIndex::default());
+    let (mut index, scan, modes) = other_page(&c, &writer, source, start);
     assert_eq!(modes, (1, 0, 0));
     assert!(scan.snapshots[0].request_count > 0);
     index.record_accepted_snapshot_fingerprints(
@@ -1309,6 +1322,10 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         assert!(!committed.accepted.is_empty(), "native ACK baseline exists");
         assert!(committed.group.is_some() && committed.body_witness.is_some());
         driver.restart();
+        assert_eq!(
+            crate::snapshots::state_v2_growth_retention_active(&driver.prior),
+            v2
+        );
         assert_eq!(NativeAcceptedState::of(&driver.prior, &key), committed);
         // Select the unchanged file for EOF version observation without
         // changing its replay binding or accepted money. Give BOTH the cold
@@ -1391,6 +1408,7 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         // quiet arm: empty finalized set is the expected outcome; money proof is the raw FIELDS equality (a) + zero-entity/zero-batch asserts on both arms
         driver.save_gc(Mode::Restart);
     }
+    drop(custody);
 }
 
 #[test]
@@ -1400,12 +1418,21 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
 )]
 fn shared_24b_old_writer_restored_version_tail_and_unchanged_restart_twice() {
     assert!(supported("shared_24b"));
-    codex_24b_old_writer_row(false);
+    codex_24b_old_writer_row(false, false);
+}
+
+/// [money] Codex-ON: the same 24b row with its index published to state v2.
+/// Cold Full, restored Tail and restarted arms emit equal money and placement.
+#[test]
+fn shared_24b_old_writer_on_published_state_v2() {
+    if supported("shared_24b_state_v2") {
+        codex_24b_old_writer_row(false, true);
+    }
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "needs card-F retirement: main v1 restore re-derives SessionStartState prelude (DoD 6)"]
 fn shared_24b_old_writer_zero_old_bytes_target() {
-    codex_24b_old_writer_row(true);
+    codex_24b_old_writer_row(true, false);
 }

@@ -24601,17 +24601,22 @@ impl ScanIndex {
             return false;
         }
 
+        // D62: a state v2 load never reuses the memo's nonce; first load and
+        // high-water still read the unfiltered memo.
+        let v2 = state_v2::state_v2_growth_retention_active(self);
         let mut minted = minted_proof_incarnations();
         let memo = minted.get(path);
         let first_load_in_process = memo.is_none();
         let high_water = memo.map_or(0, |memo| memo.seq_high_water);
-        let reused = memo.and_then(|memo| match (&origin, &memo.identity) {
-            (LoadOrigin::Loaded(now), MintedIdentity::Loaded(before)) if now == before => {
-                Some(memo.nonce.clone())
-            }
-            (LoadOrigin::Missing, MintedIdentity::Missing) => Some(memo.nonce.clone()),
-            _ => None,
-        });
+        let reused = memo
+            .filter(|_| !v2)
+            .and_then(|memo| match (&origin, &memo.identity) {
+                (LoadOrigin::Loaded(now), MintedIdentity::Loaded(before)) if now == before => {
+                    Some(memo.nonce.clone())
+                }
+                (LoadOrigin::Missing, MintedIdentity::Missing) => Some(memo.nonce.clone()),
+                _ => None,
+            });
         let (identity, nonce) = match origin {
             LoadOrigin::Loaded(stamp) if !self.codex_proof_index_incarnation.is_empty() => (
                 MintedIdentity::Loaded(stamp),
@@ -81613,6 +81618,7 @@ mod tests {
         let mut removed = accepted_retry.clone();
         removed.files.remove("accepted.jsonl");
         state_v2::money_test_support::assert_selected_saves(
+            scan_index_persistence::Source::Claude,
             &committed,
             &[committable.clone(), retry, accepted_retry, removed],
         );
@@ -82323,6 +82329,7 @@ mod tests {
             &BTreeMap::new(),
         );
         state_v2::money_test_support::assert_selected_saves(
+            scan_index_persistence::Source::Claude,
             &ScanIndex::default(),
             &[committable, retry],
         );
