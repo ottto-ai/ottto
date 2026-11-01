@@ -1070,6 +1070,35 @@ fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let header = tx.get(&removed).unwrap().unwrap();
     assert_eq!(value(&mut tx, &header), b"retained");
 }
+/// [behaviour] a written row at 78% of its cap reports a counts-only gauge and alarm.
+#[test]
+fn row_near_its_cap_reports_gauge_and_alarm() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = mapper::key("file.progress", "synthetic-private-row", 0).unwrap();
+    let (_, records) = crate::local_resource_diagnostics::capture(|| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        // 800 KiB plus two quotes of logical JSON against the 1 MiB mutable cap.
+        mapper::put(&mut tx, &key, &"x".repeat(800 * 1024)).unwrap();
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    });
+    let latest = |r: &serde_json::Value| r["counts"]["latest"].clone();
+    let gauge = serde_json::json!({ "percent": 78, "kind": "file.progress" });
+    assert!(records.iter().any(|r| latest(r)["row_cap_max"] == gauge));
+    assert!(records.iter().any(|r| latest(r)["row_cap_alarm"] == 78));
+    assert!(!records
+        .iter()
+        .any(|r| r.to_string().contains("synthetic-private")));
+
+    // A row refused while encoding still reports, so the refusal is visible.
+    let (_, records) = crate::local_resource_diagnostics::capture(|| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        assert!(mapper::put(&mut tx, &key, &"x".repeat(2 * 1024 * 1024)).is_err());
+    });
+    let gauge = serde_json::json!({ "percent": 100, "kind": "file.progress" });
+    assert!(records.iter().any(|r| latest(r)["row_cap_max"] == gauge));
+    assert!(records.iter().any(|r| latest(r)["row_cap_alarm"] == 100));
+}
 /// [format] sqlite full at a row or chunk write rolls back the complete save.
 #[test]
 fn sqlite_full_at_row_or_chunk_write_rolls_back_the_complete_save() {

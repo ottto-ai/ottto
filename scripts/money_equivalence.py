@@ -210,6 +210,7 @@ def main():
     receipts = root / "receipts"
     receipts.mkdir(parents=True)
     ref = os.environ.get("MONEY_EQUIVALENCE_BASE", "").strip()
+    explicit = bool(ref)
     if not ref:
         # workflow_dispatch has no pull_request payload. Resolve the branch's
         # unique open PR base; never assume its base is the candidate branch.
@@ -229,6 +230,11 @@ def main():
         base_sha = output(["git", "rev-parse", "FETCH_HEAD^{commit}"])
     else:
         base_sha = resolved.stdout.strip()
+    if not explicit:
+        # Compare against the branch's fork point, not the base tip: later
+        # base changes are not this branch's, and the transplanted head test
+        # file need not compile against newer base test files.
+        base_sha = output(["git", "merge-base", base_sha, "HEAD"])
     head_sha = output(["git", "rev-parse", "HEAD"])
     manifest = {"base": base_sha, "head": head_sha, "base_ref": ref,
                 "arms": ["retained_ram_tail_or_unchanged", "cold_full", "disk_restore"],

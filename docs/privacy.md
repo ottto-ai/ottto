@@ -85,7 +85,7 @@ none of these keys uploads no defaults at all rather than an empty record, so
 
 When a scan needs multiple uploads, `ottto-service` stores a temporary local
 resume checkpoint containing only the semantic hashes of snapshots the backend
-already accepted, their hash-neutral context-curve body witnesses, and a
+already accepted, their hash-neutral body witnesses, and a
 one-way hash that binds the checkpoint to its relay device. It does not store
 raw account/device identifiers, titles, prompts,
 responses, paths, session ids, usage payloads, or attribution labels. The

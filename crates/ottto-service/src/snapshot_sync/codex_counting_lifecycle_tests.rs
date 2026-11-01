@@ -11,9 +11,6 @@ fn prepare(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
         false,
     )
     .unwrap();
-    // The parser no longer builds curves; a retained body-tracking curve keeps
-    // a changed body's witness distinct.
-    crate::snapshots::attach_retained_context_curve(&mut scan.snapshots, true);
     index.bind_session_accounts(SnapshotSource::Codex, "machine", &mut scan.snapshots, &[]);
     apply_upload_policy(
         SnapshotSource::Codex,
@@ -221,8 +218,12 @@ fn counting_transition_capture_and_failed_upload_select_whole_entries() {
         "settled control saves Legacy"
     );
     assert_ne!(
-        loaded.files[&control_key].last_upload_body_witness,
-        baseline.files[&control_key].last_upload_body_witness
+        loaded.files[&control_key].last_snapshot_fingerprint,
+        baseline.files[&control_key].last_snapshot_fingerprint
+    );
+    assert_eq!(
+        loaded.files[&control_key].last_snapshot_fingerprint,
+        working.files[&control_key].last_snapshot_fingerprint
     );
     assert_eq!(
         loaded.files[&control_key].last_upload_body_witness,
