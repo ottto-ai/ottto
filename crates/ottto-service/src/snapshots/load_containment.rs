@@ -820,8 +820,8 @@ impl ScanIndex {
     /// deferred families stay held; duplicate ownership and owned-start /
     /// stale-carry posture stay fail-closed. The contract token is kept and
     /// its latch set: nothing proves the rebuilt graph ran under it. Accepted
-    /// acknowledgements carry only from a current ledger, so an unproven one
-    /// re-offers rather than suppresses. The replay generations carry so the
+    /// acknowledgements and their upload-context stamps carry only from a
+    /// current ledger, so an unproven one re-offers rather than suppresses. The replay generations carry so the
     /// replacement cycle replays only what the damaged index still owed; a
     /// spurious replay would clear the carried acknowledgements and
     /// owned-start census. Files, traversal and the Codex ownership ledgers
@@ -886,6 +886,10 @@ impl ScanIndex {
             self.accepted_rebuild_incidence = carry.accepted_rebuild_incidence;
             self.admit_carried_ack_debt()?;
             self.accepted_snapshot_fingerprints = carry.accepted_snapshot_fingerprints;
+            // P2: the durable exact-ACK stamps carry with the ledger they
+            // copy. They prove a body only under their context, destination
+            // and replay generation; file receipts are rebuilt by scan.
+            self.upload_context_proof = carry.upload_context_proof;
             if !self.accepted_rebuild_incidence.is_empty() {
                 self.accepted_rebuild_pending_since_unix_seconds =
                     carry.accepted_rebuild_pending_since_unix_seconds;

@@ -8547,20 +8547,26 @@ pub fn finalize_scan_after_policy_with_body_witness(
             && final_upload_body_witness == pending.previous_upload_body_witness
             && !pending.codex_pending_recovery
             && !quarantine_retry_required;
-        let correction_owed = semantic_noop
-            && source == SnapshotSource::ClaudeCode
+        let correction_named = source == SnapshotSource::ClaudeCode
             && index.claude_authority_correction_owed(&pending.index_key);
-        if semantic_noop
-            && !correction_owed
+        let correction_owed = semantic_noop && correction_named;
+        // The A1-A3 exclusions shared by the carry and a rebuilt receipt.
+        let receipt_eligible = !correction_named
+            && !pending.codex_pending_recovery
+            && !quarantine_retry_required
             && !index.decode_holds_file(&pending.index_key)
             && !index
                 .claude_account_deferred_holds
                 .contains_key(&pending.index_key)
             && !final_fingerprints
                 .iter()
-                .any(|fp| index.quarantined_snapshot_fingerprints.contains_key(fp))
-        {
-            let entity_bodies = result
+                .any(|fp| index.quarantined_snapshot_fingerprints.contains_key(fp));
+        let carried_incidence = index.accepted_rebuild_incidence.remove(&pending.index_key);
+        let entity_bodies = ((semantic_noop && receipt_eligible)
+            || carried_incidence.is_some()
+            || index.accepted_rebuild_incidence.contains_key(""))
+        .then(|| {
+            result
                 .snapshots
                 .iter()
                 .filter(|item| {
@@ -8568,34 +8574,60 @@ pub fn finalize_scan_after_policy_with_body_witness(
                         == Some(pending.source_file_fingerprint.as_str())
                 })
                 .map(|item| (item.snapshot_fingerprint.clone(), body_witness(item)))
-                .collect::<BTreeMap<_, _>>();
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+        if semantic_noop && receipt_eligible {
             index.carry_upload_context_receipt(
                 &pending.index_key,
                 &pending.source_file_fingerprint,
                 &entity_bodies,
             );
         }
+        // P1: a carried accepted entity whose durable stamp proves this body
+        // under the file's context is not re-sent, even while its file owes
+        // a receipt (a manual-override rebuild keeps stamps, not receipts).
+        let stamp_proven = entity_bodies
+            .iter()
+            .filter(|(fp, body)| index.file_entity_stamp_proves(&pending.index_key, fp, body))
+            .map(|(fp, _)| fp.clone())
+            .collect::<BTreeSet<_>>();
+        // P2: the file receipt only from this complete parse of the current
+        // revision that found exactly the carried accepted set, every entity
+        // stamp-proven with its body, under the A1-A3 exclusions.
+        if receipt_eligible
+            && !final_fingerprints.is_empty()
+            && carried_incidence.as_ref() == Some(&final_fingerprints)
+            && stamp_proven == final_fingerprints
+            && index.file_upload_context_requires_adoption(&pending.index_key)
+        {
+            if let Some(body) = final_upload_body_witness.as_deref() {
+                index.receipt_from_rebuilt_stamps(
+                    &pending.index_key,
+                    &pending.source_file_fingerprint,
+                    body,
+                );
+            }
+        }
         let context_rearm_required =
             !correction_owed && index.file_upload_context_requires_adoption(&pending.index_key);
+        let carried_noop = |fp: &String| {
+            index.accepted_snapshot_fingerprints.contains(fp)
+                && (!context_rearm_required || stamp_proven.contains(fp))
+        };
         if let Some(unknown) = index.accepted_rebuild_incidence.get("") {
             carried_noop_entities.extend(
                 unknown
                     .intersection(&final_fingerprints)
-                    .filter(|fp| {
-                        !context_rearm_required
-                            && index.accepted_snapshot_fingerprints.contains(*fp)
-                    })
+                    .filter(|fp| carried_noop(*fp))
                     .cloned(),
             );
         }
-        if let Some(carried) = index.accepted_rebuild_incidence.remove(&pending.index_key) {
+        if let Some(carried) = carried_incidence {
             carried_noop_entities.extend(
                 carried
                     .intersection(&final_fingerprints)
-                    .filter(|fp| {
-                        !context_rearm_required
-                            && index.accepted_snapshot_fingerprints.contains(*fp)
-                    })
+                    .filter(|fp| carried_noop(*fp))
                     .cloned(),
             );
         }

@@ -588,6 +588,9 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
     "historical_replay_generation",
+    // Exact-ACK stamps of the carried acknowledgements (P2). Damage only
+    // means owed, as on a load.
+    "upload_context_proof",
 ];
 #[derive(Default)]
 struct Counts {

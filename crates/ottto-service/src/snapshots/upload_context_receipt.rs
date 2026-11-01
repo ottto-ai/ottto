@@ -346,11 +346,7 @@ impl ScanIndex {
         source_witness: &str,
         entity_bodies: &BTreeMap<String, String>,
     ) -> bool {
-        let proof = &self.upload_context_proof;
-        let carried = self.file_upload_context_enabled()
-            && !entity_bodies.is_empty()
-            && proof.destination_namespace_hash.is_some()
-            && proof.replay_generation == self.historical_replay_generation
+        let carried = !entity_bodies.is_empty()
             && self.files.get(key).is_some_and(|entry| {
                 entry.source_file_fingerprint == source_witness
                     && entry
@@ -363,14 +359,11 @@ impl ScanIndex {
                                 && receipt.replay_generation == RECEIPT_REPLAY_EPOCH
                                 && entry.last_upload_body_witness.as_ref()
                                     == Some(&receipt.body_witness)
-                                && entity_bodies.iter().all(|(entity, body)| {
-                                    proof.entity_stamps.get(entity).is_some_and(|stamp| {
-                                        stamp.context_fingerprint == receipt.context_fingerprint
-                                            && stamp.body_witness == *body
-                                    })
-                                })
                         })
-            });
+            })
+            && entity_bodies
+                .iter()
+                .all(|(entity, body)| self.file_entity_stamp_proves(key, entity, body));
         if carried {
             if let Some(receipt) = self
                 .files
@@ -381,6 +374,50 @@ impl ScanIndex {
             }
         }
         carried
+    }
+
+    /// An entity's durable stamp proves this body under THIS file's context in
+    /// the stamp set's replay generation. The context carries the destination
+    /// namespace, so a destination change is a context change.
+    pub(super) fn file_entity_stamp_proves(&self, key: &str, entity: &str, body: &str) -> bool {
+        let proof = &self.upload_context_proof;
+        self.file_upload_context_enabled()
+            && proof.destination_namespace_hash.is_some()
+            && proof.replay_generation == self.historical_replay_generation
+            && self.file_expected_context(key).is_some_and(|context| {
+                proof.entity_stamps.get(entity).is_some_and(|stamp| {
+                    stamp.context_fingerprint == *context && stamp.body_witness == body
+                })
+            })
+    }
+
+    /// P1/P2 after a manual-override rebuild, which keeps stamps but no file
+    /// receipts: this page's complete parse of the current revision found
+    /// exactly the carried accepted set, every entity stamp-proven with this
+    /// body (the caller checks that and the A1-A3 exclusions). Never from
+    /// stamps alone.
+    pub(super) fn receipt_from_rebuilt_stamps(
+        &mut self,
+        key: &str,
+        source_witness: &str,
+        body_witness: &str,
+    ) -> bool {
+        let Some(context_fingerprint) = self.file_expected_context(key).cloned() else {
+            return false;
+        };
+        let Some(entry) = self.files.get_mut(key).filter(|entry| {
+            entry.source_file_fingerprint == source_witness
+                && entry.last_upload_body_witness.as_deref() == Some(body_witness)
+        }) else {
+            return false;
+        };
+        entry.upload_context_receipt = Some(Receipt {
+            context_fingerprint,
+            replay_generation: RECEIPT_REPLAY_EPOCH,
+            source_witness: source_witness.to_string(),
+            body_witness: body_witness.to_string(),
+        });
+        true
     }
 
     /// An entity's durable stamp proves exactly this body under this context,
@@ -442,8 +479,10 @@ impl ScanIndex {
         }
         let mut by_source: BTreeMap<&str, BTreeMap<String, String>> = BTreeMap::new();
         let mut by_source_bytes = BTreeMap::<&str, BTreeMap<String, u64>>::new();
+        let mut parsed_source = BTreeMap::<&str, &str>::new();
         for item in items {
             if let Some(source) = item.source_file_fingerprint.as_deref() {
+                parsed_source.insert(item.snapshot_fingerprint.as_str(), source);
                 if !by_source
                     .get(source)
                     .is_some_and(|bodies| bodies.contains_key(&item.snapshot_fingerprint))
@@ -464,16 +503,32 @@ impl ScanIndex {
         self.files
             .iter()
             .filter_map(|(key, entry)| {
-                if self.receipt_matches(key, entry)
-                    || self.decode_holds_file(key)
-                    || self
-                        .effective_upload_body_witness_revision_excluded_source_files
-                        .contains(&entry.source_file_fingerprint)
+                if self.receipt_matches(key, entry) || self.decode_holds_file(key) {
+                    return None;
+                }
+                let entities = self.file_snapshot_fingerprints.get(key)?;
+                // A forced reparse clears the entry's revision after this page
+                // parsed and sent it. Its receipt is keyed by the revision the
+                // page parsed and proves nothing until the re-read restores
+                // that same revision. A file at another revision earns none.
+                let source_witness = if entry.source_file_fingerprint.is_empty() {
+                    let mut parsed = entities
+                        .iter()
+                        .map(|fp| parsed_source.get(fp.as_str()).copied());
+                    let first = parsed.next().flatten()?;
+                    parsed
+                        .all(|source| source == Some(first))
+                        .then_some(first)?
+                } else {
+                    entry.source_file_fingerprint.as_str()
+                };
+                if self
+                    .effective_upload_body_witness_revision_excluded_source_files
+                    .contains(source_witness)
                 {
                     return None;
                 }
-                let bodies = by_source.get(entry.source_file_fingerprint.as_str())?;
-                let entities = self.file_snapshot_fingerprints.get(key)?;
+                let bodies = by_source.get(source_witness)?;
                 if bodies.len() != entities.len()
                     || !entities.iter().all(|fp| bodies.contains_key(fp))
                 {
@@ -493,13 +548,13 @@ impl ScanIndex {
                     receipt: Receipt {
                         context_fingerprint: context_fingerprint.clone(),
                         replay_generation: RECEIPT_REPLAY_EPOCH,
-                        source_witness: entry.source_file_fingerprint.clone(),
+                        source_witness: source_witness.to_string(),
                         body_witness,
                     },
                     historical_replay_generation: self.historical_replay_generation.clone(),
                     bodies: bodies.clone(),
                     wire_bytes: by_source_bytes
-                        .get(entry.source_file_fingerprint.as_str())
+                        .get(source_witness)
                         .cloned()
                         .unwrap_or_default(),
                     prior_acks: BTreeSet::new(),

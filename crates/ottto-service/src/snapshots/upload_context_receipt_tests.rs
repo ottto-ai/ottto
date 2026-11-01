@@ -833,6 +833,66 @@ fn mtime_only_rewrite_carries_the_receipt_without_a_resend() {
     f.assert_quiet();
 }
 
+/// [regress] [money] A forced reparse clears the entry's revision after the
+/// page parsed and sent it. The exact ACKs earn a receipt keyed by the parsed
+/// revision; it proves nothing until the re-read restores that revision, and
+/// then the identical accepted bodies are not sent again (before: no receipt,
+/// so one more send). A file at another revision when the ACK lands earns none.
+#[test]
+fn forced_reparse_receipt_keys_the_parsed_revision() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let key = f.key();
+    let previous = f.index.clone();
+    let (sent, _) = f.walk(true);
+    assert!(!sent.snapshots.is_empty());
+    let parsed = f.entry().source_file_fingerprint.clone();
+    let mut moved = f.index.clone();
+    moved.files.get_mut(&key).unwrap().source_file_fingerprint = "f".repeat(64);
+    assert!(moved
+        .file_upload_context_ack_candidates(&sent.snapshots)
+        .is_empty());
+    f.index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    let context = f.index.active_upload_context_fingerprint.clone().unwrap();
+    f.uploader.activate(f.source, context, &mut f.index);
+    let (files, _) = f
+        .uploader
+        .send(f.source, &mut f.index, &previous, &sent.snapshots)
+        .unwrap();
+    assert_eq!(files, 1, "receipted under the parsed revision");
+    assert_eq!(
+        f.entry()
+            .upload_context_receipt
+            .as_ref()
+            .unwrap()
+            .source_witness,
+        parsed
+    );
+    assert!(
+        f.index.file_upload_context_requires_adoption(&key),
+        "proves nothing until the re-read"
+    );
+    let sent_items = f.uploader.counts().0;
+    let previous = f.index.clone();
+    let (reread, _) = f.walk(true);
+    assert_eq!(reread.scanned_file_count, 1, "the forced reparse happens");
+    assert!(
+        reread.snapshots.is_empty(),
+        "no second send: {:?}",
+        reread.snapshots
+    );
+    assert!(!f.index.file_upload_context_requires_adoption(&key));
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &reread.snapshots)
+        .unwrap();
+    assert_eq!(f.uploader.counts().0, sent_items);
+    f.assert_quiet();
+}
+
 /// [regress] A refused sibling leaves a proven file quiet: no re-read, no
 /// re-send. Before, Pi's source-wide gate kept every file owed while any
 /// sibling stayed unsettled.
