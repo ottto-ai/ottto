@@ -128,7 +128,9 @@ jobs:
         run: |
           build_status=0
           cargo test --workspace --locked --no-run || build_status=$?
-          cargo test --manifest-path crates/Cargo.toml --workspace --locked --no-run || build_status=$?
+          if [ "${{ matrix.shard }}" = 1 ]; then
+            cargo test --manifest-path crates/Cargo.toml --workspace --locked --no-run || build_status=$?
+          fi
           if [ "$build_status" -eq 0 ]; then
             echo "CACHE_ON_FAILURE=true" >> "$GITHUB_ENV"
           fi

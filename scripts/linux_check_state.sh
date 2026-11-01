@@ -21,6 +21,8 @@ gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?filter=all&per_page=100
         [ $runs[] | select(.name == $name) ] as $exact
         | if any($exact[]; .conclusion == "success") then "success"
           elif any($runs[]; (.name | startswith($name)) and .status != "completed") then "pending"
+          # Finished shards whose summary check is not created yet.
+          elif ($exact | length) == 0 and any($runs[]; .name | startswith($name)) then "pending"
           elif ($exact | length) == 0 then "none"
           else "red" end;
     [ state("Rust tests (Linux)"), state("Rust format (Linux)") ]
