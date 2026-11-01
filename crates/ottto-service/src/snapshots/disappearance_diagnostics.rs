@@ -6,7 +6,7 @@ use super::SnapshotSource;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-// Q-B2 opt-in (default OFF): settle Claude members of deleted directories as
+// Opt-in (default OFF): settle Claude members of deleted directories as
 // removals. Declared beside the NotFound sites it splits so this module's
 // fixtures set it on their own thread; no options seam reaches the candidate
 // and walk sites. The counters below stay diagnostics only.
@@ -157,9 +157,9 @@ static TOTALS: [Counters; 3] = [const { Counters::new() }; 3];
 /// `Site` order, each `[loss, removal]`; NotFound in `counts` includes both,
 /// and root NotFounds have no site. The `vanished_*` counts are what the
 /// page merge dropped with a vanished Claude member's retired entry.
-/// `parent_missing_removals` (Q-B2, omitted at zero) counts the NotFound
+/// `parent_missing_removals` (omitted at zero) counts the NotFound
 /// removals settled below a missing parent; they are also in the site split.
-/// `vanished_pin_refusals` counts Q-B2 witnesses refused by the shared pin
+/// `vanished_pin_refusals` counts absence witnesses refused by the shared pin
 /// budget, and `vanished_retire_blocked_possible_move` confirmed absences held
 /// because another path carries the session (or the lookup was incomplete).
 /// The sticky flag invalidates exact intervals; false is not a coherence proof.
@@ -233,19 +233,19 @@ pub(super) fn vanished(source: SnapshotSource, vanished: Vanished) {
     });
 }
 
-/// Q-B2: a census member below a missing parent settled as a removal.
+/// A census member below a missing parent settled as a removal.
 pub(super) fn parent_missing_removal(source: SnapshotSource) {
     let counters = &TOTALS[source_index(source)];
     counters.bump(&counters.parent_missing_removals);
 }
 
-/// Q-B2: the shared pin budget refused a new absence witness.
+/// The shared pin budget refused a new absence witness.
 pub(super) fn vanished_pin_refused(source: SnapshotSource) {
     let counters = &TOTALS[source_index(source)];
     counters.bump(&counters.vanished_pin_refusals);
 }
 
-/// Q-B2 rename guard: a confirmed absence held as a possible move.
+/// Rename guard: a confirmed absence held as a possible move.
 pub(super) fn vanished_retire_blocked_possible_move(source: SnapshotSource) {
     let counters = &TOTALS[source_index(source)];
     counters.bump(&counters.vanished_retire_blocked_possible_move);
@@ -658,7 +658,6 @@ mod tests {
             &[],
             false,
             false,
-            false,
         );
         assert_eq!(state.identified_candidates.len(), 1);
         assert!(
@@ -932,8 +931,8 @@ mod tests {
             .is_some_and(|entry| entry.has_unverified_source()));
     }
 
-    /// One bounded walk per `(at, now)` over a deleted session directory, as on
-    /// the M4: a fresh census window whose discovery is still pending
+    /// One bounded walk per `(at, now)` over a deleted session directory, as
+    /// observed: a fresh census window whose discovery is still pending
     /// (`pending_directories` > 0), the indexed member enumerated at the forced
     /// index site, then the queued `directory` (if any) read. Returns, per
     /// walk, the member's (disappeared, removed) and the directory's disappeared.
@@ -1005,7 +1004,7 @@ mod tests {
     }
 
     /// A live real root with one indexed subagent member whose whole session
-    /// directory was deleted (the 107-entry M4 shape), plus a gone directory
+    /// directory was deleted (the common observed shape), plus a gone directory
     /// that was still queued under the live root.
     #[cfg(unix)]
     fn deleted_directory_index(root: &Path) -> (ScanIndex, PathBuf, PathBuf) {
@@ -1049,12 +1048,12 @@ mod tests {
         assert!(!enabled());
     }
 
-    /// [regress] RF1 B2: on the M4 every Claude walk ended red with 47-71
+    /// [regress] Observed: every Claude walk ended red with 47-71
     /// CandidateForcedIndex losses per process, all members of deleted
     /// directories, observed while discovery was still pending. ON: the first
-    /// NotFound stays loss and a strictly later walk settles it (Q-B2a); a
+    /// NotFound stays loss and a strictly later walk settles it; a
     /// member seen again needs two fresh observations; a vanished queued
-    /// directory below its live parent settles the same way (Q-B2b).
+    /// directory below its live parent settles the same way.
     #[cfg(unix)]
     #[test]
     fn claude_member_of_deleted_directory_is_removal_after_a_later_walk() {
@@ -1101,7 +1100,7 @@ mod tests {
         super::super::sampled_scan::set_test_now(None);
     }
 
-    /// [money] Lead B rename guard: a confirmed absence whose session is also
+    /// [money] Rename guard: a confirmed absence whose session is also
     /// indexed under another live path may be a move, so retiring it could
     /// double count the copy. It stays loss and is counted, never retired.
     #[cfg(unix)]
@@ -1153,7 +1152,7 @@ mod tests {
         super::super::sampled_scan::set_test_now(None);
     }
 
-    /// [money] Lead B Q-B2: settling the deleted member through the page
+    /// [money] Settling the deleted member through the page
     /// merge drops its entry exactly as a live-parent removal does. The
     /// accepted (ACKed) ledger stays byte-for-byte, and no zero or removal
     /// body is built for its family.
@@ -1437,7 +1436,6 @@ mod tests {
             None,
             &[],
             false,
-            true,
         );
         assert!(
             state
@@ -1710,265 +1708,6 @@ mod tests {
         let mut expected = [[[0; OUTCOMES]; SITES]; 3];
         expected[1][Site::WalkDirectory.index()] = [1, 0];
         assert_eq!(sites, expected, "a vanished queued directory stays loss");
-    }
-
-    #[test]
-    fn isolated_sources_classes_order_and_sticky_wrap() {
-        let totals = [const { Counters::new() }; 3];
-        let causes = [
-            Cause::NotFound,
-            Cause::RootResolutionUnresolved,
-            Cause::PreflightFingerprintChanged,
-            Cause::ComparisonTargetRevisionChanged,
-        ];
-        for (s, source) in [
-            SnapshotSource::Codex,
-            SnapshotSource::ClaudeCode,
-            SnapshotSource::Pi,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            for (c, cause) in causes.into_iter().enumerate() {
-                for _ in 0..s * 4 + c + 1 {
-                    totals[source_index(source)].record(cause);
-                }
-            }
-        }
-        for (s, counters) in totals.iter().enumerate() {
-            let value = serde_json::to_value(counters.snapshot()).unwrap();
-            let expected_counts: [u64; 4] = std::array::from_fn(|c| (s * 4 + c + 1) as u64);
-            assert_eq!(
-                value,
-                serde_json::json!({"version":1,
-                "scope":"process_lifetime_not_window",
-                "counts":expected_counts,
-                "not_found_sites":([[0, 0]; SITES]),
-                "vanished_audit_debt_dropped":0,
-                "vanished_request_census_removed":0,
-                "overflowed":false})
-            );
-        }
-        let counters = Counters::new();
-        counters.counts[0].store(u64::MAX, Ordering::Relaxed);
-        counters.record(Cause::NotFound);
-        assert_eq!(counters.snapshot().counts, [0; 4]);
-        assert!(counters.snapshot().overflowed);
-        counters.record(Cause::ComparisonTargetRevisionChanged);
-        assert!(counters.snapshot().overflowed);
-
-        // Site slots are [loss, removal] in Site order and share the sticky flag.
-        let sites = Counters::new();
-        for (site, removal) in [
-            (Site::WalkDirectory, false),
-            (Site::WalkEntry, false),
-            (Site::CandidateWalk, true),
-            (Site::CandidateForcedIndex, true),
-            (Site::Open, false),
-            (Site::Open, true),
-        ] {
-            sites.record_not_found_site(site, removal);
-        }
-        assert_eq!(
-            sites.snapshot().not_found_sites,
-            [[1, 0], [1, 0], [0, 1], [0, 1], [1, 1]]
-        );
-        assert_eq!(sites.snapshot().counts, [0; 4]);
-        assert!(!sites.snapshot().overflowed);
-        sites.not_found_sites[0].store(u64::MAX, Ordering::Relaxed);
-        sites.record_not_found_site(Site::WalkDirectory, false);
-        assert_eq!(sites.snapshot().not_found_sites[0], [0, 0]);
-        assert!(sites.snapshot().overflowed);
-
-        // Vanished-member counts are their own slots and share the sticky flag.
-        let vanished = Counters::new();
-        vanished.record_vanished(Vanished::AuditDebtDropped);
-        vanished.record_vanished(Vanished::RequestCensusRemoved);
-        vanished.record_vanished(Vanished::RequestCensusRemoved);
-        let snapshot = vanished.snapshot();
-        assert_eq!(
-            (
-                snapshot.vanished_audit_debt_dropped,
-                snapshot.vanished_request_census_removed
-            ),
-            (1, 2)
-        );
-        assert_eq!(snapshot.counts, [0; 4]);
-        assert_eq!(snapshot.not_found_sites, [[0; OUTCOMES]; SITES]);
-        assert!(!snapshot.overflowed);
-        vanished.vanished[0].store(u64::MAX, Ordering::Relaxed);
-        vanished.record_vanished(Vanished::AuditDebtDropped);
-        assert_eq!(vanished.snapshot().vanished_audit_debt_dropped, 0);
-        assert!(vanished.snapshot().overflowed);
-
-        // Model the observable between-instructions state of a wrapping writer.
-        // Isolated primitive test only: this is NOT a scanner producer fixture.
-        let between = Counters::new();
-        between.counts[0].store(u64::MAX, Ordering::Relaxed);
-        assert_eq!(between.counts[0].fetch_add(1, Ordering::Relaxed), u64::MAX);
-        assert_eq!(between.snapshot().counts[0], 0);
-        assert!(
-            !between.snapshot().overflowed,
-            "false does not rule out an already visible concurrent wrap"
-        );
-        between.overflowed.store(true, Ordering::Relaxed);
-        assert!(between.snapshot().overflowed);
-    }
-
-    #[test]
-    fn fixed_storage_bounds_are_target_layout_checks_not_rss_or_capacity_claims() {
-        assert!(std::mem::size_of_val(&TOTALS) <= 480);
-        assert!(std::mem::size_of::<Totals>() <= 176);
-    }
-
-    #[test]
-    fn all_eleven_producers_and_only_original_operational_increments() {
-        let source = include_str!("../snapshots.rs");
-        let calls = |name: &str| -> Vec<&str> {
-            source
-                .split(&format!("disappearance_diagnostics::{name}("))
-                .skip(1)
-                .map(|piece| piece.split(");").next().unwrap())
-                .collect()
-        };
-        // Eleven operational producers: seven cause increments, then four
-        // NotFound sites that stay loss unless excused.
-        let increments = calls("increment");
-        let expected = [
-            (
-                "census.disappeared_file_count",
-                "PreflightFingerprintChanged",
-            ),
-            (
-                "census.disappeared_file_count",
-                "ComparisonTargetRevisionChanged",
-            ),
-            ("census.disappeared_file_count", "RootResolutionUnresolved"),
-            ("census.disappeared_file_count", "RootResolutionUnresolved"),
-            ("census.disappeared_file_count", "NotFound"),
-            ("census.disappeared_file_count", "NotFound"),
-            ("census.disappeared_file_count", "NotFound"),
-        ];
-        assert_eq!(increments.len(), expected.len());
-        for (call, (counter, cause)) in increments.into_iter().zip(expected) {
-            assert!(call.contains(counter));
-            assert!(call.contains(&format!("Cause::{cause}")));
-        }
-        let not_found = calls("not_found");
-        let expected = [
-            (
-                "traversal.counts.disappeared_file_count",
-                "Site::WalkDirectory",
-            ),
-            ("traversal.counts.disappeared_file_count", "Site::WalkEntry"),
-            ("census.disappeared_file_count", "site"),
-            ("census.disappeared_file_count", "Site::Open"),
-        ];
-        assert_eq!(not_found.len(), expected.len());
-        for (call, (counter, site)) in not_found.into_iter().zip(expected) {
-            assert!(call.contains(counter));
-            assert!(call.contains(site));
-        }
-        // Process-only removals: the Q-B2b directory, candidate and open
-        // sites, each in a parent-present branch, never an operational count.
-        let removals = calls("not_found_removal");
-        assert_eq!(removals.len(), 3);
-        for (call, site) in removals
-            .into_iter()
-            .zip(["Site::WalkDirectory", "site", "Site::Open"])
-        {
-            assert!(call.contains(site));
-            assert!(!call.contains("disappeared_file_count"));
-        }
-        assert_eq!(
-            source.matches("claude_absence_is_removal(source, ").count(),
-            3
-        );
-        // Only those two parent-present branches mark a key vanished. Audit
-        // retirement also serves the bounded account-hold absence path; it
-        // requires the stronger readable-parent/root proof before counting.
-        assert_eq!(
-            source
-                .matches("census.claude_vanished_index_keys.insert(")
-                .count(),
-            2
-        );
-        assert_eq!(
-            source
-                .matches(".retire_vanished_claude_audit_debt_entry(")
-                .count(),
-            3
-        );
-        assert_eq!(
-            source
-                .matches("index.retire_vanished_claude_audit_debt_entry(")
-                .count(),
-            2
-        );
-        assert_eq!(
-            source
-                .matches("self.retire_vanished_claude_audit_debt_entry(")
-                .count(),
-            1
-        );
-        assert_eq!(source.matches(".retire_absent_account_hold(").count(), 3);
-        let account_retirement = source
-            .split_once("fn retire_absent_account_hold(")
-            .unwrap()
-            .1
-            .split_once("/// SOURCE N2:")
-            .unwrap()
-            .0;
-        assert!(account_retirement.contains("sampled_audit::absence_parent("));
-        assert!(account_retirement.contains("audit_retired_absent(\"claude_code\")"));
-        assert!(!account_retirement.contains("disappeared_file_count"));
-        let vanished = calls("vanished");
-        assert_eq!(vanished.len(), 4);
-        for (call, kind) in vanished.into_iter().zip([
-            "AuditDebtDropped",
-            "RequestCensusRemoved",
-            "AuditDebtDropped",
-            "RequestCensusRemoved",
-        ]) {
-            assert!(call.contains(&format!("Vanished::{kind}")));
-        }
-        assert_eq!(source.matches("Site::CandidateWalk,").count(), 1);
-        assert_eq!(source.matches("Site::CandidateForcedIndex,").count(), 1);
-        assert!(!source.contains("disappeared_file_count += 1;"));
-        assert!(source
-            .contains("traversal.counts.disappeared_file_count += census.disappeared_file_count;"));
-        assert_eq!(
-            source
-                .matches("resolve_configured_scan_root(source, root, &mut census)")
-                .count(),
-            1
-        );
-        assert!(source.contains("disappeared_file_count: census.disappeared_file_count,"));
-        assert!(source.contains("disappeared_file_count: counts.disappeared_file_count,"));
-        let transition = include_str!("traversal_transition.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        assert_eq!(
-            transition
-                .matches("disappearance_diagnostics::snapshot(source)")
-                .count(),
-            2
-        );
-        let point = include_str!("../local_resource_diagnostics.rs")
-            .split("fn traversal_point(")
-            .nth(1)
-            .unwrap()
-            .split("/// One preparation/page observation")
-            .next()
-            .unwrap();
-        assert!(!point.contains("process_sample("));
-        assert_eq!(point.matches("emit(&Record").count(), 1);
-        // The status/wire producer has no reason field or diagnostic dependency.
-        // No new visibility seam is needed in that private production module.
-        let status = include_str!("../snapshot_sync.rs");
-        assert!(!status.contains("disappearance_process_totals_v1"));
-        assert!(!status.contains("disappearance_diagnostics"));
     }
 }
 

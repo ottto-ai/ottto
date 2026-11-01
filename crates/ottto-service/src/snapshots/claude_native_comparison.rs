@@ -258,15 +258,6 @@ impl TerminalTraversal {
             .take()
             .map(|traversal| Box::new(Self { traversal }))
     }
-
-    #[cfg(test)]
-    pub(super) fn context_pointer_for_test(&self) -> usize {
-        self.traversal.context_fingerprint.as_ptr() as usize
-    }
-    #[cfg(test)]
-    pub(super) fn contains_observed_for_test(&self, key: &str) -> bool {
-        self.traversal.observed_index_keys.contains(key)
-    }
 }
 crate::heap_layout_bound::fields!(TerminalTraversal; traversal);
 crate::heap_layout_bound::fields!(NativeCensusCompletion; census_window_end);
@@ -294,7 +285,7 @@ pub(super) fn select_recovery_before_audits(
             && requested.contains(&candidate.path)
             && files
                 .get(&local_index_key(&candidate.path))
-                .is_some_and(|entry| entry.source_file_fingerprint.is_empty());
+                .is_some_and(ScanIndexEntry::rearmed);
         if eligible {
             selected.push(candidate.clone());
         }
@@ -409,7 +400,7 @@ impl WindowEligibility {
             && claude_usage_family_witness_fingerprint(witness) == saved.proof
             && saved.certified.iter().all(|(key, skip)| {
                 index.files.get(key).is_some_and(|entry| {
-                    entry.source_file_fingerprint == skip.revision
+                    entry.observed_fingerprint() == skip.revision
                         && entry.scan_identity_version.as_deref()
                             == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
                         && entry.last_snapshot_fingerprint.is_some()
@@ -1188,7 +1179,7 @@ impl NativePhase {
             || index.terminal_jsonl_dispositions.contains_key(&key)
             || entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
             || entry.last_snapshot_fingerprint.is_none()
-            || entry.source_file_fingerprint.is_empty()
+            || entry.rearmed()
             || entry.source_file_fingerprint != candidate.source_file_fingerprint
             || index.active_upload_context_fingerprint.is_none()
             || index.upload_context_fingerprint != index.active_upload_context_fingerprint
@@ -1637,7 +1628,7 @@ impl NativePhase {
                 if !self.parsed_roots.contains(root)
                     && skip.census_window_end == census_window_end
                     && index.files.get(&key).is_some_and(|entry| {
-                        entry.source_file_fingerprint == skip.revision
+                        entry.observed_fingerprint() == skip.revision
                             && skip.upload_context == index.active_upload_context_fingerprint
                     })
                     && retained

@@ -19,17 +19,17 @@ pub(crate) struct Counts {
 }
 crate::heap_layout_bound::fields!(Counts; roots_collapsed, windows_collapsed, window_bytes_saved, roots_refused, window_bytes_before, window_bytes_after);
 
-/// Historical evidence view used by retirement and the load self-check.
-/// Borrowed maps avoid allocating a second per-member representation.
+/// Per-window evidence view folded by `HistorySummary`: the window's account
+/// and invalid flag, and each member with its identity revision.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ConsumerProjection<'a> {
-    pub(super) account_identifier_hash: &'a str,
-    pub(super) invalid: bool,
+struct ConsumerProjection<'a> {
+    account_identifier_hash: &'a str,
+    invalid: bool,
     member_keys: &'a BTreeMap<String, u64>,
     requests: &'a BTreeMap<String, ClaudeAccountRequestSet>,
 }
 impl<'a> ConsumerProjection<'a> {
-    pub(super) fn members(self) -> impl Iterator<Item = (&'a String, Option<&'a String>)> {
+    fn members(self) -> impl Iterator<Item = (&'a String, Option<&'a String>)> {
         self.member_keys.keys().map(move |member| {
             (
                 member,
@@ -69,7 +69,7 @@ impl ClaudeAccountFamilyPendingWindow {
 }
 
 impl ClaudeAccountFamilyPendingWindow {
-    pub(super) fn consumer_projection(&self) -> ConsumerProjection<'_> {
+    fn consumer_projection(&self) -> ConsumerProjection<'_> {
         ConsumerProjection {
             account_identifier_hash: &self.account_identifier_hash,
             invalid: self.invalid,
@@ -80,51 +80,25 @@ impl ClaudeAccountFamilyPendingWindow {
 }
 
 impl ClaudeAccountFamilyPending {
-    pub(super) fn retirement_observations(
-        &self,
-    ) -> impl Iterator<Item = (Option<u64>, ConsumerProjection<'_>, bool)> {
-        self.previous_windows
-            .iter()
-            .chain(std::iter::once(&self.current))
-            .map(|window| {
-                (
-                    rfc3339_unix_seconds(&window.census_window_end),
-                    window.consumer_projection(),
-                    std::ptr::eq(window, &self.current),
-                )
-            })
+    pub(super) fn has_history(&self) -> bool {
+        !self.previous_windows.is_empty()
     }
 
-    /// First equal predecessor creates the second endpoint. Later equal pushes
-    /// replace only that endpoint. A -> B -> A always starts distinct runs.
+    pub(super) fn history_summary(&self) -> HistorySummary {
+        HistorySummary::from_windows(&self.previous_windows)
+    }
+
     pub(super) fn retain_previous_window(&mut self, old: ClaudeAccountFamilyPendingWindow) {
-        let len = self.previous_windows.len();
-        if len >= 2 {
-            let first = &self.previous_windows[len - 2];
-            let last = &self.previous_windows[len - 1];
-            if let (Some(a), Some(b), Some(c), Some(current)) = (
-                rfc3339_unix_seconds(&first.census_window_end),
-                rfc3339_unix_seconds(&last.census_window_end),
-                rfc3339_unix_seconds(&old.census_window_end),
-                rfc3339_unix_seconds(&self.census_window_end),
-            ) {
-                if a < b
-                    && b < c
-                    && c < current
-                    && first.strict_evidence() == last.strict_evidence()
-                    && last.strict_evidence() == old.strict_evidence()
-                {
-                    self.previous_windows[len - 1] = old;
-                    return;
-                }
-            }
-        }
-        self.previous_windows.push(old);
+        retain_run_endpoint(
+            &mut self.previous_windows,
+            old,
+            &self.current.census_window_end,
+        );
     }
 
     fn apply_checked_plan(&mut self, retained: Vec<usize>) -> Option<usize> {
-        if history_projection(self, 0..self.previous_windows.len())
-            != history_projection(self, retained.iter().copied())
+        if HistorySummary::from_windows(&self.previous_windows)
+            != HistorySummary::from_windows(retained.iter().map(|&i| &self.previous_windows[i]))
         {
             return None;
         }
@@ -176,52 +150,104 @@ impl ClaudeAccountFamilyPending {
     }
 }
 
-/// Per-root decision summary: historical existence, the union of member keys,
-/// and each member's winning boundary/account/invalid/revision. This covers the
-/// retirement walk's absence check and timestamp competition, plus scheduling's
-/// history-nonempty predicate. References borrow existing evidence, never clone
-/// the history. Current-window gates and family-level holds are untouched.
-#[derive(Debug, PartialEq, Eq)]
-struct HistoryProjection<'a> {
-    history_nonempty: bool,
-    latest: BTreeMap<&'a String, (u64, &'a str, bool, Option<&'a String>)>,
+/// First equal predecessor creates the second endpoint. Later equal pushes
+/// replace only that endpoint. A -> B -> A always starts distinct runs.
+fn retain_run_endpoint(
+    windows: &mut Vec<ClaudeAccountFamilyPendingWindow>,
+    old: ClaudeAccountFamilyPendingWindow,
+    current_end: &str,
+) {
+    let len = windows.len();
+    if len >= 2 {
+        let first = &windows[len - 2];
+        let last = &windows[len - 1];
+        if let (Some(a), Some(b), Some(c), Some(current)) = (
+            rfc3339_unix_seconds(&first.census_window_end),
+            rfc3339_unix_seconds(&last.census_window_end),
+            rfc3339_unix_seconds(&old.census_window_end),
+            rfc3339_unix_seconds(current_end),
+        ) {
+            if a < b
+                && b < c
+                && c < current
+                && first.strict_evidence() == last.strict_evidence()
+                && last.strict_evidence() == old.strict_evidence()
+            {
+                windows[len - 1] = old;
+                return;
+            }
+        }
+    }
+    windows.push(old);
 }
-fn history_projection<'a>(
-    pending: &'a ClaudeAccountFamilyPending,
-    retained: impl Iterator<Item = usize>,
-) -> Option<HistoryProjection<'a>> {
-    let mut history_nonempty = false;
-    let mut latest = BTreeMap::new();
-    for window in retained
-        .map(|i| {
-            history_nonempty = true;
-            &pending.previous_windows[i]
-        })
-        .chain(std::iter::once(&pending.current))
-    {
-        let time = rfc3339_unix_seconds(&window.census_window_end)?;
+
+/// Per-root decision summary of the archived windows: the newest boundary,
+/// whether any boundary is unparsable, and each member's winning
+/// boundary/account/invalid/revision (first wins on ties). Retirement reads it
+/// with the current window; the load self-check compares it alone.
+/// Current-window gates and family-level holds are untouched.
+#[derive(Default, PartialEq, Eq)]
+pub(super) struct HistorySummary {
+    newest_boundary: Option<u64>,
+    unparsable: bool,
+    latest: BTreeMap<String, Latest>,
+}
+/// A member's winning (boundary, account, invalid, revision).
+pub(super) type Latest = (u64, String, bool, Option<String>);
+impl HistorySummary {
+    fn from_windows<'a>(
+        windows: impl IntoIterator<Item = &'a ClaudeAccountFamilyPendingWindow>,
+    ) -> Self {
+        let mut summary = Self::default();
+        windows.into_iter().for_each(|window| summary.fold(window));
+        summary
+    }
+
+    fn fold(&mut self, window: &ClaudeAccountFamilyPendingWindow) {
+        let Some(time) = rfc3339_unix_seconds(&window.census_window_end) else {
+            self.unparsable = true;
+            return;
+        };
+        self.newest_boundary = self.newest_boundary.max(Some(time));
         let projection = window.consumer_projection();
         for (member, revision) in projection.members() {
-            if latest
+            if self
+                .latest
                 .get(member)
                 .map_or(true, |(previous, _, _, _)| time > *previous)
             {
-                latest.insert(
-                    member,
+                self.latest.insert(
+                    member.clone(),
                     (
                         time,
-                        projection.account_identifier_hash,
+                        projection.account_identifier_hash.to_owned(),
                         projection.invalid,
-                        revision,
+                        revision.cloned(),
                     ),
                 );
             }
         }
     }
-    Some(HistoryProjection {
-        history_nonempty,
-        latest,
-    })
+
+    /// Each member's newest (boundary, account, invalid, revision) across the
+    /// archive and `current`. `None` refuses the family: a boundary is
+    /// unparsable or an archived window is not older than current. Current
+    /// is then strictly newest, so folding it wins its own members.
+    pub(super) fn with_current(
+        mut self,
+        current: &ClaudeAccountFamilyPendingWindow,
+    ) -> Option<BTreeMap<String, Latest>> {
+        let current_end = rfc3339_unix_seconds(&current.census_window_end)?;
+        if self.unparsable
+            || self
+                .newest_boundary
+                .is_some_and(|newest| newest >= current_end)
+        {
+            return None;
+        }
+        self.fold(current);
+        Some(self.latest)
+    }
 }
 
 // Streaming byte counter: never materialize the encoded histories.

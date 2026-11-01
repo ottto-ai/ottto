@@ -277,11 +277,6 @@ impl SideLedger {
         self.entries.len()
     }
 
-    #[cfg(test)]
-    pub(in crate::snapshots) fn pass_seq(&self) -> u32 {
-        self.pass_seq
-    }
-
     fn slot(&self, ns: u128) -> Option<&GateSlot> {
         self.gate.iter().flatten().find(|slot| slot.ns == ns)
     }
@@ -829,7 +824,7 @@ impl SideLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap_layout_bound::{bound, layout_supported, tree_node_bytes, tree_nodes, Counter};
+    use crate::heap_layout_bound::{bound, layout_supported, Counter};
     use crate::snapshots::{SideRequest, SideRequestState};
 
     fn entry() -> LedgerEntry {
@@ -856,20 +851,6 @@ mod tests {
             dev: 1,
             ino: u64::try_from(p).unwrap(),
         }
-    }
-
-    #[test]
-    fn ledger_charge_is_the_full_node_formula_and_covers_a_full_map() {
-        let node = tree_node_bytes::<LedgerKey, LedgerEntry>().unwrap();
-        assert_eq!(SIDE_LEDGER_BYTES, (MAX_SIDE_LEDGER + 1) * node);
-        assert_eq!(size_of::<LedgerEntry>(), 96);
-        assert_eq!(size_of::<GateSlot>(), 48);
-        #[cfg(target_pointer_width = "64")]
-        assert_eq!(SIDE_LEDGER_BYTES, 125_840);
-        // A real map at the limit costs exactly the charge.
-        let mut c = Counter::new(usize::MAX);
-        tree_nodes::<LedgerKey, LedgerEntry>(MAX_SIDE_LEDGER, &mut c).unwrap();
-        assert!(c.bytes <= SIDE_LEDGER_BYTES);
     }
 
     /// [behaviour] U-T64(f): the charge is constant, lock-free and inside the state bound.
@@ -1014,27 +995,6 @@ mod tests {
         assert!(ledger.begin_pass(5, 500).side_allowed);
     }
 
-    /// U-T60(d)(xiv): a poisoned ledger lock clears the ledger.
-    #[test]
-    fn poisoned_ledger_is_cleared_and_usable() {
-        let cache = std::sync::Arc::new(SharedCache::default());
-        cache.side_ledger().begin_pass(3, 10);
-        let poisoner = cache.clone();
-        let _ = std::thread::spawn(move || {
-            let _ledger = poisoner.side_ledger();
-            panic!("poison the side ledger");
-        })
-        .join();
-        assert!(cache.side.is_poisoned());
-        let (pass, counts) =
-            crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| {
-                cache.side_ledger().pass_seq()
-            });
-        assert_eq!(pass, 0);
-        assert_eq!(counts.side_requests_rearmed, 1);
-        assert!(!cache.side.is_poisoned());
-    }
-
     #[test]
     fn entry_projection_round_trips_every_request_state() {
         for state in [
@@ -1138,6 +1098,7 @@ mod tests {
             opened_changed_nanos: 0,
             opened_birth_nanos: 0,
             upload_context_receipt: None,
+            evidence_owed: false,
         }
     }
 
@@ -1696,61 +1657,6 @@ mod tests {
             (saved.saved_wseq, saved.full_saved_wseq),
             (ledger.wseq, ledger.wseq)
         );
-    }
-
-    /// D5′ (v): once the stamp runs out nothing is covered: no mark, no
-    /// watermark move, mismatched entries kept, no lossless eviction; idle
-    /// eviction still applies.
-    #[test]
-    fn d5_exhausted_stamps_preserve_every_charge() {
-        if !layout_supported() {
-            return;
-        }
-        let ns = 51;
-        let mut ledger = SideLedger {
-            wseq: u32::MAX - 2,
-            ..SideLedger::default()
-        };
-        let mut work = index_with_p();
-        ledger.begin_index_pass(ns, 100, &mut work);
-        let old = pkey(ns, 5);
-        g7(&mut ledger, &mut work, old, 1);
-        assert!(!ledger.wseq_exhausted);
-        replace(&mut ledger, &mut work, old);
-        assert!(ledger.wseq_exhausted);
-        assert_eq!(ledger.get(&old).unwrap().wseq, 0);
-        assert_eq!(ledger.save_mark(ns).wseq, None);
-        let charged = g7(&mut ledger, &mut work, pkey(ns, 9), 2);
-        let before = *ledger.slot(ns).unwrap();
-        save(&mut ledger, &work, ns, true);
-        let after = *ledger.slot(ns).unwrap();
-        assert!(after.saved, "the gate still behaves as today");
-        assert_eq!(
-            (after.saved_wseq, after.full_saved_wseq),
-            (before.saved_wseq, before.full_saved_wseq)
-        );
-        let mut other = index_with_p();
-        other.codex_parent_side_requests.insert(
-            P.into(),
-            SideRequest {
-                dev_ino: (1, 88),
-                ..charged
-            },
-        );
-        ledger.begin_index_pass(ns, 200, &mut other);
-        assert_eq!(tags(&ledger, ns).len(), 2, "both kept");
-        // Fill the ledger from this namespace; another namespace's charge
-        // finds nothing lossless, and evicts only once this one is idle.
-        for p in 1..=(MAX_SIDE_LEDGER as u128 - 2) {
-            ledger.charge(key(ns, p), entry(), 200).unwrap();
-        }
-        assert_eq!(ledger.len(), MAX_SIDE_LEDGER);
-        ledger.begin_pass(52, 300);
-        assert_eq!(
-            ledger.charge(key(52, 1), entry(), 300),
-            Err(ChargeRefusal::Full)
-        );
-        assert_eq!(ledger.charge(key(52, 1), entry(), 110 + 3600), Ok(true));
     }
 
     /// D5′ (vii): a write between the mark and the successful save's

@@ -116,10 +116,7 @@ fn integrated_ack(
         .snapshots
         .iter()
         .map(|item| {
-            serde_json::json!({
-                "source_session_id":item.source_session_id,
-                "snapshot_fingerprint":item.snapshot_fingerprint,
-                "occurrence_count":1,"body_witness_version":match crate::snapshots::snapshot_upload_body_witness_version(item) {
+            let version = match crate::snapshots::snapshot_upload_body_witness_version(item) {
                 Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION) =>
                     Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION),
                 Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION) =>
@@ -127,8 +124,14 @@ fn integrated_ack(
                 None | Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION)
                     | Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION) => None,
                 other => panic!("unexpected retained ordinary fixture witness: {other:?}"),
-            },
-                "body_witness_digest":snapshot_upload_body_witness(item)
+            };
+            // As the backend's entity ACK does, the digest travels only with
+            // a witness version.
+            serde_json::json!({
+                "source_session_id":item.source_session_id,
+                "snapshot_fingerprint":item.snapshot_fingerprint,
+                "occurrence_count":1,"body_witness_version":version,
+                "body_witness_digest":version.map(|_| snapshot_upload_body_witness(item))
             })
         })
         .collect::<Vec<_>>();
@@ -322,6 +325,8 @@ fn integrated_claude(hours: usize) -> SameSourceAckFixture {
         &mut scan.snapshots,
         &working,
         crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded,
+        &mut Default::default(),
+        &Default::default(),
     );
     assert!(withheld.is_empty(), "{withheld:?}");
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut working);

@@ -571,7 +571,6 @@ impl ApcFixture {
                 Some(&self.support),
                 &[],
                 false,
-                true,
             );
             state.enable_native_comparison();
             loop {
@@ -776,6 +775,7 @@ impl ApcFixture {
                     })),
                     ApcUpload::PermanentRejection | ApcUpload::RetryableRejection => {
                         let response = crate::snapshot_client::SnapshotBatchResponse {
+                            conflict_rescans: Default::default(),
                             accepted: 0,
                             sessions_reconciled: 0,
                             session_ids: Vec::new(),
@@ -927,12 +927,6 @@ impl ApcFixture {
         )
         .expect("no paid restore");
         let census_complete = scan.census_complete;
-        settle_context_curve_replay_state(
-            &mut index,
-            true,
-            census_complete && fully_settled,
-            "replay-generation-apc",
-        );
         let (window_start, window_end) =
             snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");
         save_index_and_publish_manifest(
@@ -999,7 +993,6 @@ impl ApcFixture {
                 Some(&self.support),
                 &[],
                 false,
-                true,
             );
             state.enable_native_comparison();
             loop {
@@ -1198,6 +1191,7 @@ impl ApcFixture {
                     })),
                     ApcUpload::PermanentRejection | ApcUpload::RetryableRejection => {
                         let response = crate::snapshot_client::SnapshotBatchResponse {
+        conflict_rescans: Default::default(),
                             accepted: 0,
                             sessions_reconciled: 0,
                             session_ids: Vec::new(),
@@ -1349,12 +1343,6 @@ impl ApcFixture {
         )
         .expect("no paid restore");
         let census_complete = scan.census_complete;
-        settle_context_curve_replay_state(
-            &mut index,
-            true,
-            census_complete && fully_settled,
-            "replay-generation-apc",
-        );
         index.accept_file_upload_context_acks(
             &progress.context_receipt_candidates,
             &progress.fresh_context_body_acks,
@@ -2859,12 +2847,6 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
                 complete && expected_transport,
                 "{outcome}, held={held}, complete={complete}"
             );
-            settle_context_curve_replay_state(
-                &mut index,
-                true,
-                complete && settled,
-                "last-empty-cycle",
-            );
             let scratch = crate::test_scratch::ScratchDir::new("apc-last-empty-cycle");
             let path = scratch.join("index.json");
             index.save(&path).unwrap();
@@ -2872,11 +2854,6 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
             assert_eq!(
                 loaded.claude_authority_proof_correction_pending(),
                 !complete
-            );
-            assert_eq!(
-                serde_json::to_value(loaded).unwrap()["completed_context_curve_replay_generation"]
-                    .as_str(),
-                (complete && expected_transport).then_some("last-empty-cycle")
             );
         }
     }

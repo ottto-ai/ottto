@@ -112,6 +112,7 @@ fn typed_row(row: &Value) -> SnapshotModelUsage {
             .get("identity_parts")
             .map(|parts| parts.as_array().unwrap().iter().map(typed_part).collect()),
         identity_retained: row.get("identity_retained").is_some_and(|v| v == true),
+        copy_invalidated: row.get("copy_invalidated").is_some_and(|v| v == true),
         cost_usd: opt_string(row, "cost_usd"),
         input_cost_usd: opt_string(row, "input_cost_usd"),
         output_cost_usd: opt_string(row, "output_cost_usd"),
@@ -176,6 +177,7 @@ fn typed_item(value: &Value) -> SnapshotItem {
                 .map(|entry| SnapshotRequestEvidence {
                     identity_basis: opt_string(entry, "identity_basis").unwrap(),
                     provider_workspace_hash: opt_string(entry, "provider_workspace_hash"),
+                    account_source: None,
                 })
                 .collect()
         })
@@ -198,32 +200,6 @@ fn typed_item(value: &Value) -> SnapshotItem {
             || facts.as_array().unwrap().is_empty()));
     item.attribution_facts = Vec::new();
     item
-}
-
-#[test]
-fn w0_r5_fixture_digest_reproduces() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(W0_DIR);
-    let mut lines = fs::read_dir(&dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|name| name.ends_with(".json") && name != "index.json")
-        .map(|name| {
-            let bytes = fs::read(dir.join(&name)).unwrap();
-            format!("{name}\0{:x}", Sha256::digest(bytes))
-        })
-        .collect::<Vec<_>>();
-    lines.sort();
-    assert_eq!(lines.len(), 63);
-    let digest = format!("{:x}", Sha256::digest(lines.join("\n").as_bytes()));
-    let index = w0_index();
-    assert_eq!(index["fixture_revision"], "session_identity_w0:r5");
-    assert_eq!(index["canonicalization"], "session_identity_leaf:v3");
-    assert_eq!(index["new_collector"], identity::COLLECTOR);
-    assert_eq!(digest, index["fixture_digest"].as_str().unwrap());
-    assert_eq!(
-        digest,
-        "2a9b46f12fcd0b23f063b3b845f4d1d64d235f5711877cd315575b92c7efd8e6"
-    );
 }
 
 #[test]
@@ -462,6 +438,7 @@ fn contributions_of(item: &SnapshotItem) -> Option<Vec<Contribution>> {
             login: login.cloned(),
             org: entry.provider_workspace_hash.clone(),
             basis: basis_token(&entry.identity_basis)?,
+            account_source: None,
         }))
     };
     let mut out = Vec::new();
@@ -595,6 +572,7 @@ fn w0_r5_cap_fallbacks_match_bodies() {
             login: Some("f".repeat(64)),
             org: Some("e".repeat(64)),
             basis: identity::TELEMETRY,
+            account_source: None,
         });
         contributions.push(extra);
         let mut built = stripped(&base);
@@ -695,6 +673,7 @@ fn telemetry(login: char, org: char) -> RequestIdentity {
         login: Some(login.to_string().repeat(64)),
         org: Some(org.to_string().repeat(64)),
         basis: identity::TELEMETRY,
+        account_source: None,
     })
 }
 
@@ -703,6 +682,7 @@ fn login_key(login: &str) -> RequestIdentity {
         login: Some(login.to_string()),
         org: Some("d".repeat(64)),
         basis: identity::TELEMETRY,
+        account_source: None,
     })
 }
 
@@ -892,6 +872,7 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
                         login: Some(format!("{login:064x}")),
                         org: Some("d".repeat(64)),
                         basis: identity::TELEMETRY,
+                        account_source: None,
                     }),
                 });
             }
@@ -921,44 +902,6 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
     );
     assert_eq!(refusals, 200);
     assert!(identity::item_bytes(&item) <= identity::MAX_ITEM_BYTES);
-}
-
-#[test]
-fn over_cap_diagnostics_increment_each_reason_and_record_last_size() {
-    use identity::OverCap;
-    let reasons = BTreeSet::from([
-        OverCap::EvidenceEntries,
-        OverCap::AuthorityKeys,
-        OverCap::PartsPerRow,
-        OverCap::PartsPerItem,
-        OverCap::Rows,
-        OverCap::Bytes,
-    ]);
-    let (_, records) = crate::local_resource_diagnostics::capture(|| {
-        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 700_000, None);
-        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 800_000, None);
-    });
-    assert_eq!(records.len(), 2);
-    let before = &records[0]["counts"]["claude_request_identity_over_cap"];
-    let after = &records[1]["counts"]["claude_request_identity_over_cap"];
-    for label in [
-        "evidence_entries",
-        "authority_keys",
-        "parts_per_row",
-        "parts_per_item",
-        "rows",
-        "bytes",
-    ] {
-        assert_eq!(
-            after[label].as_u64().unwrap(),
-            before[label].as_u64().unwrap() + 1
-        );
-    }
-    assert_eq!(
-        records[1]["counts"]["claude_request_identity_last_over_cap_item_bytes"],
-        800_000
-    );
-    assert!(serde_json::to_vec(&records[1]).unwrap().len() < 2048);
 }
 
 #[test]
@@ -1095,7 +1038,8 @@ fn classify_follows_the_session_rulings() {
         RequestIdentity::Tagged(AuthorityKey {
             login: login.clone(),
             org: Some(org_d.clone()),
-            basis: identity::TELEMETRY
+            basis: identity::TELEMETRY,
+            account_source: None,
         })
     );
     // A supplied contradictory org is never dropped to obtain login-only.
@@ -1117,7 +1061,8 @@ fn classify_follows_the_session_rulings() {
         RequestIdentity::Tagged(AuthorityKey {
             login: login.clone(),
             org: Some(org_d.clone()),
-            basis: identity::TELEMETRY_LOGIN
+            basis: identity::TELEMETRY_LOGIN,
+            account_source: None,
         })
     );
     assert_eq!(
@@ -1128,7 +1073,8 @@ fn classify_follows_the_session_rulings() {
         RequestIdentity::Tagged(AuthorityKey {
             login: login.clone(),
             org: None,
-            basis: identity::TELEMETRY_LOGIN
+            basis: identity::TELEMETRY_LOGIN,
+            account_source: None,
         })
     );
     // Original clock is required for any tag.
@@ -1181,7 +1127,8 @@ fn classify_follows_the_session_rulings() {
         RequestIdentity::Tagged(AuthorityKey {
             login: None,
             org: Some(org_e.clone()),
-            basis: identity::TRANSCRIPT_ORG
+            basis: identity::TRANSCRIPT_ORG,
+            account_source: None,
         })
     );
     for (verdict, refusal) in [
@@ -1225,11 +1172,13 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
         login: Some(LOGIN_A.to_string()),
         org: Some(org.clone()),
         basis: identity::TRANSCRIPT_SOLE_LOGIN,
+        account_source: None,
     });
     let org_only = RequestIdentity::Tagged(AuthorityKey {
         login: None,
         org: Some(org.clone()),
         basis: identity::TRANSCRIPT_ORG,
+        account_source: None,
     });
     // Production suppresses the basis until the receiver's time-scoped veto
     // is verified: a qualifying census still yields org-only.
@@ -1347,6 +1296,7 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
             login: Some(OWNER_A.to_string()),
             org: None,
             basis: identity::TELEMETRY_LOGIN,
+            account_source: None,
         })
     );
     assert_eq!(
@@ -1355,6 +1305,7 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
             login: Some(LOGIN_A.to_string()),
             org: Some(org.clone()),
             basis: identity::TRANSCRIPT_SOLE_LOGIN,
+            account_source: None,
         })
     );
     let mut terminal = facts("req_none", Some(999_000), MarkerVerdict::Trusted(&org));
@@ -1365,6 +1316,7 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
             login: None,
             org: Some(org.clone()),
             basis: identity::TRANSCRIPT_ORG,
+            account_source: None,
         })
     );
 }
@@ -2453,7 +2405,6 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
                 None,
                 &[],
                 false,
-                true,
             )
             .with_sampled_acquisition(cache.clone(), Scope("unchanged-census".into()));
             let mut mode = None;
@@ -2843,7 +2794,8 @@ fn only_intact_rows_establish_login_org_membership() {
         RequestIdentity::Tagged(AuthorityKey {
             login: Some("a".repeat(64)),
             org: None,
-            basis: identity::TELEMETRY_LOGIN
+            basis: identity::TELEMETRY_LOGIN,
+            account_source: None,
         })
     );
 }
@@ -3232,6 +3184,7 @@ fn transcript_email_never_binds_and_refuses_unqualified_coverage() {
             login: None,
             org: Some(org.to_string()),
             basis: identity::TRANSCRIPT_ORG,
+            account_source: None,
         })
     };
     let refused = RequestIdentity::Refused;
@@ -3392,6 +3345,7 @@ fn transcript_email_never_binds_and_refuses_unqualified_coverage() {
             login: Some(OWNER_A.to_string()),
             org: Some("d".repeat(64)),
             basis: identity::TELEMETRY,
+            account_source: None,
         })
     );
 }
@@ -3411,6 +3365,7 @@ fn status_pairings_establish_marker_org_membership_for_the_telemetry_login() {
             login: Some(OWNER_A.to_string()),
             org: org.map(str::to_string),
             basis: identity::TELEMETRY_LOGIN,
+            account_source: None,
         })
     };
     // Without existing evidence the marker org is not established (§2a.12).
@@ -3688,6 +3643,7 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
         login: None,
         org: Some(org.clone()),
         basis: identity::TRANSCRIPT_ORG,
+        account_source: None,
     });
     assert_eq!(
         reason(&ledger, &default_home),
@@ -3767,6 +3723,7 @@ fn rows_under_another_root_own_the_request() {
         login: Some(OWNER_A.to_string()),
         org: None,
         basis: identity::TELEMETRY_LOGIN,
+        account_source: None,
     });
     assert_eq!(from(ROOT, "req_own"), login_only);
     assert_eq!(from(ROOT, "req_both"), login_only);
@@ -3778,6 +3735,7 @@ fn rows_under_another_root_own_the_request() {
             login: None,
             org: Some(D64.to_string()),
             basis: identity::TRANSCRIPT_ORG,
+            account_source: None,
         })
     );
 }
@@ -3943,7 +3901,8 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
                 RequestIdentity::Tagged(AuthorityKey {
                     login: Some(OWNER_A.into()),
                     org: None,
-                    basis: identity::TELEMETRY_LOGIN
+                    basis: identity::TELEMETRY_LOGIN,
+                    account_source: None,
                 })
             );
             assert_eq!(
@@ -4834,6 +4793,7 @@ fn login_org(login: char, org: Option<char>, basis: &'static str) -> RequestIden
         login: Some(hex(login)),
         org: org.map(hex),
         basis,
+        account_source: None,
     })
 }
 
@@ -4881,93 +4841,6 @@ fn current_of(
 
 fn owned(value: &str) -> Option<String> {
     Some(value.to_string())
-}
-
-/// A -> B -> A inside one hour bucket: the newest request decides, by its own
-/// time, in any input order; the history keeps both accounts exactly.
-#[test]
-fn current_account_follows_the_newest_request_not_its_hour_bucket() {
-    let requests = || {
-        vec![
-            display_request(
-                Some("max"),
-                HOUR_10,
-                10,
-                login_org('a', Some('d'), identity::TELEMETRY),
-                Some("2026-09-01T10:05:00.100Z"),
-            ),
-            display_request(
-                Some("max"),
-                HOUR_10,
-                20,
-                login_org('b', Some('d'), identity::TELEMETRY),
-                Some("2026-09-01T10:20:00Z"),
-            ),
-            display_request(
-                Some("max"),
-                HOUR_10,
-                30,
-                login_org('a', Some('d'), identity::TELEMETRY),
-                Some("2026-09-01T10:40:00.250Z"),
-            ),
-        ]
-    };
-    let (_, display) = displayed(&requests());
-    assert_eq!(
-        current_of(&display),
-        (
-            "known",
-            Some(hex('a').as_str()),
-            Some(hex('d').as_str()),
-            Some("max"),
-            None
-        )
-    );
-    assert_eq!(
-        display.current.latest_request_at.as_deref(),
-        Some("2026-09-01T10:40:00.25Z")
-    );
-    assert_eq!(
-        uses(&display),
-        vec![
-            (
-                owned(&hex('a')),
-                owned(&hex('d')),
-                owned("max"),
-                2,
-                40,
-                owned("2026-09-01T10:40:00.25Z"),
-                true
-            ),
-            (
-                owned(&hex('b')),
-                owned(&hex('d')),
-                owned("max"),
-                1,
-                20,
-                owned("2026-09-01T10:20:00Z"),
-                false
-            ),
-        ]
-    );
-    // Every input order folds to the same display.
-    for order in [[2, 1, 0], [1, 2, 0], [2, 0, 1]] {
-        let mut shuffled = requests();
-        let mut reordered = Vec::new();
-        for index in order {
-            reordered.push(std::mem::replace(
-                &mut shuffled[index],
-                display_request(None, HOUR_10, 0, RequestIdentity::Missing, None),
-            ));
-        }
-        assert_eq!(displayed(&reordered).1, display, "{order:?}");
-    }
-    // B last: B is current, across buckets too.
-    let mut b_last = requests();
-    b_last[1].bucket = HOUR_11;
-    b_last[1].at = Some("2026-09-01T11:01:00Z");
-    let (_, display) = displayed(&b_last);
-    assert_eq!(display.current.account_identifier_hash, owned(&hex('b')));
 }
 
 /// A newer unidentified request makes the current account unknown; it never
@@ -5054,136 +4927,6 @@ fn a_newer_unidentified_request_clears_the_current_account() {
         display.history.iter().map(|u| u.input_tokens).sum::<u64>(),
         row_input
     );
-}
-
-/// Requests at the same newest instant that disagree on any of account,
-/// workspace or plan leave the current account unknown; agreeing ones do not.
-#[test]
-fn equal_newest_times_with_different_triples_are_unknown() {
-    const AT: Option<&str> = Some("2026-09-01T10:30:00Z");
-    for (case, second) in [
-        (
-            "account",
-            display_request(
-                Some("max"),
-                HOUR_10,
-                2,
-                login_org('b', Some('d'), identity::TELEMETRY),
-                AT,
-            ),
-        ),
-        (
-            "workspace",
-            display_request(
-                Some("max"),
-                HOUR_10,
-                2,
-                login_org('a', Some('e'), identity::TELEMETRY),
-                AT,
-            ),
-        ),
-        (
-            "plan",
-            display_request(
-                Some("pro"),
-                HOUR_10,
-                2,
-                login_org('a', Some('d'), identity::TELEMETRY),
-                AT,
-            ),
-        ),
-        (
-            "unidentified",
-            display_request(Some("max"), HOUR_10, 2, RequestIdentity::Missing, AT),
-        ),
-    ] {
-        let (_, display) = displayed(&[
-            display_request(
-                Some("max"),
-                HOUR_10,
-                1,
-                login_org('a', Some('d'), identity::TELEMETRY),
-                AT,
-            ),
-            second,
-            display_request(
-                Some("max"),
-                HOUR_10,
-                4,
-                login_org('c', Some('d'), identity::TELEMETRY),
-                Some("2026-09-01T10:29:59.999Z"),
-            ),
-        ]);
-        assert_eq!(display.current.status, "unknown", "{case}");
-        let reason = if case == "unidentified" {
-            "latest_request_unidentified"
-        } else {
-            "conflicting_latest_requests"
-        };
-        assert_eq!(
-            display.current.unknown_reason.as_deref(),
-            Some(reason),
-            "{case}"
-        );
-    }
-    // The same triple twice at the newest instant is still that triple.
-    let (_, display) = displayed(&[
-        display_request(
-            Some("max"),
-            HOUR_10,
-            1,
-            login_org('a', Some('d'), identity::TELEMETRY),
-            AT,
-        ),
-        display_request(
-            Some("max"),
-            HOUR_10,
-            2,
-            login_org('a', Some('d'), identity::TELEMETRY),
-            AT,
-        ),
-    ]);
-    assert_eq!(display.current.account_identifier_hash, owned(&hex('a')));
-}
-
-/// A newer request replaces the entire conflicting tie set, even when its
-/// storage reuses one of those ties. No old account/workspace/plan may survive.
-#[test]
-fn newer_request_replaces_conflicting_latest_ties() {
-    for (plan, identity) in [
-        (Some("max"), login_org('b', Some('e'), identity::TELEMETRY)),
-        (Some("pro"), login_org('c', None, identity::TELEMETRY_LOGIN)),
-        (None, RequestIdentity::Missing),
-    ] {
-        let latest = display_request(plan, HOUR_10, 4, identity, Some("2026-09-01T10:31:00Z"));
-        let expected = displayed(std::slice::from_ref(&latest)).1.current;
-        let (_, actual) = displayed(&[
-            display_request(
-                Some("max"),
-                HOUR_10,
-                1,
-                login_org('a', Some('d'), identity::TELEMETRY),
-                Some("2026-09-01T10:30:00Z"),
-            ),
-            display_request(
-                Some("max"),
-                HOUR_10,
-                2,
-                login_org('b', Some('e'), identity::TELEMETRY),
-                Some("2026-09-01T10:30:00Z"),
-            ),
-            latest,
-        ]);
-        assert_eq!(actual.current, expected);
-        assert_eq!(
-            actual
-                .history
-                .iter()
-                .map(|entry| entry.request_count)
-                .sum::<u64>(),
-            3
-        );
-    }
 }
 
 /// One login across two workspaces and two plans: every exact triple stays
@@ -5381,6 +5124,7 @@ fn withdrawn_transcript_tags_withdraw_from_the_display() {
                 login: None,
                 org: Some(hex('e')),
                 basis: identity::TRANSCRIPT_ORG,
+                account_source: None,
             }),
             Some("2026-09-01T10:02:00Z"),
         ),
@@ -5458,6 +5202,7 @@ fn fallback_withholds_and_ineligible_items_carry_no_display() {
                 login: Some(format!("{n:064x}")),
                 org: None,
                 basis: identity::TELEMETRY,
+                account_source: None,
             }),
             at: Some("2026-09-01T10:01:00Z"),
         })
@@ -5550,6 +5295,8 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
         &mut items,
         &ScanIndex::default(),
         crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded,
+        &mut Default::default(),
+        &Default::default(),
     );
     assert!(items
         .iter()

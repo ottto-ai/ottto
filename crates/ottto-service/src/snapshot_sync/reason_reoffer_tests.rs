@@ -691,7 +691,7 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     );
 }
 
-/// O1: the runtime cooldown view holds exactly the retained exact-body
+/// [regress] O1: the runtime cooldown view holds exactly the retained exact-body
 /// conflicts that no lease lets through this cycle, including a due record
 /// still waiting for budget (no unlimited ordinary reparse while it waits)
 /// and an F2-re-clamped deadline read from the prepared ledger. A lease, a
@@ -754,10 +754,23 @@ fn cooldown_view_holds_only_unleased_retained_exact_body_conflicts() {
         .parser_version
         .push_str("-older");
     assert!(
+        mismatched
+            .reason_reoffer_cooldowns(NOW)
+            .contains_key(&fp(1)),
+        "a version-only change retains exact-body cooldown proof"
+    );
+    mismatched
+        .quarantined_fingerprints
+        .get_mut(&fp(1))
+        .unwrap()
+        .witness
+        .contract
+        .push_str("-older");
+    assert!(
         !mismatched
             .reason_reoffer_cooldowns(NOW)
             .contains_key(&fp(1)),
-        "a stale ledger witness grants no cooldown proof"
+        "a changed contract grants no cooldown proof"
     );
     // The view is a read: every refusal, conflict and deadline is retained.
     for value in [1, 2, 4] {
