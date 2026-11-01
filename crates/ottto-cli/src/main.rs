@@ -2582,8 +2582,8 @@ fn human_summary(payload: &serde_json::Value) -> String {
         return sanitize_for_terminal(message);
     }
     // The port-bearing local detail follows any canonical guidance, which
-    // never carries ports itself.
-    let with_relay_mismatch = |mut summary: String| {
+    // never carries ports itself. Doctor adds the local OTEL store footprint.
+    let with_details = |mut summary: String| {
         if payload["relay"]["last_error"]["code"].as_str() == Some("claude_relay_endpoint_mismatch")
         {
             if let Some(message) = payload["relay"]["last_error"]["text"].as_str() {
@@ -2591,16 +2591,22 @@ fn human_summary(payload: &serde_json::Value) -> String {
                 summary.push_str(&sanitize_for_terminal(message));
             }
         }
+        if let (Some(files), Some(bytes)) = (
+            payload["local_otel"]["files"].as_u64(),
+            payload["local_otel"]["bytes"].as_u64(),
+        ) {
+            summary.push_str(&format!("\nLocal OTEL store: {files} files, {bytes} bytes"));
+        }
         summary
     };
     if let Some(guidance) = payload
         .pointer("/canonical_health/blockers/0/clear_condition")
         .and_then(|value| value.as_str())
     {
-        return with_relay_mismatch(sanitize_for_terminal(guidance));
+        return with_details(sanitize_for_terminal(guidance));
     }
     if let Some(daemon) = payload.get("daemon").and_then(|value| value.as_str()) {
-        return with_relay_mismatch(format!(
+        return with_details(format!(
             "Ottto local daemon: {}",
             sanitize_for_terminal(daemon)
         ));
@@ -3280,6 +3286,11 @@ mod tests {
         assert_eq!(parse_json_output(&json), payload);
         payload["canonical_health"]["blockers"] = serde_json::json!([]);
         assert_eq!(human_summary(&payload), "Ottto local daemon: running");
+        payload["local_otel"] = serde_json::json!({"files": 2, "bytes": 8});
+        assert_eq!(
+            human_summary(&payload),
+            "Ottto local daemon: running\nLocal OTEL store: 2 files, 8 bytes"
+        );
     }
 
     #[test]
