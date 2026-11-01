@@ -6,7 +6,7 @@ use super::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +132,7 @@ impl Starting {
                 .then_some(index.claude_full_rearm_progress.held_family_roots.as_ref())
                 .flatten(),
         );
+        let owed = super::evidence_owed::enabled();
         Self {
             prior_held_family_roots,
             prior_held_family_set_digest,
@@ -163,20 +164,25 @@ impl Starting {
             admissions_dropped: 0,
             due_retained: 0,
             context_change_owed: 0,
-            contract_unproven_families: index
-                .claude_usage_family_pending
-                .values()
-                .filter(|pending| super::evidence_owed::enabled() && pending.contract_unproven)
-                .count(),
-            stale_pending_occurrences: index
-                .claude_usage_family_pending
-                .values()
-                .filter(|pending| {
-                    super::evidence_owed::enabled() && pending.census_window_end != now
-                })
-                .flat_map(|pending| pending.member_occurrences.values())
-                .map(BTreeMap::len)
-                .fold(0, usize::saturating_add),
+            contract_unproven_families: if owed {
+                index
+                    .claude_usage_family_pending
+                    .values()
+                    .filter(|pending| pending.contract_unproven)
+                    .count()
+            } else {
+                0
+            },
+            stale_pending_occurrences: if owed {
+                index
+                    .claude_usage_family_pending
+                    .values()
+                    .filter(|pending| pending.census_window_end != now)
+                    .map(super::ClaudeUsageFamilyPending::occurrences)
+                    .fold(0, usize::saturating_add)
+            } else {
+                0
+            },
         }
     }
 

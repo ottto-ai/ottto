@@ -632,10 +632,12 @@ impl ClaudeRequestCensusRecord {
                 .is_some_and(|fingerprint| fingerprint == self.source_file_fingerprint)
     }
 
-    /// Negative provenance check for the narrow id-less pending exception.
-    /// The pending marker supplies the exact cause; this only refuses parse
-    /// loss, stale derivation, decode invalidation, twins and retirement.
-    /// It never supplies a body ACK, coverage or a duplicate proof.
+    /// Negative provenance check for the narrow id-less pending exception,
+    /// and for an owed re-stamp from an identity-incomplete record of this
+    /// revision (`evidence_owed`). The pending marker or the stored evidence
+    /// supplies the exact cause; this only refuses parse loss, stale
+    /// derivation, decode invalidation, twins and retirement. It never
+    /// supplies a body ACK, coverage or a duplicate proof.
     pub(super) fn idless_native_for(&self, entry_fingerprint: &str) -> bool {
         self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
             && self.shape == ClaudeRequestCensusShape::IdentityIncomplete
@@ -644,6 +646,22 @@ impl ClaudeRequestCensusRecord {
             && self.retired.is_none()
             && decode_fingerprint(entry_fingerprint)
                 .is_some_and(|fp| fp == self.source_file_fingerprint)
+    }
+
+    /// `reproduces` in `window`, or in any window from `since` on.
+    pub(super) fn reproduces_since(
+        &self,
+        entry_fingerprint: &str,
+        window: u64,
+        since: Option<u64>,
+    ) -> bool {
+        (self.window == window || since.is_some_and(|since| self.window >= since))
+            && self.reproduces(entry_fingerprint, self.window)
+    }
+
+    /// Written by a parse in `since` or later.
+    pub(super) fn written_since(&self, since: Option<u64>) -> bool {
+        since.is_some_and(|since| self.window >= since)
     }
 
     /// Owed-evidence keep (`evidence_owed` ON only): this exact revision was
@@ -655,8 +673,7 @@ impl ClaudeRequestCensusRecord {
             && !self.unverified
             && !self.twin
             && self.retired.is_none()
-            && decode_fingerprint(entry_fingerprint)
-                .is_some_and(|fingerprint| fingerprint == self.source_file_fingerprint)
+            && fingerprint_matches(self, entry_fingerprint)
     }
 
     /// Freshness of a ledger holder: `current_for`, or a loss-free
@@ -795,7 +812,7 @@ pub(crate) fn claude_request_hash(request_id: &str) -> u64 {
 
 /// `claude_request_hash` from a pending key (the full SHA-256 hex of the
 /// request id): its first 16 hex digits. None for a malformed key.
-pub(crate) fn claude_request_hash_from_pending_key(sha256_hex: &str) -> Option<u64> {
+pub(super) fn claude_request_hash_from_pending_key(sha256_hex: &str) -> Option<u64> {
     u64::from_str_radix(sha256_hex.get(..16)?, 16).ok()
 }
 
