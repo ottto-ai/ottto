@@ -90,9 +90,9 @@ fn with_bind_plan(plan: BindPlan, run: impl FnOnce()) {
     });
 }
 
-#[test]
-fn busy_port_is_counted_untouched_and_retried_and_primary_is_excluded() {
-    let (_dir, mut supervisor) = scratch();
+// A port whose first bind fails with the real native busy error and whose
+// retry receives the still-held listener, never a released ephemeral port.
+fn busy_then_held() -> BindPlan {
     let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = busy.local_addr().unwrap().port();
     busy.set_nonblocking(true).unwrap();
@@ -100,10 +100,17 @@ fn busy_port_is_counted_untouched_and_retried_and_primary_is_excluded() {
     // Bypass the test plan when exercising the wildcard/loopback probes.
     let busy_error = socket::bind_with_probe(port, socket::bind_ipv6_wildcard).unwrap_err();
     assert_eq!(busy_error.kind(), io::ErrorKind::AddrInUse);
-    let plan = BindPlan {
+    BindPlan {
         port,
         results: [Err(busy_error), Ok(busy)].into(),
-    };
+    }
+}
+
+#[test]
+fn busy_port_is_counted_untouched_and_retried_and_primary_is_excluded() {
+    let (_dir, mut supervisor) = scratch();
+    let plan = busy_then_held();
+    let port = plan.port;
     // Transfer the held listener on retry instead of releasing its port and
     // racing other ephemeral allocations. The primary step must not bind.
     with_bind_plan(plan, || {
@@ -921,30 +928,33 @@ impl Supervisor {
 #[test]
 fn revoke_between_approval_read_and_bind_fences_the_new_listener() {
     let (_dir, mut supervisor) = scratch();
-    let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = busy.local_addr().unwrap().port();
+    let plan = busy_then_held();
+    let port = plan.port;
     let candidates = [APPROVED, port];
-    supervisor
-        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
-        .unwrap();
-    assert!(supervisor.open.is_empty());
-    // Same order as the production tick: snapshot, read, then an injected
-    // synchronous revoke phase before reconcile gets to bind the freed port.
-    let generation = supervisor.admission.generation.load(Ordering::SeqCst);
-    let approval = Approval::Approved(APPROVED);
-    supervisor
-        .admission
-        .generation
-        .fetch_add(1, Ordering::SeqCst);
-    drop(busy);
-    supervisor
-        .tick(160, approval, 0, &candidates, &[], generation)
-        .unwrap();
-    let activity = &supervisor.open[&port].activity;
-    assert_eq!(activity.generation, generation);
-    with_request_approval(Some(APPROVED), || {
-        assert!(activity
-            .export_if_approved(|| panic!("mid-tick revoke allowed export"))
-            .is_none());
+    // The retry binds the held listener: a released ephemeral port can be
+    // claimed by another allocation before the tick binds it.
+    with_bind_plan(plan, || {
+        supervisor
+            .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
+            .unwrap();
+        assert!(supervisor.open.is_empty());
+        // Same order as the production tick: snapshot, read, then an injected
+        // synchronous revoke phase before reconcile gets to bind the freed port.
+        let generation = supervisor.admission.generation.load(Ordering::SeqCst);
+        let approval = Approval::Approved(APPROVED);
+        supervisor
+            .admission
+            .generation
+            .fetch_add(1, Ordering::SeqCst);
+        supervisor
+            .tick(160, approval, 0, &candidates, &[], generation)
+            .unwrap();
+        let activity = &supervisor.open[&port].activity;
+        assert_eq!(activity.generation, generation);
+        with_request_approval(Some(APPROVED), || {
+            assert!(activity
+                .export_if_approved(|| panic!("mid-tick revoke allowed export"))
+                .is_none());
+        });
     });
 }
