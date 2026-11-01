@@ -26883,6 +26883,23 @@ impl OwnedSourceScan {
             } else {
                 file_limit
             };
+        // A due quarantine retry of an unchanged file is neither fresh nor a
+        // census member, so no dedicated turn below selects it and it would
+        // wait for an ordinary page. It rides the next selecting page first.
+        // Order only: its flags are kept and its lease still paces attempts.
+        let due_retries = index
+            .terminal_contract_retries
+            .values()
+            .map(Path::new)
+            .collect::<BTreeSet<_>>();
+        traversal.pending_candidates.retain(|candidate| {
+            let due = pending_paths.len() < selection_limit
+                && due_retries.contains(candidate.path.as_path());
+            if due {
+                pending_paths.push(candidate.clone());
+            }
+            !due
+        });
         // Fresh data gets a bounded page of its own, at most every other
         // ordinary page. Mixing it behind 64 MiB of census revalidation
         // starves it; always putting it first can starve the census instead.

@@ -3300,6 +3300,9 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
 /// (b) a new Codex day is a new date directory. Retained-roster refresh
 /// finds it with no watcher hint; its rollout must still reach the
 /// post-policy upload set within two ordinary pages.
+/// [regress] (c) a due quarantine retry of an unchanged, already read file is
+/// neither fresh nor a census member. It rides the next selecting page beside
+/// that work, keeps its flags, and is not read again on the page after.
 #[test]
 fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3453,19 +3456,62 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
             }
         }
         assert_eq!(published, BTreeSet::from([NEW_DAY.to_string()]));
+
+        // Arm (c): NEW was read and is unchanged; its retry is due and leased.
+        // The owed census turn runs while SESSION has fresh bytes waiting.
+        let leased = fixture.file(NEW);
+        let key = local_index_key(&leased);
+        let fingerprint = index.file_snapshot_fingerprints[&key]
+            .first()
+            .unwrap()
+            .clone();
+        let mut record = snapshot_quarantine_record(SnapshotSource::Codex);
+        record.retry_after_unix_seconds = 0;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert(fingerprint.clone(), record);
+        let mut hints = index.activate_terminal_contract_retries(BTreeSet::from([fingerprint]));
+        assert_eq!(hints, vec![leased.clone()]);
+        fixture.append(SESSION, &token_line(7));
+        hints.push(fixture.file(SESSION));
+        index.traversal.as_mut().unwrap().codex_freshness_yield = true;
+        let queued = index.traversal.as_ref().unwrap().pending_candidates.len();
+        cache.clear();
+        let published_ids = |scan: &SourceScanResult| {
+            scan.snapshots
+                .iter()
+                .map(|item| item.source_session_id.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        let selected = selected_page(&fixture, &cache, index, &collected_at(7), &hints);
+        assert_eq!(selected.codex_selected_flags[&key], (false, true));
+        let (next, ridden) = finish_published(selected);
+        index = next;
+        assert_eq!(published_ids(&ridden), BTreeSet::from([NEW.to_string()]));
+        assert_eq!(ridden.census_window_end, window);
+        assert_eq!(pending_flags(&index, &leased), None);
+        assert_eq!(
+            pending_flags(&index, &fixture.file(SESSION)),
+            Some((false, true))
+        );
+        // SESSION joined the queue; the census turn still read its members.
+        assert!(index.traversal.as_ref().unwrap().pending_candidates.len() <= queued);
+
+        // The lease is still held, yet only a new hint could queue the file.
+        let (_, after) = published_scan(&fixture, &cache, index, &collected_at(8), &[]);
+        assert_eq!(published_ids(&after), BTreeSet::from([SESSION.to_string()]));
     });
 }
 
-/// One Codex page stepped to completion, returning the same post-policy
-/// upload set the collector would offer.
-fn published_scan(
+/// One Codex page selected at `collected_at`, not yet stepped.
+fn selected_page(
     fixture: &ScanRoot,
     cache: &Arc<SharedCache>,
     index: ScanIndex,
     collected_at: &str,
     hints: &[PathBuf],
-) -> (ScanIndex, SourceScanResult) {
-    let mut scan = OwnedSourceScan::new(
+) -> OwnedSourceScan {
+    OwnedSourceScan::new(
         SnapshotSource::Codex,
         std::slice::from_ref(&fixture.root),
         index,
@@ -3477,7 +3523,23 @@ fn published_scan(
         hints,
         false,
     )
-    .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
+    .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()))
+}
+
+/// One Codex page stepped to completion, returning the same post-policy
+/// upload set the collector would offer.
+fn published_scan(
+    fixture: &ScanRoot,
+    cache: &Arc<SharedCache>,
+    index: ScanIndex,
+    collected_at: &str,
+    hints: &[PathBuf],
+) -> (ScanIndex, SourceScanResult) {
+    finish_published(selected_page(fixture, cache, index, collected_at, hints))
+}
+
+/// Step `scan` to completion and apply the collector's upload policy.
+fn finish_published(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
     loop {
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
