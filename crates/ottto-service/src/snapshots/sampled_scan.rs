@@ -2096,6 +2096,8 @@ pub(super) mod test_hooks {
     }
 
     /// Scale the room beside a restore without allocating a large fixture graph.
+    /// Its callers are the native-layout restore tests, which are macOS-only.
+    #[cfg(target_os = "macos")]
     pub(in crate::snapshots) fn active_restore_room(room: Option<usize>) {
         ACTIVE_RESTORE_ROOM.with(|slot| slot.set(room));
     }
