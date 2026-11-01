@@ -336,6 +336,7 @@ impl Drop for Txn<'_> {
             if self.write && !self.store.import {
                 let bytes = self.store.wal_bytes();
                 self.store.stats.observe_wal(bytes);
+                self.store.stats.refused_save_bytes = self.dirty_bytes;
                 telemetry::save_work(self.dirty_rows, self.dirty_bytes);
             }
             // SQLite journal OFF cannot promise rollback. An aborted import
@@ -861,6 +862,7 @@ impl Store for Sqlite {
             self.stats.erasure_pending_marks = 0;
             self.stats.dirty_rows_per_save = 0;
             self.stats.encoded_bytes_per_save = 0;
+            self.stats.refused_save_bytes = 0;
             self.maintenance(false)?;
         }
         if mode == TxnMode::Write {
@@ -1178,21 +1180,17 @@ impl Sqlite {
         self.stats.dirty_rows_per_save > 5_000
             || self.stats.encoded_bytes_per_save > SAVE_TARGET_BYTES
     }
-    fn record_save_error(&mut self, error: &anyhow::Error, dirty_bytes: u64) {
+    /// Charged bytes of the last refused save, for its ceiling alarm.
+    pub(super) fn refused_save_bytes(&self) -> u64 {
+        self.stats.refused_save_bytes
+    }
+    fn record_save_error(&mut self, error: &anyhow::Error) {
         if self.save_failure.is_some() {
             return;
         }
         if disk_full(error) {
             self.save_failure = Some(Hold::SaveFull);
             telemetry::event("sqlite_full", &1);
-        } else if error
-            .chain()
-            .any(|e| e.to_string() == "state_v2_save_ceiling")
-        {
-            // A save hold is never silent: alarm with its content-free cause.
-            self.save_failure = Some(Hold::SaveCeiling);
-            telemetry::event("save_ceiling_alarm", &dirty_bytes);
-            telemetry::event("save_ceiling_cause", &"error_chain");
         }
     }
 }
@@ -1225,8 +1223,6 @@ impl Txn<'_> {
         // exceed them. Only the hard charged-work ceiling refuses publication.
         if self.dirty_bytes > self.store.purge_policy.save_ceiling {
             self.store.save_failure = Some(Hold::SaveCeiling);
-            telemetry::event("save_ceiling_alarm", &self.dirty_bytes);
-            telemetry::event("save_ceiling_cause", &"charged_work");
             anyhow::bail!(Hold::SaveCeiling);
         }
         Ok(())
@@ -1486,7 +1482,7 @@ impl Transaction for Txn<'_> {
             Ok(h)
         })();
         if let Err(error) = &result {
-            self.store.record_save_error(error, self.dirty_bytes);
+            self.store.record_save_error(error);
         }
         self.failed |= result.is_err();
         result
@@ -1523,7 +1519,7 @@ impl Transaction for Txn<'_> {
             Ok(count != 0)
         })();
         if let Err(error) = &result {
-            self.store.record_save_error(error, self.dirty_bytes);
+            self.store.record_save_error(error);
         }
         self.failed |= result.is_err();
         result
@@ -1628,7 +1624,7 @@ impl Txn<'_> {
             Ok(())
         })();
         if let Err(error) = &result {
-            self.store.record_save_error(error, self.dirty_bytes);
+            self.store.record_save_error(error);
             self.store
                 .stats
                 .commit(&DurableCommitOutcome::NotPublished, None);
@@ -1673,7 +1669,7 @@ impl Txn<'_> {
             return DurableCommitOutcome::Committed(next);
         }
         if let Err(error) = &result {
-            self.store.record_save_error(error, self.dirty_bytes);
+            self.store.record_save_error(error);
             if self.store.save_failure == Some(Hold::SaveFull) {
                 // FULL is retryable only after abandoning the complete save.
                 // SQLite may already have auto-rolled back the transaction.
@@ -1684,6 +1680,7 @@ impl Txn<'_> {
             }
         }
         if !self.store.import {
+            self.store.stats.refused_save_bytes = self.dirty_bytes;
             telemetry::save_work(self.dirty_rows, self.dirty_bytes);
         }
         self.finished = true;
