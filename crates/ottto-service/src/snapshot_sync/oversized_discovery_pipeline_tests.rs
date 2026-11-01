@@ -50,6 +50,21 @@ fn oversized_clock(now: u64) -> String {
         .unwrap()
 }
 
+/// The 30 min re-listing pass stamps only its own clock and count; an
+/// unchanged generation's traversal is otherwise byte-identical.
+fn without_listing_clock(traversal: &serde_json::Value) -> serde_json::Value {
+    let mut traversal = traversal.clone();
+    traversal
+        .as_object_mut()
+        .unwrap()
+        .remove("listing_started_unix_seconds");
+    traversal["counts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("listing_generations");
+    traversal
+}
+
 fn oversized_tick(fixture: &RearmFixture, now: u64) -> RearmPage {
     let (page, rows) = crate::local_resource_diagnostics::capture(|| {
         fixture.page(&oversized_clock(now), RearmUpload::Accept)
@@ -63,6 +78,8 @@ fn oversized_tick(fixture: &RearmFixture, now: u64) -> RearmPage {
     page
 }
 
+/// [behaviour] An unchanged oversized file keeps its loss disclosed with no
+/// clock restart; a re-listing pass changes only its own clock and count.
 #[test]
 #[serial(source_manifests)]
 fn oversized_unchanged_has_no_clock_restarts_and_keeps_incomplete_disclosure() {
@@ -82,7 +99,10 @@ fn oversized_unchanged_has_no_clock_restarts_and_keeps_incomplete_disclosure() {
         );
         assert_eq!(page.scan.scanned_file_count, 0);
         let current = c1a_saved(&fixture);
-        assert_eq!(current["traversal"], saved["traversal"]);
+        assert_eq!(
+            without_listing_clock(&current["traversal"]),
+            without_listing_clock(&saved["traversal"])
+        );
         assert_eq!(c1a_latch(&fixture), latch);
     }
     // The only new durable content consists of hashes plus a sighting count.
@@ -529,6 +549,9 @@ fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
     }
 }
 
+/// [behaviour] With no hint, a new file beside an oversized one is found by
+/// the re-listing pass inside the recovery floor, uploaded and ACKed without a
+/// restart; the floor still re-walks exactly once.
 #[test]
 #[serial(source_manifests)]
 fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor() {
@@ -554,13 +577,14 @@ fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor
     .unwrap();
     // Every fixture page independently reloads the exhausted checkpoint: no
     // process-local state or watcher input can discover this file for it.
-    let quiet = oversized_tick(&fixture, floor - 1);
-    assert!(!quiet.parsed.contains(NEW_SESSION));
-    let (retry, starts) = oversized_walk(&fixture, floor, RearmUpload::Accept);
-    assert_eq!(starts.len(), 1);
-    assert!(retry.iter().any(|page| page.parsed.contains(NEW_SESSION)));
+    // The re-listing pass finds it inside the floor, with no traversal
+    // restart (oversized_tick asserts none).
+    let quiet = (0..C1B_MAX_PAGES as u64)
+        .map(|number| oversized_tick(&fixture, floor - 600 + number))
+        .collect::<Vec<_>>();
+    assert!(quiet.iter().any(|page| page.parsed.contains(NEW_SESSION)));
     assert!(
-        retry
+        quiet
             .iter()
             .any(|page| page.scan.snapshots.iter().any(|item| {
                 item.source_session_id == NEW_SESSION
@@ -569,11 +593,19 @@ fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor
             })),
         "no-hint discovery reaches the real uploader and durable ACK"
     );
+    assert!(quiet.iter().all(|page| !page.scan.census_complete));
+    let (retry, starts) = oversized_walk(&fixture, floor, RearmUpload::Accept);
+    assert_eq!(starts.len(), 1);
     assert!(!retry.last().unwrap().scan.census_complete);
     assert_eq!(retry.last().unwrap().scan.oversized_file_count, 1);
     assert!(fixture.hinted_paths.is_empty());
 }
 
+/// [regress] Two oversized files retry only changed content and keep an exact
+/// loss count. A third file that turns up oversized only to a re-listing pass
+/// records no debt, so its later shrink cannot cancel another file's loss: the
+/// count and the incomplete census survive save/reload. Before the fix the
+/// pass recorded the debt but restored its count away.
 #[test]
 #[serial(source_manifests)]
 fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
@@ -644,6 +676,47 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
     assert_eq!(page.scan.oversized_file_count, 1);
     assert!(page.parsed.contains(OVERSIZED_SESSION));
     assert_eq!(page.scan.scanned_file_count, 1);
+    assert!(!page.scan.census_complete);
+
+    // Every tick reloads the saved index, so each check below is post-reload.
+    const LATE: &str = "e7000000-0000-4000-8000-000000000007";
+    let late = fixture.root.join(format!("{LATE}.jsonl"));
+    std::fs::File::create(&late)
+        .unwrap()
+        .set_len(OVERSIZED_BYTES)
+        .unwrap();
+    let interval = crate::snapshots::LISTING_INTERVAL_SECONDS;
+    let listed_at = after["traversal"]["listing_started_unix_seconds"]
+        .as_u64()
+        .unwrap()
+        + interval
+        + 60;
+    let page = oversized_tick(&fixture, listed_at);
+    let listed = c1a_saved(&fixture);
+    assert!(listed["traversal"]["counts"]["listing_generations"].as_u64() >= Some(1));
+    assert_eq!(
+        listed["traversal"]["oversized_discovery"],
+        after["traversal"]["oversized_discovery"],
+        "a re-listing pass records no oversized debt"
+    );
+    assert_eq!(listed["traversal"]["counts"]["oversized_file_count"], 1);
+    assert_eq!(page.scan.oversized_file_count, 1);
+    assert!(!page.scan.census_complete);
+    std::fs::write(&late, rearm_transcript_line(LATE, None, "req_late_shrunk", 0)).unwrap();
+    let page = oversized_tick(
+        &fixture,
+        oversized_deadline(&listed).max(listed_at + interval + 60),
+    );
+    let reloaded = c1a_saved(&fixture);
+    assert_eq!(
+        reloaded["traversal"]["counts"]["oversized_file_count"], 1,
+        "the remaining file's loss stays counted"
+    );
+    assert_eq!(
+        reloaded["traversal"]["oversized_discovery"],
+        after["traversal"]["oversized_discovery"]
+    );
+    assert_eq!(page.scan.oversized_file_count, 1);
     assert!(!page.scan.census_complete);
 }
 

@@ -3613,10 +3613,9 @@ fn clear_source_manifests_for_test() {
 /// Hard ceiling on how long a source may go unscanned on cadence grounds alone.
 ///
 /// The cost tiers are allowed to stretch a quiet source out to here and no
-/// further, and the 6-hour full sweep is unconditional on top of it: neither the
-/// filesystem watcher nor a server directive can suppress a sweep, because a
-/// watcher that silently stops delivering events would otherwise stop collection
-/// with every health signal green.
+/// further: neither the filesystem watcher nor a server directive can suppress
+/// a scan, because a watcher that silently stops delivering events would
+/// otherwise stop collection with every health signal green.
 const MAX_CYCLE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// How long the loop is willing to sit inside one wait before re-deciding.
@@ -3653,7 +3652,6 @@ fn record_finished_snapshot_cadence(
         cadence.record_scan_failure(now);
     } else {
         cadence.record_scan_success(now, accepted);
-        cadence.record_full_sweep(now);
     }
 }
 
