@@ -1326,6 +1326,9 @@ fn successor_cold_reopen(disposition: Option<&str>) {
 /// oracle with real account evidence, without adding a second test/receipt name.
 pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
     assert!(crate::heap_layout_bound::layout_supported(), "placement oracle must execute");
+    // The restart leg restores from a durable record, which is written only
+    // while restart restore is on.
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     with_e2(|| {
         let mut c = corpus("head-conflict-account-placement");
         let org_a = "11111111-1111-4111-8111-111111111111";
@@ -1351,10 +1354,13 @@ pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
         let restart = E2ScanFixture::capturing_identity();
         disk.begin(&restart, SnapshotSource::ClaudeCode);
         let cold = E2ScanFixture::capturing_identity();
+        // The restart reads first: the RAM page writes its successor record at
+        // native settlement, which a later restart would reuse as Unchanged.
+        let restarted = c.raw(&restart, prior.clone(), 100, true, &[]);
         let mut pages = [
             c.raw(&retained, prior.clone(), 100, true, &[]),
-            c.raw(&cold, prior.clone(), 100, true, &[]),
-            c.raw(&restart, prior, 100, true, &[]),
+            c.raw(&cold, prior, 100, true, &[]),
+            restarted,
         ];
         assert_eq!(pages[0].modes, (0, 1, 0), "RAM Tail");
         assert_eq!(pages[1].modes, (1, 0, 0), "cold Full");
