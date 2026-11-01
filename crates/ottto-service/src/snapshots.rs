@@ -87756,7 +87756,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for PiLedger {
     fn stable_heap(&self) -> bool {
         use crate::heap_layout_bound::HeapLayoutBound as B;
         let Self { usage_keys, fork } = self;
-        B::stable_heap(usage_keys) && fork.as_deref().is_none_or(B::stable_heap)
+        B::stable_heap(usage_keys) && fork.as_deref().map_or(true, B::stable_heap)
     }
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         use crate::heap_layout_bound::HeapLayoutBound as B;
