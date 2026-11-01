@@ -578,7 +578,7 @@ fn filtered_account_hydrate_equals_full_for_requested_families_only() {
         serde_json::to_vec(&expected).unwrap()
     );
 }
-/// [regress] rows lost out of band at an equal generation are refused or rewritten, never Absent.
+/// [behaviour] rows lost out of band at an equal generation are refused or rewritten, never Absent.
 #[test]
 fn out_of_band_family_row_loss_is_refused_or_rewritten_never_silently_absent() {
     const FAMILY: &str = "synthetic-family";
