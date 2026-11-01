@@ -1624,107 +1624,63 @@ fn pi_e4_receipted_captures_and_posts() {
     pi_publication_case(crate::snapshots::NativePublication::Receipted, None);
 }
 
-/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
-/// These typed outcome rows do not prove a real store failure.
+/// [money] Typed mapper outcomes control retained retry and HTTP/ACK.
+/// These injections do not prove a real store failure.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_e4_publish_without_record_captures_and_posts() {
-    pi_publication_case(
-        crate::snapshots::NativePublication::PublishWithoutRecord,
-        Some(PiE4::Unprepared(
-            PiUnpreparedDisposition::PublishWithoutRecord {
+fn pi_e4_publication_outcomes_control_retry_and_posts() {
+    use crate::snapshots::NativePublication as Publication;
+    for (publication, outcome) in [
+        (
+            Publication::PublishWithoutRecord,
+            PiE4::Unprepared(PiUnpreparedDisposition::PublishWithoutRecord {
                 cause: PiUnprepared::NotPersisted(PiNotPersisted::Codec),
-            },
-        )),
-    );
-}
-
-/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
-/// These typed outcome rows do not prove a real store failure.
-#[test]
-#[serial(client_report)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_e4_failed_published_without_record_captures_and_posts() {
-    pi_publication_case(
-        crate::snapshots::NativePublication::FailedPublishedWithoutRecord,
-        Some(PiE4::Write(PiWriteOutcome::FailedPublishedWithoutRecord(
-            PiDegradedCause::WriteFailedRetired,
-        ))),
-    );
-}
-
-/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
-/// These typed outcome rows do not prove a real store failure.
-#[test]
-#[serial(client_report)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_e4_publish_retaining_prior_captures_and_posts() {
-    pi_publication_case(
-        crate::snapshots::NativePublication::PublishRetainingPrior,
-        Some(PiE4::Unprepared(
-            PiUnpreparedDisposition::PublishRetainingPrior {
+            }),
+        ),
+        (
+            Publication::FailedPublishedWithoutRecord,
+            PiE4::Write(PiWriteOutcome::FailedPublishedWithoutRecord(
+                PiDegradedCause::WriteFailedRetired,
+            )),
+        ),
+        (
+            Publication::PublishRetainingPrior,
+            PiE4::Unprepared(PiUnpreparedDisposition::PublishRetainingPrior {
                 format: 3,
                 cause: PiUnprepared::NotPersisted(PiNotPersisted::Codec),
-            },
-        )),
-    );
-}
-
-/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
-/// These typed outcome rows do not prove a real store failure.
-#[test]
-#[serial(client_report)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_e4_publish_store_untouched_captures_and_posts() {
-    pi_publication_case(
-        crate::snapshots::NativePublication::PublishStoreUntouched,
-        Some(PiE4::Unprepared(
-            PiUnpreparedDisposition::PublishStoreUntouched {
+            }),
+        ),
+        (
+            Publication::PublishStoreUntouched,
+            PiE4::Unprepared(PiUnpreparedDisposition::PublishStoreUntouched {
                 cause: PiDegraded::Disabled,
-            },
-        )),
-    );
-}
-
-/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
-/// These typed outcome rows do not prove a real store failure.
-#[test]
-#[serial(client_report)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_e4_failed_held_refuses_retained_retry() {
-    pi_publication_case(
-        crate::snapshots::NativePublication::FailedHeld,
-        Some(PiE4::Write(PiWriteOutcome::FailedHeld(PiHeldCause::Fence))),
-    );
-}
-
-/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
-/// These typed outcome rows do not prove a real store failure.
-#[test]
-#[serial(client_report)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_e4_receipt_pending_refuses_retained_retry() {
-    pi_publication_case(
-        crate::snapshots::NativePublication::ReceiptPending,
-        Some(PiE4::Write(PiWriteOutcome::ReceiptPending)),
-    );
-}
-
-/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
-/// These typed outcome rows do not prove a real store failure.
-#[test]
-#[serial(client_report)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_e4_unprepared_hold_and_strict_rebind_refuse_retained_retry() {
-    for outcome in [
-        PiE4::Unprepared(PiUnpreparedDisposition::Hold(PiHeldCause::Fence)),
-        PiE4::Unprepared(PiUnpreparedDisposition::PublishStrictRebind),
-        PiE4::Write(PiWriteOutcome::FailedPublishedWithoutRecord(
-            PiDegradedCause::StrictRebind,
-        )),
+            }),
+        ),
+        (
+            Publication::FailedHeld,
+            PiE4::Write(PiWriteOutcome::FailedHeld(PiHeldCause::Fence)),
+        ),
+        (
+            Publication::ReceiptPending,
+            PiE4::Write(PiWriteOutcome::ReceiptPending),
+        ),
+        (
+            Publication::Hold,
+            PiE4::Unprepared(PiUnpreparedDisposition::Hold(PiHeldCause::Fence)),
+        ),
+        (
+            Publication::Hold,
+            PiE4::Unprepared(PiUnpreparedDisposition::PublishStrictRebind),
+        ),
+        (
+            Publication::Hold,
+            PiE4::Write(PiWriteOutcome::FailedPublishedWithoutRecord(
+                PiDegradedCause::StrictRebind,
+            )),
+        ),
     ] {
-        pi_publication_case(crate::snapshots::NativePublication::Hold, Some(outcome));
+        pi_publication_case(publication, Some(outcome));
     }
 }
 

@@ -1451,6 +1451,15 @@ fn pi_pages(
     ([tail_index, full_index, disk_index], full)
 }
 
+macro_rules! pi_row {
+    ($name:expr) => {
+        let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+        if !supported($name) {
+            return;
+        }
+    };
+}
+
 fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> SourceScanResult {
     let (c, mut disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
     let mut priors = [prior.clone(), prior.clone(), prior];
@@ -1565,10 +1574,7 @@ fn pi_ledger_splits(
 /// money from the RAM Tail and the disk restore.
 #[test]
 fn pi() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi") {
-        return;
-    }
+    pi_row!("pi");
     // Every appended line boundary, including model/thinking changes,
     // the large system message, and the user/assistant flush boundary.
     let lines: Vec<Value> = pi_seed()
@@ -1588,10 +1594,7 @@ fn pi() {
 /// cold Full's money on every route.
 #[test]
 fn pi_tool_turn() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_tool_turn") {
-        return;
-    }
+    pi_row!("pi_tool_turn");
     let mut tool = pi_turn("message", Some("tool-response"), 20, "2026-10-27T06:01:00Z");
     tool["message"]["stopReason"] = json!("toolUse");
     tool["message"]["content"] = json!([{"type":"toolCall","id":"synthetic-call",
@@ -1615,10 +1618,7 @@ fn pi_tool_turn() {
 /// model row, on every route.
 #[test]
 fn pi_summary_usage() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_summary_usage") {
-        return;
-    }
+    pi_row!("pi_summary_usage");
     for kind in ["compaction", "branch_summary"] {
         let summary = json!({"type":kind,"id":"b0000001","parentId":"a0000001",
             "timestamp":"2026-10-27T07:00:01Z", "summary":"Synthetic branch checkpoint.",
@@ -1661,10 +1661,7 @@ fn pi_summary_usage() {
 /// their provider on every route.
 #[test]
 fn pi_usage_entry_kinds() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_usage_entry_kinds") {
-        return;
-    }
+    pi_row!("pi_usage_entry_kinds");
     let entries = ["cache_warm", "synthetic_future_kind"]
         .into_iter()
         .map(|kind| {
@@ -1687,10 +1684,7 @@ fn pi_usage_entry_kinds() {
 /// restore seal.
 #[test]
 fn pi_ledger_seal_boundaries() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_ledger_seal_boundaries") {
-        return;
-    }
+    pi_row!("pi_ledger_seal_boundaries");
     use PiLedgerStep::{ConflictDrop, Emit, Noop};
     let message = pi_turn(
         "message",
@@ -1751,10 +1745,7 @@ fn pi_ledger_seal_boundaries() {
 /// on every route, before or after a pair.
 #[test]
 fn pi_divergent_pair_quarantine() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_divergent_pair_quarantine") {
-        return;
-    }
+    pi_row!("pi_divergent_pair_quarantine");
     for paired in [false, true] {
         let message = pi_turn(
             "message",
@@ -1785,10 +1776,7 @@ fn pi_divergent_pair_quarantine() {
 }
 
 fn pi_usage_case(name: &str) {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported(name) {
-        return;
-    }
+    pi_row!(name);
     let (response, input, repeats, requests, tokens) = match name {
         "pi_no_response_id" => (None, 20, 2, 4, 70),
         "pi_error_zero_requests" => (Some("synthetic-error"), 0, 1, 1, 10),
@@ -1820,10 +1808,7 @@ fn pi_no_response_id() {
 /// every route.
 #[test]
 fn pi_selector_across_seal() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_selector_across_seal") {
-        return;
-    }
+    pi_row!("pi_selector_across_seal");
     let scan = pi_splits(
         "pi_selector_across_seal",
         &pi_seed(),
@@ -1859,10 +1844,7 @@ fn pi_selector_across_seal() {
 /// resolve as in cold Full on every route.
 #[test]
 fn pi_time_and_invalid_evidence() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_time_and_invalid_evidence") {
-        return;
-    }
+    pi_row!("pi_time_and_invalid_evidence");
     let scan = pi_splits(
         "pi_provider_hour_and_late_time",
         &pi_seed(),
@@ -1911,10 +1893,7 @@ fn pi_error_zero_requests() {
 /// [money] Pinned residual: copied lines timestamped at or after the fork header stay counted.
 #[test]
 fn pi_cli_fork_preserves_double_count() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_cli_fork_preserves_double_count") {
-        return;
-    }
+    pi_row!("pi_cli_fork_preserves_double_count");
     // The fork rule skips only copies stamped before the fork header; these copies are
     // stamped at or after it, so they stay counted.
     const EXPECTED_FORK_TOTALS: (u64, u64) = (3, 40);
@@ -1960,10 +1939,7 @@ fn pi_cli_fork_preserves_double_count() {
 }
 
 fn pi_lifecycle_case(name: &str) {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported(name) {
-        return;
-    }
+    pi_row!(name);
     let (rewrite, downgrade, turns): (bool, bool, &[(&str, u64, &str)]) = match name {
         "pi_upgrade_without_semantic_revision" => (
             false,
@@ -2093,10 +2069,7 @@ fn pi_version_rewrite_after_tail() {
 /// emits cold Full's money.
 #[test]
 fn pi_restart_between_pages() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_restart_between_pages") {
-        return;
-    }
+    pi_row!("pi_restart_between_pages");
     pi_splits(
         "pi_restart_between_pages",
         &pi_seed(),
@@ -2125,10 +2098,7 @@ fn pi_downgrade_then_reupgrade() {
 /// and later growth restores and Tails, each equal to cold Full.
 #[test]
 fn pi_acquisition_metadata_changes() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !supported("pi_acquisition_metadata_changes") {
-        return;
-    }
+    pi_row!("pi_acquisition_metadata_changes");
     use std::os::unix::fs::PermissionsExt;
     let (c, mut disk, path, scanner, prior, mut proof) =
         pi_disk_corpus("pi_acquisition_metadata_changes", &pi_seed());

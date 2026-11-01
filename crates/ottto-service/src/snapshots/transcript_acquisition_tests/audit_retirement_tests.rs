@@ -2285,7 +2285,6 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
     let _clock = Clock::at(START);
     let source = SnapshotSource::Pi;
     for evict in [false, true] {
@@ -2293,22 +2292,19 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
         let fixture = ScanFixture::new(source);
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
         let cache = Arc::new(sampled_scan::SharedCache::default());
-        let (index, _, modes) = production_scan(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            Some(cache.clone()),
-            "pi-recordless-audit",
-        );
+        let scan = |index, cache: &Arc<sampled_scan::SharedCache>| {
+            production_scan(
+                &fixture,
+                source,
+                index,
+                Some(cache.clone()),
+                "pi-recordless-audit",
+            )
+        };
+        let (index, _, modes) = scan(ScanIndex::default(), &cache);
         assert_eq!(modes, (1, 0, 0));
         fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-        let (mut index, _, modes) = production_scan(
-            &fixture,
-            source,
-            index,
-            Some(cache.clone()),
-            "pi-recordless-audit",
-        );
+        let (mut index, _, modes) = scan(index, &cache);
         assert_eq!(modes, (0, 1, 0));
         let key = local_index_key(&fixture.file.0);
         let due = index.files[&key].unverified_deadline().unwrap();
@@ -2341,19 +2337,9 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
             (CandidateDecision::Parse, Some(CandidateParseReason::Audit)),
             "the unchanged file is selected by its audit obligation"
         );
-        let ((((mut index, _, modes), diagnostics), _counts), reads) =
+        let (((mut index, _, modes), diagnostics), reads) =
             terminal_contract_retry::source_acquisitions(|| {
-                observe(|| {
-                    crate::local_resource_diagnostics::capture(|| {
-                        production_scan(
-                            &fixture,
-                            source,
-                            index,
-                            Some(cache.clone()),
-                            "pi-recordless-audit",
-                        )
-                    })
-                })
+                crate::local_resource_diagnostics::capture(|| scan(index, &cache))
             });
         assert_eq!(modes, (1, 0, 0), "one verification Full per marker");
         assert_eq!(reads.len(), 1);
@@ -2374,33 +2360,14 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
         sampled_scan::set_test_now(Some(
             due + 2 * crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
         ));
-        let (((index, _, modes), _counts), reads) =
-            terminal_contract_retry::source_acquisitions(|| {
-                observe(|| {
-                    production_scan(
-                        &fixture,
-                        source,
-                        ScanIndex::load(&state).unwrap(),
-                        Some(cache.clone()),
-                        "pi-recordless-audit",
-                    )
-                })
-            });
+        let ((index, _, modes), reads) = terminal_contract_retry::source_acquisitions(|| {
+            scan(ScanIndex::load(&state).unwrap(), &cache)
+        });
         assert_eq!(modes, (0, 0, 0), "no marker re-stage loop");
         assert!(reads.is_empty());
         fixture.file.append(&usage(source, 170, 2, "fixture-model"));
-        let (((_, _, modes), _counts), reads) =
-            terminal_contract_retry::source_acquisitions(|| {
-                observe(|| {
-                    production_scan(
-                        &fixture,
-                        source,
-                        index,
-                        Some(cache.clone()),
-                        "pi-recordless-audit",
-                    )
-                })
-            });
+        let ((_, _, modes), reads) =
+            terminal_contract_retry::source_acquisitions(|| scan(index, &cache));
         assert_eq!(modes, (1, 0, 0));
         assert_eq!(reads.len(), 1);
         assert_eq!(reads.get(&fixture.file.0), Some(&1));

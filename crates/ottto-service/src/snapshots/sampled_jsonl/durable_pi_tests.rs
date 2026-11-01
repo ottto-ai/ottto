@@ -122,34 +122,6 @@ fn take_section(d: &mut Dec<'_>) -> Result<PiSection, Corrupt> {
     PiSection::take(d)
 }
 
-/// [format] The populated body counts exactly and round-trips.
-#[test]
-fn plain_trailing_pi_body_counts_and_round_trips() {
-    let original = reduction(ledger());
-    assert!(original
-        .accumulator
-        .seen_pi_usage_keys
-        .usage_keys()
-        .values()
-        .any(|state| !state.message.is_empty()
-            && !state.message_end.is_empty()
-            && !state.paired_digests.is_empty()));
-    let bytes = body(&original).unwrap();
-    assert_eq!(bytes, unbounded_body(&original));
-    let mut count = Enc::count(usize::MAX);
-    put(&mut count, &original, &Rederive::default()).unwrap();
-    assert_eq!(count.counted(), bytes.len());
-    assert_eq!(verify_without_allocation(&bytes), Ok(()));
-    let decoded = take_body(&mut Dec::new(&bytes)).unwrap();
-    assert_eq!(
-        ledger_contents(&decoded.reduction),
-        ledger_contents(&original)
-    );
-    let mut again = Enc::bytes(RECORD_BYTES);
-    put(&mut again, &decoded.reduction, &decoded.rederive).unwrap();
-    assert_eq!(again.into_bytes(), bytes);
-}
-
 /// [format] The Pi section bytes are pinned for a one-key ledger without a fork.
 #[test]
 fn pi_section_bytes_are_pinned() {
@@ -320,61 +292,6 @@ fn moved_ledger_allowance_is_scoped_to_one_pi_body() {
     }
 }
 
-/// [format] Truncation, trailing bytes and duplicate ledger keys refuse.
-#[test]
-fn corrupt_or_truncated_trailing_fields_are_refused() {
-    let keys = ledger();
-    let bytes = body(&reduction(keys.clone())).unwrap();
-    let section = section(&keys);
-    let at = bytes.len() - section.len();
-    let refused = |candidate: &[u8]| {
-        assert_eq!(verify_without_allocation(candidate), Err(Corrupt));
-        assert!(take_body(&mut Dec::new(candidate)).is_err());
-    };
-    for end in 0..bytes.len() {
-        refused(&bytes[..end]);
-    }
-    refused(&[&bytes[..], &[0_u8]].concat());
-    refused(&[&bytes[..], &section].concat());
-    let (key, state) = keys.into_iter().next().unwrap();
-    let mut e = Enc::bytes(RECORD_BYTES);
-    e.varint(2).unwrap();
-    for _ in 0..2 {
-        key.put_h(&mut e, "fixture").unwrap();
-        state.put(&mut e).unwrap();
-    }
-    false.put(&mut e).unwrap();
-    Option::<i128>::None.put(&mut e).unwrap();
-    refused(&[&bytes[..at], &e.into_bytes()].concat());
-}
-
-/// [format] Every ledger key and digest is 64-char lower hex.
-#[test]
-fn ledger_h_values_must_be_lower_hex_digests() {
-    for invalid in [
-        "id".to_string(),
-        "A".repeat(64),
-        "g".repeat(64),
-        "0".repeat(63),
-    ] {
-        let mut keys = ledger();
-        keys.insert(invalid.clone(), PiUsageDedupState::default());
-        assert_eq!(
-            body(&reduction(keys)),
-            Err(Refuse::NotDigest("PiSection.usage_keys"))
-        );
-        let mut keys = ledger();
-        keys.entry(digest(0x01))
-            .or_default()
-            .paired_digests
-            .insert(invalid);
-        assert_eq!(
-            body(&reduction(keys)),
-            Err(Refuse::NotDigest("PiUsageDedupState.paired_digests"))
-        );
-    }
-}
-
 /// [format] The Pi row's tag, slot, format and allowlist pin are fixed, and it
 /// round-trips a populated body byte for byte.
 #[test]
@@ -404,6 +321,12 @@ fn pi_registered_body_rows_preserve_populated_body_bytes() {
         (row.encode)(&decoded.reduction, RECORD_BYTES, 1024 * 1024).unwrap(),
         bytes
     );
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut mismatch = original.clone();
+        mismatch.accumulator.source = source;
+        let bytes = unbounded_body(&mismatch);
+        assert!(super::super::take_registered(&mut Dec::new(&bytes), SnapshotSource::Pi).is_err());
+    }
     let plan = BodyEncoding::new(
         &original.accumulator,
         &original.report,
@@ -416,9 +339,72 @@ fn pi_registered_body_rows_preserve_populated_body_bytes() {
     let mut streamed = Vec::new();
     assert_eq!(plan.write(&mut streamed, len).unwrap(), bytes.len());
     assert_eq!(streamed, bytes);
-    for end in 0..bytes.len() {
-        assert!((row.verify)(&mut Dec::new(&bytes[..end])).is_err());
-        assert!((row.decode)(&bytes[..end], SnapshotSource::Pi).is_err());
+    let mut count = Enc::count(usize::MAX);
+    put(&mut count, &original, &Rederive::default()).unwrap();
+    assert_eq!(count.counted(), bytes.len());
+    assert_eq!(
+        ledger_contents(&decoded.reduction),
+        ledger_contents(&original)
+    );
+    assert!(original
+        .accumulator
+        .seen_pi_usage_keys
+        .usage_keys()
+        .values()
+        .any(|state| !state.message.is_empty()
+            && !state.message_end.is_empty()
+            && !state.paired_digests.is_empty()));
+    super::super::tests::assert_structural_body(SnapshotSource::Pi, "pi-ledger", &bytes, 0);
+    let section = section(original.accumulator.seen_pi_usage_keys.usage_keys());
+    let mut duplicate = Enc::bytes(RECORD_BYTES);
+    duplicate.varint(2).unwrap();
+    let (key, state) = original
+        .accumulator
+        .seen_pi_usage_keys
+        .usage_keys()
+        .iter()
+        .next()
+        .unwrap();
+    for _ in 0..2 {
+        key.put_h(&mut duplicate, "fixture").unwrap();
+        state.put(&mut duplicate).unwrap();
+    }
+    false.put(&mut duplicate).unwrap();
+    Option::<i128>::None.put(&mut duplicate).unwrap();
+    for candidate in [
+        [&bytes[..], &[0_u8]].concat(),
+        [&bytes[..], &section].concat(),
+        [
+            &bytes[..bytes.len() - section.len()],
+            &duplicate.into_bytes(),
+        ]
+        .concat(),
+    ] {
+        assert_eq!(verify_without_allocation(&candidate), Err(Corrupt));
+        assert!(
+            super::super::take_registered(&mut Dec::new(&candidate), SnapshotSource::Pi).is_err()
+        );
+    }
+    for invalid in [
+        "id".to_string(),
+        "A".repeat(64),
+        "g".repeat(64),
+        "0".repeat(63),
+    ] {
+        for paired in [false, true] {
+            let mut keys = ledger();
+            let field = if paired {
+                keys.entry(digest(0x01))
+                    .or_default()
+                    .paired_digests
+                    .insert(invalid.clone());
+                "PiUsageDedupState.paired_digests"
+            } else {
+                keys.insert(invalid.clone(), PiUsageDedupState::default());
+                "PiSection.usage_keys"
+            };
+            assert_eq!(body(&reduction(keys)), Err(Refuse::NotDigest(field)));
+        }
     }
 }
 
@@ -497,20 +483,11 @@ fn fork_copies_before_the_header_skip_usage_but_at_and_after_count() {
                 &fork_usage(kind, "after", "2026-10-27T06:00:00.000000002Z", 30),
                 &mut acc,
             );
-            acc.seen_pi_usage_keys.finish_fork_read(|_| false);
         });
         assert_eq!(acc.accepted_usage_totals.input_tokens, 50, "{kind}");
         assert_eq!(acc.accepted_usage_totals.request_count, 2, "{kind}");
         assert_eq!(counts.pi_fork_copies_skipped_entries, 1);
         assert_eq!(counts.pi_fork_copies_skipped_tokens, 102);
-        assert_eq!(counts.pi_fork_parent_unseen, 1);
-        assert!(acc
-            .seen_pi_usage_keys
-            .fork
-            .as_ref()
-            .unwrap()
-            .parent_ref
-            .is_none());
         // An ordinary file keeps historical usage, with normal identity.
         let mut ordinary = SnapshotAccumulator::new(SnapshotSource::Pi);
         apply_pi_line(&fork_header(None, FORK_TIME), &mut ordinary);
@@ -520,36 +497,40 @@ fn fork_copies_before_the_header_skip_usage_but_at_and_after_count() {
         );
         assert_eq!(ordinary.accepted_usage_totals.input_tokens, 100);
     }
-}
-
-/// [regress] A copy is judged by its envelope time, by the provider time only
-/// when the envelope has none; an invalid or missing time counts.
-#[test]
-fn fork_cutoff_uses_envelope_then_provider_only_when_envelope_is_absent() {
-    let header = fork_header(Some(PARENT_CANARY), FORK_TIME);
+    // Envelope time wins; only an absent envelope falls back to provider time.
     let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);
-    apply_pi_line(&header, &mut acc);
-    let mut value = fork_usage("message", "envelope", "2026-10-27T05:59:59Z", 100);
-    value["message"]["timestamp"] = serde_json::json!("2026-10-27T07:00:00Z");
-    apply_pi_line(&value, &mut acc); // old envelope, later provider: copied
-    assert_eq!(acc.accepted_usage_totals.input_tokens, 0);
-    value["message"]["responseId"] = serde_json::json!("provider");
-    value["message"]["timestamp"] = serde_json::json!("2026-10-27T05:59:59Z");
-    value.as_object_mut().unwrap().remove("timestamp");
-    apply_pi_line(&value, &mut acc); // absent envelope: provider proves copied
-    assert_eq!(acc.accepted_usage_totals.input_tokens, 0);
-    value["timestamp"] = serde_json::json!("invalid");
-    value["message"]["responseId"] = serde_json::json!("invalid-envelope");
-    apply_pi_line(&value, &mut acc); // invalid envelope cannot prove a copy
-    assert_eq!(acc.accepted_usage_totals.input_tokens, 100);
-    value.as_object_mut().unwrap().remove("timestamp");
-    value["message"]
-        .as_object_mut()
-        .unwrap()
-        .remove("timestamp");
-    value["message"]["responseId"] = serde_json::json!("no-clock");
-    apply_pi_line(&value, &mut acc);
-    assert_eq!(acc.accepted_usage_totals.input_tokens, 200);
+    apply_pi_line(&fork_header(Some(PARENT_CANARY), FORK_TIME), &mut acc);
+    for (i, (envelope, provider, expected)) in [
+        (
+            Some("2026-10-27T05:59:59Z"),
+            Some("2026-10-27T07:00:00Z"),
+            0,
+        ),
+        (None, Some("2026-10-27T05:59:59Z"), 0),
+        (Some("invalid"), Some("2026-10-27T05:59:59Z"), 100),
+        (None, None, 200),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut value = fork_usage("message", &format!("clock-{i}"), FORK_TIME, 100);
+        value.as_object_mut().unwrap().remove("timestamp");
+        value["message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("timestamp");
+        if let Some(at) = envelope {
+            value["timestamp"] = serde_json::json!(at);
+        }
+        if let Some(at) = provider {
+            value["message"]["timestamp"] = serde_json::json!(at);
+        }
+        apply_pi_line(&value, &mut acc);
+        assert_eq!(
+            acc.accepted_usage_totals.input_tokens, expected,
+            "clock {i}"
+        );
+    }
     for at in ["invalid", ""] {
         let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);
         apply_pi_line(&fork_header(Some(PARENT_CANARY), at), &mut acc);
@@ -561,11 +542,22 @@ fn fork_cutoff_uses_envelope_then_provider_only_when_envelope_is_absent() {
             acc.accepted_usage_totals.input_tokens, 100,
             "unknown header clock"
         );
-        let (_, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-            acc.seen_pi_usage_keys.finish_fork_read(|_| true)
-        });
-        assert_eq!(counts.pi_fork_cutoff_unknown, 1);
     }
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);
+    apply_pi_line(&fork_header(Some(PARENT_CANARY), FORK_TIME), &mut acc);
+    let mut copied = fork_usage("usage", "copy", "2026-10-27T05:59:59Z", 100);
+    copied["model"] = serde_json::json!("copied-context-model");
+    apply_pi_line(&copied, &mut acc);
+    assert_eq!(acc.latest_model.as_deref(), Some("copied-context-model"));
+    for kind in ["compaction", "branch_summary"] {
+        apply_pi_line(&fork_usage(kind, kind, FORK_TIME, 20), &mut acc);
+    }
+    assert_eq!(acc.accepted_usage_totals.input_tokens, 40);
+    assert!(acc
+        .usage_buckets
+        .values()
+        .flat_map(|b| b.rows.keys())
+        .all(|k| k.model == "copied-context-model"));
 }
 
 /// [format] A fork persists only its parent flag and local header time, never
@@ -595,22 +587,19 @@ fn fork_round_trip_keeps_only_local_cutoff_fields_and_funds_the_box() {
         .unwrap();
     assert!(fork.has_parent);
     assert_eq!(fork.header_nanos, pi_timestamp_nanos(FORK_TIME));
-    assert!(fork.parent_ref.is_none());
     assert_eq!(body(&decoded.reduction).unwrap(), bytes);
     let cloned = original.accumulator.seen_pi_usage_keys.clone();
-    assert!(cloned.fork.as_ref().unwrap().parent_ref.is_none());
+    assert_eq!(
+        cloned.fork_parts(),
+        original.accumulator.seen_pi_usage_keys.fork_parts()
+    );
 }
 
 /// [format] A Claude or Codex accumulator carrying fork state refuses to encode
 /// instead of dropping it.
 #[test]
-fn non_pi_fork_refuses_instead_of_silently_dropping_and_default_is_empty() {
+fn non_pi_fork_refuses_instead_of_silently_dropping() {
     use crate::durable_tail_codec::DurableEmpty;
-    let ledger = PiLedger {
-        fork: Some(Box::default()),
-        ..PiLedger::default()
-    };
-    assert!(ledger.durable_empty());
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let mut acc = SnapshotAccumulator::new(source);
         acc.seen_pi_usage_keys =
@@ -624,10 +613,10 @@ fn non_pi_fork_refuses_instead_of_silently_dropping_and_default_is_empty() {
 }
 
 /// [format] Decoding a fork charges its box, and the heap bound counts the box
-/// and the parent's capacity.
+/// allocation.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "native heap layout")]
-fn fork_heap_bound_charges_inline_box_allocation_and_parent_capacity() {
+fn fork_heap_bound_charges_inline_box_allocation() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -653,16 +642,7 @@ fn fork_heap_bound_charges_inline_box_allocation_and_parent_capacity() {
     );
     let mut fork = base.clone();
     fork.note_header(&fork_header(Some(PARENT_CANARY), FORK_TIME));
-    let extra = std::mem::size_of::<PiFork>()
-        + std::mem::align_of::<PiFork>()
-        + fork
-            .fork
-            .as_ref()
-            .unwrap()
-            .parent_ref
-            .as_ref()
-            .unwrap()
-            .capacity();
+    let extra = std::mem::size_of::<PiFork>() + std::mem::align_of::<PiFork>();
     for measure in [
         crate::heap_layout_bound::bound::<PiLedger>,
         crate::heap_layout_bound::completed_bound::<PiLedger>,
@@ -671,41 +651,6 @@ fn fork_heap_bound_charges_inline_box_allocation_and_parent_capacity() {
         let after = measure(&fork, usize::MAX).unwrap();
         assert_eq!(after - before, extra);
         assert!(measure(&fork, after - 1).is_none());
-    }
-}
-
-/// [behaviour] The parent is looked up once per Full read, counted when unknown,
-/// and never kept for a later Tail.
-#[test]
-fn fork_parent_membership_is_full_read_only_and_never_retained() {
-    use crate::local_resource_diagnostics::cache_lifecycle;
-    for known in [false, true] {
-        let mut ledger = PiLedger::default();
-        ledger.note_header(&fork_header(Some(PARENT_CANARY), FORK_TIME));
-        let (_, counts) = cache_lifecycle::observe(|| {
-            assert!(ledger.skip_fork_copy(&fork_usage(
-                "message",
-                "old",
-                "2026-10-27T05:00:00Z",
-                10
-            )));
-            ledger.finish_fork_read(|parent| {
-                assert_eq!(parent, PARENT_CANARY);
-                known
-            });
-            // The parent value ends with the Full read. Even another skipped
-            // entry cannot recreate a parent membership count during Tail.
-            assert!(ledger.skip_fork_copy(&fork_usage(
-                "message",
-                "tail-old",
-                "2026-10-27T05:00:00Z",
-                10
-            )));
-            ledger.finish_fork_read(|_| panic!("Tail must not acquire parent history"));
-        });
-        assert_eq!(counts.pi_fork_copies_skipped_entries, 2);
-        assert_eq!(counts.pi_fork_parent_unseen, u64::from(!known));
-        assert!(ledger.fork.as_ref().unwrap().parent_ref.is_none());
     }
 }
 
@@ -720,25 +665,4 @@ fn fork_section_semantics_agree_between_verify_and_decode() {
     let bad = [&original[..prefix], &e.into_bytes()].concat();
     assert_eq!(verify_without_allocation(&bad), Err(Corrupt));
     assert!(take_body(&mut Dec::new(&bad)).is_err());
-}
-
-/// [regress] A skipped copied usage entry still sets the model that later owned
-/// summaries bill under.
-#[test]
-fn copied_top_level_usage_keeps_the_model_for_owned_summaries() {
-    let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);
-    apply_pi_line(&fork_header(Some(PARENT_CANARY), FORK_TIME), &mut acc);
-    let mut copied = fork_usage("usage", "copy", "2026-10-27T05:59:59Z", 100);
-    copied["model"] = serde_json::json!("copied-context-model");
-    apply_pi_line(&copied, &mut acc);
-    assert_eq!(acc.latest_model.as_deref(), Some("copied-context-model"));
-    for kind in ["compaction", "branch_summary"] {
-        apply_pi_line(&fork_usage(kind, kind, FORK_TIME, 20), &mut acc);
-    }
-    assert_eq!(acc.accepted_usage_totals.input_tokens, 40);
-    assert!(acc
-        .usage_buckets
-        .values()
-        .flat_map(|b| b.rows.keys())
-        .all(|k| k.model == "copied-context-model"));
 }
