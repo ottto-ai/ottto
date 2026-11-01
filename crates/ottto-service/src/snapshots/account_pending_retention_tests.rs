@@ -201,8 +201,8 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// [money] Unsafe archived boundaries: the load walk refuses the family and
-/// changes nothing, resident or cold.
+/// [money] Unsafe archived boundaries: the load walk refuses a resident
+/// family and never walks a cold one; neither changes.
 #[test]
 fn account_window_unsafe_boundaries_are_untouched() {
     let (dir, root, base) = retention_fixture();
@@ -220,8 +220,8 @@ fn account_window_unsafe_boundaries_are_untouched() {
             .previous_windows
             .resident_mut()[2]
             .census_window_end = boundary.into();
-        // Cold arm: a cold archive is never walked and nothing changes; the
-        // run the walk would collapse stays visible as `uncollapsed`.
+        // Cold arm: never walked, nothing changes; `uncollapsed` counts the
+        // interior windows of equal-evidence runs, boundaries unchecked.
         for (cold_arm, mut index) in [(false, index.clone()), (true, cold(index))] {
             let before = index.claude_account_family_pending.clone();
             index.collapse_account_pending_windows();

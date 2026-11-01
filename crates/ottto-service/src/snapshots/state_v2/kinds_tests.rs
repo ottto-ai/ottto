@@ -829,8 +829,9 @@ fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
     }
 }
 
-/// One rollover step: archive current under a new boundary, or remove all.
-fn roll(index: &mut ScanIndex, boundary: &str, strict: bool) {
+/// One strict rollover step (no raw holds): archive current under a new
+/// boundary, or remove all.
+fn roll(index: &mut ScanIndex, boundary: &str) {
     if boundary == "gone" {
         index.claude_account_family_pending.clear();
         return;
@@ -845,7 +846,7 @@ fn roll(index: &mut ScanIndex, boundary: &str, strict: bool) {
     if p.census_window_end != boundary {
         let old = p.current.clone();
         p.current.census_window_end = boundary.into();
-        p.archive(old, strict);
+        p.archive(old, true);
     }
 }
 /// [money] window ids are monotonic across a b a and complete family removal.
@@ -887,7 +888,7 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
             }
         }
         cold.generation += 1;
-        roll(&mut cold, boundary, false);
+        roll(&mut cold, boundary);
         let mut tx = cold_db.begin(TxnMode::Write).unwrap();
         delta(cold_baseline, &cold, &mut tx, &mut cold_cx).unwrap();
         let outcome = tx.commit(cold.generation - 1, cold.generation);
@@ -896,7 +897,7 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
         let (_, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
         let mut next = prev.clone();
         next.generation += 1;
-        roll(&mut next, boundary, false);
+        roll(&mut next, boundary);
         let baseline = baseline(&prev, &mut cx).unwrap();
         let mut tx = db.begin(TxnMode::Write).unwrap();
         delta(baseline, &next, &mut tx, &mut cx).unwrap();
@@ -963,8 +964,8 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
         graph.generation += 1;
         // Equal evidence at increasing boundaries: each rollover replaces the
         // stored last endpoint.
-        roll(&mut graph, &at(4), true);
-        roll(&mut graph, &at(5), true);
+        roll(&mut graph, &at(4));
+        roll(&mut graph, &at(5));
         let mut tx = db.begin(TxnMode::Write).unwrap();
         delta(previous, &graph, &mut tx, &mut cx).unwrap();
         assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
@@ -987,7 +988,7 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
     drop(tx);
     let previous = baseline(&graph, &mut cx).unwrap();
     graph.generation += 1;
-    roll(&mut graph, &at(6), true);
+    roll(&mut graph, &at(6));
     let mut tx = cold_db.begin(TxnMode::Write).unwrap();
     let control = mapper::key("account.current", FAMILY, 1).unwrap();
     let h = tx.get(&control).unwrap().unwrap();
@@ -1016,7 +1017,7 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
     drop(tx);
     let previous = baseline(&stale, &mut cx).unwrap();
     stale.generation += 1;
-    roll(&mut stale, &at(7), true);
+    roll(&mut stale, &at(7));
     let mut tx = cold_db.begin(TxnMode::Write).unwrap();
     delta(previous, &stale, &mut tx, &mut cx).unwrap();
     assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
@@ -1024,7 +1025,7 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
     let (current, mut fresh) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
     drop(tx);
     let previous = baseline(&current, &mut fresh).unwrap();
-    roll(&mut stale, &at(8), true);
+    roll(&mut stale, &at(8));
     let before = count("cold_lineage_miss");
     let mut tx = cold_db.begin(TxnMode::Write).unwrap();
     let error = delta(previous, &stale, &mut tx, &mut fresh).err().unwrap();
