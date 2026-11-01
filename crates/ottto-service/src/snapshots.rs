@@ -28799,6 +28799,7 @@ impl OwnedSourceScan {
                 context_read_budget.record(
                     index,
                     &active.candidate,
+                    active.cursor.is_some(),
                     active
                         .parser
                         .reader

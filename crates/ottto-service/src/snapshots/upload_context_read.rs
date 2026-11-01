@@ -146,7 +146,15 @@ impl Budget {
             }
         }
     }
-    pub(super) fn record(&mut self, index: &mut ScanIndex, candidate: &CandidateFile, bytes: u64) {
+    /// A cursor job's bytes are bounded by its own cursor allowance; they
+    /// share this page's room only when this budget admitted the job.
+    pub(super) fn record(
+        &mut self,
+        index: &mut ScanIndex,
+        candidate: &CandidateFile,
+        cursor: bool,
+        bytes: u64,
+    ) {
         if bytes == 0 || !index.file_upload_context_enabled {
             return;
         }
@@ -160,7 +168,8 @@ impl Budget {
                 }
             });
         }
-        if self.admitted.contains(&key) {
+        let admitted = self.admitted.contains(&key);
+        if admitted {
             if first {
                 index.context_read_counts.files += 1;
             }
@@ -168,7 +177,9 @@ impl Budget {
                 index.context_read_counts.local_bytes.saturating_add(bytes);
             self.native_reserved = self.native_reserved.saturating_sub(bytes);
         }
-        self.native_read = self.native_read.saturating_add(bytes);
+        if admitted || !cursor {
+            self.native_read = self.native_read.saturating_add(bytes);
+        }
     }
     pub(super) fn charge_cursor_ordinary(
         &mut self,
