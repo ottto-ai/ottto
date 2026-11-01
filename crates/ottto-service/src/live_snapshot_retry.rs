@@ -271,13 +271,7 @@ impl LiveRetryOwner {
         self.retry.clear();
     }
 
-    pub(super) fn boundary(
-        &mut self,
-        busy: impl Iterator<Item = SnapshotSource>,
-        home: &Path,
-        support: &Path,
-        daemon: &LocalDaemon,
-    ) {
+    pub(super) fn boundary(&mut self, home: &Path, support: &Path, daemon: &LocalDaemon) {
         if !self.enabled {
             return;
         }
@@ -285,7 +279,7 @@ impl LiveRetryOwner {
             self.clear();
             return;
         }
-        self.retry.boundary(busy, Instant::now(), |page| {
+        self.retry.boundary(Instant::now(), |page| {
             // Fresh local credentials are scoped to this one turn. The page
             // owns only the hashed destination and account fence.
             let (device, secret) = load_snapshot_device_credentials()?;
@@ -309,7 +303,6 @@ impl LiveRetryOwner {
         &mut self,
         send: impl FnMut(&mut PreparedRetry) -> Result<SnapshotPageOutcome>,
     ) {
-        self.retry
-            .boundary(std::iter::empty(), Instant::now(), send);
+        self.retry.boundary(Instant::now(), send);
     }
 }

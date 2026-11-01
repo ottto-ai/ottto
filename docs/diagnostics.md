@@ -732,7 +732,7 @@ fragment per source preparation; never Full; fail-open; fragment bytes only
 (from the committed fragment offset to EOF)**. A preparation is a fresh source
 scan frame: the ordinary rotation offers each due source once per sync cycle
 (`snapshot_sync.rs:4569`, index reload `:6051`), after its negotiated cadence and
-backend-backoff gates. Resuming a parked frame's `step` does not reload it.
+backend-backoff gates. Later `step` turns of the same frame do not reload it.
 Each admitted Codex continuation worker page also prepares and reloads its own
 frame (`snapshot_sync/continuation.rs:1078`, `snapshot_sync.rs:6528,6594`); it is
 not limited to once per outer sync cycle. Thus the bound is per preparation,
@@ -913,14 +913,6 @@ reader-health recovery) wakes only after restart: a delay while a recorded hold
 keeps the file discoverable, not an age-based drop. A never-binding account
 keeps usage off the server; token/age disclosure is implemented, and
 bounded-lifetime release remains a SOURCE follow-up.
-
-`counts.source_rotation_serial_fallback` counts failed parking decisions while
-sibling sources wait, drained by that source's next completed page. Closed
-causes are `unsupported_layout` and `bound_refused`. A refused bound (`None`)
-covers both opaque ownership and over-limit frames; it does not distinguish
-their causes. Unavailable shared allowance also uses `bound_refused`.
-Each decision continues the same owned frame serially and counts once; ordinary
-serial turns with no waiting sibling do not count.
 
 ## Context Footprint Discovery
 

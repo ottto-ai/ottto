@@ -3984,13 +3984,22 @@ fn e2_absent_subagent_twin_holds_its_session() {
             )
         };
         let cold = route(&expected);
-        for proof in 0..4 {
+        for proof in 0..5 {
             let mut shorter = prefix.clone();
             if proof == 1 {
-                shorter.push(json!({"type":"last-prompt"}));
+                // The observed exit lines: no request id and no usage.
+                shorter.extend([
+                    json!({"type":"mode"}),
+                    json!({"type":"last-prompt"}),
+                    json!({"type":"cost-state"}),
+                ]);
+            }
+            if proof == 2 {
+                // A suffix row with usage is not request-free.
+                shorter.push(line("c", &at(3), 5));
             }
             write(&shorter_path, &shorter);
-            if proof == 2 {
+            if proof == 3 {
                 use crate::snapshots::claude_request_census::{
                     ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
                 };
@@ -4015,7 +4024,7 @@ fn e2_absent_subagent_twin_holds_its_session() {
             // An older, uncertified writer produced the observed longer copy
             // at the later-born path. Its own session requests still count.
             let mut case_full = full.clone();
-            let birth = if proof == 3 {
+            let birth = if proof == 4 {
                 for value in &mut case_full {
                     if value["type"] == "assistant" {
                         value["version"] = json!("2.0.0");
@@ -4032,14 +4041,19 @@ fn e2_absent_subagent_twin_holds_its_session() {
             };
             let mut items = vec![parse(&longer, Some(birth), &index, &case_full)];
             let mut reasons = BTreeMap::new();
-            assert!(finish_page(
+            let withheld = finish_page(
                 &mut items,
                 &index,
                 TelemetryRead::Loaded,
                 &mut reasons,
-                &Default::default()
-            )
-            .is_empty());
+                &Default::default(),
+            );
+            if proof == 2 {
+                assert_eq!(withheld.len(), 1, "the absent twin stays held");
+                assert_eq!(reasons.get("absent_twin"), Some(&1));
+                continue;
+            }
+            assert!(withheld.is_empty());
             assert!(reasons.is_empty());
             let actual = tag_owned(
                 vec![parse(&longer, Some(birth), &index, &case_full)],

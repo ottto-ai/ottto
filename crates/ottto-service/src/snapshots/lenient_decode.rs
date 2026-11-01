@@ -3142,7 +3142,9 @@ pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn repair_key(value: &str) -> [u8; 32] {
+/// A full 256-bit key over the exact string: equal strings give equal keys
+/// (spelling-sensitive), so a holder or join never keeps the strings.
+pub(super) fn repair_key(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
 }
 
