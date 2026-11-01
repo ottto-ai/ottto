@@ -353,6 +353,9 @@ fn condition_b(class: &str) {
                 crate::locked_state_dir::test_locks::hold(&dir);
                 let index_path = dir.join("scan-index.json");
                 let mut saved = ram.clone();
+                // `ram` carries the v2 store's generation; a v1 save creates
+                // a new file only from generation 0.
+                saved.generation = 0;
                 saved.save(&index_path).unwrap();
                 ScanIndex::load(&index_path).unwrap()
             };

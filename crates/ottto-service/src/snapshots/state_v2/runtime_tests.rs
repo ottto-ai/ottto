@@ -302,7 +302,7 @@ fn f7_off_after_publication_saves_natively_and_unmapped_custody_holds() {
     // [money] Archived account windows stay row-only through the latched OFF
     // load and save, and read back with the pre-switch placement.
     let f = Fixture::new();
-    let window = account_window;
+    let window = member_window;
     let mut pre = ScanIndex::default();
     pre.claude_account_family_pending.insert(
         "family".into(),
@@ -348,6 +348,20 @@ fn account_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindo
         invalid: false,
     }
 }
+/// An account window with one member request set. Decode marks a window
+/// without member requests invalid, so a typed fixture stored as valid needs
+/// one to load back canonical.
+fn member_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindow {
+    let mut window = account_window(day);
+    let hash = format!("{:016x}{}", day, "0".repeat(48));
+    let requests =
+        crate::snapshots::ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([hash]))
+            .unwrap();
+    window.members.insert("member".into(), 1);
+    window.member_requests.insert("member".into(), requests);
+    window.evidence_request_count = 1;
+    window
+}
 /// [money] A held page's subset save commits the working graph's queued cold
 /// rollovers; the committed-load route (every pass load, a growth claim's
 /// load and claim-only save) re-hydrates the same session; the retry's
@@ -377,7 +391,8 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
         let mut window = account_window(day);
         window.account_identifier_hash = account.to_string().repeat(64);
         for (n, member) in members.iter().enumerate() {
-            let hash = format!("{:064x}", u64::from(day) * 16 + n as u64);
+            // Members of one window need distinct 16-hex prefixes.
+            let hash = format!("{:016x}{}", u64::from(day) * 16 + n as u64, "0".repeat(48));
             let mut requests =
                 ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([hash])).unwrap();
             requests.identity_revision = Some(format!("{account}{day:063x}"));
@@ -1269,7 +1284,11 @@ mod hydrate_parity {
             },
         );
         // The shared load tail never walks a cold archive: the window a v1
-        // load collapses stays in the store, counted as uncollapsed.
+        // load collapses stays in the store, counted as uncollapsed. Publish
+        // the decoded graph, as typed_case does: decode marks these
+        // member-less windows invalid, and rows hold only canonical values.
+        let index: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
         let f = Fixture::new();
         publish(&f, &index);
         let (actual, _) = ScanIndex::load_inner_with_support(
@@ -1324,18 +1343,7 @@ mod hydrate_parity {
 
         let mut index = seed();
         // A complete hydrate with raw holds keeps account archives resident.
-        // Decode marks a window without member requests invalid, so give each
-        // window one member request set.
-        let window = |day: u32| {
-            let mut window = account_window(day);
-            let hash = format!("{:064x}", u64::from(day));
-            let requests =
-                s::ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([hash])).unwrap();
-            window.members.insert("member".into(), 1);
-            window.member_requests.insert("member".into(), requests);
-            window.evidence_request_count = 1;
-            window
-        };
+        let window = member_window;
         index.claude_account_family_pending.insert(
             "account-family".into(),
             s::ClaudeAccountFamilyPending {
@@ -1613,6 +1621,8 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     seed.generation = 0;
     let mut current = super::super::money_test_support::publish(&seed, &f.path, progress);
     let committed = current.clone();
+    // Loads keep account archives cold; compare the bytes the store holds.
+    let committed_view = materialized(&committed);
     let committed_generation = current.generation;
     let committed_context = current.upload_context_fingerprint.clone();
     current.upload_context_fingerprint = Some("uncommitted-context".into());
@@ -1639,8 +1649,8 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
         )
     });
     assert_eq!(
-        serde_json::to_vec(&restored).unwrap(),
-        serde_json::to_vec(&committed).unwrap()
+        serde_json::to_vec(&materialized(&restored)).unwrap(),
+        serde_json::to_vec(&committed_view).unwrap()
     );
     assert!(restored.decode_holds.same_as(&committed.decode_holds));
     assert_eq!(
