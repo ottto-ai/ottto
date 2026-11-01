@@ -30759,6 +30759,16 @@ impl OwnedSourceScan {
                 #[cfg(unix)]
                 let (parsed_file, m3_publication, m3_strict_rebind, m3_staged) = match m3_route {
                     Some((context, active, held)) => {
+                        // A certified cursor prefix carries `unsealed` to keep
+                        // its audit debt. It cannot stage a native write, so
+                        // its retained successor still belongs to post-save.
+                        let cursor_post_save = source == SnapshotSource::Codex
+                            && cursor_publication.is_some()
+                            && completed_acquisition.as_ref().is_some_and(|completed| {
+                                completed.unsealed
+                                    && completed.reduction.is_some()
+                                    && completed.durable.owed().is_none()
+                            });
                         let settled = parser.finish_with_repository_identity_prepared(
                             finish_request,
                             completed_acquisition.take(),
@@ -30779,7 +30789,7 @@ impl OwnedSourceScan {
                             settled.native,
                             settled.publication,
                             settled.strict_rebind,
-                            settled.staged,
+                            settled.staged && !cursor_post_save,
                         )
                     }
                     None => (

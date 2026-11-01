@@ -2293,13 +2293,19 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             // Ordinary Claude Tail already commits its M3 record before ACK;
             // Codex's paged cursor still offers its record after index save.
             // Verify that boundary as well as the exact replacement below.
+            let settled = read_record();
             if source == SnapshotSource::ClaudeCode {
-                let settled = read_record();
                 assert_eq!(settled.format, store::FORMAT_V3);
                 assert_eq!(settled.record.certificate.sealed_offset, length);
                 assert_ne!(
                     settled.wire, old_record.wire,
                     "native Tail committed before index save",
+                );
+            } else {
+                assert_eq!(settled.record.certificate.sealed_offset, before);
+                assert_eq!(
+                    settled.wire, old_record.wire,
+                    "certified cursor successor belongs to the post-save writer",
                 );
             }
             index.save(&index_path).unwrap();
