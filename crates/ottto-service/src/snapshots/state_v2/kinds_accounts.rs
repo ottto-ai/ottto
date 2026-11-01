@@ -155,6 +155,74 @@ pub(super) fn hydrate_txn(
 ) -> Result<()> {
     hydrate_filtered(tx, index, cx, None)
 }
+// A family has few rows of a kind, usually one.
+const FAMILY_PAGE: usize = 8;
+/// One family's rows of one kind, every position, in key order.
+fn family_rows(tx: &mut dyn Transaction, kind: &str, family: &str) -> Result<Vec<Header>> {
+    let kind = RecordKind::parse(kind)?;
+    let mut found = Vec::new();
+    let mut after = None;
+    loop {
+        let page = tx.scan_record_key(&kind, family.as_bytes(), after, FAMILY_PAGE)?;
+        let more = page.len() == FAMILY_PAGE;
+        if let Some(RowKey::Record { position, .. }) = page.last().map(|h| &h.key) {
+            after = Some(*position);
+        }
+        found.extend(page);
+        if !more {
+            return Ok(found);
+        }
+    }
+}
+/// A full hydrate visits the whole kind; a filtered one only the requested
+/// families.
+fn visit(
+    tx: &mut dyn Transaction,
+    kind: &str,
+    roots: Option<&BTreeSet<String>>,
+    mut f: impl FnMut(&mut dyn Transaction, Header) -> Result<()>,
+) -> Result<()> {
+    let Some(roots) = roots else {
+        return mapper::rows(tx, kind, f);
+    };
+    for family in roots {
+        for h in family_rows(tx, kind, family)? {
+            f(tx, h)?;
+        }
+    }
+    Ok(())
+}
+/// `mapper::read_map` for the requested names, with its row checks. Its member
+/// count needs the whole kind, so only the full hydrate proves that.
+fn family_map<T: serde::de::DeserializeOwned + Serialize>(
+    tx: &mut dyn Transaction,
+    kind: &str,
+    roots: &BTreeSet<String>,
+) -> Result<std::collections::BTreeMap<String, T>> {
+    let manifest = tx
+        .get(&mapper::key(kind, "", 0)?)?
+        .context("state_v2_missing_manifest")?;
+    mapper::read::<usize>(tx, &manifest, None)?;
+    let mut result = std::collections::BTreeMap::new();
+    visit(tx, kind, Some(roots), |tx, h| {
+        let RowKey::Record {
+            key_bytes,
+            position,
+            ..
+        } = &h.key
+        else {
+            anyhow::bail!("state_v2_record_key")
+        };
+        if *position == 0 {
+            ensure!(key_bytes.is_empty(), "state_v2_manifest_key");
+            return Ok(());
+        }
+        ensure!(*position == 1, "state_v2_member_position");
+        result.insert(dependency_family(key_bytes)?, mapper::read(tx, &h, None)?);
+        Ok(())
+    })?;
+    Ok(result)
+}
 pub(super) fn hydrate_filtered(
     tx: &mut dyn Transaction,
     index: &mut ScanIndex,
@@ -166,7 +234,10 @@ pub(super) fn hydrate_filtered(
     let mut seed = filter.is_none().then_some(&mut cx.digests);
     macro_rules! load {
         ($f:ident, Accounts, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = mapper::read_field_map(tx, $kind, roots, seed.as_deref_mut())?;
+            index.$f = match roots {
+                Some(roots) => mapper::FieldMap::from_rows(family_map(tx, $kind, roots)?),
+                None => mapper::read_field_map(tx, $kind, None, seed.as_deref_mut())?,
+            };
         };
         ($($t:tt)*) => {};
     }
@@ -178,7 +249,7 @@ pub(super) fn hydrate_filtered(
     let mut count = 0;
     let mut controls = 0;
     let mut seen = BTreeSet::new();
-    mapper::rows(tx, "account.current", |tx, h| {
+    visit(tx, "account.current", roots, |tx, h| {
         let RowKey::Record {
             key_bytes,
             position,
@@ -206,9 +277,6 @@ pub(super) fn hydrate_filtered(
             return Ok(());
         }
         count += 1;
-        if roots.is_some_and(|roots| !roots.contains(&family)) {
-            return Ok(());
-        }
         let mut windows = Vec::new();
         for id in &ids {
             let key = mapper::key("account_window", &family, *id)?;
@@ -236,21 +304,18 @@ pub(super) fn hydrate_filtered(
         );
         Ok(())
     })?;
-    ensure!((count, controls) == expected, "accounts_missing_family");
-    cx.account_controls = controls;
+    // The manifest counts every family, so only a full hydrate can compare it.
+    ensure!(
+        roots.is_some() || (count, controls) == expected,
+        "accounts_missing_family"
+    );
+    cx.account_controls = expected.1;
     // Unreferenced windows must not silently disappear on hydration.
-    mapper::rows(tx, "account_window", |_, h| {
-        let RowKey::Record { key_bytes, .. } = &h.key else {
-            anyhow::bail!("accounts_key");
-        };
-        if roots.map_or(true, |r| {
-            dependency_family(key_bytes).is_ok_and(|s| r.contains(&s))
-        }) {
-            ensure!(seen.contains(&h.key), "accounts_orphan_window");
-        }
+    visit(tx, "account_window", roots, |_, h| {
+        ensure!(seen.contains(&h.key), "accounts_orphan_window");
         Ok(())
     })?;
-    mapper::rows(tx, "account.absent_members", |_, h| {
+    visit(tx, "account.absent_members", roots, |_, h| {
         let RowKey::Record {
             key_bytes,
             position,
@@ -261,12 +326,10 @@ pub(super) fn hydrate_filtered(
         };
         let family = dependency_family(key_bytes)?;
         ensure!(*position == 1, "accounts_absent_position");
-        if roots.map_or(true, |r| r.contains(&family)) {
-            ensure!(
-                index.claude_account_family_pending.contains_key(&family),
-                "accounts_orphan_absent"
-            );
-        }
+        ensure!(
+            index.claude_account_family_pending.contains_key(&family),
+            "accounts_orphan_absent"
+        );
         Ok(())
     })?;
     Ok(())

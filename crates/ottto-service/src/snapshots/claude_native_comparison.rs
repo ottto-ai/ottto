@@ -177,7 +177,7 @@ pub(crate) fn selected_page_is_clean(
         && scan.zero_snapshot_usage_evidence_count == 0
         && scan.dropped_usage_record_count == 0
         && !index.bounded_sweep_had_unsettled_upload
-        && !super::claude_effective_duplicate_fence_closed(index)
+        && !index.claude_duplicate_request_witness_overflowed
         && !disposition.duplicate_census.census_invalid
         && !disposition.duplicate_census.fence_after
         && (scan.census_complete

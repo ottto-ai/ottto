@@ -14,7 +14,7 @@ macro_rules! local_switch {
             #[cfg(not(test))]
             {
                 // Pin policy for this process, including worker threads and yields.
-                // Ron changes the marker himself and restarts the daemon to apply it.
+                // The owner changes the marker and restarts the daemon to apply it.
                 static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
             }
@@ -34,8 +34,6 @@ macro_rules! local_switch {
 }
 pub(super) use local_switch;
 
-pub(super) const NAME: &str = "claude_terminal_off_enabled";
-local_switch!(NAME, marker_enables = true, test_default = false);
 /// The same owner marker check for switches whose test policy differs
 /// (the copy-prefix switch, `claude_request_money::e2`).
 pub(in crate::snapshots) fn marker_at(support: &std::path::Path, name: &str) -> bool {
@@ -69,47 +67,5 @@ impl ThreadSwitchForTest {
 impl Drop for ThreadSwitchForTest {
     fn drop(&mut self) {
         self.slot.with(|switch| switch.set(self.previous));
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct ClaudeTerminalOffForTest {
-    _switch: ThreadSwitchForTest,
-}
-#[cfg(test)]
-impl ClaudeTerminalOffForTest {
-    pub(crate) fn enabled() -> Self {
-        Self {
-            _switch: ThreadSwitchForTest::set(&ENABLED, true),
-        }
-    }
-    /// The thread's test policy, ignoring any completion-path override.
-    /// Retained feature fixtures use it to select their containment setup;
-    /// main tests keep the original helper at the default OFF.
-    pub(crate) fn active() -> bool {
-        ENABLED.with(std::cell::Cell::get)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    /// [off=main] Default OFF preserves the main policy and checkpoint contract.
-    #[test]
-    fn machine_switch_defaults_off_and_only_local_regular_marker_enables() {
-        let scratch = crate::test_scratch::ScratchDir::new("terminal-off-policy");
-        assert!(!enabled_at(&scratch));
-        std::fs::write(scratch.join(NAME), b"").unwrap();
-        assert!(enabled_at(&scratch));
-        std::fs::remove_file(scratch.join(NAME)).unwrap();
-        assert!(!enabled_at(&scratch));
-        std::fs::create_dir(scratch.join(NAME)).unwrap();
-        assert!(!enabled_at(&scratch));
-        assert!(!enabled(), "fixture process never consults host marker");
-        let guard = ClaudeTerminalOffForTest::enabled();
-        assert!(enabled());
-        assert!(!std::thread::spawn(enabled).join().unwrap());
-        drop(guard);
-        assert!(!enabled());
     }
 }
