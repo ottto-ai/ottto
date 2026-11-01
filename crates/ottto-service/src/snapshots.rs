@@ -4819,12 +4819,7 @@ fn deserialize_codex_side_requests<'de, D: serde::Deserializer<'de>>(
 fn take_dropped_codex_side_requests() -> u64 {
     DROPPED_CODEX_SIDE_REQUESTS.with(|count| count.replace(0))
 }
-fn valid_codex_protected_owner(owner: &str) -> bool {
-    owner.len() == 64
-        && owner
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
+use crate::hex::is_sha256_lower as valid_codex_protected_owner;
 fn codex_protected_owner(session: &str) -> String {
     sha256_hex(&["codex_protected_owner:v1", &resolve_codex_identity(session)])
 }

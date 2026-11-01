@@ -1217,16 +1217,11 @@ fn warn_answered_body_witness_rejection(
     expected_version: u64,
     echoed_version: Option<u64>,
 ) {
-    use sha2::Digest;
-    let digest = sha2::Sha256::digest(source_session_id.as_bytes());
     let line = format!(
-        "warning: local snapshot head-CAS answer ACK rejected: session_hash={:02x}{:02x}{:02x}{:02x} \
+        "warning: local snapshot head-CAS answer ACK rejected: session_hash={} \
          witness_version={expected_version} echoed_witness_version={} \
          reason=ack_body_witness_mismatch; the next conflict re-records the challenge",
-        digest[0],
-        digest[1],
-        digest[2],
-        digest[3],
+        crate::snapshot_sync::SessionHash::of(source_session_id),
         echoed_version.map_or_else(|| "none".to_string(), |version| version.to_string()),
     );
     eprintln!("{line}");
@@ -1241,12 +1236,7 @@ thread_local! {
 }
 
 fn valid_snapshot_head_token(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
+    value.is_some_and(crate::hex::is_sha256_lower)
 }
 
 fn record_snapshot_ack_occurrences(
@@ -1303,11 +1293,7 @@ fn validate_snapshot_entity_ref(reference: &SnapshotEntityRef) -> Result<()> {
     ) {
         (None, None) => {}
         (Some(version), Some(digest))
-            if matches!(version, 3..=20)
-                && digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) => {}
+            if matches!(version, 3..=20) && crate::hex::is_sha256_lower(digest) => {}
         _ => return Err(anyhow!("snapshot ACK body witness proof is malformed")),
     }
     Ok(())

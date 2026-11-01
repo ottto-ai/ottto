@@ -242,18 +242,11 @@ fn valid_pair(pair: &Pair) -> bool {
         && pair
             .account_identifier_hash
             .as_deref()
-            .is_some_and(strong_hash)
+            .is_some_and(crate::hex::is_sha256_lower)
         && pair
             .organization_identifier_hash
             .as_deref()
-            .is_some_and(|org| org.is_empty() || strong_hash(org))
-}
-
-fn strong_hash(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            .is_some_and(|org| org.is_empty() || crate::hex::is_sha256_lower(org))
 }
 
 fn merge(cache: &mut Cache, entries: &[Entry]) -> bool {
