@@ -5,7 +5,10 @@ name: Linux tests
 # native behavior. A green Linux run is never merge evidence on its own.
 
 on:
+  # Drafts skip both jobs; they run when the PR is marked ready, or on
+  # `gh workflow run linux-tests.yml --ref <branch>`.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
   # Daily main run that refreshes the shared Linux cache; PR refs only restore.
   schedule:
@@ -23,6 +26,7 @@ jobs:
     # Minutes of Linux instead of a Mac round: fmt is the commonest Mac-only
     # failure, and in a merge queue a Mac failure ejects the PR.
     name: Rust format (Linux)
+    if: ${{ !github.event.pull_request.draft }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
@@ -44,6 +48,7 @@ jobs:
 
   rust-linux:
     name: Rust tests (Linux)
+    if: ${{ !github.event.pull_request.draft }}
     # Heap-layout tests run here too: the lib step took 15-27 min in trial
     # runs against 7-12 before.
     timeout-minutes: 60

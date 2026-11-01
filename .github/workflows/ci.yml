@@ -1,7 +1,10 @@
 name: Public CI
 
 on:
+  # Drafts run nothing: ready_for_review starts the run the merge guard waits
+  # for, and the merge queue reruns every required check on the merged commit.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
     types: [checks_requested]
   push:
@@ -23,7 +26,7 @@ on:
         type: boolean
         default: false
       money_equivalence_base:
-        description: Comparison ref (empty uses this branch PR base, otherwise main)
+        description: Comparison ref (empty uses the fork point from this branch PR base, otherwise main)
         type: string
         default: ""
       scan_stack_margin:
@@ -117,16 +120,16 @@ jobs:
         # ottto-service #[serial] tests run one at a time in a second process
         # beside the rest (3 threads), so threads stop idling on serial locks.
         # Six shared-state races appeared above 4 threads in one process.
-        # Branch Mac runs (dispatch) keep going past a failing test binary so
-        # scripts/mac_batch.py can map every failure to a PR; merge_group and
-        # schedule runs still stop at the first failing binary.
+        # Dispatch and merge-queue runs keep going past a failing test binary
+        # so scripts/mac_batch.py report can map every failure to a PR; the
+        # schedule run still stops at the first failing binary.
         # --require-pass is the layout coverage receipt: with
         # OTTTO_REQUIRE_LAYOUT=1 that test passes only on a validated layout,
         # and the step fails unless it printed "... ok" (not ignored, not absent).
         run: >-
           python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1
           --require-pass heap_layout_bound::sampled_scalar_buffer_tests::layout_gate_coverage_receipt
-          ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }}
+          ${{ github.event_name != 'schedule' && '--no-fail-fast' || '' }}
 
       - name: Filtered Rust tests (partial pre-check)
         if: env.OTTTO_CI_TEST_FILTER != ''
@@ -157,7 +160,7 @@ jobs:
     steps: *rust-contract-steps
 
   public-surface:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    if: ${{ !github.event.pull_request.draft && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}
     name: Public surface checks
     timeout-minutes: 30
     runs-on: ubuntu-24.04
@@ -189,7 +192,7 @@ jobs:
 
   dependency-review:
     name: Dependency review
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
@@ -207,7 +210,7 @@ jobs:
           fail-on-severity: moderate
 
   rust-advisories:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    if: ${{ !github.event.pull_request.draft && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}
     name: Rust advisory audit
     timeout-minutes: 10
     runs-on: ubuntu-24.04

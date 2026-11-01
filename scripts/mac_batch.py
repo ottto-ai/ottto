@@ -24,7 +24,8 @@ Usage:
             OTTTO_MAC_DISPATCH_GATE; exit 0 = go, 1 = wait, 3 = stale state),
             push the branch and dispatch ci.yml on it. --dry-run stops after
             the plan and does NOT call the gate (an OK reserves a Mac slot).
-  report    After the run completes: per failing test, which PR(s) touch the
+  report    After a mac-batch or merge-queue run completes (a queued train
+            PR's members are its "train: merge #<n>" commits): per failing test, which PR(s) touch the
             test function, its file or the code under test; per PR whether the
             run counts as its Mac evidence (CLEARED), it must fix and re-run
             (SUSPECT, exit 4), or the run proved nothing for this head
@@ -528,6 +529,29 @@ def parse_trailers(message: str) -> Tuple[Optional[str], List[Tuple[int, str]]]:
     return base, members
 
 
+QUEUE_BRANCH = re.compile(r"^gh-readonly-queue/[^/]+/pr-(\d+)-([0-9a-f]{40})$")
+TRAIN_MERGE = re.compile(r"^train: merge #(\d+)\b")
+
+
+def queue_members(r: Runner, a: argparse.Namespace, branch: str) -> Tuple[str, List[Tuple[int, str]]]:
+    """Base and members of a merge-queue run: the queued PR, or, for a train
+    PR, each member merged by a first-parent "train: merge #<n>" commit."""
+    m = QUEUE_BRANCH.match(branch)
+    if not m:
+        raise Refused(f"{branch} is not a merge-queue branch")
+    number, base = int(m.group(1)), m.group(2)
+    head = gh_json(r, "pr", "view", str(number), "-R", a.repo, "--json", "headRefOid")["headRefOid"]
+    fetch(r, a.remote, [base, head])
+    members = []
+    log = r.git("log", "--first-parent", "--merges", "--format=%P%x00%s", f"{base}..{head}").stdout
+    for line in reversed(log.splitlines()):
+        parents, subject = line.split("\0", 1)
+        t = TRAIN_MERGE.match(subject)
+        if t:
+            members.append((int(t.group(1)), parents.split()[1]))
+    return base, members or [(number, head)]
+
+
 def live_batches(r: Runner, remote: str) -> Dict[str, List[Tuple[int, str]]]:
     out = r.git("ls-remote", remote, f"refs/heads/{BRANCH_PREFIX}*").stdout
     found: Dict[str, List[Tuple[int, str]]] = {}
@@ -839,7 +863,10 @@ def cmd_report(r: Runner, a: argparse.Namespace) -> int:
         print(f"run {a.run} is {run['status']}; report after it completes (poll at most every 5 min)")
         return EXIT_WAIT
     fetch(r, a.remote, [run["headSha"]])
-    base, trailer_members = parse_trailers(r.git("log", "-1", "--format=%B", run["headSha"]).stdout)
+    if run["event"] == "merge_group":
+        base, trailer_members = queue_members(r, a, run["headBranch"])
+    else:
+        base, trailer_members = parse_trailers(r.git("log", "-1", "--format=%B", run["headSha"]).stdout)
     if base is None or not trailer_members:
         raise Refused(f"run {a.run} ({run['headBranch']}) is not a mac-batch run")
     fetch(r, a.remote, [sha for _, sha in trailer_members])
