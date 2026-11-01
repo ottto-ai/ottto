@@ -628,8 +628,12 @@ impl SnapshotAccumulator {
             return;
         };
         if counting.version.is_none() {
-            let version =
-                codex_counting_version::decide(value, counting.evidence, counting.cutover_unix_ms);
+            // Preserve the meaning of historical persisted None cutovers.
+            let version = counting
+                .cutover_unix_ms
+                .map_or(CountingVersion::Legacy, |cutover| {
+                    codex_counting_version::decide(value, counting.evidence, cutover)
+                });
             counting.version = Some(version);
             if version == CountingVersion::V2 {
                 counting.reducer = Some(Box::default());

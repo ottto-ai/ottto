@@ -3155,6 +3155,13 @@ fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
         assert!(seeded
             .iter()
             .all(|(path, _)| index.files.contains_key(&local_index_key(path))));
+        // Retain the real Legacy ACKs before the entries leave the index.
+        for (path, _) in &seeded {
+            assert!(codex_counting_version::tombstone_before_retire(
+                &mut index,
+                &local_index_key(path)
+            ));
+        }
         // The per-pass index loads without the members' entries.
         index.files.clear();
         let (index, result, _) = pages_at(&root, index, &cache, collected_at, || {

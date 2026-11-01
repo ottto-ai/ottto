@@ -464,6 +464,10 @@ pub(crate) struct Grouping {
     accepted_rows_vanished: u64,
     /// Why the caller found no accepted state, when it found none.
     accepted_miss: accepted::UnknownCause,
+    /// X-B1 (Lead B 2026-10-31): bucket rows sent with `copy_invalidated`,
+    /// by bucket start. Empty unless the copy-prefix switch is on and the
+    /// receiver advertised option (ii) retention.
+    copy_invalidated: BTreeMap<String, BTreeSet<RowKey>>,
     failed: Option<Ineligible>,
     /// Requests a `RequestSink` admitted: those the item's transcript holds,
     /// and telemetry-only (auxiliary) ones the reported rebuild added.
@@ -592,6 +596,7 @@ impl Grouping {
             accepted_share_changed: BTreeSet::new(),
             accepted_rows_vanished: 0,
             accepted_miss: accepted::UnknownCause::NoKey,
+            copy_invalidated: BTreeMap::new(),
             failed: None,
             transcript_requests: 0,
             telemetry_only_requests: 0,
@@ -632,6 +637,12 @@ impl Grouping {
             accepted_share_changed: BTreeSet::new(),
             accepted_rows_vanished: 0,
             accepted_miss: self.accepted_miss,
+            copy_invalidated: self
+                .copy_invalidated
+                .iter()
+                .filter(|(start, _)| starts.contains(start.as_str()))
+                .map(|(start, rows)| (start.clone(), rows.clone()))
+                .collect(),
             failed: self.failed,
             transcript_requests: self.transcript_requests,
             telemetry_only_requests: self.telemetry_only_requests,
@@ -932,6 +943,45 @@ pub(crate) fn apply_cut_held_for_test(
     (tagged, evidence.history_held.take())
 }
 
+/// `apply_with_reserved_bytes_for_test` with `flagged` buckets' rows marked
+/// `copy_invalidated` and, for `fallback`, upstream proof lost.
+#[cfg(test)]
+pub(crate) fn apply_copy_invalidated_for_test(
+    item: &mut SnapshotItem,
+    contributions: &[Contribution],
+    accepted: &AcceptedBuckets,
+    flagged: &[&str],
+    fallback: bool,
+    extra_wire_bytes: usize,
+) -> Result<Tagged, Ineligible> {
+    let mut grouping = Grouping::new(bucket_row_count(item));
+    grouping.extra_wire_bytes = extra_wire_bytes;
+    for c in contributions {
+        grouping.add_at(
+            &c.bucket_start,
+            &c.row_key,
+            &c.usage,
+            c.identity.as_ref(),
+            Some(&c.bucket_start),
+        );
+    }
+    if fallback {
+        grouping.lose_upstream_proof_for_test();
+    }
+    for bucket in &item.usage_buckets {
+        if flagged.contains(&bucket.bucket_start.as_str()) {
+            grouping
+                .copy_invalidated
+                .entry(bucket.bucket_start.clone())
+                .or_default()
+                .extend(bucket.model_usage.iter().map(row_key_from_model_usage));
+        }
+    }
+    let known = accepted.get(&item.source_session_id);
+    grouping.accepted_miss = accepted.miss_cause();
+    apply_grouped_with_accepted(item, grouping, known, accepted.retained_enabled())
+}
+
 /// `apply` with each request's own transcript time (`None`: auxiliary),
 /// withdrawing transcript tags first exactly as `tag_item` does.
 #[cfg(test)]
@@ -1049,11 +1099,13 @@ fn apply_grouped_trimmed(
         }
     }
     let mut deferred = defer_retained_rows(item, &mut grouping, proved);
+    let mut copy_marks = CopyMarks(std::mem::take(&mut grouping.copy_invalidated));
     // Marker bytes are constant across every tag selection; markers go on
     // the item only after measurement, as the last change before hashing.
     grouping.extra_wire_bytes = grouping
         .extra_wire_bytes
-        .saturating_add(deferred.marker_bytes());
+        .saturating_add(deferred.marker_bytes())
+        .saturating_add(copy_marks.bytes());
 
     let evidence = grouping
         .rows()
@@ -1189,6 +1241,7 @@ fn apply_grouped_trimmed(
             unpriced.count(&mut counts);
             deferred.drop_stripped(item, &unpriced.keys);
             deferred.mark(item);
+            copy_marks.mark(item, &mut counts);
             deferred.count(item, retained, &mut counts);
             budget::record(&counts);
             untag_groups(&mut grouping, &unpriced.keys);
@@ -1241,6 +1294,7 @@ fn apply_grouped_trimmed(
         unpriced.count(&mut counts);
         deferred.drop_stripped(item, &unpriced.keys);
         deferred.mark(item);
+        copy_marks.mark(item, &mut counts);
         deferred.count(item, retained, &mut counts);
         budget::record(&counts);
         let mut visible = grouping;
@@ -1292,7 +1346,19 @@ fn apply_grouped_trimmed(
     // Markers must fit beside the stripped body; the newest ones are kept.
     // A dropped marker is a stripped proved row, so it counts as a refusal.
     // Measured at the largest refusal count, so the final digits never grow,
-    // and with a final-length fingerprint.
+    // and with a final-length fingerprint. Tombstone flags fit first: an
+    // unfit one is counted and stays tombstoned in the ledger.
+    if !copy_marks.0.is_empty() {
+        item.request_identity_refusals = refusals.saturating_add(deferred.rows.len() as u64);
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        let flags = copy_marks.bytes();
+        let unflagged = grouping
+            .item_bytes(item)
+            .saturating_sub(deferred.marker_bytes())
+            .saturating_sub(flags);
+        copy_marks.keep_newest(MAX_ITEM_BYTES.saturating_sub(unflagged), &mut counts);
+        grouping.extra_wire_bytes -= flags - copy_marks.bytes();
+    }
     let dropped = if deferred.rows.is_empty() {
         0
     } else {
@@ -1305,6 +1371,7 @@ fn apply_grouped_trimmed(
     };
     let refusals = refusals.saturating_add(dropped);
     deferred.mark(item);
+    copy_marks.mark(item, &mut counts);
     deferred.count(item, retained, &mut counts);
     budget::record(&counts);
     item.request_identity_refusals = refusals;
@@ -1319,6 +1386,83 @@ fn apply_grouped_trimmed(
 
 /// Bytes one `identity_retained` member adds to a compact wire row.
 const MARKER_BYTES: usize = r#","identity_retained":true"#.len();
+/// Bytes one `copy_invalidated` member adds to a compact wire row.
+const COPY_INVALIDATED_BYTES: usize = r#","copy_invalidated":true"#.len();
+
+/// X-B1 (Lead B 2026-10-31): bucket rows F5 tombstoned, this pass or earlier
+/// and still tombstoned, flagged so a retaining receiver never re-applies
+/// their retained proof. One bool per bucket row, so bounded by the rows the
+/// item carries; flags are reserved before measurement like markers. The
+/// identity leaf hashes each flag (`row_leaf`).
+struct CopyMarks(BTreeMap<String, BTreeSet<RowKey>>);
+
+impl CopyMarks {
+    fn len(&self) -> usize {
+        self.0.values().map(BTreeSet::len).sum()
+    }
+
+    fn bytes(&self) -> usize {
+        self.len() * COPY_INVALIDATED_BYTES
+    }
+
+    /// Keep the newest buckets' flags within `available` bytes; drops count.
+    fn keep_newest(&mut self, available: usize, counts: &mut budget::Counts) {
+        let before = self.len();
+        while self.bytes() > available {
+            self.0.pop_first();
+        }
+        counts.copy_invalidated_unfit += (before - self.len()) as u64;
+    }
+
+    fn mark(&self, item: &mut SnapshotItem, counts: &mut budget::Counts) {
+        if self.0.is_empty() {
+            return;
+        }
+        for bucket in &mut item.usage_buckets {
+            let Some(rows) = self.0.get(&bucket.bucket_start) else {
+                continue;
+            };
+            for row in &mut bucket.model_usage {
+                if rows.contains(&row_key_from_model_usage(row)) {
+                    row.copy_invalidated = true;
+                    counts.copy_invalidated_rows += 1;
+                }
+            }
+        }
+    }
+}
+
+/// The item's bucket rows to flag: this pass's copy-derived rows and rows
+/// the ledger holds as the `INVALIDATED_PROOF` tombstone.
+fn copy_invalidated_rows(
+    item: &SnapshotItem,
+    copy_derived: &[(i64, RowKey)],
+    accepted: Option<&accepted::AcceptedSession>,
+) -> BTreeMap<String, BTreeSet<RowKey>> {
+    let mut flagged = BTreeMap::<String, BTreeSet<RowKey>>::new();
+    let Some(accepted) = accepted else {
+        return flagged;
+    };
+    for bucket in &item.usage_buckets {
+        let Some(start) = accepted::bucket_key(&bucket.bucket_start) else {
+            continue;
+        };
+        for row in &bucket.model_usage {
+            let key = row_key_from_model_usage(row);
+            if copy_derived
+                .iter()
+                .any(|(at, derived)| *at == start && *derived == key)
+                || accepted.copy_invalidated(start, &key)
+            {
+                flagged
+                    .entry(bucket.bucket_start.clone())
+                    .or_default()
+                    .insert(key);
+            }
+        }
+    }
+    flagged
+}
 
 /// One marked bucket row with today's identities, restored only for display.
 struct DeferredRow {
@@ -1555,6 +1699,104 @@ fn defer_retained_rows(
     deferred
 }
 
+/// The frozen share set of a row whose current tagged shares differ from it.
+fn changed_shares(
+    accepted: &accepted::AcceptedSession,
+    start: i64,
+    row: &RowKey,
+    group: &RowGroup,
+) -> Option<BTreeSet<Option<[u8; 32]>>> {
+    let prior = accepted.row_shares(start, row);
+    // Only a row frozen with tagged proof can constrain later proof.
+    // New rows and rows previously ACKed untagged remain admissible.
+    if prior.is_empty() {
+        return None;
+    }
+    let current = group
+        .by_key
+        .iter()
+        .filter(|(_, amount)| amount.counts != [0; 8])
+        .map(|(key, _)| key.as_ref().map(|key| accepted.authority_hash(key)))
+        .collect::<BTreeSet<_>>();
+    // Resolving an untagged share to the same surviving tagged set is
+    // new proof, not a retag. Missing prior tagged keys still count changed.
+    let resolved_missing = prior.contains(&None)
+        && current == prior.iter().filter(|key| key.is_some()).copied().collect();
+    (current != prior && !resolved_missing).then_some(prior)
+}
+
+/// One copy-derived accepted row the identity pass treated as never
+/// accepted; the caller tombstones it in the durable ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CopyInvalidation {
+    session: String,
+    bucket: i64,
+    row: RowKey,
+}
+
+/// SOURCE 2026-10-31 (#944 xPR F5): proof a copied marker lent must not keep
+/// placing. A frozen row whose shares change and are only accounts copied
+/// markers lent to that very row's requests (ones the copy-prefix switch
+/// re-derived without them) is copy-derived: it is treated as never accepted
+/// (fresh own tags or untagged, never a refusal or marker). Other changed
+/// rows keep #909's refusal, and rows their own evidence still proves are
+/// unchanged.
+fn copy_derived_rows(
+    item: &SnapshotItem,
+    grouping: &Grouping,
+    accepted: Option<&accepted::AcceptedSession>,
+) -> Vec<(i64, RowKey)> {
+    let Some(accepted) = accepted else {
+        return Vec::new();
+    };
+    // Per row: the accounts copied markers lent, and whether every lent
+    // request's own evidence was positively read this pass.
+    let mut lent = BTreeMap::<(i64, RowKey), (BTreeSet<Option<[u8; 32]>>, bool)>::new();
+    for (bucket, row, slot) in super::claude_request_money::e2::copied_marker_lent_rows(item) {
+        if let Some(start) = accepted::bucket_key(bucket) {
+            let (accounts, read) = lent
+                .entry((start, row_key_from_model_usage(&row)))
+                .or_insert_with(|| (BTreeSet::new(), true));
+            accounts.insert(Some(accepted.authority_hash(&slot.lent)));
+            *read &= slot.read;
+        }
+    }
+    if lent.is_empty() {
+        return Vec::new();
+    }
+    let groups = grouping
+        .groups
+        .iter()
+        .filter_map(|(bucket, rows)| Some((accepted::bucket_key(bucket)?, rows)))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    let mut counts = budget::Counts::default();
+    for ((start, row), (lent, read)) in lent {
+        let group = groups.get(&start).and_then(|rows| rows.get(&row));
+        let Some(prior) = group
+            .and_then(|group| changed_shares(accepted, start, &row, group))
+            .filter(|prior| !prior.is_disjoint(&lent))
+        else {
+            continue;
+        };
+        // Lead B Addendum 4: without per-ACK provenance, a freeze holding any
+        // share copied markers did not lend may be a corrected body's, and
+        // evidence this pass could not read may still prove the latest
+        // proof. Both keep #909's protection, counted.
+        if !prior.is_subset(&lent) {
+            counts.copy_derived_mixed_not_invalidated += 1;
+        } else if !read {
+            counts.copy_derived_skipped_evidence_unavailable += 1;
+        } else {
+            rows.push((start, row));
+        }
+    }
+    if !counts.is_empty() {
+        budget::record(&counts);
+    }
+    rows
+}
+
 fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::AcceptedSession>) {
     let Some(accepted) = accepted else {
         return;
@@ -1570,26 +1812,9 @@ fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::
         // the gate (no money or tagging change).
         grouping.accepted_rows_vanished += accepted.vanished_rows(start, rows.keys());
         for (row, group) in rows {
-            let prior = accepted.row_shares(start, row);
-            let current = group
-                .by_key
-                .iter()
-                .filter(|(_, amount)| amount.counts != [0; 8])
-                .map(|(key, _)| key.as_ref().map(|key| accepted.authority_hash(key)))
-                .collect::<BTreeSet<_>>();
-            // Only a row frozen with tagged proof can constrain later proof.
-            // New rows and rows previously ACKed untagged remain admissible.
-            if prior.is_empty() {
+            let Some(prior) = changed_shares(accepted, start, row, group) else {
                 continue;
-            }
-            // Resolving an untagged share to the same surviving tagged set is
-            // new proof, not a retag. Missing prior tagged keys still count changed.
-            let resolved_missing = prior.contains(&None)
-                && current == prior.iter().filter(|key| key.is_some()).copied().collect();
-            let changed = current != prior && !resolved_missing;
-            if !changed {
-                continue;
-            }
+            };
             grouping.accepted_share_changed.insert(bucket.clone());
             let mut kept = BTreeMap::<Option<AuthorityKey>, Amounts>::new();
             for (key, amount) in std::mem::take(&mut group.by_key) {
@@ -2191,6 +2416,7 @@ fn strip(item: &mut SnapshotItem) {
         row.evidence_ref = None;
         row.identity_parts = None;
         row.identity_retained = false;
+        row.copy_invalidated = false;
     }
 }
 
@@ -2530,6 +2756,22 @@ fn deref(
 }
 
 fn row_leaf(row: &SnapshotModelUsage, evidence: &[SnapshotRequestEvidence]) -> Value {
+    let leaf = identity_leaf(row, evidence);
+    if !row.copy_invalidated {
+        return leaf;
+    }
+    // X-B1: the flag reaches content identity, so a body differing only by
+    // it is never suppressed as already accepted.
+    match leaf {
+        Value::Object(mut leaf) => {
+            leaf.insert("copy_invalidated".into(), json!(true));
+            Value::Object(leaf)
+        }
+        _ => json!({"copy_invalidated": true}),
+    }
+}
+
+fn identity_leaf(row: &SnapshotModelUsage, evidence: &[SnapshotRequestEvidence]) -> Value {
     // Option (ii): the receiver's leaf for a row deferring to retained proof.
     if row.identity_retained {
         return json!({"retained": true});
@@ -2752,6 +2994,17 @@ impl OrgMarkers {
 // E2 consumes this compact, native-sequence-ordered placement before any
 // requests aggregate. Marker state is bounded independently of request count.
 pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
+/// A counted request's grain slot (live key, origin), the account a copied
+/// marker lent it, and whether this pass positively read its own evidence.
+#[derive(Clone, Debug)]
+pub(crate) struct LentSlot {
+    pub(crate) key: super::claude_request_money::body::ClaudeLiveKey,
+    pub(crate) origin: Option<super::claude_request_money::body::ClaudeRequestUsageOrigin>,
+    pub(crate) lent: Arc<AuthorityKey>,
+    /// Classified tagged or missing, never refused (unreadable, pending).
+    pub(crate) read: bool,
+}
+crate::heap_layout_bound::fields!(LentSlot; key, origin, lent, read);
 
 #[derive(Clone, Debug)]
 struct AccountRun {
@@ -2785,9 +3038,14 @@ pub(crate) struct RequestAccounts {
     /// The uniform wire account a non-discard unhealthy read cleared (Lead B
     /// Addendum 4); the bound owner admits the Unknown body only if it was its own.
     unhealthy_cleared_account: Option<String>,
+    /// Copy-prefix switch on: per counted request whose account a copied
+    /// marker had lent (the copy decision re-derived it without the marker),
+    /// its grain slot, kept current through telemetry placement, and that
+    /// account (see `copy_derived_rows`).
+    pub(crate) copied_marker_lent: BTreeMap<u64, LentSlot>,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, unhealthy_no_fallback, unhealthy_cleared_account);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending, unhealthy_no_fallback, unhealthy_cleared_account, copied_marker_lent);
 
 /// One account policy for E2. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
@@ -3268,6 +3526,10 @@ pub(crate) fn reconcile_request_accounts(
                 .and_then(|row| *row);
             let identity = request_occurrence_facts(item, request, occurrence, false)
                 .map(|facts| classify_ref(evidence, &facts));
+            let read = matches!(
+                identity,
+                Some(IdentityRef::Tagged(_) | IdentityRef::Missing)
+            );
             let own = match identity {
                 Some(IdentityRef::Tagged(key)) if telemetry.is_some() && key.login.is_some() => {
                     let found = keys.iter().find(|known| key.matches(known));
@@ -3366,6 +3628,16 @@ pub(crate) fn reconcile_request_accounts(
                 account
             };
             occurrence.e2_inherited = account.as_ref().map(|_| accounts.inherited > before);
+            // Own evidence for the lent account itself ends the loan.
+            if let std::collections::btree_map::Entry::Occupied(mut lent) =
+                accounts.copied_marker_lent.entry(sequence)
+            {
+                if account.as_ref() == Some(&lent.get().lent) {
+                    lent.remove();
+                } else {
+                    lent.get_mut().read = read;
+                }
+            }
             place_request_identity(
                 &mut fold,
                 occurrence,
@@ -3896,12 +4168,7 @@ impl<'a> ScanEvidence<'a> {
                 evidence.invalid_logins.insert(key);
                 continue;
             };
-            if let Some(org) = row
-                .request_identity
-                .as_ref()
-                .filter(|identity| identity.disposition == ClaudeIdentityDisposition::Complete)
-                .and_then(|identity| organization_hash(identity).ok().flatten())
-            {
+            if let Some(org) = complete_org(row) {
                 evidence
                     .memberships
                     .entry(login.to_string())
@@ -4062,6 +4329,27 @@ fn organization_hash(identity: &ClaudeRequestIdentityEvidence) -> Result<Option<
             .map(Some)
             .ok_or(()),
     }
+}
+
+/// The org of a row whose request identity is complete, as memberships use.
+fn complete_org(row: &ClaudeLocalOtelEvidence) -> Option<&str> {
+    row.request_identity
+        .as_ref()
+        .filter(|identity| identity.disposition == ClaudeIdentityDisposition::Complete)
+        .and_then(|identity| organization_hash(identity).ok().flatten())
+}
+
+/// A telemetry-only side call's own account: an intact row login with a
+/// complete org (the same checks that establish memberships). `None` when
+/// either is missing or incomplete: the caller keeps the session fallback.
+pub(crate) fn side_call_account(row: &ClaudeLocalOtelEvidence, root: &str) -> AccountPartition {
+    let login = valid_login(row, root)?;
+    let org = complete_org(row)?;
+    Some(Arc::new(AuthorityKey {
+        login: Some(login.to_owned()),
+        org: Some(org.to_owned()),
+        basis: TELEMETRY,
+    }))
 }
 
 /// The row's login when the row itself is intact: D1's capture, count,
@@ -4768,6 +5056,9 @@ pub(crate) struct ScanOutcome {
     pub(crate) sent: usize,
     pub(crate) fallback: usize,
     pub(crate) ineligible: usize,
+    /// Copy-derived accepted rows this pass's bodies treat as never accepted,
+    /// for the sync loop to tombstone through `AcceptedBuckets` before upload.
+    pub(crate) copy_invalidated: Vec<CopyInvalidation>,
 }
 
 const REPORTED: &str = "session_exclusive_reported_usage:v1";
@@ -4934,7 +5225,13 @@ pub(crate) fn apply_scan_with_ownership(
         if item.provenance.collector != "claude_code_jsonl" {
             continue;
         }
-        match tag_item(item, evidence, &mut reported, ownership) {
+        match tag_item(
+            item,
+            evidence,
+            &mut reported,
+            ownership,
+            &mut outcome.copy_invalidated,
+        ) {
             Some(Ok(Tagged::Sent { .. })) => outcome.sent += 1,
             Some(Ok(Tagged::Fallback { .. })) => outcome.fallback += 1,
             Some(Err(_)) | None => outcome.ineligible += 1,
@@ -5261,6 +5558,7 @@ fn tag_item(
     evidence: &ScanEvidence<'_>,
     reported: &mut BTreeMap<String, Grouping>,
     ownership: &TranscriptOwnership<'_>,
+    invalidated_rows: &mut Vec<CopyInvalidation>,
 ) -> Option<Result<Tagged, Ineligible>> {
     let accepted = evidence
         .accepted_buckets
@@ -5301,13 +5599,37 @@ fn tag_item(
             .wire_size_reservation
             .map_or(0, |reserve| reserve(item));
         grouping.accepted_miss = miss;
-        let tagged = apply_cut(item, grouping, evidence, accepted, retained);
+        let copy_derived = copy_derived_rows(item, &grouping, accepted);
+        // Like `identity_retained`, only a receiver advertising option (ii)
+        // retention mirrors the flag in its identity leaf (and only it holds
+        // proof to drop). Switch off sends no flag, so its bytes stay main's.
+        if retained && super::claude_request_money::e2::resumed_prefix_enabled() {
+            grouping.copy_invalidated = copy_invalidated_rows(item, &copy_derived, accepted);
+        }
+        let invalidated = accepted
+            .filter(|_| !copy_derived.is_empty())
+            .map(|accepted| accepted.invalidated(&copy_derived));
+        let tagged = apply_cut(
+            item,
+            grouping,
+            evidence,
+            invalidated.as_ref().or(accepted),
+            retained,
+        );
         if tagged.is_err() {
             (
                 item.source_started_at,
                 item.source_ended_at,
                 item.source_last_activity_at,
             ) = lifecycle;
+        } else {
+            invalidated_rows.extend(copy_derived.into_iter().map(|(bucket, row)| {
+                CopyInvalidation {
+                    session: item.source_session_id.clone(),
+                    bucket,
+                    row,
+                }
+            }));
         }
         // A cap failure cannot authorize a uniform starting-account rewrite.
         // The budget's proved subset or full strip is the final identity body.

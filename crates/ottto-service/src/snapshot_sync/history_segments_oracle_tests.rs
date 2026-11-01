@@ -155,7 +155,7 @@ fn segmented_session_cold_full_ram_and_restored_tail_agree() {
         let scanner = E2ScanFixture::default();
         disk.begin(&scanner, SnapshotSource::ClaudeCode);
         let mut warm = c.raw(&scanner, ScanIndex::default(), 100, true, &[]);
-        warm.enrich_with(&c, None, Some((&segments, now)));
+        warm.enrich_with_segments(&c, None, Some((&segments, now)));
         warm.finish();
         let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
         assert!(disk.records() > 0, "the warm owner persists its records");
@@ -177,7 +177,7 @@ fn segmented_session_cold_full_ram_and_restored_tail_agree() {
             (0, 1, 0),
         );
         for page in &mut pages {
-            page.enrich_with(&c, None, Some((&segments, now)));
+            page.enrich_with_segments(&c, None, Some((&segments, now)));
             page.finish();
         }
         compare_claude_uploads(&pages);

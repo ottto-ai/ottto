@@ -52,6 +52,23 @@ pub(crate) struct Counts {
     pub(crate) retained_missing_unfit: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) proved_rows_capped: u64,
+    /// Copy-prefix switch on: accepted rows whose proof a copied marker lent
+    /// (SOURCE 2026-10-31, #944 xPR F5), tombstoned once per row.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) copy_derived_proof_invalidated: u64,
+    /// Lent rows kept on #909 per pass (Lead B Addendum 4): an OFF-era freeze
+    /// mixing lent and other shares, or lent requests whose own evidence this
+    /// pass could not read.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) copy_derived_mixed_not_invalidated: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) copy_derived_skipped_evidence_unavailable: u64,
+    /// X-B1: bucket rows sent with `copy_invalidated`, and tombstoned rows
+    /// whose flag did not fit beside a stripped body (still tombstoned).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) copy_invalidated_rows: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) copy_invalidated_unfit: u64,
     /// Settled-history segment entries above the stated design maximum.
     /// An alarm only: segment entries are never evicted by count.
     #[serde(skip_serializing_if = "is_zero")]
@@ -62,7 +79,7 @@ impl Counts {
         self == &Self::default()
     }
 }
-const COUNTER_COUNT: usize = 19;
+const COUNTER_COUNT: usize = 24;
 #[cfg(not(test))]
 static COUNTERS: [AtomicU64; COUNTER_COUNT] = [const { AtomicU64::new(0) }; COUNTER_COUNT];
 #[cfg(test)]
@@ -101,6 +118,11 @@ pub(super) fn record(counts: &Counts) {
             counts.retained_set_cleared,
             counts.retained_missing_unfit,
             counts.proved_rows_capped,
+            counts.copy_derived_proof_invalidated,
+            counts.copy_derived_mixed_not_invalidated,
+            counts.copy_derived_skipped_evidence_unavailable,
+            counts.copy_invalidated_rows,
+            counts.copy_invalidated_unfit,
             counts.accepted_segments_over_design,
         ]) {
             let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(value)));
@@ -108,7 +130,7 @@ pub(super) fn record(counts: &Counts) {
     });
 }
 pub(super) fn take_counts() -> Counts {
-    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, accepted_state_evicted, same_as_parent, differs, unpriced_part_untagged, accepted_row_vanished, no_key, epoch_changed, untracked_session, incomplete, retained_marker_rows, retained_proof_missing_received, retained_set_cleared, retained_missing_unfit, proved_rows_capped, accepted_segments_over_design] =
+    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, accepted_state_evicted, same_as_parent, differs, unpriced_part_untagged, accepted_row_vanished, no_key, epoch_changed, untracked_session, incomplete, retained_marker_rows, retained_proof_missing_received, retained_set_cleared, retained_missing_unfit, proved_rows_capped, copy_derived_proof_invalidated, copy_derived_mixed_not_invalidated, copy_derived_skipped_evidence_unavailable, copy_invalidated_rows, copy_invalidated_unfit, accepted_segments_over_design] =
         counters(|counters| counters.each_ref().map(|counter| counter.swap(0, Relaxed)));
     Counts {
         retained_buckets,
@@ -133,6 +155,11 @@ pub(super) fn take_counts() -> Counts {
         retained_set_cleared,
         retained_missing_unfit,
         proved_rows_capped,
+        copy_derived_proof_invalidated,
+        copy_derived_mixed_not_invalidated,
+        copy_derived_skipped_evidence_unavailable,
+        copy_invalidated_rows,
+        copy_invalidated_unfit,
         accepted_segments_over_design,
     }
 }
