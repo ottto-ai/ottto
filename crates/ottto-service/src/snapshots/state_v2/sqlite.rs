@@ -818,6 +818,13 @@ impl Sqlite {
         }
     }
     #[cfg(test)]
+    pub(super) fn validate_references(&self) -> Result<()> {
+        references::verify_counts(
+            self.conn()?,
+            self.references.context("reference_extractor_missing")?,
+        )
+    }
+    #[cfg(test)]
     pub(super) fn validate_parts(&mut self) -> Result<()> {
         let conn = self.conn()?;
         // A bounded row scan verifies all owner lengths/digests. The separate
@@ -1205,7 +1212,7 @@ pub(super) fn disk_full(error: &anyhow::Error) -> bool {
                 .is_some_and(|e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))
     })
 }
-const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
+pub(super) const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
 const SAVE_CEILING_BYTES: u64 = 256 * 1024 * 1024;
 impl Txn<'_> {
     fn charge(&mut self, bytes: u64, rows: u64, pages: u64) -> Result<()> {

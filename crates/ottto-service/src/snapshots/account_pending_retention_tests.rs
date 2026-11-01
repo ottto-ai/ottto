@@ -471,6 +471,15 @@ fn account_window_opaque_holds_preserve_history_and_its_save_budget() {
     assert_eq!(loaded.claude_account_window_retention.windows_collapsed, 0);
     assert_eq!(loaded.claude_account_window_retention.window_bytes_saved, 0);
     lenient_decode::check_held_output(&loaded).unwrap();
+    let (reopened, counts) = state_v2::compact_reopened_for_test(&loaded);
+    assert_eq!(
+        counts,
+        json!({"windows_removed": 0, "families_refused": 0, "families_done": 0})
+    );
+    assert_eq!(
+        serde_json::to_vec(&reopened.claude_account_family_pending).unwrap(),
+        serde_json::to_vec(&loaded.claude_account_family_pending).unwrap()
+    );
     loaded
         .claude_account_family_pending
         .get_mut(&root)
@@ -617,9 +626,20 @@ fn account_window_placement_parity_with_two_endpoint_retention() {
         );
 
         let summary = legacy.claude_account_family_pending[&root].history_summary();
+        let (reopened, counts) = state_v2::compact_reopened_for_test(&legacy);
+        assert_eq!(counts["windows_removed"], windows.len() - newest.len());
+        assert_eq!(counts["families_done"], 1);
+        assert_eq!(counts["families_refused"], 0);
+        assert_eq!(
+            reopened.claude_account_family_pending[&root]
+                .previous_windows
+                .resident(),
+            &newest
+        );
         let expected = placement(legacy.clone(), &root);
         assert_eq!(!expected.1, retires, "nonvacuous {history}");
         for (arm, index) in [
+            ("v2 compacted reopened", reopened),
             ("new rolled", new_rolled.clone()),
             ("new collapsed", new_collapsed),
             ("cold legacy", cold(legacy)),
