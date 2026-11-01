@@ -552,6 +552,140 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
                 .values()
                 .all(|r| r.identity_revision.is_some())));
 }
+/// [money] Cold usage pending stores what the resident graph stores: a page
+/// loads only its own families, a sibling subset saves one of them, the
+/// working graph loads another, changes it, removes a third and saves with no
+/// Unknown refusal; the reload equals the resident run. The running total is
+/// the fold of the rows after hydrate and after restart. A whole-kind load
+/// joins every family, and settling returns the unchanged one to its head.
+#[test]
+fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
+    use crate::snapshots::usage_pending::{tests::family, Families, UsagePending};
+    let total = |families: &Families| UsagePending::from(families.clone()).total_occurrences();
+    let roots =
+        |names: &[&str]| -> BTreeSet<String> { names.iter().map(|r| (*r).into()).collect() };
+    let run = |cold: bool| {
+        let f = Fixture::new();
+        let mut pre = ScanIndex::default();
+        for (root, members) in [("r1", 2), ("r2", 3), ("r3", 4), ("r4", 2)] {
+            pre.claude_usage_family_pending
+                .insert(root.into(), family("w1", members, false));
+        }
+        f.import_graph(Some(&pre));
+        fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+        let loaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+        let stored = materialized(&loaded).claude_usage_family_pending.clone();
+        assert_eq!(*stored, *pre.claude_usage_family_pending);
+        let mut working = if cold { loaded } else { materialized(&loaded) };
+        let usage = &working.claude_usage_family_pending;
+        assert_eq!(usage.cold().is_some(), cold);
+        assert_eq!(usage.total_occurrences(), total(&stored));
+        assert_eq!(
+            usage.roots().collect::<Vec<_>>(),
+            stored.keys().collect::<Vec<_>>()
+        );
+        let committed = working.clone();
+
+        // The page loads r1 alone; r2 stays Unknown, never absent.
+        load_usage(&mut working, Some(&roots(&["r1"]))).unwrap();
+        assert_eq!(
+            working.claude_usage_family_pending.family("r2").is_err(),
+            cold
+        );
+        let usage = &mut working.claude_usage_family_pending;
+        usage.family_mut("r1").unwrap().unwrap().invalid = true;
+        let mut subset = working.committable_subset_with_local_holds(
+            &committed,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert!(save_with(&f.path, &mut subset).unwrap());
+
+        // The working graph loads r2 after the sibling's save, changes it
+        // and removes r3; r1 is still its loaded value and r4 a head.
+        working.generation = subset.generation;
+        load_usage(&mut working, Some(&roots(&["r2"]))).unwrap();
+        let usage = &mut working.claude_usage_family_pending;
+        usage.family_mut("r2").unwrap().unwrap().census_window_end = "w2".into();
+        usage.discard("r3");
+        let mut checkpoint = working.committable_subset_with_local_holds(
+            &subset,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert!(save_with(&f.path, &mut checkpoint).unwrap());
+
+        // A join loads every family; settling keeps only the changed ones.
+        working.generation = checkpoint.generation;
+        load_usage(&mut working, None).unwrap();
+        let joined = working.claude_usage_family_pending.all().unwrap().clone();
+        settle_usage(&mut working, &BTreeSet::new());
+        if let Some(cold) = working.claude_usage_family_pending.cold() {
+            assert_eq!(cold.loaded().keys().collect::<Vec<_>>(), ["r1", "r2"]);
+        }
+        assert_eq!(
+            working.claude_usage_family_pending.family("r4").is_err(),
+            cold
+        );
+
+        let reloaded = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+        let families = materialized(&reloaded).claude_usage_family_pending.clone();
+        assert_eq!(*families, joined);
+        assert_eq!(
+            reloaded.claude_usage_family_pending.total_occurrences(),
+            total(&families)
+        );
+        assert_eq!(reloaded.claude_usage_family_pending.cold().is_some(), cold);
+        families.resident().unwrap().clone()
+    };
+    let cold = run(true);
+    assert_eq!(cold, run(false));
+    let mut expected = Families::from([
+        ("r1".to_owned(), family("w1", 2, false)),
+        ("r2".to_owned(), family("w2", 3, false)),
+        ("r4".to_owned(), family("w1", 2, false)),
+    ]);
+    expected.get_mut("r1").unwrap().invalid = true;
+    assert_eq!(cold, expected);
+}
+
+/// [money] A row deleted out of band makes the page's keyed load refuse as a
+/// whole (counted): no family of the page is applied and the deleted family
+/// stays discoverable, Unknown rather than absent.
+#[test]
+fn cold_usage_pending_out_of_band_delete_refuses_the_whole_page() {
+    use crate::snapshots::usage_pending::tests::family;
+    let f = Fixture::new();
+    let mut pre = ScanIndex::default();
+    for root in ["r1", "r2"] {
+        pre.claude_usage_family_pending
+            .insert(root.into(), family("w1", 2, false));
+    }
+    f.import_graph(Some(&pre));
+    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    let mut working = load_with(&f.path, false, &ClaudeMapper).unwrap().unwrap();
+    assert!(working.claude_usage_family_pending.cold().is_some());
+    with_session_db(&working, |db| {
+        let key = mapper::key("usage.pending", "r2", 1).unwrap();
+        sqlite::delete_row_elsewhere_for_test(db, &key);
+    });
+    let unknown = || {
+        telemetry::latest_for_test("usage_pending_unknown")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    let before = unknown();
+    let page: BTreeSet<String> = ["r1".into(), "r2".into()].into();
+    assert!(load_usage(&mut working, Some(&page)).is_err());
+    assert!(unknown() > before);
+    let usage = &working.claude_usage_family_pending;
+    assert!(usage.cold().unwrap().loaded().is_empty());
+    assert!(usage.family("r1").is_err());
+    assert!(usage.contains_key("r2"));
+    assert!(usage.family("r2").is_err());
+}
 /// [format] f6 explicit forget deletes all artifacts, invalidates stale clones,
 /// and exposes only committed file membership to the restart-record sweep.
 #[test]

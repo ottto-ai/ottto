@@ -2074,7 +2074,8 @@ fn demotion_after_same_call_reproof_binds_current_witness() {
         &mut index.claude_usage_family_pending,
         APC_WINDOW,
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
+    )
+    .unwrap();
     let observations = ClaudeNativeObservations {
         counts,
         census_window_end: APC_WINDOW.to_string(),

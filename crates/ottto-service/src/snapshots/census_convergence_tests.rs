@@ -161,32 +161,35 @@ fn claude_family_pending_reobservation_stays_exact_within_a_window() {
     let family_root = claude_snapshot_family_root(&full);
 
     // An identical later page keeps the family valid.
-    let mut pending = BTreeMap::new();
+    let mut pending = UsagePending::default();
     for _ in 0..2 {
         accumulate_claude_usage_family_pending_with_limit(
             std::slice::from_ref(&full),
             &mut pending,
             WINDOW,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        );
+        )
+        .unwrap();
     }
     assert!(!pending[&family_root].invalid);
 
     // Growth or shrinkage on a later page of the same window invalidates.
     for pages in [[&prefix, &full], [&full, &prefix]] {
-        let mut pending = BTreeMap::new();
+        let mut pending = UsagePending::default();
         accumulate_claude_usage_family_pending_with_limit(
             std::slice::from_ref(pages[0]),
             &mut pending,
             WINDOW,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        );
+        )
+        .unwrap();
         let counts = accumulate_claude_usage_family_pending_with_limit(
             std::slice::from_ref(pages[1]),
             &mut pending,
             WINDOW,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        );
+        )
+        .unwrap();
         assert!(pending[&family_root].invalid);
         assert_eq!(
             counts,
@@ -198,19 +201,21 @@ fn claude_family_pending_reobservation_stays_exact_within_a_window() {
     }
 
     // A new census window starts over.
-    let mut pending = BTreeMap::new();
+    let mut pending = UsagePending::default();
     accumulate_claude_usage_family_pending_with_limit(
         std::slice::from_ref(&prefix),
         &mut pending,
         OLDER_WINDOW,
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
+    )
+    .unwrap();
     let counts = accumulate_claude_usage_family_pending_with_limit(
         std::slice::from_ref(&full),
         &mut pending,
         WINDOW,
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
+    )
+    .unwrap();
     assert!(!pending[&family_root].invalid);
     assert_eq!(counts.page_invalidated_member_changed_count, 0);
     assert_eq!(pending[&family_root].census_window_end, WINDOW);
