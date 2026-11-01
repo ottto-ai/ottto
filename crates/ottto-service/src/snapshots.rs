@@ -42376,9 +42376,9 @@ impl PiLedger {
     /// The first header that names a parent marks the file a fork. Pi writes
     /// one header, as the first line.
     fn note_header(&mut self, value: &Value) {
-        let Some(_) = string_at(value, &["parentSession"]).filter(|p| !p.is_empty()) else {
+        if !string_at(value, &["parentSession"]).is_some_and(|p| !p.is_empty()) {
             return;
-        };
+        }
         self.fork = Some(Box::new(PiFork {
             has_parent: true,
             header_nanos: pi_timestamp_value(value.get("timestamp"))
