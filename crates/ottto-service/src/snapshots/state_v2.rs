@@ -110,6 +110,14 @@ struct Identity {
     binding: super::scan_index_persistence::Binding,
     fence_generation: u64,
 }
+
+/// Sources whose index routes through this store. The set only grows: a
+/// published route's custody wins, and dropping its source here would let v1
+/// load the frozen JSON. Removing a source needs an explicit export back to
+/// v1, never an edit to this set.
+fn v2_on(source: super::scan_index_persistence::Source) -> bool {
+    matches!(source, super::scan_index_persistence::Source::Claude)
+}
 const INLINE_BYTES: usize = 512;
 const PART_BYTES: usize = 256 * 1024;
 const VALUE_BYTES: u64 = 64 * 1024 * 1024;

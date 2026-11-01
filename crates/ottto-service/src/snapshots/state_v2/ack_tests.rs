@@ -1,3 +1,5 @@
+use super::super::super::scan_index_persistence::Source;
+use super::super::money_test_support::synthetic_file;
 use super::*;
 
 fn progress(generation: u64, body: &str) -> Vec<u8> {
@@ -149,8 +151,8 @@ fn v1_readable_progress_seals_without_rewriting_bytes() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-v1-permissions");
     let parent = scratch.join("a".repeat(64));
     std::fs::create_dir(&parent).unwrap();
-    let index = parent.join("claude_code-synthetic-scan-index.json");
-    let path = parent.join("claude_code-synthetic-scan-index-upload-progress.json");
+    let index = parent.join(synthetic_file(Source::Claude, ".json"));
+    let path = parent.join(synthetic_file(Source::Claude, "-upload-progress.json"));
     let bytes = serde_json::to_vec(&serde_json::json!({"schema_version":3,
         "destination_namespace_hash":"a".repeat(64),"generation":1}))
     .unwrap();
@@ -180,8 +182,8 @@ fn obsolete_unpublished_seal_preserves_custody_then_retries_after_v1_advances() 
     let scratch = crate::test_scratch::ScratchDir::canonical("v2-ack-obsolete-import");
     let parent = scratch.join("a".repeat(64));
     std::fs::create_dir(&parent).unwrap();
-    let index = parent.join("claude_code-synthetic-scan-index.json");
-    let path = parent.join("claude_code-synthetic-scan-index-upload-progress.json");
+    let index = parent.join(synthetic_file(Source::Claude, ".json"));
+    let path = parent.join(synthetic_file(Source::Claude, "-upload-progress.json"));
     let progress = |generation| {
         serde_json::to_vec(&serde_json::json!({"schema_version":3,
         "destination_namespace_hash":"a".repeat(64),"generation":generation}))

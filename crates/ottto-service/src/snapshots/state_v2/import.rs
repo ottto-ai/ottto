@@ -1,4 +1,4 @@
-//! Pre-publication pacing and the Claude semantic mapper boundary.
+//! Pre-publication pacing and the semantic mapper boundary.
 use super::*;
 use anyhow::bail;
 use std::path::Path;
@@ -42,63 +42,39 @@ impl Pace {
 /// Raw inventory and parity proof precede publication. The four semantic
 /// adapters share a transaction and context in `kinds`; this boundary owns
 /// their integration with runtime CAS.
-pub(super) trait Mapper {
-    /// Emit ALL private text from key, fixed/header, labels/aliases and raw
-    /// holds, as well as packed values. Replacements must retain none silently.
-    fn private_paths(
-        header: &Header,
-        value: &dyn Value,
-        paths: &mut dyn FnMut(&str) -> Result<()>,
-    ) -> Result<()>;
+pub(super) struct Mapper;
+impl Mapper {
     /// Enumerate the complete reference list packed in this row, including
     /// repeated edges. Shared values must not reference other shared values.
-    fn references(
-        header: &Header,
-        value: &dyn Value,
-        refs: &mut dyn FnMut(&RowKey) -> Result<()>,
-    ) -> Result<()>;
-    fn inventory_context(&self, path: &Path) -> std::result::Result<Option<Original>, Pause>;
-    fn import_generation(&self, index: &ScanIndex) -> Result<u64> {
-        Ok(index.generation)
-    }
-    fn import_graph<S: Store>(
-        &self,
-        store: &mut S,
-        index: &ScanIndex,
-        original: Option<&Original>,
-    ) -> Result<KindCx>;
-    /// Read every semantic row through Transaction::read_value, verifying
-    /// value digests while decoding. Never return
-    /// a partially hydrated graph or normalize unknown raw holds away.
-    fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)>;
-}
-/// Composed semantic mapper.
-pub(super) struct ClaudeMapper;
-impl Mapper for ClaudeMapper {
-    fn references(
+    pub(super) fn references(
         header: &Header,
         value: &dyn Value,
         refs: &mut dyn FnMut(&RowKey) -> Result<()>,
     ) -> Result<()> {
         kinds::references(header, value, refs)
     }
-    fn private_paths(
+    /// Emit ALL private text from key, fixed/header, labels/aliases and raw
+    /// holds, as well as packed values. Replacements must retain none silently.
+    pub(super) fn private_paths(
         header: &Header,
         value: &dyn Value,
         paths: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<()> {
         kinds::private_paths(header, value, paths)
     }
-    fn inventory_context(&self, path: &Path) -> std::result::Result<Option<Original>, Pause> {
+    pub(super) fn inventory_context(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<Option<Original>, Pause> {
         Original::read(path).map(Some)
     }
-    fn import_generation(&self, index: &ScanIndex) -> Result<u64> {
+    pub(super) fn import_generation(&self, index: &ScanIndex) -> Result<u64> {
         index
             .generation
             .checked_add(1)
             .ok_or_else(|| Pause::Oversize.into())
     }
-    fn import_graph<S: Store>(
+    pub(super) fn import_graph<S: Store>(
         &self,
         store: &mut S,
         index: &ScanIndex,
@@ -123,7 +99,10 @@ impl Mapper for ClaudeMapper {
         let mut tx = store.begin(TxnMode::Read)?;
         verify_normalized_at(&mut tx, index, original, identity.binding, generation)
     }
-    fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
+    /// Read every semantic row through Transaction::read_value, verifying
+    /// value digests while decoding. Never return
+    /// a partially hydrated graph or normalize unknown raw holds away.
+    pub(super) fn hydrate_context<S: Store>(&self, store: &mut S) -> Result<(ScanIndex, KindCx)> {
         let mut tx = store.begin(TxnMode::Read)?;
         let header = tx
             .get(&RowKey::Meta("identity".into()))?
@@ -132,14 +111,9 @@ impl Mapper for ClaudeMapper {
         let mut bytes = Vec::new();
         tx.read_value(&header, &mut bytes)?;
         let identity: Identity = serde_json::from_slice(&bytes)?;
-        anyhow::ensure!(
-            identity.binding.source == super::super::scan_index_persistence::Source::Claude,
-            Hold::ForeignBinding
-        );
+        anyhow::ensure!(v2_on(identity.binding.source), Hold::ForeignBinding);
         kinds::hydrate_txn(&mut tx, identity.binding)
     }
-}
-impl ClaudeMapper {
     /// The one production save: merge current CAS custody, then run the
     /// semantic delta under the resident committed context. Emit the complete
     /// dirty delta with per-key SQLite header reads. Saves above 5k rows /
@@ -920,7 +894,10 @@ mod application_cases {
             let parent = dir.join("a".repeat(64));
             fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
             Self {
-                path: parent.join("claude_code-synthetic-scan-index.json"),
+                path: parent.join(money_test_support::synthetic_file(
+                    super::super::super::scan_index_persistence::Source::Claude,
+                    ".json",
+                )),
                 dir,
             }
         }
@@ -998,7 +975,7 @@ mod application_cases {
             db.reference_extractor(kinds::references);
             db.control("identity", &identity).unwrap();
             db.control("generation", &generation).unwrap();
-            let verified = ClaudeMapper
+            let verified = Mapper
                 .import_graph(&mut db, &index, Some(&original))
                 .unwrap();
             assert_eq!(
@@ -1086,7 +1063,7 @@ mod application_cases {
             db.reference_extractor(kinds::references);
             db.control("identity", &identity).unwrap();
             db.control("generation", &0_u64).unwrap();
-            let result = ClaudeMapper.import_graph(&mut db, &index, Some(&original));
+            let result = Mapper.import_graph(&mut db, &index, Some(&original));
             let key = mapper::key("scan_state.traversal", "", 0).unwrap();
             if target > 16 * 1024 * 1024 {
                 let error = result.err().unwrap();
@@ -1111,7 +1088,7 @@ mod application_cases {
             let stored = mapper::bytes(&mut tx, &header).unwrap();
             assert_eq!(codec::expand(&stored, value_cap(&key)).unwrap(), expected);
             drop(tx);
-            let restored = ClaudeMapper.hydrate_context(&mut db).unwrap().0;
+            let restored = Mapper.hydrate_context(&mut db).unwrap().0;
             assert_eq!(serde_json::to_vec(&restored.traversal).unwrap(), expected);
             original.capture_progress(&c.path).unwrap();
             original.preserve(&c.path).unwrap();
@@ -1166,7 +1143,7 @@ mod application_cases {
         db.reference_extractor(kinds::references);
         db.control("identity", &identity).unwrap();
         db.control("generation", &9_u64).unwrap();
-        ClaudeMapper
+        Mapper
             .import_graph(&mut db, &index, Some(&original))
             .unwrap();
         original
@@ -1200,9 +1177,10 @@ mod application_cases {
     #[test]
     fn original_progress_requires_owner_and_unchanged_bytes_and_baseline() {
         let c = Corpus::new();
-        let progress_path = c
-            .path
-            .with_file_name("claude_code-synthetic-scan-index-upload-progress.json");
+        let progress_path = c.path.with_file_name(money_test_support::synthetic_file(
+            super::super::super::scan_index_persistence::Source::Claude,
+            "-upload-progress.json",
+        ));
         let bytes = serde_json::to_vec(&serde_json::json!({
             "schema_version":3, "generation":7, "destination_namespace_hash":c.binding().namespace_hash,
             "opaque_extension":{"exact":"bytes"}
@@ -1610,6 +1588,15 @@ mod codec_mapper_regressions {
         );
         let original = Original::default();
         let mut tx = db.begin(TxnMode::Read).unwrap();
-        verify_normalized_at(&mut tx, &index, &original, money_test_support::binding(), 1).unwrap();
+        verify_normalized_at(
+            &mut tx,
+            &index,
+            &original,
+            money_test_support::binding(
+                super::super::super::scan_index_persistence::Source::Claude,
+            ),
+            1,
+        )
+        .unwrap();
     }
 }
