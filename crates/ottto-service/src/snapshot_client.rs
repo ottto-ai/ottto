@@ -78,12 +78,11 @@ impl BatchRejected {
 
 impl std::fmt::Display for BatchRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "reason=validation_reject status={} count={}",
-            self.status,
-            self.snapshot_indexes.as_ref().map_or(0, Vec::len)
-        )
+        write!(f, "reason=validation_reject status={}", self.status)?;
+        if let Some(indexes) = &self.snapshot_indexes {
+            write!(f, " count={}", indexes.len())?;
+        }
+        Ok(())
     }
 }
 

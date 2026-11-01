@@ -1329,10 +1329,20 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_alone() {
                     .collect();
                 result.accepted_identity_buckets = Some(json!(backend
                     .keys()
-                    .filter_map(|id| progress
-                        .accepted_identity_buckets
-                        .get(id)
-                        .map(|buckets| (id.clone(), serde_json::to_value(buckets).unwrap())))
+                    .filter_map(
+                        |id| progress.accepted_identity_buckets.get(id).map(|buckets| {
+                            let mut buckets = serde_json::to_value(buckets).unwrap();
+                            // last_ack is a global LRU sequence: the prior ACK
+                            // and retry history differ from a cold Full. As in
+                            // advertised_cap_retags_previously_stripped_accepted_body,
+                            // re-ACKs may change it without changing money or shares.
+                            let last_ack = buckets.as_object_mut().unwrap().remove("last_ack");
+                            assert!(last_ack
+                                .and_then(|value| value.as_u64())
+                                .is_some_and(|ack| ack > 0));
+                            (id.clone(), buckets)
+                        })
+                    )
                     .collect::<BTreeMap<_, _>>()));
                 result
             };
@@ -1401,7 +1411,8 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_alone() {
             .into();
             old.snapshot_fingerprint = crate::snapshots::snapshot_fingerprint(source, &old);
             assert_ne!(old.snapshot_fingerprint, fp);
-            send(&[old], &mut progress, &mut backend, false);
+            let (_, accepted, _) = send(&[old], &mut progress, &mut backend, false);
+            assert_eq!(accepted, 1, "one ACK for the distinct prior revision");
             let prior = route(Mode::Ram, vec![], &backend, &progress);
             let (result, accepted, emitted) = send(&items, &mut progress, &mut backend, true);
             assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });

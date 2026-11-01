@@ -8889,7 +8889,7 @@ fn finish_sync_source(
                     "backend rejected snapshot batch authorization",
                 )
             } else if let Some(rejected) = error.downcast_ref::<BatchRejected>() {
-                eprintln!("ottto-service: {rejected}");
+                eprintln!("ottto-service: source={} {rejected}", source.api_slug());
                 (
                     CollectorState::Error {
                         code: "backend_validation_error",
@@ -11821,12 +11821,12 @@ where
     }
 
     if conflicted_entities > 0 {
-        // Every conflicting entity is durably quarantined with the same
+        // Every retryable refused entity is durably quarantined with the same
         // bounded backoff a rejection gets, and every sibling in the page is
         // checkpointed. The distinct result prevents the caller from marking
         // a broad historical backfill complete while preserving that progress.
         eprintln!(
-            "local snapshot upload deferred {conflicted_entities} conflicting \
+            "local snapshot upload deferred {conflicted_entities} unsettled \
              entity(ies) for {poison_scope}; they are quarantined for a bounded \
              retry while every other entity in the page settled."
         );
@@ -13069,6 +13069,9 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     }
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
+    }
+    if error.downcast_ref::<BatchRejected>().is_some() {
+        return "local snapshot payload validation failed".to_string();
     }
     if error.downcast_ref::<SnapshotEntityDeferred>().is_some() {
         return "local snapshot upload deferred by unsettled entities".to_string();
@@ -17559,9 +17562,6 @@ mod tests {
     }
 
     #[test]
-    // Records client-report poison losses into process-global counters,
-    // so it shares the serial group with the tests that assert on them.
-    #[serial(client_report)]
     fn item_specific_422_isolates_poison_and_checkpoints_valid_siblings() {
         let poison_scope = &unique_poison_scope();
         let items = test_fingerprints(25);
@@ -17608,9 +17608,6 @@ mod tests {
     }
 
     #[test]
-    // Records client-report poison losses into process-global counters,
-    // so it shares the serial group with the tests that assert on them.
-    #[serial(client_report)]
     fn unlocated_validation_failure_keeps_whole_batch_pending() {
         let items = test_fingerprints(75);
         let mut progress = test_upload_progress();
@@ -17633,9 +17630,6 @@ mod tests {
     }
 
     #[test]
-    // Records client-report poison losses into process-global counters,
-    // so it shares the serial group with the tests that assert on them.
-    #[serial(client_report)]
     fn held_validation_rejection_prunes_old_accepted_revisions_from_progress() {
         let poison_scope = &unique_poison_scope();
         let poison = format!("{:064x}", 9000);
