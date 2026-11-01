@@ -54,7 +54,9 @@ fn with_retry_clock<T>(now: u64, run: impl FnOnce() -> T) -> T {
     run()
 }
 
-/// [regress] An indexed validation hold preserves money and lets exact-ACK siblings settle.
+/// [regress] An indexed validation hold, or an identity deferral naming the
+/// same item (it ended the whole pass), preserves money and lets exact-ACK
+/// siblings settle.
 #[test]
 #[serial(client_report)]
 fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work() {
@@ -187,11 +189,14 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
             "tagged placement control"
         );
 
-        for source in [
+        for (source, identity) in [
             SnapshotSource::ClaudeCode,
             SnapshotSource::Codex,
             SnapshotSource::Pi,
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|source| [(source, false), (source, true)])
+        {
             let scratch = crate::test_scratch::ScratchDir::new("indexed-validation-progress");
             let progress_path = scratch.join("progress.json");
             let mut items = page.scan.snapshots.clone();
@@ -303,6 +308,14 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                                 if !retrying && batch.len() > 1 {
                                     assert!(index > 0, "post-packing nonzero request index");
                                 }
+                                if identity {
+                                    return Err(anyhow::Error::new(UploadShed {
+                                        status: 503,
+                                        retry_after: Some(Duration::from_secs(60)),
+                                        code: Some(crate::snapshot_client::UploadShedCode::OriginalIdentityUnavailable),
+                                    })
+                                    .context(ShedSnapshotIndexes(vec![index])));
+                                }
                                 let text = json!({"errors":[
                                     {"ctx":{"validator": "x".repeat(700)},"loc":["body","snapshots",index,"session_artifacts",0,"value"]},
                                     {"loc":["body","snapshots",index,"session_artifacts",1,"value"]}
@@ -340,10 +353,25 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
             let (_, accepted, _) = send(&[old], &mut progress, &mut backend, false);
             assert_eq!(accepted, 1, "one ACK for the distinct prior revision");
             let prior = route(Mode::Ram, vec![], &backend, &progress);
+            let sent_at = current_unix_seconds();
             let (result, accepted, emitted) = send(&items, &mut progress, &mut backend, true);
+            // Deferred, never Shed: the caller sets no source backoff.
             assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
             assert_eq!(accepted as usize, items.len() - 1);
             assert_eq!(progress.quarantined_fingerprints.len(), 1);
+            let record = &progress.quarantined_fingerprints[&fp];
+            assert_eq!(
+                record.disposition,
+                SnapshotQuarantineDisposition::RetryPending
+            );
+            assert_eq!(record.failed_reconstruction_count, 1);
+            if identity {
+                assert!(
+                    (sent_at + 60..=current_unix_seconds() + 72)
+                        .contains(&record.retry_after_unix_seconds),
+                    "the identity hold waits the server's Retry-After window, not 6-12 h"
+                );
+            }
             assert!(!progress.accepted_fingerprints.contains(&fp));
             assert!(!progress.accepted_body_witnesses.contains_key(&fp));
             assert!(progress
@@ -474,6 +502,83 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
         0
     );
     crate::client_report::reset_for_test();
+}
+
+/// [behaviour] An identity deferral holds every item of the named session:
+/// a duplicate occurrence, an alias revision in the same request the server
+/// did not name, and one queued in a later batch (never sent). Only those:
+/// siblings in both batches settle by exact ACK in the same pass.
+#[test]
+fn identity_deferral_holds_every_item_of_the_named_session() {
+    let item = |session: &str, n: u64| (session.to_string(), format!("{n:064x}"));
+    let named = item("held", 1);
+    // Fingerprint order packs [1, 2, 3] then, by class, [4, 5].
+    let items = vec![
+        named.clone(),
+        item("held", 2),
+        item("sibling", 3),
+        item("held", 4),
+        item("later", 5),
+        named.clone(),
+    ];
+    let mut progress = test_upload_progress();
+    let mut accepted = 0;
+    let mut sent = Vec::new();
+    let sent_at = current_unix_seconds();
+    let result = upload_resumable_batches_with_body_witness_partitioned(
+        &items,
+        &unique_poison_scope(),
+        &mut progress,
+        &mut accepted,
+        |item| item.1.as_str(),
+        |item| item.1.clone(),
+        |item| Some(item.0.as_str()),
+        |item| item.1 >= format!("{:064x}", 4),
+        &mut InplaceRetryBudget::default(),
+        |batch| {
+            sent.push(batch.iter().map(|item| item.1.clone()).collect::<Vec<_>>());
+            match batch.iter().position(|item| *item == named) {
+                Some(index) => Err(anyhow::Error::new(UploadShed {
+                    status: 503,
+                    retry_after: Some(Duration::from_secs(60)),
+                    code: Some(crate::snapshot_client::UploadShedCode::OriginalIdentityUnavailable),
+                })
+                .context(ShedSnapshotIndexes(vec![index]))),
+                None => Ok(accepted_batch(batch.len())),
+            }
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(result, ResumableUploadResult::Deferred { count: 3 });
+    let fp = |n: u64| format!("{n:064x}");
+    assert_eq!(
+        sent,
+        vec![vec![fp(1), fp(2), fp(3)], vec![fp(3)], vec![fp(5)]]
+    );
+    assert_eq!(accepted, 2);
+    assert_eq!(
+        progress.accepted_fingerprints,
+        BTreeSet::from([fp(3), fp(5)])
+    );
+    assert_eq!(
+        progress
+            .quarantined_fingerprints
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([fp(1), fp(2), fp(4)])
+    );
+    for record in progress.quarantined_fingerprints.values() {
+        assert_eq!(
+            record.disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert_eq!(record.failed_reconstruction_count, 1);
+        assert!(
+            (sent_at + 60..=current_unix_seconds() + 72).contains(&record.retry_after_unix_seconds)
+        );
+    }
 }
 
 /// A scanned semantic-no-op sibling, an ACKed sibling, and one indexed
