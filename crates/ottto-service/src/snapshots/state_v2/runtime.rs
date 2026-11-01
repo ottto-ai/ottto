@@ -343,9 +343,13 @@ fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Opt
                 state.current = None;
             }
             let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-            let (deadline, work) = purge_policy();
-            let mut db = sqlite::Sqlite::open_with_policy(&db_path, &identity, deadline, work)
-                .map_err(Hold::storage)?;
+            let mut db = sqlite::Sqlite::open_with_policy(
+                &db_path,
+                &identity,
+                ERASURE_DEADLINE,
+                ERASURE_WORK_BUDGET,
+            )
+            .map_err(Hold::storage)?;
             // Static stage labels: Hold::storage reports where a reopen failed.
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)
@@ -521,9 +525,13 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         // Publication succeeded: adoption failure is a hold, never a v1 result.
         let (identity, db_path) =
             fence::reconcile(path, &binding_for(path)?, true)?.ok_or(Hold::DbUnavailable)?;
-        let (deadline, work) = purge_policy();
-        let mut db = sqlite::Sqlite::open_with_policy(&db_path, &identity, deadline, work)
-            .map_err(Hold::storage)?;
+        let mut db = sqlite::Sqlite::open_with_policy(
+            &db_path,
+            &identity,
+            ERASURE_DEADLINE,
+            ERASURE_WORK_BUDGET,
+        )
+        .map_err(Hold::storage)?;
         db.audit_headers()?;
         let stamp = db.stamp()?;
         ensure!(
@@ -886,15 +894,8 @@ pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usiz
     .unwrap_or(requested.min(250))
 }
 
-pub(super) fn purge_policy() -> (Duration, Duration) {
-    let seconds = std::env::var("OTTTO_CLAUDE_STATE_V2_ERASURE_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(86400)
-        .min(72 * 3600);
-    (Duration::from_secs(seconds), Duration::from_secs(2))
-}
+const ERASURE_DEADLINE: Duration = Duration::from_secs(86400);
+const ERASURE_WORK_BUDGET: Duration = Duration::from_secs(2);
 
 /// idle releases the page baseline when a cycle completes; an error exit skips
 /// idle, so dropping this at the cycle's end releases it as well.
