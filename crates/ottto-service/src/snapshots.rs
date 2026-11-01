@@ -84,6 +84,8 @@ mod claude_family_census_shadow_tests;
 #[cfg(test)]
 mod claude_history_upgrade_tests;
 mod claude_reemission_exclusions;
+#[cfg(all(test, unix))]
+mod claude_terminal_e2_retry_tests;
 #[cfg(test)]
 mod contract5_cutover_tests;
 mod money_freshness;
@@ -5250,6 +5252,13 @@ struct ClaudeUsageAuthorityQuarantineRecord {
     proof_correction: Option<ClaudeAuthorityProofCorrection>,
 }
 
+// Terminal verdicts before E2 get one retry; delete when the count of matching records reaches 0.
+const PRE_E2_TERMINAL_DEADLINE_CUTOFF: u64 = 1_793_167_200; // 2026-10-28T06:00Z
+fn claude_terminal_predates_e2(record: &ClaudeUsageAuthorityQuarantineRecord) -> bool {
+    record.disposition == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+        && (1..=PRE_E2_TERMINAL_DEADLINE_CUTOFF).contains(&record.retry_after_unix_seconds)
+}
+
 include!("snapshots/authority_proof_correction.rs");
 include!("snapshots/load_containment.rs");
 #[path = "snapshots/local_switch.rs"]
@@ -10149,6 +10158,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 && same_binding
                 && (existing.disposition
                     == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+                    && !claude_terminal_predates_e2(existing)
                     || existing.retry_after_unix_seconds > now)
         });
         if !retain_existing {
@@ -52809,7 +52819,8 @@ impl ScanIndex {
             == Some(&candidate.source_file_fingerprint);
         let retry_due = record.disposition
             == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
-            && record.retry_after_unix_seconds <= now;
+            && record.retry_after_unix_seconds <= now
+            || claude_terminal_predates_e2(record);
         (!witness_matches || !revision_matches || retry_due).then_some(root_session_id)
     }
 
