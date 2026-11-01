@@ -4605,7 +4605,7 @@ pub struct ScanIndexEntry {
     /// census-window debt is kept this way; a read the file really needs
     /// clears the fingerprint as main does. Never set while the switch is OFF.
     /// Downgrade from ON state means a fresh walk; an older binary drops the
-    /// bit.
+    /// bit (a state-v2 store refuses it instead, see `identity_contract`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) evidence_owed: bool,
 }
@@ -5056,8 +5056,10 @@ struct ClaudeUsageFamilyPending {
     idless_revision: Option<[u8; 32]>,
     /// The request-identity contract (and body-witness revision) this WHOLE
     /// pending was built under; `None` = mixed, legacy or unknown, never
-    /// provable. Written on accumulation; read only by the evidence-owed
-    /// re-stamp. An old decoder drops it.
+    /// provable. Written on accumulation (switch OFF too); read only by the
+    /// evidence-owed re-stamp. An old v1 decoder drops it. A state-v2 store
+    /// refuses keys from a newer build by design: a build without this field
+    /// holds the Claude source at load until that store is reset.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
