@@ -1067,6 +1067,10 @@ enum ClaudeSlotProbeFailure {
     CredentialUnavailable,
     IdentityMismatch,
     ConcurrentMutation,
+    /// The stored credential and `.claude.json` name different plan families,
+    /// so they come from different logins. Unlike `ConcurrentMutation` this
+    /// holds on every pass until the slot signs in again.
+    CredentialAccountMismatch,
     /// The slot's stored login could not be read, or is malformed (for
     /// example a refresh token without an access deadline). Fail closed:
     /// transient, retried on the next pass, and not evidence that the login
@@ -1085,6 +1089,7 @@ impl ClaudeSlotProbeFailure {
             Self::CredentialUnavailable => "claude_slot_credential_unavailable",
             Self::IdentityMismatch => "claude_slot_identity_mismatch",
             Self::ConcurrentMutation => "claude_slot_concurrent_mutation",
+            Self::CredentialAccountMismatch => "claude_credential_account_mismatch",
             Self::ProbeFailed => "claude_slot_probe_failed",
             Self::SignedOutByCli => "claude_slot_signed_out_by_cli",
         }
@@ -1111,6 +1116,13 @@ impl ClaudeSlotProbeFailure {
                 ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
                 ClaudeConfigSlotDiagnosticCodeV1::ConcurrentMutation,
                 "This registered Claude slot changed during verification; collection will retry from a stable state.",
+            ),
+            // Same wire state as a race, so the slot is refused exactly as
+            // before; only the code and the action differ.
+            Self::CredentialAccountMismatch => (
+                ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
+                ClaudeConfigSlotDiagnosticCodeV1::ConcurrentMutation,
+                "This Claude slot's saved login belongs to a different account than its account file; sign in again with `claude /login` for this slot.",
             ),
             Self::ProbeFailed => (
                 ClaudeConfigSlotCollectionStateV1::ProbeFailed,
@@ -5694,6 +5706,8 @@ fn claude_default_snapshot_is_uploadable(snapshot: &AgentStatusSnapshot) -> bool
 fn claude_snapshot_candidate_rank(snapshot: &AgentStatusSnapshot) -> Option<ClaudeSnapshotQuality> {
     if snapshot.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == ClaudeSlotProbeFailure::ConcurrentMutation.diagnostic_code()
+            || diagnostic.code
+                == ClaudeSlotProbeFailure::CredentialAccountMismatch.diagnostic_code()
     }) {
         return None;
     }
@@ -6106,7 +6120,10 @@ pub(crate) fn verify_claude_local_identity(
         ClaudeSlotProbeFailure::CredentialUnavailable => {
             ClaudeLocalIdentityFailure::CredentialUnavailable
         }
-        ClaudeSlotProbeFailure::IdentityMismatch => ClaudeLocalIdentityFailure::IdentityMismatch,
+        ClaudeSlotProbeFailure::IdentityMismatch
+        | ClaudeSlotProbeFailure::CredentialAccountMismatch => {
+            ClaudeLocalIdentityFailure::IdentityMismatch
+        }
         ClaudeSlotProbeFailure::ConcurrentMutation => {
             ClaudeLocalIdentityFailure::ConcurrentMutation
         }
@@ -6603,7 +6620,7 @@ fn resolve_registered_claude_slot_from_local(
 ///
 /// Two present plan facts that contradict each other (the credential says one
 /// plan, `.claude.json` names another organization type) mean the two files
-/// were written by different logins: `ConcurrentMutation`.
+/// were written by different logins: `CredentialAccountMismatch`.
 fn claude_account_from_local_metadata(
     oauth: &ClaudeCliOauthAccount,
     credential: &ClaudeOAuthCredential,
@@ -6612,7 +6629,7 @@ fn claude_account_from_local_metadata(
         credential.subscription_type.as_deref(),
         oauth.organization_type.as_deref(),
     ) {
-        return Err(ClaudeSlotProbeFailure::ConcurrentMutation);
+        return Err(ClaudeSlotProbeFailure::CredentialAccountMismatch);
     }
     let mut auth = serde_json::Map::new();
     auth.insert("loggedIn".to_string(), Value::Bool(true));
@@ -8130,6 +8147,7 @@ fn claude_default_slot_collection_status(
         ClaudeSlotProbeFailure::CredentialUnavailable,
         ClaudeSlotProbeFailure::ProbeFailed,
         ClaudeSlotProbeFailure::ConcurrentMutation,
+        ClaudeSlotProbeFailure::CredentialAccountMismatch,
         ClaudeSlotProbeFailure::IdentityMismatch,
         ClaudeSlotProbeFailure::IdentityUnknown,
     ] {
@@ -27070,7 +27088,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn contradicting_local_plan_facts_are_a_concurrent_login() {
+    fn contradicting_local_plan_facts_are_a_different_login() {
         assert!(claude_local_plan_facts_contradict(
             Some("team"),
             Some("claude_max")
@@ -27101,6 +27119,56 @@ for line in sys.stdin:
             Some("future_plan"),
             Some("claude_team")
         ));
+    }
+
+    /// [behaviour] A credential and `.claude.json` from different logins get
+    /// their own sign-in-again code; a file that changes between the two reads
+    /// keeps the race code. Neither yields an identity.
+    #[test]
+    fn credential_account_mismatch_is_not_a_concurrent_mutation() {
+        let oauth = |organization_type: &str| ClaudeCliOauthAccount {
+            account_uuid: Some("account-fixture".to_string()),
+            email_address: Some("fixture@example.invalid".to_string()),
+            organization_uuid: Some("organization-fixture".to_string()),
+            organization_type: Some(organization_type.to_string()),
+            ..Default::default()
+        };
+        for (initial, last, expected, code) in [
+            (
+                "claude_team",
+                "claude_team",
+                ClaudeSlotProbeFailure::CredentialAccountMismatch,
+                "claude_credential_account_mismatch",
+            ),
+            (
+                "claude_max",
+                "claude_team",
+                ClaudeSlotProbeFailure::ConcurrentMutation,
+                "claude_slot_concurrent_mutation",
+            ),
+        ] {
+            let credential = ClaudeOAuthCredential {
+                access_token: Some("fixture".to_string()),
+                has_refresh_token: true,
+                access_expires_at: None,
+                relogin_required_at: None,
+                has_inference_scope: Some(true),
+                has_profile_scope: true,
+                subscription_type: Some("max".to_string()),
+            };
+            let failure = stable_claude_slot_credential(
+                Some(oauth(initial)),
+                Some(credential),
+                Some(oauth(last)),
+            )
+            .and_then(|stable| {
+                claude_account_from_local_metadata(&stable.oauth_account, &stable.credential)
+            })
+            .err()
+            .expect("no identity");
+            assert_eq!(failure, expected);
+            assert_eq!(default_claude_identity_diagnostic(failure).code, code);
+        }
     }
 
     #[test]
