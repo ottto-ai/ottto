@@ -272,25 +272,27 @@ fn held<T>(result: Result<T>) -> Result<T> {
 
 /// Present root: caller already owns CheckpointLock, BEFORE v1 decode.
 /// Missing root calls the same function from check_missing's existing lock.
+/// Without a support dir (unit tests, tools) `importable` is false and only an
+/// existing route loads. The returned flag says the caller's v1 load may import.
 pub(in super::super) fn load_locked(
     path: &Path,
-    support: Option<&Path>,
+    importable: bool,
     custody: bool,
 ) -> Result<(Option<ScanIndex>, bool)> {
     // Do not probe the Claude sentinel for Codex, Pi or unbound paths.
-    if binding(path).is_none() {
-        return Ok((None, false));
-    }
-    // Without a support dir (unit tests, tools) only an existing route loads.
-    let importable = support.is_some();
-    let index = load_with_custody(path, importable, custody)?;
-    let sample_v1 = importable && index.is_none();
-    Ok((index, sample_v1))
-}
-fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Option<ScanIndex>> {
     let Some(binding) = binding(path) else {
-        return Ok(None);
+        return Ok((None, false));
     };
+    let index = load_with_custody(path, &binding, importable, custody)?;
+    let try_import = importable && index.is_none();
+    Ok((index, try_import))
+}
+fn load_with_custody(
+    path: &Path,
+    binding: &super::super::scan_index_persistence::Binding,
+    importable: bool,
+    custody: bool,
+) -> Result<Option<ScanIndex>> {
     if !importable && !route_needed(path, custody)? {
         return Ok(None);
     }
@@ -299,7 +301,7 @@ fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Opt
         state.inventory_ready = false;
         state.original = None;
         state.save_digests = None;
-        let pair = fence::reconcile(path, &binding, state.latched)?;
+        let pair = fence::reconcile(path, binding, state.latched)?;
         state.pass_written_start = (importable || pair.is_some())
             .then(telemetry::process_written_bytes)
             .flatten();

@@ -13,7 +13,7 @@ pub(in crate::snapshots) fn erase_published(path: &Path) {
 }
 
 fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
-    load_with_custody(path, importable, published(path)?)
+    Ok(load_locked(path, importable, published(path)?)?.0)
 }
 fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
     save_with_mode(path, index, false, None)
@@ -277,7 +277,7 @@ fn f7_published_route_saves_natively_and_unmapped_custody_holds() {
     let f = Fixture::new();
     f.import(false);
     fence::publish(&f.path, &f.identity(), &mut false).unwrap();
-    assert!(load_locked(&f.path, None, published(&f.path).unwrap()).is_err());
+    assert!(load_locked(&f.path, false, published(&f.path).unwrap()).is_err());
 }
 /// [format] f6 explicit forget deletes all artifacts, invalidates stale clones,
 /// and exposes only committed file membership to the restart-record sweep.
@@ -867,7 +867,7 @@ mod hydrate_parity {
             let f = Fixture::new();
             publish(&f, &index);
             let before = fs::read(&f.path).unwrap();
-            let error = load_locked(&f.path, None, published(&f.path).unwrap()).unwrap_err();
+            let error = load_locked(&f.path, false, published(&f.path).unwrap()).unwrap_err();
             assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
             assert_eq!(fs::read(&f.path).unwrap(), before);
         }

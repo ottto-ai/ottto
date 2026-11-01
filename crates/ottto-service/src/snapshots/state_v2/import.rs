@@ -1075,7 +1075,7 @@ mod application_cases {
                 .publish_import(&c.path, &identity, db, &mut false)
                 .unwrap();
             let _lock = super::super::super::CheckpointLock::acquire(&c.path).unwrap();
-            let mut current = super::super::runtime::load_locked(&c.path, None, true)
+            let mut current = super::super::runtime::load_locked(&c.path, false, true)
                 .unwrap()
                 .0
                 .unwrap();
@@ -1086,7 +1086,7 @@ mod application_cases {
                     .unwrap_err();
             // Value admission is save pressure: the paced named hold, not DbUnavailable.
             assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
-            let reloaded = super::super::runtime::load_locked(&c.path, None, true)
+            let reloaded = super::super::runtime::load_locked(&c.path, false, true)
                 .unwrap()
                 .0
                 .unwrap();
@@ -1140,7 +1140,7 @@ mod application_cases {
         let _lock = super::super::super::CheckpointLock::acquire(&c.path).unwrap();
         let loaded = super::super::runtime::load_locked(
             &c.path,
-            None,
+            false,
             super::super::runtime::published(&c.path).unwrap(),
         )
         .unwrap()
