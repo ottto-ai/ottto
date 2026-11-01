@@ -4854,6 +4854,154 @@ fn a1a_scan_at(
     })
 }
 
+/// [money] An owed unchanged file restores current evidence; a stale contract
+/// cannot supply a stamp or replace the cold Full's totals and placement.
+#[test]
+#[cfg(target_os = "macos")]
+fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
+    use crate::snapshots::evidence_owed::{EvidenceContract, EvidenceOwedForTest};
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
+
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    let _owed = EvidenceOwedForTest::on();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    const SESSION: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    let source = SnapshotSource::ClaudeCode;
+    for changed in [false, true] {
+        let mut disk = fixture::NativeColdStore::with_scope(
+            source,
+            "owed-rearmed-restore",
+            Scope("e2-pipeline".into()),
+        );
+        let path = disk.path(SESSION);
+        let key = disk.key(SESSION);
+        std::fs::write(&path, a1a_row("first", 100)).unwrap();
+        let read = |disk: &fixture::NativeColdStore,
+                    index: ScanIndex,
+                    cache: Arc<SharedCache>,
+                    changed: bool| {
+            claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+                let mut owned = OwnedSourceScan::new_with_identity_capture(
+                    source,
+                    std::slice::from_ref(&disk.sessions),
+                    index,
+                    "2026-08-02T08:00:00Z",
+                    183,
+                    100,
+                    false,
+                    Some(&disk.root),
+                    &[],
+                    false,
+                    true,
+                )
+                .with_sampled_acquisition(cache, disk.namespace.clone());
+                if changed {
+                    // Change after traversal construction, which records its starting contract.
+                    owned.index.claude_request_identity_contract =
+                        Some(CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL.into());
+                }
+                let (mut index, mut scan, modes) = fixture::scan_modes(owned, 100_000);
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+                    &disk.root, &mut scan, &mut index,
+                );
+                (index, scan, modes)
+            })
+        };
+        let mut seed = ScanIndex {
+            claude_request_identity_contract: Some(
+                claude_request_identity::cycle_contract(true).into(),
+            ),
+            ..Default::default()
+        };
+        seed.activate_effective_upload_body_witness_revision(effective_revision(source));
+        disk.cache
+            .durable_begin_pass(source, &disk.index_path, &disk.namespace, true);
+        let (mut index, mut initial, modes) = read(&disk, seed, disk.cache.clone(), false);
+        assert_eq!(modes, (1, 0, 0));
+        assert_eq!(initial.snapshots.len(), 1);
+        assert_eq!(initial.snapshots[0].input_tokens, 100);
+        let stamped = EvidenceContract::current(&index);
+        assert!(stamped.is_some());
+        assert_eq!(
+            index.claude_usage_family_pending[SESSION].identity_contract,
+            stamped
+        );
+        finalize_scan_after_policy(source, &mut initial, &mut index);
+        assert!(!index.files[&key].evidence_owed);
+        assert!(!index.files[&key].observed_fingerprint().is_empty());
+        index.record_accepted_snapshot_fingerprints(
+            &initial
+                .snapshots
+                .iter()
+                .map(|s| s.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        index.save(&disk.index_path).unwrap();
+        assert_native_write_before_save(&disk.cache, disk.writer, source, &index, &key);
+        let mut prior = index;
+        if changed {
+            // A stale unchanged record is held without a Full obligation. Stage
+            // its due audit while the entry still has an observed revision.
+            let fingerprint = prior.files[&key].observed_fingerprint().to_owned();
+            assert!(prior.stage_sampled_audit(
+                &key,
+                &fingerprint,
+                crate::transcript_acquisition::AuditDebt {
+                    due_unix_seconds: 1
+                },
+            ));
+        }
+        // Lose the pending occurrences so only the record can restore their evidence.
+        // Keep the physical file and its revision unchanged across the re-arm.
+        prior.claude_usage_family_pending.clear();
+        prior.traversal = None;
+        evidence_owed::clear(prior.files.get_mut(&key).unwrap());
+        assert!(prior.files[&key].evidence_owed && prior.files[&key].rearmed());
+        assert!(prior.files[&key].observed_fingerprint().is_empty());
+        prior.save(&disk.index_path).unwrap();
+        disk.restart();
+        assert!(disk.cache.retained_checkpoint(&key).is_none());
+        assert!(disk.index.claude_usage_family_pending.is_empty());
+        let prior = disk.index.clone();
+        disk.cache
+            .durable_begin_pass(source, &disk.index_path, &disk.namespace, true);
+        let (cold_index, cold, cold_modes) = read(
+            &disk,
+            prior.clone(),
+            Arc::new(SharedCache::default()),
+            changed,
+        );
+        assert_eq!(cold_modes, (1, 0, 0));
+        let (index, restored, modes) = read(&disk, prior, disk.cache.clone(), changed);
+        money_oracle::assert_equivalent(
+            &scan_money(source, &cold_index, &cold),
+            &scan_money(source, &index, &restored),
+        );
+        let current = EvidenceContract::current(&index);
+        assert_eq!(
+            index.claude_usage_family_pending[SESSION].identity_contract,
+            current
+        );
+        assert!(!index.files[&key].evidence_owed);
+        assert!(!index.files[&key].observed_fingerprint().is_empty());
+        let counts = disk.cache.durable_counters(source).unwrap().0;
+        if changed {
+            assert_eq!(counts.restored, 0);
+            assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
+            assert_eq!(modes, (1, 0, 0));
+            assert_eq!(current, None, "a stale record never supplies its old stamp");
+        } else {
+            assert_eq!(counts.restored, 1);
+            assert_eq!(modes, (0, 0, 1));
+            assert!(current.is_some());
+            assert_eq!(current, stamped);
+        }
+    }
+}
+
 /// [money] a1a frozen floor holds before certificate even after working entry clear.
 #[test]
 fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
