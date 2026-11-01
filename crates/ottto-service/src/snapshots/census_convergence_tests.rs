@@ -1540,7 +1540,7 @@ type TraversalProblem = fn(&mut ScanTraversalCheckpoint);
 /// A clean terminal traversal that observed `observed`.
 fn clean_terminal_traversal(observed: BTreeSet<String>) -> ScanTraversalCheckpoint {
     ScanTraversalCheckpoint {
-        observed_index_keys: observed,
+        observed_index_keys: observed.into(),
         unhealthy_retry_attempt: 0,
         unhealthy_retry_not_before_unix_seconds: None,
         counts: ScanTraversalCounts::default(),

@@ -114,13 +114,6 @@ impl std::fmt::Debug for UsageHead {
 fn count(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
-fn occurrence_count(family: &ClaudeUsageFamilyPending) -> usize {
-    family
-        .member_occurrences
-        .values()
-        .map(BTreeMap::len)
-        .fold(0_usize, usize::saturating_add)
-}
 impl UsageHead {
     pub(super) fn of(family: &ClaudeUsageFamilyPending, digest: [u8; 32]) -> Self {
         let mut members = BTreeMap::<String, (Option<u32>, Option<u32>)>::new();
@@ -137,7 +130,7 @@ impl UsageHead {
             identity_contract: family.identity_contract,
             contract_unproven: family.contract_unproven,
             members,
-            occurrences: occurrence_count(family),
+            occurrences: family.occurrences(),
             digest,
         }
     }
@@ -224,7 +217,7 @@ impl<'a> UsageView<'a> {
     }
     pub(super) fn occurrences(self) -> usize {
         match self {
-            Self::Full(f) => occurrence_count(f),
+            Self::Full(f) => f.occurrences(),
             Self::Head(h) => h.occurrences,
         }
     }
@@ -576,12 +569,12 @@ impl UsagePending {
         match self {
             Self::Resident(families) => families
                 .values()
-                .map(occurrence_count)
+                .map(ClaudeUsageFamilyPending::occurrences)
                 .fold(0_usize, usize::saturating_add),
             Self::Cold(cold) if cold.complete => cold
                 .loaded
                 .values()
-                .map(occurrence_count)
+                .map(ClaudeUsageFamilyPending::occurrences)
                 .fold(0_usize, usize::saturating_add),
             Self::Cold(cold) => {
                 let mut total = cold.head_occurrences;
@@ -589,7 +582,7 @@ impl UsagePending {
                     if let Some(head) = cold.heads.get(root) {
                         total = total.saturating_sub(head.occurrences);
                     }
-                    total = total.saturating_add(occurrence_count(family));
+                    total = total.saturating_add(family.occurrences());
                 }
                 total
             }

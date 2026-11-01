@@ -1179,7 +1179,7 @@ pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
         }
     };
     let mut count = 0_usize;
-    kinds_accounts::visit(&mut tx, kind, roots, |tx, h| {
+    mapper::visit(&mut tx, kind, roots, |tx, h| {
         let RowKey::Record {
             key_bytes,
             position,
@@ -1209,8 +1209,10 @@ pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
 /// Cold usage pending: load the families a page names before it
 /// accumulates (`Some`), or every family before a decision that joins them
 /// (`None`). A missing, changed or unreadable row, or a store this graph does
-/// not hold, is Unknown: nothing is installed for the caller to apply, and
-/// the caller refuses its whole decision. Counted.
+/// not hold, is Unknown and the caller refuses its whole decision. Counted.
+/// Rows install one at a time, only after every wanted row was read: a later
+/// digest mismatch can leave earlier verified rows installed while the caller
+/// still refuses the whole decision.
 pub(in super::super) fn load_usage(
     index: &mut ScanIndex,
     roots: Option<&std::collections::BTreeSet<String>>,

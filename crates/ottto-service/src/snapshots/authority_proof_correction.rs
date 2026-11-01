@@ -221,12 +221,12 @@ impl ScanIndex {
             self.claude_usage_family_pending.discard(root);
         }
         let mut rearmed = 0_usize;
-        for (index_key, entry) in &mut self.files {
+        for (index_key, entry) in self.files.slots_mut() {
             if claude_index_path_member_ref(Path::new(index_key))
                 .is_some_and(|member| unbound.contains(member.root))
                 && !entry.source_file_fingerprint.is_empty()
             {
-                entry.source_file_fingerprint.clear();
+                entry.make_mut().source_file_fingerprint.clear();
                 rearmed += 1;
             }
         }

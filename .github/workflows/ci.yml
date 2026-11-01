@@ -1,7 +1,10 @@
 name: Public CI
 
 on:
+  # Drafts run nothing: ready_for_review starts the run the merge guard waits
+  # for, and the merge queue reruns every required check on the merged commit.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
     types: [checks_requested]
   push:
@@ -23,7 +26,7 @@ on:
         type: boolean
         default: false
       money_equivalence_base:
-        description: Comparison ref (empty uses this branch PR base, otherwise main)
+        description: Comparison ref (empty uses the fork point from this branch PR base, otherwise main)
         type: string
         default: ""
       scan_stack_margin:
@@ -39,6 +42,34 @@ permissions:
   contents: read
 
 jobs:
+  linux-first:
+    # Every macOS dispatch (full, partial, money equivalence, stack margin)
+    # needs a green Linux tests run on the same head first. mac-batch/*
+    # branches are exempt: mac_batch.py plan checked each member's head.
+    name: Linux green first
+    if: github.event_name == 'workflow_dispatch' && !startsWith(github.ref_name, 'mac-batch/')
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Linux tests green on this head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          state="$(bash scripts/linux_check_state.sh "$GITHUB_SHA")"
+          if [ "$state" != success ]; then
+            echo "::error::Linux tests on $GITHUB_SHA are '$state'. Run 'gh workflow run linux-tests.yml --ref $GITHUB_REF_NAME', wait for green, then dispatch the Mac run."
+            exit 1
+          fi
+
   rust:
     # Keep this literal: skipped jobs can expose an unevaluated name expression.
     # Partial dispatches run in the separate, explicitly named job below.
@@ -51,7 +82,8 @@ jobs:
     # the queue. Rollback: revert step 3 (Mac on PRs) FIRST, then the queue
     # rule; never leave the PR skip without the queue. Step 4 (this main-push
     # skip) can be reverted on its own at any time.
-    if: ${{ github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin || inputs.rust_test_filter != '')) }}
+    needs: linux-first
+    if: ${{ !cancelled() && needs.linux-first.result != 'failure' && github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin || inputs.rust_test_filter != '')) }}
     # Main's own queue run takes about 38 min (runs 40321546891, 40331916601,
     # 40348583388); 40 cancelled #791 (run 40378483829). Headroom, not a target.
     timeout-minutes: 55
@@ -117,16 +149,16 @@ jobs:
         # ottto-service #[serial] tests run one at a time in a second process
         # beside the rest (3 threads), so threads stop idling on serial locks.
         # Six shared-state races appeared above 4 threads in one process.
-        # Branch Mac runs (dispatch) keep going past a failing test binary so
-        # scripts/mac_batch.py can map every failure to a PR; merge_group and
-        # schedule runs still stop at the first failing binary.
+        # Dispatch and merge-queue runs keep going past a failing test binary
+        # so scripts/mac_batch.py report can map every failure to a PR; the
+        # schedule run still stops at the first failing binary.
         # --require-pass is the layout coverage receipt: with
         # OTTTO_REQUIRE_LAYOUT=1 that test passes only on a validated layout,
         # and the step fails unless it printed "... ok" (not ignored, not absent).
         run: >-
           python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1
           --require-pass heap_layout_bound::sampled_scalar_buffer_tests::layout_gate_coverage_receipt
-          ${{ github.event_name == 'workflow_dispatch' && '--no-fail-fast' || '' }}
+          ${{ github.event_name != 'schedule' && '--no-fail-fast' || '' }}
 
       - name: Filtered Rust tests (partial pre-check)
         if: env.OTTTO_CI_TEST_FILTER != ''
@@ -150,14 +182,15 @@ jobs:
   rust-partial:
     # Separate static names also preserve the full check when either job skips.
     name: Rust contracts (partial pre-check)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.rust_test_filter != '' && !(inputs.money_equivalence || inputs.scan_stack_margin) }}
+    needs: linux-first
+    if: ${{ !cancelled() && needs.linux-first.result != 'failure' && github.event_name == 'workflow_dispatch' && inputs.rust_test_filter != '' && !(inputs.money_equivalence || inputs.scan_stack_margin) }}
     timeout-minutes: 55
     runs-on: macos-15
     env: *rust-contract-env
     steps: *rust-contract-steps
 
   public-surface:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    if: ${{ !github.event.pull_request.draft && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}
     name: Public surface checks
     timeout-minutes: 30
     runs-on: ubuntu-24.04
@@ -189,7 +222,7 @@ jobs:
 
   dependency-review:
     name: Dependency review
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
@@ -207,7 +240,7 @@ jobs:
           fail-on-severity: moderate
 
   rust-advisories:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    if: ${{ !github.event.pull_request.draft && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}
     name: Rust advisory audit
     timeout-minutes: 10
     runs-on: ubuntu-24.04
@@ -238,7 +271,8 @@ jobs:
     # matrix, retry or cache. The receipt that the scan workers' explicit
     # stack (SNAPSHOT_SYNC_WORKER_STACK_BYTES) is headroom over a cycle that
     # fits the 2 MiB default; an overflow aborts the test binary.
-    if: github.event_name == 'workflow_dispatch' && inputs.scan_stack_margin && !inputs.money_equivalence
+    needs: linux-first
+    if: ${{ !cancelled() && needs.linux-first.result != 'failure' && github.event_name == 'workflow_dispatch' && inputs.scan_stack_margin && !inputs.money_equivalence }}
     timeout-minutes: 40
     runs-on: macos-15
     steps:
@@ -262,7 +296,8 @@ jobs:
     # Opt-in only: no added macOS minutes on pushes/PRs. One standard Mac,
     # two independent builds, no matrix/retry or cache writes. Never run the
     # expensive benchmark or ordinary Mac jobs alongside this dispatch.
-    if: github.event_name == 'workflow_dispatch' && inputs.money_equivalence
+    needs: linux-first
+    if: ${{ !cancelled() && needs.linux-first.result != 'failure' && github.event_name == 'workflow_dispatch' && inputs.money_equivalence }}
     timeout-minutes: 55
     runs-on: macos-15
     env:

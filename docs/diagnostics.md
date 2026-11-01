@@ -1915,8 +1915,8 @@ A bucket row enters the local proved-row ledger only when a stored-body entity
 ACK (no `unchanged_basis`) covers a body where that row carried a positive tag,
 only while the capability is on, and only when that ACK declares a body witness
 version and its digest equals the local body witness of a body that has a
-public witness version (context curve, session account evidence or cache
-observations), so the ACK validator also checked the exact version. The
+public witness version (session account evidence or cache observations), so
+the ACK validator also checked the exact version. The
 ledger keeps truncated keyed digests of the row key and of that proof
 (authorities plus the eight counts and five costs); later positive proof
 replaces it. Per revision, a proved row whose current proof equals the ACKed

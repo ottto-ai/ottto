@@ -125,22 +125,12 @@ pub(super) fn hydrate_cas_families(
 ) -> Result<()> {
     let members: BTreeMap<String, usize> =
         mapper::read_map(tx, "family.requests", Some(roots), None)?;
-    for (root, count) in members {
+    for root in roots {
+        let pending = index.claude_usage_family_pending.view(root);
         ensure!(
-            index
-                .claude_usage_family_pending
-                .view(&root)
-                .is_some_and(|p| p.hash_member_count() == count),
+            members.get(root).copied() == pending.map(|p| p.hash_member_count()),
             "state_v2_census_membership"
         );
-    }
-    for root in roots {
-        if index.claude_usage_family_pending.contains_key(root) {
-            ensure!(
-                tx.get(&mapper::key("family.requests", root, 1)?)?.is_some(),
-                "state_v2_census_membership"
-            );
-        }
     }
     Ok(())
 }

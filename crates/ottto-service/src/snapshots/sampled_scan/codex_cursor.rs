@@ -2802,6 +2802,27 @@ impl SharedCache {
             .unwrap_or(Err(ReadyRefusal::Unavailable))
     }
 
+    /// What a ready ticket's paused singleton reads from its page's join
+    /// evidence: its path, its owner and whether its ownership header is
+    /// decided (no parent ledger is read after that). None for a group or a
+    /// ticket that is not ready. No IO.
+    pub(in crate::snapshots) fn paused_singleton(
+        &self,
+        ticket: &CodexCursorTicket,
+    ) -> Option<(PathBuf, Option<String>, bool)> {
+        self.with_cursor(|cursor| {
+            let job = ready_job(cursor, ticket)
+                .ok()
+                .filter(|job| job.group.is_none())?;
+            Some((
+                job.candidate.path.clone(),
+                job.cursor.as_ref()?.owner.clone(),
+                job.parser.accumulator.codex_ownership_boundary
+                    != CodexOwnershipBoundary::Undetermined,
+            ))
+        })?
+    }
+
     /// Stage 1 (D): the index keys of a ready ticket's job members: the only
     /// paths a continuation page selects. None unless the ticket is ready.
     #[cfg(test)]

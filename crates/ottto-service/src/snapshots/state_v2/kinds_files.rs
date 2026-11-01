@@ -28,7 +28,7 @@ pub(super) fn hydrate_txn(
 ) -> Result<()> {
     macro_rules! load {
         ($f:ident, Files, (map $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = mapper::read_map(tx, $kind, None, Some(&mut cx.digests))?;
+            index.$f = mapper::read_field_map(tx, $kind, None, Some(&mut cx.digests))?;
         };
         ($($t:tt)*) => {};
     }
