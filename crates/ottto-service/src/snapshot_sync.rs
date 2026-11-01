@@ -1045,6 +1045,7 @@ fn settle_checkpointed_upload(
     upload_progress: &SnapshotUploadProgress,
     holds: &LocalHoldSettlement,
     resolved_permanent_rejections: bool,
+    unsettled_roots: Option<&BTreeSet<String>>,
 ) -> UploadIndexSettlement {
     let terminal_bound_holds = resolved_permanent_rejections
         && holds.page_held()
@@ -1078,11 +1079,14 @@ fn settle_checkpointed_upload(
     };
     let settled = resolved_permanent_rejections && (!holds.page_held() || terminal_bound_holds);
     if !settled {
-        index.mark_bounded_sweep_unsettled_by(if resolved_permanent_rejections {
-            UnsettledUploadCause::RejectedWithHolds
-        } else {
-            UnsettledUploadCause::DeferredConflict
-        });
+        index.mark_bounded_sweep_unsettled_in(
+            if resolved_permanent_rejections {
+                UnsettledUploadCause::RejectedWithHolds
+            } else {
+                UnsettledUploadCause::DeferredConflict
+            },
+            unsettled_roots,
+        );
     }
     let fully_settled = upload_settled_without_account_holds(&index, settled && !holds.any());
     UploadIndexSettlement {
@@ -3718,10 +3722,20 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     // After every selected-entry restore above: a drain whose entry this
     // save does not keep stays owed.
     committable.restore_unselected_claude_proof_body_drains(body_drains);
-    match cause {
-        Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
-        None => committable.mark_bounded_sweep_unsettled(),
-    }
+    // Scope the stamp to the families of this page's entities that were not
+    // exact-ACKed, including local holds.
+    let unsettled_roots = index.claude_entity_family_roots(
+        &current_bodies
+            .keys()
+            .filter(|fingerprint| !accepted.contains(**fingerprint))
+            .map(|fingerprint| fingerprint.to_string())
+            .chain(locally_held.iter().cloned())
+            .collect(),
+    );
+    committable.mark_bounded_sweep_unsettled_in(
+        cause.unwrap_or(UnsettledUploadCause::Unattributed),
+        unsettled_roots.as_ref(),
+    );
     let census_absent = progress.complete_census_ack_retirements(
         index,
         correction_scan.is_some_and(|scan| scan.census_complete),
@@ -8621,12 +8635,29 @@ fn finish_sync_source(
                 _ => unreachable!(),
             };
             clear_shed_streak(source);
+            // Scope the unsettled stamp to the families of this page's
+            // entities without an exact ACK of their body, and held ones.
+            let unsettled_roots = index.claude_entity_family_roots(
+                &scan_result
+                    .snapshots
+                    .iter()
+                    .filter(|item| {
+                        upload_progress
+                            .accepted_body_witnesses
+                            .get(&item.snapshot_fingerprint)
+                            != Some(&snapshot_upload_body_witness(item))
+                    })
+                    .map(|item| item.snapshot_fingerprint.clone())
+                    .chain(local_holds.held_fingerprints.iter().cloned())
+                    .collect(),
+            );
             let settlement = settle_checkpointed_upload(
                 index,
                 &committed_index,
                 &upload_progress,
                 &local_holds,
                 resolved_permanent_rejections,
+                unsettled_roots.as_ref(),
             );
             index = settlement.index;
             if !settlement.fully_settled {
@@ -9402,12 +9433,7 @@ fn activate_source_upload_context(
     index.activate_file_upload_context(source, context.clone());
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
-    progress.context_resend =
-        if matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex) {
-            upload_context_resend::Cycle::new(context, index.source_upload_context_matches())
-        } else {
-            upload_context_resend::Cycle::default()
-        };
+    progress.context_resend = upload_context_resend::Cycle::new(context);
 }
 
 /// Production form of the above: outside a historical replay, due refusal
@@ -11600,7 +11626,6 @@ where
     progress
         .context_resend
         .reserve_ordinary_bytes(ordinary_bytes);
-    let mut context_budget_deferred = 0usize;
     let mut unit_ends = Vec::new();
     order.clear();
     for unit in ordinary_units {
@@ -11617,9 +11642,9 @@ where
             {
                 order.push(item);
             } else {
-                context_budget_deferred += 1;
-                // Labelled apart from backend conflicts below; both still
-                // report Deferred until receipts are authoritative.
+                // Local pacing debt, not a backend conflict: the body stays
+                // owed by its file's missing receipt and does not make the
+                // page Deferred (or the sweep unsettled).
                 progress.context_resend.counts.budget_deferred += 1;
                 progress
                     .context_resend
@@ -11865,9 +11890,9 @@ where
         .count();
     if let Some(error) = deferred_validation_error {
         Err(error)
-    } else if conflicted_entities > 0 || context_budget_deferred > 0 {
+    } else if conflicted_entities > 0 {
         Ok(ResumableUploadResult::Deferred {
-            count: conflicted_entities.saturating_add(context_budget_deferred),
+            count: conflicted_entities,
         })
     } else if permanent_rejected > 0 {
         Ok(ResumableUploadResult::Rejected {
@@ -21051,16 +21076,28 @@ mod tests {
             !completed.fully_settled,
             "the debt keeps completion pending"
         );
-        let rejected =
-            settle_checkpointed_upload(committed.clone(), &committed, &progress, &debt_only, true);
+        let rejected = settle_checkpointed_upload(
+            committed.clone(),
+            &committed,
+            &progress,
+            &debt_only,
+            true,
+            None,
+        );
         assert!(!rejected.index.bounded_sweep_had_unsettled_upload());
         assert!(rejected
             .index
             .bounded_sweep_unsettled_cause_names()
             .is_empty());
         assert!(!rejected.fully_settled);
-        let deferred =
-            settle_checkpointed_upload(committed.clone(), &committed, &progress, &debt_only, false);
+        let deferred = settle_checkpointed_upload(
+            committed.clone(),
+            &committed,
+            &progress,
+            &debt_only,
+            false,
+            None,
+        );
         assert!(
             deferred.index.bounded_sweep_had_unsettled_upload(),
             "a retryable server conflict beside the debt still marks the sweep"
@@ -24030,19 +24067,14 @@ mod tests {
                     ));
                 }
                 settled_receipt(&f);
-                // Partial checkpoints leave the source-wide upload context
-                // unadopted, so every unchanged file stays selected under it
-                // (upload_context_receipt.rs:402). Production adopts it on a
-                // census-complete pass with no unsettled upload (snapshots.rs:8447)
-                // and saves that index. Run that quiet pass from the saved
-                // checkpoint first: all accepted bodies stay suppressed.
+                // Each file is current by its own receipt under the active
+                // context; no census adoption stands in for one. Run the quiet
+                // pass from the saved checkpoint first: all accepted bodies
+                // stay suppressed.
                 let recovery = f.progress.ack_recovery.take();
                 // Every restart below reloads this exact saved ledger.
                 let saved = std::fs::read(&f.progress_path).unwrap();
-                let adopted = |index: &ScanIndex| {
-                    serde_json::to_value(index).unwrap()["upload_context_fingerprint"]
-                        == "boundary-current-policy"
-                };
+                let adopted = |index: &ScanIndex| index.upload_context_owed_file_count() == 0;
                 for _ in 0..3 {
                     f.restart_preparation();
                     assert!(f.items.is_empty(), "accepted bodies stay suppressed");

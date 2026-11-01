@@ -213,16 +213,23 @@ pub(crate) fn indexed_size(index: &ScanIndex, path: &Path) -> Option<u64> {
         .map(|entry| entry.size_bytes)
 }
 
-/// Establish the completed legacy census precondition after the synthetic
-/// uploader has ACKed every current entity. Partial subsets intentionally
-/// retain the previous context; this creates no per-file receipt or ACK.
-pub(crate) fn adopt_acked_census_for_test(index: &mut ScanIndex, context: &str) {
+/// Model already delivered history after the synthetic uploader has ACKed
+/// every current entity: each file holds its receipt under `context` (an
+/// empty file its local empty proof). Creates no ACK.
+pub(crate) fn receipt_acked_files_for_test(index: &mut ScanIndex, context: &str) {
     let delivered = index.current_snapshot_fingerprints();
     assert!(!delivered.is_empty());
     assert!(delivered
         .iter()
         .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
-    index.upload_context_fingerprint = Some(context.into());
+    for entry in index.files.values_mut() {
+        entry.upload_context_receipt = Some(super::upload_context_receipt::Receipt {
+            context_fingerprint: context.into(),
+            replay_generation: crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH,
+            source_witness: entry.source_file_fingerprint.clone(),
+            body_witness: entry.last_upload_body_witness.clone().unwrap_or_default(),
+        });
+    }
 }
 
 /// Install the real exclusion input used by ordinary-money fixture families.

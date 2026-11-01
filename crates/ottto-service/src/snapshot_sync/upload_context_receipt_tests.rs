@@ -336,6 +336,8 @@ pub(crate) struct Uploader {
     pub not_stored: bool,
     pub refuse: bool,
     pub fail_after: Option<usize>,
+    /// The last page completed: neither Deferred nor Rejected.
+    pub completed: bool,
 }
 impl Uploader {
     pub(crate) fn new(source: SnapshotSource) -> Self {
@@ -352,6 +354,7 @@ impl Uploader {
             not_stored: false,
             refuse: false,
             fail_after: None,
+            completed: false,
         }
     }
     pub(crate) fn activate(
@@ -423,7 +426,7 @@ impl Uploader {
         let fail_after = self.fail_after;
         let not_stored = self.not_stored;
         let refuse = self.refuse;
-        upload_resumable_batches_with_body_witness(
+        let result = upload_resumable_batches_with_body_witness(
             items,
             "context-real-uploader",
             &mut self.progress,
@@ -517,10 +520,17 @@ impl Uploader {
             },
             |progress| progress.save(&path),
         )?;
+        self.completed = result == ResumableUploadResult::Completed;
         settle_index_after_upload(index, previous, &self.progress);
         let counts = index.accept_file_upload_context_acks(
             &self.progress.split_context_receipt_candidates(),
             &self.progress.fresh_context_body_acks,
+        );
+        // As the service finish: durable stamps before any ACK can retire.
+        index.stamp_entity_upload_context_acks(
+            &self.progress.destination_namespace_hash,
+            &self.progress.accepted_body_witnesses,
+            &self.progress.accepted_body_contexts,
         );
         Ok((counts.files, counts.bytes))
     }

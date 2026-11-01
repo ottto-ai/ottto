@@ -3914,6 +3914,10 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
         index.activate_quarantine_witness(SnapshotSource::ClaudeCode);
         index.activate_effective_upload_body_witness_revision(revision);
         index.adopt_effective_upload_body_witness_revision_monotonically();
+        if reason == CandidateParseReason::UploadContext {
+            // The file holds no receipt under this context: its own debt.
+            index.activate_upload_context("retry-context".into());
+        }
     };
     let memo = withheld_account::Memo::default();
     let page = |mut index: ScanIndex, revision| {
@@ -3941,7 +3945,6 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     );
     match reason {
         CandidateParseReason::UploadContext => {
-            previous.upload_context_fingerprint = Some("retry-context".into());
             // The prior checkpoint enters with unresolved context debt.
             // The reader may drain its census before account settlement.
             previous.bounded_sweep_had_unsettled_upload = true;
@@ -3977,14 +3980,13 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     assert_eq!(held.files[&key].source_file_fingerprint, fingerprint);
     assert!(held.claude_account_deferred_holds.contains_key(&key));
     if reason == CandidateParseReason::UploadContext {
-        // A drained reader can adopt its global context at finalization. The
-        // real checkpoint subset restores the previous context independently
-        // of that read and the Completed per-file account restoration. Exercise
-        // that composition, rather than assuming the old sweep flag survives.
+        // A read grants no receipt; only an exact ACK does. The real
+        // checkpoint subset keeps the file's own context debt, independently
+        // of the Completed per-file account restoration.
         held = held.committable_subset(&previous, &accepted, &BTreeMap::new());
-        assert_ne!(
-            held.upload_context_fingerprint, held.active_upload_context_fingerprint,
-            "real checkpoint preserves the unsettled context debt"
+        assert!(
+            held.file_upload_context_requires_adoption(&key),
+            "real checkpoint preserves the file's context debt"
         );
     }
     let checkpoint = root.0.join("equal-held.json");

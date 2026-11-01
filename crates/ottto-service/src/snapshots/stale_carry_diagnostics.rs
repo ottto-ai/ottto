@@ -7,7 +7,6 @@ pub(super) enum Rejection {
     ProvenanceOrContext,
     Contract,
     AcceptedLedger,
-    UploadContext,
     WindowScratch,
     OrdinaryScratch,
     MemberEvidence,
@@ -50,7 +49,6 @@ counts! {
     provenance_or_context: ProvenanceOrContext,
     contract: Contract,
     accepted_ledger: AcceptedLedger,
-    upload_context: UploadContext,
     window_scratch: WindowScratch,
     ordinary_scratch: OrdinaryScratch,
     member_evidence: MemberEvidence,
@@ -67,8 +65,6 @@ impl Counts {
             Rejection::Contract
         } else if !super::claude_accepted_ledger_is_current(index) {
             Rejection::AcceptedLedger
-        } else if index.upload_context_fingerprint != index.active_upload_context_fingerprint {
-            Rejection::UploadContext
         } else {
             // Legacy fence/independent-acceptance admission did not qualify.
             Rejection::MemberEvidence

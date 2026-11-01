@@ -804,10 +804,6 @@ mod tests {
                 );
             }
             assert_eq!(
-                plain.upload_context_fingerprint.as_deref(),
-                (!flag).then_some("unsettled-cause-context")
-            );
-            assert_eq!(
                 without_unsettled_causes(&plain),
                 without_unsettled_causes(&tagged),
                 "flag={flag}"

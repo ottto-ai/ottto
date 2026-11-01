@@ -95,7 +95,7 @@ fn fixture() -> ScanIndex {
     .unwrap();
     let mut index: ScanIndex = serde_json::from_value(fixture["logical"].clone()).unwrap();
     index.generation = 0;
-    index.upload_context_fingerprint = Some("/synthetic/exact-context".into());
+    index.historical_replay_generation = Some("/synthetic/exact-context".into());
     index
 }
 fn commit_populate(db: &mut sqlite::Sqlite, index: &ScanIndex) {
@@ -286,7 +286,7 @@ fn misc_row_digests_cover_scalar_map_ack_and_raw_hold_changes() {
     let mut next = prev.clone();
     next.generation += 1;
     assert_eq!(before.rows, baseline(&next, &mut cx).unwrap().rows);
-    next.upload_context_fingerprint = Some("different-context".into());
+    next.historical_replay_generation = Some("different-context".into());
     next.accepted_snapshot_fingerprints.insert("e".repeat(64));
     next.decode_holds
         .v2_insert(
@@ -310,7 +310,7 @@ fn misc_row_digests_cover_scalar_map_ack_and_raw_hold_changes() {
     assert_eq!(
         changed,
         BTreeSet::from([
-            mapper::key("setting.upload_context_fingerprint", "", 0).unwrap(),
+            mapper::key("setting.historical_replay_generation", "", 0).unwrap(),
             mapper::key("accepted.entity", "", 0).unwrap(),
             mapper::key("accepted.entity", &"e".repeat(64), 1).unwrap(),
             mapper::key("v1_field.repair_provenance", "", 0).unwrap(),
@@ -709,7 +709,7 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
     let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     let mut next = prev.clone();
-    next.upload_context_fingerprint = Some("new-context".into());
+    next.historical_replay_generation = Some("new-context".into());
     let digests = baseline(&prev, &mut cx).unwrap();
     let digests = super::save_graph(&mut db, &identity, digests, &mut next, &mut cx).unwrap();
     assert_persisted(&mut db, &next);
@@ -729,11 +729,11 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
     );
     let (current, _) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert_eq!(
-        current.upload_context_fingerprint,
-        next.upload_context_fingerprint
+        current.historical_replay_generation,
+        next.historical_replay_generation
     );
     let mut retry = current.clone();
-    retry.upload_context_fingerprint = Some("never-committed".into());
+    retry.historical_replay_generation = Some("never-committed".into());
     // Enough new rows that the save must grow the file past SQLite's page cap.
     for n in 0..2048 {
         retry
@@ -748,8 +748,8 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
         hydrate(&mut db, Scratch::binding())
             .unwrap()
             .0
-            .upload_context_fingerprint,
-        current.upload_context_fingerprint
+            .historical_replay_generation,
+        current.historical_replay_generation
     );
 }
 
@@ -763,7 +763,7 @@ fn refused_commit_refuses_reload_required_without_post_commit() {
         let (current, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
         let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
         let mut next = current.clone();
-        next.upload_context_fingerprint = Some("never-committed".into());
+        next.historical_replay_generation = Some("never-committed".into());
         next.files.clear();
         next.claude_account_family_pending.clear();
         next.accepted_snapshot_fingerprints.insert("f".repeat(64));
@@ -787,15 +787,15 @@ fn refused_commit_refuses_reload_required_without_post_commit() {
             current.generation + u64::from(after_commit)
         );
         assert_eq!(
-            hydrated.upload_context_fingerprint,
+            hydrated.historical_replay_generation,
             if after_commit {
-                next.upload_context_fingerprint.clone()
+                next.historical_replay_generation.clone()
             } else {
-                current.upload_context_fingerprint
+                current.historical_replay_generation
             }
         );
         let mut next = hydrated.clone();
-        next.upload_context_fingerprint = Some("committed".into());
+        next.historical_replay_generation = Some("committed".into());
         save_graph(&mut db, &identity, &hydrated, &mut next, &mut cx).unwrap();
         assert_persisted(&mut db, &next);
     }
@@ -906,7 +906,7 @@ fn refused_commit_preserves_owed_custody_through_independent_saves() {
         bodies: BTreeMap::from([("unpublished".into(), "body".into())]),
         pending_bodies: BTreeMap::new(),
     });
-    next.upload_context_fingerprint = Some("independent-change".into());
+    next.historical_replay_generation = Some("independent-change".into());
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     sqlite::fence_commit_writing(&db, "generation");
     let error = save_graph(&mut db, &identity, &prev, &mut next, &mut cx).unwrap_err();
@@ -920,7 +920,7 @@ fn refused_commit_preserves_owed_custody_through_independent_saves() {
     );
     // Independent work can commit from a fresh durable graph on the next pass.
     let mut selected = restored.clone();
-    selected.upload_context_fingerprint = Some("independent-change".into());
+    selected.historical_replay_generation = Some("independent-change".into());
     selected.files.insert(
         "independent-file".into(),
         selected.files["synthetic-file"].clone(),
@@ -930,7 +930,7 @@ fn refused_commit_preserves_owed_custody_through_independent_saves() {
     let (reopened, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert!(reopened.files.contains_key("independent-file"));
     assert_eq!(
-        reopened.upload_context_fingerprint.as_deref(),
+        reopened.historical_replay_generation.as_deref(),
         Some("independent-change")
     );
     assert_eq!(

@@ -382,8 +382,17 @@ impl NativePreparationFixture {
         let native_conjunction = claude_native_comparison::actual_native_conjunction(&disposition);
         assert!(native_conjunction);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-        index.upload_context_fingerprint = Some("native-preparation-test".into());
-        index.active_upload_context_fingerprint = index.upload_context_fingerprint.clone();
+        index.active_upload_context_fingerprint = Some("native-preparation-test".into());
+        // Model delivered history: each file holds its receipt in this context.
+        let context = index.active_upload_context_fingerprint.clone().unwrap();
+        for entry in index.files.values_mut() {
+            entry.upload_context_receipt = Some(upload_context_receipt::Receipt {
+                context_fingerprint: context.clone(),
+                replay_generation: crate::snapshots::RETIRED_CONTEXT_CURVE_REPLAY_EPOCH,
+                source_witness: entry.source_file_fingerprint.clone(),
+                body_witness: entry.last_upload_body_witness.clone().unwrap_or_default(),
+            });
+        }
         assert!(index.claude_usage_family_witnesses.contains_key(&parent));
         Self {
             native_conjunction,

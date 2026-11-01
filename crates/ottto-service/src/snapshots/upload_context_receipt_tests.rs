@@ -47,10 +47,7 @@ impl Fixture {
                 .collect::<String>(),
         )
         .unwrap();
-        let mut index = ScanIndex {
-            upload_context_fingerprint: Some("c".repeat(64)),
-            ..ScanIndex::default()
-        };
+        let mut index = ScanIndex::default();
         index.activate_file_upload_context(source, "d".repeat(64));
         Self {
             _scratch: scratch,
@@ -256,10 +253,6 @@ impl Fixture {
                 .unwrap();
             assert_eq!(self.uploader.posts.len(), before, "no POST after adoption");
             assert!(!scan.census_complete);
-            assert_eq!(
-                self.index.upload_context_fingerprint.as_deref(),
-                Some("c".repeat(64).as_str())
-            );
         }
     }
 }
@@ -285,68 +278,6 @@ fn claude_fresh_index_and_context_change_are_quiet_after_adoption() {
     );
     assert_eq!(f.adopt().files, 1);
     f.assert_quiet();
-}
-#[test]
-fn claude_source_context_matched_without_receipts_is_quiet_for_three_relists() {
-    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
-    let (_, items) = f.pending();
-    f.index.record_accepted_snapshot_fingerprints(
-        &items
-            .iter()
-            .map(|item| item.snapshot_fingerprint.clone())
-            .collect(),
-    );
-    f.index.upload_context_fingerprint = f.index.active_upload_context_fingerprint.clone();
-    assert!(f.entry().upload_context_receipt.is_none());
-    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
-    for _ in 0..3 {
-        let (scan, bytes) = f.walk(true);
-        assert_eq!(
-            (scan.scanned_file_count, bytes, scan.snapshots.len()),
-            (0, 0, 0)
-        );
-        assert!(f.entry().upload_context_receipt.is_none());
-    }
-}
-#[test]
-fn claude_source_context_matched_mixed_file_is_quiet_for_three_relists() {
-    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
-    let (mut scan, _) = f.walk(false);
-    // Model a post-policy file group with two distinct entities, through the
-    // real finalizer, before settling only one of its entities.
-    assert_eq!(scan.snapshots.len(), 1);
-    let mut sibling = scan.snapshots[0].clone();
-    sibling.source_session_id = "019fa111-2222-7333-8444-666666666666".into();
-    scan.snapshots.push(sibling);
-    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
-    assert_eq!(f.index.file_snapshot_fingerprints[&f.key()].len(), 2);
-    let accepted = scan.snapshots[0].snapshot_fingerprint.clone();
-    let refused = scan.snapshots[1].snapshot_fingerprint.clone();
-    assert_ne!(accepted, refused);
-    f.index
-        .record_accepted_snapshot_fingerprints(&BTreeSet::from([accepted.clone()]));
-    let mut quarantine = snapshot_quarantine_record(f.source);
-    quarantine.witness = f.index.active_quarantine_witness.clone().unwrap();
-    quarantine.upload_body_witness = Some(snapshot_upload_body_witness(&scan.snapshots[1]));
-    f.index
-        .quarantined_snapshot_fingerprints
-        .insert(refused.clone(), quarantine);
-    f.index.upload_context_fingerprint = f.index.active_upload_context_fingerprint.clone();
-    assert!(f.entry().upload_context_receipt.is_none());
-    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
-    for _ in 0..3 {
-        let (scan, bytes) = f.walk(true);
-        assert_eq!(
-            (scan.scanned_file_count, bytes, scan.snapshots.len()),
-            (0, 0, 0)
-        );
-        assert_eq!(f.index.file_snapshot_fingerprints[&f.key()].len(), 2);
-        assert!(f
-            .index
-            .quarantined_snapshot_fingerprints
-            .contains_key(&refused));
-        assert!(f.entry().upload_context_receipt.is_none());
-    }
 }
 #[test]
 fn upload_context_receipt_parse_refused() {
@@ -544,7 +475,6 @@ fn scoped_mode_preserves_census_settlement_after_acked_file_becomes_empty_or_sup
         let old_receipt = f.entry().upload_context_receipt.clone();
         let base = "d".repeat(64);
         f.index.copy_prefix_base_upload_context = Some(base.clone());
-        f.index.upload_context_fingerprint = Some(base.clone());
         f.index.activate_file_upload_context(
             f.source,
             crate::snapshot_sync::resumed_prefix_upload_context(base, true),
@@ -571,18 +501,13 @@ fn scoped_mode_preserves_census_settlement_after_acked_file_becomes_empty_or_sup
         finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
         assert!(f.index.confirmed_empty_files.contains(&f.key()));
         assert!(f.entry().last_upload_body_witness.is_none());
-        assert_eq!(f.entry().upload_context_receipt, old_receipt);
-        // Drain a prior incomplete census's unsettled marker through the
-        // ordinary complete-census finalizer, without manufacturing an ACK.
-        for _ in 0..2 {
-            if f.index.source_upload_context_matches() {
-                break;
-            }
-            let (mut census, _) = f.walk(false);
-            census.census_complete = true;
-            finalize_scan_after_policy(f.source, &mut census, &mut f.index);
-        }
-        assert!(f.index.source_upload_context_matches());
+        // The old ACK receipt named other source bytes; the file's own local
+        // empty proof replaces it. Nothing was emitted, ACKed or credited.
+        let proof = f.entry().upload_context_receipt.clone().unwrap();
+        assert_ne!(Some(&proof), old_receipt.as_ref());
+        assert!(proof.body_witness.is_empty());
+        assert_eq!(proof.source_witness, f.entry().source_file_fingerprint);
+        assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
         for _ in 0..3 {
             let (scan, bytes) = f.walk(true);
             assert_eq!(
@@ -702,15 +627,13 @@ fn upload_context_receipt_historical_replay_rearms_retained_entry() {
     assert!(f.index.files[&key].upload_context_receipt.is_none());
     assert_eq!(f.adopt().files, 1);
     assert!(!f.index.prepare_historical_replay("synthetic-replay".into()));
-    // Replay semantics still own the global witness (None after rearm).
-    assert!(f.index.upload_context_fingerprint.is_none());
     for _ in 0..3 {
         assert_eq!(f.walk(true).0.scanned_file_count, 0);
     }
 }
 
-/// [behaviour] Pi writes the shared per-file receipt from its exact ACK under
-/// the active context, while its read and resend decisions stay main's.
+/// [behaviour] Pi earns the shared per-file receipt from its exact ACK under
+/// the active context, and decides from it like Claude and Codex.
 #[test]
 fn pi_exact_ack_writes_the_shared_file_receipt() {
     let mut f = Fixture::new(SnapshotSource::Pi);
@@ -723,12 +646,11 @@ fn pi_exact_ack_writes_the_shared_file_receipt() {
         Some(&receipt.body_witness)
     );
     assert_eq!(f.uploader.counts(), (0, 0, 0, 0), "no context resend");
-    // Write-only: Pi still follows the source-wide context gate.
-    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
 }
 
 /// [behaviour] A confirmed-empty file gets a local proof of its context and
-/// source witness, which is never ACK evidence and changes no selection.
+/// source witness: it proves that file only and is never ACK evidence.
 #[test]
 fn empty_file_proof_is_local_and_never_ack_evidence() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
@@ -744,14 +666,15 @@ fn empty_file_proof_is_local_and_never_ack_evidence() {
     assert!(proof.body_witness.is_empty());
     assert_eq!(proof.context_fingerprint, local_on);
     assert_eq!(proof.source_witness, f.entry().source_file_fingerprint);
-    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
     f.index
         .set_copy_prefix_base_upload_context(Some(base), false);
     assert!(f.index.copy_prefix_base_upload_context.is_none());
 }
 
 /// [format] An old decoder drops the per-entity stamp. Missing means owed, and
-/// the file receipt beside it is untouched.
+/// the file receipt beside it is untouched. The retired source-wide context
+/// is decoded and dropped, and grants nothing.
 #[test]
 fn entity_stamp_dropped_by_old_decoder_is_owed() {
     let mut f = Fixture::new(SnapshotSource::Codex);
@@ -776,18 +699,22 @@ fn entity_stamp_dropped_by_old_decoder_is_owed() {
         .as_object_mut()
         .unwrap()
         .remove("upload_context_proof");
+    // An earlier daemon's source-wide context decodes and is dropped.
+    encoded["upload_context_fingerprint"] = json!("d".repeat(64));
     fs::write(&saved_path, serde_json::to_vec(&encoded).unwrap()).unwrap();
     f.index = ScanIndex::load(&saved_path).unwrap();
+    assert!(serde_json::to_value(&f.index).unwrap()["upload_context_fingerprint"].is_null());
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
     assert_eq!(f.index.upload_context_owed_counts().no_proof_entities, 1);
     assert!(f.entry().upload_context_receipt.is_some());
 }
 
-/// [behaviour] Local pacing debt is labelled apart from backend conflicts. It
-/// keeps today's Deferred outcome until receipts are authoritative.
+/// [regress] Local pacing debt is not a backend conflict: the deferred
+/// catch-up stays owed on its own file and the page completes, so it no
+/// longer marks the sweep unsettled (before: Deferred, deferred_conflict).
 #[test]
-fn local_budget_deferral_is_labelled_apart_from_server_conflicts() {
+fn local_budget_deferral_completes_the_page_and_stays_owed() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.adopt();
     let previous = f.index.clone();
@@ -803,6 +730,90 @@ fn local_budget_deferral_is_labelled_apart_from_server_conflicts() {
     assert_eq!(
         f.uploader.deferral_counts(),
         (scan.snapshots.len() as u64, 0)
+    );
+    assert!(f.uploader.completed, "local pacing never defers the page");
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+}
+
+/// [money] A context change owes an unchanged file once: its identical body
+/// is re-sent, equals a cold Full under the new context, earns the receipt,
+/// and is never owed twice under that context.
+#[test]
+fn context_change_is_owed_once_then_stamped_and_equals_a_full() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    assert_eq!(f.adopt().files, 1);
+    let previous = f.index.clone();
+    let context = "e".repeat(64);
+    f.index
+        .activate_file_upload_context(f.source, context.clone());
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.scanned_file_count, 1, "owed once");
+    let mut cold = Fixture::new(f.source);
+    cold.index
+        .activate_file_upload_context(cold.source, context.clone());
+    let (cold_scan, _) = cold.walk(true);
+    sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+        &sampled_scan::transition_fixture::scan_money(f.source, &cold.index, &cold_scan),
+        &sampled_scan::transition_fixture::scan_money(f.source, &f.index, &scan),
+    );
+    f.uploader.activate(f.source, context, &mut f.index);
+    let (files, _) = f
+        .uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    assert_eq!(files, 1, "stamped");
+    assert_eq!(f.uploader.counts().0, scan.snapshots.len() as u64);
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+    f.assert_quiet();
+}
+
+/// [regress] A refused sibling leaves a proven file quiet: no re-read, no
+/// re-send. Before, Pi's source-wide gate kept every file owed while any
+/// sibling stayed unsettled.
+#[test]
+fn refused_sibling_causes_no_reread_of_a_proven_file() {
+    let mut f = Fixture::new(SnapshotSource::Pi);
+    assert_eq!(f.adopt().files, 1);
+    let proven = f.key();
+    let sibling_session = "019fa111-2222-7333-8444-666666666666";
+    fs::write(
+        f.root.join(format!("{sibling_session}.jsonl")),
+        [
+            json!({"type":"session","id":sibling_session,"timestamp":"2026-10-29T10:00:00Z"}),
+            json!({"type":"message_end","message":{"responseId":"synthetic-sibling","model":"gpt-5.4","timestamp":"1793268001000","usage":{"input":7,"output":3}}}),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>(),
+    )
+    .unwrap();
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| item.source_session_id != SESSION));
+    f.uploader.refuse = true;
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    f.index
+        .mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
+    let posts = f.uploader.posts.len();
+    for _ in 0..3 {
+        let (scan, _) = f.walk(true);
+        assert!(scan
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id != SESSION));
+        assert!(!f.index.file_upload_context_requires_adoption(&proven));
+    }
+    assert_eq!(
+        f.uploader.posts.len(),
+        posts,
+        "the proven file is never re-sent"
     );
 }
 
@@ -935,18 +946,6 @@ fn upload_context_receipt_partial_checkpoint_old_ack_refused() {
         f.source, &f.index, &previous, &items, false,
     );
     assert!(f.entry().upload_context_receipt.is_none());
-}
-#[test]
-fn upload_context_legacy_activation_preserves_identical_body_noop() {
-    let mut f = Fixture::new(SnapshotSource::Codex);
-    f.adopt();
-    // The legacy/Pi activation path does not decide from file receipts.
-    f.index.file_upload_context_enabled = false;
-    f.index.activate_upload_context("e".repeat(64));
-    let (scan, _) = f.walk(true);
-    assert_eq!(scan.scanned_file_count, 1);
-    assert!(scan.snapshots.is_empty());
-    assert!(scan.semantic_noop_count > 0);
 }
 #[test]
 fn upload_context_policy_change_reprojects_old_refusal_then_keeps_backoff() {
@@ -1137,7 +1136,7 @@ fn real_uploader_same_context_transport_retry_has_zero_context_resends() {
     assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
 }
 #[test]
-fn real_uploader_old_unstamped_progress_with_equal_source_context_resends_nothing() {
+fn real_uploader_retired_ack_with_durable_stamp_resends_nothing() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     let previous = f.index.clone();
     let (_, items) = f.pending();
@@ -1148,7 +1147,6 @@ fn real_uploader_old_unstamped_progress_with_equal_source_context_resends_nothin
     f.uploader.forget_stamps();
     let key = f.key();
     f.index.files.get_mut(&key).unwrap().upload_context_receipt = None;
-    f.index.upload_context_fingerprint = Some("d".repeat(64));
     let previous = f.index.clone();
     f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
     assert_eq!(
@@ -1156,7 +1154,8 @@ fn real_uploader_old_unstamped_progress_with_equal_source_context_resends_nothin
             .send(f.source, &mut f.index, &previous, &items)
             .unwrap()
             .0,
-        0
+        1,
+        "the durable entity stamp restores the receipt without a POST"
     );
     assert_eq!(f.uploader.posts.len(), 1);
     assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
@@ -1492,7 +1491,6 @@ fn terminal_census_context_deferral_stays_owed_after_restart() {
     assert!(scan.census_complete, "the actual scanner closes its census");
     assert!(f.index.traversal.is_none(), "the terminal queue is retired");
     finalize_scan_after_policy(source, &mut scan, &mut f.index);
-    assert_eq!(f.index.upload_context_fingerprint.as_ref(), Some(&context));
     f.uploader.activate(source, context.clone(), &mut f.index);
     f.uploader.set_byte_allowance(0);
     let first = f.uploader.posts.len();
@@ -1504,7 +1502,7 @@ fn terminal_census_context_deferral_stays_owed_after_restart() {
         0
     );
     assert_eq!(f.uploader.posts.len(), first);
-    assert_ne!(f.index.upload_context_fingerprint.as_ref(), Some(&context));
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
 
     // Restart with only persisted index/ACK evidence and no retained traversal.
     f.index = serde_json::from_slice(&serde_json::to_vec(&f.index).unwrap()).unwrap();

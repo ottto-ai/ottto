@@ -301,7 +301,6 @@ impl Serialize for ScanIndex {
         }
         field!(schema_version);
         field!(generation);
-        field!(upload_context_fingerprint, Option::is_none);
         map.serialize_entry(
             "files",
             &WireMap(&self.files, self.decode_holds.0.get("files")),
@@ -424,7 +423,7 @@ impl Serialize for ScanIndex {
 pub(super) const FIELDS: &[&str] = &[
     "schema_version",
     "generation",
-    "upload_context_fingerprint",
+    "upload_context_fingerprint", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "files",
     "session_account_bindings",
     "terminal_jsonl_dispositions",
@@ -2092,9 +2091,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.upload_ack_retirement_handoff =
                                 self.history_scalar(value, None)?
                         }
-                        "upload_context_fingerprint" => {
-                            index.upload_context_fingerprint = self.typed(value)?
-                        }
+                        "upload_context_fingerprint" => {} // TOMBSTONE: decode-and-drop.
                         "files" => index.files = self.records("files", value, true)?,
                         "session_account_bindings" => {
                             index.session_account_bindings = self.typed(value)?

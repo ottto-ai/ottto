@@ -147,7 +147,7 @@ impl Budget {
         }
     }
     pub(super) fn record(&mut self, index: &mut ScanIndex, candidate: &CandidateFile, bytes: u64) {
-        if bytes == 0 || !index.file_upload_context_enabled {
+        if bytes == 0 || !index.file_upload_context_enabled() {
             return;
         }
         let key = local_index_key(&candidate.path);
@@ -199,7 +199,7 @@ impl ScanIndex {
             .extend(absent.into_values().cloned());
     }
     pub(super) fn context_only_read(&self, candidate: &CandidateFile) -> bool {
-        if !self.file_upload_context_enabled {
+        if !self.file_upload_context_enabled() {
             return false;
         }
         let key = local_index_key(&candidate.path);

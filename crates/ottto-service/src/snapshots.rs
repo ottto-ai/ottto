@@ -3515,12 +3515,10 @@ pub struct ScanIndex {
     pub schema_version: u16,
     #[serde(default)]
     pub generation: u64,
-    /// The exact privacy/attribution context under which every settled entity
-    /// fingerprint in this index was produced. A policy transition keeps the
-    /// policy-neutral entity identity but must force one complete correction
-    /// pass before this witness advances.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    upload_context_fingerprint: Option<String>,
+    /// retired_<old>: the source-wide upload context, replaced by per-file
+    /// receipts and per-entity stamps. Decode-only; never written.
+    #[serde(rename = "upload_context_fingerprint", default, skip_serializing)]
+    retired_upload_context_fingerprint: serde::de::IgnoredAny,
     pub files: BTreeMap<String, ScanIndexEntry>,
     /// Hash-only owner proof keyed by machine and session in this source index.
     /// A later current login can never replace it.
@@ -3923,8 +3921,6 @@ pub struct ScanIndex {
     #[serde(skip)]
     active_upload_context_fingerprint: Option<String>,
     #[serde(skip)]
-    file_upload_context_enabled: bool,
-    #[serde(skip)]
     pub(crate) context_read_counts: upload_context_read::LocalCounts,
     /// Runtime-only revision of the effective additive upload projection.
     /// Adoption is recorded per complete, settled file rather than per census.
@@ -4279,7 +4275,7 @@ impl Default for ScanIndex {
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: 0,
             upload_ack_retirement_handoff: None,
-            upload_context_fingerprint: None,
+            retired_upload_context_fingerprint: serde::de::IgnoredAny,
             files: BTreeMap::new(),
             retired_reread_guard: serde::de::IgnoredAny,
             session_account_bindings: BTreeMap::new(),
@@ -4364,7 +4360,6 @@ impl Default for ScanIndex {
             quarantined_snapshot_fingerprints: BTreeMap::new(),
             active_quarantine_witness: None,
             active_upload_context_fingerprint: None,
-            file_upload_context_enabled: false,
             context_read_counts: Default::default(),
             active_effective_upload_body_witness_revision: 0,
             active_effective_upload_body_witness_revision_monotone: false,
@@ -5914,13 +5909,13 @@ fn claude_stale_rearm_can_reopen_fence(index: &ScanIndex, stale: &BTreeSet<Strin
 
 /// The start-wide checks every stale-family carry shares: the duplicate
 /// fence is already closed, the contract-5 latch is clear and a contract is
-/// recorded, the accepted ledger is current and the upload context active.
+/// recorded, and the accepted ledger is current. Upload context is each
+/// member's own proof.
 fn claude_stale_carry_start_admitted(index: &ScanIndex) -> bool {
     index.claude_duplicate_request_witness_overflowed
         && !index.claude_request_identity_contract_changed
         && index.claude_request_identity_contract.is_some()
         && claude_accepted_ledger_is_current(index)
-        && index.upload_context_fingerprint == index.active_upload_context_fingerprint
 }
 
 /// An exact committed upload-body head whose current entities all have ACKs.
@@ -5941,6 +5936,7 @@ fn claude_stale_member_independently_accepted(
             .as_ref()
             .is_some_and(|witness| !witness.is_empty())
         && claude_index_file_body_accepted(index, key, entry)
+        && !index.file_upload_context_requires_adoption(key)
         && entry
             .last_snapshot_fingerprint
             .as_ref()
@@ -5980,21 +5976,18 @@ fn claude_accepted_retry_start_admitted(
     (!index.claude_request_identity_contract_changed || scope.is_some())
         && index.claude_request_identity_contract.is_some()
         && claude_accepted_ledger_is_current(index)
-        && index.upload_context_fingerprint == index.active_upload_context_fingerprint
 }
 
 fn claude_contract_debt_scope(index: &ScanIndex) -> Option<&BTreeSet<String>> {
     static EMPTY: BTreeSet<String> = BTreeSet::new();
     if !index.bounded_sweep_had_unsettled_upload {
         Some(&EMPTY)
-    } else if index.unsettled_cause_bits() == UnsettledUploadCause::CompletedBlockingHolds.bit() {
+    } else {
         index
             .claude_full_rearm_progress
             .held_family_roots
             .as_ref()
             .filter(|roots| held_family_scope_has_writer_shape(roots))
-    } else {
-        None
     }
 }
 
@@ -6316,7 +6309,8 @@ fn claude_fence_closed_retry_carry_observed(
             || index
                 .claude_account_deferred_holds
                 .contains_key(index_key.as_str())
-            || (!confirmed_empty && !claude_index_file_body_accepted(index, index_key, entry));
+            || (!confirmed_empty && !claude_index_file_body_accepted(index, index_key, entry))
+            || index.file_upload_context_requires_adoption(index_key);
         let status = blocked.entry(root_session_id).or_default();
         status.0 |= refused;
         // The accepted refusal is the streaming/storage-only member predicate.
@@ -8616,8 +8610,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
         // again when a history hold is released, even without an old body tuple.
         // Legacy/unknown incidence stays funded and protects only its original
         // ACKs even when no file association can be recovered.
-        let context_rearm_required = index.file_upload_context_enabled
-            && index.file_upload_context_requires_adoption(&pending.index_key);
+        let context_rearm_required =
+            index.file_upload_context_requires_adoption(&pending.index_key);
         if let Some(unknown) = index.accepted_rebuild_incidence.get("") {
             carried_noop_entities.extend(
                 unknown
@@ -8712,9 +8706,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
         });
     }
     if result.census_complete {
-        if !index.bounded_sweep_had_unsettled_upload {
-            index.upload_context_fingerprint = index.active_upload_context_fingerprint.clone();
-        }
         index.bounded_sweep_had_unsettled_upload = false;
         index.bounded_sweep_unsettled_causes = 0;
         index.claude_full_rearm_progress.held_family_roots = None;
@@ -10509,18 +10500,16 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         // and the accepted ledger is current and not being rebuilt. Authority
         // debt alone does not unsettle the sweep; `claude_unchanged_proof_roots`
         // still excludes every quarantined or demoting root.
-        // When the sweep's only unsettled cause is scoped
-        // `CompletedBlockingHolds`, only the held families lose the skip below;
-        // they stay held, re-offered and unproven residue. Any other cause, or
-        // a stamp that could not name its families, keeps the sweep-wide veto.
+        // When every unsettled stamp named its families, only those families
+        // lose the skip below; they stay held, re-offered and unproven residue.
+        // A stamp that could not name its families keeps the sweep-wide veto.
         let unsettled_families = index.unchanged_proof_unsettled_families();
         let unchanged_proof_gate = fence_stays_closed
             && !full_rearm
             && !latch_rearms
             && identity_contract_recorded
             && unsettled_families.is_some()
-            && claude_accepted_ledger_is_current(index)
-            && index.upload_context_fingerprint == index.active_upload_context_fingerprint;
+            && claude_accepted_ledger_is_current(index);
         // A partially settled page earlier in this traversal (shed, lost ACK
         // or refused CAS) keeps the latch; so does a partial save of this one,
         // and so does any RetryPending authority family.
@@ -12536,6 +12525,7 @@ fn claude_unchanged_proof_roots<'p>(
         let (root_session_id, source_session_id) = member_ref.into_owned();
         *unchanged = claude_index_file_body_accepted(index, index_key, entry)
             && !entry.rearmed()
+            && !index.file_upload_context_requires_adoption(index_key)
             && !current_ids.contains(source_session_id.as_str())
             && !index
                 .claude_account_deferred_holds
@@ -27147,7 +27137,7 @@ impl OwnedSourceScan {
                 ))
             });
         let codex_selected_flags =
-            if source == SnapshotSource::Codex || index.file_upload_context_enabled {
+            if source == SnapshotSource::Codex || index.file_upload_context_enabled() {
                 pending_paths
                     .iter()
                     .map(|pending| {
@@ -27862,7 +27852,7 @@ impl OwnedSourceScan {
                     // group; sorting the admitted queue would be too late.
                     groups.sort_by_key(|(own, group)| {
                         (
-                            index.file_upload_context_enabled
+                            index.file_upload_context_enabled()
                                 && group
                                     .members
                                     .iter()
@@ -28022,7 +28012,7 @@ impl OwnedSourceScan {
                         // Ordinary groups have already spent their slots. Before
                         // the first context group, reserve the remaining ordinary
                         // singletons too; catch-up must never evict one below.
-                        let context_group = index.file_upload_context_enabled
+                        let context_group = index.file_upload_context_enabled()
                             && group
                                 .members
                                 .iter()
@@ -28162,7 +28152,7 @@ impl OwnedSourceScan {
                     {
                         // G1: re-reads leave before any census member.
                         let context_evict = index
-                            .file_upload_context_enabled
+                            .file_upload_context_enabled()
                             .then(|| {
                                 let disposable = |candidate: &CandidateFile| {
                                     index.context_only_read(candidate)
@@ -28214,7 +28204,7 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                if index.file_upload_context_enabled {
+                if index.file_upload_context_enabled() {
                     codex_join_groups
                         .make_contiguous()
                         .sort_by_cached_key(|group| {
@@ -28645,7 +28635,7 @@ impl OwnedSourceScan {
                     !codex_page.cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
                         && codex_join_inventory.is_some()
                         && (!codex_page.continuation() || codex_parent_identities.census_valid())
-                        && (!index.file_upload_context_enabled
+                        && (!index.file_upload_context_enabled()
                             || !identified_candidates.iter().any(|candidate| {
                                 !index.context_only_read(candidate)
                                     && index
@@ -28656,7 +28646,7 @@ impl OwnedSourceScan {
                                         .0
                                         == CandidateDecision::Parse
                             }))
-                        && (!index.file_upload_context_enabled
+                        && (!index.file_upload_context_enabled()
                             || !codex_join_groups.iter().any(|group| {
                                 group
                                     .members
@@ -28757,7 +28747,7 @@ impl OwnedSourceScan {
             // the next group is a re-read.
             let rereads_wait = || {
                 codex_join_groups.front().is_some_and(|group| {
-                    (!index.file_upload_context_enabled
+                    (!index.file_upload_context_enabled()
                         || group
                             .members
                             .iter()
@@ -28773,7 +28763,7 @@ impl OwnedSourceScan {
                     )
                 })
             };
-            let context_group_waits = index.file_upload_context_enabled
+            let context_group_waits = index.file_upload_context_enabled()
                 && codex_join_groups.front().is_some_and(|group| {
                     group
                         .members
@@ -28792,7 +28782,7 @@ impl OwnedSourceScan {
                 });
             if active_file.is_none() && !rereads_wait() && !context_group_waits {
                 if let Some(group) = codex_join_groups.pop_front() {
-                    if index.file_upload_context_enabled
+                    if index.file_upload_context_enabled()
                         && group
                             .members
                             .iter()
@@ -31688,9 +31678,9 @@ impl OwnedSourceScan {
                 if source == SnapshotSource::Codex {
                     // Count-only attribution of why Codex files were selected
                     // on this page. No path, session, or identifier is named.
-                    if let Some(line) = census.codex_parse_reasons_line(
-                        index.upload_context_fingerprint == index.active_upload_context_fingerprint,
-                    ) {
+                    if let Some(line) =
+                        census.codex_parse_reasons_line(index.upload_context_owed_file_count())
+                    {
                         eprintln!("{line}");
                     }
                 }
@@ -31710,8 +31700,8 @@ impl OwnedSourceScan {
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={} identity_incomplete_holds_entered_process_total={} identity_incomplete_holds_cleared_process_total={} identity_incomplete_hold_deadlines_restored_process_total={} held_audit_open_failed_keys={} held_audit_open_failed_oldest_age_seconds={} held_audit_open_backoff_evicted_keys={}",
-                        index.upload_context_fingerprint == index.active_upload_context_fingerprint,
+                        "local snapshot census claude parse reasons: upload_context_owed_files={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={} identity_incomplete_holds_entered_process_total={} identity_incomplete_holds_cleared_process_total={} identity_incomplete_hold_deadlines_restored_process_total={} held_audit_open_failed_keys={} held_audit_open_failed_oldest_age_seconds={} held_audit_open_backoff_evicted_keys={}",
+                        index.upload_context_owed_file_count(),
                         census_count_fields(&CANDIDATE_PARSE_REASON_NAMES, &census.parse_reasons),
                         census.claude_compaction_unlinked_parent_count,
                         history_upgrade.denied_for(&[
@@ -40440,15 +40430,15 @@ impl ScanCensus {
 
     /// The local census line attributing this page's Codex selections, or
     /// `None` when nothing was decided. Counts only: no path or identifier.
-    fn codex_parse_reasons_line(&self, upload_context_matches: bool) -> Option<String> {
+    fn codex_parse_reasons_line(&self, upload_context_owed_files: usize) -> Option<String> {
         if self.parse_reasons.iter().all(|count| *count == 0)
             && self.codex_selections.iter().all(|count| *count == 0)
         {
             return None;
         }
         Some(format!(
-            "local snapshot census codex parse reasons: upload_context_matches={} {} {}",
-            upload_context_matches,
+            "local snapshot census codex parse reasons: upload_context_owed_files={} {} {}",
+            upload_context_owed_files,
             census_count_fields(&CANDIDATE_PARSE_REASON_NAMES, &self.parse_reasons),
             census_count_fields(&CODEX_SELECTION_NAMES, &self.codex_selections),
         ))
@@ -46646,14 +46636,27 @@ impl ScanIndex {
     }
 
     /// Mark the sweep unsettled by a `Completed` page's blocking local holds,
-    /// scoped to the held entities' Claude families (`held_family_roots`, raw
-    /// roots). The scope survives only while every earlier stamp of this
-    /// sweep was scoped too; `None`, no family or overflow drops it. A prior
-    /// scope outside the writer's shape (as loaded from a damaged index) is
-    /// unknown and stays sweep-wide until the next sweep resets the flag. The
-    /// flag, census withhold and every other reader of the flag are unchanged.
+    /// scoped to the held entities' Claude families.
     pub(crate) fn mark_bounded_sweep_held_by_families(
         &mut self,
+        held_family_roots: Option<&BTreeSet<String>>,
+    ) {
+        self.mark_bounded_sweep_unsettled_in(
+            UnsettledUploadCause::CompletedBlockingHolds,
+            held_family_roots,
+        );
+    }
+
+    /// Mark the sweep unsettled, scoped to the Claude families (raw roots)
+    /// whose entities are unsettled (`held_family_roots`). The scope survives
+    /// only while every earlier stamp of this sweep was scoped too; `None`, no
+    /// family or overflow drops it. A prior scope outside the writer's shape
+    /// (as loaded from a damaged index) is unknown and stays sweep-wide until
+    /// the next sweep resets the flag. The flag, census withhold and every
+    /// other reader of the flag are unchanged.
+    pub(crate) fn mark_bounded_sweep_unsettled_in(
+        &mut self,
+        cause: UnsettledUploadCause,
         held_family_roots: Option<&BTreeSet<String>>,
     ) {
         let prior = if self.bounded_sweep_had_unsettled_upload {
@@ -46664,7 +46667,7 @@ impl ScanIndex {
         } else {
             Some(BTreeSet::new())
         };
-        self.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::CompletedBlockingHolds);
+        self.mark_bounded_sweep_unsettled_by(cause);
         self.claude_full_rearm_progress.held_family_roots = prior
             .zip(held_family_roots.filter(|roots| !roots.is_empty()))
             .map(|(mut scope, roots)| {
@@ -46680,19 +46683,14 @@ impl ScanIndex {
     }
 
     /// Root digests of the families whose unsettled uploads this sweep owes:
-    /// none while the sweep is settled, the held families while scoped
-    /// `CompletedBlockingHolds` is its only cause, and `None` (every family
-    /// keeps its proof re-arm) for any other cause or an unscoped stamp.
-    /// A loaded scope is trusted only in the shape the writer produces: not
-    /// empty, at most `MAX_SCOPED_HELD_FAMILY_ROOTS`, every entry a canonical
-    /// root digest. Anything else keeps the sweep-wide veto.
+    /// none while the sweep is settled, the named families while every stamp
+    /// named them, and `None` (every family keeps its proof re-arm) for an
+    /// unscoped stamp. A loaded scope is trusted only in the shape the writer
+    /// produces: not empty, at most `MAX_SCOPED_HELD_FAMILY_ROOTS`, every
+    /// entry a canonical root digest. Anything else keeps the sweep-wide veto.
     pub(crate) fn unchanged_proof_unsettled_families(&self) -> Option<BTreeSet<String>> {
         if !self.bounded_sweep_had_unsettled_upload {
             return Some(BTreeSet::new());
-        }
-        if self.bounded_sweep_unsettled_causes != UnsettledUploadCause::CompletedBlockingHolds.bit()
-        {
-            return None;
         }
         self.claude_full_rearm_progress
             .held_family_roots
@@ -48733,7 +48731,6 @@ impl ScanIndex {
             entry.upload_context_receipt = None;
         }
         self.upload_context_proof.entity_stamps.clear();
-        self.upload_context_fingerprint = None;
         // Replay resets delivery authority, not file-owned recovery evidence.
         // Otherwise a missing member or expired trace can silently shrink or
         // reprice a previously joined contribution during ordinary replay.
@@ -49157,7 +49154,7 @@ impl ScanIndex {
         self.active_quarantine_witness = Some(
             self.active_upload_context_fingerprint
                 .as_deref()
-                .filter(|_| self.file_upload_context_enabled)
+                .filter(|_| self.file_upload_context_enabled())
                 .map_or_else(
                     || snapshot_quarantine_witness(source),
                     |context| snapshot_quarantine_witness_for_context(source, context),
@@ -50842,6 +50839,29 @@ impl ScanIndex {
     }
 
     /// Keys whose scanned entity set or head names a held revision.
+    /// Claude family roots of the files holding these entities. `None` when
+    /// one cannot be placed, or for another source: the stamp stays sweep-wide.
+    pub(crate) fn claude_entity_family_roots(
+        &self,
+        entities: &BTreeSet<String>,
+    ) -> Option<BTreeSet<String>> {
+        let mut placed = BTreeSet::new();
+        let mut roots = BTreeSet::new();
+        for key in self.locally_held_keys(entities) {
+            let (root, _) = claude_index_path_family_member(Path::new(&key))?;
+            roots.insert(root);
+            placed.extend(
+                self.file_snapshot_fingerprints
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .chain(self.files[&key].last_snapshot_fingerprint.as_ref())
+                    .filter(|fingerprint| entities.contains(*fingerprint)),
+            );
+        }
+        (placed.len() == entities.len()).then_some(roots)
+    }
+
     fn locally_held_keys(&self, held: &BTreeSet<String>) -> BTreeSet<String> {
         self.files
             .iter()
@@ -51578,7 +51598,7 @@ impl ScanIndex {
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: previous.generation,
             upload_ack_retirement_handoff: previous.upload_ack_retirement_handoff.clone(),
-            upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
+            retired_upload_context_fingerprint: serde::de::IgnoredAny,
             retired_reread_guard: serde::de::IgnoredAny,
             files,
             session_account_bindings: self.session_account_bindings.clone(),
@@ -51688,7 +51708,6 @@ impl ScanIndex {
             quarantined_snapshot_fingerprints: retained_quarantine.clone(),
             active_quarantine_witness: self.active_quarantine_witness.clone(),
             active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),
-            file_upload_context_enabled: self.file_upload_context_enabled,
             context_read_counts: self.context_read_counts.clone(),
             active_effective_upload_body_witness_revision: self
                 .active_effective_upload_body_witness_revision,
@@ -56152,7 +56171,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_context_transition_forces_a_complete_a_b_a_reparse() {
+    fn upload_context_without_receipt_reparses_under_every_context() {
         let root = temp_dir("upload-context-aba");
         let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
         fs::write(
@@ -56181,14 +56200,11 @@ mod tests {
             result
         };
 
+        // No ACK, no receipt: a complete census alone proves nothing, so the
+        // file stays owed under every context until its own receipt exists.
         assert_eq!(scan_with_context("context-a").scanned_file_count, 1);
-        assert_eq!(scan_with_context("context-a").scanned_file_count, 0);
+        assert_eq!(scan_with_context("context-a").scanned_file_count, 1);
         assert_eq!(scan_with_context("context-b").scanned_file_count, 1);
-        assert_eq!(scan_with_context("context-a").scanned_file_count, 1);
-        assert_eq!(
-            index.upload_context_fingerprint.as_deref(),
-            Some("context-a")
-        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -60527,10 +60543,7 @@ mod tests {
         )
         .expect("write partial sidecar");
 
-        let mut index = ScanIndex {
-            upload_context_fingerprint: Some("prior-context".to_string()),
-            ..ScanIndex::default()
-        };
+        let mut index = ScanIndex::default();
         index.activate_upload_context("next-context".to_string());
         let mut scan = scan_source_roots(
             SnapshotSource::Codex,
@@ -60562,9 +60575,12 @@ mod tests {
             Some("Must not partially settle")
         );
         finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
-        assert_eq!(
-            index.upload_context_fingerprint.as_deref(),
-            Some("prior-context")
+        assert!(
+            index
+                .files
+                .keys()
+                .all(|key| index.file_upload_context_requires_adoption(key)),
+            "an incomplete census grants no upload-context proof"
         );
         let _ = fs::remove_dir_all(codex_dir);
     }
@@ -60784,7 +60800,6 @@ mod tests {
         let fingerprint = "a".repeat(64);
         let activity = Some("2026-05-14T10:03:00Z".to_string());
         let mut index = ScanIndex {
-            upload_context_fingerprint: Some("prior-context".to_string()),
             codex_state_only_snapshot_fingerprints: BTreeMap::from([(
                 session_id.to_string(),
                 fingerprint.clone(),
@@ -60818,9 +60833,9 @@ mod tests {
             Some(&activity)
         );
         assert_eq!(
-            index.upload_context_fingerprint.as_deref(),
-            Some("prior-context"),
-            "an incomplete state census cannot advance the policy/cutoff epoch"
+            index.upload_context_owed_counts().no_proof_entities,
+            1,
+            "an incomplete state census grants no upload-context proof"
         );
         let _ = fs::remove_dir_all(codex_dir);
     }
@@ -83122,11 +83137,8 @@ mod tests {
     }
 
     #[test]
-    fn partial_commit_preserves_old_upload_context_and_forces_full_policy_reparse() {
-        let mut previous = ScanIndex {
-            upload_context_fingerprint: Some("context-a".to_string()),
-            ..ScanIndex::default()
-        };
+    fn partial_commit_grants_no_upload_context_proof_and_forces_policy_reparse() {
+        let mut previous = ScanIndex::default();
         previous.files.insert(
             "/opaque/accepted.jsonl".to_string(),
             manifest_index_entry(Some("old-accepted")),
@@ -83137,7 +83149,6 @@ mod tests {
         );
 
         let mut scanned = previous.clone();
-        scanned.upload_context_fingerprint = Some("context-b".to_string());
         scanned.activate_upload_context("context-b".to_string());
         scanned.files.insert(
             "/opaque/accepted.jsonl".to_string(),
@@ -83153,11 +83164,6 @@ mod tests {
             &BTreeMap::new(),
         );
         committable.mark_bounded_sweep_unsettled();
-        assert_eq!(
-            committable.upload_context_fingerprint.as_deref(),
-            Some("context-a"),
-            "a shed/partial save cannot advance the global policy epoch"
-        );
 
         committable.activate_upload_context("context-b".to_string());
         let mut candidate = test_candidate(PathBuf::from("/opaque/accepted.jsonl"));
@@ -83172,7 +83178,7 @@ mod tests {
         assert_eq!(
             committable.candidate_decision(&candidate),
             CandidateDecision::Parse,
-            "even an accepted page is re-derived because untouched siblings still owe the policy transition"
+            "an accepted page without its own context proof is re-derived"
         );
         assert!(committable.bounded_sweep_had_unsettled_upload);
     }
