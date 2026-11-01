@@ -229,7 +229,7 @@ fn bootstrap_cache_heads_with_budget(
                 // The partitioned uploader persisted each conflicting probe's exact
                 // body quarantine. Carry that hold into the normal upload rather
                 // than discarding every unrelated file's progress.
-                ResumableUploadResult::Deferred { count } => {
+                ResumableUploadResult::Deferred { count, .. } => {
                     deferred = deferred.saturating_add(count);
                 }
                 outcome => {
@@ -323,10 +323,17 @@ fn with_bootstrap_deferred(
     }
     match result {
         ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {
-            ResumableUploadResult::Deferred { count: deferred }
+            ResumableUploadResult::Deferred {
+                count: deferred,
+                context_budget: 0,
+            }
         }
-        ResumableUploadResult::Deferred { count } => ResumableUploadResult::Deferred {
+        ResumableUploadResult::Deferred {
+            count,
+            context_budget,
+        } => ResumableUploadResult::Deferred {
             count: count.saturating_add(deferred),
+            context_budget,
         },
         other => other,
     }
@@ -8576,6 +8583,7 @@ fn finish_sync_source(
 
     let mut upload_fully_settled = true;
     let mut deferred_entity_count = None;
+    let mut context_budget_deferred = 0;
     let mut resolved_permanent_rejections = false;
     // Local-hold Completed/Deferred/Rejected subsets and selected-state
     // restoration below can omit a still-live file. Capture which retirement
@@ -8602,7 +8610,13 @@ fn finish_sync_source(
                     resolved_permanent_rejections = true;
                     count
                 }
-                ResumableUploadResult::Deferred { count } => count,
+                ResumableUploadResult::Deferred {
+                    count,
+                    context_budget,
+                } => {
+                    context_budget_deferred = context_budget;
+                    count
+                }
                 _ => unreachable!(),
             };
             clear_shed_streak(source);
@@ -9269,7 +9283,7 @@ fn finish_sync_source(
             scan_result.codex_counting_v2.as_deref(),
         );
         if !resolved_permanent_rejections {
-            return Err(snapshot_entity_deferred(count));
+            return Err(snapshot_entity_deferred(count, context_budget_deferred));
         }
         // Permanent refusals still finish transport successfully and remain
         // disclosed as errors. Only an otherwise earned, clean selected save
@@ -10531,6 +10545,7 @@ enum ResumableUploadResult {
     /// held for bounded retry and paced context offers wait for a later pass.
     Deferred {
         count: usize,
+        context_budget: usize,
     },
     Disabled(Option<String>),
     /// The backend shed a page. Every earlier page is accepted and
@@ -10629,6 +10644,8 @@ fn require_normal_write_ack_for_legacy_reconciliation(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SnapshotEntityDeferred {
     count: usize,
+    conflicted: usize,
+    context_budget: usize,
 }
 
 impl std::fmt::Display for SnapshotEntityDeferred {
@@ -10643,8 +10660,12 @@ impl std::fmt::Display for SnapshotEntityDeferred {
 
 impl std::error::Error for SnapshotEntityDeferred {}
 
-fn snapshot_entity_deferred(count: usize) -> anyhow::Error {
-    anyhow::Error::new(SnapshotEntityDeferred { count })
+fn snapshot_entity_deferred(count: usize, context_budget: usize) -> anyhow::Error {
+    anyhow::Error::new(SnapshotEntityDeferred {
+        count,
+        conflicted: count.saturating_sub(context_budget),
+        context_budget,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11843,6 +11864,7 @@ where
     } else if conflicted_entities > 0 || context_budget_deferred > 0 {
         Ok(ResumableUploadResult::Deferred {
             count: conflicted_entities.saturating_add(context_budget_deferred),
+            context_budget: context_budget_deferred,
         })
     } else if permanent_rejected > 0 {
         Ok(ResumableUploadResult::Rejected {
@@ -13074,8 +13096,8 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
     }
-    if error.downcast_ref::<SnapshotEntityDeferred>().is_some() {
-        return "local snapshot upload deferred by unsettled entities".to_string();
+    if let Some(deferred) = error.downcast_ref::<SnapshotEntityDeferred>() {
+        return format!("local snapshot upload deferred by unsettled entities: count={} conflicted={} context_budget={}", deferred.count, deferred.conflicted, deferred.context_budget);
     }
     if error.downcast_ref::<LocalHealthRefreshHeld>().is_some() {
         return "local health upload held after setup-run refresh failed".to_string();
@@ -13657,7 +13679,13 @@ mod tests {
             |progress| progress.save(&progress_path),
         )
         .unwrap();
-        assert_eq!(outcome, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            outcome,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                context_budget: 0
+            }
+        );
         index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
         index.save(&index_path).unwrap();
         progress.retire_pending_cache_heads(
@@ -15987,7 +16015,13 @@ mod tests {
             |state| state.save(&progress_path),
         )
         .expect("conflict remains retryable");
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                context_budget: 0
+            }
+        );
         assert_eq!(accepted, 0);
 
         index.mark_bounded_sweep_unsettled();
@@ -16518,7 +16552,13 @@ mod tests {
         )
         .expect("a per-entity conflict is retryable, not a whole-page failure");
 
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                context_budget: 0
+            }
+        );
         assert_eq!(uploaded_batches, vec![first_batch.clone(), later_batch]);
         assert_eq!(accepted, SNAPSHOT_BATCH_LIMIT as u64);
         assert_eq!(persisted.len(), 2);
@@ -16539,7 +16579,7 @@ mod tests {
             .accepted_fingerprints
             .contains(&items[SNAPSHOT_BATCH_LIMIT]));
 
-        let deferred = snapshot_entity_deferred(1);
+        let deferred = snapshot_entity_deferred(1, 0);
         assert_eq!(
             deferred
                 .downcast_ref::<SnapshotEntityDeferred>()
@@ -16548,7 +16588,7 @@ mod tests {
         );
         assert_eq!(
             safe_error(&deferred),
-            "local snapshot upload deferred by unsettled entities"
+            "local snapshot upload deferred by unsettled entities: count=1 conflicted=1 context_budget=0"
         );
 
         // Model the next authoritative scan replacing the oversized canonical
@@ -16616,7 +16656,13 @@ mod tests {
         )
         .expect("an all-conflict page remains retryable");
 
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 3 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 3,
+                context_budget: 0
+            }
+        );
         assert_eq!(accepted, 0);
         assert!(progress.accepted_fingerprints.is_empty());
         assert_eq!(
@@ -16629,7 +16675,7 @@ mod tests {
         );
         assert_eq!(persisted.last(), Some(&progress));
 
-        let deferred = snapshot_entity_deferred(3);
+        let deferred = snapshot_entity_deferred(3, 0);
         assert_eq!(
             deferred
                 .downcast_ref::<SnapshotEntityDeferred>()
@@ -18578,7 +18624,13 @@ mod tests {
         )
         .expect("a normal entity conflict is a closed-machine result");
 
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                context_budget: 0
+            }
+        );
         assert_eq!(observed_classes, vec![false, true]);
         assert_eq!(accepted, 1);
         assert!(progress.accepted_fingerprints.contains(&ordinary));

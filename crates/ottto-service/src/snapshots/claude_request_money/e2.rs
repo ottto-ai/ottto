@@ -3748,7 +3748,7 @@ pub(crate) fn finish_page(
     claude_request_identity::record_page_identity_counts(items);
 
     let mut corrected_sessions = BTreeSet::new();
-    let mut sessions = BTreeMap::<&str, Session>::new();
+    let mut sessions = BTreeMap::<String, Session>::new();
     for item in items.iter_mut() {
         let SnapshotItem {
             claude_money: Some(fold),
@@ -3781,7 +3781,7 @@ pub(crate) fn finish_page(
             0,
         ]));
         let session = sessions
-            .entry(source_session_id.as_str())
+            .entry(source_session_id.clone())
             .or_insert_with(|| Session {
                 entity: Default::default(),
                 first_original: None,
@@ -3870,10 +3870,11 @@ pub(crate) fn finish_page(
 
     let locations = sessions
         .iter()
-        .map(|(session, state)| (*session, state.locations.as_slice()))
+        .map(|(session, state)| (session.as_str(), state.locations.as_slice()))
         .collect::<Vec<_>>();
     let held = absent_twins(
         &locations,
+        items,
         index,
         queued_family_deferred_paths,
         hold_reasons,
@@ -3885,7 +3886,7 @@ pub(crate) fn finish_page(
         .into_iter()
         .map(|(session, mut state)| {
             state.entity.telemetry_owned_complete = state.complete;
-            state.entity.held |= held.contains(session);
+            state.entity.held |= held.contains(&session);
             decided.push((session.to_owned(), state.decided));
             let first = (state.first_original, state.first_undo);
             (session.to_owned(), (state.entity, first, state.twin_loans))
@@ -4051,12 +4052,73 @@ pub(crate) fn visit_identity_rows(
     Some(())
 }
 
+/// Prove dominance from the current request census, else bounded member bytes.
+/// No path, account or birth-time preference grants redundancy.
+fn redundant_twin(key: &str, other: &str, folded: &SnapshotItem, index: &ScanIndex) -> bool {
+    use std::io::{BufRead, BufReader, Read};
+    let proof = || -> Option<bool> {
+        let metadata = std::fs::metadata(key).ok()?;
+        if let Some(record) = index.claude_request_census.get(key).filter(|record| {
+            !record.request_hashes().is_empty()
+                && index.files.get(key).is_some_and(|entry| {
+                    record.current_for(entry.observed_fingerprint())
+                        && entry.same_listing_stamp_as(&metadata)
+                })
+        }) {
+            let hashes = folded
+                .claude_usage_request_ids
+                .iter()
+                .map(|id| claude_request_hash(id))
+                .collect::<BTreeSet<_>>();
+            if record
+                .request_hashes()
+                .iter()
+                .all(|hash| hashes.contains(hash))
+            {
+                return Some(true);
+            }
+        }
+        let bound = std::fs::metadata(other).ok()?.len();
+        if metadata.len() > bound {
+            return Some(false);
+        }
+        let mut p = BufReader::new(std::fs::File::open(key).ok()?.take(bound.saturating_add(1)));
+        let mut q = BufReader::new(std::fs::File::open(other).ok()?.take(bound));
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let (mut prefix, mut read) = (true, 0u64);
+        loop {
+            a.clear();
+            let n = p.read_until(b'\n', &mut a).ok()?;
+            if n == 0 {
+                return Some(read == metadata.len());
+            }
+            read = read.saturating_add(n as u64);
+            if prefix {
+                b.clear();
+                q.read_until(b'\n', &mut b).ok()?;
+                if a == b {
+                    continue;
+                }
+                prefix = false;
+            }
+            let line: serde_json::Value = serde_json::from_slice(&a).ok()?;
+            if line.get("requestId").is_some_and(|id| !id.is_null())
+                || line.pointer("/message/id").is_some_and(|id| !id.is_null())
+            {
+                return Some(false);
+            }
+        }
+    };
+    proof() == Some(true)
+}
+
 /// Sessions (roots and subagent members) with a live indexed path that is
 /// not on this page: never publish one path over complete twin history. Only
 /// sessions whose birth table knows more paths than the page holds build the
 /// shared twin groups (after the scan, so not the page's own copy).
 fn absent_twins(
     sessions: &[(&str, &[LocationKey])],
+    items: &[SnapshotItem],
     index: &ScanIndex,
     queued_family_deferred_paths: &BTreeSet<LocationKey>,
     hold_reasons: &mut BTreeMap<&'static str, u64>,
@@ -4078,7 +4140,25 @@ fn absent_twins(
     for (session, here) in suspects {
         let absent = path_twins(&groups, session).is_some_and(|keys| {
             keys.iter().any(|(key, size)| {
-                size.is_some() && !here.contains(&location_key(key)) && Path::new(key).is_file()
+                if size.is_none() || here.contains(&location_key(key)) || !Path::new(key).is_file()
+                {
+                    return false;
+                }
+                let redundant = keys.iter().any(|(other, _)| {
+                    items.iter().any(|item| {
+                        item.source_session_id == *session
+                            && item.claude_money.as_deref().is_some_and(|fold| {
+                                fold.location == Some(Located(location_key(other)))
+                                    // A folded copy that still excludes requests cannot replace its witness.
+                                    && fold.skipped.is_empty()
+                            })
+                            && redundant_twin(key, other, item, index)
+                    })
+                });
+                if redundant {
+                    diag("twin_redundant", 1);
+                }
+                !redundant
             })
         });
         if absent {
