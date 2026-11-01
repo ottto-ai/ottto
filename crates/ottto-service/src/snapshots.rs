@@ -24951,9 +24951,11 @@ fn release_departed_join_owners(
     let Some(traversal) = traversal.as_ref() else {
         return;
     };
-    cache.release_join_owners(&traversal.codex_rollout_paths, keep, |owner, members| {
-        index.accept_codex_block(members, owner);
-    });
+    cache.release_join_owners(
+        &traversal.codex_rollout_paths,
+        |owner| traversal.residue.blocked_session_ids.contains(owner) || keep(owner),
+        |owner, members| index.accept_codex_block(members, owner),
+    );
 }
 
 /// U1a-2a (row 6, design rev 18.2 §2.3–2.4): what the side fence decided for
@@ -27695,6 +27697,12 @@ impl OwnedSourceScan {
             codex_parent_identities.parents_applied = true;
         }
         let claude_effort_support_dir_ref = claude_effort_support_dir.as_deref();
+        // A prior page's ownership refusal still vetoes inclusive fallback
+        // after its page-local block set has been lost to save/reload.
+        if let Some(traversal) = index.traversal.as_ref() {
+            codex_state_only_blocked_session_ids
+                .extend(traversal.residue.blocked_session_ids.iter().cloned());
+        }
         // Construct the large continuation once. Repeating it in every yield
         // branch multiplies debug-build stack slots and can overflow native
         // callers even though the retained scanner state is unchanged.
@@ -31715,10 +31723,11 @@ impl OwnedSourceScan {
                     {
                         continue;
                     }
-                    if !index
-                        .files
-                        .get(index_key)
-                        .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                    if !index.codex_residue_holds_entry(index_key)
+                        && !index
+                            .files
+                            .get(index_key)
+                            .is_some_and(ScanIndexEntry::codex_history_is_protected)
                     {
                         // A Claude member that vanished beneath its present
                         // parent also drops its unverified audit debt (SOURCE
@@ -44902,6 +44911,7 @@ fn reconcile_missing_index_entries_with_side(
             continue; // SOURCE: debt retirement alone does not prune incidence.
         }
         if !observed
+            && !index.codex_residue_holds_entry(key)
             && !index.decode_holds_file(key)
             && !index
                 .files
@@ -52083,6 +52093,22 @@ impl ScanIndex {
                 cache.and_then(|cache| cache.resident_usage(source, key)),
             );
         }
+    }
+
+    /// Ownership uncertainty survives absence until the traversal resolves it.
+    /// Filename candidates veto retirement only; they grant no ownership.
+    fn codex_residue_holds_entry(&self, key: &str) -> bool {
+        let Some(traversal) = self.traversal.as_ref() else {
+            return false;
+        };
+        let owners = &traversal.residue.blocked_session_ids;
+        self.files
+            .get(key)
+            .and_then(|entry| entry.codex_counting_owner.as_deref())
+            .is_some_and(|owner| owners.iter().any(|id| codex_protected_owner(id) == owner))
+            || codex_session_id_candidates_from_path(Path::new(key))
+                .iter()
+                .any(|owner| owners.contains(owner))
     }
 
     fn remove_file_entry_unless_held(&mut self, key: &str, vanished: bool) {
