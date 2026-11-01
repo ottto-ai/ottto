@@ -619,7 +619,16 @@ fn e2_carry_pages(
                 "usage":{"input_tokens":0,"output_tokens":0}}});
         let native = fs::read_to_string(&path).unwrap();
         fs::write(path, format!("{native}{zero}\n")).unwrap();
-        api.push(complete_api_row(&root, "req_side", 7, 3, 2, 0));
+        let mut side = complete_api_row(&root, "req_side", 7, 3, 2, 0);
+        side.request_identity = Some(serde_json::from_value(json!({
+            "identity_hash_scheme": "provider-sha256:v1", "disposition": "complete",
+            "account": {"origin": "log_record", "disposition": "complete",
+                "log_record_hash": e2_account()},
+            "organization": {"origin": "log_record", "disposition": "complete",
+                "log_record_hash": "1".repeat(64)}
+        })).unwrap());
+        e2_resign(&mut side);
+        api.push(side);
         trace.push(complete_trace_row(&root, "req_side", ""));
     }
     for row in &mut api[2..4] {
