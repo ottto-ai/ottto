@@ -155,6 +155,8 @@ pub(crate) use session_start::{session_start_verdict, StartVerdict};
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
 mod disappearance_diagnostics;
 pub(crate) mod evidence_owed;
+mod usage_pending;
+use usage_pending::UsagePending;
 #[cfg(test)]
 mod launch_demand_tests;
 #[cfg(test)]
@@ -3672,8 +3674,8 @@ pub struct ScanIndex {
     /// ids remain in the transcript/API sidecars that produced them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     claude_usage_family_witnesses: BTreeMap<String, ClaudeUsageFamilyWitness>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    claude_usage_family_pending: BTreeMap<String, ClaudeUsageFamilyPending>,
+    #[serde(default, skip_serializing_if = "UsagePending::is_empty")]
+    claude_usage_family_pending: UsagePending,
     /// Slice D1: one request-census record per Claude transcript index key,
     /// bound to the candidate fingerprint and census window of the parse that
     /// produced it. Local-only and content-free (8-byte SHA-256 prefixes of
@@ -4310,7 +4312,7 @@ impl Default for ScanIndex {
             claude_account_family_witnesses: BTreeMap::new(),
             claude_account_family_pending: BTreeMap::new(),
             claude_usage_family_witnesses: BTreeMap::new(),
-            claude_usage_family_pending: BTreeMap::new(),
+            claude_usage_family_pending: UsagePending::default(),
             claude_request_census: ClaudeRequestCensus::default(),
             claude_request_census_shadow: ClaudeRequestCensusShadowState::default(),
             claude_usage_authority_quarantine: BTreeMap::new(),

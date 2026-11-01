@@ -24,16 +24,15 @@ pub(super) fn rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> 
     }
     scan_index_fields!(each save);
     // Census owns the membership cardinality, derived once from selected usage.
-    rows.put(
-        mapper::key("family.requests", "", 0)?,
-        &next.claude_usage_family_pending.len(),
-    )?;
-    for (root, pending) in &next.claude_usage_family_pending {
+    let mut families = 0_usize;
+    for (root, pending) in next.claude_usage_family_pending.views() {
+        families += 1;
         rows.put(
             mapper::key("family.requests", root, 1)?,
-            &pending.member_request_id_hashes.len(),
+            &pending.hash_member_count(),
         )?;
     }
+    rows.put(mapper::key("family.requests", "", 0)?, &families)?;
     Ok(())
 }
 pub(super) fn hydrate_txn(
@@ -93,8 +92,8 @@ pub(super) fn hydrate_txn(
         ensure!(
             index
                 .claude_usage_family_pending
-                .get(&root)
-                .is_some_and(|p| p.member_request_id_hashes.len() == count),
+                .view(&root)
+                .is_some_and(|p| p.hash_member_count() == count),
             "state_v2_census_membership"
         );
     }
@@ -130,8 +129,8 @@ pub(super) fn hydrate_cas_families(
         ensure!(
             index
                 .claude_usage_family_pending
-                .get(&root)
-                .is_some_and(|p| p.member_request_id_hashes.len() == count),
+                .view(&root)
+                .is_some_and(|p| p.hash_member_count() == count),
             "state_v2_census_membership"
         );
     }
