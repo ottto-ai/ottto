@@ -1122,7 +1122,7 @@ impl ClaudeSlotProbeFailure {
             Self::CredentialAccountMismatch => (
                 ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
                 ClaudeConfigSlotDiagnosticCodeV1::ConcurrentMutation,
-                "This Claude slot's saved login belongs to a different account than its account file; sign in again with `claude /login` for this slot.",
+                "This Claude slot's saved login and its account file come from different logins; sign in again with `claude /login` for this slot.",
             ),
             Self::ProbeFailed => (
                 ClaudeConfigSlotCollectionStateV1::ProbeFailed,
