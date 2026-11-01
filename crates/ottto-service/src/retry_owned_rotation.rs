@@ -214,7 +214,6 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
             committed_index: ScanIndex::default(),
             backfill_state: Default::default(),
             backfill_pending: false,
-            replay_generation: "owned".into(),
             legacy_reconciliation_pending: BTreeSet::new(),
             active_legacy_reconciliation: BTreeSet::new(),
             scan: Some(scan),

@@ -176,7 +176,6 @@ impl ContinuationFixture {
             committed_index: ScanIndex::default(),
             backfill_state: Default::default(),
             backfill_pending: false,
-            replay_generation: "ordinary".into(),
             legacy_reconciliation_pending: BTreeSet::new(),
             active_legacy_reconciliation: BTreeSet::new(),
             scan: None,
@@ -424,7 +423,6 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         &mut progress,
     );
     let generation = cycle_replay_generation(source, CONTINUATION_NAMESPACE);
-    assert_eq!(prepared.replay_generation, generation);
     let now = reason_reoffer::now_unix_seconds();
     let claimed = prepare_upload_progress_for_cycle_with_reoffer(
         &mut progress,
