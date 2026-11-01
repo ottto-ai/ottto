@@ -1764,6 +1764,144 @@ fn aged_published_key_gets_normal_read_and_keeps_owed_debt() {
     );
 }
 
+/// [regress] A paced growth refusal was counted unreadable at both admission
+/// sites (sampled and unsampled), turning the traversal red. It now defers
+/// with its debt owed, and the next pass after the interval admits its Full.
+#[test]
+fn paced_growth_read_defers_at_both_admission_sites() {
+    use crate::snapshots::sampled_audit::GROWTH_FULL_INTERVAL;
+    use crate::snapshots::{
+        local_index_key, sampled_scan, scan_source_roots_with_test_limit, OwnedSourceScan,
+        OwnedSourceScanStep, SnapshotSource,
+    };
+    let at = |seconds: u64| {
+        ::time::OffsetDateTime::from_unix_timestamp(seconds as i64)
+            .unwrap()
+            .format(&::time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let reduction = crate::codex_scan_diagnostics::UnreadableCause::Reduction as usize;
+    for sampled in [false, true] {
+        let f = Fixture::new();
+        let roots = f.support.join("transcripts");
+        fs::create_dir(&roots).unwrap();
+        let transcript = roots.join("11111111-1111-4111-8111-111111111111.jsonl");
+        let line = serde_json::json!({"type": "assistant",
+            "sessionId": "11111111-1111-4111-8111-111111111111", "uuid": "u1",
+            "cwd": "/synthetic", "timestamp": "2026-10-06T10:00:00.000Z",
+            "requestId": "req_u1", "message": {"id": "msg_u1", "model": "claude-opus-4-8",
+                "role": "assistant", "usage": {"input_tokens": 10, "output_tokens": 20}}});
+        fs::write(&transcript, format!("{line}\n")).unwrap();
+        let key = local_index_key(&transcript);
+        let claimed = sampled_scan::now_seconds();
+        let mut seed = ScanIndex::default();
+        seed.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes": 4, "modified_unix_seconds": 1,
+                "source_file_fingerprint": "a".repeat(64),
+                "scan_identity_version": crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
+            }))
+            .unwrap(),
+        );
+        seed.v2_mut().growth_retention.insert(
+            key.clone(),
+            serde_json::from_value(
+                serde_json::json!({"predecessor_size": 4, "last_growth_full_unix": claimed}),
+            )
+            .unwrap(),
+        );
+        let progress = br#"{"generation":0}"#;
+        let mut index = super::super::money_test_support::publish(&seed, &f.path, progress);
+        let cache = std::sync::Arc::new(sampled_scan::SharedCache::default());
+        // Unsampled pages take the StateMissing site; sampled pages the
+        // acquisition site.
+        let page = |index: &mut ScanIndex, now: u64| {
+            if !sampled {
+                return scan_source_roots_with_test_limit(
+                    SnapshotSource::ClaudeCode,
+                    std::slice::from_ref(&roots),
+                    index,
+                    &at(now),
+                    30,
+                    10,
+                    false,
+                )
+                .unwrap();
+            }
+            let mut scan = OwnedSourceScan::new(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&roots),
+                std::mem::take(index),
+                &at(now),
+                30,
+                10,
+                false,
+                None,
+                &[],
+                false,
+            )
+            .with_sampled_acquisition(
+                cache.clone(),
+                crate::transcript_acquisition::Scope("paced-growth".into()),
+            );
+            loop {
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete {
+                        index: done, scan, ..
+                    } => {
+                        *index = done;
+                        return scan;
+                    }
+                }
+            }
+        };
+
+        sampled_scan::test_hooks::clear();
+        let result = page(&mut index, claimed);
+        assert_eq!(result.unreadable_path_count, 0, "sampled={sampled}");
+        assert!(
+            !sampled_scan::test_hooks::unreadable().contains(&reduction),
+            "sampled={sampled}"
+        );
+        assert!(
+            index.traversal.as_ref().map_or(true, |walk| {
+                !walk.counts.has_errors() && walk.unhealthy_retry_not_before_unix_seconds.is_none()
+            }),
+            "sampled={sampled}: healthy, no unhealthy retry armed"
+        );
+        assert_eq!(index.files[&key].size_bytes, 4, "sampled={sampled}");
+        assert_eq!(
+            serde_json::to_value(&index.v2().growth_retention[&key]).unwrap()["predecessor_size"],
+            4,
+            "sampled={sampled}: the growth debt stays owed"
+        );
+
+        // A later pass after the interval selects the file again; the claim
+        // advancing to that pass's clock is its admitted Full.
+        let later = claimed + GROWTH_FULL_INTERVAL;
+        sampled_scan::set_test_now(Some(later));
+        for _ in 0..3 {
+            let result = page(&mut index, later);
+            assert_eq!(result.unreadable_path_count, 0, "sampled={sampled}");
+            if serde_json::to_value(&index.v2().growth_retention[&key]).unwrap()
+                ["last_growth_full_unix"]
+                == later
+            {
+                break;
+            }
+        }
+        sampled_scan::set_test_now(None);
+        assert_eq!(
+            serde_json::to_value(&index.v2().growth_retention[&key]).unwrap()
+                ["last_growth_full_unix"],
+            later,
+            "sampled={sampled}: the aged-out Full was admitted"
+        );
+    }
+}
+
 /// [behaviour] a bound v1 source with no support dir never opens, creates or migrates SQLite custody.
 #[test]
 fn off_bound_v1_load_and_save_leave_all_database_paths_absent() {
