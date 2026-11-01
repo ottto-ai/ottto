@@ -1522,10 +1522,6 @@ struct PendingCacheHeadFile {
 /// existing rescan handshake instead of conflicting on it forever.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct HeadConflictChallenge {
-    /// Optional for older #905 checkpoints. Only a complete census may retire
-    /// this metadata when its refused entity is superseded or vanishes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    snapshot_fingerprint: Option<String>,
     challenge: String,
     stale_revision_v2_hash: String,
     /// Answers the server refused again. Counted and logged; never terminal,
@@ -2479,14 +2475,11 @@ impl SnapshotUploadProgress {
     fn record_head_conflict_challenge(
         &mut self,
         session_id: &str,
-        snapshot_fingerprint: &str,
         challenge: &str,
         rescan: &crate::snapshot_client::SnapshotConflictRescan,
         now: u64,
     ) -> Option<u32> {
-        if !is_snapshot_fingerprint(snapshot_fingerprint)
-            || !is_snapshot_fingerprint(challenge)
-            || !is_snapshot_fingerprint(&rescan.revision_v2_hash)
+        if !is_snapshot_fingerprint(challenge) || !is_snapshot_fingerprint(&rescan.revision_v2_hash)
         {
             return None;
         }
@@ -2515,7 +2508,6 @@ impl SnapshotUploadProgress {
         self.head_conflict_challenges.insert(
             key,
             HeadConflictChallenge {
-                snapshot_fingerprint: Some(snapshot_fingerprint.to_string()),
                 challenge: challenge.to_string(),
                 stale_revision_v2_hash: rescan.revision_v2_hash.clone(),
                 answer_attempts,
@@ -3144,24 +3136,6 @@ impl SnapshotUploadProgress {
                     .keys()
                     .all(|entity| pending.settled_entities.contains(entity)))
         });
-    }
-
-    /// Retire optional recovery state only after the successful index save.
-    /// An incomplete/opaque census cannot prove a held entity vanished. This
-    /// never retires quarantine, accepted proof or owed usage.
-    fn retire_head_conflict_challenges(
-        &mut self,
-        current_entities: &BTreeSet<String>,
-        census_complete: bool,
-    ) {
-        if census_complete {
-            self.head_conflict_challenges.retain(|_, record| {
-                record
-                    .snapshot_fingerprint
-                    .as_ref()
-                    .map_or(true, |fingerprint| current_entities.contains(fingerprint))
-            });
-        }
     }
 
     fn finish_cycle(&mut self, path: &Path) -> Result<()> {
@@ -8099,10 +8073,6 @@ fn finish_sync_source(
     // by the authoritative current index before any early upload error can
     // preserve them forever.
     let current_fingerprints = index.current_snapshot_fingerprints();
-    // Capture absence authority before upload settlement selects a smaller
-    // committable index. Held/unacknowledged bodies are still in this census.
-    let head_conflict_census_complete =
-        scan_result.census_complete && !index.upload_progress_ack_incidence_unknown();
     if upload_progress.retain_current_quarantines_with_diagnostics(
         &current_fingerprints,
         scan_result.local_codex_diagnostics.as_mut(),
@@ -9218,8 +9188,6 @@ fn finish_sync_source(
     upload_progress
         .permanent_rejections
         .retain(|fingerprint, _| current_entities.contains(fingerprint));
-    upload_progress
-        .retire_head_conflict_challenges(&current_fingerprints, head_conflict_census_complete);
     // Before `finish_cycle` retires this cycle's quarantine records.
     let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
     let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
@@ -11166,7 +11134,6 @@ where
             };
             if let Some(attempts) = progress.record_head_conflict_challenge(
                 &entity.source_session_id,
-                &entity.snapshot_fingerprint,
                 challenge,
                 rescan,
                 now,
@@ -24903,7 +24870,7 @@ mod head_conflict_answer_tests;
 mod head_conflict_released_progress_fixture;
 
 crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer);
-crate::heap_layout_bound::fields!(HeadConflictChallenge; snapshot_fingerprint, challenge, stale_revision_v2_hash, answer_attempts, last_answer_unix);
+crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revision_v2_hash, answer_attempts, last_answer_unix);
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);

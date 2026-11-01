@@ -559,27 +559,6 @@ fn refused_answers_are_counted_and_paced_by_the_quarantine_window() {
         challenge(0xb)
     );
     assert_eq!(progress.head_conflict_challenges[&key].answer_attempts, 3);
-    let owed = progress.quarantined_fingerprints.clone();
-    progress.retire_head_conflict_challenges(&BTreeSet::new(), false);
-    assert_eq!(
-        progress.head_conflict_challenges.len(),
-        cap,
-        "partial census keeps held sessions"
-    );
-    progress.retire_head_conflict_challenges(
-        &BTreeSet::from([item.snapshot_fingerprint.clone()]),
-        true,
-    );
-    assert_eq!(progress.head_conflict_challenges.len(), cap);
-    progress.retire_head_conflict_challenges(&BTreeSet::from(["8".repeat(64)]), true);
-    assert!(
-        progress.head_conflict_challenges.is_empty(),
-        "complete census retires superseded/vanished metadata"
-    );
-    assert_eq!(
-        progress.quarantined_fingerprints, owed,
-        "retirement never retires debt"
-    );
 
     for permanent in [false, true] {
         let mut rejected_item = item.clone();
@@ -651,7 +630,6 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
     progress.head_conflict_challenges.insert(
         key.clone(),
         HeadConflictChallenge {
-            snapshot_fingerprint: Some(item.snapshot_fingerprint.clone()),
             challenge: challenge(0xc),
             stale_revision_v2_hash: revision_v2(&item),
             answer_attempts: 0,
@@ -857,5 +835,14 @@ fn released_0205_rewrite_preserves_money_ledgers_and_drops_only_recovery_metadat
     assert_eq!(
         upgraded.head_conflict_challenges[&key].challenge,
         challenge(0xd)
+    );
+
+    // A record persisted with the retired refused-entity field still decodes.
+    let mut retired: Value = serde_json::from_slice(&bytes).unwrap();
+    retired["head_conflict_challenges"][&key]["snapshot_fingerprint"] = Value::from("8".repeat(64));
+    let decoded: SnapshotUploadProgress = serde_json::from_value(retired).unwrap();
+    assert_eq!(
+        decoded.head_conflict_challenges,
+        progress.head_conflict_challenges
     );
 }
