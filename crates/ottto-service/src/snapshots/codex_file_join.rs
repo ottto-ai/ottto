@@ -2442,7 +2442,13 @@ pub(super) mod tests {
     #[test]
     fn counting_v2_group_is_configured_once_and_folded_once() {
         let (root, keys) = counting_v2_fixture();
-        let (legacy_index, legacy) = scan(&root, ScanIndex::default(), 2);
+        let (legacy_index, legacy) = {
+            // The fixture's October 1 headers predate the frozen cutover.
+            let _cutover = codex_counting_version::TestCutover::set(
+                codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
+            );
+            scan(&root, ScanIndex::default(), 2)
+        };
         let _cutover = codex_counting_version::TestCutover::set(0);
         let (index, counted) = scan(&root, ScanIndex::default(), 2);
         assert_eq!(counted.snapshots.len(), 2, "one alias per physical member");
@@ -2460,9 +2466,16 @@ pub(super) mod tests {
             assert!(index.files[key].codex_counting_v2, "V2 marks every member");
             assert!(!legacy_index.files[key].codex_counting_v2);
         }
-        assert!(
-            legacy.codex_counting_v2.is_none(),
-            "an inactive scan reports no receipts, not a zero block"
+        let legacy_receipts = legacy
+            .codex_counting_v2
+            .as_deref()
+            .expect("a pre-cutover Legacy scan still reports bookkeeping");
+        assert_eq!(legacy_receipts.v2_sessions, 0);
+        assert_eq!(legacy_receipts.native_counted, 0);
+        assert_eq!(legacy_receipts.tombstone_count, 0);
+        assert_eq!(
+            legacy_receipts.tombstone_cap,
+            codex_counting_version::MAX_COUNTING_TOMBSTONES as u64
         );
         for (counted, legacy) in counted.snapshots.iter().zip(&legacy.snapshots) {
             assert_eq!(counted.input_tokens, legacy.input_tokens);
@@ -2542,7 +2555,7 @@ pub(super) mod tests {
         traces.priority_turns.insert(turn.into());
         let job = replay_group(
             inventory.groups().into_values().next().unwrap(),
-            Some(Arc::new(traces.clone())),
+            Some(Arc::new(traces)),
             &ScanIndex::default(),
         )
         .unwrap();
@@ -3341,6 +3354,8 @@ pub(super) mod tests {
         assert!(inventory_hold(&index).is_none());
         fs::remove_dir_all(root).unwrap();
     }
+    /// [money] Protected history survives retirement; quiet retries acquire
+    /// and enqueue nothing, while bounded metadata visits may advance.
     #[test]
     fn retired_sources_keep_protected_history_and_quiet_retry_is_idempotent() {
         let root = native_join_fixture_root(true);
@@ -3432,9 +3447,18 @@ pub(super) mod tests {
         );
         let (quiet_index, quiet_result) = scan(&root, after.clone(), 3);
         assert_eq!(quiet_result.scanned_file_count, 0);
+        let mut quiet_counts = quiet_index.traversal.as_ref().unwrap().counts.clone();
+        let mut expected_counts = counts;
+        assert_eq!(quiet_counts.codex_roster_growth_enqueued, 0);
+        assert_eq!(expected_counts.codex_roster_growth_enqueued, 0);
+        // An append need not move the directory witness, so quiet retries
+        // still perform bounded roster visits. Only this work counter varies;
+        // every money, loss, cause and enqueue count remains idempotent.
+        quiet_counts.codex_roster_refresh_visited = 0;
+        expected_counts.codex_roster_refresh_visited = 0;
         assert_eq!(
-            serde_json::to_value(&quiet_index.traversal.as_ref().unwrap().counts).unwrap(),
-            serde_json::to_value(&counts).unwrap()
+            serde_json::to_value(&quiet_counts).unwrap(),
+            serde_json::to_value(&expected_counts).unwrap()
         );
         assert_eq!(
             quiet_index

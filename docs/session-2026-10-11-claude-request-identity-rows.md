@@ -76,6 +76,7 @@ the exact cohort token in that cycle's activity hint (`emission_permit`). See
     capture does not record which. Transcript clocks are never borrowed. A
     reported item whose request count includes auxiliary requests fails the
     request-id precondition and keeps today's bytes wholesale.
+    2026-10-31 ID1: telemetry-only side calls take their own row's complete account (B3, #1018); BadClock refusal no longer applies to them; money bucket unchanged.
   - Unreadable sidecars refuse every request; they never fall through.
 - **Transcript markers** (`credential_org` attachment lines):
   - They are captured only on owned lines, after inherited-fork exclusion,

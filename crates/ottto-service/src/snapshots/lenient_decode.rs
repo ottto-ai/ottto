@@ -411,7 +411,7 @@ impl Serialize for ScanIndex {
         );
         field!(
             claude_copy_removals,
-            claude_request_money::copy_removals::CopyRemovals::is_empty
+            claude_request_money::copy_removals::CopyRemovals::is_unwritten
         );
         map.end()
     }
@@ -2510,9 +2510,10 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
 
         if pass == Pass::Full {
+            // An empty undamaged store is never written: absence is an empty
+            // store, not lost metadata (Lead B F4). Damage is `missing`.
             if !seen.contains("claude_copy_removals") {
-                index.claude_copy_removals =
-                    claude_request_money::copy_removals::CopyRemovals::missing();
+                index.claude_copy_removals = Default::default();
             }
             migrate_carried_ack_debt(&mut index)?;
             let authority_span = self
