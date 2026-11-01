@@ -1496,6 +1496,16 @@ mod share_bound_tests {
         restored.record(&enlarged);
         assert_eq!(restored.get("bounded-shares").unwrap().shares, known.shares);
         assert!(!restored.get("bounded-shares").unwrap().incomplete);
+        // A settled-history segment entry keeps the same raised-cap shares.
+        let mut segment = enlarged.clone();
+        segment["source_session_id"] = json!("bounded-shares#w20260827");
+        segment["history_segment"] = json!({"of":"bounded-shares"});
+        let mut segments = AcceptedBuckets::segments_for_test();
+        segments.set_item_cap(2 * 1024 * 1024);
+        segments.record(&segment);
+        let own = segments.get("bounded-shares#w20260827").unwrap();
+        assert_eq!(own.shares, known.shares);
+        assert!(!own.incomplete);
         if crate::heap_layout_bound::layout_supported() {
             assert!(crate::heap_layout_bound::bound(&restored, 100_000).is_none());
             assert!(crate::heap_layout_bound::bound(&restored, usize::MAX).unwrap() > 500_000);

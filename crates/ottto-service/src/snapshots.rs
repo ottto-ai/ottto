@@ -8348,9 +8348,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
     let mut by_source_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut by_source_file_body_witness: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for snapshot in &result.snapshots {
-        if let Some(source_file_fingerprint) =
-            history_segments::local_file(snapshot, &segment_files)
-        {
+        for source_file_fingerprint in history_segments::local_files(snapshot, &segment_files) {
             by_source_file
                 .entry(source_file_fingerprint.clone())
                 .or_default()
@@ -8405,8 +8403,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
             );
         }
         let quarantine_retry_required = result.snapshots.iter().any(|snapshot| {
-            history_segments::local_file(snapshot, &segment_files).map(String::as_str)
-                == Some(pending.source_file_fingerprint.as_str())
+            history_segments::local_files(snapshot, &segment_files)
+                .any(|file| *file == pending.source_file_fingerprint)
                 && index.quarantine_requires_retry_body(
                     &snapshot.snapshot_fingerprint,
                     &body_witness(snapshot),
@@ -8572,10 +8570,11 @@ pub fn finalize_scan_after_policy_with_body_witness(
         index.note_claude_history_not_stamped();
     }
     result.snapshots.retain(|snapshot| {
-        !carried_noop_entities.contains(&snapshot.snapshot_fingerprint)
-            && history_segments::local_file(snapshot, &segment_files)
-                .map(|source_file| !noop_source_files.contains(source_file))
-                .unwrap_or(true)
+        !carried_noop_entities.contains(&snapshot.snapshot_fingerprint) && {
+            // Kept while any owning file still has work.
+            let mut files = history_segments::local_files(snapshot, &segment_files).peekable();
+            files.peek().is_none() || files.any(|file| !noop_source_files.contains(file))
+        }
     });
 
     // State-only Codex entities do not have a source-file fingerprint, so they

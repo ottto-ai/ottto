@@ -217,42 +217,45 @@ pub(crate) fn packing_unit(item: &SnapshotItem) -> Option<&str> {
     group_of(item).or_else(|| super::claude_request_money::request_owned_family_root(item))
 }
 
-/// Each segment's local file, keyed by segment id: its live body's
-/// `source_file_fingerprint`. Segments name no file on the wire; locally
-/// they settle, retry and leave with that file. Empty without segments.
-pub(crate) fn segment_files(items: &[SnapshotItem]) -> BTreeMap<String, String> {
+/// Each segment's local files, keyed by segment id: the
+/// `source_file_fingerprint` of every live body of its session (two local
+/// copies of one session share it). Segments name no file on the wire;
+/// locally they settle, retry and leave with those files. Empty without
+/// segments.
+pub(crate) fn segment_files(items: &[SnapshotItem]) -> BTreeMap<String, BTreeSet<String>> {
     if items.iter().all(|item| item.history_segment.is_none()) {
         return BTreeMap::new();
     }
-    let lives = items
-        .iter()
-        .filter(|item| item.history_segments.is_some())
-        .filter_map(|item| {
-            Some((
-                item.source_session_id.as_str(),
-                item.source_file_fingerprint.as_deref()?,
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut lives = BTreeMap::<&str, BTreeSet<String>>::new();
+    for item in items.iter().filter(|item| item.history_segments.is_some()) {
+        if let Some(file) = &item.source_file_fingerprint {
+            lives
+                .entry(item.source_session_id.as_str())
+                .or_default()
+                .insert(file.clone());
+        }
+    }
     items
         .iter()
         .filter_map(|item| {
-            let file = lives.get(item.history_segment.as_ref()?.of.as_str())?;
-            Some((item.source_session_id.clone(), (*file).to_string()))
+            let files = lives.get(item.history_segment.as_ref()?.of.as_str())?;
+            Some((item.source_session_id.clone(), files.clone()))
         })
         .collect()
 }
 
-/// An item's local file: its own, else (a segment) its live body's.
-pub(crate) fn local_file<'a>(
+/// An item's local files: its own, else (a segment) its live bodies'.
+pub(crate) fn local_files<'a>(
     item: &'a SnapshotItem,
-    segment_files: &'a BTreeMap<String, String>,
-) -> Option<&'a String> {
-    item.source_file_fingerprint.as_ref().or_else(|| {
-        segment_files
-            .get(&item.source_session_id)
-            .filter(|_| item.history_segment.is_some())
-    })
+    segment_files: &'a BTreeMap<String, BTreeSet<String>>,
+) -> impl Iterator<Item = &'a String> {
+    let segment = item
+        .history_segment
+        .as_ref()
+        .and(segment_files.get(&item.source_session_id));
+    item.source_file_fingerprint
+        .iter()
+        .chain(segment.into_iter().flatten())
 }
 
 /// A cut session's group descriptor: the live session id, plus the segment

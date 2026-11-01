@@ -670,6 +670,22 @@ fn history_live_waits_on_a_segment_outside_its_page() {
     assert!(progress.accepted_fingerprints.contains(&"e".repeat(64)));
 }
 
+/// [money] Two local copies of one cut session: the packer sends one copy
+/// of the group, and that ACK settles it (both copies' segments are the
+/// same entity, counted once against `count`).
+#[test]
+fn history_group_with_a_duplicate_local_copy_settles_once() {
+    let mut progress = progress();
+    let [segment, live] = history_group();
+    let items = [segment.clone(), live.clone(), segment, live];
+    assert_eq!(group_page_at(&mut progress, &items, &[0, 1], &[]), 0);
+    for fingerprint in ['d', 'e'] {
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&fingerprint.to_string().repeat(64)));
+    }
+}
+
 /// [money] A live body whose `count` names a segment missing from the input
 /// (held, quarantined or deferred) settles nothing of its group.
 #[test]

@@ -4991,7 +4991,10 @@ fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> Result<Sna
 
 #[allow(dead_code)] // Native retained-copy preparation; activation review remains closed.
 fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
-    if item.cache_observations.is_some() || item.cache_base_head_etag.is_some() {
+    if item.cache_observations.is_some()
+        || item.cache_base_head_etag.is_some()
+        || crate::snapshots::history_segments::group_of(item).is_some()
+    {
         return None;
     }
     Some(SnapshotItem {
@@ -7603,10 +7606,8 @@ fn finish_sync_source(
     ] {
         ledger.bind_context(attribution_context.as_ref());
         ledger.set_retained_enabled(retained_enabled);
+        ledger.set_item_cap(identity_item_cap);
     }
-    upload_progress
-        .accepted_identity_buckets
-        .set_item_cap(identity_item_cap);
     // Settled-history segments: only the server's exact token cuts a body.
     let history_segments_now = (activity_hint.session_history_segments_contract.as_deref()
         == Some(crate::snapshots::history_segments::CONTRACT))
@@ -11082,7 +11083,12 @@ where
             .collect::<BTreeSet<_>>();
         // A live body also needs every segment of its group outside this
         // page (an earlier batch, or one held, quarantined or deferred) ACKed
-        // with its exact bytes, and all `count` of them present.
+        // with its exact bytes, and all `count` of them present. Two local
+        // copies of one session repeat its segments: the packer sends one.
+        let sent = indices
+            .iter()
+            .map(|index| fingerprint(&items[*index]))
+            .collect::<BTreeSet<_>>();
         for (live, segments) in &group_segments {
             let count = groups.iter().find_map(|(_, group)| match group {
                 Some((id, Some(count))) if id == live => Some(*count),
@@ -11091,13 +11097,17 @@ where
             // A positive ACK of the exact bytes: a hold or refusal of the
             // same bytes is not a stored part.
             let ready = segments.iter().all(|index| {
-                indices.contains(index)
+                sent.contains(fingerprint(&items[*index]))
                     || progress
                         .accepted_body_witnesses
                         .get(fingerprint(&items[*index]))
                         .is_some_and(|witness| *witness == body_witness(&items[*index]))
             });
-            if !ready || count != Some(segments.len() as u64) {
+            let unique = segments
+                .iter()
+                .map(|index| fingerprint(&items[*index]))
+                .collect::<BTreeSet<_>>();
+            if !ready || count != Some(unique.len() as u64) {
                 unsettled_groups.insert(live.clone());
             }
         }
