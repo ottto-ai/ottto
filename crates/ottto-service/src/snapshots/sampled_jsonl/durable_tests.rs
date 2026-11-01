@@ -3097,8 +3097,8 @@ fn claude_and_codex_bodies_round_trip_byte_identical_through_the_pi_ledger() {
 #[test]
 fn pi_fork_restore_tail_matches_cold_at_every_physical_line_cut() {
     let source = SnapshotSource::Pi;
-    let header = json!({"type":"session","id":"synthetic-m2-cut",
-        "timestamp":"2026-10-20T10:00:00Z","parentSession":"CANARY_M2_PARENT"})
+    let header = json!({"type":"session","id":"synthetic-pi-cut",
+        "timestamp":"2026-10-20T10:00:00Z","parentSession":"CANARY_PI_PARENT"})
     .to_string();
     let mut lines = vec![header];
     for (id, at) in [
@@ -3121,7 +3121,7 @@ fn pi_fork_restore_tail_matches_cold_at_every_physical_line_cut() {
         );
     }
     for cut in 1..lines.len() {
-        let scratch = Scratch::new("m2-cut");
+        let scratch = Scratch::new("pi-fork-cut");
         let path = scratch.write("fork.jsonl", &lines[..cut]);
         let (reduction, checkpoint) = full_read(&path, source);
         let bytes = encode(&reduction, 1 << 20, line_cap()).unwrap();
@@ -3165,7 +3165,7 @@ fn pi_fork_restore_tail_matches_cold_at_every_physical_line_cut() {
 /// [format] Pi native accounting and restore contract.
 #[test]
 fn copied_only_pi_fork_is_complete_emits_zero_and_restores_tail() {
-    let scratch = Scratch::new("m2-only-copies");
+    let scratch = Scratch::new("pi-fork-only-copies");
     let at = "2026-10-20T09:59:59Z";
     let copy = json!({"type":"message","timestamp":at,"message":{"role":"assistant",
         "responseId":"copy","timestamp":at,"model":"gpt-5.4","usage":{"input":100,"output":10}}})
@@ -3174,7 +3174,7 @@ fn copied_only_pi_fork_is_complete_emits_zero_and_restores_tail() {
         "fork.jsonl",
         &[
             json!({"type":"session","id":"synthetic-copy-only","timestamp":"2026-10-20T10:00:00Z",
-            "parentSession":"CANARY_M2_PARENT"})
+            "parentSession":"CANARY_PI_PARENT"})
             .to_string(),
             copy.clone(),
         ],

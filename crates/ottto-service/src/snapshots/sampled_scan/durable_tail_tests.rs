@@ -11371,11 +11371,11 @@ mod pi_bound;
 fn non_pi_fork_live_encode_refusal_is_counted_and_writes_nothing() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        let root = crate::test_scratch::ScratchDir::new("m2-non-pi-fork-refused");
+        let root = crate::test_scratch::ScratchDir::new("non-pi-fork-refused");
         let _lock = test_locks::hold(&root);
         let path = root.join("fixture.jsonl");
         std::fs::write(&path, b"{\"type\":\"session\",\"id\":\"fixture\"}\n").unwrap();
-        let scope = Scope("m2-non-pi-fork-refused".into());
+        let scope = Scope("non-pi-fork-refused".into());
         let (_, checkpoint) = native_record_of(&path, &scope, source);
         let mut accumulator = SnapshotAccumulator::new(source);
         let report = JsonlReadReport::default();

@@ -449,10 +449,10 @@ fn pi_registered_bounded_decode_charges_the_shared_graph_and_ledger() {
 }
 
 const FORK_TIME: &str = "2026-10-27T06:00:00.000000001Z";
-const PARENT_CANARY: &str = "/synthetic/CANARY_M2_PARENT/session.jsonl";
+const PARENT_CANARY: &str = "/synthetic/CANARY_PI_PARENT/session.jsonl";
 
 fn fork_header(parent: Option<&str>, at: &str) -> Value {
-    serde_json::json!({"type":"session", "id":"synthetic-m2-fork",
+    serde_json::json!({"type":"session", "id":"synthetic-pi-fork",
         "timestamp":at, "parentSession":parent})
 }
 fn fork_usage(kind: &str, id: &str, at: &str, input: u64) -> Value {
