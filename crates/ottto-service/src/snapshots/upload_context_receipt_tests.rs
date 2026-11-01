@@ -31,6 +31,10 @@ impl Fixture {
                 json!({"type":"session_meta","payload":{"id":SESSION}}),
                 json!({"timestamp":"2026-10-29T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":12,"output_tokens":4}}}}),
             ],
+            SnapshotSource::Pi => vec![
+                json!({"type":"session","id":SESSION,"timestamp":"2026-10-29T10:00:00Z"}),
+                json!({"type":"message_end","message":{"responseId":"synthetic-response","model":"gpt-5.4","timestamp":"1793268001000","usage":{"input":12,"output":4}}}),
+            ],
             _ => vec![
                 json!({"type":"assistant","sessionId":SESSION,"timestamp":"2026-10-29T10:00:01Z","requestId":"synthetic-request","message":{"id":"synthetic-message","model":"claude-sonnet-4-6","usage":{"input_tokens":12,"output_tokens":4}}}),
             ],
@@ -705,6 +709,103 @@ fn upload_context_receipt_historical_replay_rearms_retained_entry() {
     }
 }
 
+/// [behaviour] Pi writes the shared per-file receipt from its exact ACK under
+/// the active context, while its read and resend decisions stay main's.
+#[test]
+fn pi_exact_ack_writes_the_shared_file_receipt() {
+    let mut f = Fixture::new(SnapshotSource::Pi);
+    assert_eq!(f.adopt().files, 1);
+    let receipt = f.entry().upload_context_receipt.clone().unwrap();
+    assert_eq!(receipt.context_fingerprint, "d".repeat(64));
+    assert_eq!(receipt.source_witness, f.entry().source_file_fingerprint);
+    assert_eq!(
+        f.entry().last_upload_body_witness.as_ref(),
+        Some(&receipt.body_witness)
+    );
+    assert_eq!(f.uploader.counts(), (0, 0, 0, 0), "no context resend");
+    // Write-only: Pi still follows the source-wide context gate.
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+}
+
+/// [behaviour] A confirmed-empty file gets a local proof of its context and
+/// source witness, which is never ACK evidence and changes no selection.
+#[test]
+fn empty_file_proof_is_local_and_never_ack_evidence() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    assert_eq!(f.adopt().files, 1);
+    let base = "b".repeat(64);
+    let local_on = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
+    f.index
+        .activate_file_upload_context(f.source, local_on.clone());
+    fs::write(&f.path, "").unwrap();
+    assert_eq!(f.walk(true).0.scanned_file_count, 1);
+    assert!(f.index.confirmed_empty_files.contains(&f.key()));
+    let proof = f.entry().upload_context_receipt.clone().unwrap();
+    assert!(proof.body_witness.is_empty());
+    assert_eq!(proof.context_fingerprint, local_on);
+    assert_eq!(proof.source_witness, f.entry().source_file_fingerprint);
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    f.index
+        .set_copy_prefix_base_upload_context(Some(base), false);
+    assert!(f.index.copy_prefix_base_upload_context.is_none());
+}
+
+/// [format] An old decoder drops the per-entity stamp. Missing means owed, and
+/// the file receipt beside it is untouched.
+#[test]
+fn entity_stamp_dropped_by_old_decoder_is_owed() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.adopt();
+    let entity = "b".repeat(64);
+    f.index
+        .codex_state_only_snapshot_fingerprints
+        .insert("state-only".into(), entity.clone());
+    f.index.stamp_entity_upload_context_acks(
+        &"a".repeat(64),
+        &BTreeMap::from([(entity.clone(), "c".repeat(64))]),
+        &BTreeMap::from([(entity.clone(), "d".repeat(64))]),
+    );
+    assert_eq!(f.index.upload_context_owed_counts().no_proof_entities, 0);
+    let saved_path = f._scratch.join("entity-stamp-index.json");
+    f.index.save(&saved_path).unwrap();
+    let mut encoded: Value = serde_json::from_slice(&fs::read(&saved_path).unwrap()).unwrap();
+    assert!(encoded["upload_context_proof"]["entity_stamps"]
+        .get(&entity)
+        .is_some());
+    encoded
+        .as_object_mut()
+        .unwrap()
+        .remove("upload_context_proof");
+    fs::write(&saved_path, serde_json::to_vec(&encoded).unwrap()).unwrap();
+    f.index = ScanIndex::load(&saved_path).unwrap();
+    f.index
+        .activate_file_upload_context(f.source, "d".repeat(64));
+    assert_eq!(f.index.upload_context_owed_counts().no_proof_entities, 1);
+    assert!(f.entry().upload_context_receipt.is_some());
+}
+
+/// [behaviour] Local pacing debt is labelled apart from backend conflicts. It
+/// keeps today's Deferred outcome until receipts are authoritative.
+#[test]
+fn local_budget_deferral_is_labelled_apart_from_server_conflicts() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.adopt();
+    let previous = f.index.clone();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    let (scan, _) = f.walk(true);
+    assert!(!scan.snapshots.is_empty());
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    f.uploader.set_byte_allowance(0);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    assert_eq!(
+        f.uploader.deferral_counts(),
+        (scan.snapshots.len() as u64, 0)
+    );
+}
+
 fn legacy_round_trip(version: &str) {
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.adopt();
@@ -839,7 +940,7 @@ fn upload_context_receipt_partial_checkpoint_old_ack_refused() {
 fn upload_context_legacy_activation_preserves_identical_body_noop() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.adopt();
-    // The legacy/Pi activation path does not enable file receipts.
+    // The legacy/Pi activation path does not decide from file receipts.
     f.index.file_upload_context_enabled = false;
     f.index.activate_upload_context("e".repeat(64));
     let (scan, _) = f.walk(true);
