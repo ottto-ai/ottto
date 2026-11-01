@@ -3521,12 +3521,12 @@ pub struct ScanIndex {
     /// fingerprint in this index was produced. A policy transition keeps the
     /// policy-neutral entity identity but must force one complete correction
     /// pass before this witness advances.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     upload_context_fingerprint: Option<String>,
     pub files: BTreeMap<String, ScanIndexEntry>,
     /// Hash-only owner proof keyed by machine and session in this source index.
     /// A later current login can never replace it.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     session_account_bindings: BTreeMap<String, SessionAccountBinding>,
     /// Files whose oversized physical lines were skipped once under a bounded
     /// parser generation. The path key plus exact opened-object-derived source
@@ -3534,21 +3534,21 @@ pub struct ScanIndex {
     /// repeated work for an unchanged object. Keyed identically to `files` and
     /// retired with it, so this map is a subset of `files`, never its own
     /// independently growing store - see `prune_terminal_jsonl_dispositions`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     terminal_jsonl_dispositions: BTreeMap<String, TerminalJsonlDisposition>,
     /// Configured roots that have successfully resolved at least once for this
     /// destination/source index. A root that never existed is optional, but a
     /// root that disappears after contributing an authoritative census must
     /// fail the generation red instead of reconciling every entity beneath it
     /// away as if the directory had been observed empty.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     known_configured_scan_roots: BTreeSet<String>,
     /// Pre-root-witness index paths not currently covered by any resolved root.
     /// This is the upgrade-safe witness for a configured symlink whose old
     /// canonical target cannot be reconstructed while the link is missing.
     /// Inference requires a prior traversal with the same root-context proof;
     /// paths clear when a resolved root covers them or the root context changes.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     legacy_unresolved_root_file_witnesses: BTreeSet<String>,
     /// Last accepted semantic fingerprint for Codex sessions that exist only
     /// in the local state database and have no usage-bearing rollout file.
@@ -3557,88 +3557,76 @@ pub struct ScanIndex {
     /// their fingerprints beside the file index lets a successful upload
     /// acknowledge them exactly like file-backed snapshots, without turning
     /// every later state-database observation into another upload.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub codex_state_only_snapshot_fingerprints: BTreeMap<String, String>,
     /// Codex rollout sessions whose physical file is known to contain an
     /// inherited prefix but whose exclusive ownership boundary is unresolved.
     /// Persisting the session id prevents a later incremental page (where the
     /// unchanged rollout is not reparsed) from publishing inclusive
     /// `state_5.sqlite.tokens_used` as session-local usage.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     codex_state_only_blocked_session_ids: BTreeSet<String>,
     /// L-SB: what each local index key's latest settleable disclosure blocked
     /// (strict disclosures add). A re-parse or memo replay that no longer
     /// blocks an id releases it unless another holder remains. Never pruned by
     /// census absence. Never a settling rule.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     codex_state_only_blocked_by_file: BTreeMap<String, BTreeSet<String>>,
     /// Ids the group paths block with no file attribution: queued or paused
     /// join owners and capture-boundary held owners.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     codex_state_only_blocked_unattributed: BTreeSet<String>,
     /// Ids blocked before L-SB existed: never released by attribution.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     codex_state_only_blocked_legacy: BTreeSet<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     codex_state_only_blocked_attributed: bool,
     /// Parent ids requested by unresolved legacy ordinary forks. This bounded
     /// set forces an unchanged parent through one structural prepass instead
     /// of retaining every Codex transcript signature in the index.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     codex_parent_ownership_refs: BTreeSet<String>,
     /// Content-free ordered evidence for only the referenced parent sessions.
     /// Missing, overflowed, or incomplete ledgers are never authoritative.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     codex_parent_ownership_ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
     /// U1a-2a: paced side requests for unchanged parent rollouts, keyed by
     /// the parent's index key. Pacing only, never evidence; the process side
     /// ledger holds any charge made since the last save. Decoded per entry
     /// (D4): a malformed request is dropped and counted, never the index.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "deserialize_codex_side_requests"
-    )]
+    #[serde(default, deserialize_with = "deserialize_codex_side_requests")]
     codex_parent_side_requests: BTreeMap<String, SideRequest>,
     /// U1a-2a: side records for unchanged parent rollouts, keyed by the
     /// parent's index key. Decoded per entry: an undecodable record is
     /// dropped (P then has no record), never the index.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "deserialize_lenient_map"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_map")]
     codex_parent_side: BTreeMap<String, CodexParentSide>,
     /// Index-global and monotone: never reset by replay, so a re-created
     /// record never reuses a generation a waiting child saw.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default)]
     codex_parent_side_generation: u64,
     /// Completed proof-cursor sweeps; the record epoch prune's clock.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default)]
     codex_parent_proof_wrap_epoch: u64,
     /// U1a-2a (row 34): per fork child's index key, its parent-prefix proof
     /// or the proof it is owed. Decoded per entry, then semantically at
     /// load (`retain_decodable_codex_parent_state`); never the index.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "deserialize_lenient_map"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_map")]
     codex_parent_prefix_proofs: BTreeMap<String, CodexParentProofState>,
     /// The proof due scan's resume key (key order, wrapping).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     codex_parent_proof_cursor: Option<String>,
     /// The side-record prune's resume key (key order, wrapping).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     codex_parent_side_cursor: Option<String>,
     /// Index-wide and monotone, never cleared by replay: each owe sets
     /// `entry.seq = ++seq`, and a finish applies only to an equal `seq`.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default)]
     codex_parent_proof_seq: u64,
     /// This index's proof incarnation; `""` = unminted, which no proof job
     /// binds to. Adopted from `codex_proof_index_minted` at its first use;
     /// carried by the subset and `Clone`; not cleared by replay.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     codex_proof_index_incarnation: String,
     /// RAM only (row 35): the incarnation `load` minted or reused, persisted
     /// only once a use binds it (an owe, a proof job), so an index with no
@@ -3654,22 +3642,22 @@ pub struct ScanIndex {
     /// Durable, local-only index of Claude Desktop naming sidecars. Paging the
     /// store without retaining these safe extracted fields would make titles
     /// disappear whenever their file was outside the current bounded page.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_desktop_title_files: BTreeMap<String, ClaudeDesktopTitleIndexEntry>,
     /// Proven root/child account families survive incremental child-only
     /// reparses. The witness is local-only, carries no raw account identifier,
     /// and is created only from a complete filesystem census plus exact request
     /// coverage.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_account_family_witnesses: BTreeMap<String, ClaudeAccountFamilyWitness>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_account_family_pending: BTreeMap<String, ClaudeAccountFamilyPending>,
     /// Complete Claude request-ownership witnesses. These are local-only and
     /// persist only content-free request-set fingerprints; raw provider request
     /// ids remain in the transcript/API sidecars that produced them.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_usage_family_witnesses: BTreeMap<String, ClaudeUsageFamilyWitness>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_usage_family_pending: BTreeMap<String, ClaudeUsageFamilyPending>,
     /// Slice D1: one request-census record per Claude transcript index key,
     /// bound to the candidate fingerprint and census window of the parse that
@@ -3677,13 +3665,10 @@ pub struct ScanIndex {
     /// provider request ids); never proof, usage or upload input, and no
     /// decision reads it. Decoded per entry: a malformed record is dropped,
     /// never the index.
-    #[serde(default, skip_serializing_if = "ClaudeRequestCensus::is_empty")]
+    #[serde(default)]
     claude_request_census: ClaudeRequestCensus,
     /// Slice D1: count-only shadow memory between complete terminals.
-    #[serde(
-        default,
-        skip_serializing_if = "ClaudeRequestCensusShadowState::is_empty"
-    )]
+    #[serde(default)]
     claude_request_census_shadow: ClaudeRequestCensusShadowState,
     /// Families whose current transcript revision could not reconstruct a
     /// previously proven session-exclusive usage witness. Unlike backend
@@ -3691,7 +3676,7 @@ pub struct ScanIndex {
     /// upload or manifest set. The prior witness and the current content-free
     /// pending proof remain durable so a later complete family scan can
     /// re-prove authority without trusting the older body itself.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_usage_authority_quarantine: BTreeMap<String, ClaudeUsageAuthorityQuarantineRecord>,
     /// Path-(a) absence retirement: SHA-256 of each RetryPending family root
     /// a raw-complete census retired as wholly absent, to its retirement unix
@@ -3720,16 +3705,12 @@ pub struct ScanIndex {
     /// missing counts as absent) fits under the cap and its repair budget,
     /// those roots are tombstoned and the fence comes down. A non-boolean
     /// value decodes as set.
-    #[serde(
-        default,
-        skip_serializing_if = "is_false",
-        deserialize_with = "deserialize_fail_closed_flag"
-    )]
+    #[serde(default, deserialize_with = "deserialize_fail_closed_flag")]
     claude_retired_family_tombstones_uncertain: bool,
     /// Hash-only duplicate request ownership discovered by a complete Claude
     /// census. This keeps later incremental reparses fail-closed even after
     /// the terminal pending census is released.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_duplicate_request_owners: BTreeMap<String, BTreeSet<ClaudeDuplicateRequestOwner>>,
     /// A duplicate witness that exceeds the local bound cannot be represented
     /// partially. Fail all Claude posture closed and force a full corrective
@@ -3742,7 +3723,7 @@ pub struct ScanIndex {
     /// parsed on an earlier page can be reselected once and emitted on the
     /// following pass instead of leaving its first `ownership_unresolved` body
     /// permanent.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     claude_owned_start_census: BTreeMap<String, ClaudeOwnedStartCensusWitness>,
     /// Index keys whose parsed revision is held locally because its session
     /// ownership could not be bound, mapped to that held source fingerprint.
@@ -3752,30 +3733,26 @@ pub struct ScanIndex {
     /// when a later parse resolves it or rooted no-follow lookup proves it absent;
     /// until then discovery ignores its age (`DiscoveryRetention`), so a
     /// present held file is always observed and only an absent one is pruned.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     // Correctness hold: recorded ownership debt survives age and growth. Only
     // approved interim withheld_reparse{start,evidence,growth} may Full here.
     claude_account_deferred_holds: BTreeMap<String, String>,
     /// Scheduling-only backoff for full duplicate-fence re-arms while the
     /// fence stays closed. Losing either field schedules one immediate full
     /// re-arm; neither field can open the fence.
-    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    #[serde(default)]
     claude_duplicate_fence_rearm_attempt: u8,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     claude_duplicate_fence_next_full_rearm_unix_seconds: Option<u64>,
     /// Scheduling-only memory that suppresses whole-index re-arms which
     /// cannot make progress. Losing it costs re-arms, never an opening.
-    #[serde(
-        default,
-        skip_serializing_if = "ClaudeFullRearmProgress::is_empty",
-        deserialize_with = "deserialize_lenient_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_default")]
     claude_full_rearm_progress: ClaudeFullRearmProgress,
     /// Contract-5 identity contract observed when the current traversal
     /// started: the full collector token under a permit, `""` without one, or
     /// a placeholder that matches no contract once it changed mid-traversal.
     /// `None` is unknown (an old index, or one an old decoder rewrote).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     claude_request_identity_contract: Option<String>,
     /// Set whenever a prepared Claude cycle sees a contract that differs from
     /// the record above, including an unknown record. While set, no unchanged
@@ -3783,11 +3760,11 @@ pub struct ScanIndex {
     /// terminal that re-arms every family file (a duplicate-fence full re-arm,
     /// or this latch's own re-arm while the fence stays closed), and whose
     /// whole traversal ran under the contract that terminal sees, clears it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     claude_request_identity_contract_changed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     claude_desktop_store_cursor: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     claude_desktop_store_upper_bound: Option<String>,
     #[serde(default)]
     claude_desktop_store_sweep_had_errors: bool,
@@ -3803,26 +3780,26 @@ pub struct ScanIndex {
     claude_desktop_lineage_census_complete: bool,
     /// When the last complete, error-free Desktop store sweep finished, bound
     /// to this process and store inventory. Absent (unknown) for older indexes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     claude_desktop_census_witness: Option<claude_request_identity::DesktopCensusWitness>,
     #[serde(default)]
     claude_desktop_store_retry_attempt: u8,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     claude_desktop_store_retry_not_before_unix_seconds: Option<u64>,
     /// Lexicographic path cursor for a bounded sweep when a source has more
     /// eligible transcripts than one cycle may parse. Kept in the v2-only
     /// index so an older daemon can neither clobber nor misread it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub resume_after_path: Option<String>,
     /// Frozen lexicographic ceiling for the current bounded sweep. Files that
     /// arrive after the sweep starts wait for the next generation instead of
     /// keeping a hot tail full forever and starving older prefix keys.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub resume_upper_bound_path: Option<String>,
     /// Observation boundary paired with `resume_upper_bound_path`. A sweep
     /// that spans cycles may publish only through the time at which its frozen
     /// path generation was captured, never through the later finishing tick.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub resume_census_window_end: Option<String>,
     /// At least one earlier page in this frozen sweep was only partially
     /// settled. The final page may finish discovery, but one clean follow-up
@@ -3839,50 +3816,42 @@ pub struct ScanIndex {
     /// Reset with the flag.
     /// Read through `unsettled_cause_bits`, which reports none without the
     /// flag and `Unattributed` for a flag with no recorded cause.
-    #[serde(
-        default,
-        skip_serializing_if = "is_zero_u16",
-        deserialize_with = "deserialize_unsettled_causes"
-    )]
+    #[serde(default, deserialize_with = "deserialize_unsettled_causes")]
     bounded_sweep_unsettled_causes: u16,
     /// Durable bounded filesystem census. It is intentionally destination-
     /// scoped with the rest of the scan index: missed watcher events, daemon
     /// restarts, deletions, and roots created after startup all converge via
     /// this finite queue without an O(all paths) tick.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     traversal: Option<ScanTraversalCheckpoint>,
     /// C1b: the stale Claude families the current traversal's start carried,
     /// with the replay buffer it funded for their cancellations. Every
     /// traversal start replaces it.
-    #[serde(default, skip_serializing_if = "ClaudeStaleFamilyCarry::is_empty")]
+    #[serde(default)]
     claude_stale_family_carry: ClaudeStaleFamilyCarry,
     /// Residue named by the last completed census, see `ScanResidueWitness`.
     /// Absent while the last completed census was clean.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     scan_residue_witness: Option<ScanResidueWitness>,
     /// Destination-scoped historical bootstrap/replay generation currently
     /// being paged. Matching generations resume; a new reviewed revision
     /// clears only derived transcript settlement state once.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     historical_replay_generation: Option<String>,
     /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
     /// The three curve replay slots retired with full context-curve upload.
-    #[serde(rename = "context_curve_capability_enabled", default, skip_serializing)]
+    #[serde(rename = "context_curve_capability_enabled", default)]
     retired_context_curve_capability_enabled: serde::de::IgnoredAny,
     /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
-    #[serde(rename = "context_curve_replay_epoch", default, skip_serializing)]
+    #[serde(rename = "context_curve_replay_epoch", default)]
     retired_context_curve_replay_epoch: serde::de::IgnoredAny,
     /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
-    #[serde(
-        rename = "completed_context_curve_replay_generation",
-        default,
-        skip_serializing
-    )]
+    #[serde(rename = "completed_context_curve_replay_generation", default)]
     retired_completed_context_curve_replay_generation: serde::de::IgnoredAny,
     /// Files that were fully read and valid but intentionally produced no
     /// snapshot. Separate from `last_snapshot_fingerprint=None`, which legacy
     /// indexes can only treat as unknown/incomplete.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     pub confirmed_empty_files: BTreeSet<String>,
     /// Scan-local moved-session evidence from the existing bounded header
     /// inventory. Never serialized or used as file/body settlement evidence.
@@ -3891,30 +3860,30 @@ pub struct ScanIndex {
     /// Final post-policy entity fingerprints produced by each transcript.
     /// Most files contain one session; the set preserves exact entity grain
     /// for split/provider files instead of hiding all but an arbitrary last.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub file_snapshot_fingerprints: BTreeMap<String, BTreeSet<String>>,
     /// Server-reconstructible semantic activity clock for each final entity.
     /// This mirrors the accepted-log `occurred_at` rule and never uses local
     /// file mtime or the collector observation clock.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub snapshot_activity_at: BTreeMap<String, Option<String>>,
     /// Exact entity ACK identities known durable at the backend. Older indexes
     /// deserialize this empty. The separate version bit distinguishes that
     /// legacy absence from a current, authoritatively empty ledger.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     accepted_snapshot_fingerprints: BTreeSet<String>,
-    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    #[serde(default)]
     accepted_snapshot_fingerprint_ledger_version: u8,
     /// Restart-stable lexicographic cursor for bounded re-entry of ambiguous
     /// pre-ledger entities through the existing snapshot entity-ACK contract.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     legacy_settlement_reconcile_after_fingerprint: Option<String>,
     /// Rejected entities are quarantined under the exact daemon/parser/wire
     /// contract that produced the rejection. They are excluded from the
     /// server-agreement manifest while that witness is current, but are
     /// automatically re-derived after a repair changes any witness component.
     /// This isolates poison without turning quarantine into a permanent fence.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub quarantined_snapshot_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
     /// Runtime-only witness used to decide whether a persisted quarantine is
     /// stale. It is reconstructed from the current source before every scan.
@@ -3981,7 +3950,6 @@ pub struct ScanIndex {
     /// and is dropped on load with the gate marker (lenient decode).
     #[serde(
         default,
-        skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_lenient_claude_history_cutoff"
     )]
     claude_history_cutoff_unix_seconds: Option<u64>,
@@ -3989,55 +3957,35 @@ pub struct ScanIndex {
     /// (StateMissing M3). Without it, an index a pre-gate daemon built, or
     /// rebuilt only partly, gets its cutoff on the first gated load. Any
     /// stored value but `true` reads as `false` (lenient decode, fail closed).
-    #[serde(
-        default,
-        skip_serializing_if = "std::ops::Not::not",
-        deserialize_with = "deserialize_lenient_true"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_true")]
     claude_history_gate_loaded: bool,
     /// Claude only: this index's cutoff was recorded for history another
     /// destination received, under a claim policy other than an explicit
     /// `full` (SOURCE ruling, cross-org move). Kept, so the hold outlives this
     /// destination's own bootstrap; only an explicit `full` claim clears it.
-    #[serde(
-        default,
-        skip_serializing_if = "std::ops::Not::not",
-        deserialize_with = "deserialize_lenient_move_hold"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_move_hold")]
     claude_history_move_not_full: bool,
     /// Claude only: an explicit `full` claim was seen for this destination,
     /// which releases its move hold for good, even while the evidence still
     /// reads as a move (its own bootstrap and uploads not yet done).
-    #[serde(
-        default,
-        skip_serializing_if = "std::ops::Not::not",
-        deserialize_with = "deserialize_lenient_true"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_true")]
     claude_history_move_released: bool,
     /// Legacy carry marker. New carries have bounded per-file incidence below;
     /// old marker-only checkpoints migrate to bounded unknown incidence on read.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     accepted_incidence_pending_census: bool,
     /// Accepted incidence carried by Repair, separate from current membership.
     /// Empty key means an old ACK whose file could not be named. This bounded
     /// debt survives census/held files and retires only at that file's complete,
     /// policy-permitted reconstruction. It never admits newly recorded ACKs.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     accepted_rebuild_incidence: BTreeMap<String, BTreeSet<String>>,
     /// Visibility only: oldest outstanding carried set, including unknown
     /// incidence. Never used for admission, release or eviction.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_lenient_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_default")]
     accepted_rebuild_pending_since_unix_seconds: Option<u64>,
     /// Persisted alarm throttle; a future value stays throttled on rollback.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_lenient_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_default")]
     accepted_rebuild_last_alarm_unix_seconds: Option<u64>,
     /// Hash-only counting evidence of retired, unprotected Codex entries, by
     /// owner, so a moved session's evidence outlives its old entry being
@@ -4045,32 +3993,24 @@ pub struct ScanIndex {
     /// `codex_counting_version::MAX_COUNTING_TOMBSTONES`. Never file/body
     /// settlement evidence. Type damage decodes as empty, like a lost index.
     /// Appended serialized slot, so older positional indexes keep their slots.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "deserialize_lenient_map"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_map")]
     codex_counting_tombstones: BTreeMap<String, codex_counting_version::CountingTombstone>,
     /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
     #[serde(rename = "reread_guard", default, skip_serializing)]
     retired_reread_guard: serde::de::IgnoredAny,
     /// Diagnostic-only bounded FIFO of evicted Legacy tombstones. Appended
     /// serialized slot; old indexes default empty, damaged values are dropped.
-    #[serde(
-        default,
-        skip_serializing_if = "codex_counting_version::EvictedLegacyOwners::is_empty",
-        deserialize_with = "deserialize_lenient_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_default")]
     codex_counting_evicted_legacy: codex_counting_version::EvictedLegacyOwners,
     /// Scan-local cap eviction events by safety class; drained into receipts.
     #[serde(skip)]
     codex_counting_evictions: [u64; 3],
     /// Appended persisted field: preserve every older positional index slot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub(crate) upload_ack_retirement_handoff: Option<UploadAckRetirementHandoff>,
     /// One paced native audit outside the sampled-marker slot pool. This is
     /// scheduling only; the census hold remains the authority until Full.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     held_audit_progress: Option<sampled_audit::HeldAuditProgress>,
     /// Runtime-only, Claude only: what owed history does this cycle where no
     /// list is intended, set with the cutoff before scanning.
@@ -4080,11 +4020,7 @@ pub struct ScanIndex {
     #[serde(skip)]
     claude_history_emission: HistoryEmission,
     // Append persisted fields last: positional serde indexes must stay stable.
-    #[serde(
-        default,
-        skip_serializing_if = "claude_money_birth_store::BirthStore::is_empty",
-        deserialize_with = "deserialize_lenient_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_lenient_default")]
     pub(crate) claude_money_birth_store: claude_money_birth_store::BirthStore,
     /// Inventory fence for the Desktop pagination cursor, never identity proof.
     /// The version prefix rejects #851's legacy digest; an absent/mismatched
@@ -4104,7 +4040,6 @@ pub struct ScanIndex {
     /// the current proof decides.
     #[serde(
         default,
-        skip_serializing_if = "claude_request_money::copy_removals::CopyRemovals::is_unwritten",
         deserialize_with = "claude_request_money::copy_removals::CopyRemovals::deserialize_lenient"
     )]
     pub(crate) claude_copy_removals: claude_request_money::copy_removals::CopyRemovals,
