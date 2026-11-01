@@ -51,12 +51,16 @@ struct PipelineCycle<'a> {
 }
 
 struct PipelinePage {
+    parsed: BTreeSet<String>,
     scan: crate::snapshots::SourceScanResult,
     /// The index reloaded from disk after the page's durable save.
     index: ScanIndex,
     fully_settled: bool,
     backfill_succeeded: bool,
     held: BTreeSet<String>,
+    /// Sessions whose finalized body carried the E2 request-owned contract,
+    /// taken before classification removes held bodies.
+    request_owned_sessions: BTreeSet<String>,
     /// The page's hold classification, before settlement.
     progress_blocking: bool,
     uploaded: BTreeSet<String>,
@@ -74,8 +78,22 @@ struct PipelineFixture {
     durable_progress: bool,
 }
 
+fn request_owned_sessions(scan: &crate::snapshots::SourceScanResult) -> BTreeSet<String> {
+    scan.snapshots
+        .iter()
+        .filter(|item| {
+            item.usage_accounting_contract.as_deref()
+                == Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT)
+        })
+        .map(|item| item.source_session_id.clone())
+        .collect()
+}
+
 impl PipelineFixture {
+
+
     fn new(name: &str) -> Self {
+
         let base = test_dir(name);
         let root = base.join("projects");
         let support = base.join("support");
@@ -153,6 +171,8 @@ impl PipelineFixture {
         })
     }
 
+
+
     fn page_with_reoffers_born(
         &self,
         collected_at: &str,
@@ -161,6 +181,7 @@ impl PipelineFixture {
         before_classify: impl FnOnce(&mut ScanIndex),
         reoffers: bool,
     ) -> PipelinePage {
+
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
         self.cache.bind_withheld(&mut index);
         index.activate_upload_context(cycle.upload_context.to_string());
@@ -170,17 +191,26 @@ impl PipelineFixture {
         index.activate_effective_upload_body_witness_revision(
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
+        // Production order (`finish_sync_source`): the real exclusion list is
+        // runtime state, so it is loaded again after every reload.
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        index.load_claude_reemission_exclusions(&self.support);
+        crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
         let committed_index = index.clone();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
-            SnapshotSource::ClaudeCode,
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
             std::slice::from_ref(&self.root),
             &mut index,
             collected_at,
             183,
             self.page_files,
-            true,
+            &self.support,
         )
         .expect("scan bounded Claude page");
+        let parsed = scan
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone())
+            .collect();
         let (mut disposition, census_withheld, _) =
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
         if let Some(owner_session) = cycle.proven_owner_session {
@@ -281,6 +311,7 @@ impl PipelineFixture {
                 .save(&progress_path)
                 .expect("save lease before synthetic upload");
         }
+        let request_owned_sessions = request_owned_sessions(&scan);
         let holds = LocalHoldSettlement::classify(
             SnapshotSource::ClaudeCode,
             &mut index,
@@ -435,11 +466,13 @@ impl PipelineFixture {
         )
         .expect("save index and publish manifest");
         PipelinePage {
+            parsed,
             scan,
             index: ScanIndex::load(&self.index_path).expect("reload scan index"),
             fully_settled,
             backfill_succeeded: census_complete && !census_withheld && fully_settled,
             held: holds.held_fingerprints,
+            request_owned_sessions,
             progress_blocking: holds.progress_blocking,
             uploaded,
             result,
@@ -447,8 +480,11 @@ impl PipelineFixture {
         }
     }
 
+
+
     /// Pages of one traversal, until its census completes or the page bound.
     fn traversal(&self, hour: u32, cycle: &PipelineCycle<'_>) -> Vec<PipelinePage> {
+
         let mut pages: Vec<PipelinePage> = Vec::new();
         for number in 0..PIPELINE_MAX_PAGES {
             let upload = if number == 0 {
@@ -470,8 +506,11 @@ impl PipelineFixture {
         pages
     }
 
+
+
     /// The baseline: every session committed and accepted, one owner proven.
     fn baseline(&self) -> ScanIndex {
+
         let pages = self.traversal(
             8,
             &PipelineCycle {
@@ -579,6 +618,24 @@ impl PipelineFixture {
         );
         assert_eq!(index.claude_usage_authority_pending_count(), 0);
         revision
+    }
+
+    /// The real list input: after the unlisted baseline, list only the held
+    /// families, as a later operator list install would. Every page loads it
+    /// again, as `finish_sync_source` does.
+    fn list_held(&self, sessions: &[&str]) {
+        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&self.support, sessions);
+    }
+}
+
+/// A listed held family reads on ordinary (fold-absent) money: its body
+/// carries no request-owned contract on any page that parsed it.
+fn assert_listed_fold_absent<'a>(pages: impl IntoIterator<Item = &'a PipelinePage>, session: &str) {
+    for page in pages {
+        assert!(
+            !page.request_owned_sessions.contains(session),
+            "listed {session} never reads request-owned money"
+        );
     }
 }
 
@@ -925,97 +982,6 @@ fn unsettled_cause_is_named_on_the_claude_transition_lines() {
     }
 }
 
-/// A historical replay reset clears ordinary committed Claude file entries but
-/// keeps family witnesses and authority quarantines. A bound terminal authority
-/// hold met on an earlier bounded page then has no committed entry to restore;
-/// settling it would let the terminal page read the still-present family as
-/// vanished, drop its witness and quarantine, publish a manifest without it,
-/// and complete the replay. The hold stays progress-blocking instead: the
-/// healthy sibling commits, and the traversal stays incomplete with its
-/// authority evidence, no manifest, and backfill and replay pending.
-#[test]
-#[serial(source_manifests)]
-fn replay_reset_terminal_authority_hold_keeps_the_claude_traversal_incomplete() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fixture = PipelineFixture::new("claude-census-convergence-replay-terminal-hold");
-    let baseline = fixture.baseline();
-    let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
-    let revision = fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
-    // The account owner stays proven, so the only hold is the authority one.
-    let cycle = PipelineCycle {
-        replay_generation: "replay-generation-reset",
-        proven_owner_session: Some(PIPELINE_HELD_SESSION),
-        historical_replay: true,
-        ..PIPELINE_HOLD_CYCLE
-    };
-    // Fixture assumption: the production reset drops the held key's committed
-    // entry and keeps the family's bound authority evidence.
-    let mut reset = ScanIndex::load(&fixture.index_path).expect("load scan index");
-    reset.prepare_historical_replay(cycle.replay_generation.to_string());
-    assert!(!reset.files.contains_key(&held_key));
-    assert_eq!(
-        reset.bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
-        Some(revision.clone())
-    );
-
-    let first = fixture.page("2026-08-02T09:00:00Z", &cycle, PipelineUpload::Accept);
-    assert!(!first.scan.census_complete);
-    assert_eq!(first.held.len(), 1, "the unchanged demoted family is held");
-    // Classified as a non-progressing bound terminal demotion, not an account
-    // deferral: only the missing committed entry keeps it blocking.
-    assert!(!first.progress_blocking);
-    assert_eq!(first.index.claude_account_deferred_hold_count(), 0);
-    assert!(first.uploaded.is_disjoint(&first.held));
-    assert!(!first.fully_settled);
-    assert!(first.index.bounded_sweep_had_unsettled_upload());
-    assert!(!first.index.files.contains_key(&held_key));
-    assert_eq!(
-        first
-            .index
-            .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
-        Some(revision.clone())
-    );
-    // The healthy sibling on the same page still commits.
-    assert!(!first.uploaded.is_empty());
-    for fingerprint in &first.uploaded {
-        assert!(first
-            .index
-            .accepted_snapshot_fingerprint_recorded(fingerprint));
-        assert!(first
-            .index
-            .current_snapshot_fingerprints()
-            .contains(fingerprint));
-    }
-
-    // The terminal ordinary page of the same census window.
-    let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
-    assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
-    assert!(last.held.is_empty());
-    assert!(
-        !last.scan.census_complete,
-        "the held family owes a clean follow-up"
-    );
-    assert!(!last.backfill_succeeded);
-    assert_eq!(
-        last.index
-            .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
-        Some(revision)
-    );
-    assert!(last
-        .index
-        .context_curve_replay_needed(cycle.replay_generation));
-    assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
-    let held_body = first.held.iter().next().expect("held body");
-    assert!(!last.uploaded.contains(held_body));
-    assert!(!last.index.accepted_snapshot_fingerprint_recorded(held_body));
-    assert!(!last
-        .index
-        .current_snapshot_fingerprints()
-        .contains(held_body));
-}
-
 /// Control: without a replay reset, the same terminal authority demotion of a
 /// changed revision restores the committed entry, so the bounded traversal
 /// converges in its census window. The family keeps its witness and a terminal
@@ -1025,10 +991,11 @@ fn replay_reset_terminal_authority_hold_keeps_the_claude_traversal_incomplete() 
 #[serial(source_manifests)]
 fn restorable_terminal_authority_hold_lets_a_bounded_claude_traversal_converge() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("claude-census-convergence-restorable-terminal-hold");
     let baseline = fixture.baseline();
+    fixture.list_held(&[PIPELINE_HELD_SESSION]);
     let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
     let committed_revision = fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
@@ -1060,6 +1027,7 @@ fn restorable_terminal_authority_hold_lets_a_bounded_claude_traversal_converge()
     for page in [&first, &last] {
         assert!(!page.uploaded.contains(held_body));
     }
+    assert_listed_fold_absent([&first, &last], PIPELINE_HELD_SESSION);
     let settled = &last.index;
     assert!(!settled.accepted_snapshot_fingerprint_recorded(held_body));
     assert!(!settled.current_snapshot_fingerprints().contains(held_body));
@@ -1157,6 +1125,8 @@ impl PipelineFixture {
         let baseline = pages.last().expect("baseline page").index.clone();
         assert!(pages.last().is_some_and(|page| page.scan.census_complete));
         assert!(pages.iter().all(|page| page.held.is_empty()));
+        // The list names the root; its closure covers the subagents below.
+        fixture.list_held(&[TERMINAL_FAMILY_ROOT]);
         fixture.seed_terminal_authority(TERMINAL_FAMILY_ROOT);
 
         std::fs::create_dir_all(fixture.root.join(TERMINAL_FAMILY_ROOT).join("subagents"))
@@ -1175,6 +1145,9 @@ impl PipelineFixture {
         let pages = fixture.traversal(9, &bind);
         for page in &pages {
             assert!(page.uploaded.is_disjoint(&page.held));
+        }
+        for agent in TERMINAL_FAMILY_AGENTS {
+            assert_listed_fold_absent(&pages, &terminal_family_member(agent));
         }
 
         let mut index = ScanIndex::load(&fixture.index_path).expect("load scan index");
@@ -1246,7 +1219,7 @@ fn assert_held_bodies_never_delivered(
 #[serial(source_manifests)]
 fn terminal_family_never_committed_members_let_the_claude_census_complete() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     let (fixture, baseline) =
         PipelineFixture::terminal_family("claude-census-terminal-family-members");
@@ -1374,7 +1347,7 @@ fn terminal_family_never_committed_members_let_the_claude_census_complete() {
 #[serial(source_manifests)]
 fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
 
     // A RetryPending family elsewhere withholds the census only; the bound
@@ -1422,6 +1395,24 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
             historical_replay: true,
             ..TERMINAL_FAMILY_CYCLE
         };
+        // A13 transfer (E2-018, missing commit): the production reset drops
+        // the committed root entry and keeps the family's bound authority
+        // evidence and witness.
+        let before = ScanIndex::load(&fixture.index_path).expect("load scan index");
+        let root_key = PipelineFixture::key(&baseline, TERMINAL_FAMILY_ROOT);
+        let bound_before = before
+            .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+            .expect("bound terminal record before the reset");
+        let witness_before = before
+            .claude_usage_family_witness_digest_for_test(TERMINAL_FAMILY_ROOT)
+            .expect("retained family witness before the reset");
+        let mut reset = before.clone();
+        reset.prepare_historical_replay(cycle.replay_generation.to_string());
+        assert!(!reset.files.contains_key(&root_key));
+        assert_eq!(
+            reset.bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT),
+            Some(bound_before.clone())
+        );
         let pages = fixture.traversal(10, &cycle);
         let last = pages.last().expect("terminal page");
         assert!(!last.scan.census_complete);
@@ -1440,6 +1431,139 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
             .index
             .context_curve_replay_needed(cycle.replay_generation));
         assert_held_bodies_never_delivered(&pages, &last.index, &baseline);
+        // A13 transfer (E2-018): membership accumulates over bounded pages.
+        // Check the held page after all family members were rediscovered,
+        // preserving the exact full binding as well as no-delivery guards.
+        let hold = pages
+            .iter()
+            .find(|page| {
+                !page.held.is_empty()
+                    && page.index.bounded_sweep_had_unsettled_upload()
+                    && page
+                        .index
+                        .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+                        == Some(bound_before.clone())
+            })
+            .expect("held page with the complete bound family that marks the sweep");
+        assert!(
+            !hold.scan.census_complete,
+            "the hold page cannot publish a census"
+        );
+        assert_eq!(
+            hold.index
+                .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT),
+            Some(bound_before.clone()),
+            "the exact bound revisions survive the hold page"
+        );
+        assert!(!hold.progress_blocking);
+        assert_eq!(hold.index.claude_account_deferred_hold_count(), 0);
+        assert!(!hold.fully_settled);
+        assert!(!hold.index.files.contains_key(&root_key));
+        // The walk's terminal page holds nothing, stays in the same census
+        // window, and owes a clean follow-up.
+        let terminal = pages
+            .iter()
+            .find(|page| !page.index.scan_traversal_in_progress_for_test())
+            .expect("the walk's terminal page");
+        assert!(terminal.held.is_empty());
+        assert_eq!(terminal.scan.census_window_end, hold.scan.census_window_end);
+        assert!(
+            !terminal.scan.census_complete,
+            "the held family owes a clean follow-up"
+        );
+        // The bound authority evidence and witness are retained exactly at
+        // the walk's end. `traversal` runs PIPELINE_MAX_PAGES pages because
+        // the census never completes, so `last` is the first page of the
+        // clean follow-up walk: it re-reads the unanchored root before that
+        // walk reaches the subagents, and during a replay reset the record
+        // binds only the family members read so far (snapshots.rs:10137).
+        let terminal_at = pages
+            .iter()
+            .position(|page| !page.index.scan_traversal_in_progress_for_test())
+            .expect("the walk's terminal page");
+        let pages_diag = pages
+            .iter()
+            .enumerate()
+            .map(|(number, page)| {
+                format!(
+                    "p{number}:in_progress={} held={} unsettled={} members={}",
+                    page.index.scan_traversal_in_progress_for_test(),
+                    page.held.len(),
+                    page.index.bounded_sweep_had_unsettled_upload(),
+                    page.index
+                        .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+                        .map_or(0, |members| members.len()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            terminal
+                .index
+                .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT),
+            Some(bound_before.clone()),
+            "the walk's terminal page keeps the exact bound family; {pages_diag}"
+        );
+        assert_eq!(
+            terminal
+                .index
+                .claude_usage_family_witness_digest_for_test(TERMINAL_FAMILY_ROOT),
+            Some(witness_before.clone())
+        );
+        // After the walk, every member is either bound at its exact revision
+        // or still blocked by the replay-reset hold: no index entry, an
+        // unsettled sweep, and no census to prune it.
+        assert!(terminal_at < pages.len() - 1, "{pages_diag}");
+        let last_members = last
+            .index
+            .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+            .expect("terminal quarantine retained");
+        assert_eq!(
+            last_members.get(TERMINAL_FAMILY_ROOT),
+            bound_before.get(TERMINAL_FAMILY_ROOT)
+        );
+        for (member, revision) in &bound_before {
+            match last_members.get(member) {
+                Some(bound) => assert_eq!(bound, revision, "{pages_diag}"),
+                None => {
+                    let agent = member
+                        .rsplit_once("_agent-")
+                        .map(|(_, agent)| agent)
+                        .expect("an unbound member is a subagent");
+                    assert_eq!(PipelineFixture::subagent_key(&last.index, agent), None);
+                    assert!(
+                        last.index.bounded_sweep_had_unsettled_upload(),
+                        "{pages_diag}"
+                    );
+                    assert!(!last.scan.census_complete);
+                }
+            }
+        }
+        assert_eq!(
+            last.index
+                .claude_usage_family_witness_digest_for_test(TERMINAL_FAMILY_ROOT),
+            Some(witness_before)
+        );
+        // Healthy siblings still commit beside the hold.
+        assert!(pages.iter().any(|page| !page.uploaded.is_empty()));
+        for page in &pages {
+            for fingerprint in &page.uploaded {
+                assert!(page
+                    .index
+                    .accepted_snapshot_fingerprint_recorded(fingerprint));
+                assert!(page
+                    .index
+                    .current_snapshot_fingerprints()
+                    .contains(fingerprint));
+            }
+        }
+        // No held body (including one the baseline had accepted before the
+        // reset) is ever uploaded, accepted or current.
+        for held in pages.iter().flat_map(|page| page.held.iter()) {
+            assert!(pages.iter().all(|page| !page.uploaded.contains(held)));
+            assert!(!last.index.accepted_snapshot_fingerprint_recorded(held));
+            assert!(!last.index.current_snapshot_fingerprints().contains(held));
+        }
         // Every save withdraws the cached manifest; only a complete census
         // publishes one.
         assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
@@ -1546,6 +1670,7 @@ fn terminal_bound_hold_traversal(
 ) -> (PipelineFixture, ScanIndex, PipelinePage, PipelinePage) {
     let fixture = PipelineFixture::new(name);
     let baseline = fixture.baseline();
+    fixture.list_held(&[PIPELINE_HELD_SESSION]);
     fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
     if retry_pending {
@@ -1559,6 +1684,7 @@ fn terminal_bound_hold_traversal(
     let first = fixture.page("2026-08-02T09:00:00Z", &cycle, first_upload);
     assert!(!first.scan.census_complete);
     assert_eq!(first.held.len(), 1, "the changed demoted revision is held");
+    assert_listed_fold_absent([&first], PIPELINE_HELD_SESSION);
     // A RetryPending family elsewhere no longer blocks this page (path-(a)
     // bridge); FLIPS for `retry_pending` on the pre-bridge head.
     assert!(!first.progress_blocking, "retry_pending={retry_pending}");
@@ -1567,107 +1693,6 @@ fn terminal_bound_hold_traversal(
     let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
     assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
     (fixture, baseline, first, last)
-}
-
-/// H1: a `Rejected` page (a validated permanent refusal) whose only local
-/// hold is bound to a terminal authority record settles the hold through the
-/// same restore path a `Completed` page uses, so the traversal completes its
-/// census in the same window. The family stays named, terminal residue: its
-/// quarantine is rebound to the held revision and counted as terminal
-/// ownership-incomplete, the held body is never uploaded or accepted, and
-/// backfill stays pending on the held page.
-#[test]
-#[serial(source_manifests)]
-fn rejected_page_with_terminal_bound_holds_lets_the_claude_census_complete() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let _source_manifests = SourceManifestTestGuard::new();
-    let settled_before = terminal_hold_settlement_count();
-    let (_fixture, baseline, first, last) = terminal_bound_hold_traversal(
-        "claude-census-rejected-terminal-bound-hold",
-        PipelineUpload::ServerRejected,
-        false,
-    );
-    assert_eq!(
-        terminal_hold_settlement_count(),
-        settled_before + 1,
-        "exactly one eligible Rejected settlement decision"
-    );
-    let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
-    assert!(
-        !first.index.bounded_sweep_had_unsettled_upload(),
-        "terminal-bound holds no longer leave a Rejected page unsettled"
-    );
-    assert_eq!(
-        first.index.files[&held_key].last_snapshot_fingerprint,
-        baseline.files[&held_key].last_snapshot_fingerprint
-    );
-    let held_revision = first
-        .index
-        .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION)
-        .expect("terminal quarantine bound to the held revision");
-
-    assert!(last.scan.census_complete, "the census completes in window");
-    let held_body = first.held.iter().next().expect("held body");
-    for page in [&first, &last] {
-        assert!(!page.uploaded.contains(held_body));
-    }
-    let settled = &last.index;
-    assert!(!settled.accepted_snapshot_fingerprint_recorded(held_body));
-    assert!(!settled.current_snapshot_fingerprints().contains(held_body));
-    assert_eq!(
-        settled.file_snapshot_fingerprints[&held_key],
-        baseline.file_snapshot_fingerprints[&held_key]
-    );
-    // Named residue: the terminal record still binds the held revision.
-    assert_eq!(
-        settled.bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
-        Some(held_revision)
-    );
-    assert_eq!(settled.claude_usage_authority_pending_count(), 0);
-    // Counted residue: terminal ownership-incomplete, disclosed on the receipt.
-    let counts =
-        SyncCounts::from_scan_result(&last.scan, 0, 183).with_snapshot_terminal_counts(settled);
-    assert!(counts.census_complete);
-    assert!(counts.terminal_ownership_incomplete_file_count >= 1);
-    assert_ne!(counts.disclosed_loss(), DisclosedLoss::None);
-    let (window_start, window_end) =
-        snapshot_manifest_window(&last.scan.census_window_end, 183).expect("manifest window");
-    let manifest = settled
-        .manifest_for_window(SnapshotSource::ClaudeCode, &window_start, &window_end)
-        .expect("complete activity witness");
-    assert_eq!(
-        manifest,
-        baseline
-            .manifest_for_window(SnapshotSource::ClaudeCode, &window_start, &window_end)
-            .expect("baseline manifest")
-    );
-    assert_eq!(
-        cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode),
-        Some(manifest)
-    );
-
-    // Control: the refusal still reports as today. The held page is not
-    // fully settled, so neither a non-dominated nor a dominated-only refusal
-    // becomes Success.
-    for refusals in [
-        PermanentRefusalCounts {
-            total: 1,
-            dominated: 0,
-        },
-        PermanentRefusalCounts {
-            total: 1,
-            dominated: 1,
-        },
-    ] {
-        assert!(matches!(
-            refused_entity_state(true, refusals, first.fully_settled),
-            CollectorState::Error {
-                code: "backend_validation_error",
-                ..
-            }
-        ));
-    }
 }
 
 /// Controls for H1. A `Deferred` page keeps its own retryable conflict and
@@ -1681,7 +1706,7 @@ fn rejected_page_with_terminal_bound_holds_lets_the_claude_census_complete() {
 #[serial(source_manifests)]
 fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_census() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     for (name, upload, retry_pending) in [
         (
@@ -1732,6 +1757,7 @@ fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_censu
     let before = terminal_hold_settlement_count();
     let fixture = PipelineFixture::new("claude-census-rejected-unrestorable-hold");
     fixture.baseline();
+    fixture.list_held(&[PIPELINE_HELD_SESSION]);
     fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
     let cycle = PipelineCycle {
         replay_generation: "replay-generation-reset",
@@ -1746,6 +1772,7 @@ fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_censu
         PipelineUpload::ServerRejected,
     );
     assert_eq!(first.held.len(), 1);
+    assert_listed_fold_absent([&first], PIPELINE_HELD_SESSION);
     assert!(!first.progress_blocking);
     assert!(first.index.bounded_sweep_had_unsettled_upload());
     let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
@@ -1778,6 +1805,7 @@ fn mixed_rejected_fixture(name: &str, account_hold: bool) -> (PipelineFixture, S
     .unwrap();
     let baseline = fixture.baseline();
     if !account_hold {
+        fixture.list_held(&[PIPELINE_HELD_SESSION]);
         fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
     }
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
@@ -1796,7 +1824,7 @@ fn mixed_rejected_fixture(name: &str, account_hold: bool) -> (PipelineFixture, S
 #[serial(client_report)]
 fn real_rejected_page_restores_terminal_hold_and_discloses_refusal_beside_accepted_sibling() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     for reason in ["invalid", "usage_accounting_authority_downgrade"] {
         let (fixture, baseline) = mixed_rejected_fixture("h1-real-terminal-refusal", false);
@@ -2003,12 +2031,32 @@ fn assert_real_rejected_hold(
         );
         assert_eq!(counts.disclosed_loss(), DisclosedLoss::Unsettled);
     } else {
+        assert_listed_fold_absent([&first, &last], PIPELINE_HELD_SESSION);
         assert!(last
             .index
             .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION)
             .is_some());
         assert_eq!(last.index.claude_usage_authority_pending_count(), 0);
         assert_eq!(last.index.claude_account_deferred_hold_count(), 0);
+        // A14 transfer (E2-022): named residue, the terminal record still
+        // binds the held revision; the held key keeps its committed entity
+        // set; counted residue, terminal ownership-incomplete, disclosed.
+        let held_revision = first
+            .index
+            .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION)
+            .expect("terminal quarantine bound to the held revision");
+        assert_eq!(
+            last.index
+                .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
+            Some(held_revision)
+        );
+        assert_eq!(
+            last.index.file_snapshot_fingerprints[&held_key],
+            baseline.file_snapshot_fingerprints[&held_key]
+        );
+        assert!(counts.census_complete);
+        assert!(counts.terminal_ownership_incomplete_file_count >= 1);
+        assert_ne!(counts.disclosed_loss(), DisclosedLoss::None);
     }
 
     // Independent accepted-fold oracle: A retains its accepted revision;
@@ -2063,10 +2111,11 @@ fn assert_real_rejected_hold(
 #[serial(source_manifests)]
 fn rejected_page_with_terminal_and_retry_pending_held_entities_blocks_without_counting() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("h1-two-held-terminal-retry");
     fixture.baseline();
+    fixture.list_held(&PIPELINE_SESSIONS[..2]);
     for session in &PIPELINE_SESSIONS[..2] {
         fixture.seed_terminal_authority(session);
         fixture.append(session, "req_changed");
@@ -2089,6 +2138,9 @@ fn rejected_page_with_terminal_and_retry_pending_held_entities_blocks_without_co
         2,
         "both terminal A and RetryPending B are held on this page"
     );
+    for session in &PIPELINE_SESSIONS[..2] {
+        assert_listed_fold_absent([&first], session);
+    }
     assert_eq!(first.index.claude_usage_authority_pending_count(), 1);
     assert!(first.progress_blocking);
     assert!(first.index.bounded_sweep_had_unsettled_upload());
@@ -2102,10 +2154,11 @@ fn rejected_page_with_terminal_and_retry_pending_held_entities_blocks_without_co
 #[serial(source_manifests)]
 fn rejected_page_with_unbound_authority_only_hold_blocks_without_counting() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("h1-unbound-authority-hold");
     fixture.baseline();
+    fixture.list_held(&[PIPELINE_HELD_SESSION]);
     fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
     let cycle = PipelineCycle {
@@ -2130,6 +2183,7 @@ fn rejected_page_with_unbound_authority_only_hold_blocks_without_counting() {
         },
     );
     assert_eq!(first.held.len(), 1);
+    assert_listed_fold_absent([&first], PIPELINE_HELD_SESSION);
     assert_eq!(
         first.index.claude_account_deferred_hold_count(),
         0,
@@ -2194,11 +2248,12 @@ fn rejected_page_with_cap_refused_account_hold_blocks_without_counting() {
 #[serial(source_manifests)]
 fn eligible_rejected_hold_preserves_earlier_unsettled_traversal_debt() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     let mut fixture = PipelineFixture::new("h1-earlier-unsettled-debt");
     fixture.page_files = 1;
     fixture.baseline();
+    fixture.list_held(&[PIPELINE_SESSIONS[1]]);
     fixture.seed_terminal_authority(PIPELINE_SESSIONS[1]);
     fixture.append(PIPELINE_SESSIONS[1], "req_1_2");
     let cycle = PipelineCycle {
@@ -2223,6 +2278,7 @@ fn eligible_rejected_hold_preserves_earlier_unsettled_traversal_debt() {
         PipelineUpload::ServerRejected,
     );
     assert_eq!(held_page.held.len(), 1);
+    assert_listed_fold_absent([&held_page], PIPELINE_SESSIONS[1]);
     assert!(!held_page.progress_blocking);
     assert_eq!(
         terminal_hold_settlement_count(),
@@ -2279,119 +2335,6 @@ const BRIDGE_CYCLE: PipelineCycle<'static> = PipelineCycle {
     ..PIPELINE_HOLD_CYCLE
 };
 
-/// A held revision of a RetryPending family, on a Completed and on a Rejected
-/// first page: the hold, the quarantine and the withheld census stay; the
-/// sweep is not marked, so the traversal ends without owing a clean
-/// follow-up.
-#[test]
-#[serial(source_manifests)]
-fn bound_retry_pending_hold_settles_without_marking_the_sweep() {
-    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let _source_manifests = SourceManifestTestGuard::new();
-    for upload in [PipelineUpload::Accept, PipelineUpload::ServerRejected] {
-        let fixture = PipelineFixture::new("patha-bridge-bound-retry-pending-hold");
-        let baseline = fixture.baseline();
-        let committed_revision = fixture.seed_retry_pending_authority(PIPELINE_HELD_SESSION);
-        fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
-        let cycle = PipelineCycle {
-            first_page_upload: upload,
-            ..BRIDGE_CYCLE
-        };
-        let before = terminal_hold_settlement_count();
-        let pages = fixture.walk(9, &cycle);
-        let (first, last) = (&pages[0], pages.last().expect("terminal page"));
-        assert_eq!(first.held.len(), 1, "{upload:?}: the demoted revision");
-        assert_eq!(first.index.claude_account_deferred_hold_count(), 0);
-        // FLIPS on the pre-bridge head: RetryPending was progress-blocking.
-        assert!(!first.progress_blocking, "{upload:?}");
-        assert!(
-            !first.index.bounded_sweep_had_unsettled_upload(),
-            "{upload:?}: authority debt alone does not mark the sweep"
-        );
-        assert!(!first.fully_settled, "{upload:?}");
-        assert_eq!(
-            terminal_hold_settlement_count(),
-            before + u64::from(upload == PipelineUpload::ServerRejected),
-            "{upload:?}"
-        );
-        let record = first
-            .index
-            .claude_authority_record_for_test(PIPELINE_HELD_SESSION)
-            .expect("the family stays quarantined");
-        assert!(!record.terminal && record.bound_to_retained_witness);
-        assert_eq!(record.failed_reconstruction_count, 2, "one more failure");
-        let held_revision = record.member_source_file_fingerprints[PIPELINE_HELD_SESSION].clone();
-        assert_ne!(
-            held_revision, committed_revision,
-            "bound to the held revision"
-        );
-
-        // The held key keeps its committed, accepted revision.
-        let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
-        let held_body = first.held.iter().next().expect("held body").clone();
-        for page in &pages {
-            assert!(!page.uploaded.contains(&held_body), "{upload:?}");
-            assert!(!page
-                .index
-                .accepted_snapshot_fingerprint_recorded(&held_body));
-            assert!(!page
-                .index
-                .current_snapshot_fingerprints()
-                .contains(&held_body));
-            assert_eq!(
-                page.index.files[&held_key].last_snapshot_fingerprint,
-                baseline.files[&held_key].last_snapshot_fingerprint
-            );
-            assert_eq!(
-                page.index.files[&held_key].source_file_fingerprint,
-                committed_revision
-            );
-            assert_eq!(
-                page.index.file_snapshot_fingerprints[&held_key],
-                baseline.file_snapshot_fingerprints[&held_key]
-            );
-            assert!(!page.backfill_succeeded);
-        }
-
-        // The terminal withholds the census and keeps the retry state.
-        assert!(!last.scan.census_complete, "{upload:?}: withheld");
-        assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
-        assert!(
-            !last.index.bounded_sweep_had_unsettled_upload(),
-            "{upload:?}"
-        );
-        assert_eq!(last.index.claude_usage_authority_pending_count(), 1);
-        let kept = last
-            .index
-            .claude_authority_record_for_test(PIPELINE_HELD_SESSION)
-            .expect("still quarantined");
-        assert!(
-            !kept.terminal && kept.bound_to_retained_witness,
-            "{upload:?}"
-        );
-        assert_eq!(
-            (
-                kept.failed_reconstruction_count,
-                &kept.member_source_file_fingerprints,
-                kept.retry_after_unix_seconds,
-                &kept.correction,
-            ),
-            (
-                record.failed_reconstruction_count,
-                &record.member_source_file_fingerprints,
-                record.retry_after_unix_seconds,
-                &record.correction,
-            ),
-            "{upload:?}: no extra failure, same binding and deadline"
-        );
-        let counts = SyncCounts::from_scan_result(&last.scan, 0, 183)
-            .with_snapshot_terminal_counts(&last.index);
-        assert_eq!(counts.disclosed_loss(), DisclosedLoss::Unsettled);
-        assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
-    }
-}
-
 /// Any second cause keeps marking the sweep beside authority debt: a Deferred
 /// page (retryable server conflict), and a held revision whose RetryPending
 /// record is not bound to it.
@@ -2399,11 +2342,12 @@ fn bound_retry_pending_hold_settles_without_marking_the_sweep() {
 #[serial(source_manifests)]
 fn retry_pending_hold_beside_a_second_cause_still_marks_the_sweep() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     for unbound in [false, true] {
         let fixture = PipelineFixture::new("patha-bridge-second-cause");
         fixture.baseline();
+        fixture.list_held(&[PIPELINE_HELD_SESSION]);
         fixture.seed_retry_pending_authority(PIPELINE_HELD_SESSION);
         fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
         let cycle = PipelineCycle {
@@ -2423,6 +2367,7 @@ fn retry_pending_hold_beside_a_second_cause_still_marks_the_sweep() {
         });
         let (first, last) = (&pages[0], pages.last().expect("terminal page"));
         assert_eq!(first.held.len(), 1, "unbound={unbound}");
+        assert_listed_fold_absent(&pages, PIPELINE_HELD_SESSION);
         assert_eq!(first.progress_blocking, unbound, "unbound={unbound}");
         assert!(
             first.index.bounded_sweep_had_unsettled_upload(),
@@ -3097,11 +3042,12 @@ fn absent_retry_pending_family_is_kept_on_an_index_loaded_fresh_in_this_process(
 #[serial(source_manifests)]
 fn returning_member_that_never_reproves_is_held_until_its_bounded_terminal() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     let mut fixture = PipelineFixture::new("patha-tombstone-never-reproves");
     let session = PIPELINE_SESSIONS[2];
     let baseline = fixture.absent_retry_pending_family(session);
+    fixture.list_held(&[session]);
     let witness = ScanIndex::load(&fixture.index_path)
         .expect("load scan index")
         .claude_usage_family_witness_digest_for_test(session)
@@ -3134,6 +3080,7 @@ fn returning_member_that_never_reproves_is_held_until_its_bounded_terminal() {
         }
         let pages = fixture.walk(12 + step, &ABSENCE_CYCLE);
         let shape = format!("return {step}");
+        assert_listed_fold_absent(&pages, session);
         for page in &pages {
             for item in page
                 .scan
@@ -3192,102 +3139,6 @@ fn returning_member_that_never_reproves_is_held_until_its_bounded_terminal() {
 /// Damages a saved index's JSON; the second argument is a tombstone digest.
 type IndexJsonDamage = fn(&mut serde_json::Value, &str);
 
-/// SOURCE Round 13 F1: a retired family whose persisted tombstone set is
-/// then omitted, wrongly typed or damaged (its marker stays) is never read as
-/// new. The load raises the uncertainty fence and re-tombstones the
-/// witnessed, unindexed root, so a complete census while the family is still
-/// absent keeps its witness. When the member returns it is held against that
-/// witness: nothing is uploaded or accepted and a bounded record re-forms.
-#[test]
-#[serial(source_manifests)]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn returning_member_after_a_lost_tombstone_set_is_held_not_new() {
-    // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let _source_manifests = SourceManifestTestGuard::new();
-    let session = PIPELINE_SESSIONS[2];
-    let digest = crate::snapshots::claude_retired_family_digest_for_test(session);
-    let shapes: [(&str, IndexJsonDamage); 3] = [
-        ("omitted-set", |index, _| {
-            index
-                .as_object_mut()
-                .unwrap()
-                .remove("claude_retired_family_tombstones");
-        }),
-        ("null-set", |index, _| {
-            index["claude_retired_family_tombstones"] = serde_json::Value::Null;
-        }),
-        ("damaged-entry", |index, digest| {
-            index["claude_retired_family_tombstones"][digest] = serde_json::json!("lost");
-        }),
-    ];
-    for (shape, damage) in shapes {
-        let mut fixture = PipelineFixture::new(&format!("patha-lost-tombstones-{shape}"));
-        let baseline = fixture.absent_retry_pending_family(session);
-        let witness = ScanIndex::load(&fixture.index_path)
-            .expect("load scan index")
-            .claude_usage_family_witness_digest_for_test(session)
-            .expect("the seeded family keeps its witness");
-        let traversals = walk_until_census_complete(&fixture, 9, 3);
-        assert_absent_family_retired(&traversals, &baseline, session, shape);
-        let mut index_json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
-        assert_eq!(
-            index_json["claude_retired_family_tombstones_initialized"],
-            serde_json::json!(true),
-            "{shape}"
-        );
-        assert!(
-            index_json["claude_retired_family_tombstones"]
-                .get(&digest)
-                .is_some(),
-            "{shape}"
-        );
-        damage(&mut index_json, &digest);
-        std::fs::write(
-            &fixture.index_path,
-            serde_json::to_vec(&index_json).unwrap(),
-        )
-        .unwrap();
-
-        // Still absent: a complete census keeps the witness and tombstone.
-        let absent = walk_until_census_complete(&fixture, 12, 3);
-        let last = absent
-            .last()
-            .and_then(|pages| pages.last())
-            .expect("terminal page");
-        assert!(last.scan.census_complete, "{shape}");
-        assert_eq!(
-            last.index
-                .claude_usage_family_witness_digest_for_test(session),
-            Some(witness.clone()),
-            "{shape}: the witness survives the complete census"
-        );
-        assert!(
-            last.index.claude_family_tombstoned_for_test(session),
-            "{shape}: re-tombstoned from its witness"
-        );
-        assert!(
-            !last
-                .index
-                .claude_retired_family_tombstones_uncertain_for_test(),
-            "{shape}"
-        );
-
-        // The member returns.
-        std::fs::write(
-            fixture.root.join(format!("{session}.jsonl")),
-            pipeline_transcript_line(session, "req_2_1", 0),
-        )
-        .expect("restore the retired family's member");
-        let pages = fixture.walk(16, &ABSENCE_CYCLE);
-        assert_returning_member_held(&pages, session, &witness, shape);
-    }
-}
-
 /// A retired family's returning member, on the walk that reads it: nothing
 /// of it is uploaded or accepted, its record re-forms bound to the retained
 /// witness after one failed reconstruction, and its tombstone stays.
@@ -3345,115 +3196,142 @@ fn assert_returning_member_held(pages: &[PipelinePage], session: &str, witness: 
 )]
 fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
     // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     let session = PIPELINE_SESSIONS[2];
-    let shape = "partial-checkpoint";
-    let mut fixture = PipelineFixture::new("patha-h729-restored-stale-member");
-    let baseline = fixture.absent_retry_pending_family(session);
-    let removed_key = PipelineFixture::key(&baseline, session);
-    let committed_bytes = std::fs::read(&fixture.index_path).expect("read committed index");
-    let committed = ScanIndex::load(&fixture.index_path).expect("load scan index");
-    assert!(committed.files.contains_key(&removed_key));
-    let witness = committed
-        .claude_usage_family_witness_digest_for_test(session)
-        .expect("the seeded family keeps its witness");
-    let traversals = walk_until_census_complete(&fixture, 9, 3);
-    assert_absent_family_retired(&traversals, &baseline, session, shape);
+    // A18 transfer (E2-031): the set is lost as omitted, null or a damaged
+    // entry (its marker stays); each shape is held, never new.
+    let digest = crate::snapshots::claude_retired_family_digest_for_test(session);
+    let damages: [(&str, IndexJsonDamage); 3] = [
+        ("omitted-set", |index, _| {
+            index
+                .as_object_mut()
+                .unwrap()
+                .remove("claude_retired_family_tombstones");
+        }),
+        ("null-set", |index, _| {
+            index["claude_retired_family_tombstones"] = serde_json::Value::Null;
+        }),
+        ("damaged-entry", |index, digest| {
+            index["claude_retired_family_tombstones"][digest] = serde_json::json!("lost");
+        }),
+    ];
+    for (damage_shape, damage) in damages {
+        let shape = format!("partial-checkpoint-{damage_shape}");
+        let shape = shape.as_str();
+        let mut fixture =
+            PipelineFixture::new(&format!("patha-h729-restored-stale-member-{damage_shape}"));
+        let baseline = fixture.absent_retry_pending_family(session);
+        fixture.list_held(&[session]);
+        let removed_key = PipelineFixture::key(&baseline, session);
+        let committed_bytes = std::fs::read(&fixture.index_path).expect("read committed index");
+        let committed = ScanIndex::load(&fixture.index_path).expect("load scan index");
+        assert!(committed.files.contains_key(&removed_key));
+        let witness = committed
+            .claude_usage_family_witness_digest_for_test(session)
+            .expect("the seeded family keeps its witness");
+        let traversals = walk_until_census_complete(&fixture, 9, 3);
+        assert_absent_family_retired(&traversals, &baseline, session, shape);
 
-    // The retiring pages' uploads are shed: their ordinary saves never land,
-    // and the partial checkpoint selects against the committed index
-    // instead, restoring the removed member's entry while it keeps the
-    // retirement, its tombstone and the witness.
-    let retired = ScanIndex::load(&fixture.index_path).expect("load scan index");
-    std::fs::write(&fixture.index_path, &committed_bytes)
-        .expect("only the committed index is on disk");
-    let mut checkpoint = retired.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
-    checkpoint.mark_bounded_sweep_unsettled();
-    assert!(
-        checkpoint.files.contains_key(&removed_key),
-        "the stale member is restored"
-    );
-    assert!(checkpoint.claude_family_tombstoned_for_test(session));
-    assert!(checkpoint
-        .claude_authority_record_for_test(session)
-        .is_none());
-    assert_eq!(
-        checkpoint.claude_usage_family_witness_digest_for_test(session),
-        Some(witness.clone())
-    );
-    checkpoint
-        .save(&fixture.index_path)
-        .expect("save the partial checkpoint");
-
-    // The set is lost; the marker stays.
-    let mut index_json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
-    assert_eq!(
-        index_json["claude_retired_family_tombstones_initialized"],
-        serde_json::json!(true)
-    );
-    index_json
-        .as_object_mut()
-        .unwrap()
-        .remove("claude_retired_family_tombstones");
-    std::fs::write(
-        &fixture.index_path,
-        serde_json::to_vec(&index_json).unwrap(),
-    )
-    .unwrap();
-    let loaded = ScanIndex::load(&fixture.index_path).expect("a lost set still loads");
-    assert!(
-        loaded.files.contains_key(&removed_key),
-        "the stale member is still indexed"
-    );
-    // Round 15: the load only raises the fence; the complete census drains it.
-    assert!(
-        loaded.claude_retired_family_tombstones_uncertain_for_test(),
-        "the lost set raises the fence"
-    );
-    assert!(!loaded.claude_family_tombstoned_for_test(session));
-
-    // Still absent: the complete census removes the stale entry, keeps the
-    // witness and re-tombstones the root.
-    let absent = walk_until_census_complete(&fixture, 12, 4);
-    let last = absent
-        .last()
-        .and_then(|pages| pages.last())
-        .expect("terminal page");
-    assert!(last.scan.census_complete);
-    assert!(!last.index.files.contains_key(&removed_key));
-    assert_eq!(
-        last.index
-            .claude_usage_family_witness_digest_for_test(session),
-        Some(witness.clone()),
-        "the witness survives the complete census"
-    );
-    assert!(
-        last.index.claude_family_tombstoned_for_test(session),
-        "indexed presence never waives the retired root's slot"
-    );
-    assert!(!last
-        .index
-        .claude_retired_family_tombstones_uncertain_for_test());
-    for page in absent.iter().flatten() {
+        // The retiring pages' uploads are shed: their ordinary saves never land,
+        // and the partial checkpoint selects against the committed index
+        // instead, restoring the removed member's entry while it keeps the
+        // retirement, its tombstone and the witness.
+        let retired = ScanIndex::load(&fixture.index_path).expect("load scan index");
+        std::fs::write(&fixture.index_path, &committed_bytes)
+            .expect("only the committed index is on disk");
+        let mut checkpoint =
+            retired.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+        checkpoint.mark_bounded_sweep_unsettled();
         assert!(
-            page.scan
-                .snapshots
-                .iter()
-                .all(|snapshot| snapshot.source_session_id != session),
-            "the absent member is never offered"
+            checkpoint.files.contains_key(&removed_key),
+            "the stale member is restored"
         );
-    }
+        assert!(checkpoint.claude_family_tombstoned_for_test(session));
+        assert!(checkpoint
+            .claude_authority_record_for_test(session)
+            .is_none());
+        assert_eq!(
+            checkpoint.claude_usage_family_witness_digest_for_test(session),
+            Some(witness.clone())
+        );
+        checkpoint
+            .save(&fixture.index_path)
+            .expect("save the partial checkpoint");
 
-    // The member returns: held against its witness until a proof.
-    std::fs::write(
-        fixture.root.join(format!("{session}.jsonl")),
-        pipeline_transcript_line(session, "req_2_1", 0),
-    )
-    .expect("restore the retired family's member");
-    let pages = fixture.walk(17, &ABSENCE_CYCLE);
-    assert_returning_member_held(&pages, session, &witness, shape);
+        // The set is lost; the marker stays.
+        let mut index_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
+        assert_eq!(
+            index_json["claude_retired_family_tombstones_initialized"],
+            serde_json::json!(true)
+        );
+        assert!(
+            index_json["claude_retired_family_tombstones"]
+                .get(&digest)
+                .is_some(),
+            "{shape}"
+        );
+        damage(&mut index_json, &digest);
+        std::fs::write(
+            &fixture.index_path,
+            serde_json::to_vec(&index_json).unwrap(),
+        )
+        .unwrap();
+        let loaded = ScanIndex::load(&fixture.index_path).expect("a lost set still loads");
+        assert!(
+            loaded.files.contains_key(&removed_key),
+            "the stale member is still indexed"
+        );
+        // Round 15: the load only raises the fence; the complete census drains it.
+        assert!(
+            loaded.claude_retired_family_tombstones_uncertain_for_test(),
+            "the lost set raises the fence"
+        );
+        assert!(!loaded.claude_family_tombstoned_for_test(session));
+
+        // Still absent: the complete census removes the stale entry, keeps the
+        // witness and re-tombstones the root.
+        let absent = walk_until_census_complete(&fixture, 12, 4);
+        let last = absent
+            .last()
+            .and_then(|pages| pages.last())
+            .expect("terminal page");
+        assert!(last.scan.census_complete);
+        assert!(!last.index.files.contains_key(&removed_key));
+        assert_eq!(
+            last.index
+                .claude_usage_family_witness_digest_for_test(session),
+            Some(witness.clone()),
+            "the witness survives the complete census"
+        );
+        assert!(
+            last.index.claude_family_tombstoned_for_test(session),
+            "indexed presence never waives the retired root's slot"
+        );
+        assert!(!last
+            .index
+            .claude_retired_family_tombstones_uncertain_for_test());
+        for page in absent.iter().flatten() {
+            assert!(
+                page.scan
+                    .snapshots
+                    .iter()
+                    .all(|snapshot| snapshot.source_session_id != session),
+                "the absent member is never offered"
+            );
+        }
+
+        // The member returns: held against its witness until a proof.
+        std::fs::write(
+            fixture.root.join(format!("{session}.jsonl")),
+            pipeline_transcript_line(session, "req_2_1", 0),
+        )
+        .expect("restore the retired family's member");
+        let pages = fixture.walk(17, &ABSENCE_CYCLE);
+        assert_returning_member_held(&pages, session, &witness, shape);
+        assert_listed_fold_absent(&pages, session);
+    }
 }
 
 /// SOURCE Round 13 F2, on the priced fast path and the bounded fallback: with
@@ -3468,7 +3346,7 @@ fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
 #[serial(source_manifests)]
 fn full_tombstone_set_keeps_the_excess_family_and_holds_both_returns() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     let cap = crate::snapshots::MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES_FOR_TEST;
     let (oldest, excess) = (PIPELINE_SESSIONS[1], PIPELINE_SESSIONS[2]);
@@ -3478,6 +3356,7 @@ fn full_tombstone_set_keeps_the_excess_family_and_holds_both_returns() {
             refuse_scratch.then(crate::snapshots::RefuseClaudeAbsentFamilyScratchForTest::new);
         let mut fixture = PipelineFixture::new(&format!("patha-tombstone-capacity-{shape}"));
         let baseline = fixture.baseline();
+        fixture.list_held(&[oldest, excess]);
         fixture.restart_process();
         for session in [oldest, excess] {
             fixture.seed_retry_pending_authority(session);
@@ -3560,6 +3439,9 @@ fn full_tombstone_set_keeps_the_excess_family_and_holds_both_returns() {
             .expect("restore the member");
         }
         let pages = fixture.walk(13, &ABSENCE_CYCLE);
+        for session in [oldest, excess] {
+            assert_listed_fold_absent(&pages, session);
+        }
         for page in &pages {
             for item in page
                 .scan
@@ -3619,7 +3501,7 @@ fn full_tombstone_set_keeps_the_excess_family_and_holds_both_returns() {
 #[serial(source_manifests)]
 fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     for retry_pending in [false, true] {
         let fixture = PipelineFixture::new(if retry_pending {
@@ -3628,6 +3510,7 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
             "reoffer-h1-terminal"
         });
         let baseline = fixture.baseline();
+        fixture.list_held(&[PIPELINE_HELD_SESSION]);
         fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
         fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
         fixture.append(PIPELINE_SESSIONS[1], "req_1_2");
@@ -3659,6 +3542,7 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
             ResumableUploadResult::Rejected { .. }
         ));
         assert_eq!(first.held.len(), 1);
+        assert_listed_fold_absent([&first], PIPELINE_HELD_SESSION);
         assert!(
             first.held.is_disjoint(&first.uploaded),
             "a leased held body was never transmitted"
@@ -3696,15 +3580,18 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
 /// the authority debt names no unsettled cause. The family keeps its record,
 /// binding, failure count, deadline and pending, and the ordinary census,
 /// backfill and replay stay withheld. #706's unbound arm above is the
-/// second-cause control.
+/// second-cause control. The same bound hold on a Completed first page (the
+/// E2-028 Accept arm) also settles without marking the sweep and without the
+/// checkpointed-page counter.
 #[test]
 #[serial(source_manifests)]
 fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("reoffer-bound-retry-pending");
     let baseline = fixture.baseline();
+    fixture.list_held(&[PIPELINE_HELD_SESSION]);
     let committed_revision = fixture.seed_retry_pending_authority(PIPELINE_HELD_SESSION);
     fixture.seed_retry_pending_family_pending(PIPELINE_HELD_SESSION);
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
@@ -3751,6 +3638,7 @@ fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause(
         ResumableUploadResult::Rejected { .. }
     ));
     assert_eq!(first.held.len(), 1);
+    assert_listed_fold_absent([&first], PIPELINE_HELD_SESSION);
     assert!(
         !first.progress_blocking,
         "the bound RetryPending hold is non-progressing"
@@ -3801,6 +3689,15 @@ fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause(
     assert!(first
         .index
         .claude_usage_family_pending_retained_for_test(PIPELINE_HELD_SESSION));
+    // A16 transfer (E2-028): an authority-only hold (no account deferral),
+    // exactly one more failure, and the held body is never current.
+    assert_eq!(first.index.claude_account_deferred_hold_count(), 0);
+    assert_eq!(kept.failed_reconstruction_count, 2, "one more failure");
+    assert!(!first
+        .index
+        .current_snapshot_fingerprints()
+        .contains(&held_body));
+    assert!(!first.backfill_succeeded);
 
     let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
     assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
@@ -3825,4 +3722,262 @@ fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause(
     assert!(last
         .index
         .claude_usage_family_pending_retained_for_test(PIPELINE_HELD_SESSION));
+    // A16 transfer (E2-028): through the terminal page the held key keeps
+    // its committed, accepted revision and body; the held body is never
+    // accepted or current; the loss is disclosed as unsettled and no
+    // manifest is published.
+    assert!(!last
+        .index
+        .accepted_snapshot_fingerprint_recorded(&held_body));
+    assert!(!last
+        .index
+        .current_snapshot_fingerprints()
+        .contains(&held_body));
+    assert_eq!(
+        last.index.files[&held_key].last_snapshot_fingerprint,
+        baseline.files[&held_key].last_snapshot_fingerprint
+    );
+    assert_eq!(
+        last.index.files[&held_key].source_file_fingerprint,
+        committed_revision
+    );
+    assert_eq!(
+        last.index.file_snapshot_fingerprints[&held_key],
+        baseline.file_snapshot_fingerprints[&held_key]
+    );
+    let counts =
+        SyncCounts::from_scan_result(&last.scan, 0, 183).with_snapshot_terminal_counts(&last.index);
+    assert_eq!(counts.disclosed_loss(), DisclosedLoss::Unsettled);
+    assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
+
+    // E2-028 Accept arm (restored): a held revision of a RetryPending family
+    // on a Completed first page. The hold, the quarantine and the withheld
+    // census stay; the sweep is not marked, so the traversal ends without
+    // owing a clean follow-up.
+    {
+        let upload = PipelineUpload::Accept;
+        let fixture = PipelineFixture::new("patha-bridge-bound-retry-pending-hold");
+        let baseline = fixture.baseline();
+        fixture.list_held(&[PIPELINE_HELD_SESSION]);
+        let committed_revision = fixture.seed_retry_pending_authority(PIPELINE_HELD_SESSION);
+        fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+        let cycle = PipelineCycle {
+            first_page_upload: upload,
+            ..BRIDGE_CYCLE
+        };
+        let before = terminal_hold_settlement_count();
+        let pages = fixture.walk(9, &cycle);
+        let (first, last) = (&pages[0], pages.last().expect("terminal page"));
+        assert_eq!(first.held.len(), 1, "{upload:?}: the demoted revision");
+        assert_listed_fold_absent(&pages, PIPELINE_HELD_SESSION);
+        assert_eq!(first.index.claude_account_deferred_hold_count(), 0);
+        // FLIPS on the pre-bridge head: RetryPending was progress-blocking.
+        assert!(!first.progress_blocking, "{upload:?}");
+        assert!(
+            !first.index.bounded_sweep_had_unsettled_upload(),
+            "{upload:?}: authority debt alone does not mark the sweep"
+        );
+        assert!(!first.fully_settled, "{upload:?}");
+        assert_eq!(
+            terminal_hold_settlement_count(),
+            before + u64::from(upload == PipelineUpload::ServerRejected),
+            "{upload:?}"
+        );
+        let record = first
+            .index
+            .claude_authority_record_for_test(PIPELINE_HELD_SESSION)
+            .expect("the family stays quarantined");
+        assert!(!record.terminal && record.bound_to_retained_witness);
+        assert_eq!(record.failed_reconstruction_count, 2, "one more failure");
+        let held_revision = record.member_source_file_fingerprints[PIPELINE_HELD_SESSION].clone();
+        assert_ne!(
+            held_revision, committed_revision,
+            "bound to the held revision"
+        );
+
+        // The held key keeps its committed, accepted revision.
+        let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
+        let held_body = first.held.iter().next().expect("held body").clone();
+        for page in &pages {
+            assert!(!page.uploaded.contains(&held_body), "{upload:?}");
+            assert!(!page
+                .index
+                .accepted_snapshot_fingerprint_recorded(&held_body));
+            assert!(!page
+                .index
+                .current_snapshot_fingerprints()
+                .contains(&held_body));
+            assert_eq!(
+                page.index.files[&held_key].last_snapshot_fingerprint,
+                baseline.files[&held_key].last_snapshot_fingerprint
+            );
+            assert_eq!(
+                page.index.files[&held_key].source_file_fingerprint,
+                committed_revision
+            );
+            assert_eq!(
+                page.index.file_snapshot_fingerprints[&held_key],
+                baseline.file_snapshot_fingerprints[&held_key]
+            );
+            assert!(!page.backfill_succeeded);
+        }
+
+        // The terminal withholds the census and keeps the retry state.
+        assert!(!last.scan.census_complete, "{upload:?}: withheld");
+        assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
+        assert!(
+            !last.index.bounded_sweep_had_unsettled_upload(),
+            "{upload:?}"
+        );
+        assert_eq!(last.index.claude_usage_authority_pending_count(), 1);
+        let kept = last
+            .index
+            .claude_authority_record_for_test(PIPELINE_HELD_SESSION)
+            .expect("still quarantined");
+        assert!(
+            !kept.terminal && kept.bound_to_retained_witness,
+            "{upload:?}"
+        );
+        assert_eq!(
+            (
+                kept.failed_reconstruction_count,
+                &kept.member_source_file_fingerprints,
+                kept.retry_after_unix_seconds,
+                &kept.correction,
+            ),
+            (
+                record.failed_reconstruction_count,
+                &record.member_source_file_fingerprints,
+                record.retry_after_unix_seconds,
+                &record.correction,
+            ),
+            "{upload:?}: no extra failure, same binding and deadline"
+        );
+        let counts = SyncCounts::from_scan_result(&last.scan, 0, 183)
+            .with_snapshot_terminal_counts(&last.index);
+        assert_eq!(counts.disclosed_loss(), DisclosedLoss::Unsettled);
+        assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
+    }
+}
+
+
+
+/// [money] F5 root (Codex money audit: 38 observed-but-unindexed files,
+/// $202.81): a partial ACK with no restart. A page reads two of three files
+/// and only one is acknowledged, so the partial checkpoint has no entry for
+/// the other. The very next page reads it once, with the usage a fresh scan
+/// counts, and no file is read twice.
+#[test]
+fn codex_partial_ack_keeps_the_unacknowledged_new_file_owed_without_a_restart() {
+    let dir = test_dir("f5-codex-partial-ack");
+    let root = dir.join("home/.codex/sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    for (tokens, session) in [
+        (11, "019fa111-2222-7333-8444-555555555551"),
+        (22, "019fa111-2222-7333-8444-555555555552"),
+        (33, "019fa111-2222-7333-8444-555555555553"),
+    ] {
+        std::fs::write(
+            root.join(format!("rollout-2026-10-29T10-00-00-{session}.jsonl")),
+            [
+                serde_json::json!({"type":"session_meta","payload":{"id":session}}),
+                serde_json::json!({"timestamp":"2026-10-29T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":tokens,"output_tokens":4}}}}),
+            ]
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>(),
+        )
+        .unwrap();
+    }
+    let page = |index: &mut ScanIndex, minute: u32, file_limit: usize| {
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            index,
+            &format!("2026-10-29T12:0{minute}:00Z"),
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            file_limit,
+            false,
+        )
+        .unwrap();
+        crate::snapshots::finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, index);
+        scan
+    };
+    let usage = |scan: &crate::snapshots::SourceScanResult, session: &str| {
+        scan.snapshots
+            .iter()
+            .filter(|item| item.source_session_id == session)
+            .map(|item| {
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.reasoning_output_tokens,
+                    item.request_count,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let fresh = page(&mut ScanIndex::default(), 0, MAX_BACKFILL_FILES_PER_SOURCE);
+    assert_eq!(fresh.snapshots.len(), 3);
+
+    let committed = ScanIndex::default();
+    let mut working = committed.clone();
+    let first = page(&mut working, 1, 2);
+    assert_eq!(first.snapshots.len(), 2, "page 1 reads two of three files");
+    let acknowledged = first.snapshots[0].clone();
+    let unacknowledged = first.snapshots[1].source_session_id.clone();
+    let mut progress = test_upload_progress();
+    progress
+        .accepted_fingerprints
+        .insert(acknowledged.snapshot_fingerprint.clone());
+    progress.accepted_body_witnesses.insert(
+        acknowledged.snapshot_fingerprint.clone(),
+        snapshot_upload_body_witness(&acknowledged),
+    );
+    let index_path = dir.join("codex-index.json");
+    let progress_path = dir.join("codex-progress.json");
+    progress.save(&progress_path).unwrap();
+    let mut index = checkpoint_partial_snapshot_index(
+        &working,
+        &committed,
+        &progress,
+        &first.snapshots,
+        Some(&first),
+        &BTreeSet::new(),
+        &index_path,
+        &progress_path,
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(
+        !index.files.keys().any(|key| key.contains(&unacknowledged)),
+        "the checkpoint keeps no entry for the unacknowledged file"
+    );
+
+    let later = (2..=4)
+        .map(|minute| page(&mut index, minute, 2))
+        .collect::<Vec<_>>();
+    let expected = usage(&fresh, &unacknowledged);
+    assert_eq!(expected.len(), 1);
+    assert_eq!(
+        usage(&later[0], &unacknowledged),
+        expected,
+        "the next page reads the unacknowledged file"
+    );
+    assert_eq!(
+        later
+            .iter()
+            .flat_map(|scan| usage(scan, &unacknowledged))
+            .collect::<Vec<_>>(),
+        expected,
+        "read once"
+    );
+    assert!(
+        later
+            .iter()
+            .all(|scan| usage(scan, &acknowledged.source_session_id).is_empty()),
+        "the acknowledged file is not read again"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

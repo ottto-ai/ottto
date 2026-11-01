@@ -12,7 +12,8 @@ pub(crate) struct Receipt {
 }
 
 /// Captured from the final admitted bodies under their own context, before POST.
-/// Never serialized; restored ACK ledgers cannot create these acknowledgements.
+/// Never serialized. A restored ACK counts only through `prior_acks`: its
+/// durable stamp of this same mode context and exact body (Lead B Q1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Candidate {
     key: String,
@@ -24,9 +25,34 @@ pub(crate) struct Candidate {
     historical_replay_generation: Option<String>,
     bodies: BTreeMap<String, String>,
     wire_bytes: BTreeMap<String, u64>,
+    /// Bodies already exact-ACKed by an earlier pass under this mode context.
+    prior_acks: BTreeSet<String>,
+    /// This pass's catch-up allowance deferred at least one body.
+    split: bool,
 }
 
 impl Candidate {
+    /// Lead B Q1 (2026-10-31): a file's ACKs may split across passes; its
+    /// receipt still waits until every body is exact-ACKed in this context.
+    pub(crate) fn with_split_evidence(
+        mut self,
+        stamped: impl Fn(&str, &str, &str) -> bool,
+        deferred: &BTreeSet<String>,
+    ) -> Self {
+        let context = self
+            .mode_context
+            .as_ref()
+            .unwrap_or(&self.receipt.context_fingerprint);
+        let prior_acks = self
+            .bodies
+            .iter()
+            .filter(|(entity, body)| stamped(entity, body, context))
+            .map(|(entity, _)| entity.clone())
+            .collect();
+        self.prior_acks = prior_acks;
+        self.split = self.bodies.keys().any(|entity| deferred.contains(entity));
+        self
+    }
     pub(crate) fn entities(&self) -> impl Iterator<Item = (&String, &String)> {
         self.bodies.iter()
     }
@@ -69,10 +95,12 @@ pub(crate) struct RearmCounts {
     pub files: u64,
     pub bytes: u64,
     pub local_bytes: u64,
+    /// Files left owed after this pass deferred part of their ACK set (Lead B Q1).
+    pub context_split_files: u64,
 }
 impl RearmCounts {
     pub(crate) fn emit(&self, source: SnapshotSource) {
-        if self.files > 0 || self.local_bytes > 0 {
+        if self.files > 0 || self.local_bytes > 0 || self.context_split_files > 0 {
             crate::local_resource_diagnostics::traversal_point(
                 "upload_context_rearm",
                 source.api_slug(),
@@ -351,13 +379,18 @@ impl ScanIndex {
                         .get(entry.source_file_fingerprint.as_str())
                         .cloned()
                         .unwrap_or_default(),
+                    prior_acks: BTreeSet::new(),
+                    split: false,
                 })
             })
             .collect()
     }
 
-    /// Called on the final selected index, using only this cycle's exact ACKs.
-    /// No parse/finalize/quarantine/old-context path has this authority.
+    /// Called on the final selected index, using only exact ACKs of the active
+    /// context: this cycle's, or an earlier pass's by its durable stamp of the
+    /// same body (Lead B Q1). Stamps are cleared on every replay-generation
+    /// change, which carries the curve epoch. No parse/finalize/quarantine/
+    /// old-context path has this authority.
     pub(crate) fn accept_file_upload_context_acks(
         &mut self,
         candidates: &[Candidate],
@@ -384,7 +417,7 @@ impl ScanIndex {
                     .effective_upload_body_witness_revision_excluded_source_files
                     .contains(&candidate.receipt.source_witness)
                 || candidate.bodies.iter().any(|(entity, body)| {
-                    fresh_acks.get(entity) != Some(body)
+                    (fresh_acks.get(entity) != Some(body) && !candidate.prior_acks.contains(entity))
                         || self.quarantined_snapshot_fingerprints.contains_key(entity)
                 })
                 || self
@@ -423,9 +456,40 @@ impl ScanIndex {
                 }
             }
         }
+        // A split file stays owed: no receipt until its last body is exact.
+        // Only a file this pass advanced returns to the queue now; one whose
+        // whole tail was deferred waits, as before, so pressure cannot loop.
+        let mut progressed = Vec::new();
+        for candidate in candidates.iter().filter(|candidate| candidate.split) {
+            if self
+                .files
+                .get(&candidate.key)
+                .is_some_and(|entry| self.receipt_matches(&candidate.key, entry))
+            {
+                continue;
+            }
+            counts.context_split_files += 1;
+            if candidate
+                .bodies
+                .iter()
+                .any(|(entity, body)| fresh_acks.get(entity) == Some(body))
+            {
+                progressed.push(candidate.key.as_str());
+            }
+        }
+        // The terminal census can retire its traversal and tentatively adopt
+        // the source context before upload. A deferred tail must revoke that
+        // adoption too, so the existing next-generation context scan still
+        // selects the owed file after a restart, even with no queue left.
+        if counts.context_split_files > 0
+            && self.upload_context_fingerprint == self.active_upload_context_fingerprint
+        {
+            self.upload_context_fingerprint = None;
+        }
+        self.requeue_split_context_reads(progressed.into_iter());
         counts
     }
 }
 crate::heap_layout_bound::fields!(Receipt; context_fingerprint, replay_generation, source_witness, body_witness);
 
-crate::heap_layout_bound::fields!(Candidate; key, receipt, mode_context, historical_replay_generation, bodies, wire_bytes);
+crate::heap_layout_bound::fields!(Candidate; key, receipt, mode_context, historical_replay_generation, bodies, wire_bytes, prior_acks, split);

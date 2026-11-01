@@ -115,33 +115,15 @@ impl std::fmt::Display for SnapshotAckRejected {
 
 impl std::error::Error for SnapshotAckRejected {}
 
-/// Whether snapshot batch bodies are gzip-encoded.
-///
-/// Default OFF, deliberately. Response compression is universal, but nothing
-/// decompresses a *request* body unless a route opts in, and the batch route does
-/// not yet — the OTLP route is the only one in the estate with a request
-/// decompression path. Shipping this enabled would 4xx every upload from an
-/// upgraded daemon against today's server.
-///
-/// So the encoder ships now (the release train is the long pole) behind
-/// `OTTTO_SNAPSHOT_UPLOAD_GZIP=1`, and the default flips in the release AFTER the
-/// batch route decompresses. The refusal fallback below means a premature flip
-/// degrades to identity encoding instead of stopping sync.
-static SNAPSHOT_UPLOAD_GZIP: AtomicBool = AtomicBool::new(false);
-static SNAPSHOT_UPLOAD_GZIP_INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Gzip is enabled until the backend refuses an encoded snapshot batch.
+/// Size budgets and encoding failures still fall back to identity per request.
+static SNAPSHOT_UPLOAD_GZIP: AtomicBool = AtomicBool::new(true);
 
 pub(crate) fn snapshot_upload_gzip_enabled() -> bool {
-    if !SNAPSHOT_UPLOAD_GZIP_INITIALIZED.swap(true, Ordering::Relaxed) {
-        let enabled = std::env::var("OTTTO_SNAPSHOT_UPLOAD_GZIP")
-            .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-        SNAPSHOT_UPLOAD_GZIP.store(enabled, Ordering::Relaxed);
-    }
     SNAPSHOT_UPLOAD_GZIP.load(Ordering::Relaxed)
 }
 
 fn disable_snapshot_upload_gzip() {
-    SNAPSHOT_UPLOAD_GZIP_INITIALIZED.store(true, Ordering::Relaxed);
     if SNAPSHOT_UPLOAD_GZIP.swap(false, Ordering::Relaxed) {
         eprintln!(
             "ottto-service: snapshot upload gzip disabled for this process — the backend refused \
@@ -557,6 +539,11 @@ impl UploadFailureDiagnostics {
     /// `net_resilience` keys the transport-layer outage streak on this.
     pub(crate) fn status_family(&self) -> &'static str {
         self.status_family
+    }
+
+    /// A batch HTTP response proves a send; transport/token failures do not.
+    pub(crate) fn is_snapshot_batch_response(&self) -> bool {
+        self.endpoint == "snapshot_batch" && self.http_status.is_some()
     }
 
     /// Whether a snapshot page exceeded the client or gateway read deadline.
@@ -3900,6 +3887,43 @@ mod tests {
         );
         assert_eq!(parse_retry_after("", now), None);
         assert_eq!(parse_retry_after("later", now), None);
+    }
+
+    /// [behaviour] A fresh default client sends eligible batches as gzip.
+    #[test]
+    fn default_snapshot_client_sends_gzip() {
+        // Refusals in other tests must not change this process-default proof.
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_complete_http_request(&mut stream);
+            let body =
+                r#"{"accepted":0,"sessions_reconciled":0,"session_ids":[],"disabled":false}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            request
+        });
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "synthetic-machine".into(),
+            collector_version: None,
+            snapshots: Vec::new(),
+            upload_policy: Default::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let response = client
+            .upload_batch("synthetic-relay", &request, false)
+            .unwrap();
+        response.validate_entity_ack(&request).unwrap();
+        let captured = server.join().unwrap();
+        let headers = captured.split_once("\r\n\r\n").unwrap().0;
+        assert!(headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip")));
     }
 
     #[test]

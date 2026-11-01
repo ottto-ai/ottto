@@ -618,6 +618,7 @@ fn quarantine_invalid_scan_index(
     // Only the source-aware daemon load (which names its support directory)
     // can spend an armed user Repair; the unattributed load (audit, retry
     // driver) always refuses.
+    state_v2::guard_containment_locked(path)?;
     let recent = scan_index_rebuilt_recently(path, now)?;
     let armed = source
         .zip(support_dir)

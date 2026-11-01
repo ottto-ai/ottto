@@ -13,6 +13,9 @@ const MAX_SHARES: usize = 1_536;
 pub(crate) const MAX_PROVED_ROWS: usize = 1_024;
 /// Tombstone for a proof superseded before upload: a keyed digest is never zero.
 const REPLACED_PROOF: [u8; 16] = [0; 16];
+/// Definite "never accepted" tombstone for proof a copied marker lent
+/// (SOURCE 2026-10-31, #944 xPR F5): never a marker, refusal or replacement.
+const INVALIDATED_PROOF: [u8; 16] = [0xff; 16];
 /// Pending `retained_proof_missing` buckets feed one diagnostic only.
 const MAX_PENDING_MISSING: usize = 64;
 
@@ -255,7 +258,12 @@ fn wire_row_key(row: &Value) -> Option<RowKey> {
     };
     Some(RowKey {
         model: text("model")?,
-        selector_hash: super::super::selector_hash(&context),
+        // The daemon's RowKey partition (`row_key_with_selector_hash`): a
+        // marked copy and its unmarked own twin are different rows.
+        selector_hash: super::super::copy_unproven_selector_hash(
+            row["copy_unproven"] == json!(true),
+            super::super::selector_hash(&context),
+        ),
         reasoning_effort: text("reasoning_effort"),
         auth_mode: text("auth_mode"),
         billing_channel: text("billing_channel"),
@@ -392,7 +400,15 @@ impl AcceptedSession {
             .binary_search_by(|entry| (entry.bucket, entry.row).cmp(&(bucket, row)))
             .ok()
             .map(|index| self.proved[index].proof)
-            .filter(|proof| *proof != REPLACED_PROOF)
+            .filter(|proof| *proof != REPLACED_PROOF && *proof != INVALIDATED_PROOF)
+    }
+    /// The row holds the copy-derived `INVALIDATED_PROOF` tombstone: no
+    /// later witnessed proof replaced it (X-B1 `copy_invalidated`).
+    pub(super) fn copy_invalidated(&self, bucket: i64, row: &RowKey) -> bool {
+        let row = proved_row_hash(self.bound_key(), row);
+        self.proved
+            .binary_search_by_key(&(bucket, row), |entry| (entry.bucket, entry.row))
+            .is_ok_and(|index| self.proved[index].proof == INVALIDATED_PROOF)
     }
     /// A replacement's reply never settled, so the server may hold either
     /// proof. Kept here because the share hints are evicted independently.
@@ -416,6 +432,39 @@ impl AcceptedSession {
     }
     pub(super) fn proof_missing(&self, bucket: i64) -> bool {
         self.missing.binary_search(&bucket).is_ok()
+    }
+    /// This ledger with `rows` invalidated, for the pass that decides them.
+    pub(super) fn invalidated(&self, rows: &[(i64, RowKey)]) -> Self {
+        let mut state = self.clone();
+        state.invalidate(rows);
+        state
+    }
+    /// Copy-derived rows become a definite "never accepted" record: their
+    /// frozen shares go while the bucket stays accepted (the row reads as
+    /// ACKed untagged), and a proved row becomes the `INVALIDATED_PROOF`
+    /// tombstone, pruned with its bucket. Returns the rows changed.
+    fn invalidate(&mut self, rows: &[(i64, RowKey)]) -> u64 {
+        let key = self.bound_key().clone();
+        let mut changed = 0;
+        for (bucket, row) in rows {
+            let shared = row_hash(&key, row);
+            let before = self.shares.len();
+            self.shares
+                .retain(|share| (share.bucket, share.row) != (*bucket, shared));
+            let mut hit = self.shares.len() != before;
+            let proved = proved_row_hash(&key, row);
+            if let Ok(at) = self
+                .proved
+                .binary_search_by_key(&(*bucket, proved), |entry| (entry.bucket, entry.row))
+            {
+                let held = &mut self.proved[at];
+                hit |= held.proof != INVALIDATED_PROOF;
+                held.proof = INVALIDATED_PROOF;
+                held.account = None;
+            }
+            changed += u64::from(hit);
+        }
+        changed
     }
 }
 impl<'de> Deserialize<'de> for AcceptedBuckets {
@@ -614,7 +663,7 @@ impl AcceptedBuckets {
             let live = state
                 .proved
                 .iter()
-                .filter(|row| row.proof != REPLACED_PROOF);
+                .filter(|row| row.proof != REPLACED_PROOF && row.proof != INVALIDATED_PROOF);
             (live.count(), state.missing.len())
         })
     }
@@ -646,6 +695,24 @@ impl AcceptedBuckets {
             ..Default::default()
         });
     }
+    /// Tombstone the copy-derived rows an identity pass treated as never
+    /// accepted (`AcceptedSession::invalidate`), counted once per row.
+    /// Returns whether the ledger changed; the caller persists before upload.
+    pub(crate) fn invalidate_copy_derived(&mut self, rows: &[super::CopyInvalidation]) -> bool {
+        let mut invalidated = 0;
+        for row in rows {
+            if let Some(state) = self.session_mut(&row.session) {
+                invalidated += state.invalidate(&[(row.bucket, row.row.clone())]);
+            }
+        }
+        if invalidated > 0 {
+            super::budget::record(&super::budget::Counts {
+                copy_derived_proof_invalidated: invalidated,
+                ..Default::default()
+            });
+        }
+        invalidated > 0
+    }
     fn session_mut(&mut self, session: &str) -> Option<&mut AcceptedSession> {
         let key = self.1.as_ref()?;
         let epoch = key_epoch(key);
@@ -655,7 +722,7 @@ impl AcceptedBuckets {
     }
     /// The session's entry, refreshed as the last ACK; a full ledger evicts
     /// its least recently ACKed session (#909 LRU).
-    fn session_entry(&mut self, session: &str) -> Option<&mut AcceptedSession> {
+    fn session_entry(&mut self, session: &str, report: bool) -> Option<&mut AcceptedSession> {
         let fingerprint_key = self.1.as_ref()?;
         let key = session_key(fingerprint_key, session);
         let last_ack = self
@@ -673,10 +740,12 @@ impl AcceptedBuckets {
                 .map(|(key, _)| key.clone())
                 .expect("full ledger");
             self.0.remove(&oldest);
-            super::budget::record(&super::budget::Counts {
-                accepted_state_evicted: 1,
-                ..Default::default()
-            });
+            if report {
+                super::budget::record(&super::budget::Counts {
+                    accepted_state_evicted: 1,
+                    ..Default::default()
+                });
+            }
         }
         let entry = self.0.entry(key).or_insert_with(|| AcceptedSession {
             key_epoch: key_epoch(fingerprint_key),
@@ -728,6 +797,7 @@ impl AcceptedBuckets {
                         && held.row == row_hash
                         && held.proof != proof
                         && held.proof != REPLACED_PROOF
+                        && held.proof != INVALIDATED_PROOF
                 }) {
                     replaced.insert((start, row_hash));
                 }
@@ -757,7 +827,7 @@ impl AcceptedBuckets {
         // `record` normally settled (and LRU-refreshed) this ACK's session;
         // refreshing again would only churn persisted bytes.
         if self.session_mut(session).is_none() {
-            self.session_entry(session);
+            self.session_entry(session, true);
         }
         let Some(entry) = self.session_mut(session) else {
             return;
@@ -847,6 +917,18 @@ impl AcceptedBuckets {
             });
         }
     }
+    /// Copy-prefix ENABLE guard (Lead B F3): whether a stored-body ACK
+    /// may have frozen `session`'s bucket at `bucket_start`. Known hints
+    /// answer exactly; incomplete hints (whole buckets evicted) or an
+    /// unparsable start answer yes. Without hints for the session the answer
+    /// is no, the same reach as #909's own protection (`accepted_state_unknown`).
+    pub(crate) fn may_have_accepted(&self, session: &str, bucket_start: &str) -> bool {
+        self.get(session).is_some_and(|state| {
+            state.incomplete
+                || bucket_key(bucket_start)
+                    .map_or(true, |start| state.binary_search(&start).is_ok())
+        })
+    }
     pub(crate) fn get(&self, session: &str) -> Option<&AcceptedSession> {
         let key = self.1.as_ref()?;
         self.0
@@ -856,6 +938,13 @@ impl AcceptedBuckets {
     /// Record only the body actually stored. A stripped ACK preserves prior
     /// fingerprints while the bucket is present; fingerprints never restore tags.
     pub(crate) fn record(&mut self, body: &Value) {
+        self.record_with_diagnostics(body, true);
+    }
+    /// Pre-upload custody sizing must not report hypothetical evictions.
+    pub(crate) fn preview_record(&mut self, body: &Value) {
+        self.record_with_diagnostics(body, false);
+    }
+    fn record_with_diagnostics(&mut self, body: &Value, report: bool) {
         let Some(fingerprint_key) = self.1.as_ref() else {
             return;
         };
@@ -873,7 +962,9 @@ impl AcceptedBuckets {
         }
         let fingerprint_key = fingerprint_key.clone();
         let fingerprint_key = &fingerprint_key;
-        let entry = self.session_entry(session).expect("bound fingerprint key");
+        let entry = self
+            .session_entry(session, report)
+            .expect("bound fingerprint key");
         let mut shares = std::mem::take(&mut entry.shares)
             .into_iter()
             .collect::<BTreeSet<_>>();

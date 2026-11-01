@@ -1290,6 +1290,7 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
         let setup = |scan: &mut OwnedSourceScan| {
             if inputs != "parents" {
                 let traces = Arc::new(CodexTurnTraceMap {
+                    since_epoch: 0,
                     priority_turns: (0..5000).map(|n| format!("unrelated-turn-{n}")).collect(),
                     incomplete: false,
                 });
@@ -1422,6 +1423,7 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
                     turns.insert("turn-b2-1".into());
                 }
                 scan.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
+                    since_epoch: 0,
                     priority_turns: turns,
                     incomplete: false,
                 }));
@@ -2413,6 +2415,7 @@ fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
     fixture.file.append(&usage(source, 100, 0, "fixture-model"));
     let live = |scan: &mut OwnedSourceScan| {
         scan.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
+            since_epoch: 0,
             priority_turns: BTreeSet::new(),
             incomplete: false,
         }));
@@ -2713,6 +2716,7 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
     let (old, _, _, _) = acquire(&fixture, SnapshotSource::Codex, None, 100);
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
     parser.accumulator.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
+        since_epoch: 0,
         priority_turns: BTreeSet::from(["unrelated-turn".into()]),
         incomplete: false,
     }));
@@ -2723,6 +2727,7 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
     let (old, _, _, _) = acquire(&fixture, SnapshotSource::Codex, None, 100);
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
     parser.accumulator.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
+        since_epoch: 0,
         priority_turns: BTreeSet::from(["this-turn".into()]),
         incomplete: false,
     }));

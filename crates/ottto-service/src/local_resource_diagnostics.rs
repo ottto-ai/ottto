@@ -1,6 +1,6 @@
 //! Content-free observations in the existing local service log, never wire data.
 //! CPU includes concurrent process work; maximum RSS is a lifetime high-water mark.
-use serde::{ser::SerializeMap, Serialize};
+use serde::{ser::SerializeMap, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -282,7 +282,7 @@ struct ClaudeRecordCaps {
     #[serde(skip_serializing_if = "is_zero")]
     claude_money_record_cap_hits: u64,
 }
-fn is_zero(value: &u64) -> bool {
+pub(crate) fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 #[cfg(not(test))]
@@ -332,6 +332,57 @@ pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64) {
     )
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct CapCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub boundary_overflow_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub bootstrap_overflow_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub parent_signature_clear_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub price_trace_row_limit_hits: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub parent_ref_refusals: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub inventory_hold_keys_discarded: u64,
+}
+impl CapCounts {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    pub(crate) fn drain(&mut self, source: &str) -> Self {
+        for (event, total) in [
+            &mut self.boundary_overflow_events,
+            &mut self.bootstrap_overflow_events,
+            &mut self.parent_signature_clear_events,
+            &mut self.price_trace_row_limit_hits,
+            &mut self.parent_ref_refusals,
+            &mut self.inventory_hold_keys_discarded,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            *total = total.saturating_add(source_count(source, CAP_EVENT_START + event, |n| {
+                n.swap(0, Relaxed)
+            }));
+        }
+        if !self.is_empty() {
+            traversal_point("scan_cap_events", source, self);
+        }
+        *self
+    }
+    pub(crate) fn record(source: &str, event: usize, amount: u64) {
+        source_count(source, CAP_EVENT_START + event, |slot| {
+            slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+                .unwrap_or_else(|n| n)
+        });
+    }
+}
+
+crate::heap_layout_bound::fields!(CapCounts; boundary_overflow_events, bootstrap_overflow_events, parent_signature_clear_events, price_trace_row_limit_hits, parent_ref_refusals, inventory_hold_keys_discarded);
+
 /// K10 (LD): one line observer's counts for a page; nonzero keys only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct LineDeliveryCounts {
@@ -352,8 +403,8 @@ pub(crate) enum UnselectedReason {
     /// F4 kept custody because another same-member path prevents absence proof.
     WithheldAbsenceAmbiguous = 18,
 }
-/// Three reasons, seven withheld events, growth, deleted tokens and audit retirement.
-const UNSELECTED_REASONS: usize = 19;
+const CAP_EVENT_START: usize = 19;
+const UNSELECTED_REASONS: usize = CAP_EVENT_START + 6;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -822,7 +873,7 @@ impl Probe {
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
-                Default::default()
+                self.page_events.with_current().retained_cache_only()
             },
             collection: counts,
             pending,
@@ -934,10 +985,17 @@ impl Observation {
 
 /// Local prepare window, including index load/baseline work before page probes.
 /// Return values and errors pass through; unwinding closes sampling silently.
-pub(crate) fn source_prepare<T>(source: &str, inner: impl FnOnce() -> T) -> T {
+pub(crate) fn source_prepare<T>(
+    source: &str,
+    inner: impl FnOnce() -> T,
+    v2_active: impl FnOnce(&T) -> bool,
+) -> T {
     let probe = Probe::start();
     let footprint = footprint::Stage::begin();
     let result = inner();
+    if source == "claude_code" && v2_active(&result) {
+        crate::snapshots::state_v2_prepare_observed();
+    }
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
@@ -953,11 +1011,20 @@ pub(crate) fn source_prepare<T>(source: &str, inner: impl FnOnce() -> T) -> T {
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
 pub(crate) fn source_finish<T>(
     source: &str,
+    v2_active: bool,
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let probe = Probe::start();
     let footprint = footprint::Stage::begin();
+    let v2_active = source == "claude_code" && v2_active;
+    let v2_window = v2_active
+        .then(crate::snapshots::state_v2_finish_window)
+        .flatten();
     let result = inner();
+    drop(v2_window);
+    if v2_active {
+        crate::snapshots::state_v2_post_pass_observed();
+    }
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
@@ -1247,6 +1314,11 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
         "claude_reemission_stop_latched"
     };
     traversal_point(stage, "claude_code", counts);
+}
+/// State-v2 backend observations use the existing local-only #799 sink.
+/// Callers supply counts, lengths and bounded states, never storage keys.
+pub(crate) fn claude_state_v2(counts: &impl Serialize) {
+    traversal_point("claude_state_v2", "claude_code", counts);
 }
 /// Local alarm (5a1b): durable-store holds, T14 rebuilds, mode repairs and a
 /// disabled store, as [since last, total] counts. No path, id or wire event.
@@ -2325,9 +2397,11 @@ mod tests {
     fn footprint_fields_are_stage_only_for_all_native_sources() {
         for source in ["claude_code", "codex", "pi"] {
             let (result, records) = capture(|| {
-                source_prepare(source, || {
-                    source_finish(source, || Ok::<_, anyhow::Error>(17))
-                })
+                source_prepare(
+                    source,
+                    || source_finish(source, false, || Ok::<_, anyhow::Error>(17)),
+                    |_| false,
+                )
             });
             assert_eq!(result.unwrap(), 17);
             assert_eq!(records.len(), 2);
@@ -2370,7 +2444,7 @@ mod tests {
         let value = Box::new(17);
         let original = std::ptr::from_ref(value.as_ref());
         let (result, records) = capture(|| {
-            source_finish("claude_code", || {
+            source_finish("claude_code", false, || {
                 let mut upload = UploadCall::start("claude_code");
                 upload.serialized(20);
                 upload.attempt(20, false);
@@ -2409,7 +2483,7 @@ mod tests {
         let error =
             anyhow::Error::new(OriginalError(identity.clone())).context("synthetic context");
         let original_chain: Vec<_> = error.chain().map(ToString::to_string).collect();
-        let (result, records) = capture(|| source_finish::<()>("codex", || Err(error)));
+        let (result, records) = capture(|| source_finish::<()>("codex", false, || Err(error)));
         let returned = result.unwrap_err();
         assert_eq!(
             returned
@@ -2432,7 +2506,7 @@ mod tests {
         let original = payload.clone();
         let (result, records) = capture(|| {
             std::panic::catch_unwind(|| {
-                source_finish::<()>("pi", || std::panic::panic_any(payload))
+                source_finish::<()>("pi", false, || std::panic::panic_any(payload))
             })
         });
         let panic = result.unwrap_err();
@@ -2507,6 +2581,12 @@ mod tests {
                     full_causes: Default::default(),
                 },
             );
+            // Another source's page: its retained-cache events and nothing else.
+            let scope = claude_reread::Scope::begin(true);
+            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
+            cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+            let mut probe = Probe::start();
+            probe.page_events.merge(scope.finish());
             probe.collection(
                 "codex",
                 CollectionCounts {
@@ -2529,9 +2609,10 @@ mod tests {
             1
         );
         assert!(rows[1]["counts"].get("claude_reread").is_none());
-        assert!(rows[1]["counts"]
-            .get("retained_cache_page_events")
-            .is_none());
+        assert_eq!(
+            rows[1]["counts"]["retained_cache_page_events"]["take_hit"],
+            1
+        );
         assert_eq!(rows[2]["stage"], "native_comparison_decision");
         assert_eq!(
             rows[2]["counts"]["claude_reread"]["restored_empty_sibling"],
@@ -2797,7 +2878,7 @@ mod tests {
             let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
                 for _ in 0..ITERATIONS {
                     if stage == "source_finish" {
-                        source_finish("claude_code", || Ok(())).unwrap();
+                        source_finish("claude_code", false, || Ok(())).unwrap();
                     } else {
                         Probe::start().collection(
                             "claude_code",
@@ -2890,7 +2971,7 @@ mod tests {
                     full_causes: Default::default(),
                 },
             );
-            source_finish("secret/path/provider", || Ok(())).unwrap();
+            source_finish("secret/path/provider", false, || Ok(())).unwrap();
             let mut upload = UploadCall::start("secret/path/provider");
             upload.serialized(1000);
             upload.attempt(100, true);
@@ -3099,7 +3180,8 @@ pub(crate) fn scan_index_repair_required(
     source: &str,
     cause: crate::snapshots::scan_index_health::RepairCause,
 ) {
-    static TOTALS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static TOTALS: [AtomicU64; crate::snapshots::scan_index_health::RepairCause::COUNT] =
+        [const { AtomicU64::new(0) }; crate::snapshots::scan_index_health::RepairCause::COUNT];
     let count = TOTALS[cause as usize]
         .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
         .unwrap_or_else(|v| v)
@@ -3113,4 +3195,76 @@ pub(crate) fn scan_index_repair_required(
             },
         }),
     );
+}
+
+/// Reuses the bounded stage sampler. CPU is process-attributed; concurrent work
+/// can contribute. Peaks are 50-ms observations, not hard memory bounds.
+pub(crate) struct StateV2Probe {
+    footprint: Option<footprint::Stage>,
+    cpu: Option<ProcessSample>,
+}
+impl StateV2Probe {
+    pub(crate) fn begin() -> Self {
+        Self {
+            footprint: footprint::Stage::begin(),
+            cpu: process_sample(),
+        }
+    }
+    pub(crate) fn memory(&self) -> (StateV2Memory, StateV2Memory) {
+        self.footprint
+            .as_ref()
+            .map(|s| s.finish().memory())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn finish(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let (steady, peak) = self
+            .footprint
+            .as_ref()
+            .map(|s| {
+                let (end, peak) = s.finish().memory();
+                (end.rss_bytes, peak.rss_bytes)
+            })
+            .unwrap_or_default();
+        (
+            self.cpu
+                .zip(process_sample())
+                .and_then(|(a, b)| b.cpu_us.checked_sub(a.cpu_us)),
+            steady,
+            peak,
+        )
+    }
+}
+
+/// V2 growth counters use the existing local #799 row. No keys or paths.
+pub(crate) fn v2_growth_retained(bytes: u64) {
+    claude_state_v2(&serde_json::json!({"v2_growth_retained": {"files": 1, "bytes": bytes}}));
+}
+pub(crate) fn v2_growth_revalidate(uncertain: bool) {
+    claude_state_v2(
+        &serde_json::json!({"v2_growth_revalidate": {"stats": 1, "uncertain": u64::from(uncertain)}}),
+    );
+}
+pub(crate) fn v2_growth_uncertain_alarm(passes: u32) {
+    traversal_point(
+        "v2_growth_uncertain_alarm",
+        "claude_code",
+        &serde_json::json!({"consecutive_passes": passes}),
+    );
+}
+pub(crate) fn census_retire_skipped_grown() {
+    claude_state_v2(&serde_json::json!({"census_retire_skipped_grown": 1}));
+}
+
+/// Current process memory, not lifetime ru_maxrss. Unavailable is never zero.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct StateV2Memory {
+    pub(crate) rss_bytes: Option<u64>,
+    pub(crate) phys_footprint_bytes: Option<u64>,
+}
+pub(crate) fn state_v2_memory() -> StateV2Memory {
+    footprint::current()
+}
+pub(crate) fn state_v2_cpu_us() -> Option<u64> {
+    process_sample().map(|p| p.cpu_us)
 }
