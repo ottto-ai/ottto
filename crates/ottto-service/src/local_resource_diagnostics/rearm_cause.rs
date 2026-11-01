@@ -38,7 +38,7 @@ impl Tags {
             index
                 .files
                 .get(key)
-                .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+                .is_some_and(crate::snapshots::ScanIndexEntry::rearmed)
         });
     }
 }
@@ -58,12 +58,26 @@ pub(crate) fn retain(index: &ScanIndex) {
     with_tags(|tags| tags.retain(index));
 }
 pub(crate) fn clear(key: &str, entry: &mut ScanIndexEntry, cause: Cause) {
-    if !entry.source_file_fingerprint.is_empty() {
+    clear_owed(
+        key,
+        entry,
+        cause,
+        crate::snapshots::evidence_owed::owes(cause),
+    );
+}
+/// `owe`: evidence owed ON decided this re-arm owes evidence (keeps the
+/// fingerprint) instead of clearing it.
+pub(crate) fn clear_owed(key: &str, entry: &mut ScanIndexEntry, cause: Cause, owe: bool) {
+    if !entry.rearmed() {
         with_tags(|tags| {
             tags.0.insert(key.to_owned(), cause);
         });
     }
-    entry.source_file_fingerprint.clear();
+    if owe && !entry.source_file_fingerprint.is_empty() {
+        entry.evidence_owed = true;
+    } else {
+        entry.source_file_fingerprint.clear();
+    }
 }
 pub(crate) fn reproven(key: &str) {
     with_tags(|tags| {
