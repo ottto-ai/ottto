@@ -34070,6 +34070,8 @@ impl OwnedSourceScan {
             // before releasing any restore transfer credit.
             #[cfg(unix)]
             let mut active_restore_lease = None;
+            #[cfg(unix)]
+            let mut preparation_lease = ActiveRestoreCredit(None);
             let mut parser = match sampled_scan::new_source_parser(
                 opened_file,
                 &candidate,
@@ -34194,7 +34196,7 @@ impl OwnedSourceScan {
                     None
                 };
                 #[cfg(unix)]
-                let (mut taken, mut preparation_lease) = match if restart_restore::enabled() {
+                let (mut taken, transfer_lease) = match if restart_restore::enabled() {
                     context
                         .cache
                         .take_prepared(source, &key)
@@ -34219,7 +34221,9 @@ impl OwnedSourceScan {
                     }
                 };
                 #[cfg(unix)]
-                let mut preparation_lease = ActiveRestoreCredit(preparation_lease.take());
+                {
+                    preparation_lease.0 = transfer_lease;
+                }
                 #[cfg(unix)]
                 if let Some((taken, receipt)) = taken.as_mut().zip(receipt.as_ref()) {
                     if let Some(owed) = taken.durable.take_owed() {
@@ -34938,8 +34942,32 @@ impl OwnedSourceScan {
                                     }
                                     #[cfg(unix)]
                                     if restored_durable {
-                                        // Cold state need not fit retained admission. Preserve
-                                        // growth via native Full or the counted resource pace.
+                                        // A transient rejection preserves a fitting original
+                                        // in RAM, including its Q11 guard. Oversized or
+                                        // unfundable originals use the counted growth pace.
+                                        let taken = if refusal.is_none() {
+                                            match context
+                                                .cache
+                                                .return_prepared_taken(key.clone(), taken)
+                                            {
+                                                Ok(()) => {
+                                                    if let Some(lease) = preparation_lease.take() {
+                                                        lease.release();
+                                                    }
+                                                    residue_index_keys.insert(key.clone());
+                                                    context.cache.durable_custody_hold(
+                                                        source,
+                                                        "active_restore_prepare",
+                                                        index,
+                                                        &candidate,
+                                                    );
+                                                    pending!();
+                                                }
+                                                Err(taken) => taken,
+                                            }
+                                        } else {
+                                            taken
+                                        };
                                         drop(taken);
                                         if let Some(lease) = preparation_lease.take() {
                                             lease.release();
@@ -34953,7 +34981,13 @@ impl OwnedSourceScan {
                                                     refusal = Some("active_restore_prepare");
                                                     if source == SnapshotSource::Codex { resource_full_pending = refusal; }
                                                 }
-                                                _ => { pending!(); }
+                                                _ => {
+                                                    residue_index_keys.insert(key.clone());
+                                                    context.cache.durable_custody_hold(
+                                                        source, "prepared_funding_pending", index, &candidate,
+                                                    );
+                                                    pending!();
+                                                }
                                             }
                                         }
                                         returned_refusal = refusal;
