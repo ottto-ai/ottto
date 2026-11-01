@@ -64,7 +64,10 @@ counters!(EvidenceOwed {
     age_le_1d,
     age_le_7d,
     age_gt_7d,
-    age_unknown
+    age_unknown,
+    identity_contract_owed,
+    identity_owed_read_under_latch,
+    queue_at_page_start_under_latch
 });
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Counts {

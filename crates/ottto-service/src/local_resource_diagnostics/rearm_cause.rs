@@ -73,11 +73,7 @@ pub(crate) fn clear_owed(key: &str, entry: &mut ScanIndexEntry, cause: Cause, ow
             tags.0.insert(key.to_owned(), cause);
         });
     }
-    if owe && !entry.source_file_fingerprint.is_empty() {
-        entry.evidence_owed = true;
-    } else {
-        entry.source_file_fingerprint.clear();
-    }
+    crate::snapshots::evidence_owed::keep_or_clear(entry, owe);
 }
 pub(crate) fn reproven(key: &str) {
     with_tags(|tags| {

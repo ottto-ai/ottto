@@ -4651,9 +4651,10 @@ pub struct ScanIndexEntry {
     /// census-window debt is kept this way; a read the file really needs
     /// clears the fingerprint as main does. Never set while the switch is OFF.
     /// An older v1 binary drops the bit and treats such entries as observed;
-    /// must-read debt stays visible to it as an empty fingerprint. After a
-    /// downgrade from ON, start a fresh walk. A state-v2 store refuses the
-    /// bit instead (see `identity_contract`).
+    /// debt that keeps main's clear stays visible to it as an empty
+    /// fingerprint, owed debt (the identity-contract re-arm included) does
+    /// not. After a downgrade from ON, start a fresh walk. A state-v2 store
+    /// refuses the bit instead (see `identity_contract`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) evidence_owed: bool,
 }
@@ -5179,6 +5180,15 @@ struct ClaudeUsageFamilyPending {
         deserialize_with = "deserialize_lenient_default"
     )]
     contract_unproven: bool,
+}
+impl ClaudeUsageFamilyPending {
+    /// Stored usage occurrences, the unit of the pending occurrence cap.
+    fn occurrences(&self) -> usize {
+        self.member_occurrences
+            .values()
+            .map(BTreeMap::len)
+            .fold(0, usize::saturating_add)
+    }
 }
 
 fn claude_idless_revision(fingerprint: &str) -> [u8; 32] {
@@ -10703,6 +10713,8 @@ fn apply_claude_reported_usage_with_negative_dependencies(
             ..Default::default()
         };
         let mut preserved = 0;
+        let guard = evidence_owed::enabled();
+        let census_window = rfc3339_unix_seconds(census_window_end);
         for (index_key, entry) in &mut index.files {
             let Some((root_session_id, source_session_id)) =
                 claude_index_path_family_member(Path::new(index_key))
@@ -10733,6 +10745,21 @@ fn apply_claude_reported_usage_with_negative_dependencies(
                     .is_some_and(|request_hashes| {
                         !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
                     });
+            // Evidence owed ON: a revision read in this window was read under
+            // the recorded contract (a change within the walk leaves it
+            // unrecorded and this re-arm off). The identity-contract re-arm
+            // does not owe it again, so one read clears that debt even when
+            // its family stays cap-invalid.
+            let identity_contract_rearm = identity_contract_rearm
+                && !(guard
+                    && census_window.is_some_and(|window| {
+                        index
+                            .claude_request_census
+                            .get(index_key)
+                            .is_some_and(|record| {
+                                record.reproduces(&entry.source_file_fingerprint, window)
+                            })
+                    }));
             let proof_candidate = proven.contains_key(&root_session_id)
                 && !current_ids.contains(source_session_id.as_str());
             let negative = negative_keys.contains(index_key.as_str());
@@ -10776,16 +10803,23 @@ fn apply_claude_reported_usage_with_negative_dependencies(
                 rearm.clear_calls = rearm.clear_calls.saturating_add(1);
                 // Evidence owed ON: a census-only re-arm owes instead of
                 // clearing and is resolved by a bound re-stamp. A changed
-                // witness or duplicate owner, or an identity-contract change,
-                // must be read: main's clear, so an older reader still sees
-                // the debt and older-contract pending never re-stamps.
-                if identity_contract_rearm
+                // witness or duplicate owner must be read: main's clear, so an
+                // older reader still sees the debt. The identity-contract
+                // re-arm is owed and paced too: older-contract pending is
+                // marked `contract_unproven` at the latch clear (or stays
+                // under the latch), so it never re-stamps and is read.
+                if (identity_contract_rearm && !guard)
                     || invalidated_witness_roots.contains(&root_session_id)
                     || changed_duplicate_owner
                     || current_member_owns_changed_request
                 {
                     entry.source_file_fingerprint.clear();
                 } else {
+                    if identity_contract_rearm && !entry.rearmed() {
+                        claude_contract::note(|counts| {
+                            counts.evidence_owed.identity_contract_owed += 1
+                        });
+                    }
                     evidence_owed::clear(entry);
                 }
                 rearmed_bytes = rearmed_bytes.saturating_add(entry.size_bytes);
@@ -10819,7 +10853,6 @@ fn apply_claude_reported_usage_with_negative_dependencies(
 
         // Evidence owed ON: completion retires only families
         // with a completed family proof; every other indexed family stays owed.
-        let guard = evidence_owed::enabled();
         index
             .claude_usage_family_pending
             .retain(|root_session_id, pending| {
@@ -11019,8 +11052,7 @@ fn accumulate_claude_usage_family_pending_with_credit(
     let mut counts = ClaudeDuplicateCensusCounts::default();
     let mut retained_occurrence_count = pending_by_root
         .values()
-        .flat_map(|pending| pending.member_occurrences.values())
-        .map(BTreeMap::len)
+        .map(ClaudeUsageFamilyPending::occurrences)
         .fold(0_usize, usize::saturating_add);
     for item in snapshots {
         let construction = match credit.as_deref_mut() {
@@ -19914,6 +19946,11 @@ impl SnapshotAccumulator {
                     }
                 }
                 let request_id_was_new = self.claude_usage_request_ids.insert(request_id);
+                // Identity completeness depends on this file's bytes alone (a
+                // repeated id here, an id-less response below). The owed
+                // re-stamp relies on that: it accepts an identity-incomplete
+                // census record of the same revision (`evidence_owed`). If it
+                // ever depends on another input, that input joins that check.
                 // Progressive rows for one response were merged by response
                 // key above. Reaching this point twice for one provider request
                 // id therefore means two distinct responses claim the same
@@ -27768,6 +27805,7 @@ impl OwnedSourceScan {
         let (mut active_file, mut codex_cursor_lease) = active_frame.into_parts();
         let index = &mut index_storage;
         let mut evidence_owed_page = evidence_owed::Page::default();
+        evidence_owed::note_page_start(index, source);
         // L-5: a resumed step re-probes everything it needs.
         codex_parent_identities.begin_step();
         // PR-P: once per page, on a selecting page (discovery done), before any
