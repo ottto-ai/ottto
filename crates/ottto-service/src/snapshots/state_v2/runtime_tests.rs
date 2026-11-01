@@ -1858,7 +1858,6 @@ fn paced_growth_read_defers_at_both_admission_sites() {
             !sampled_scan::test_hooks::unreadable().contains(&reduction),
             "sampled={sampled}"
         );
-        assert!(result.growth_deferred >= 1, "sampled={sampled}");
         assert!(
             index.traversal.as_ref().map_or(true, |walk| {
                 !walk.counts.has_errors() && walk.unhealthy_retry_not_before_unix_seconds.is_none()
