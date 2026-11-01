@@ -337,13 +337,25 @@ fn condition_b(class: &str) {
         if class == "pending" {
             // Restart arm: the family rolls inside the page; the cold page
             // saves through the production delta, reloads cold and scans the
-            // next page. v1 takes the same rollover through its own save/load.
+            // next page. v1 takes the same rollover in RAM and through a real
+            // v1 save and load. The rollover is the scan's own `archive()`
+            // applied directly: this corpus pins the census window (input
+            // clock), so no scan advances it.
             let end = "2026-10-30T00:00:00Z";
-            let mut resident: ScanIndex =
+            let mut ram: ScanIndex =
                 serde_json::from_slice(&serde_json::to_vec(&pages[0].index).unwrap()).unwrap();
-            crate::snapshots::state_v2_roll_account_families(&mut resident, end);
-            let resident: ScanIndex =
-                serde_json::from_slice(&serde_json::to_vec(&resident).unwrap()).unwrap();
+            crate::snapshots::state_v2_roll_account_families(&mut ram, end);
+            let ram: ScanIndex =
+                serde_json::from_slice(&serde_json::to_vec(&ram).unwrap()).unwrap();
+            let restart = {
+                let dir = c.base.join("v1-restart");
+                std::fs::create_dir_all(&dir).unwrap();
+                crate::locked_state_dir::test_locks::hold(&dir);
+                let index_path = dir.join("scan-index.json");
+                let mut saved = ram.clone();
+                saved.save(&index_path).unwrap();
+                ScanIndex::load(&index_path).unwrap()
+            };
             let [_, _, disk] = pages;
             let mut page = disk.index;
             let (cold, view) = store.roll_save_reload(&mut page, end);
@@ -351,19 +363,21 @@ fn condition_b(class: &str) {
             let placement = |index: &ScanIndex| {
                 serde_json::to_value(index).unwrap()["claude_account_family_pending"].clone()
             };
-            assert_eq!(placement(&view), placement(&resident), "account placement");
+            assert_eq!(placement(&view), placement(&ram), "account placement");
+            // The next page switches account and captures identity, so its
+            // rows are tagged and accepted shares are recorded.
             grow(&path, "r3", 30);
             c.evidence(
                 &[
                     tagged_api("r1", 10, Some(&"a".repeat(64))),
                     tagged_api("r2", 20, None),
-                    tagged_api("r3", 30, Some(&"a".repeat(64))),
+                    tagged_api("r3", 30, Some(&"b".repeat(64))),
                 ],
                 &[trace("r1", ""), trace("r2", ""), trace("r3", "")],
             );
-            let mut next = [resident.clone(), resident, cold].map(|prior| {
+            let mut next = [ram, restart, cold].map(|prior| {
                 c.raw(
-                    &E2ScanFixture::with_identity_capture(false),
+                    &E2ScanFixture::with_identity_capture(true),
                     prior,
                     100,
                     false,
@@ -379,7 +393,37 @@ fn condition_b(class: &str) {
                     "restart totals and account tags"
                 );
             }
+            assert!(
+                next[0]
+                    .scan
+                    .snapshots
+                    .iter()
+                    .any(|item| !item.request_evidence.is_empty()),
+                "positive control: tagged rows reach the restart page"
+            );
             compare_claude_uploads(&next);
+            let accepted = next.each_ref().map(|page| {
+                let mut progress = e2_progress();
+                progress
+                    .accepted_identity_buckets
+                    .bind_test_key(Some([0x42; 32]));
+                let (result, sent, _) = upload(&page.scan.snapshots, &mut progress, ack);
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                assert!(!sent.is_empty());
+                assert!(
+                    !progress.accepted_identity_buckets.is_empty(),
+                    "positive control: accepted identity shares"
+                );
+                serde_json::to_vec(&progress).unwrap()
+            });
+            assert_eq!(
+                accepted[0], accepted[1],
+                "v1 restart accepted identity buckets"
+            );
+            assert_eq!(
+                accepted[0], accepted[2],
+                "cold restart accepted identity buckets"
+            );
         }
     });
 }
