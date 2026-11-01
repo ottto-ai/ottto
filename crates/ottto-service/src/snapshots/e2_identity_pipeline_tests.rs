@@ -399,6 +399,125 @@ fn e2_pipeline_root_and_child_keep_independent_own_telemetry_logins() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// [money] An evidence-owed start that drops an unfinished retry admission,
+/// then drains to quiet, ends with a cold Full's totals and per-login
+/// placement: an entity ACKed before the drop and read again after re-emits
+/// the same money, latest wins, counted once.
+#[test]
+fn e2_pipeline_admission_drop_drains_to_the_cold_full() {
+    let (dir, root, _) = claude_account_family_fixture(false);
+    let support = dir.join("support");
+    let (mut api, trace) = e2_family_evidence(&root);
+    api[4].account_identifier_hash = Some("b".repeat(64));
+    e2_resign(&mut api[4]);
+    e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        &root,
+        &trace,
+    );
+    let roots = std::slice::from_ref(&dir);
+    let (cold, _, failed) = e2_page(roots, &support, &mut ScanIndex::default());
+    assert!(!failed);
+    assert_eq!(cold.len(), 2);
+
+    let _owed = evidence_owed::EvidenceOwedForTest::on();
+    let mut index = ScanIndex::default();
+    let (first, _, _) = e2_page(roots, &support, &mut index);
+    index.record_accepted_snapshot_fingerprints(
+        &first
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    let mut latest = first
+        .into_iter()
+        .map(|item| (item.source_session_id.clone(), item))
+        .collect::<BTreeMap<_, _>>();
+    // Older-window evidence, an unfinished admission main's builder would
+    // persist for it, and a member that must be read again after the drop.
+    for pending in index.claude_usage_family_pending.values_mut() {
+        pending.census_window_end = "2026-08-01T07:10:00Z".into();
+    }
+    let stale = index.claude_usage_family_pending.keys().cloned().collect();
+    let admission = claude_retry_admission_start(&index, &stale, "2026-08-02T07:10:00Z", None);
+    assert!(!admission.complete);
+    index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+        context_fingerprint: scan_traversal_context_fingerprint(
+            SnapshotSource::ClaudeCode,
+            roots,
+            &index,
+            7,
+        ),
+        process: claude_full_rearm_process(),
+        full_rearm_window: false,
+        admission: Some(admission),
+    });
+    let child_key = index
+        .files
+        .keys()
+        .find(|key| key.contains("/subagents/"))
+        .cloned()
+        .unwrap();
+    index
+        .files
+        .get_mut(&child_key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+
+    let mut dropped = 0;
+    let mut reemitted = BTreeSet::new();
+    for _ in 0..4 {
+        let ((items, _, failed), rows) =
+            crate::local_resource_diagnostics::capture(|| e2_page(roots, &support, &mut index));
+        assert!(!failed);
+        dropped += rows
+            .iter()
+            .filter(|row| {
+                row["counts"]["event"] == "starting" && row["counts"]["admissions_dropped"] == 1
+            })
+            .count();
+        let mut entities = BTreeSet::new();
+        for item in items {
+            assert!(entities.insert(item.source_session_id.clone()), "one body per entity");
+            reemitted.insert(item.source_session_id.clone());
+            latest.insert(item.source_session_id.clone(), item);
+        }
+    }
+    assert_eq!(dropped, 1);
+    assert!(
+        reemitted.iter().any(|entity| entity != &root),
+        "the ACKed child entity is read again after the drop"
+    );
+    assert_eq!(latest.len(), cold.len());
+    for item in &cold {
+        let got = &latest[&item.source_session_id];
+        assert_eq!(e2_login_counts(got), e2_login_counts(item));
+        let (got, want) = (
+            serde_json::to_value(got).unwrap(),
+            serde_json::to_value(item).unwrap(),
+        );
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_5m_tokens",
+            "cache_creation_1h_tokens",
+            "reasoning_output_tokens",
+            "unattributed_total_tokens",
+            "request_count",
+            "cost",
+            "usage_buckets",
+            "model_usage",
+        ] {
+            assert_eq!(got.get(field), want.get(field), "{field}");
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
     for (bound, partial) in [(false, false), (true, false), (false, true), (true, true)] {
