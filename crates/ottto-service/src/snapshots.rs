@@ -35009,7 +35009,6 @@ impl OwnedSourceScan {
                             retained_finalization_charge: continued
                                 .map_or(0, |(_, charge, _)| charge),
                             retained_usage: continued.map(|(_, _, usage)| usage),
-
                             reinsertion,
                         });
                     }
@@ -36857,6 +36856,7 @@ impl OwnedJsonlParser {
             accumulator.apply_first_prompt_fallback();
             recognized_usage_drop_count += accumulator
                 .seen_pi_usage_keys
+                .usage_keys()
                 .values()
                 .filter(|state| state.has_cross_shape_conflict())
                 .count();
@@ -41796,10 +41796,11 @@ fn codex_total_usage_has_request_count(value: &Value) -> bool {
 }
 
 /// Shared content projection; usage and timing stay with the native caller.
-fn pi_content_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
+/// The content projection of one Pi line; `role` is the message role.
+fn pi_content_line(value: &Value, role: Option<&str>, accumulator: &mut SnapshotAccumulator) {
     match string_at(value, &["type"]).as_deref() {
         Some("session") => pi_workspace_content(value, accumulator),
-        Some("message") => pi_prompt_content(value, pi_message_role(value).as_deref(), accumulator),
+        Some("message") => pi_prompt_content(value, role, accumulator),
         _ => {}
     }
 }
@@ -41831,7 +41832,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
                     .or_else(|| string_at(value, &["session_id"]))
                     .or_else(|| string_at(value, &["sessionId"]));
             }
-            pi_content_line(value, accumulator);
+            pi_content_line(value, None, accumulator);
             accumulator.note_pi_time(pi_timestamp_field(value));
         }
         Some("message") => {
@@ -41839,7 +41840,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             // nested `message.role`. This is the only chance to capture prompt
             // text for a title fallback.
             let role = pi_message_role(value);
-            pi_content_line(value, accumulator);
+            pi_content_line(value, role.as_deref(), accumulator);
             let timestamp = pi_message_timestamp(value);
             if role.as_deref() == Some("assistant")
                 && accumulator.seen_pi_usage_keys.skip_fork_copy(value)
@@ -41975,6 +41976,7 @@ fn apply_pi_usage_line(
         let is_new_occurrence = match pi_usage_dedup_key(value) {
             Some(key) => accumulator
                 .seen_pi_usage_keys
+                .usage_keys_mut()
                 .entry(key)
                 .or_default()
                 .record(shape, occurrence_digest),
@@ -42245,9 +42247,36 @@ impl Clone for PiFork {
     }
 }
 
+impl PiFork {
+    /// Usage on an entry stamped strictly before the fork header time is the
+    /// parent's copied spend: skip it, counted. An entry without a valid
+    /// time counts normally. The envelope time comes first, as Pi copies it.
+    fn copied_usage(&self, value: &Value) -> Option<UsageTotals> {
+        let header = self.header_nanos?;
+        // A present invalid envelope is not evidence for skipping. Only an
+        // absent envelope falls back to the provider clock.
+        let at = pi_timestamp_value(
+            value
+                .get("timestamp")
+                .or_else(|| value.pointer("/message/timestamp")),
+        )
+        .as_deref()
+        .and_then(pi_timestamp_nanos)?;
+        if at < header {
+            pi_message_usage(value)
+        } else {
+            None
+        }
+    }
+}
+
 impl PiLedger {
     pub(crate) fn usage_keys(&self) -> &BTreeMap<String, PiUsageDedupState> {
         &self.usage_keys
+    }
+
+    pub(crate) fn usage_keys_mut(&mut self) -> &mut BTreeMap<String, PiUsageDedupState> {
+        &mut self.usage_keys
     }
 
     /// The persisted fork values: (`has_parent`, header time).
@@ -42294,35 +42323,19 @@ impl PiLedger {
         }));
     }
 
-    /// Usage on an entry stamped strictly before the fork header time is the
-    /// parent's copied spend: skip it, counted. An entry without a valid
-    /// time counts normally. The envelope time comes first, as Pi copies it.
     fn is_fork_copy(&self, value: &Value) -> bool {
-        let Some(header) = self.fork.as_deref().and_then(|fork| fork.header_nanos) else {
-            return false;
-        };
-        // A present invalid envelope is not evidence for skipping. Only an
-        // absent envelope falls back to the provider clock.
-        pi_timestamp_value(
-            value
-                .get("timestamp")
-                .or_else(|| value.pointer("/message/timestamp")),
-        )
-        .as_deref()
-        .and_then(pi_timestamp_nanos)
-        .is_some_and(|at| at < header)
-            && pi_message_usage(value).is_some()
+        self.fork
+            .as_deref()
+            .is_some_and(|fork| fork.copied_usage(value).is_some())
     }
 
     fn skip_fork_copy(&mut self, value: &Value) -> bool {
-        if !self.is_fork_copy(value) {
+        let Some(fork) = self.fork.as_deref_mut() else {
             return false;
-        }
-        let usage = pi_message_usage(value).expect("copy classifier required usage");
-        let fork = self
-            .fork
-            .as_deref_mut()
-            .expect("copy classifier required a fork");
+        };
+        let Some(usage) = fork.copied_usage(value) else {
+            return false;
+        };
         use crate::local_resource_diagnostics::cache_lifecycle::{add, Event};
         fork.copies_this_read = fork.copies_this_read.saturating_add(1);
         add(Event::PiForkCopiesSkippedEntries, 1);
@@ -42349,19 +42362,6 @@ impl PiLedger {
                 add(Event::PiForkParentUnseen, copies);
             }
         }
-    }
-}
-
-impl std::ops::Deref for PiLedger {
-    type Target = BTreeMap<String, PiUsageDedupState>;
-    fn deref(&self) -> &Self::Target {
-        &self.usage_keys
-    }
-}
-
-impl std::ops::DerefMut for PiLedger {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.usage_keys
     }
 }
 
@@ -78607,7 +78607,7 @@ mod tests {
         for line in fixture.lines() {
             apply_pi_line(&serde_json::from_str(line).unwrap(), &mut accumulator);
         }
-        assert!(accumulator.seen_pi_usage_keys.is_empty());
+        assert!(accumulator.seen_pi_usage_keys.usage_keys().is_empty());
         let _ = fs::remove_file(path);
     }
 

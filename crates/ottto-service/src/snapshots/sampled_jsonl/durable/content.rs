@@ -263,7 +263,9 @@ impl Decoded {
                                 }
                             }
                         }
-                        SnapshotSource::Pi => pi_content_line(value, &mut fresh),
+                        SnapshotSource::Pi => {
+                            pi_content_line(value, pi_message_role(value).as_deref(), &mut fresh)
+                        }
                     }
                     Ok(())
                 },

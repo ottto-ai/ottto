@@ -11333,7 +11333,7 @@ fn pi_live_prepare_ledger_cap_counts_entry_cap_refusal_once() {
         )
         .unwrap();
     for over_cap in [false, true] {
-        *accumulator.seen_pi_usage_keys = (0..codec::pi::PI_LEDGER_MAX_KEYS
+        *accumulator.seen_pi_usage_keys.usage_keys_mut() = (0..codec::pi::PI_LEDGER_MAX_KEYS
             + usize::from(over_cap))
             .map(|n| (format!("{n:064x}"), PiUsageDedupState::default()))
             .collect();

@@ -3045,7 +3045,7 @@ fn labelled_e_arm_is_wire_identical_to_the_unlabelled_arm() {
     let decoded = <labelled::SnapshotAccumulator as Durable>::take(&mut d).unwrap();
     d.finish().unwrap();
     assert_eq!(decoded.n, 7);
-    assert!(decoded.seen_pi_usage_keys.is_empty());
+    assert!(decoded.seen_pi_usage_keys.usage_keys().is_empty());
     assert_eq!(twin_bytes(&decoded).unwrap(), plain_bytes);
     let refused = Err(Refuse::NonEmpty("SnapshotAccumulator.seen_pi_usage_keys"));
     let mut plain = plain;
@@ -3054,6 +3054,7 @@ fn labelled_e_arm_is_wire_identical_to_the_unlabelled_arm() {
         .insert("k".into(), PiUsageDedupState::default());
     let mut new = new;
     new.seen_pi_usage_keys
+        .usage_keys_mut()
         .insert("k".into(), PiUsageDedupState::default());
     assert_eq!(twin_bytes(&plain), refused);
     assert_eq!(twin_bytes(&new), refused);
@@ -3078,7 +3079,12 @@ fn claude_and_codex_bodies_round_trip_byte_identical_through_the_pi_ledger() {
         ));
         let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
         let decoded = decode_body(&body, source).unwrap();
-        assert!(decoded.reduction.accumulator.seen_pi_usage_keys.is_empty());
+        assert!(decoded
+            .reduction
+            .accumulator
+            .seen_pi_usage_keys
+            .usage_keys()
+            .is_empty());
         let (restored, _) = restore(&path, &body, source).unwrap();
         assert_eq!(
             encode(&restored, 1 << 20, line_cap()).unwrap(),

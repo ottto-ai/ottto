@@ -35,7 +35,7 @@ fn ledger() -> BTreeMap<String, PiUsageDedupState> {
 
 fn reduction(keys: BTreeMap<String, PiUsageDedupState>) -> CachedJsonlReduction {
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Pi);
-    *accumulator.seen_pi_usage_keys = keys;
+    *accumulator.seen_pi_usage_keys.usage_keys_mut() = keys;
     CachedJsonlReduction {
         accumulator,
         report: JsonlReadReport::default(),
@@ -104,6 +104,7 @@ fn verify_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
 fn ledger_contents(reduction: &CachedJsonlReduction) -> impl PartialEq + std::fmt::Debug {
     let ledger = &reduction.accumulator.seen_pi_usage_keys;
     let keys = ledger
+        .usage_keys()
         .iter()
         .map(|(key, state)| {
             (
@@ -128,6 +129,7 @@ fn plain_trailing_pi_body_counts_and_round_trips() {
     assert!(original
         .accumulator
         .seen_pi_usage_keys
+        .usage_keys()
         .values()
         .any(|state| !state.message.is_empty()
             && !state.message_end.is_empty()
@@ -240,7 +242,12 @@ fn ledger_cap_decodes_at_the_bound_and_refuses_past_it() {
     assert_eq!(verify_without_allocation(&at_cap), Ok(()));
     let decoded = take_body(&mut Dec::new(&at_cap)).unwrap();
     assert_eq!(
-        decoded.reduction.accumulator.seen_pi_usage_keys.len(),
+        decoded
+            .reduction
+            .accumulator
+            .seen_pi_usage_keys
+            .usage_keys()
+            .len(),
         PI_LEDGER_MAX_KEYS
     );
     keys.insert(
@@ -254,14 +261,14 @@ fn ledger_cap_decodes_at_the_bound_and_refuses_past_it() {
     let forged = unbounded_body(&over);
     assert_eq!(verify_without_allocation(&forged), Err(Corrupt));
     assert!(take_body(&mut Dec::new(&forged)).is_err());
-    let bytes = section(&over.accumulator.seen_pi_usage_keys);
+    let bytes = section(over.accumulator.seen_pi_usage_keys.usage_keys());
     let mut calls = 0;
     let mut grant = |_: u64| {
         calls += 1;
         true
     };
     let mut d = Dec::bounded(&bytes, &mut grant);
-    let result = take_ledger(&mut d).map(|keys| keys.len());
+    let result = take_ledger(&mut d).map(|ledger| ledger.usage_keys().len());
     assert_eq!(d.outcome(result), Err(DecodeFailure::Integrity));
     assert_eq!(calls, 0);
 }
