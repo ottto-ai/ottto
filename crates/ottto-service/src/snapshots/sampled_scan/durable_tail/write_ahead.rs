@@ -545,12 +545,14 @@ impl SharedCache {
             .map_err(|_| HeldCause::CustodyBound)?
         {
             ReadOutcome::Found(record) => {
-                slot.store.authorize(
-                    &record,
-                    &Expected {
-                        binding: binding.clone(),
-                    },
-                );
+                let expected = Expected {
+                    binding: binding.clone(),
+                };
+                // An unmatched predecessor supplies no permission to stage a write.
+                record
+                    .eligible(&expected)
+                    .map_err(|_| HeldCause::Incompatible)?;
+                slot.store.authorize(&record, &expected);
             }
             ReadOutcome::Refused(reason) => return Err(HeldCause::Protected(reason)),
             ReadOutcome::Missing => {}

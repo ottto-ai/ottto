@@ -77,8 +77,8 @@ fn live_keys(index_path: &Path) -> Result<LiveKeys> {
     };
     let Some((path, state)) = route else {
         // Not loaded yet (daemon start, a sweep before the first load):
-        // published custody makes v1 JSON stale, so S1 can't vouch until its
-        // load imports the route. OFF/unpublished opens no store or sentinel.
+        // published custody makes v1 JSON stale, so no answer is possible until its
+        // load imports the route. Unpublished opens no store or sentinel.
         let reason = if published(index_path)? {
             IncompleteReason::Import
         } else {
