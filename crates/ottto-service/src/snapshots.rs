@@ -8360,8 +8360,7 @@ struct PendingIndexFinalization {
     diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
-    /// Accepted extent this restored read published below; 0 = not below.
-    restored_behind_accepted: u64,
+    restored_behind_accepted: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -8899,10 +8898,9 @@ pub fn finalize_scan_after_policy_with_body_witness(
     // even without a surviving offer.
     #[cfg(unix)]
     for pending in &result.pending_finalization {
-        let accepted_extent = pending.restored_behind_accepted;
-        if accepted_extent == 0 {
+        let Some(accepted_extent) = pending.restored_behind_accepted else {
             continue;
-        }
+        };
         let offered = result.snapshots.iter().any(|snapshot| {
             snapshot.source_file_fingerprint.as_deref()
                 == Some(pending.source_file_fingerprint.as_str())
@@ -31848,7 +31846,7 @@ impl OwnedSourceScan {
                         }
                         let alias_fingerprint = alias.source_file_fingerprint.clone();
                         pending_finalization.push(PendingIndexFinalization {
-                            restored_behind_accepted: 0,
+                            restored_behind_accepted: None,
                             withheld_content: None,
                             sampled_audit_verified: false,
                             codex_pending_recovery: index
@@ -31913,7 +31911,7 @@ impl OwnedSourceScan {
                 pending_finalization.push(PendingIndexFinalization {
                     restored_behind_accepted: file_sampling
                         .as_ref()
-                        .map_or(0, |active| active.restored_behind_accepted),
+                        .and_then(|active| active.restored_behind_accepted),
                     withheld_content: parse_complete
                         .then(|| index.withheld_completed_seen(&candidate))
                         .flatten(),
@@ -34516,7 +34514,7 @@ impl OwnedSourceScan {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
-                            restored_behind_accepted: 0,
+                            restored_behind_accepted: None,
                             key: local_index_key(&candidate.path),
                             scope,
                             mode,
@@ -35363,7 +35361,7 @@ impl OwnedSourceScan {
                                 index.files.get(&key).map(|e| e.size_bytes),
                             );
                         #[cfg(not(unix))]
-                        let restored_behind_accepted = 0;
+                        let restored_behind_accepted = None;
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
                             restored_behind_accepted,
@@ -35436,7 +35434,7 @@ impl OwnedSourceScan {
                         planned_mode = Some((mode, recovered_audit_due));
                         file_sampling = Some(sampled_scan::Active {
                             no_record: active_bound_degraded,
-                            restored_behind_accepted: 0,
+                            restored_behind_accepted: None,
                             key,
                             scope,
                             mode,
@@ -88480,8 +88478,8 @@ const _: () = {
     assert!(size_of::<OwnedJsonlParser>() == 5312);
     assert!(std::mem::align_of::<OwnedJsonlParser>() == 16);
     // The merged candidate, parse-reason and accepted-extent fields make the
-    // active frame 888 bytes; parser/custody boxing is unchanged.
-    assert!(size_of::<OwnedActiveFile>() == 888);
+    // active frame 896 bytes; parser/custody boxing is unchanged.
+    assert!(size_of::<OwnedActiveFile>() == 896);
     assert!(
         size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() == 4880
     );

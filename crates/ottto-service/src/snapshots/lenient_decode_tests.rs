@@ -703,7 +703,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     .unwrap();
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
-        restored_behind_accepted: 0,
+        restored_behind_accepted: None,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
@@ -4611,34 +4611,38 @@ fn restored_behind_accepted_counts_pi_offers_or_index_regressions() {
         )
     };
     let none = || (None, None);
-    assert_eq!(finalize(0, Some(&body), none(), true).0, 0, "not flagged");
-    let (count, offered, group, witness) = finalize(1, Some(&body), none(), true);
+    assert_eq!(
+        finalize(None, Some(&body), none(), true).0,
+        0,
+        "not flagged"
+    );
+    let (count, offered, group, witness) = finalize(Some(0), Some(&body), none(), true);
     assert_eq!((count, offered), (1, 1), "the offered body");
-    let (count, offered, group, witness) = finalize(1, Some(&body), (group, witness), true);
+    let (count, offered, group, witness) = finalize(Some(0), Some(&body), (group, witness), true);
     assert_eq!((count, offered), (0, 0), "semantic no-op, nothing offered");
-    let (count, offered, ..) = finalize(u64::MAX, Some(&body), (group, witness), true);
+    let (count, offered, ..) = finalize(Some(u64::MAX), Some(&body), (group, witness), true);
     assert_eq!(
         (count, offered),
         (1, 0),
         "complete no-op still counts an index regression"
     );
     assert_eq!(
-        finalize(u64::MAX, Some(&body), none(), false).0,
+        finalize(Some(u64::MAX), Some(&body), none(), false).0,
         0,
         "incomplete reconstruction counts neither an offer nor an index regression"
     );
     assert_eq!(
-        finalize(u64::MAX, None, none(), false).0,
+        finalize(Some(u64::MAX), None, none(), false).0,
         0,
         "an index regression alone cannot bypass complete finalization"
     );
     assert_eq!(
-        finalize(1, None, none(), true).0,
+        finalize(Some(0), None, none(), true).0,
         0,
         "no body for this file"
     );
     assert_eq!(
-        finalize(u64::MAX, None, none(), true).0,
+        finalize(Some(u64::MAX), None, none(), true).0,
         1,
         "a smaller committed index selection counts even without an offer"
     );

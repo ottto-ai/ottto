@@ -172,7 +172,7 @@ pub(in crate::snapshots) fn restored_tail_below_accepted(
     mode: crate::transcript_acquisition::ReadMode,
     frozen: Option<u64>,
     accepted: Option<u64>,
-) -> u64 {
+) -> Option<u64> {
     use crate::snapshots::durable_sources::BelowAccepted;
     use crate::transcript_acquisition::ReadMode;
     let publishes = match crate::snapshots::durable_sources::below_accepted(source) {
@@ -180,14 +180,12 @@ pub(in crate::snapshots) fn restored_tail_below_accepted(
         BelowAccepted::Tail => mode == ReadMode::Tail,
         BelowAccepted::NoFloor => matches!(mode, ReadMode::Tail | ReadMode::Unchanged),
     };
-    match (frozen, accepted) {
-        (Some(end), Some(floor))
-            if end < floor && publishes && restored && restart_restore::enabled() =>
-        {
-            floor
-        }
-        _ => 0,
-    }
+    (restart_restore::enabled()
+        && publishes
+        && restored
+        && frozen.zip(accepted).is_some_and(|(end, floor)| end < floor))
+    .then_some(accepted)
+    .flatten()
 }
 
 pub(in crate::snapshots) fn record_restored_publication(source: SnapshotSource, published: bool) {
