@@ -10035,6 +10035,14 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         accepted_identity_buckets,
     )
     .apply(index);
+    // Footprint windows only: the whole evidence stage, its sidecar read and
+    // its fold. Local diagnostics; no behaviour or wire change.
+    let evidence_window = crate::local_resource_diagnostics::StageWindow::begin(
+        "claude_code",
+        "claude_local_evidence",
+    );
+    let read_window =
+        crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_read");
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
     let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {
@@ -10257,6 +10265,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             trace_report.evidence.insert(root_session_id, rows);
         }
     }
+    drop(read_window);
+    let fold_window =
+        crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_fold");
     if stats.request_set_mismatch_root_count > 0 {
         index.note_claude_ignored_rearm_veto(
             &scan_result.census_window_end,
@@ -10530,6 +10541,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
         }
     }
+    drop(fold_window);
+    drop(evidence_window);
     Ok((disposition, census_withheld, stats))
 }
 
