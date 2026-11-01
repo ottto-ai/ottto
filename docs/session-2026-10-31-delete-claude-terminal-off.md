@@ -13,18 +13,14 @@ admission re-offer, resumed prefix) still use. The terminal-off invocation is
 deleted, and no `claude_terminal_off()` remains, including in tests. The OFF
 checkpoint test moves to `snapshots/checkpoint_main_tests.rs`.
 
-`traversal_healthy` retains the gate's false conjunct: an existing Claude retry
-admission still prevents healthy completion. It must not become
-`state.complete`. Terminal effects are allowed, and the identity latch retains
-every original OFF condition. No serialized field or version changes.
+`traversal_healthy` folds to `state.complete && evidence_owed::enabled()` for
+an existing Claude retry admission. Terminal effects are allowed, and the
+identity latch retains every original OFF condition. No serialized field or
+version changes.
 
-Remove ON-only diagnostics and test counters. Keep the existing emitted
-`rearm_full_suppressed` field at zero so the OFF diagnostic output stays exact.
+Remove ON-only diagnostics and test counters. Retain the always-zero
+`rearm_full_suppressed` field for debug diagnostics; serialized output omits it.
 No diagnostic slots are renumbered. The money oracle and money-equivalence
 sources and expectations remain unchanged. Local validation is formatting and
 package clippy only; runtime and money checks belong to Linux CI. The PR records
 the exact-head results and OFF proof, including indirect helper expansion.
-
-This draft follows the E2 gate retirement PR; integration owns ordering and
-conflict resolution. The remaining switch-ledger update belongs to its board
-owner.

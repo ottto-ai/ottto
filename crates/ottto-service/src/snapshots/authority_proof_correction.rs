@@ -1027,9 +1027,3 @@ impl ScanIndex {
         drains
     }
 }
-
-// Controlled historical INPUT for production-default pipeline fixtures. This
-// constructs a save an older completing reader could have produced. It never
-// runs the terminal fold, changes the fence, or proves a fresh release cohort.
-#[cfg(test)]
-impl ScanIndex {}

@@ -236,7 +236,6 @@ impl ScanIndex {
             .get_mut(key)
             .expect("validated entry")
             .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-
         true
     }
 }
@@ -372,7 +371,6 @@ pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<Aud
         .files
         .get(key)
         .and_then(|entry| entry.audit_obligation(now));
-
     obligation.or_else(|| progress_debt(index, key, now))
 }
 
@@ -507,7 +505,6 @@ impl OpenBackoff {
                 && open_stamp(key) == failure.stamp
         })
     }
-
     fn owed(&self, key: &str) -> Option<u64> {
         self.keys.get(key).map(|failure| failure.owed_due)
     }
@@ -657,9 +654,6 @@ pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
         return;
     };
     let recorded = record_open_failure(key, due, now);
-    // An ordinary admission can be a previously failed key while another
-    // member owns the progress slot. Its failure must not steal that turn.
-
     let previous = index.held_audit_progress.take();
     // Rule 7: an overflow-evicted key may retry, so it takes the next turn,
     // and its owed due moves into the slot: the debt is never dropped.
@@ -2622,7 +2616,6 @@ mod growth_tests {
                     retention: crate::snapshots::DiscoveryRetention::unverified(&resumed.files),
                     growth: Some(&resumed.v2().growth_retention),
                 },
-                sampled_scan::now_seconds(),
             )
             .is_some());
         }
@@ -2952,7 +2945,6 @@ mod growth_tests {
                 retention: crate::snapshots::DiscoveryRetention::unverified(&index.files),
                 growth: Some(&index.v2().growth_retention),
             },
-            sampled_scan::now_seconds(),
         )
         .unwrap();
         for cause in [
@@ -3025,7 +3017,6 @@ mod growth_tests {
                 retention: crate::snapshots::DiscoveryRetention::unverified(&index.files),
                 growth: Some(&index.v2().growth_retention),
             },
-            sampled_scan::now_seconds(),
         )
         .unwrap()
         .0

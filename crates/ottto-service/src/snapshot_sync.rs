@@ -2368,7 +2368,6 @@ impl SnapshotUploadProgress {
             self.reason_reoffer_counts.accepted += 1;
         }
         self.permanent_rejections.remove(fingerprint);
-
         self.accepted_fingerprints.insert(fingerprint.to_string());
         self.accepted_body_witnesses
             .insert(fingerprint.to_string(), body_witness.to_string());
@@ -6900,7 +6899,6 @@ fn prepare_sync_source_inner(
         upload_progress.reason_reoffer_cooldowns(reoffer_now)
     });
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
-
     let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     // Leased unchanged files join the same bounded, revalidated hint queue.
     watcher_hints.paths.extend(reoffer_paths);
@@ -7348,7 +7346,6 @@ fn prepare_continuation_source(
     debug_assert!(leased_paths.is_empty());
     index.activate_reason_reoffer_cooldowns(upload_progress.reason_reoffer_cooldowns(reoffer_now));
     upload_progress.reselect_pending_cache_heads(&mut index, inputs.cache_observations_enabled);
-
     let roots = crate::snapshot_roots::scan_roots(
         source,
         home,
@@ -7509,7 +7506,6 @@ fn finish_sync_source(
         preparation.source == SnapshotSource::ClaudeCode,
         preparation.native_comparison_lease.is_some(),
     );
-
     let SourcePreparation {
         mut native_comparison_reservation,
         mut native_comparison_lease,
@@ -9191,7 +9187,6 @@ fn activate_source_upload_context(
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &context),
     );
     index.activate_file_upload_context(source, context.clone());
-
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
     progress.context_resend =
@@ -9323,8 +9318,7 @@ pub struct ClaudeLocalEvidenceStats {
     )]
     pub unhealthy_root_no_fallback_requests: crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
-    /// Containment's withheld full re-arm; absent from the line while zero,
-    /// which it always is under the default OFF.
+    /// Local withheld full re-arms; omitted from serialized output while zero.
     #[serde(skip_serializing_if = "claude_rearm_full_suppressed_is_zero")]
     pub rearm_full_suppressed: u64,
     pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,

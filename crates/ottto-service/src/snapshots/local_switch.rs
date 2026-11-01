@@ -14,7 +14,7 @@ macro_rules! local_switch {
             #[cfg(not(test))]
             {
                 // Pin policy for this process, including worker threads and yields.
-                // Ron changes the marker himself and restarts the daemon to apply it.
+                // The owner changes the marker and restarts the daemon to apply it.
                 static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 *ENABLED.get_or_init(|| enabled_at(&ottto_core::default_support_dir()))
             }

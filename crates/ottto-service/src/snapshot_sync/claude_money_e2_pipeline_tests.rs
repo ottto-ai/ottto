@@ -141,7 +141,6 @@ impl Corpus {
         sampled: bool,
         hints: &[PathBuf],
     ) -> Page {
-
         index.activate_upload_context("e2-synthetic-destination".into());
         index.activate_effective_upload_body_witness_revision(3);
         index.adopt_effective_upload_body_witness_revision_monotonically();
@@ -167,7 +166,6 @@ impl Corpus {
             unhealthy: Default::default(),
         }
     }
-
 
     fn reload(&self, index: &mut ScanIndex) -> ScanIndex {
         self.reload_in(index, "scan-index.json")
@@ -281,7 +279,6 @@ impl Page {
             .retain_claude_history_emission_permitted(&mut self.scan.snapshots);
         holds
     }
-
 
     fn receipt(&self) -> Vec<(String, String, String)> {
         self.scan
@@ -511,7 +508,6 @@ fn ready(
     limit: usize,
     sampled: bool,
 ) -> Page {
-
     let mut p = corpus.raw(scanner, index, limit, sampled, &[]);
     p.enrich(corpus);
     let mut send = Page {
@@ -533,7 +529,6 @@ fn ready(
     );
     p
 }
-
 
 
 /// [money] Cumulative acquisition modes and an independent cold read preserve all money fields.

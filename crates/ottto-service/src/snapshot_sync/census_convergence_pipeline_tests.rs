@@ -91,9 +91,7 @@ fn request_owned_sessions(scan: &crate::snapshots::SourceScanResult) -> BTreeSet
 
 impl PipelineFixture {
 
-
     fn new(name: &str) -> Self {
-
         let base = test_dir(name);
         let root = base.join("projects");
         let support = base.join("support");
@@ -172,7 +170,6 @@ impl PipelineFixture {
     }
 
 
-
     fn page_with_reoffers_born(
         &self,
         collected_at: &str,
@@ -181,7 +178,6 @@ impl PipelineFixture {
         before_classify: impl FnOnce(&mut ScanIndex),
         reoffers: bool,
     ) -> PipelinePage {
-
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
         self.cache.bind_withheld(&mut index);
         index.activate_upload_context(cycle.upload_context.to_string());
@@ -475,10 +471,8 @@ impl PipelineFixture {
     }
 
 
-
     /// Pages of one traversal, until its census completes or the page bound.
     fn traversal(&self, hour: u32, cycle: &PipelineCycle<'_>) -> Vec<PipelinePage> {
-
         let mut pages: Vec<PipelinePage> = Vec::new();
         for number in 0..PIPELINE_MAX_PAGES {
             let upload = if number == 0 {
@@ -501,10 +495,8 @@ impl PipelineFixture {
     }
 
 
-
     /// The baseline: every session committed and accepted, one owner proven.
     fn baseline(&self) -> ScanIndex {
-
         let pages = self.traversal(
             8,
             &PipelineCycle {
@@ -3840,7 +3832,6 @@ fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause(
         assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
     }
 }
-
 
 
 /// [money] F5 root (Codex money audit: 38 observed-but-unindexed files,

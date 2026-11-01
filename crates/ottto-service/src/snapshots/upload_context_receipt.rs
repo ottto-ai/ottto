@@ -116,7 +116,6 @@ impl ScanIndex {
     }
     pub(crate) fn activate_file_upload_context(&mut self, source: SnapshotSource, context: String) {
         self.activate_upload_context(context);
-
         self.file_upload_context_enabled =
             matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex);
         self.activate_quarantine_witness(source);
@@ -264,7 +263,6 @@ impl ScanIndex {
         if self.upload_context_fingerprint == self.active_upload_context_fingerprint {
             return false;
         }
-
         if !self.file_upload_context_enabled || self.confirmed_empty_files.contains(key) {
             // A suppressed/empty result has no ACK receipt. Keep its existing
             // census-context gate so a new policy can make it uploadable.
@@ -280,7 +278,6 @@ impl ScanIndex {
             return false;
         }
         let key = local_index_key(&candidate.path);
-
         self.files.get(&key).is_some_and(|entry| {
             entry.source_file_fingerprint == candidate.source_file_fingerprint
                 && entry.size_bytes == candidate.size_bytes

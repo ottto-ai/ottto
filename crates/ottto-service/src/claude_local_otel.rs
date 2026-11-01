@@ -30,7 +30,6 @@ pub(crate) mod support_health;
 mod bounded_read;
 #[cfg(test)]
 mod decoder_tests;
-
 #[cfg(test)]
 mod trace_read_bound_tests;
 
@@ -1156,14 +1155,13 @@ fn decode_api_sidecar(
         health.unreadable_lines += 1;
         return Ok(empty(health));
     }
-    // Preserve ordinary API read-through on concurrent appends. Only an
-    // explicit pass budget bounds the read at opened length plus a sentinel.
-    let limit = allowance;
-    let mut reader = BufReader::new((&file).take(limit));
+    // Preserve ordinary API read-through on concurrent appends within the
+    // protected per-pair allowance.
+    let mut reader = BufReader::new((&file).take(allowance));
     let rows = decode_api_rows(&mut reader, session_id, &mut health);
-    let bytes = limit - reader.get_ref().limit();
+    let bytes = allowance - reader.get_ref().limit();
     health.oversized_files = u64::from(opened.len().max(bytes) >= MAX_EVIDENCE_FILE_BYTES);
-    if bytes >= limit {
+    if bytes >= allowance {
         health.unreadable_lines += 1;
         return Ok(empty(health));
     }

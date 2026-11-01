@@ -545,7 +545,6 @@ impl Uploader {
         )?;
         Ok(retired)
     }
-
     pub(crate) fn restart(&mut self, source: SnapshotSource, context: &str) {
         self.progress = SnapshotUploadProgress::load(
             &self.scratch.join("progress.json"),

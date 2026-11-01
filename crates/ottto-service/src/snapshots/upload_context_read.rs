@@ -198,7 +198,7 @@ impl ScanIndex {
             .pending_candidates
             .extend(absent.into_values().cloned());
     }
-    pub(super) fn context_only_read(&self, candidate: &CandidateFile, _audit_now: u64) -> bool {
+    pub(super) fn context_only_read(&self, candidate: &CandidateFile) -> bool {
         if !self.file_upload_context_enabled {
             return false;
         }

@@ -95,7 +95,7 @@ fn claim_first_observation(observed: &std::sync::atomic::AtomicBool) -> bool {
 #[path = "money_freshness_tests.rs"]
 mod tests;
 
-// Default ON, sampled once per process like restart_restore/#899 policy.
+// Default ON, sampled once per process through the shared local switch.
 super::local_switch::local_switch!(
     "money_freshness_disabled",
     marker_enables = false,
