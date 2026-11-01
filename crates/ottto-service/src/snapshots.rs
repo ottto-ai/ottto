@@ -41780,6 +41780,7 @@ fn record_codex_identity_key(
 /// of 175 Codex pages while Codex itself kept it open. BUSY at the open's
 /// schema probe, which never waits, is retried too: it usually means Codex
 /// is closing the database, and the retry re-checks whether it is now idle.
+/// So does CANTOPEN when Codex removed the `-wal` after that check.
 const CODEX_SIDECAR_OPEN_RETRIES: u32 = 3;
 const CODEX_SIDECAR_OPEN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -77824,10 +77825,11 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
-    /// [behaviour] Any database that is not an idle WAL file with one name
-    /// takes the plain open, which reads live WAL frames and writes nothing
-    /// beside the database. A symlinked name with no `-wal` of its own is
-    /// refused rather than snapshotted. With no connection attached, an
+    /// [behaviour] An idle WAL database with a second hard link is refused
+    /// for good (not retried), with nothing created. Any database that is
+    /// not an idle WAL file takes the plain open, which reads live WAL frames
+    /// and writes nothing beside the database, also through a symlinked name,
+    /// which is read through its target. With no connection attached, an
     /// existing `-shm` keeps its bytes (a writable open would truncate it)
     /// and the frames are read through a private index; a `-wal` without its
     /// `-shm` fails closed (CANTOPEN, retried) with no file created. SQLite
@@ -77848,6 +77850,23 @@ mod tests {
             codex_idle_wal_history(&codex_dir, "01a04e22-49cf-7460-9fd7-f7dbfd2f05e4");
         let alias_path = codex_dir.join("alias.sqlite");
         std::os::unix::fs::symlink(&history_path, &alias_path).expect("link history fixture");
+        let other_name = codex_dir.join("other.sqlite");
+        fs::hard_link(&history_path, &other_name).expect("hard-link history fixture");
+        let (ordinal, open) = rollout_ordinal(&history_path);
+        let linked = ordinal.expect_err("second hard link refused");
+        assert!(linked
+            .downcast_ref::<crate::codex_scan_diagnostics::LinkedDatabase>()
+            .is_some());
+        assert_eq!((open.retries, open.snapshots), (0, 0));
+        let mut evidence = crate::codex_scan_diagnostics::LoaderEvidence::default();
+        evidence.observe_root(&Err(linked), open, false, "codex root");
+        assert_eq!(
+            evidence.reason,
+            crate::codex_scan_diagnostics::LoaderReason::LinkedDatabase
+        );
+        assert_eq!(evidence.transient_retries, 0);
+        assert_eq!(sqlite_wal_and_shm_exist(&history_path), [false, false]);
+        fs::remove_file(&other_name).expect("unlink second name");
 
         let writer = Connection::open(&history_path).expect("open history writer");
         writer
@@ -77860,11 +77879,7 @@ mod tests {
         assert_eq!(ordinal.expect("read live WAL database"), Some(4));
         assert_eq!(open.snapshots, 0);
         let (ordinal, open) = rollout_ordinal(&alias_path);
-        assert!(matches!(
-            ordinal.expect_err("linked name refused").downcast_ref::<rusqlite::Error>(),
-            Some(rusqlite::Error::SqliteFailure(failure, _))
-                if failure.code == rusqlite::ErrorCode::DatabaseBusy
-        ));
+        assert_eq!(ordinal.expect("read live WAL through symlink"), Some(4));
         assert_eq!(open.snapshots, 0);
         assert_eq!(sqlite_wal_and_shm_exist(&alias_path), [false, false]);
         let copies = [(&indexed, true), (&bare, false)].map(|(dir, with_shm)| {
@@ -77898,10 +77913,8 @@ mod tests {
             Some(rusqlite::Error::SqliteFailure(failure, _))
                 if failure.code == rusqlite::ErrorCode::CannotOpen
         ));
-        assert_eq!(
-            (open.retries, open.snapshots),
-            (CODEX_SIDECAR_OPEN_RETRIES, 0)
-        );
+        assert!(open.retries > 0);
+        assert_eq!(open.snapshots, 0);
         assert_eq!(sqlite_wal_and_shm_exist(&bare_path), [true, false]);
         for (path, bytes) in [(&indexed_path, &indexed_bytes), (&bare_path, &bare_bytes)] {
             for (suffix, before) in bytes {

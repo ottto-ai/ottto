@@ -10,7 +10,7 @@ use ottto_protocol::{
     SessionLaunchRecencyPrecisionV1 as Precision, SessionLaunchRecentFolderV1 as Item,
     SessionLaunchRecentFoldersV1 as Response,
 };
-use rusqlite::OpenFlags;
+use rusqlite::{Connection, OpenFlags};
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -398,6 +398,14 @@ fn codex_folders(
             (&deadline as *const Instant).cast_mut().cast(),
         );
     }
+    // A snapshot the database moved past fails as a database error before
+    // any schema error its moved pages may show.
+    connection
+        .read(|connection| Ok(codex_folder_rows(connection)))
+        .map_err(|_| "codex_database")?
+}
+
+fn codex_folder_rows(connection: &Connection) -> Result<Vec<(String, Option<i64>)>, &'static str> {
     let mut columns = connection
         .prepare("PRAGMA table_info(threads)")
         .map_err(|_| "codex_schema")?;
@@ -424,17 +432,13 @@ fn codex_folders(
     let rows = statement
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|_| "codex_database")?;
-    let rows = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "codex_database")?;
-    connection.verify().map_err(|_| "codex_database")?;
-    Ok(rows)
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "codex_database")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
     #[test]
     fn timed_out_folder_scan_still_answers_cli_launchable() {
         let support = std::env::temp_dir().join(format!(
