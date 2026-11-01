@@ -4275,8 +4275,18 @@ fn e2_absent_subagent_twin_holds_its_session() {
         full.extend([switch_context(), org_marker(ORG_B), line("b", &at(2), 20)]);
         write(&longer, &full);
         write(&shorter_path, &prefix);
-        let original = parse_and_remember(&longer, t0(), &mut index, &full);
-        let copy = parse_and_remember(&shorter_path, t0() + 60_000_000_000, &mut index, &prefix);
+        index.files.insert(local_index_key(&longer), entry());
+        index.files.insert(local_index_key(&shorter_path), entry());
+        // Production stages live birth witnesses before parsing either twin.
+        // Without that proof the prefix counts as unproven, so a co-read sums it twice.
+        stage_twins(
+            &mut index,
+            &[(&longer, t0()), (&shorter_path, t0() + 60_000_000_000)],
+        );
+        let original = parse(&longer, Some(t0()), &index, &full);
+        let copy = parse(&shorter_path, Some(t0() + 60_000_000_000), &index, &prefix);
+        assert_eq!(fold(&copy).entity.totals().1, 0);
+        assert_eq!(fold(&copy).entity.removed_requests, 1);
         let expected = tag_owned(vec![original, copy], &index);
         assert_eq!(
             (expected[0].request_count, expected[0].input_tokens),
