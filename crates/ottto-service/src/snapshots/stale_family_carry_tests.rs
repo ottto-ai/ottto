@@ -4653,7 +4653,8 @@ fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
 /// Full's (the family pending a Full folds in this window: same ids, same
 /// occurrences, observed for fence coverage), including a confirmed-empty
 /// member with no pending re-stamped from its census record (a Full folds
-/// nothing for it); an owed cap-invalid family gets no read and no credit
+/// nothing for it); both arms also against a real parse and fold of the same
+/// bytes; an owed cap-invalid family gets no read and no credit
 /// unless its recorded requests fit the cap; and census completion retires
 /// only proven families.
 #[test]
@@ -4662,6 +4663,7 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         return;
     }
     let _owed = evidence_owed::EvidenceOwedForTest::on();
+    owed_restamp_equals_a_real_fold_of_the_same_bytes();
     let (mut fixture, window) = owed_rearmed(2, true);
     let before = fixture.index.claude_usage_family_pending.clone();
     assert_eq!(
@@ -4800,6 +4802,132 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         false,
         &BTreeSet::new()
     ));
+}
+
+/// Both re-stamp arms against a real parse and fold of the same bytes (the
+/// account family fixture's root and child, plus a member whose transcript
+/// parses to no snapshot): the pending a Full folds in this window, with its
+/// ids and per-request usage, equals the earlier window's real fold re-stamped
+/// from pending and from the census record, with no read. No body is
+/// re-emitted, so the accepted bodies' totals and account placement stand.
+fn owed_restamp_equals_a_real_fold_of_the_same_bytes() {
+    let (dir, parent, items) = claude_account_family_fixture(false);
+    let subagents = dir.join(&parent).join("subagents");
+    let empty = subagents.join("agent-b4d1585d310070d0f.jsonl");
+    fs::write(
+        &empty,
+        format!(
+            "{{\"timestamp\":\"2026-08-02T07:00:05Z\",\"type\":\"user\",\"sessionId\":\"{parent}\",\"agentId\":\"b4d1585d310070d0f\",\"isSidechain\":true,\"message\":{{\"role\":\"user\",\"content\":\"x\"}}}}\n"
+        ),
+    )
+    .unwrap();
+    assert!(
+        parse_claude_code_jsonl_file(&empty, CARRY_FAILED, "empty".to_string())
+            .unwrap()
+            .is_empty(),
+        "a confirmed-empty parse"
+    );
+    let paths = [
+        dir.join(format!("{parent}.jsonl")),
+        subagents.join("agent-a4d1585d310070d0f.jsonl"),
+        empty,
+    ];
+    let mut index = ScanIndex {
+        claude_request_identity_contract: Some(
+            claude_request_identity::cycle_contract(true).to_string(),
+        ),
+        ..ScanIndex::default()
+    };
+    let mut candidates = Vec::new();
+    for path in &paths {
+        let key = local_index_key(path);
+        let mut entry = manifest_index_entry(None);
+        entry.source_file_fingerprint = format!("{:x}", Sha256::digest(key.as_bytes()));
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string());
+        let mut candidate = test_candidate(path.clone());
+        candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
+        candidate.legacy_source_file_fingerprint = entry.source_file_fingerprint.clone();
+        candidate.size_bytes = entry.size_bytes;
+        candidate.modified_unix_seconds = entry.modified_unix_seconds;
+        candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap();
+        index.files.insert(key, entry);
+        candidates.push(candidate);
+    }
+    index.confirmed_empty_files.insert(local_index_key(&paths[2]));
+    let fold = |index: &mut ScanIndex, window: &str| {
+        let mut page = items.clone();
+        apply_claude_reported_usage_with_index_and_limits(
+            &mut page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            index,
+            false,
+            window,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+            None,
+        );
+    };
+    let mut full = index.clone();
+    fold(&mut full, CARRY_RETRY);
+    let folded = &full.claude_usage_family_pending[&parent];
+    assert!(
+        !folded.invalid && folded.member_occurrences.len() == 2,
+        "{folded:?}"
+    );
+
+    let mut owed = index;
+    fold(&mut owed, CARRY_FAILED);
+    for path in &paths {
+        let key = local_index_key(path);
+        let (_, member) = claude_index_path_family_member(path).unwrap();
+        let fingerprint = owed.files[&key].source_file_fingerprint.clone();
+        let mut record = serde_json::json!({
+            "v": claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
+            "fp": fingerprint,
+            "w": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+            "s": "exact",
+            "bi": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+            "bd": 1, "bn": 1,
+        });
+        if let Some(hashes) = owed.claude_usage_family_pending[&parent]
+            .member_request_id_hashes
+            .get(&member)
+        {
+            record["h"] = hashes.iter().map(|hash| &hash[..16]).collect::<String>().into();
+        }
+        owed.claude_request_census
+            .insert(key.clone(), scoped_retry_record(&key, record));
+        evidence_owed::clear(owed.files.get_mut(&key).unwrap());
+    }
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    for candidate in &candidates {
+        let (mut decision, mut reason) = (CandidateDecision::Skip, None);
+        evidence_owed::resolve(
+            &mut owed,
+            &mut evidence_owed::Page::default(),
+            candidate,
+            CARRY_RETRY,
+            &mut decision,
+            &mut reason,
+        );
+        assert_eq!(decision, CandidateDecision::Skip, "no read");
+    }
+    let counts = scope.finish().contract.evidence_owed;
+    assert_eq!(
+        (counts.restamped, counts.restamped_from_record, counts.read),
+        (2, 1, 0),
+        "{counts:?}"
+    );
+    assert!(owed.files.values().all(|entry| !entry.evidence_owed));
+    assert_eq!(
+        owed.claude_usage_family_pending,
+        full.claude_usage_family_pending
+    );
+    fs::remove_dir_all(dir).unwrap();
 }
 
 /// [money] With the identity-contract latch SET, a family whose pending is
