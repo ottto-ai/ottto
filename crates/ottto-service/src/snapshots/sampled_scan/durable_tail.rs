@@ -1487,6 +1487,17 @@ impl SharedCache {
         }
     }
 
+    /// After a source's local copy is erased: only its slot and retirements.
+    pub(crate) fn durable_forget_source(&self, snapshot_source: SnapshotSource) {
+        if let (Some(source), Some(mut stores)) = (durable_source(snapshot_source), self.durable())
+        {
+            *stores.slot(source) = None;
+            for pending in &mut stores.retiring {
+                *pending = pending.filter(|pending| pending.source != snapshot_source);
+            }
+        }
+    }
+
     /// A post-save pass in a process that does not hold the state-directory
     /// lock: nothing is written or collected, and the admitted keys are
     /// dropped (they would never be written).

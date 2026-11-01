@@ -83,7 +83,7 @@ thread_local! {
 /// Test evidence only: takes this thread's latest value of an event, so a
 /// concurrent test cannot supply or overwrite it.
 #[cfg(test)]
-pub(super) fn take_thread_event_for_test(name: &str) -> Option<serde_json::Value> {
+pub(in super::super) fn take_thread_event_for_test(name: &str) -> Option<serde_json::Value> {
     THREAD_EVENTS.with(|events| events.borrow_mut().remove(name))
 }
 /// Cumulative process-lifetime count, kept in the same inventory as events.

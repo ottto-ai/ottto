@@ -6879,6 +6879,15 @@ fn promote_pending_device_credential_with_stores(
     device_store: &FileDeviceStore,
     active_secret_store: &impl ControlTokenStore,
 ) -> Result<(), LocalApiError> {
+    // A failed marker write keeps the candidate staged, so recovery retries both.
+    if let Ok(Some(current)) = device_store.load() {
+        crate::snapshot_sync::disable_sources_dropped_from_grant(
+            &default_support_dir(),
+            &current,
+            &pending.device,
+        )
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    }
     // After server confirmation the old active secret may already be invalid.
     // Never roll it back on a file-side failure: keep the separately staged
     // candidate intact so restart recovery can finish the same generation.
@@ -9562,6 +9571,18 @@ fn is_terminal_setup_run_scan_error(error: &LocalApiError) -> bool {
     matches!(details.status, Some(401) | Some(403))
 }
 
+fn set_source_marker(
+    write: fn(&Path, crate::snapshots::SnapshotSource) -> anyhow::Result<()>,
+    source: &SourceKind,
+) -> Result<(), LocalApiError> {
+    let source = match source {
+        SourceKind::ClaudeCode => crate::snapshots::SnapshotSource::ClaudeCode,
+        SourceKind::Codex => crate::snapshots::SnapshotSource::Codex,
+        SourceKind::Pi => crate::snapshots::SnapshotSource::Pi,
+    };
+    write(&default_support_dir(), source).map_err(|_| LocalApiError::StatePoisoned)
+}
+
 fn setup_answer(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
@@ -9570,6 +9591,10 @@ fn setup_answer(
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
     require_authorized_local_client(daemon, authorization)?;
+    // Before any connection or POST: collection stops even if the run is gone.
+    if answer_type.trim() == "disable_source" {
+        set_source_marker(crate::snapshot_sync::disable_snapshot_source, &source)?;
+    }
     let mut connection = daemon.connection_for_authorized_client()?;
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         connection
@@ -9623,6 +9648,9 @@ fn setup_action(
         }
     };
     let queued = queue_setup_action(&api_base_url, &mut credentials, &source, &action_type)?;
+    if action_type == "install_source" {
+        set_source_marker(crate::snapshot_sync::reconnect_snapshot_source, &source)?;
+    }
     let action_results =
         process_setup_actions(daemon, &api_base_url, &mut credentials, &status.machine)?;
     request_snapshot_sync_after_setup_actions(daemon, &action_results);

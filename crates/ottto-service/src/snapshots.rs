@@ -186,6 +186,8 @@ mod line_delivery_tests;
 mod pi_retry_inputs;
 mod sampled_audit;
 mod sampled_jsonl;
+#[cfg(test)]
+mod source_erasure_tests;
 /// Structural verification plus the nested source binding `decode` enforces.
 #[cfg(unix)]
 pub(crate) fn verify_durable_body(
