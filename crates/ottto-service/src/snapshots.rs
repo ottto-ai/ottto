@@ -923,6 +923,8 @@ pub(crate) const LISTING_INTERVAL_SECONDS: u64 = 30 * 60;
 /// A re-listing pass queues an owed file whose stamp is unchanged at most
 /// once per this interval.
 const LISTING_OWED_PACE_SECONDS: u64 = 6 * 60 * 60;
+/// Bound on `ScanTraversalCheckpoint::listing_owed_requeued_unix_seconds`.
+const MAX_LISTING_OWED_PACES: usize = MAX_BACKFILL_FILES_PER_SOURCE;
 const UNHEALTHY_SCAN_RETRY_BASE_SECONDS: u64 = 60;
 const UNHEALTHY_SCAN_RETRY_MAX_SECONDS: u64 = 60 * 60;
 /// The retry attempt at which the exponential delay reaches its ceiling
@@ -2607,6 +2609,10 @@ struct ScanTraversalCounts {
     /// once per file per `LISTING_OWED_PACE_SECONDS`.
     #[serde(skip_serializing_if = "is_zero_u64")]
     listing_owed_requeued: u64,
+    /// Pacing stamps dropped because the map reached its bound; each lets
+    /// its file be re-queued before six hours.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    listing_owed_pace_evicted: u64,
 }
 
 /// Residue a generation disclosed as terminal after settling. Counts exclude
@@ -2759,8 +2765,13 @@ struct ScanTraversalCheckpoint {
     listing_started_unix_seconds: Option<u64>,
     /// Owed files with an unchanged stamp that a re-listing pass queued,
     /// with that pass's start. Bounded: past the bound the oldest stamp is
-    /// dropped, so the bound can only bring a re-queue forward.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// dropped, so the bound can only bring a re-queue forward. Decoded
+    /// leniently (`deserialize_listing_owed_paces`), never failing the index.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_listing_owed_paces"
+    )]
     listing_owed_requeued_unix_seconds: BTreeMap<String, u64>,
 }
 
@@ -43678,8 +43689,9 @@ fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at:
 }
 
 /// Whether this re-listing pass may queue an owed file whose stamp is
-/// unchanged: once per file per `LISTING_OWED_PACE_SECONDS`. A stamp from a
-/// clock that moved backwards expires rather than holds.
+/// unchanged: once per file per `LISTING_OWED_PACE_SECONDS`, measured from
+/// the start of the pass that queued it. A stamp from a clock that moved
+/// backwards expires rather than holds.
 fn pace_listing_owed(traversal: &mut ScanTraversalCheckpoint, key: &str) -> bool {
     let Some(now) = traversal.listing_started_unix_seconds else {
         return true;
@@ -43690,17 +43702,39 @@ fn pace_listing_owed(traversal: &mut ScanTraversalCheckpoint, key: &str) -> bool
         return false;
     }
     paced.retain(|_, at| fresh(at));
-    if paced.len() >= MAX_BACKFILL_FILES_PER_SOURCE {
-        let oldest = paced
-            .iter()
-            .min_by_key(|(_, at)| **at)
-            .map(|(key, _)| key.clone());
-        if let Some(oldest) = oldest {
-            paced.remove(&oldest);
-        }
-    }
+    traversal.counts.listing_owed_pace_evicted +=
+        trim_listing_owed_paces(paced, MAX_LISTING_OWED_PACES - 1);
     paced.insert(key.to_owned(), now);
     true
+}
+
+/// Drops the oldest pacing stamps until at most `bound` remain, so a bound
+/// can only bring a re-queue forward. Returns how many were dropped.
+fn trim_listing_owed_paces(paces: &mut BTreeMap<String, u64>, bound: usize) -> u64 {
+    let excess = paces.len().saturating_sub(bound);
+    if excess == 0 {
+        return 0;
+    }
+    let mut by_age = paces
+        .iter()
+        .map(|(key, at)| (*at, key.clone()))
+        .collect::<Vec<_>>();
+    by_age.sort_unstable();
+    for (_, key) in by_age.into_iter().take(excess) {
+        paces.remove(&key);
+    }
+    excess as u64
+}
+
+/// The owed re-queue pacing map through the lenient map decoder: a stamp
+/// this binary cannot decode is dropped, and past the bound the oldest are
+/// dropped. Either only brings a re-queue forward; the traversal is kept.
+fn deserialize_listing_owed_paces<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, u64>, D::Error> {
+    let mut paces = deserialize_lenient_map(deserializer)?;
+    trim_listing_owed_paces(&mut paces, MAX_LISTING_OWED_PACES);
+    Ok(paces)
 }
 
 /// Watcher hints go through `ScanIndex::hint_settled`: a settled file
@@ -44298,6 +44332,7 @@ fn advance_bounded_directory_traversal_with_budget(
         if let Some(mut saved) = saved {
             saved.listing_changes_without_hint = counts.listing_changes_without_hint;
             saved.listing_owed_requeued = counts.listing_owed_requeued;
+            saved.listing_owed_pace_evicted = counts.listing_owed_pace_evicted;
             *counts = saved;
         }
     };
@@ -84499,7 +84534,7 @@ crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, listing_owed_pace_evicted);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);

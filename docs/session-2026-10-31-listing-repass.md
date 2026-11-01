@@ -9,9 +9,11 @@ file were weighed by the generation's walk and keep their own schedulers and
 the next walk, as on main; re-offering them every pass would re-read the same
 files every 30 minutes. The check is stat-only; no file is opened. Acquisition
 still chooses Tail or Full. An owed file whose stamp is unchanged is queued at
-most once per file per 6 hours (a bounded per-generation map; past the bound
-the oldest stamp is dropped, so a re-queue can only come sooner). An entry
-stored without mtime nanos compares at whole seconds.
+most once per file per 6 hours, measured from the start of the pass that
+queued it (a bounded per-generation map, decoded leniently; past the bound the
+oldest stamp is dropped and counted in `listing_owed_pace_evicted`, so a
+re-queue can only come sooner). On the listing path and in the hint filter an
+entry stored without mtime nanos compares at whole seconds.
 
 A queued file joins the census by the watcher-hint rule: always for Claude and
 Pi, and for Codex only if this generation has not observed it yet. A hint that

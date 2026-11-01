@@ -4180,7 +4180,8 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
     }
 }
 
-/// Retired evidence cannot reset live census, move slots or select another read.
+/// [format] Retired evidence cannot reset live census, move slots or select
+/// another read.
 #[test]
 fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
     let seed = every_persisted_field_fixture();
