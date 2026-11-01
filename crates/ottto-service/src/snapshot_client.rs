@@ -1,7 +1,6 @@
 use crate::snapshots::{
     snapshot_upload_body_witness, snapshot_upload_body_witness_version, SnapshotBatchRequest,
-    SnapshotSource, SnapshotSourceManifest, SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION,
-    SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION,
+    SnapshotSource, SnapshotSourceManifest,
     SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION,
     SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION, SNAPSHOT_ENTITY_ACK_CONTRACT,
 };
@@ -22,8 +21,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION: u64 = 5;
-pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION: u64 = 6;
 pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION: u64 = 7;
 pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION: u64 = 8;
 
@@ -854,38 +851,22 @@ fn default_occurrence_count() -> u64 {
 pub(crate) fn snapshot_ack_body_witness_version(
     item: &crate::snapshots::SnapshotItem,
 ) -> Result<Option<u64>> {
-    if item.context_curve.is_none()
-        && item.session_account_evidence.is_none()
-        && item.cache_observations.is_none()
-    {
+    if item.session_account_evidence.is_none() && item.cache_observations.is_none() {
         return Ok(None);
     }
     let version = snapshot_upload_body_witness_version(item)
         .filter(|version| {
             matches!(
                 *version,
-                SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION
-                    | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION
-                    | 15
-                    | 16
-                    | 19
-                    | 20
+                15 | 16
                     | SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION
                     | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION
             )
         })
         .ok_or_else(|| anyhow!("snapshot evidence has no supported body witness version"))?;
     let public_version = match version {
-        SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION => {
-            SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION
-        }
-        SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION => {
-            SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION
-        }
         15 => 13,
         16 => 14,
-        19 => 17,
-        20 => 18,
         SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION => {
             if item.cache_observations.is_some() {
                 13
@@ -981,7 +962,6 @@ impl SnapshotBatchResponse {
                 }
                 if request.snapshots.iter().any(|item| {
                     crate::snapshots::claude_request_money::is_request_owned_literal(item)
-                        || item.context_curve.is_some()
                         || item.session_account_evidence.is_some()
                         || item.cache_observations.is_some()
                 }) {
@@ -1217,16 +1197,11 @@ fn warn_answered_body_witness_rejection(
     expected_version: u64,
     echoed_version: Option<u64>,
 ) {
-    use sha2::Digest;
-    let digest = sha2::Sha256::digest(source_session_id.as_bytes());
     let line = format!(
-        "warning: local snapshot head-CAS answer ACK rejected: session_hash={:02x}{:02x}{:02x}{:02x} \
+        "warning: local snapshot head-CAS answer ACK rejected: session_hash={} \
          witness_version={expected_version} echoed_witness_version={} \
          reason=ack_body_witness_mismatch; the next conflict re-records the challenge",
-        digest[0],
-        digest[1],
-        digest[2],
-        digest[3],
+        crate::snapshot_sync::SessionHash::of(source_session_id),
         echoed_version.map_or_else(|| "none".to_string(), |version| version.to_string()),
     );
     eprintln!("{line}");
@@ -1241,12 +1216,7 @@ thread_local! {
 }
 
 fn valid_snapshot_head_token(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
+    value.is_some_and(crate::hex::is_sha256_lower)
 }
 
 fn record_snapshot_ack_occurrences(
@@ -1303,11 +1273,7 @@ fn validate_snapshot_entity_ref(reference: &SnapshotEntityRef) -> Result<()> {
     ) {
         (None, None) => {}
         (Some(version), Some(digest))
-            if matches!(version, 3..=20)
-                && digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) => {}
+            if matches!(version, 3..=20) && crate::hex::is_sha256_lower(digest) => {}
         _ => return Err(anyhow!("snapshot ACK body witness proof is malformed")),
     }
     Ok(())
@@ -4658,7 +4624,6 @@ mod tests {
         use crate::snapshots::{start_verdict_store, SnapshotSessionStart, StartVerdict};
         let support = crate::test_scratch::private_dir("composition-ack-verdict");
         let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        item.context_curve = None;
         item.cache_observations = None;
         item.session_account_evidence = None;
         item.session_start = Some(Box::new(SnapshotSessionStart {
@@ -4724,8 +4689,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        item.context_curve = None;
+        let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         let ack = entity_ack(
             1,
             vec![SnapshotEntityRef {

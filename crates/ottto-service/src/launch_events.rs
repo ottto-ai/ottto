@@ -500,7 +500,7 @@ fn redacted_label(path: &Path) -> String {
     let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
         return "unnamed".to_string();
     };
-    if stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if crate::hex::is_sha256_any_case(stem) {
         return stem[..16].to_string();
     }
     "unnamed".to_string()
